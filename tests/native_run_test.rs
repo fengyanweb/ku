@@ -2909,6 +2909,776 @@ fn native_fs_write_read_roundtrip() {
 }
 
 #[test]
+fn native_async_fs_write_preserves_views_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).expect("create async fs test directory");
+    }
+    let text = "中文🙂\0tail";
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Content(): str! { println("content") return ok("中文🙂@NUL@tail") }
+async fn Roundtrip(): null! {
+    path = (await Pathname())?
+    content = (await Content())?
+    fs.write(path, content)?
+    println(path)
+    println(content)
+    fs.try_write((await Pathname())?, (await Content())?)?
+    println(path)
+    println(content)
+    fs.write("empty.bin", "")?
+    return ok(null)
+}
+async fn MissingParent(): null! {
+    try {
+        fs.write("missing-parent/file.bin", "unchanged")?
+        fail "missing parent write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn NulPath(): null! {
+    try {
+        fs.try_write("keep.txt@NUL@ignored", "unchanged")?
+        fail "NUL path write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Roundtrip())?;
+    (await MissingParent())?;
+    (await NulPath())?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    fs::write(source.join("main.ku"), program).expect("write async fs program");
+    fs::write(source.join("keep.txt"), "keep").expect("write truncation sentinel");
+    let expected = format!(
+        "path\ncontent\n数据.bin\n{text}\npath\ncontent\n数据.bin\n{text}\nfs\nwrite_failed\ncleaned\nfs\nwrite_failed\n"
+    );
+    let entry = source.join("main.ku");
+    let mut interpreted = Command::new(ku_binary());
+    interpreted.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreted, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty(), "{:?}", interpreted.stderr);
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(source.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(source.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(source.join("keep.txt")).unwrap(), b"keep");
+    fs::remove_file(source.join("数据.bin")).unwrap();
+    fs::remove_file(source.join("empty.bin")).unwrap();
+
+    let executable = bin.join(exe_name("asyncfs"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        eprintln!("skip native async fs execution: no C compiler");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfs")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfs")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(fs::read(data.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(data.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("数据.bin").exists());
+        assert!(!directory.join("empty.bin").exists());
+        assert!(!directory.join("keep.txt").exists());
+    }
+}
+
+#[test]
+fn native_async_fs_read_preserves_owned_results_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-read-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let text = "中文🙂\0tail";
+    let medium = "多段🙂\0".repeat(4096);
+    fs::write(source.join("数据.bin"), text.as_bytes()).unwrap();
+    fs::write(source.join("medium.bin"), medium.as_bytes()).unwrap();
+    fs::write(source.join("empty.bin"), b"").unwrap();
+    fs::write(source.join("invalid.bin"), [0xff, 0xfe]).unwrap();
+    fs::write(source.join("keep.txt"), b"keep").unwrap();
+    fs::write(source.join("pathname.txt"), "数据.bin").unwrap();
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Echo(text: str): str! { return ok(text) }
+async fn Small(): null! {
+    path = (await Pathname())?
+    text = fs.read(path)?
+    fs.write("roundtrip.bin", text)?
+    println(path)
+    println(text)
+    println(text)
+    echoed = (await Echo(fs.try_read((await Pathname())?)?))?
+    println(echoed)
+    println(fs.read("empty.bin")?)
+    return ok(null)
+}
+async fn Medium(): null! {
+    text = fs.try_read("medium.bin")?
+    fs.try_write("medium-copy.bin", text)?
+    return ok(null)
+}
+async fn ExistsChecks(): null! {
+    path = fs.read("pathname.txt")?
+    println(fs.exists(path))
+    println(path)
+    println(fs.exists("."))
+    println(fs.exists("missing.bin"))
+    println(fs.exists(""))
+    println(fs.exists("keep.txt@NUL@ignored"))
+    println(fs.exists((await Pathname())?))
+    return ok(null)
+}
+async fn ReadFailure(path: str): null! {
+    try {
+        fs.read(path)?
+        fail "read should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Small())?;
+    (await Medium())?;
+    (await ExistsChecks())?;
+    (await ReadFailure("missing.bin"))?;
+    (await ReadFailure("invalid.bin"))?;
+    (await ReadFailure("keep.txt@NUL@ignored"))?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    let entry = source.join("main.ku");
+    fs::write(&entry, program).unwrap();
+    let expected = format!(
+        "path\n数据.bin\n{text}\n{text}\npath\n{text}\n\ntrue\n数据.bin\ntrue\nfalse\ntrue\nfalse\npath\ntrue\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\n"
+    );
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs read interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(
+        fs::read(source.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(source.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    for file in ["roundtrip.bin", "medium-copy.bin"] {
+        fs::remove_file(source.join(file)).unwrap();
+    }
+    let executable = bin.join(exe_name("asyncfsread"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs read build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfsread")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfsread")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs read");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(
+        fs::read(data.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(data.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("roundtrip.bin").exists());
+        assert!(!directory.join("medium-copy.bin").exists());
+    }
+}
+#[test]
+fn native_async_flat_array_for_preserves_sources_and_owned_iteration_across_await() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-flat-array-for"));
+    let dir = &cleanup.0;
+    let first = "数组🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    fs::write(dir.join("third.txt"), "未遍历").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn Next(value: int): int! { println(value) return ok(value) }
+async fn Show(text: str): null! { time.sleep(0)? println(text) return ok(null) }
+async fn Numbers(): null! {
+    values = [(await Next(1))?, (await Next(2))?, (await Next(3))?]
+    total = 0
+    for value in values {
+        if (value == 2) { continue }
+        total = total + value
+        if (value == 3) { break }
+    }
+    println(total)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn Strings(): null! {
+    rows = [fs.read("first.txt")?, fs.try_read("second.txt")?, fs.read("third.txt")?]
+    values = rows
+    seen = 0
+    for text in values {
+        (await Show(text))?
+        seen = seen + 1
+        if (seen == 1) { continue }
+        break
+    }
+    for text in values { println(text) }
+    println(values.len())
+    return ok(null)
+}
+async fn EmptyAndBool(): null! {
+    empty: [str] = []
+    for text in empty { println(text) }
+    println(empty.is_empty())
+    flags = [true, false]
+    for flag in flags { time.sleep(0)? println(flag) }
+    return ok(null)
+}
+async fn Nested(): null! {
+    values = [1, 2]
+    total = 0
+    for outer in values {
+        for inner in values {
+            time.sleep(0)?
+            if (inner == 1) { continue }
+            total = total + outer
+            break
+        }
+    }
+    println(total)
+    return ok(null)
+}
+async fn Early(): str! {
+    values = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try {
+        for text in values { return ok(text) }
+    } finally { println("early-finally") }
+    fail "empty"
+}
+async fn SumValues(values: [int], offset: int): int! {
+    total = offset
+    for value in values { time.sleep(0)? total = total + value }
+    return ok(total)
+}
+async fn ForwardValues(values: [int], offset: int): int! {
+    return (await SumValues(values, offset))
+}
+async fn EchoTexts(values: [str]): null! {
+    for text in values { (await Show(text))? }
+    return ok(null)
+}
+async fn ForwardTexts(values: [str]): null! { return (await EchoTexts(values)) }
+async fn CountFlags(values: [bool]): int! {
+    count = 0
+    for flag in values { if (flag) { count = count + 1 } }
+    return ok(count)
+}
+async fn ParameterNumbers(): null! {
+    values = [10, 20]
+    println((await ForwardValues(values.clone(), (await Next(5))?))?)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn ParameterTexts(): null! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?];
+    (await ForwardTexts(words))?;
+    return ok(null)
+}
+async fn ParameterEmptyAndBool(): null! {
+    flags = [false, true, true]
+    println((await CountFlags(flags))?)
+    empty: [int] = []
+    println((await SumValues(empty, 0))?)
+    println((await SumValues([], 0))?)
+    return ok(null)
+}
+async fn Recover(): null! {
+    values = [1, 2]
+    try {
+        for value in values {
+            if (value == 2) { fail "row" }
+            println(value)
+        }
+    } catch (err) { println(err.message) }
+      finally { println("error-finally") }
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Numbers())?;
+    (await Strings())?;
+    (await EmptyAndBool())?;
+    (await Nested())?;
+    println((await Early())?);
+    (await ParameterNumbers())?;
+    (await ParameterTexts())?;
+    (await ParameterEmptyAndBool())?;
+    (await Recover())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("1\n2\n3\n4\n1\n2\n3\n{first}\n乙\n{first}\n乙\n未遍历\n3\ntrue\ntrue\nfalse\n3\nearly-finally\n{first}\n5\n35\n10\n20\n{first}\n乙\n2\n0\n0\n1\nrow\nerror-finally\n1\n2\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter flat array comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "flatarrayfor") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "flatarrayfor")).unwrap();
+    assert!(generated.contains("KuArray_int"));
+    assert!(generated.contains("KuArray_bool"));
+    assert!(generated.contains("KuArray_str"));
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native flat array execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
+fn native_async_array_results_cross_await_and_callable_boundaries() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-array-results"));
+    let dir = &cleanup.0;
+    let first = "返回🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn ArrayNumbers(values: [int]): [int]! {
+    try { if (!values.is_empty()) { return ok(values) } }
+    finally { println("numbers-finally") }
+    empty: [int] = []
+    return ok(empty)
+}
+async fn ForwardNumbers(): [int]! { return (await ArrayNumbers([1, 2, 3])) }
+async fn ArrayFlags(): [bool]! { flags = [true, false] return ok(flags) }
+async fn UseNumbers(): null! {
+    values = (await ForwardNumbers())?
+    for value in values { println(value) }
+    empty: [int] = []
+    nothing = (await ArrayNumbers(empty))?
+    println(nothing.is_empty())
+    flags = (await ArrayFlags())?
+    for flag in flags { println(flag) }
+    return ok(null)
+}
+async fn TextRows(): [str]! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try { if (!words.is_empty()) { return ok(words) } }
+    finally { println("texts-finally") }
+    fail "empty-texts"
+}
+async fn ForwardRows(): [str]! { return (await TextRows()) }
+async fn UseRows(): null! {
+    saved: [str]! = await ForwardRows()
+    time.sleep(0)?
+    rows = saved?
+    for row in rows { println(row) }
+    fetch: async fn(): [str]! = TextRows
+    again = (await fetch())?
+    for row in again { println(row) }
+    return ok(null)
+}
+async fn MissingRows(): [str]! { fail "array-failed" }
+async fn ReplacedRows(replace: bool): [str]! {
+    rows = [fs.read("first.txt")?]
+    try { if (!rows.is_empty()) { return ok(rows) } }
+    finally { if (replace) { fail "replaced-array" } }
+    empty: [str] = []
+    return ok(empty)
+}
+async fn PartialRows(): [str]! {
+    rows = [fs.read("first.txt")?, fs.read("missing.txt")?]
+    return ok(rows)
+}
+async fn ReassignText(): null! {
+    text = fs.read("first.txt")?
+    text = text
+    println(text)
+    try { text = fs.read("missing.txt")? }
+    catch (err) { println(err.code) }
+    println(text)
+    text = fs.read("second.txt")?
+    println(text)
+    if (true) { text = fs.read("first.txt")? }
+    println(text)
+    return ok(null)
+}
+async fn ReassignArrays(): null! {
+    rows = (await TextRows())?
+    rows = rows
+    rows = []
+    println(rows.len())
+    rows = (await TextRows())?
+    moved = rows
+    rows = []
+    println(moved.len())
+    println(rows.is_empty())
+    for row in moved { println(row) }
+    return ok(null)
+}
+async fn ReassignResults(): null! {
+    result: [str]! = await MissingRows()
+    result = await TextRows()
+    result = result
+    rows = result?
+    for row in rows { println(row) }
+    number: int! = ok(1)
+    number = ok(2)
+    println(number?)
+    try { fail "old-error" } catch (err) {
+        held = err
+        try { fail "new-error" } catch (next) { held = next }
+        println(held.message)
+    }
+    return ok(null)
+}
+async fn CheckErrors(): null! {
+    try {
+        unexpected = (await MissingRows())?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await ReplacedRows(true))?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await PartialRows())?
+        println("unexpected")
+    } catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await UseNumbers())?;
+    (await UseRows())?;
+    (await CheckErrors())?;
+    (await ReassignText())?;
+    (await ReassignArrays())?;
+    (await ReassignResults())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter array Result comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "arrayresults") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "arrayresults")).unwrap();
+    for field in ["integer_array", "boolean_array", "string_array"] {
+        assert!(generated.contains(field));
+    }
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native array Result execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
+fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-callable-parameters"));
+    let dir = &cleanup.0;
+    let program = r#"async fn First(value: int): int! { println("first") return ok(value + 1) }
+async fn Second(value: int): int! { println("second") return ok(value + 2) }
+async fn Apply(action: async fn(int): int!, value: int): int! {
+    once = action.clone()
+    first = (await once(value))?
+    second = (await action(value))?
+    return ok(first + second)
+}
+async fn Forward(action: async fn(int): int!, value: int): int! {
+    return await Apply(action, value)
+}
+async fn UnusedSameSignature(value: int): int! {
+    return await Forward(First, value)
+}
+async fn Argument(): int! { println("arg") return ok(4) }
+async fn main(): null! {
+    action = First
+    println((await Forward(action.clone(), (await Argument())?))?)
+    println((await action(2))?)
+    println((await Apply(Second, 3))?)
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).expect("write callable parameter program");
+    let expected = "arg\nfirst\nfirst\n10\nfirst\n3\nsecond\nsecond\n10\n";
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded callable parameter interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "callableparameters") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "callableparameters")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut command = Command::new(executable);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native callable parameter execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_fs_intrinsic_gates_emit_complete_cross_platform_helpers() {
     let dir = unique_temp_dir("fs-gates-c");
     let cases = [
@@ -3254,6 +4024,36 @@ fn native_json_parse_read_and_convert() {
 }
 
 #[test]
+fn native_json_encode_decode_example_keeps_values_usable() {
+    let dir = unique_temp_dir("json-encode-decode");
+    fs::write(dir.join("main.ku"), include_str!("../examples/json.ku"))
+        .expect("write JSON encode/decode example");
+    let c = native_emit_c(&dir, "main.ku");
+    assert!(c.contains("static KuResult_kuvalue ku_json_parse(KuString text)"));
+    assert!(c.contains("static KuResult_str ku_json_stringify(KuValue value)"));
+    assert!(c.contains("ku_json_parse_error_at("));
+    assert!(c.contains("ku_json_write_value("));
+    let Some(exe) = native_build(&dir, "main.ku", "jsonencodedecode") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    let stdout = stdout.replace('\r', "");
+    assert!(stdout.contains("\"name\":\"中文😀\""), "{stdout}");
+    assert!(
+        stdout.contains("\"embedded_nul\":\"left\\u0000right\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nroundtrip ok\njson/parse_error\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("byte 7"), "{stdout}");
+    assert_eq!(code, Some(0));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_kuvalue_equality_is_structural_borrowed_and_array_aware() {
     let dir = unique_temp_dir("kuvalue-equality");
     fs::write(
@@ -3468,6 +4268,7 @@ fn main(): null! {
     ExpectReject("1e")?
     ExpectReject("1e+")?
     ExpectReject("9223372036854775808")?
+    ExpectReject("-9223372036854775809")?
     ExpectReject("1e400")?
     println("done")
     return ok(null)
@@ -3506,6 +4307,10 @@ fn main(): null! {
     println(json.parse("1.5")?)
     println(json.stringify(json.parse("-0.25")?)?)
     println(json.stringify([1.5, 2.25])?)
+    println(json.encode(json.decode("9223372036854775807")?)?)
+    println(json.encode(json.decode("-9223372036854775808")?)?)
+    duplicate = json.decode("{\"value\":1,\"value\":2}")?
+    println(duplicate["value"]?.as_int()? + 1)
     return ok(null)
 }
 "#,
@@ -3517,7 +4322,10 @@ fn main(): null! {
         return;
     };
     let (stdout, code) = run_binary(&exe);
-    assert_eq!(stdout.replace('\r', ""), "1.5\n-0.25\n[1.5,2.25]\n");
+    assert_eq!(
+        stdout.replace('\r', ""),
+        "1.5\n-0.25\n[1.5,2.25]\n9223372036854775807\n-9223372036854775808\n3\n"
+    );
     assert_eq!(code, Some(0));
 
     fs::write(

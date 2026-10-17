@@ -1,12 +1,52 @@
 # Ku Diagnostics
 
-诊断输出始终包含三类信息：出问题的位置、问题描述、修改方向。`ku check --json` 使用 JSON Lines，字段为：
+诊断输出包含出问题的位置、问题描述；已细分的诊断还提供修改方向。`ku check --json` 使用 JSON Lines，字段为：
 
 ```txt
 level code message file line column endLine endColumn notes helps
 ```
 
 成功时 `ku check --json` 静默输出。
+
+## 诊断码唯一登记表
+
+`src/error.rs` 的 `diagnostic_registry!` 是编译器诊断 ID、code、说明、notes 和 helps 的唯一登记来源。它同时生成 `DiagnosticId` 与 `DIAGNOSTIC_REGISTRY`；新增分类必须在这里登记，不得为不同的已识别问题复用一个 code。`tests/diagnostic_registry_test.rs` 遍历实际登记表检查 ID/code 唯一性和帮助文本，并通过 Lexer → Parser → Checker 的真实失败程序验证 HTTP 与 match 分类。
+
+错误产生点可以使用 `KuError::with_diagnostic_id(DiagnosticId::...)` 显式指定内部身份；该身份不依赖英文 message，并随 clone 和导入文件的诊断上下文保留。尚未迁移的产生点仍经过 `legacy_diagnostic_id` 的文案分类适配层，`ku check` 的部分内部接口也仍包装已渲染文本。这不是完整的 typed diagnostic transport；登记表唯一性不能代替逐个 producer 的迁移和集成测试。
+
+本轮拆分的分类如下。实验版本允许这些 code 收敛，JSON 字段、坐标约定、错误 message 和成功静默合同不变；依赖原有混用 code 的工具需按新分类更新。
+
+| code | 唯一登记分类 | 修改方向 |
+| --- | --- | --- |
+| E0501 | match 不穷尽 | 补齐缺少的变体，或增加无 guard 的兜底分支 |
+| E0502 | match 分支不可达 | 删除不可达分支，或把兜底分支移到具体模式之后 |
+| E0601 | 未知 std 模块 | 检查实际模块名及小写规则 |
+| E0604 | 成员未导出 | 确认成员存在；用户 fn/struct/enum 导出名须以 ASCII 大写字母开头 |
+| E0605 | std 模块缺少显式 import | 添加对应 import |
+| E0701 | 普通 HTTP handler 签名或响应写法不合法 | 使用返回 HttpResponse 的 `fn()` / `fn(req)` |
+| E0703 | HTTP handler 修改捕获变量 | 移除可能被并发访问的可变捕获 |
+| E0704 | 重绑定 HTTP 共享函数绑定，或无法证明相关共享捕获/调用效果安全 | 保持共享绑定不变；需要另一个函数值时使用独立局部绑定 |
+
+其余已识别分类保留：E0104 `switch`、E0105 `let`、E0301 类型不匹配、E0302 非 bool 条件、E0401 无效 Result `?`、E0602 构造器缺少调用、E0603 unused import、E0702 handler 返回类型、E0802 非法 task 操作、E0803 task clone、E0804 重复 await，以及下文的 E0901/E0904/E0905/E0910–E0919。
+
+第二阶段增加 E0805：match guard 不能消费仍处于候选状态的 Task binding（包括含 Task
+的 payload），应在确定选中的 arm 内 move/await；guard 自己新建并 await 的任务不受此限制。
+
+通用回退分类明确标记为**未细分**：E0001 runtime、E0101 lexical/syntax、E0600 import、E0606 package、E0700 HTTP。它们不表示所有具体错误均已获得独立 ID；E0001/E0101 也可能没有通用修复 help。可恢复运行时错误的 `domain` / `code`（例如 `array/index_out_of_bounds`）是另一份 Result/Error 合同，不能被编译器的 `E` 编号替代。
+
+## HTTP 共享函数绑定
+
+E0704 的内部身份为 `HttpSharedCallableReassignment`。基础规则在 `47a5816` 通过了当时的本机及新提交三系统门禁；后续发现的多值赋值证据顺序缺口须独立修补和验证，不能沿用旧绿灯。v0.0.18 仍为开发阶段，不表示完整并发运行时或生产发布验收已完成。
+
+路由注册后，handler 直接或间接捕获的函数变量按词法绑定身份（`BindingId`）禁止重绑定，即使新函数同签名且只读也不例外。确定的写入报告 `cannot reassign HTTP-shared function binding 'render'`，并指出注册位置；不能确定相关捕获来源或调用写入效果时，以包含 `cannot prove` 和 `HTTP-shared` 的 E0704 拒绝，不能把未知效果当成只读。
+
+E0703 继续表示 handler 修改外层捕获变量；E0704 则防止注册后从其它路径替换已审计的共享函数绑定。提前创建的 setter、setter 的 move/clone 别名、分支汇合与循环回边都不能绕过此规则；注册前已完成的赋值仍需让注册时的实际函数值通过 handler 检查。
+
+多值赋值中的每一项必须保留其求值时的捕获与调用效果证据。前项调用替换了后项读取的函数时，不能用替换前的证据放行后续注册或 setter 调用；相关证据不完整仍使用 E0704，不新增诊断码。先取得旧函数值、再替换原绑定的相反顺序不因此被一并禁止。
+
+通过 `for` 来源表达式传到循环变量的函数值也保留求值后的证据。不能证明其 HTTP 共享捕获安全时仍明确以 E0704 拒绝；能确定函数体写外层捕获时使用原 E0703。不能用来源求值前的证据替代实际返回值的证据。
+
+限制不是按变量名或函数签名全局冻结，也不禁止正常调用。未共享绑定和同名的新局部保持既有规则；直接 `app.get("/", handler)` 登记函数值，不因此冻结传入值的原变量。函数值 clone 共享捕获环境，不能用 clone 擦除对同一捕获绑定的限制。完整例子及无自动解冻边界见 [HTTP 共享函数绑定规则](syntax.md#http-共享函数绑定规则)。
 
 ## Ownership
 
@@ -41,6 +81,8 @@ fn main(): null! {
 | E0917 | `borrowed operation is not supported`：当前没有安全 borrowed 路径的操作 | 先显式 clone 为 owned 值，再执行该操作 |
 | E0918 | `'&' is not written at the call site` | 写 `inspect(value)`，由函数签名决定 borrow / move |
 | E0919 | 单独 `&` 出现在参数槽位以外 | 声明写 `&name: T`，函数类型参数写 `fn(&T): R`；借用箭头加括号 |
+
+表中“先 clone”的修改方向仅适用于可 clone 的类型。Task 及包含 Task payload 的容器不能 clone；应让真正的 owner 在借用结束后消费 Task，或调整所有权与调用边界，不能通过 clone 绕过 borrowed / capture 限制。
 
 例如返回 Copy 字段合法，返回 owned 字段需要 clone：
 

@@ -235,6 +235,7 @@ fn borrow_checker_read_operations_and_required_stdlib_preserve_values() {
 import { json } from "std"
 fn Greet(&name: str): str { return "Hello " + name }
 fn Render(&name: str): str { return `name: {name}` }
+fn Encode(&values: [int]): str! { return json.encode(values) }
 fn Read(&name: str, &values: [int]): str! {
     println(name)
     println(str(name))
@@ -251,6 +252,8 @@ fn Read(&name: str, &values: [int]): str! {
 fn main(): null! {
     value = { name: "Ku" }
     text = json.stringify(value)?
+    alias = json.encode(value)?
+    if (text != alias || Encode([1, 2])? != "[1,2]") { panic("JSON alias") }
     println(value)
     println(text)
     return ok(null)
@@ -312,6 +315,23 @@ fn borrow_checker_alias_scan_rejects_deep_expressions_without_recursing_unbounde
     let source =
         format!("fn Read(&text: str, n: int) {{}} fn main() {{ text = \"Ku\" Read(text, {sum}) }}");
     let error = check_source("borrow.ku", &source).expect_err("depth must be bounded");
+    assert!(error.message.contains("error[E0101]"), "{error}");
+    assert!(
+        error
+            .message
+            .contains("maximum expression tree depth exceeded"),
+        "{error}"
+    );
+
+    // Keep the same eighty operands, splitting construction loops with
+    // parentheses so the existing checker/alias depth guard is still reached.
+    let mut sum = "1".to_owned();
+    for additions in [16, 16, 16, 16, 15] {
+        sum = format!("({sum}){}", " + 1".repeat(additions));
+    }
+    let source =
+        format!("fn Read(&text: str, n: int) {{}} fn main() {{ text = \"Ku\" Read(text, {sum}) }}");
+    let error = check_source("borrow.ku", &source).expect_err("checker depth must stay bounded");
     assert!(
         error.message.contains("maximum check depth exceeded"),
         "{error}"

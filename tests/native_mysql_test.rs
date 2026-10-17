@@ -1318,7 +1318,9 @@ int main(void) {
   client->query_timeout_ms = 1;
   KuArray_str no_params = (KuArray_str){0};
 
+  outcome_test_clock_start(1000000);
   KuResult_int late = ku_mysql_client_execute(client, outcome_text("LATE"), no_params);
+  outcome_test_clock_stop();
   if (late.ok || !outcome_code(late.error, "execution_completed_without_result")
       || !outcome_message_is_non_retryable(late.error)) return 11;
   ku_error_drop(&late.error);
@@ -2666,7 +2668,12 @@ int mysql_stmt_execute(MYSQL_STMT* s) {
     return 0;
   }
   if (strncmp(s->sql, "LATE", 4) == 0) {
-    for (int index = 0; index < 10; index++) fake_pause();
+#if defined(KU_FAKE_MYSQL_OUTCOME_CLOCK)
+    if (!ku_test_mysql_clock_enabled)
+#endif
+    {
+      for (int index = 0; index < 10; index++) fake_pause();
+    }
   }
   if (fake_atomic_load(&ku_fake_block_execute) && strncmp(s->sql, "BLOCK", 5) == 0) {
     fake_atomic_store(&ku_fake_execute_entered, 1);
@@ -2717,6 +2724,11 @@ int mysql_stmt_execute(MYSQL_STMT* s) {
     }
     s->field_count = 3;
   }
+#if defined(KU_FAKE_MYSQL_OUTCOME_CLOCK)
+  /* Exercise the deadline only after this fake statement completed. */
+  if (ku_test_mysql_clock_enabled && strncmp(s->sql, "LATE", 4) == 0)
+    ku_test_mysql_clock_calls = ku_test_mysql_clock_expire_after;
+#endif
   return 0;
 }
 unsigned int mysql_stmt_field_count(MYSQL_STMT* s) { return s->field_count; }
@@ -2787,6 +2799,12 @@ int mysql_stmt_fetch_column(MYSQL_STMT* s, MYSQL_BIND* b, unsigned int col, unsi
   return 0;
 }
 my_bool mysql_stmt_free_result(MYSQL_STMT* s) {
+  /* MariaDB Connector/C reports CR_STMT_NO_RESULT for execute-only
+     statements; the connection is still healthy and must remain reusable. */
+  if (s && s->field_count == 0) {
+    s->error_code = 5025;
+    return 1;
+  }
   if (fake_atomic_exchange(&ku_fake_fail_stmt_free_result, 0)) {
     if (s && s->connection) s->connection->broken = 1;
     return 1;

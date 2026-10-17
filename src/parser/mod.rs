@@ -5,13 +5,36 @@ use crate::token::{Token, TokenKind};
 
 const MAX_PARSE_DEPTH: usize = 32;
 const MAX_TYPE_DEPTH: usize = 32;
+const MAX_STATEMENT_DEPTH: usize = 32;
 const MAX_TOKENS: usize = 100_000;
+
+mod expression_tree;
+mod match_pattern;
+
+fn expression_tree_error(span: Span) -> KuError {
+    KuError::parse(
+        "maximum expression tree depth exceeded; expression is too deeply nested",
+        span,
+    )
+}
+
+fn check_expression_chain(count: &mut usize, limit: usize, span: Span) -> KuResult<()> {
+    if *count >= limit {
+        return Err(expression_tree_error(span));
+    }
+    *count += 1;
+    Ok(())
+}
+
+#[cfg(test)]
+mod statement_depth_tests;
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     parse_depth: usize,
     type_parse_depth: usize,
+    statement_depth: usize,
 }
 
 impl Parser {
@@ -21,6 +44,7 @@ impl Parser {
             current: 0,
             parse_depth: 0,
             type_parse_depth: 0,
+            statement_depth: 0,
         }
     }
 
@@ -482,6 +506,23 @@ impl Parser {
     }
 
     fn statement(&mut self) -> KuResult<Stmt> {
+        if matches!(
+            &self.peek().kind,
+            TokenKind::If
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Try
+                | TokenKind::Fn
+                | TokenKind::Async
+        ) {
+            let span = self.peek().span;
+            self.with_statement_depth(span, Self::statement_inner)
+        } else {
+            self.statement_inner()
+        }
+    }
+
+    fn statement_inner(&mut self) -> KuResult<Stmt> {
         if self.match_kind(&TokenKind::Let) {
             return Err(KuError::parse(
                 "'let' is not supported in Ku; use 'name = value' or 'name:type = value'",
@@ -489,19 +530,13 @@ impl Parser {
             ));
         }
         if self.match_kind(&TokenKind::If) {
-            let stmt = self.if_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::if_statement);
         }
         if self.match_kind(&TokenKind::While) {
-            let stmt = self.while_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::while_statement);
         }
         if self.match_kind(&TokenKind::For) {
-            let stmt = self.for_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::for_statement);
         }
         if self.match_kind(&TokenKind::Break) {
             let span = self.previous().span;
@@ -517,14 +552,10 @@ impl Parser {
             return self.try_statement();
         }
         if self.match_kind(&TokenKind::Async) {
-            let function = self.function(true)?;
-            self.optional_semicolon();
-            return Ok(Stmt::Function(function));
+            return self.local_function_statement(true);
         }
         if self.check(&TokenKind::Fn) {
-            let function = self.function(false)?;
-            self.optional_semicolon();
-            return Ok(Stmt::Function(function));
+            return self.local_function_statement(false);
         }
         if self.match_kind(&TokenKind::Fail) {
             return self.fail_statement();
@@ -545,6 +576,20 @@ impl Parser {
         self.expression_or_assignment_statement()
     }
 
+    // Keep branch-specific AST temporaries out of the dispatch frame: that
+    // frame remains live while nested function values parse their bodies.
+    fn terminated_statement(&mut self, parse: fn(&mut Self) -> KuResult<Stmt>) -> KuResult<Stmt> {
+        let statement = parse(self)?;
+        self.optional_semicolon();
+        Ok(statement)
+    }
+
+    fn local_function_statement(&mut self, is_async: bool) -> KuResult<Stmt> {
+        let function = self.function(is_async)?;
+        self.optional_semicolon();
+        Ok(Stmt::Function(function))
+    }
+
     fn if_statement(&mut self) -> KuResult<Stmt> {
         let start = self.previous().span.start;
         self.consume(&TokenKind::LParen, "expected '(' after 'if'")?;
@@ -553,7 +598,8 @@ impl Parser {
         let (then_branch, then_span) = self.block_or_single_statement("if")?;
         let (else_branch, end) = if self.match_kind(&TokenKind::Else) {
             if self.match_kind(&TokenKind::If) {
-                let nested = self.if_statement()?;
+                let span = self.previous().span;
+                let nested = self.with_statement_depth(span, Self::if_statement)?;
                 let span = stmt_span(&nested);
                 (vec![nested], span.end)
             } else {
@@ -958,14 +1004,22 @@ impl Parser {
 
     fn expression(&mut self) -> KuResult<Expr> {
         self.enter_parse_depth()?;
-        let result = self.or();
+        let result = self.or().and_then(|expr| {
+            if expression_tree::expression_tree_fits(&expr) {
+                Ok(expr)
+            } else {
+                Err(expression_tree_error(expr.span))
+            }
+        });
         self.leave_parse_depth();
         result
     }
 
     fn or(&mut self) -> KuResult<Expr> {
         let mut expr = self.and()?;
+        let mut chain = 0;
         while self.match_kind(&TokenKind::OrOr) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let right = self.and()?;
             let span = expr.span.merge(right.span);
             expr = Expr::new(
@@ -982,7 +1036,9 @@ impl Parser {
 
     fn and(&mut self) -> KuResult<Expr> {
         let mut expr = self.equality()?;
+        let mut chain = 0;
         while self.match_kind(&TokenKind::AndAnd) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let right = self.equality()?;
             let span = expr.span.merge(right.span);
             expr = Expr::new(
@@ -999,7 +1055,9 @@ impl Parser {
 
     fn equality(&mut self) -> KuResult<Expr> {
         let mut expr = self.comparison()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::BangEqual, TokenKind::EqualEqual]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::BangEqual => BinaryOp::NotEqual,
                 _ => BinaryOp::Equal,
@@ -1020,12 +1078,14 @@ impl Parser {
 
     fn comparison(&mut self) -> KuResult<Expr> {
         let mut expr = self.term()?;
+        let mut chain = 0;
         while self.match_any(&[
             TokenKind::Less,
             TokenKind::LessEqual,
             TokenKind::Greater,
             TokenKind::GreaterEqual,
         ]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Less => BinaryOp::Less,
                 TokenKind::LessEqual => BinaryOp::LessEqual,
@@ -1048,7 +1108,9 @@ impl Parser {
 
     fn term(&mut self) -> KuResult<Expr> {
         let mut expr = self.factor()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::Minus, TokenKind::Plus]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Minus => BinaryOp::Subtract,
                 _ => BinaryOp::Add,
@@ -1069,7 +1131,9 @@ impl Parser {
 
     fn factor(&mut self) -> KuResult<Expr> {
         let mut expr = self.unary()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::Slash, TokenKind::Star, TokenKind::Percent]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Slash => BinaryOp::Divide,
                 TokenKind::Percent => BinaryOp::Remainder,
@@ -1121,7 +1185,14 @@ impl Parser {
     }
 
     fn call(&mut self) -> KuResult<Expr> {
-        let mut expr = self.primary()?;
+        let expr = self.primary()?;
+        self.finish_call(expr)
+    }
+
+    // Do not retain postfix construction scratch while primary recursively
+    // parses a function body. The grammar and postfix loop are unchanged.
+    fn finish_call(&mut self, mut expr: Expr) -> KuResult<Expr> {
+        let mut chain = 0;
         loop {
             if self.match_kind(&TokenKind::LParen) {
                 let mut args = Vec::new();
@@ -1215,6 +1286,7 @@ impl Parser {
             } else {
                 break;
             }
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH * 2, expr.span)?;
         }
         Ok(expr)
     }
@@ -1255,6 +1327,10 @@ impl Parser {
                 self.previous().span,
             ));
         }
+        self.primary_atom()
+    }
+
+    fn primary_atom(&mut self) -> KuResult<Expr> {
         let token = self.advance().clone();
         let span = token.span;
         let kind = match token.kind {
@@ -1272,7 +1348,7 @@ impl Parser {
                         &TokenKind::Arrow,
                         "expected '=>' after typed arrow function parameter",
                     )?;
-                    let (body, body_span) = self.arrow_body()?;
+                    let (body, body_span) = self.with_statement_depth(span, Self::arrow_body)?;
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
@@ -1288,7 +1364,7 @@ impl Parser {
                     ));
                 }
                 if self.match_kind(&TokenKind::Arrow) {
-                    let (body, body_span) = self.arrow_body()?;
+                    let (body, body_span) = self.with_statement_depth(span, Self::arrow_body)?;
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
@@ -1392,7 +1468,8 @@ impl Parser {
     }
 
     fn arrow_function(&mut self) -> KuResult<Expr> {
-        let start = self.consume(&TokenKind::LParen, "expected '('")?.span.start;
+        let owner_span = self.consume(&TokenKind::LParen, "expected '('")?.span;
+        let start = owner_span.start;
         let params = self.function_value_params("arrow function")?;
         self.consume(
             &TokenKind::RParen,
@@ -1407,7 +1484,7 @@ impl Parser {
             &TokenKind::Arrow,
             "expected '=>' after arrow function parameters",
         )?;
-        let (body, body_span) = self.arrow_body()?;
+        let (body, body_span) = self.with_statement_depth(owner_span, Self::arrow_body)?;
         Ok(Expr::new(
             ExprKind::Function {
                 params,
@@ -1419,7 +1496,8 @@ impl Parser {
     }
 
     fn anonymous_function(&mut self) -> KuResult<Expr> {
-        let start = self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start;
+        let owner_span = self.consume(&TokenKind::Fn, "expected 'fn'")?.span;
+        let start = owner_span.start;
         self.consume(&TokenKind::LParen, "expected '(' after 'fn'")?;
         let params = self.function_value_params("anonymous function")?;
         self.consume(
@@ -1431,7 +1509,7 @@ impl Parser {
         } else {
             None
         };
-        let (body, body_span) = self.block()?;
+        let (body, body_span) = self.with_statement_depth(owner_span, Self::block)?;
         Ok(Expr::new(
             ExprKind::Function {
                 params,
@@ -1539,51 +1617,7 @@ impl Parser {
     }
 
     fn match_pattern(&mut self) -> KuResult<MatchPattern> {
-        let token = self.advance().clone();
-        match token.kind {
-            TokenKind::Ident(name) if name == "_" => Ok(MatchPattern::Wildcard),
-            TokenKind::Int(value) => Ok(MatchPattern::Literal(Literal::Int(value))),
-            TokenKind::Float(value) => Ok(MatchPattern::Literal(Literal::Float(value))),
-            TokenKind::String(value) => Ok(MatchPattern::Literal(Literal::String(value))),
-            TokenKind::True => Ok(MatchPattern::Literal(Literal::Bool(true))),
-            TokenKind::False => Ok(MatchPattern::Literal(Literal::Bool(false))),
-            TokenKind::Null => Ok(MatchPattern::Literal(Literal::Null)),
-            TokenKind::Ident(enum_name) => {
-                if !self.match_kind(&TokenKind::Dot) {
-                    return Ok(MatchPattern::Binding(enum_name));
-                }
-                let (mut variant, _) =
-                    self.consume_ident("expected enum variant in match pattern")?;
-                let enum_name = if self.match_kind(&TokenKind::Dot) {
-                    let namespace = enum_name;
-                    let enum_type = variant;
-                    let (actual_variant, _) =
-                        self.consume_ident("expected enum variant in match pattern")?;
-                    variant = actual_variant;
-                    format!("{namespace}.{enum_type}")
-                } else {
-                    enum_name
-                };
-                let mut fields = Vec::new();
-                if self.match_kind(&TokenKind::LParen) {
-                    if !self.check(&TokenKind::RParen) {
-                        loop {
-                            fields.push(self.match_pattern()?);
-                            if !self.match_kind(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.consume(&TokenKind::RParen, "expected ')' after payload patterns")?;
-                }
-                Ok(MatchPattern::EnumVariant {
-                    enum_name,
-                    variant,
-                    fields,
-                })
-            }
-            _ => Err(KuError::parse("expected match pattern", token.span)),
-        }
+        match_pattern::parse(self)
     }
 
     fn is_arrow_function_start(&self) -> KuResult<bool> {
@@ -1724,10 +1758,13 @@ impl Parser {
     }
 
     fn advance(&mut self) -> &Token {
+        let index = self.current;
         if !self.check(&TokenKind::Eof) {
             self.current += 1;
         }
-        self.previous()
+        // EOF is a real token. Returning previous() here reuses the last
+        // identifier/string and can point incomplete-syntax errors backwards.
+        &self.tokens[index]
     }
 
     fn peek(&self) -> &Token {
@@ -1756,6 +1793,25 @@ impl Parser {
 
     fn leave_parse_depth(&mut self) {
         self.parse_depth = self.parse_depth.saturating_sub(1);
+    }
+
+    // Count executable body owners, not braces, leaves, or top-level functions.
+    // Keep this independent of expression/type depth and in step with Checker.
+    fn with_statement_depth<T>(
+        &mut self,
+        span: Span,
+        parse: impl FnOnce(&mut Self) -> KuResult<T>,
+    ) -> KuResult<T> {
+        if self.statement_depth >= MAX_STATEMENT_DEPTH {
+            return Err(KuError::parse(
+                "maximum parse depth exceeded; statement body is too deeply nested",
+                span,
+            ));
+        }
+        self.statement_depth += 1;
+        let result = parse(self);
+        self.statement_depth -= 1;
+        result
     }
 
     fn with_type_parse_depth<T>(

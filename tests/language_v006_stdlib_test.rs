@@ -192,6 +192,42 @@ fn std_string_byte_len_rejects_wrong_types_and_arity() {
 }
 
 #[test]
+fn std_json_encode_decode_example_and_numeric_limits() {
+    let example = include_str!("../examples/json.ku");
+    check_source("json.ku", example).expect("JSON encode/decode example should check");
+    run_source("json.ku", example).expect("JSON encode/decode example should run");
+    let source = r#"
+fn ExpectReject(text: str): null! {
+    rejected = false
+    try {
+        json.decode(text)?
+    } catch (error) {
+        rejected = error.domain == "json" && error.code == "parse_error"
+    }
+    if (!rejected) { panic("out-of-range integer was accepted") }
+    return ok(null)
+}
+fn main(): null! {
+    maximum = json.decode("9223372036854775807")?
+    minimum = json.decode("-9223372036854775808")?
+    if (json.encode(maximum)? != "9223372036854775807" || json.encode(minimum)? != "-9223372036854775808") {
+        panic("JSON integer boundary changed during encoding")
+    }
+    if (maximum.as_int()? != 9223372036854775807 || minimum.as_int()? != -9223372036854775807 - 1) {
+        panic("JSON integer boundary lost precision")
+    }
+    duplicate = json.decode("{\"value\":1,\"value\":2}")?
+    if (duplicate["value"]?.as_int()? + 1 != 3) { panic("duplicate key did not keep the last value") }
+    ExpectReject("9223372036854775808")?
+    ExpectReject("-9223372036854775809")?
+    return ok(null)
+}
+"#;
+    check_source("json-boundaries.ku", source).expect("JSON alias numeric limits should check");
+    run_source("json-boundaries.ku", source).expect("JSON alias numeric limits should run");
+}
+
+#[test]
 fn std_json_try_parse_integrates_with_question_and_try_catch() {
     let source = r#"
 fn parse_value(): str! {

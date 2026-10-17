@@ -270,6 +270,7 @@ impl<'a> Generator<'a> {
                     IrTerminator::Next
                     | IrTerminator::Jump(_)
                     | IrTerminator::Safepoint { .. }
+                    | IrTerminator::SyncGuard { .. }
                     | IrTerminator::Return(None)
                     | IrTerminator::Unreachable => {}
                 }
@@ -280,7 +281,9 @@ impl<'a> Generator<'a> {
 
     fn collect_expr_strings(&mut self, expr: &IrExpr) -> KuResult<()> {
         match &expr.kind {
-            IrExprKind::Literal(value) if expr.ty == IrType::Str => {
+            IrExprKind::Literal(value) if expr.ty == IrType::Str && value != "<native-zero>" => {
+                // The exact unquoted private zero is a null transport operand,
+                // not a string literal. A user's quoted spelling still interns.
                 let bytes = decode_string_literal(value)?;
                 let next = self.strings.len();
                 self.strings
@@ -552,6 +555,30 @@ impl<'a> FunctionEmitter<'a> {
                 self.emit_print(out, &value)?;
             }
             IrInst::Expr(value) => {
+                if let IrExprKind::Call {
+                    kind: IrCallKind::Intrinsic(name),
+                    args,
+                    ..
+                } = &value.kind
+                {
+                    if name == "__ku_drop_borrow_temp" {
+                        // C-only structural cleanup can occur on the false
+                        // SyncGuard edge even for a successful LLVM program.
+                        // This prototype has no native owning ABI; preserve its
+                        // former by-value/string-pointer semantics, not a claim
+                        // of native-C cleanup or arithmetic error handling.
+                        if value.ty != IrType::Void
+                            || args.len() != 1
+                            || !matches!(args[0].kind, IrExprKind::Temp(_))
+                        {
+                            return Err(unsupported(
+                                "LLVM cleanup placeholder expects one owned temp",
+                            ));
+                        }
+                        self.generator.llvm_type(&args[0].ty)?;
+                        return Ok(false);
+                    }
+                }
                 self.emit_expr(out, value)?;
             }
             IrInst::BindOk { id, ty, result } => {
@@ -838,6 +865,19 @@ impl<'a> FunctionEmitter<'a> {
                 out.push_str(&format!(
                     "  br i1 false, label %{}, label %{}\n",
                     block_label(*timeout_block),
+                    block_label(*continue_block)
+                ));
+            }
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => {
+                // Structural placeholder only: the LLVM text prototype has no
+                // synchronous signal mailbox or checked-C arithmetic guarantee.
+                // Retain both CFG edges for predecessor/phi consistency.
+                out.push_str(&format!(
+                    "  br i1 false, label %{}, label %{}\n",
+                    block_label(*cleanup_block),
                     block_label(*continue_block)
                 ));
             }
@@ -1319,6 +1359,13 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
             } => {
                 targets.push(*continue_block);
                 targets.push(*timeout_block);
+            }
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => {
+                targets.push(*continue_block);
+                targets.push(*cleanup_block);
             }
             IrTerminator::JumpErr { target, .. } => targets.push(*target),
             IrTerminator::Next

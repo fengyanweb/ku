@@ -182,6 +182,12 @@ impl RegistryServer {
             artifact_verifications: Arc::new(ArtifactVerificationCache::new(
                 MAX_ARTIFACT_VERIFICATION_CACHE_ENTRIES,
             )),
+            #[cfg(test)]
+            connection_evidence: Mutex::new(TestConnectionEvidence::new()),
+            #[cfg(test)]
+            connection_evidence_ready: Condvar::new(),
+            #[cfg(test)]
+            publish_body_gate: Mutex::new(None),
             _instance_lock: instance_lock,
         });
         audit_registry_storage(&state)?;
@@ -256,9 +262,18 @@ impl RegistryServer {
                     continue;
                 }
                 if Instant::now() >= queued.deadline {
+                    record_connection_failure(
+                        &state,
+                        ConnectionPhase::QueueDeadline,
+                        queued.accepted_at,
+                        queued.deadline,
+                        None,
+                        None,
+                        ConnectionWorkTiming::default(),
+                    );
                     continue;
                 }
-                handle_connection(queued.stream, &state, queued.deadline);
+                handle_connection(queued.stream, &state, queued.accepted_at, queued.deadline);
             }));
         }
 
@@ -273,9 +288,11 @@ impl RegistryServer {
                         drop(stream);
                         continue;
                     }
+                    let accepted_at = Instant::now();
                     match sender.try_send(QueuedConnection {
                         stream,
-                        deadline: Instant::now() + self.state.request_timeout,
+                        accepted_at,
+                        deadline: accepted_at + self.state.request_timeout,
                     }) {
                         Ok(()) => {}
                         Err(TrySendError::Full(queued)) => drop(queued),
@@ -324,6 +341,12 @@ struct RegistryState {
     request_timeout: Duration,
     mutation_admission: MutationAdmission,
     artifact_verifications: Arc<ArtifactVerificationCache>,
+    #[cfg(test)]
+    connection_evidence: Mutex<TestConnectionEvidence>,
+    #[cfg(test)]
+    connection_evidence_ready: Condvar,
+    #[cfg(test)]
+    publish_body_gate: Mutex<Option<TestPublishBodyGate>>,
     _instance_lock: RegistryInstanceLock,
 }
 
@@ -391,6 +414,7 @@ impl ArtifactVerificationCache {
 
 struct QueuedConnection {
     stream: TcpStream,
+    accepted_at: Instant,
     deadline: Instant,
 }
 
@@ -687,11 +711,139 @@ impl HttpResponse {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionPhase {
+    QueueDeadline,
+    TlsOrFirstHead,
+    RequestHead,
+    Dispatch,
+    ResponseWrite,
+    CloseFlush,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionEvidence {
+    phase: ConnectionPhase,
+    io_kind: Option<io::ErrorKind>,
+    elapsed_ms: u128,
+    deadline_expired: bool,
+    status: Option<u16>,
+    dispatch_elapsed_ms: Option<u128>,
+    response_write_elapsed_ms: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectionWorkTiming {
+    dispatch_elapsed_ms: Option<u128>,
+    response_write_elapsed_ms: Option<u128>,
+}
+
+#[cfg(test)]
+const MAX_TEST_CONNECTION_EVIDENCE: usize = 16;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestConnectionEvidence {
+    entries: [Option<ConnectionEvidence>; MAX_TEST_CONNECTION_EVIDENCE],
+    len: usize,
+    overflow: usize,
+}
+
+#[cfg(test)]
+impl TestConnectionEvidence {
+    fn new() -> Self {
+        Self {
+            entries: [None; MAX_TEST_CONNECTION_EVIDENCE],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    fn push(&mut self, evidence: ConnectionEvidence) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(evidence);
+            self.len += 1;
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestPublishBodyGate {
+    entered: mpsc::SyncSender<Instant>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl TestPublishBodyGate {
+    fn wait(self, deadline: Instant) {
+        let _ = self.entered.try_send(deadline);
+        // One-shot fixture only. Wait against the existing request D, without
+        // changing the socket deadline or assigning a new cleanup budget.
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.release.recv_timeout(remaining) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+fn record_connection_failure(
+    state: &RegistryState,
+    phase: ConnectionPhase,
+    accepted_at: Instant,
+    deadline: Instant,
+    io_kind: Option<io::ErrorKind>,
+    status: Option<u16>,
+    work_timing: ConnectionWorkTiming,
+) {
+    let now = Instant::now();
+    let evidence = ConnectionEvidence {
+        phase,
+        io_kind,
+        elapsed_ms: now.saturating_duration_since(accepted_at).as_millis(),
+        deadline_expired: now >= deadline,
+        status,
+        dispatch_elapsed_ms: work_timing.dispatch_elapsed_ms,
+        response_write_elapsed_ms: work_timing.response_write_elapsed_ms,
+    };
+    // All fields are static classifications or numbers. Do not add a request
+    // path, credentials, body, underlying error string, or filesystem path.
+    eprintln!(
+        "ku-registry connection_failure phase={:?} io_kind={:?} elapsed_ms={} deadline_expired={} status={:?} dispatch_elapsed_ms={:?} response_write_elapsed_ms={:?}",
+        evidence.phase,
+        evidence.io_kind,
+        evidence.elapsed_ms,
+        evidence.deadline_expired,
+        evidence.status,
+        evidence.dispatch_elapsed_ms,
+        evidence.response_write_elapsed_ms,
+    );
+    #[cfg(test)]
+    {
+        let mut recorded = state
+            .connection_evidence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        recorded.push(evidence);
+        state.connection_evidence_ready.notify_all();
+    }
+    #[cfg(not(test))]
+    let _ = state;
+}
+
 #[derive(Debug)]
 struct RequestFailure {
     status: u16,
     public_message: &'static str,
     internal: Option<String>,
+    io_kind: Option<io::ErrorKind>,
 }
 
 impl RequestFailure {
@@ -700,6 +852,7 @@ impl RequestFailure {
             status,
             public_message,
             internal: None,
+            io_kind: None,
         }
     }
 
@@ -708,7 +861,13 @@ impl RequestFailure {
             status: 500,
             public_message: "internal registry error\n",
             internal: Some(message.into()),
+            io_kind: None,
         }
+    }
+
+    fn with_io_kind(mut self, kind: io::ErrorKind) -> Self {
+        self.io_kind = Some(kind);
+        self
     }
 
     fn response(&self) -> HttpResponse {
@@ -716,7 +875,12 @@ impl RequestFailure {
     }
 }
 
-fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant) {
+fn handle_connection(
+    stream: TcpStream,
+    state: &RegistryState,
+    accepted_at: Instant,
+    deadline: Instant,
+) {
     let connection = match ServerConnection::new(Arc::clone(&state.tls)) {
         Ok(connection) => connection,
         Err(_) => return,
@@ -724,8 +888,24 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
     let stream = DeadlineTcpStream::new(stream, deadline);
     let tls = StreamOwned::new(connection, stream);
     let mut reader = BufReader::with_capacity(REGISTRY_TLS_INPUT_BUFFER_BYTES, tls);
+    let mut quiet_idle_close = false;
+    // A segment stays None until it runs; Some(0) means it ran in under 1ms.
+    let mut work_timing = ConnectionWorkTiming::default();
     for request_number in 1..=MAX_REQUESTS_PER_CONNECTION {
         if Instant::now() >= deadline {
+            record_connection_failure(
+                state,
+                if request_number == 1 {
+                    ConnectionPhase::TlsOrFirstHead
+                } else {
+                    ConnectionPhase::RequestHead
+                },
+                accepted_at,
+                deadline,
+                None,
+                None,
+                work_timing,
+            );
             break;
         }
         if request_number > 1 {
@@ -733,7 +913,39 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
             reader.get_mut().sock.set_deadline(idle_deadline);
         }
         match reader.fill_buf() {
-            Ok([]) | Err(_) => break,
+            Ok([]) => {
+                quiet_idle_close = request_number > 1 && Instant::now() < deadline;
+                break;
+            }
+            Err(error) => {
+                quiet_idle_close = request_number > 1
+                    && Instant::now() < deadline
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    );
+                if !quiet_idle_close {
+                    record_connection_failure(
+                        state,
+                        if request_number == 1 {
+                            ConnectionPhase::TlsOrFirstHead
+                        } else {
+                            ConnectionPhase::RequestHead
+                        },
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        None,
+                        work_timing,
+                    );
+                }
+                break;
+            }
             Ok(_) => {}
         }
         let request = read_request_head(&mut reader);
@@ -742,16 +954,71 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
             Ok(request) => request,
             Err(failure) => {
                 log_request_failure(&failure);
-                let _ = write_http_response(reader.get_mut(), failure.response(), deadline, 0);
+                if failure.io_kind.is_some() || Instant::now() >= deadline {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::RequestHead,
+                        accepted_at,
+                        deadline,
+                        failure.io_kind,
+                        Some(failure.status),
+                        work_timing,
+                    );
+                }
+                let failure_response = failure.response();
+                let response_write_started = Instant::now();
+                let written = write_http_response(reader.get_mut(), failure_response, deadline, 0);
+                work_timing.response_write_elapsed_ms =
+                    Some(response_write_started.elapsed().as_millis());
+                if let Err(error) = written {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::ResponseWrite,
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        Some(failure.status),
+                        work_timing,
+                    );
+                }
                 break;
             }
         };
         let request_keep_alive = request.keep_alive;
-        let response = match dispatch_request(state, request, &mut reader, deadline) {
+        let dispatch_started = Instant::now();
+        let dispatched = dispatch_request(state, request, &mut reader, deadline);
+        work_timing.dispatch_elapsed_ms = Some(dispatch_started.elapsed().as_millis());
+        let response = match dispatched {
             Ok(response) => response,
             Err(failure) => {
                 log_request_failure(&failure);
-                let _ = write_http_response(reader.get_mut(), failure.response(), deadline, 0);
+                if failure.io_kind.is_some() || Instant::now() >= deadline {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::Dispatch,
+                        accepted_at,
+                        deadline,
+                        failure.io_kind,
+                        Some(failure.status),
+                        work_timing,
+                    );
+                }
+                let failure_response = failure.response();
+                let response_write_started = Instant::now();
+                let written = write_http_response(reader.get_mut(), failure_response, deadline, 0);
+                work_timing.response_write_elapsed_ms =
+                    Some(response_write_started.elapsed().as_millis());
+                if let Err(error) = written {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::ResponseWrite,
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        Some(failure.status),
+                        work_timing,
+                    );
+                }
                 break;
             }
         };
@@ -763,15 +1030,43 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
         } else {
             0
         };
-        if write_http_response(reader.get_mut(), response, deadline, remaining_requests).is_err()
-            || remaining_requests == 0
-        {
+        let response_status = response.status;
+        let response_write_started = Instant::now();
+        let written = write_http_response(reader.get_mut(), response, deadline, remaining_requests);
+        work_timing.response_write_elapsed_ms = Some(response_write_started.elapsed().as_millis());
+        if let Err(error) = written {
+            record_connection_failure(
+                state,
+                ConnectionPhase::ResponseWrite,
+                accepted_at,
+                deadline,
+                Some(error.kind()),
+                Some(response_status),
+                work_timing,
+            );
             break;
         }
+        if remaining_requests == 0 {
+            break;
+        }
+        // Never attribute a previous keep-alive request's work to the next attempt.
+        work_timing = ConnectionWorkTiming::default();
     }
     reader.get_mut().sock.set_deadline(deadline);
     reader.get_mut().conn.send_close_notify();
-    let _ = reader.get_mut().flush();
+    if let Err(error) = reader.get_mut().flush() {
+        if !quiet_idle_close || Instant::now() >= deadline {
+            record_connection_failure(
+                state,
+                ConnectionPhase::CloseFlush,
+                accepted_at,
+                deadline,
+                Some(error.kind()),
+                None,
+                work_timing,
+            );
+        }
+    }
 }
 
 fn log_request_failure(failure: &RequestFailure) {
@@ -1052,9 +1347,9 @@ fn read_crlf_line(
 ) -> Result<Vec<u8>, RequestFailure> {
     let mut line = Vec::with_capacity(128);
     loop {
-        let available = reader
-            .fill_buf()
-            .map_err(|_| RequestFailure::public(400, "failed to read request\n"))?;
+        let available = reader.fill_buf().map_err(|error| {
+            RequestFailure::public(400, "failed to read request\n").with_io_kind(error.kind())
+        })?;
         if available.is_empty() {
             return Err(RequestFailure::public(400, "truncated request headers\n"));
         }
@@ -1261,15 +1556,27 @@ fn publish_request(
     let mut hasher = Sha256::new();
     let mut remaining = request.content_length;
     let mut buffer = [0u8; 64 * 1024];
+    #[cfg(test)]
+    {
+        let gate = state
+            .publish_body_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.wait(deadline);
+        }
+    }
     while remaining > 0 {
         ensure_request_deadline(deadline)?;
         let read_len = remaining.min(buffer.len() as u64) as usize;
         let count = reader.read(&mut buffer[..read_len]).map_err(|err| {
-            if err.kind() == io::ErrorKind::TimedOut {
+            let failure = if err.kind() == io::ErrorKind::TimedOut {
                 RequestFailure::public(408, "request timed out\n")
             } else {
                 RequestFailure::public(400, "failed to read package body\n")
-            }
+            };
+            failure.with_io_kind(err.kind())
         })?;
         if count == 0 {
             return Err(RequestFailure::public(400, "truncated package body\n"));
@@ -1306,6 +1613,7 @@ fn publish_request(
             RequestFailure {
                 status: 400,
                 public_message: "invalid package archive\n",
+                io_kind: None,
                 internal: Some(format!(
                     "package validation rejected {package_name}@{version}: {err}"
                 )),
@@ -4198,7 +4506,7 @@ fn server_error(code: &str, message: impl Into<String>) -> KuError {
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../tests/support/native_pg_harness.rs"]
-mod native_test_harness;
+pub(crate) mod native_test_harness;
 
 #[cfg(test)]
 mod tests {
@@ -4215,6 +4523,8 @@ mod tests {
     use ureq::rustls::{ClientConfig, RootCertStore};
 
     use super::native_test_harness::{compile_harness, run_bounded, RUN_LIMITS, RUN_TIMEOUT};
+
+    mod connection_diagnostics;
 
     const TEST_HTTP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
     const MAX_TEST_HTTP_RESPONSE_HEADER_BYTES: usize = MAX_REQUEST_HEADER_BYTES;
@@ -4244,6 +4554,7 @@ mod tests {
 
     struct TestServer {
         base_url: String,
+        address: SocketAddr,
         public_key: String,
         agent: ureq::Agent,
         client_config: Arc<ClientConfig>,
@@ -4274,12 +4585,13 @@ mod tests {
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
-            let agent = test_registry_agent(Arc::clone(&client_config));
+            let agent = test_registry_agent(Arc::clone(&client_config), address, 0);
             let shutdown = Arc::new(AtomicBool::new(false));
             let thread_shutdown = Arc::clone(&shutdown);
             let thread = thread::spawn(move || server.serve_until(thread_shutdown));
             Self {
                 base_url: format!("https://localhost:{}/v1/", address.port()),
+                address,
                 public_key,
                 agent,
                 client_config,
@@ -4292,7 +4604,7 @@ mod tests {
         }
 
         fn fresh_agent(&self) -> ureq::Agent {
-            test_registry_agent(Arc::clone(&self.client_config))
+            test_registry_agent(Arc::clone(&self.client_config), self.address, 1)
         }
 
         fn stop(&mut self) {
@@ -4314,14 +4626,80 @@ mod tests {
         }
     }
 
-    fn test_registry_agent(client_config: Arc<ClientConfig>) -> ureq::Agent {
+    fn test_registry_resolver(address: SocketAddr) -> impl ureq::Resolver {
+        assert!(
+            address.is_ipv4() && address.ip().is_loopback() && address.port() != 0,
+            "registry test resolver requires a bound IPv4 loopback address"
+        );
+        let authority = format!("localhost:{}", address.port());
+        move |requested: &str| {
+            if requested != authority {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry test resolver rejected a foreign authority",
+                ));
+            }
+            // Only the socket already owned by this fixture is reachable. Do
+            // not consult system DNS or redirect other ports to this server.
+            Ok(vec![address])
+        }
+    }
+
+    fn test_registry_agent(
+        client_config: Arc<ClientConfig>,
+        address: SocketAddr,
+        idle_connections: usize,
+    ) -> ureq::Agent {
+        // Independent fixture operations cannot inherit another connection's
+        // absolute deadline. Real package operations explicitly keep one pool.
         ureq::AgentBuilder::new()
+            .max_idle_connections(idle_connections)
             .tls_config(client_config)
+            .resolver(test_registry_resolver(address))
             .timeout_connect(Duration::from_secs(2))
             .timeout(Duration::from_secs(8))
             .timeout_read(Duration::from_secs(8))
             .redirects(0)
             .build()
+    }
+
+    #[test]
+    fn registry_test_resolver_accepts_only_its_owned_authority_without_dns() {
+        use ureq::Resolver;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind resolver fixture");
+        let address = listener
+            .local_addr()
+            .expect("read resolver fixture address");
+        let resolver = test_registry_resolver(address);
+        assert_eq!(
+            resolver
+                .resolve(&format!("localhost:{}", address.port()))
+                .expect("resolve exact fixture authority without DNS"),
+            vec![address]
+        );
+        let other_port = if address.port() == u16::MAX {
+            1
+        } else {
+            address.port() + 1
+        };
+        for authority in [
+            format!("localhost:{other_port}"),
+            format!("127.0.0.1:{}", address.port()),
+            format!("[::1]:{}", address.port()),
+            format!("foreign.invalid:{}", address.port()),
+            format!("localhost:{}evil", address.port()),
+            "localhost".to_string(),
+            "localhost:0".to_string(),
+        ] {
+            assert_eq!(
+                resolver
+                    .resolve(&authority)
+                    .expect_err("foreign authorities must not resolve or fall back to DNS")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
     }
 
     // Production registry operations create their own HTTP agent. Keep the TLS
@@ -5138,6 +5516,7 @@ mod tests {
         response_status(
             agent
                 .put(&url)
+                .set("Connection", "close")
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Content-Type", PACKAGE_CONTENT_TYPE)
                 .set("Content-Length", &artifact.size.to_string())
@@ -5162,6 +5541,7 @@ mod tests {
         let url = format!("{base_url}packages/{name}/{version}/yank");
         let mut request = agent
             .put(&url)
+            .set("Connection", "close")
             .set("Authorization", &format!("Bearer {token}"));
         if let Some(idempotency_key) = idempotency_key {
             request = request.set("Idempotency-Key", idempotency_key);
@@ -6438,6 +6818,7 @@ mod tests {
         fs::remove_dir(&lock_path).expect("remove the exact invalid lock fixture");
 
         for expected in [201, 200] {
+            let accepted_before = server.accepted_connections.load(Ordering::Acquire);
             assert_eq!(
                 put_artifact(
                     &server.agent,
@@ -6447,6 +6828,11 @@ mod tests {
                     &artifact.checksum
                 ),
                 expected
+            );
+            assert_eq!(
+                server.accepted_connections.load(Ordering::Acquire),
+                accepted_before + 1,
+                "independent mutation attempts must not share a connection deadline"
             );
             wait_for_mutation_names(&server, &[]);
             assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
@@ -6607,7 +6993,12 @@ mod tests {
         let artifact = pack_package(&math).expect("pack first yank test version");
         let next_artifact = pack_package(&math_next).expect("pack second yank test version");
         with_fresh_registry_http_agent(&server, || publish_package(&math, "token-math"))
-            .expect("publish first yank test version");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "publish first yank test version: {error:?}; accepted_connections={}",
+                    server.accepted_connections.load(Ordering::Relaxed)
+                )
+            });
         with_fresh_registry_http_agent(&server, || publish_package(&math_next, "token-math"))
             .expect("publish second yank test version");
 
@@ -7812,9 +8203,8 @@ mod tests {
             201
         );
 
-        // The seed publish uses the same persistent protocol as real clients. Let its
-        // one-second idle lease expire so it cannot consume a load-gate worker.
-        thread::sleep(KEEP_ALIVE_IDLE_TIMEOUT + Duration::from_millis(50));
+        // The independent seed publish closes its TLS connection. The raw
+        // clients below retain the real bounded keep-alive protocol.
         let accepted_before_load = server.accepted_connections.load(Ordering::Acquire);
         let load_started = Instant::now();
         let total_deadline = load_started + TOTAL_GATE_TIMEOUT;
@@ -7937,12 +8327,27 @@ mod tests {
             Duration::from_millis(300),
         );
         let mut server = TestServer::start(files.config, files.certificate);
+        let state = server.state.upgrade().expect("live stalled TLS server");
         let stream = TcpStream::connect(registry_test_address(&server.base_url))
             .expect("open stalled TLS socket");
+        wait_for_registry_accepts(
+            &server.accepted_connections,
+            1,
+            Instant::now() + TEST_HTTP_RESPONSE_TIMEOUT,
+        );
         thread::sleep(Duration::from_millis(500));
         let _ = stream.shutdown(Shutdown::Both);
         let started = Instant::now();
         server.stop();
         assert!(started.elapsed() < Duration::from_secs(2));
+        let recorded = state.connection_evidence.lock().unwrap();
+        assert_eq!(recorded.overflow, 0);
+        let handshake = recorded.entries[0].expect("stalled TLS deadline evidence");
+        assert_eq!(handshake.phase, ConnectionPhase::TlsOrFirstHead);
+        assert!(handshake.deadline_expired);
+        for event in recorded.entries[..recorded.len].iter().flatten() {
+            assert_eq!(event.dispatch_elapsed_ms, None);
+            assert_eq!(event.response_write_elapsed_ms, None);
+        }
     }
 }

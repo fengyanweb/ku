@@ -2876,6 +2876,263 @@ fn main(): null! {
 }
 
 #[test]
+fn http_handler_lexical_capture_replay_rejects_shadowed_outer_copy_writes() {
+    for (label, declaration, call) in [
+        (
+            "lambda",
+            "mutate = () => { count = count + 1; return null }",
+            "mutate()",
+        ),
+        (
+            "named",
+            "fn mutate(): null { count += 1; return null }",
+            "mutate()",
+        ),
+        (
+            "alias",
+            "mutate = () => { count += 1; return null }\n    alias = mutate.clone()",
+            "alias()",
+        ),
+    ] {
+        let source = format!(
+            r#"
+import "std.http"
+fn main(): null! {{
+    count = 0
+    {declaration}
+    app = http.service()
+    app.get("/", fn() {{
+        count: int = 0
+        {call}
+        return http.text("ok")
+    }})
+    return ok(null)
+}}
+"#
+        );
+        rejects(
+            &format!("http-lexical-shadow-{label}.ku"),
+            &source,
+            "http handler cannot modify captured variable 'count'",
+        );
+    }
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_allows_handler_local_writes() {
+    checks(
+        "http-lexical-handler-local.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 10
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        mutate = () => { count += 1; return count }
+        if (mutate() == 1) { return http.text("local") }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_preserves_read_types_and_scope_cleanup() {
+    checks(
+        "http-lexical-read-types.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        first = read_count()
+        second = read_count()
+        if (first + second == 14) { return http.text(count.clone()) }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+    // Replaying/popping a read-only helper must not hide a later real write.
+    rejects(
+        "http-lexical-replay-followed-by-write.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        println(read_count())
+        mutate()
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+        "http handler cannot modify captured variable 'count'",
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_does_not_capture_owned_local_homonym() {
+    checks(
+        "http-lexical-local-owner.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        println(read_count())
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_top_level_parameters_do_not_capture_owned_caller_homonyms() {
+    for (label, body) in [
+        ("read", "return count"),
+        ("expression", "return count + 1"),
+        ("nested", "read = () => { return count }; return read()"),
+    ] {
+        checks(
+            &format!("http-top-parameter-{label}.ku"),
+            &format!(
+                r#"
+import "std.http"
+fn Echo(count: int): int {{ {body} }}
+fn main(): null! {{
+    app = http.service()
+    app.get("/", fn() {{
+        count: str = "local"
+        println(Echo(7))
+        println(Echo(8))
+        return http.text(count)
+    }})
+    return ok(null)
+}}
+"#
+            ),
+        );
+    }
+    checks(
+        "http-top-parameter-alias.ku",
+        r#"
+import "std.http"
+fn Echo(count: int): int { return count }
+fn main(): null! {
+    alias = Echo
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        println(alias(7))
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_top_level_parameter_exclusion_keeps_real_capture_and_move_errors() {
+    rejects(
+        "http-top-parameter-real-capture.ku",
+        r#"
+import "std.http"
+fn Echo(count: int): int { return count }
+fn main(): null! {
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        read = () => { return count.clone() }
+        println(Echo(7))
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "captured",
+    );
+    rejects(
+        "http-top-parameter-consumed.ku",
+        r#"
+import "std.http"
+fn Consume(count: str): null { return null }
+fn main(): null! {
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        Consume(count)
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "http-top-parameter-callback-write.ku",
+        r#"
+import "std.http"
+fn Invoke(count: int, op: fn(): null): null { op(); return null }
+fn main(): null! {
+    count = 0
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        Invoke(7, mutate.clone())
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "http handler cannot modify captured variable 'count'",
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_preserves_recursive_body_guard() {
+    checks(
+        "http-lexical-recursive-read.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    fn down(value: int): int {
+        if (value <= 0) { return count }
+        return down(value - 1)
+    }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        if (down(2) == 7) { return http.text(count.clone()) }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
 fn http_handler_allows_readonly_captured_function_value() {
     checks(
         "http-handler-readonly-helper.ku",
@@ -3069,6 +3326,93 @@ fn ordinary_names_are_unaffected_by_the_reserved_prefix() {
     );
 }
 
+#[test]
+fn while_condition_nested_nonreturning_body_consumes_owned_condition_once() {
+    checks(
+        "while-result-before-nonreturning-inner.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { while (true) {} }
+    return ok(null)
+}
+"#,
+    );
+    checks(
+        "while-task-before-nonreturning-inner.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { while (true) {} }
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn while_condition_inner_own_break_still_returns_to_the_outer_condition() {
+    rejects(
+        "while-result-inner-break-is-a-real-backedge.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { while (true) { break } }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-task-inner-break-is-a-real-backedge.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { while (true) { break } }
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
+#[test]
+fn while_condition_prior_outer_continue_survives_a_nonreturning_sibling_path() {
+    rejects(
+        "while-result-continue-before-nonreturning-inner.ku",
+        r#"
+fn main(): null! {
+    flag = true
+    result = ok(true)
+    while (result?) {
+        if (flag) { continue }
+        while (true) {}
+    }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-task-continue-before-nonreturning-inner.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    flag = true
+    pending = Flag()
+    while ((await pending)?) {
+        if (flag) { continue }
+        while (true) {}
+    }
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
 // ---- runtime parity: a partial move actually runs -----------------------------
 
 #[test]
@@ -3084,4 +3428,224 @@ fn main() {
 "#;
     checks("partial-run.ku", source);
     run_source("partial-run.ku", source).expect("partial move should run");
+}
+
+#[test]
+fn while_condition_owned_consumption_reaches_the_next_condition() {
+    rejects(
+        "while-condition-result-repeat.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) {}
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-condition-task-repeat.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) {}
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
+#[test]
+fn while_condition_one_consumption_without_a_backedge_is_allowed() {
+    for body in ["break", "return ok(null)"] {
+        checks(
+            "while-condition-result-once.ku",
+            &format!(
+                "fn main(): null! {{ result = ok(true)\n\
+                 while (result?) {{ {body} }}\n\
+                 return ok(null) }}"
+            ),
+        );
+        checks(
+            "while-condition-task-once.ku",
+            &format!(
+                "async fn Flag(): bool! {{ return ok(true) }}\n\
+                 async fn main(): null! {{ pending = Flag()\n\
+                 while ((await pending)?) {{ {body} }}\n\
+                 return ok(null) }}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn while_condition_reinitialization_must_update_the_original_binding() {
+    checks(
+        "while-condition-result-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result = ok(false) }
+    return ok(null)
+}
+"#,
+    );
+    checks(
+        "while-condition-task-reinit.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { pending = Flag() }
+    return ok(null)
+}
+"#,
+    );
+    rejects(
+        "while-condition-result-shadow-not-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result: bool! = ok(false) }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_continue_join_excludes_non_backedge_body_states() {
+    for terminal in ["break", "return ok(null)"] {
+        checks(
+            "while-condition-restored-continue-or-terminal.ku",
+            &format!(
+                "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                 while (result?) {{\n\
+                   if (flag) {{ result = ok(false)\ncontinue }}\n\
+                   else {{ {terminal} }}\n\
+                 }}\nreturn ok(null) }}\n\
+                 fn main(): null! {{ return Test(true) }}"
+            ),
+        );
+    }
+    rejects(
+        "while-condition-continue-before-reinit.ku",
+        r#"
+fn Test(flag: bool): null! {
+    result = ok(true)
+    while (result?) {
+        if (flag) { continue }
+        result = ok(false)
+    }
+    return ok(null)
+}
+fn main(): null! { return Test(true) }
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_false_exit_does_not_inherit_the_body_reinitialization() {
+    rejects(
+        "while-condition-false-edge-consumed.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result = ok(false) }
+    again = result?
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_short_circuit_keeps_conservative_consumption_contract() {
+    for operator in ["&&", "||"] {
+        rejects(
+            "while-short-circuit-condition-repeat.ku",
+            &format!(
+                "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                 while (flag {operator} result?) {{ continue }}\n\
+                 return ok(null) }}\n\
+                 fn main(): null! {{ return Test(true) }}"
+            ),
+            "moved",
+        );
+        for body in ["break", "result = ok(false)\ncontinue"] {
+            checks(
+                "while-short-circuit-condition-once-or-restored.ku",
+                &format!(
+                    "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                     while (flag {operator} result?) {{ {body} }}\n\
+                     return ok(null) }}\n\
+                     fn main(): null! {{ return Test(true) }}"
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn while_condition_closure_effects_participate_in_the_loop_fixedpoint() {
+    rejects(
+        "while-condition-closure-provenance-chain.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    a: fn(): null = Noop
+    b: fn(): null = Noop
+    c: fn(): null = Noop
+    d: fn(): null = Noop
+    fn Shift(): bool {
+        a = b.clone()
+        b = c.clone()
+        c = d.clone()
+        return true
+    }
+    while (Shift()) {
+        d = () => { a()  return null }
+    }
+}
+"#,
+        "E0904 cannot create closure reference cycle",
+    );
+}
+
+#[test]
+fn while_condition_throw_is_captured_before_body_reinitialization() {
+    rejects(
+        "while-condition-throw-consumed-before-body.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    try {
+        while (result?) { result = ok(false) }
+    } catch (error) {
+        again = result?
+    }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    checks(
+        "while-condition-catch-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    try {
+        while (result?) { result = ok(false) }
+    } catch (error) {
+        result = ok(false)
+    }
+    return ok(null)
+}
+"#,
+    );
 }

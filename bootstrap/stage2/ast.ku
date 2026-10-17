@@ -81,6 +81,9 @@ fn ValidateParseOutput(output: ParseOutput): ParseOutput! {
         // Materialize one bounded node, rather than repeatedly projecting
         // through the owned graph for every scalar field in the interpreter.
         node = nodes[node_index].clone()
+        if (node.kind == "Parameter" && node.int_value != 0 && node.int_value != 1) {
+            rejectParseOutput("invalid_parameter_mode", "bootstrap parameter mode must be owned (0) or borrowed (1)")?
+        }
         node_line = node.line
         node_column = node.column
         node_offset = node.offset
@@ -150,15 +153,20 @@ fn ValidateParseOutput(output: ParseOutput): ParseOutput! {
 
 fn AstCanonical(output: ParseOutput): str {
     text = "ROOT|" + str(output.root)
+    // Flatten owned projections once, as in ValidateParseOutput. Otherwise
+    // each nested index clones the complete arena in the interpreter.
+    arena = output.arena
+    nodes = arena.nodes
+    edges = arena.edges
     index = 0
-    while (index < output.arena.nodes.len()) {
-        node = output.arena.nodes[index].clone()
+    while (index < nodes.len()) {
+        node = nodes[index].clone()
         text += "\nNODE|" + str(index + 1) + "|" + node.kind + "|" + EscapeCanonical(node.text) + "|" + str(node.int_value) + "|" + str(node.line) + ":" + str(node.column) + "@" + str(node.offset) + ".." + str(node.end_line) + ":" + str(node.end_column) + "@" + str(node.end_offset) + "|" + str(node.first_edge) + "|" + str(node.edge_count)
         index = index + 1
     }
     index = 0
-    while (index < output.arena.edges.len()) {
-        text += "\nEDGE|" + str(index) + "|" + str(output.arena.edges[index])
+    while (index < edges.len()) {
+        text += "\nEDGE|" + str(index) + "|" + str(edges[index])
         index = index + 1
     }
     return text

@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, stdRootModules, types } from "./completionModel";
 import { execFileExitCode, firstWorkingExecutable } from "./executableModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
+import { MAX_DIAGNOSTIC_SOURCE_BYTES, MAX_DIAGNOSTIC_SOURCE_FILES, readDiagnosticSource, scalarColumnToUtf16, sourceLine } from "./diagnosticModel";
 
 const KU_VERSION = "0.0.17";
 const KU_MODE: vscode.DocumentSelector = [{ language: "ku", scheme: "file" }];
@@ -14,8 +15,12 @@ let status: vscode.StatusBarItem;
 const checkTimers = new Map<string, NodeJS.Timeout>();
 const checkGenerations = new Map<string, number>();
 const diagnosticUrisByRoot = new Map<string, vscode.Uri[]>();
+let diagnosticSession = 0;
+let diagnosticsEnabled = false;
 
 export function activate(context: vscode.ExtensionContext) {
+  diagnosticSession++;
+  diagnosticsEnabled = true;
   context.subscriptions.push(diagnosticCollection, output);
 
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
@@ -75,6 +80,10 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  diagnosticsEnabled = false;
+  diagnosticSession++;
+  for (const timer of checkTimers.values()) clearTimeout(timer);
+  checkTimers.clear();
   diagnosticCollection.clear();
 }
 
@@ -120,23 +129,35 @@ async function checkActiveFile(reveal: boolean) {
 }
 
 async function runCheck(document: vscode.TextDocument, reveal: boolean) {
+  if (!diagnosticsEnabled) return;
   const rootKey = document.uri.toString();
+  const documentVersion = document.version;
+  const session = diagnosticSession;
   const generation = (checkGenerations.get(rootKey) ?? 0) + 1;
   checkGenerations.set(rootKey, generation);
+  const current = () => diagnosticsEnabled && diagnosticSession === session
+    && document.version === documentVersion && checkGenerations.get(rootKey) === generation;
   const exe = await findKuExecutable(document.uri);
+  if (!current()) return;
   if (!exe) {
     setStatus("Ku: missing", true);
     return;
   }
   let result = await execFile(exe, ["check", "--json", document.uri.fsPath], workspaceFolder(document.uri));
+  if (!current()) return;
   let diagnostics = parseJsonDiagnosticEntries(result.stdout + result.stderr, document);
   let command = `${exe} check --json ${document.uri.fsPath}`;
   if (result.code !== 0 && diagnostics === undefined) {
     result = await execFile(exe, ["check", document.uri.fsPath], workspaceFolder(document.uri));
+    if (!current()) return;
     diagnostics = parseTextDiagnosticEntries(result.stdout + result.stderr, document);
     command = `${exe} check ${document.uri.fsPath}`;
   }
-  if (checkGenerations.get(rootKey) !== generation) {
+  if (!current()) return;
+  const sources = await loadDiagnosticSources(diagnostics ?? [], document);
+  diagnostics = parseJsonDiagnosticEntries(result.stdout + result.stderr, document, sources)
+    ?? parseTextDiagnosticEntries(result.stdout + result.stderr, document, sources);
+  if (!current()) {
     return;
   }
   output.clear();
@@ -163,8 +184,10 @@ interface JsonDiagnostic {
   helps: string[];
 }
 
-export function parseDiagnostics(text: string, document: vscode.TextDocument): vscode.Diagnostic[] {
-  return (parseJsonDiagnosticEntries(text, document) ?? parseTextDiagnosticEntries(text, document))
+type DiagnosticSources = ReadonlyMap<string, string | undefined>;
+
+export function parseDiagnostics(text: string, document: vscode.TextDocument, sources?: DiagnosticSources): vscode.Diagnostic[] {
+  return (parseJsonDiagnosticEntries(text, document, sources) ?? parseTextDiagnosticEntries(text, document, sources))
     .map((entry) => entry.diagnostic);
 }
 
@@ -173,7 +196,7 @@ interface DiagnosticEntry {
   diagnostic: vscode.Diagnostic;
 }
 
-function parseJsonDiagnosticEntries(text: string, document: vscode.TextDocument): DiagnosticEntry[] | undefined {
+function parseJsonDiagnosticEntries(text: string, document: vscode.TextDocument, sources?: DiagnosticSources): DiagnosticEntry[] | undefined {
   const records: JsonDiagnostic[] = [];
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) {
@@ -206,33 +229,91 @@ function parseJsonDiagnosticEntries(text: string, document: vscode.TextDocument)
     return undefined;
   }
   return records.map((record) => {
+    const uri = diagnosticUri(record.file, document);
     const startLine = Math.max(0, record.line - 1);
-    const startColumn = Math.max(0, record.column - 1);
     const endLine = Math.max(startLine, record.endLine - 1);
-    const endColumn = endLine === startLine
-      ? Math.max(startColumn + 1, record.endColumn - 1)
-      : Math.max(0, record.endColumn - 1);
+    const startSource = diagnosticLine(uri, document, record.line, sources);
+    const endSource = diagnosticLine(uri, document, endLine + 1, sources);
+    const startColumn = startSource === undefined ? 0 : scalarColumnToUtf16(startSource, record.column);
+    const endColumn = endSource === undefined ? 0 : scalarColumnToUtf16(endSource, record.endColumn);
     const details = [
       ...record.notes.map((note) => `note: ${note}`),
       ...record.helps.map((help) => `help: ${help}`),
     ];
+    if (startSource === undefined || endSource === undefined) details.push("note: source unavailable; diagnostic column could not be mapped to UTF-16");
     const message = details.length > 0 ? `${record.message}\n${details.join("\n")}` : record.message;
     const diagnostic = new vscode.Diagnostic(
-      new vscode.Range(startLine, startColumn, endLine, endColumn),
+      new vscode.Range(startLine, startColumn, endLine, endLine === startLine ? Math.max(startColumn, endColumn) : endColumn),
       message,
       diagnosticSeverity(record.level),
     );
     diagnostic.source = "ku check";
     diagnostic.code = record.code;
     return {
-      uri: diagnosticUri(record.file, document),
+      uri,
       diagnostic,
     };
   });
 }
 
 function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function diagnosticSourceKey(file: string): string {
+  const absolute = path.resolve(file);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+function openDiagnosticSource(document: vscode.TextDocument): string | undefined {
+  try {
+    if (typeof document.positionAt === "function" && typeof document.offsetAt === "function"
+      && document.offsetAt(document.positionAt(MAX_DIAGNOSTIC_SOURCE_BYTES + 1)) > MAX_DIAGNOSTIC_SOURCE_BYTES) return undefined;
+    const text = document.getText();
+    return Buffer.byteLength(text, "utf8") <= MAX_DIAGNOSTIC_SOURCE_BYTES ? text : undefined;
+  } catch { return undefined; }
+}
+
+function diagnosticLine(uri: vscode.Uri, document: vscode.TextDocument, line: number, sources?: DiagnosticSources): string | undefined {
+  const key = diagnosticSourceKey(uri.fsPath);
+  if (sources?.has(key)) {
+    const source = sources.get(key);
+    return source === undefined ? undefined : sourceLine(source, line);
+  }
+  if (key === diagnosticSourceKey(document.uri.fsPath) && typeof document.getText === "function") {
+    if (typeof document.lineAt === "function") {
+      try {
+        const text = document.lineAt(line - 1).text;
+        return text.length <= MAX_DIAGNOSTIC_SOURCE_BYTES ? text : undefined;
+      } catch { return undefined; }
+    }
+    const source = openDiagnosticSource(document);
+    if (source !== undefined) return sourceLine(source, line);
+  }
+  return undefined;
+}
+
+export async function loadDiagnosticSources(entries: DiagnosticEntry[], document: vscode.TextDocument): Promise<Map<string, string | undefined>> {
+  const sources = new Map<string, string | undefined>();
+  const files = new Map<string, string>();
+  for (const entry of entries) {
+    const key = diagnosticSourceKey(entry.uri.fsPath);
+    if (!files.has(key) && files.size < MAX_DIAGNOSTIC_SOURCE_FILES) files.set(key, entry.uri.fsPath);
+  }
+  const pending: Array<[string, string]> = [];
+  for (const [key, file] of files) {
+    const opened = [document, ...(vscode.workspace.textDocuments ?? [])].find(
+      (candidate) => !candidate.isDirty && diagnosticSourceKey(candidate.uri.fsPath) === key);
+    const text = opened ? openDiagnosticSource(opened) : undefined;
+    if (text !== undefined) sources.set(key, text);
+    else pending.push([key, file]);
+  }
+  for (let offset = 0; offset < pending.length; offset += 4) {
+    await Promise.all(pending.slice(offset, offset + 4).map(async ([key, file]) => {
+      sources.set(key, await readDiagnosticSource(file));
+    }));
+  }
+  return sources;
 }
 
 function diagnosticSeverity(level: string): vscode.DiagnosticSeverity {
@@ -248,7 +329,7 @@ function diagnosticSeverity(level: string): vscode.DiagnosticSeverity {
   }
 }
 
-function parseTextDiagnosticEntries(text: string, document: vscode.TextDocument): DiagnosticEntry[] {
+function parseTextDiagnosticEntries(text: string, document: vscode.TextDocument, sources?: DiagnosticSources): DiagnosticEntry[] {
   const diagnostics: DiagnosticEntry[] = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
@@ -257,22 +338,29 @@ function parseTextDiagnosticEntries(text: string, document: vscode.TextDocument)
       continue;
     }
     const message = cleanupMessage(lines.slice(0, i).reverse().find((line) => line.trim()) ?? "Ku check failed");
-    const line = Math.max(0, Number(location[2]) - 1);
-    const col = Math.max(0, Number(location[3]) - 1);
-    let endCol = col + 1;
+    const sourceLineNumber = Number(location[2]);
+    const sourceColumn = Number(location[3]);
+    if (!isPositiveInteger(sourceLineNumber) || !isPositiveInteger(sourceColumn)) continue;
+    const line = sourceLineNumber - 1;
+    const uri = diagnosticUri(location[1], document);
+    const source = diagnosticLine(uri, document, sourceLineNumber, sources);
+    const col = source === undefined ? 0 : scalarColumnToUtf16(source, sourceColumn);
+    let width = 1;
     const marker = lines.slice(i + 1, i + 5).find((lineText) => lineText.includes("^"));
     if (marker) {
       const first = marker.indexOf("^");
       const last = marker.lastIndexOf("^");
       if (first >= 0 && last >= first) {
-        endCol = col + Math.max(1, last - first + 1);
+        width = Math.max(1, last - first + 1);
       }
     }
+    const endCol = source === undefined ? 0 : scalarColumnToUtf16(source, sourceColumn + width);
     const range = new vscode.Range(line, col, line, endCol);
-    const diagnostic = new vscode.Diagnostic(range, `${message}${hintFor(message)}`, vscode.DiagnosticSeverity.Error);
+    const fallback = source === undefined ? "\nnote: source unavailable; diagnostic column could not be mapped to UTF-16" : "";
+    const diagnostic = new vscode.Diagnostic(range, `${message}${hintFor(message)}${fallback}`, vscode.DiagnosticSeverity.Error);
     diagnostic.source = "ku check";
     diagnostics.push({
-      uri: diagnosticUri(location[1], document),
+      uri,
       diagnostic,
     });
   }

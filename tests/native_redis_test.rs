@@ -1330,3 +1330,159 @@ fn main(): null! {{
         assert_eq!(body, format!("value-{id}"));
     }
 }
+
+/// Run explicitly against a newly created, disposable Redis instance whose
+/// default user is disabled and whose named ACL user owns only its test keys.
+/// The JSON file contains exactly host, port, username and password; it is
+/// copied into the program's private directory only after native compilation.
+#[test]
+#[ignore = "explicit opt-in: KU_REDIS_TEST_CONFIG_FILE must identify a private loopback fixture"]
+fn native_redis_live_loopback_acl_and_binary_roundtrip() {
+    use ku::{span::Span, value::Value};
+
+    let Some(config_path) = env::var_os("KU_REDIS_TEST_CONFIG_FILE").map(PathBuf::from) else {
+        eprintln!(
+            "skip: set KU_REDIS_TEST_CONFIG_FILE to a disposable Redis fixture configuration"
+        );
+        return;
+    };
+    let _guard = REDIS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(config_path.is_absolute(), "fixture config must be absolute");
+    let metadata = fs::symlink_metadata(&config_path).expect("inspect Redis fixture config");
+    assert!(metadata.is_file() && metadata.len() <= 8192);
+    let mut bytes = Vec::new();
+    fs::File::open(&config_path)
+        .expect("open Redis fixture config")
+        .take(8193)
+        .read_to_end(&mut bytes)
+        .expect("read bounded Redis fixture config");
+    assert!(bytes.len() <= 8192, "Redis fixture config exceeds limit");
+    let text = String::from_utf8(bytes.clone()).expect("Redis fixture config must be UTF-8");
+    let parsed = ku::stdlib::json::eval("decode", &[Value::String(text)], Span::default())
+        .expect("decode Redis fixture config")
+        .expect("JSON decode result");
+    let Value::Result { ok: true, value } = parsed else {
+        panic!("Redis fixture config must be valid JSON");
+    };
+    let Value::Object(fields) = *value else {
+        panic!("Redis fixture config must be an object");
+    };
+    assert_eq!(
+        fields.len(),
+        4,
+        "Redis fixture config has unexpected fields"
+    );
+    assert!(matches!(fields.get("host"), Some(Value::String(host)) if host == "127.0.0.1"));
+    assert!(matches!(fields.get("port"), Some(Value::Int(port)) if (1024..=65535).contains(port)));
+    let lower_hex = |value: &str, length| {
+        value.len() == length
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let Some(Value::String(username)) = fields.get("username") else {
+        panic!("Redis fixture requires a named ACL user");
+    };
+    assert!(username
+        .strip_prefix("ku_test_")
+        .is_some_and(|suffix| lower_hex(suffix, 16)));
+    assert!(
+        matches!(fields.get("password"), Some(Value::String(password)) if lower_hex(password, 64))
+    );
+    let key_prefix = format!("ku-live-{}-", &username[8..]);
+    // Ku string literals accept a real NUL, rather than a backslash-zero escape.
+    let source = LIVE_REDIS_SOURCE
+        .replace("__KU_KEY_PREFIX__", &key_prefix)
+        .replace("__KU_NUL__", "\0");
+    let program = build_native("live-loopback", &source)
+        .expect("an explicit Redis live test requires a native C compiler");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&program.dir, fs::Permissions::from_mode(0o700))
+            .expect("restrict Redis live program directory");
+    }
+    let private_config = program.dir.join("live-config.json");
+    fs::write(&private_config, bytes).expect("write validated Redis fixture config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private_config, fs::Permissions::from_mode(0o600))
+            .expect("restrict Redis live config");
+    }
+    fs::remove_file(program.dir.join("main.ku")).expect("remove Redis live Ku source before run");
+    fs::remove_file(&program.c_source).expect("remove Redis live C source before run");
+    let output = run_with_timeout(&program.exe, RUN_TIMEOUT);
+    assert!(
+        output.status.success(),
+        "Redis live loopback program failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "redis live loopback closed loop\n"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected Redis runtime diagnostics"
+    );
+}
+
+const LIVE_REDIS_SOURCE: &str = r#"
+import redis from "std.redis"
+import fs from "std.fs"
+import json from "std.json"
+
+fn main(): null! {
+    value = json.decode(fs.read("live-config.json")?)?
+    rejected = false
+    try {
+        wrong = redis.client({
+            host: value["host"]?.as_str()?, port: value["port"]?.as_int()?,
+            username: value["username"]?.as_str()?, password: "wrong-fixture-password",
+            max_connections: 1, max_waiters: 0,
+            connect_timeout_ms: 1000, acquire_timeout_ms: 1000, command_timeout_ms: 1000
+        })?
+        wrong.ping()?
+        wrong.close()
+    } catch (error) {
+        if (error.domain != "redis" || error.code != "auth_failed") panic("wrong password error")
+        rejected = true
+    }
+    if (!rejected) panic("wrong Redis password accepted")
+    client = redis.client({
+        host: value["host"]?.as_str()?, port: value["port"]?.as_int()?,
+        username: value["username"]?.as_str()?, password: value["password"]?.as_str()?,
+        max_connections: 1, max_waiters: 0,
+        connect_timeout_ms: 1000, acquire_timeout_ms: 1000, command_timeout_ms: 1000
+    })?
+    client.ping()?
+    payload = "中文🙂__KU_NUL__\"\\\r\n尾"
+    key = "__KU_KEY_PREFIX__binary"
+    if (client.exists(key)?) panic("fixture key already exists")
+    client.set(key, payload)?
+    if (payload != "中文🙂__KU_NUL__\"\\\r\n尾") panic("set consumed its input")
+    fetched = client.get(key)?
+    if (fetched != payload || fetched.byte_len() != payload.byte_len()) panic("Redis binary roundtrip")
+    if (!client.exists(key)?) panic("stored key missing")
+    client.set("__KU_KEY_PREFIX__empty", "")?
+    if (client.get("__KU_KEY_PREFIX__empty")? != "") panic("empty string roundtrip")
+    if (client.del(key)? != 1 || client.del("__KU_KEY_PREFIX__empty")? != 1) panic("Redis delete count")
+    if (client.exists(key)? || client.del(key)? != 0) panic("deleted key still exists")
+    missing = false
+    try {
+        absent = client.get(key)?
+        println(absent)
+    } catch (error) {
+        if (error.domain != "redis" || error.code != "key_not_found") panic("missing key error")
+        missing = true
+    }
+    if (!missing) panic("missing key accepted")
+    client.ping()?
+    client.close()
+    println("redis live loopback closed loop")
+    return ok(null)
+}
+"#;

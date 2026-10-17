@@ -12,10 +12,50 @@ use std::{
 };
 
 use crate::{
-    error::{KuError, KuResult},
+    error::{KuError, KuResult, TerminationReason},
     span::Span,
     stdlib::errors,
     value::Value,
+};
+
+mod await_ticket;
+pub(crate) use await_ticket::{
+    AwaitPayloadCharge, AwaitPayloadPolicy, AwaitPoll, AwaitStringPayloadCharge,
+    AwaitStringPayloadPolicy, AwaitTicket,
+};
+#[cfg(test)]
+mod await_ticket_tests;
+mod cancel_batch;
+mod cancellation;
+pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
+mod retirement;
+pub(crate) use retirement::{RetirementBatchPoll, TaskRetirementBatch, TaskRetirementWitness};
+#[cfg(test)]
+mod blocking_retirement_tests;
+#[cfg(test)]
+mod cancel_batch_tests;
+#[cfg(test)]
+mod cleanup_panic_tests;
+#[cfg(test)]
+mod help_panic_tests;
+mod local_driver;
+#[cfg(test)]
+mod owner_cleanup_ack_tests;
+#[cfg(test)]
+mod producer_retirement_tests;
+#[cfg(test)]
+mod queue_retirement_tests;
+#[cfg(test)]
+mod retirement_tests;
+mod runner;
+pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
+#[cfg(test)]
+mod runner_tests;
+#[cfg(test)]
+mod submission_panic_tests;
+pub(crate) use cancellation::{
+    current_cleanup_context, current_execution_termination, ensure_task_operations_allowed,
+    set_execution_termination, CancellationContext, CleanupGuard, ExecutionTerminationGuard,
 };
 
 pub const MAX_TASKS: usize = 1024;
@@ -31,26 +71,300 @@ const TASK_FAILED: u8 = 4;
 const TASK_CANCELLED: u8 = 5;
 const TASK_CANCELLING: u8 = 6;
 const TASK_PANICKED: u8 = 7;
+const TASK_TIMED_OUT: u8 = 8;
+
+const SUBMISSION_PENDING: u8 = 0;
+const SUBMISSION_ACCEPTED: u8 = 1;
+const SUBMISSION_PRODUCER_RETIRED: u8 = 2;
+
+// The same atomic word linearizes producer admission with global shutdown.
+// Closing is monotonic; the remaining bits count actual admitted submission
+// stacks, independently of active task/queue/registry accounting.
+const PRODUCER_CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
+const PRODUCER_COUNT_MASK: usize = PRODUCER_CLOSED_BIT - 1;
 
 thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
     static CURRENT_TASK_STATE: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
+    // This observes owner cleanup in a delegated blocking callback only; it
+    // never supplies public Task identity or marks an uncancelled body cleanup.
+    static BLOCKING_OWNER_PARENT: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
     static AWAIT_HELP_DEPTH: Cell<usize> = const { Cell::new(0) };
+    // Released results can own other completed Tasks. Their final lease drops
+    // enqueue an existing state, instead of recursively destroying its result.
+    static OWNER_RESULT_RELEASE_HEAD: RefCell<Option<Arc<TaskState>>> = const { RefCell::new(None) };
+    // Completed nodes reuse their original inline slot until the outermost
+    // drain has really destroyed every detached descendant. No new node or
+    // backing allocation is needed to retain these acknowledgement owners.
+    static OWNER_RESULT_FINISHED_HEAD: RefCell<Option<Arc<TaskState>>> = const { RefCell::new(None) };
+    static OWNER_RESULT_FLUSH_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static OWNER_RESULT_RELEASE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 type TaskFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
+type RunnerFactory = Box<dyn FnOnce() -> Box<dyn LocalTaskRunner> + Send + 'static>;
+
+enum TaskStart {
+    Callback(TaskFn),
+    Runner {
+        factory: RunnerFactory,
+        header_bytes: usize,
+    },
+}
+
+impl<F: FnOnce() -> KuResult<Value> + Send + 'static> From<Box<F>> for TaskStart {
+    fn from(run: Box<F>) -> Self {
+        Self::Callback(run)
+    }
+}
+
+impl TaskStart {
+    fn runner_header_bytes(&self) -> usize {
+        match self {
+            Self::Callback(_) => 0,
+            Self::Runner { header_bytes, .. } => *header_bytes,
+        }
+    }
+}
 type BlockingFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
+type CleanupPanic = Box<dyn std::any::Any + Send + 'static>;
+
+struct AwaitHelpDepthGuard {
+    previous: usize,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for AwaitHelpDepthGuard {
+    fn drop(&mut self) {
+        AWAIT_HELP_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
+struct TaskWaitGuard {
+    runtime: TaskRuntime,
+    current: i64,
+    state: Option<Arc<TaskState>>,
+}
+
+impl Drop for TaskWaitGuard {
+    fn drop(&mut self) {
+        if self.current != 0 {
+            self.runtime.clear_wait(self.current);
+        }
+        if let Some(state) = &self.state {
+            if !state.is_cancelled() {
+                state.set_status(TASK_RUNNING);
+            }
+        }
+    }
+}
 
 struct TaskJob {
     id: i64,
-    run: TaskFn,
     state: Arc<TaskState>,
+}
+
+// Inspecting a cancellation prefix can encounter an unrelated live job. Keep
+// that one node in place, ahead of the channel, rather than executing or
+// re-enqueuing it. Its original queue credit remains reserved while cached.
+struct TaskQueueReceiver {
+    // Keep the retained first node ahead of channel nodes on final Drop too.
+    head: Option<TaskJob>,
+    receiver: Receiver<TaskJob>,
+}
+
+impl TaskQueueReceiver {
+    fn recv(&mut self) -> Result<TaskJob, mpsc::RecvError> {
+        match self.head.take() {
+            Some(job) => Ok(job),
+            None => self.receiver.recv(),
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<TaskJob, TryRecvError> {
+        match self.head.take() {
+            Some(job) => Ok(job),
+            None => self.receiver.try_recv(),
+        }
+    }
 }
 
 struct BlockingJob {
     run: BlockingFn,
     response: SyncSender<KuResult<Value>>,
-    cancelled: Option<Weak<TaskState>>,
+    // Actual run/response destruction precedes this final field on success,
+    // queue rejection, cancellation and native unwind. Response delivery and
+    // the public parent Task's terminal status do not retire this obligation.
+    retirement: BlockingRetirement,
+}
+
+struct BlockingRetirement {
+    // Reuse the internal parent state previously retained for cancellation;
+    // this neither creates another logical Task owner nor allocates a node.
+    state: Option<Arc<TaskState>>,
+    // Only primitive counters live here. Retaining this independent block must
+    // not keep the pool, its channels or another logical Task owner alive.
+    metrics: Arc<BlockingPoolMetrics>,
+    accepted: bool,
+}
+
+impl BlockingRetirement {
+    fn new(
+        state: Option<Arc<TaskState>>,
+        metrics: Arc<BlockingPoolMetrics>,
+        span: Span,
+    ) -> KuResult<Self> {
+        if let Some(state) = &state {
+            state
+                .pending_blocking
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_add(1)
+                })
+                .map_err(|_| {
+                    KuError::runtime("internal blocking retirement counter overflow", span)
+                })?;
+        }
+        let resident =
+            match metrics
+                .resident
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                }) {
+                Ok(previous) => previous + 1,
+                Err(_) => {
+                    if let Some(state) = &state {
+                        state.pending_blocking.fetch_sub(1, Ordering::AcqRel);
+                        state.ready.notify_all();
+                    }
+                    return Err(KuError::runtime(
+                        "internal blocking resident counter overflow",
+                        span,
+                    ));
+                }
+            };
+        metrics.peak_resident.fetch_max(resident, Ordering::Relaxed);
+        Ok(Self {
+            state,
+            metrics,
+            accepted: false,
+        })
+    }
+}
+
+impl Drop for BlockingRetirement {
+    fn drop(&mut self) {
+        // Primitive retirement only, after the actual job's earlier fields.
+        // Never enter a user destructor, scheduler help or cancellation here.
+        if self.accepted {
+            self.metrics.finished.fetch_add(1, Ordering::Relaxed);
+        }
+        // This Release publication follows completion and precedes the parent
+        // obligation's notification. A delivered response alone never does it.
+        self.metrics.resident.fetch_sub(1, Ordering::AcqRel);
+        if let Some(state) = &self.state {
+            state.pending_blocking.fetch_sub(1, Ordering::AcqRel);
+            state.ready.notify_all();
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlockingPoolMetrics {
+    resident: AtomicUsize,
+    peak_resident: AtomicUsize,
+    peak_queued: AtomicUsize,
+    peak_running: AtomicUsize,
+    accepted: AtomicUsize,
+    rejected: AtomicUsize,
+    rejected_queue: AtomicUsize,
+    finished: AtomicUsize,
+}
+
+/// Persist a real cancelled blocking cleanup's smaller deadline before its
+/// TLS guard restores the worker and before the job's retirement publication.
+/// This window is never installed around an uncancelled callback body.
+struct BlockingCleanupWindow<'a> {
+    parent: Option<&'a TaskState>,
+    guard: Option<CleanupGuard>,
+}
+
+impl<'a> BlockingCleanupWindow<'a> {
+    fn enter(parent: Option<&'a TaskState>, context: Option<CancellationContext>) -> Self {
+        Self {
+            parent,
+            guard: context.map(CleanupGuard::enter),
+        }
+    }
+}
+
+impl Drop for BlockingCleanupWindow<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            if let Some(parent) = self.parent {
+                parent.remember_cleanup_deadline();
+            }
+        }
+        drop(self.guard.take());
+    }
+}
+
+struct BlockingOwnerParentGuard {
+    previous: Option<Weak<TaskState>>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl BlockingOwnerParentGuard {
+    fn enter(parent: Option<&Arc<TaskState>>) -> Self {
+        Self {
+            previous: BLOCKING_OWNER_PARENT.with(|slot| {
+                std::mem::replace(&mut *slot.borrow_mut(), parent.map(Arc::downgrade))
+            }),
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for BlockingOwnerParentGuard {
+    fn drop(&mut self) {
+        BLOCKING_OWNER_PARENT.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn blocking_owner_cancellation() -> Option<(Arc<TaskState>, CancellationContext)> {
+    // Actual scheduler work keeps its own cancellation tree, including a
+    // currently uncancelled Task. Do not fall through from it to this observer.
+    if CURRENT_TASK_STATE.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    let parent =
+        BLOCKING_OWNER_PARENT.with(|slot| slot.borrow().as_ref().and_then(Weak::upgrade))?;
+    let context = parent.cancellation()?;
+    Some((parent, context))
+}
+
+struct RunningBlockingJob<'a> {
+    inner: &'a TaskRuntimeInner,
+}
+
+impl<'a> RunningBlockingJob<'a> {
+    fn claim(inner: &'a TaskRuntimeInner) -> Self {
+        // Publish running before removing queued. A shutdown that observes the
+        // queue decrement with Acquire must also observe this earlier increment.
+        let running = inner.running_blocking_jobs.fetch_add(1, Ordering::AcqRel) + 1;
+        inner
+            .blocking_metrics
+            .peak_running
+            .fetch_max(running, Ordering::Relaxed);
+        Self { inner }
+    }
+}
+
+impl Drop for RunningBlockingJob<'_> {
+    fn drop(&mut self) {
+        self.inner
+            .running_blocking_jobs
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -60,22 +374,30 @@ pub struct TaskRuntime {
 
 struct TaskRuntimeInner {
     task_tx: SyncSender<TaskJob>,
-    task_rx: Arc<Mutex<Receiver<TaskJob>>>,
+    task_rx: Arc<Mutex<TaskQueueReceiver>>,
     blocking_tx: SyncSender<BlockingJob>,
     states: Mutex<HashMap<i64, Weak<TaskState>>>,
     wait_edges: Mutex<HashMap<i64, i64>>,
     active_tasks: AtomicUsize,
+    producer_gate: AtomicUsize,
     queued_tasks: AtomicUsize,
     queued_blocking_jobs: AtomicUsize,
     running_blocking_jobs: AtomicUsize,
+    blocking_metrics: Arc<BlockingPoolMetrics>,
     total_submissions: AtomicUsize,
     accepted_submissions: AtomicUsize,
     rejected_task_limit: AtomicUsize,
     rejected_task_queue: AtomicUsize,
     rejected_task_internal: AtomicUsize,
     finished_tasks: AtomicUsize,
+    finished_cancelled_tasks: AtomicUsize,
+    finished_timed_out_tasks: AtomicUsize,
+    suppressed_cleanup_outcomes: AtomicUsize,
+    cleanup_timeouts: AtomicUsize,
+    cleanup_unfinished_tasks: AtomicUsize,
     next_task_id: AtomicI64,
     shutdown: AtomicBool,
+    closing: AtomicBool,
     max_tasks: usize,
     task_queue_limit: usize,
     blocking_queue_limit: usize,
@@ -83,12 +405,504 @@ struct TaskRuntimeInner {
     blocking_workers: AtomicUsize,
 }
 
+impl TaskRuntimeInner {
+    fn producer_count(&self) -> usize {
+        self.producer_gate.load(Ordering::Acquire) & PRODUCER_COUNT_MASK
+    }
+}
+
+// This admission owner stays outside the entire producer catch boundary.
+// It owns only a primitive responsibility, never a Task lease or user payload.
+// The enum retains that guard in its original, earliest local drop scope;
+// extracting it into a later local would retire before an early build Drop.
+enum ProducerAdmission<'a> {
+    Admitted {
+        _responsibility: ProducerResponsibility<'a>,
+    },
+    Closed,
+    Overflow,
+}
+
+impl<'a> ProducerAdmission<'a> {
+    fn begin(gate: &'a AtomicUsize) -> Self {
+        match gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current & PRODUCER_CLOSED_BIT != 0 {
+                None
+            } else {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next & PRODUCER_CLOSED_BIT == 0)
+            }
+        }) {
+            Ok(_) => Self::Admitted {
+                _responsibility: ProducerResponsibility { gate },
+            },
+            Err(current) if current & PRODUCER_CLOSED_BIT != 0 => Self::Closed,
+            Err(_) => Self::Overflow,
+        }
+    }
+}
+
+struct ProducerResponsibility<'a> {
+    gate: &'a AtomicUsize,
+}
+
+impl Drop for ProducerResponsibility<'_> {
+    fn drop(&mut self) {
+        // Last in the real submission stack, after captures, rollback, per-state
+        // publication and native catch/drop(handle). No callback or new wait.
+        // Exactly one admitted guard owns this decrement; subtraction preserves
+        // the monotonic high closing bit, including the final retired producer.
+        self.gate.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn tighten_current_cleanup(mut context: CancellationContext) -> CancellationContext {
+    if let Some(actual) = current_cleanup_context() {
+        context.cleanup_deadline = context.cleanup_deadline.min(actual.cleanup_deadline);
+    }
+    // Keep the first reason supplied by the caller; only real TLS feedback
+    // tightens the same absolute D, without creating another grace interval.
+    context
+}
+
+enum TaskRegistration {
+    Ready,
+    Closing,
+    Poisoned,
+}
+
+// Producer accounting before a queue node is accepted. No user payload or
+// logical owner is retained, and rollback never fabricates worker completion.
+struct TaskSubmissionReservation<'a> {
+    runtime: &'a TaskRuntime,
+    id: i64,
+    active_owned: bool,
+    queued_reserved: bool,
+}
+
+impl<'a> TaskSubmissionReservation<'a> {
+    fn new(runtime: &'a TaskRuntime, id: i64) -> Self {
+        Self {
+            runtime,
+            id,
+            active_owned: true,
+            queued_reserved: false,
+        }
+    }
+
+    fn reserve_queue(&mut self) -> bool {
+        // A cached live head has vacated a physical channel slot without
+        // relinquishing its logical capacity. Count reservations and that
+        // retained head together so inspection cannot grow the bounded queue.
+        if self.runtime.inner.task_queue_limit != 0
+            && self
+                .runtime
+                .inner
+                .queued_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < self.runtime.inner.task_queue_limit).then_some(current + 1)
+                })
+                .is_err()
+        {
+            return false;
+        }
+        self.queued_reserved = true;
+        if self.runtime.inner.task_queue_limit == 0 {
+            // Keep sync_channel(0)'s original rendezvous admission. A zero
+            // credit limit would reject even a waiting receiver's handoff.
+            self.runtime
+                .inner
+                .queued_tasks
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        true
+    }
+
+    fn commit_to_worker(&mut self) {
+        self.active_owned = false;
+        self.queued_reserved = false;
+    }
+
+    fn rollback(&mut self) {
+        // Relinquish each responsibility first; explicit rollback and Drop
+        // cannot decrement it twice even when a later stage unwinds.
+        if std::mem::take(&mut self.queued_reserved) {
+            self.runtime
+                .inner
+                .queued_tasks
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        if std::mem::take(&mut self.active_owned) {
+            self.runtime
+                .inner
+                .active_tasks
+                .fetch_sub(1, Ordering::AcqRel);
+            self.runtime.remove_state(self.id);
+        }
+    }
+}
+
+impl Drop for TaskSubmissionReservation<'_> {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
+// Field Drop order is part of producer retirement: an uncalled constructor's
+// actual captures go first, then reservation rollback, then the primitive
+// publication. This scope adds no heap allocation or logical Task owner.
+struct ProducerScope<'a, B> {
+    build: Option<B>,
+    reservation: Option<TaskSubmissionReservation<'a>>,
+    retirement: ProducerRetirement,
+}
+
+struct ProducerRetirement {
+    state: Arc<TaskState>,
+    accepted: bool,
+}
+
+impl Drop for ProducerRetirement {
+    fn drop(&mut self) {
+        // Accepted execution can already have finished on another worker.
+        // This only classifies the producer's actual settled responsibility;
+        // it neither fabricates execution/accounting ACK nor starts cleanup.
+        self.state.submission.store(
+            if self.accepted {
+                SUBMISSION_ACCEPTED
+            } else {
+                SUBMISSION_PRODUCER_RETIRED
+            },
+            Ordering::Release,
+        );
+        self.state.ready.notify_all();
+    }
+}
+
 pub struct TaskHandle {
+    // Rust drops fields in declaration order. The final owner lease must detach
+    // its payload while this handle still keeps TaskState alive; otherwise the
+    // state's Arc drop recursively destroys nested results before the lease can
+    // enter the iterative owner drain.
+    owner: Arc<TaskOwnerLease>,
     id: i64,
     state: Arc<TaskState>,
     runtime: TaskRuntime,
 }
 
+struct TaskOwnerLease {
+    state: Weak<TaskState>,
+}
+
+enum OwnerResultRelease {
+    Pending {
+        result: KuResult<Value>,
+        context: CancellationContext,
+        next: Option<Arc<TaskState>>,
+    },
+    Finished {
+        next: Option<Arc<TaskState>>,
+    },
+}
+
+struct OwnerResultFlushGuard {
+    previous: usize,
+}
+
+impl OwnerResultFlushGuard {
+    fn enter() -> Self {
+        Self {
+            previous: OWNER_RESULT_FLUSH_DEPTH.with(|depth| {
+                let previous = depth.get();
+                depth.set(previous + 1);
+                previous
+            }),
+        }
+    }
+
+    fn is_outermost(&self) -> bool {
+        self.previous == 0
+    }
+}
+
+impl Drop for OwnerResultFlushGuard {
+    fn drop(&mut self) {
+        OWNER_RESULT_FLUSH_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
+struct SynchronousOwnerDropGuard {
+    previous: bool,
+}
+
+impl SynchronousOwnerDropGuard {
+    fn enter() -> Self {
+        Self {
+            previous: OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(false)),
+        }
+    }
+}
+
+impl Drop for SynchronousOwnerDropGuard {
+    fn drop(&mut self) {
+        OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(self.previous));
+    }
+}
+
+fn drop_owner_synchronously<T>(value: T) {
+    // A container/closure can own ordered siblings and non-Task resources. Each
+    // child must finish its ordinary depth-first drop before the next sibling;
+    // a deferred LIFO/FIFO batch would change that observable order. Restore the
+    // outer drain mode on both success and destructor panic. This deliberately
+    // retains host recursion for unclassified Value trees and queued captures.
+    let _synchronous = SynchronousOwnerDropGuard::enter();
+    drop(value);
+}
+
+fn has_single_task_leaf(mut value: &Value) -> bool {
+    loop {
+        value = match value {
+            Value::Task(_) => return true,
+            Value::Result { value, .. } => value,
+            Value::Array(values) | Value::Enum { fields: values, .. } if values.len() == 1 => {
+                &values[0]
+            }
+            Value::Object(fields) | Value::Struct { fields, .. } if fields.len() == 1 => {
+                fields.values().next().expect("one field has one value")
+            }
+            // Do not inspect closure environments, weak borrowed roots, or a
+            // wider container even if it happens to contain only one Task.
+            _ => return false,
+        };
+    }
+}
+
+// Plain leaves carry no observable resource destructor or sibling. Keep their
+// classification separate from Task leaves: they never enter the deferred
+// owner queue, and wider containers, captures and borrowed roots keep their
+// original ordered drop.
+fn has_single_plain_leaf(mut value: &Value) -> bool {
+    loop {
+        value = match value {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => {
+                return true;
+            }
+            Value::Result { value, .. } => value,
+            Value::Array(values) | Value::Enum { fields: values, .. } if values.len() == 1 => {
+                &values[0]
+            }
+            Value::Object(fields) | Value::Struct { fields, .. } if fields.len() == 1 => {
+                fields.values().next().expect("one field has one value")
+            }
+            _ => return false,
+        };
+    }
+}
+
+fn take_single_owner_field(fields: HashMap<String, Value>) -> Value {
+    let mut fields = fields.into_iter();
+    let (key, value) = fields
+        .next()
+        .expect("classified owner wrapper has one field");
+    drop(key);
+    drop(fields);
+    value
+}
+
+// Wrapper storage is consumed without a cleanup Vec or owner clones. Backing
+// allocations can be freed before the leaf; exact allocator free order is not
+// preserved. Accepted metadata is only bool/String, never a sibling resource
+// lease or closure capture.
+fn drop_single_owner_leaf(mut value: Value) {
+    loop {
+        value = match value {
+            Value::Task(task) => {
+                drop(task);
+                return;
+            }
+            plain @ (Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Null) => {
+                drop(plain);
+                return;
+            }
+            Value::Result { value, .. } => *value,
+            Value::Array(mut values) if values.len() == 1 => {
+                let child = values
+                    .pop()
+                    .expect("classified owner wrapper has one child");
+                drop(values);
+                child
+            }
+            Value::Object(fields) if fields.len() == 1 => take_single_owner_field(fields),
+            Value::Struct { name, fields } if fields.len() == 1 => {
+                drop(name);
+                take_single_owner_field(fields)
+            }
+            Value::Enum {
+                name,
+                variant,
+                mut fields,
+            } if fields.len() == 1 => {
+                drop(name);
+                drop(variant);
+                let child = fields
+                    .pop()
+                    .expect("classified owner wrapper has one child");
+                drop(fields);
+                child
+            }
+            other => {
+                // Classification precedes mutation of an exclusively owned
+                // payload. Keep an ordinary ordered drop if another caller
+                // ever supplies a shape outside that contract.
+                drop_owner_synchronously(other);
+                return;
+            }
+        };
+    }
+}
+
+fn drop_owner_result_synchronously(result: KuResult<Value>) {
+    // Finish this discarded result before another payload or accounting step.
+    // The leaf Task may start its own iterative drain, but cannot defer its
+    // cleanup into an outer drain and overtake an ordered sibling or ACK.
+    let _synchronous = SynchronousOwnerDropGuard::enter();
+    match result {
+        Ok(value) if has_single_task_leaf(&value) || has_single_plain_leaf(&value) => {
+            drop_single_owner_leaf(value);
+        }
+        result => drop(result),
+    }
+}
+
+fn drain_owner_results() {
+    if OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(true)) {
+        return;
+    }
+    let drained = catch_unwind(AssertUnwindSafe(flush_owner_results));
+    OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(false));
+    if let Err(panic) = drained {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn flush_owner_results() {
+    // A queued frame may capture completed owners while an outer result drain
+    // is active. Its ACK/accounting must not overtake detached single-Task-leaf
+    // payloads. Re-entering this loop preserves that order. Only strict linear
+    // Task paths are queued here; plain leaf chains are released synchronously.
+    // Branches, other Value trees and queued captures keep their original drop.
+    let flush = OwnerResultFlushGuard::enter();
+    let mut first_panic = None;
+    loop {
+        let Some(state) = OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow_mut().take()) else {
+            break;
+        };
+        let work = state
+            .owner_result_release
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("only a unique detached owner result is queued");
+        let OwnerResultRelease::Pending {
+            result,
+            context,
+            next,
+        } = work
+        else {
+            unreachable!("pending drain owns only pending payload nodes");
+        };
+        OWNER_RESULT_RELEASE_HEAD.with(|head| *head.borrow_mut() = next);
+        // Neither the state mutex nor the TLS RefCell borrow survives a drop.
+        // A nested lease therefore only enqueues; every queued node has already
+        // been allocated as part of its TaskState, even during OOM cleanup.
+        let dropped = catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = CleanupGuard::enter(context);
+            match result {
+                Ok(value) => drop_single_owner_leaf(value),
+                Err(error) => drop_owner_synchronously(error),
+            }
+        }));
+        if let Err(panic) = dropped {
+            if first_panic.is_none() {
+                first_panic = Some(panic);
+            }
+        }
+        OWNER_RESULT_FINISHED_HEAD.with(|head| {
+            let mut head = head.borrow_mut();
+            *state
+                .owner_result_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(OwnerResultRelease::Finished { next: head.take() });
+            *head = Some(state);
+        });
+    }
+    if flush.is_outermost() {
+        // A nested single-Task leaf drop may only have enqueued its child.
+        // Reentrant flushes can also finish nodes while an enclosing native
+        // destructor is still live. Publish nothing until the actual outer
+        // pending drain has reached quiescence, including panic cleanup.
+        loop {
+            let Some(state) = OWNER_RESULT_FINISHED_HEAD.with(|head| head.borrow_mut().take())
+            else {
+                break;
+            };
+            let finished = state
+                .owner_result_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("finished drain owns its original inline node");
+            let OwnerResultRelease::Finished { next } = finished else {
+                unreachable!("finished drain owns only destroyed payload nodes");
+            };
+            OWNER_RESULT_FINISHED_HEAD.with(|head| *head.borrow_mut() = next);
+            state.owner_payload_done.store(true, Ordering::SeqCst);
+            state.finish_owner_cleanup();
+        }
+    }
+    // A destructor panic must not leave TLS owning an undrained linked list or
+    // make a later independent release silently skip its cleanup. Keep the
+    // existing panic boundary, after draining all already-detached results.
+    if let Some(panic) = first_panic {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+impl Drop for TaskOwnerLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            let blocking_parent = blocking_owner_cancellation();
+            let mut context = current_cleanup_context()
+                .or_else(current_execution_termination)
+                .or_else(current_task_cancellation)
+                .or_else(|| blocking_parent.as_ref().map(|(_, context)| *context))
+                .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
+            if let Some((_, parent_context)) = &blocking_parent {
+                // Earlier ambient metadata keeps its cause, but cannot give
+                // this child a later D than its already-cancelled real parent.
+                context.cleanup_deadline = context
+                    .cleanup_deadline
+                    .min(parent_context.cleanup_deadline);
+            }
+            // Only an already-cancelled real blocking parent creates this
+            // outer window. Nested owner cleanup can tighten it on return or
+            // native unwind, before the short-lived internal parent Arc drops.
+            let _blocking_cleanup = blocking_parent.as_ref().map(|(parent, _)| {
+                BlockingCleanupWindow::enter(Some(parent.as_ref()), Some(context))
+            });
+            state.release_owner(context);
+        }
+    }
+}
+
+/// Concurrent fields are separate observations, not an atomic multi-counter
+/// transaction. Blocking accepted/finished totals reconcile after job retirement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRuntimeSnapshot {
     pub active_tasks: usize,
@@ -105,6 +919,19 @@ pub struct TaskRuntimeSnapshot {
     pub wait_edges: usize,
     pub queued_blocking_jobs: usize,
     pub running_blocking_jobs: usize,
+    /// Live final-retirement responsibilities, including rejected-job cleanup.
+    pub resident_blocking_jobs: usize,
+    pub peak_resident_blocking_jobs: usize,
+    /// Peak of queued_blocking_jobs, including its existing send reservations;
+    /// this is not the physical channel depth and may exceed its capacity.
+    pub peak_queued_blocking_jobs: usize,
+    pub peak_running_blocking_jobs: usize,
+    pub accepted_blocking_jobs: usize,
+    /// Rejected allowed submissions, including stopped/poisoned pool attempts.
+    pub rejected_blocking_jobs: usize,
+    pub rejected_blocking_queue: usize,
+    /// Accepted jobs whose actual captures/response/final guard have retired.
+    pub finished_blocking_jobs: usize,
     pub task_workers: usize,
     pub blocking_workers: usize,
     pub shutdown: bool,
@@ -114,6 +941,13 @@ pub struct TaskRuntimeSnapshot {
     pub rejected_task_queue: usize,
     pub rejected_task_internal: usize,
     pub finished_tasks: usize,
+    /// Cumulative cancelled outcomes after execution/accounting retirement.
+    pub finished_cancelled_tasks: usize,
+    /// Cumulative timed-out outcomes after execution/accounting retirement.
+    pub finished_timed_out_tasks: usize,
+    pub suppressed_cleanup_outcomes: usize,
+    pub cleanup_timeouts: usize,
+    pub cleanup_unfinished_tasks: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,10 +967,41 @@ pub struct TaskStressReport {
     pub blocking_workers: usize,
 }
 
+// The owned result is moved once after admission under its result lock.
+type StringAwaitObservation = (
+    Option<KuResult<Value>>,
+    bool,
+    await_ticket::AwaitPayloadCharge,
+    await_ticket::AwaitStringPayloadCharge,
+);
+
 struct TaskState {
+    id: i64,
+    runtime: Weak<TaskRuntimeInner>,
+    submission: AtomicU8,
+    pending_blocking: AtomicUsize,
+    queue_consumed: AtomicBool,
+    // Execution/queue retirement and completion cleanup are independent of
+    // public terminal result delivery and of the accounting once-claim.
+    execution_queue_retired: AtomicBool,
+    completion_cleanup_done: AtomicBool,
+    accounting_finished: AtomicBool,
+    accounting_done: AtomicBool,
     result: Mutex<Option<KuResult<Value>>>,
+    // Always acquire result before pending_run. Claiming execution and taking a
+    // queued frame for cancellation must have one arbitration point.
+    pending_run: Mutex<Option<TaskStart>>,
+    owner_released: AtomicBool,
+    // Release arbitration is not acknowledgement. The first release call
+    // and its detached payload drain can finish on different threads; both
+    // actual obligations must finish before owner cleanup is published.
+    owner_call_done: AtomicBool,
+    owner_payload_done: AtomicBool,
+    owner_cleanup_done: AtomicBool,
+    owner_result_release: Mutex<Option<OwnerResultRelease>>,
     ready: Condvar,
     cancelled: AtomicBool,
+    cancellation: Mutex<Option<CancellationContext>>,
     awaited: AtomicBool,
     status: AtomicU8,
 }
@@ -152,7 +1017,7 @@ impl TaskRuntime {
         )
     }
 
-    fn with_limits(
+    pub(crate) fn with_limits(
         task_workers: usize,
         task_queue_limit: usize,
         blocking_workers: usize,
@@ -163,22 +1028,33 @@ impl TaskRuntime {
         let (blocking_tx, blocking_rx) = mpsc::sync_channel(blocking_queue_limit);
         let inner = Arc::new(TaskRuntimeInner {
             task_tx,
-            task_rx: Arc::new(Mutex::new(task_rx)),
+            task_rx: Arc::new(Mutex::new(TaskQueueReceiver {
+                receiver: task_rx,
+                head: None,
+            })),
             blocking_tx,
             states: Mutex::new(HashMap::new()),
             wait_edges: Mutex::new(HashMap::new()),
             active_tasks: AtomicUsize::new(0),
+            producer_gate: AtomicUsize::new(0),
             queued_tasks: AtomicUsize::new(0),
             queued_blocking_jobs: AtomicUsize::new(0),
             running_blocking_jobs: AtomicUsize::new(0),
+            blocking_metrics: Arc::new(BlockingPoolMetrics::default()),
             total_submissions: AtomicUsize::new(0),
             accepted_submissions: AtomicUsize::new(0),
             rejected_task_limit: AtomicUsize::new(0),
             rejected_task_queue: AtomicUsize::new(0),
             rejected_task_internal: AtomicUsize::new(0),
             finished_tasks: AtomicUsize::new(0),
+            finished_cancelled_tasks: AtomicUsize::new(0),
+            finished_timed_out_tasks: AtomicUsize::new(0),
+            suppressed_cleanup_outcomes: AtomicUsize::new(0),
+            cleanup_timeouts: AtomicUsize::new(0),
+            cleanup_unfinished_tasks: AtomicUsize::new(0),
             next_task_id: AtomicI64::new(1),
             shutdown: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             max_tasks,
             task_queue_limit,
             blocking_queue_limit,
@@ -190,24 +1066,59 @@ impl TaskRuntime {
         Self { inner }
     }
 
-    pub(crate) fn spawn<F>(&self, run: F) -> TaskHandle
+    pub(crate) fn spawn<F>(&self, run: F) -> KuResult<TaskHandle>
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
         self.spawn_deferred(|| run)
     }
 
-    pub(crate) fn spawn_deferred<B, F>(&self, build: B) -> TaskHandle
+    pub(crate) fn spawn_deferred<B, F>(&self, build: B) -> KuResult<TaskHandle>
     where
         B: FnOnce() -> F,
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
+        self.spawn_start_deferred(|| TaskStart::Callback(Box::new(build())))
+    }
+
+    fn spawn_start_deferred<B>(&self, build: B) -> KuResult<TaskHandle>
+    where
+        B: FnOnce() -> TaskStart,
+    {
+        let producer_admission = ProducerAdmission::begin(&self.inner.producer_gate);
+        // Parameters otherwise drop after all locals on an early `?`. Move the
+        // real constructor into this later local, so its unused captures retire
+        // before the earliest admission guard, including native field unwind.
+        let constructor = build;
+        ensure_task_operations_allowed(Span::default())?;
+        if matches!(&producer_admission, ProducerAdmission::Overflow) {
+            return Err(KuError::runtime(
+                "internal task producer retirement counter overflow",
+                Span::default(),
+            ));
+        }
         self.inner.total_submissions.fetch_add(1, Ordering::Relaxed);
         let id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(TaskState {
+            id,
+            runtime: Arc::downgrade(&self.inner),
+            submission: AtomicU8::new(SUBMISSION_PENDING),
+            pending_blocking: AtomicUsize::new(0),
+            queue_consumed: AtomicBool::new(false),
+            execution_queue_retired: AtomicBool::new(false),
+            completion_cleanup_done: AtomicBool::new(false),
+            accounting_finished: AtomicBool::new(false),
+            accounting_done: AtomicBool::new(false),
             result: Mutex::new(None),
+            pending_run: Mutex::new(None),
+            owner_released: AtomicBool::new(false),
+            owner_call_done: AtomicBool::new(false),
+            owner_payload_done: AtomicBool::new(false),
+            owner_cleanup_done: AtomicBool::new(false),
+            owner_result_release: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
+            cancellation: Mutex::new(None),
             awaited: AtomicBool::new(false),
             status: AtomicU8::new(TASK_PENDING),
         });
@@ -215,102 +1126,224 @@ impl TaskRuntime {
             id,
             state: Arc::clone(&state),
             runtime: self.clone(),
+            owner: Arc::new(TaskOwnerLease {
+                state: Arc::downgrade(&state),
+            }),
         };
-        if self.inner.task_workers.load(Ordering::Acquire) == 0 {
-            self.inner
-                .rejected_task_internal
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(Ok(task_error(
-                "runtime_stopped",
-                "async task runtime has no available workers",
-            )));
-            return handle;
-        }
-        if self
-            .inner
-            .active_tasks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.inner.max_tasks).then_some(current + 1)
-            })
-            .is_err()
-        {
-            self.inner
-                .rejected_task_limit
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(Ok(task_error(
-                "too_many_tasks",
-                format!("async task limit {} reached", self.inner.max_tasks),
-            )));
-            return handle;
-        }
-        if let Ok(mut states) = self.inner.states.lock() {
-            states.insert(id, Arc::downgrade(&state));
-        } else {
-            self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-            self.inner
-                .rejected_task_internal
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(Err(KuError::runtime(
-                "async task registry is poisoned",
-                Span::default(),
-            )));
-            return handle;
-        }
-        let run = match catch_unwind(AssertUnwindSafe(build)) {
-            Ok(run) => run,
-            Err(_) => {
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
+        // The sole producer handle stays outside this unwind boundary. It is
+        // dropped after the actual producer scope under its cleanup context.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut producer = ProducerScope {
+                build: Some(constructor),
+                reservation: None,
+                retirement: ProducerRetirement {
+                    state: Arc::clone(&state),
+                    accepted: false,
+                },
+            };
+            if matches!(&producer_admission, ProducerAdmission::Closed)
+                || self.inner.closing.load(Ordering::Acquire)
+                || self.inner.task_workers.load(Ordering::Acquire) == 0
+            {
                 self.inner
                     .rejected_task_internal
                     .fetch_add(1, Ordering::Relaxed);
-                self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "spawn_panic",
-                    "async task construction panicked",
-                )));
-                return handle;
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "runtime_stopped",
+                        "async task runtime has no available workers",
+                    )),
+                );
+                return;
             }
-        };
-        self.inner.queued_tasks.fetch_add(1, Ordering::AcqRel);
-        match self.inner.task_tx.try_send(TaskJob {
-            id,
-            run: Box::new(run),
-            state: Arc::clone(&state),
-        }) {
-            Ok(()) => {
+            if self
+                .inner
+                .active_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < self.inner.max_tasks).then_some(current + 1)
+                })
+                .is_err()
+            {
                 self.inner
-                    .accepted_submissions
+                    .rejected_task_limit
                     .fetch_add(1, Ordering::Relaxed);
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "too_many_tasks",
+                        format!("async task limit {} reached", self.inner.max_tasks),
+                    )),
+                );
+                return;
             }
-            Err(TrySendError::Full(_)) => {
+            producer.reservation = Some(TaskSubmissionReservation::new(self, id));
+            let reservation = producer
+                .reservation
+                .as_mut()
+                .expect("admitted producer owns its reservation");
+            let registration = {
+                match self.inner.states.lock() {
+                    Ok(mut states) => {
+                        if self.inner.closing.load(Ordering::Acquire) {
+                            TaskRegistration::Closing
+                        } else {
+                            states.insert(id, Arc::downgrade(&state));
+                            TaskRegistration::Ready
+                        }
+                    }
+                    Err(_) => TaskRegistration::Poisoned,
+                }
+            };
+            // No rollback, completion, flush or user cleanup under the registry lock.
+            match registration {
+                TaskRegistration::Ready => {}
+                TaskRegistration::Closing => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Ok(task_error(
+                            "runtime_stopped",
+                            "async task runtime is closing",
+                        )),
+                    );
+                    return;
+                }
+                TaskRegistration::Poisoned => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Err(KuError::runtime(
+                            "async task registry is poisoned",
+                            Span::default(),
+                        )),
+                    );
+                    return;
+                }
+            }
+            let build = producer.build.take().expect("constructor is consumed once");
+            let run = match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(run) => run,
+                Err(_) => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Ok(task_error(
+                            "spawn_panic",
+                            "async task construction panicked",
+                        )),
+                    );
+                    return;
+                }
+            };
+            let header_overflow = run.runner_header_bytes() > local_driver::MAX_TYPED_RUNNER_HEADER;
+            state.install_run(run);
+            if header_overflow {
+                reservation.rollback();
+                self.inner
+                    .rejected_task_internal
+                    .fetch_add(1, Ordering::Relaxed);
+                state.reject_queued(id, Err(local_driver::storage_error()));
+                return;
+            }
+            if !reservation.reserve_queue() {
                 self.inner
                     .rejected_task_queue
                     .fetch_add(1, Ordering::Relaxed);
-                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "queue_full",
-                    format!(
-                        "async task queue limit {} reached",
-                        self.inner.task_queue_limit
-                    ),
-                )));
+                reservation.rollback();
+                state.reject_queued(
+                    id,
+                    Ok(task_error(
+                        "queue_full",
+                        format!(
+                            "async task queue limit {} reached",
+                            self.inner.task_queue_limit
+                        ),
+                    )),
+                );
+                return;
             }
-            Err(TrySendError::Disconnected(_)) => {
-                self.inner
-                    .rejected_task_internal
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "runtime_stopped",
-                    "async task runtime is stopped",
-                )));
-            }
+            match self.inner.task_tx.try_send(TaskJob {
+                id,
+                state: Arc::clone(&state),
+            }) {
+                Ok(()) => {
+                    // A worker may already own this accepted node. Transfer the
+                    // accounting responsibility before any subsequent operation.
+                    reservation.commit_to_worker();
+                    producer.retirement.accepted = true;
+                    self.inner
+                        .accepted_submissions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Full(_)) => {
+                    self.inner
+                        .rejected_task_queue
+                        .fetch_add(1, Ordering::Relaxed);
+                    reservation.rollback();
+                    state.reject_queued(
+                        id,
+                        Ok(task_error(
+                            "queue_full",
+                            format!(
+                                "async task queue limit {} reached",
+                                self.inner.task_queue_limit
+                            ),
+                        )),
+                    );
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    reservation.rollback();
+                    state.reject_queued(
+                        id,
+                        Ok(task_error(
+                            "runtime_stopped",
+                            "async task runtime is stopped",
+                        )),
+                    );
+                }
+            }; // End the Rust 2021 tail temporary before producer retirement.
+        }));
+        if let Err(panic) = outcome {
+            let _cleanup = state.cancellation().map(CleanupGuard::enter);
+            let mut first_panic = Some(panic);
+            state.catch_cleanup_panic(&mut first_panic, || drop(handle));
+            std::panic::resume_unwind(first_panic.expect("producer owns its first panic"));
         }
-        handle
+        Ok(handle)
+    }
+
+    pub(crate) fn spawn_runner_deferred<B, F, R>(&self, build: B) -> KuResult<TaskHandle>
+    where
+        B: FnOnce() -> F,
+        F: FnOnce() -> R + Send + 'static,
+        R: LocalTaskRunner + 'static,
+    {
+        self.spawn_start_deferred(|| {
+            let factory = build();
+            TaskStart::Runner {
+                factory: Box::new(move || Box::new(factory())),
+                header_bytes: std::mem::size_of::<R>(),
+            }
+        })
+    }
+
+    pub(crate) fn has_task_submissions(&self) -> bool {
+        // Monotonic: active_tasks can return to zero while an unawaited completed
+        // Task still owns a payload. Rejected submissions also return Task handles.
+        self.inner.total_submissions.load(Ordering::Acquire) != 0
     }
 
     pub fn snapshot(&self) -> KuResult<TaskRuntimeSnapshot> {
@@ -333,15 +1366,48 @@ impl TaskRuntime {
             wait_edges: 0,
             queued_blocking_jobs: self.inner.queued_blocking_jobs.load(Ordering::Acquire),
             running_blocking_jobs: self.inner.running_blocking_jobs.load(Ordering::Acquire),
+            resident_blocking_jobs: self.inner.blocking_metrics.resident.load(Ordering::Acquire),
+            peak_resident_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_resident
+                .load(Ordering::Relaxed),
+            peak_queued_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_queued
+                .load(Ordering::Relaxed),
+            peak_running_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_running
+                .load(Ordering::Relaxed),
+            accepted_blocking_jobs: self.inner.blocking_metrics.accepted.load(Ordering::Relaxed),
+            rejected_blocking_jobs: self.inner.blocking_metrics.rejected.load(Ordering::Relaxed),
+            rejected_blocking_queue: self
+                .inner
+                .blocking_metrics
+                .rejected_queue
+                .load(Ordering::Relaxed),
+            finished_blocking_jobs: self.inner.blocking_metrics.finished.load(Ordering::Relaxed),
             task_workers: self.inner.task_workers.load(Ordering::Acquire),
             blocking_workers: self.inner.blocking_workers.load(Ordering::Acquire),
-            shutdown: self.inner.shutdown.load(Ordering::Acquire),
+            shutdown: self.inner.shutdown.load(Ordering::Acquire)
+                || self.inner.closing.load(Ordering::Acquire),
             total_submissions: self.inner.total_submissions.load(Ordering::Relaxed),
             accepted_submissions: self.inner.accepted_submissions.load(Ordering::Relaxed),
             rejected_task_limit: self.inner.rejected_task_limit.load(Ordering::Relaxed),
             rejected_task_queue: self.inner.rejected_task_queue.load(Ordering::Relaxed),
             rejected_task_internal: self.inner.rejected_task_internal.load(Ordering::Relaxed),
             finished_tasks: self.inner.finished_tasks.load(Ordering::Relaxed),
+            finished_cancelled_tasks: self.inner.finished_cancelled_tasks.load(Ordering::Relaxed),
+            finished_timed_out_tasks: self.inner.finished_timed_out_tasks.load(Ordering::Relaxed),
+            suppressed_cleanup_outcomes: self
+                .inner
+                .suppressed_cleanup_outcomes
+                .load(Ordering::Relaxed),
+            cleanup_timeouts: self.inner.cleanup_timeouts.load(Ordering::Relaxed),
+            cleanup_unfinished_tasks: self.inner.cleanup_unfinished_tasks.load(Ordering::Relaxed),
         };
         for state in states.values().filter_map(Weak::upgrade) {
             snapshot.registered_tasks += 1;
@@ -413,29 +1479,45 @@ impl TaskRuntime {
         }
         let release = Arc::new(AtomicBool::new(false));
         let peak_active = Arc::new(AtomicUsize::new(before.active_tasks));
+        // The stress harness is the owner until its release/drain phase. Dropping
+        // each submitted handle would now correctly cancel that task immediately.
+        let retained = Arc::new(Mutex::new(Vec::with_capacity(self.inner.max_tasks)));
         let began = Instant::now();
         let mut producers_threads = Vec::with_capacity(producers);
         for producer in 0..producers {
             let runtime = self.clone();
             let producer_release = Arc::clone(&release);
             let peak_active = Arc::clone(&peak_active);
+            let retained = Arc::clone(&retained);
             let count = demand / producers + usize::from(producer < demand % producers);
             let producer_thread = thread::Builder::new()
                 .name(format!("ku-stress-producer-{producer}"))
-                .spawn(move || {
+                .spawn(move || -> KuResult<()> {
                     for _ in 0..count {
                         let release = Arc::clone(&producer_release);
-                        drop(runtime.spawn(move || {
+                        let task = runtime.spawn(move || {
                             while !release.load(Ordering::Acquire) && !current_task_cancelled() {
                                 thread::yield_now();
                             }
                             Ok(Value::Null)
-                        }));
+                        })?;
+                        if !task.state.is_terminal() {
+                            let mut retained = retained
+                                .lock()
+                                .map_err(|_| KuError::message("stress owner registry poisoned"))?;
+                            if retained.len() >= runtime.inner.max_tasks {
+                                return Err(KuError::message(
+                                    "stress retained-task budget exceeded",
+                                ));
+                            }
+                            retained.push(task);
+                        }
                         peak_active.fetch_max(
                             runtime.inner.active_tasks.load(Ordering::Acquire),
                             Ordering::AcqRel,
                         );
                     }
+                    Ok(())
                 });
             match producer_thread {
                 Ok(producer_thread) => producers_threads.push(producer_thread),
@@ -453,7 +1535,7 @@ impl TaskRuntime {
         }
         let mut producer_panicked = false;
         for producer in producers_threads {
-            producer_panicked |= producer.join().is_err();
+            producer_panicked |= !matches!(producer.join(), Ok(Ok(())));
         }
         if producer_panicked {
             release.store(true, Ordering::Release);
@@ -485,6 +1567,7 @@ impl TaskRuntime {
         }
 
         let after = self.snapshot()?;
+        drop(retained);
         Ok(TaskStressReport {
             demand,
             producers,
@@ -513,98 +1596,36 @@ impl TaskRuntime {
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
-        if !handle.state.claim_await() {
-            return Ok(task_error(
-                "already_awaited",
-                format!("task {} has already been awaited", handle.id),
-            ));
-        }
-        self.await_task_until(handle, None)
+        await_ticket::await_borrowed(self.clone(), handle, await_ticket::AwaitMode::Ordinary)
     }
 
     pub fn await_task_timeout(&self, handle: &TaskHandle, timeout: Duration) -> KuResult<Value> {
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            KuError::runtime(
-                "task timeout is too large for this platform",
-                Span::default(),
-            )
-        })?;
-        self.await_task_until(handle, Some(deadline))
+        await_ticket::await_borrowed(
+            self.clone(),
+            handle,
+            await_ticket::AwaitMode::Diagnostic(timeout),
+        )
     }
 
-    fn await_task_until(&self, handle: &TaskHandle, deadline: Option<Instant>) -> KuResult<Value> {
-        let current = current_task_id();
-        if current == handle.id {
-            return Ok(task_error(
-                "self_await",
-                format!("task {} cannot await itself", handle.id),
-            ));
-        }
-        let current_state = if current == 0 {
-            None
-        } else {
-            self.state(current)?
-        };
-        if current != 0 {
-            if let Some(code) = self.register_wait(current, handle.id)? {
-                return Ok(task_error(
-                    code,
-                    format!("task {current} cannot await task {}", handle.id),
-                ));
-            }
-        }
-        if let Some(state) = &current_state {
-            state.set_status(TASK_WAITING);
-        }
-        let result = (|| loop {
-            if current_task_cancelled() {
-                return Ok(task_error(
-                    "cancelled",
-                    format!("task {current} was cancelled"),
-                ));
-            }
-            if let Some(result) = handle.state.result()? {
-                return result;
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(task_error(
-                    "timeout",
-                    format!("timed out waiting for task {}", handle.id),
-                ));
-            }
-            if await_help_depth() >= MAX_AWAIT_DEPTH {
-                return Ok(task_error(
-                    "await_depth",
-                    format!("task {current} exceeded await depth {MAX_AWAIT_DEPTH}"),
-                ));
-            }
-            if self.help_one_bounded()? {
-                continue;
-            }
-            let wait = deadline
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(2))
-                })
-                .unwrap_or(Duration::from_millis(2));
-            if wait.is_zero() {
-                continue;
-            }
-            handle.state.wait(wait)?;
-        })();
-        if current != 0 {
-            self.clear_wait(current);
-        }
-        if let Some(state) = current_state {
-            if !state.is_cancelled() {
-                state.set_status(TASK_RUNNING);
-            }
-        }
-        result
+    #[cfg(test)]
+    fn await_task_until(
+        &self,
+        handle: &TaskHandle,
+        deadline: Option<Instant>,
+        consume: bool,
+    ) -> KuResult<Value> {
+        await_ticket::await_borrowed(
+            self.clone(),
+            handle,
+            await_ticket::AwaitMode::AlreadyClaimed { deadline, consume },
+        )
     }
 
     pub fn cancel_all(&self) -> usize {
+        self.cancel_all_with(CancellationContext::new(TerminationReason::Cancelled))
+    }
+
+    fn cancel_all_with(&self, context: CancellationContext) -> usize {
         let states = self
             .inner
             .states
@@ -616,25 +1637,68 @@ impl TaskRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Retain real Drop feedback across the batch even when the public
+        // cancel_all caller has no ambient cleanup context; restore it on exit.
+        let _cleanup = CleanupGuard::enter(context);
         states
             .into_iter()
-            .filter(|state| state.request_cancel())
+            .filter(|state| {
+                // An earlier real queued capture Drop can shorten the caller's
+                // TLS D. The next running or queued state receives that same
+                // tighter bound, with the original first cancellation reason.
+                state.request_cancel_with(tighten_current_cleanup(context))
+            })
             .count()
     }
 
     pub fn cancel_all_and_wait(&self, timeout: Duration) -> KuResult<usize> {
-        let cancelled = self.cancel_all();
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             KuError::runtime(
                 "task shutdown timeout is too large for this platform",
                 Span::default(),
             )
         })?;
-        while self.inner.active_tasks.load(Ordering::Acquire) != 0
+        // A real responsibility can finish while the cancellation snapshot
+        // blocks on its registry lock. Preserve having observed that work so a
+        // late last retirement cannot bypass the same absolute deadline.
+        let mut observed_outstanding = self.inner.producer_count() != 0
+            || self.inner.active_tasks.load(Ordering::Acquire) != 0
             || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
-            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
-        {
-            if Instant::now() >= deadline {
+            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
+        self.inner.closing.store(true, Ordering::Release);
+        // Only the atomic close linearizes producer admission. An attempt
+        // that began earlier remains counted through its real final Drop;
+        // attempts after this point follow the old closing rejection without
+        // adding a responsibility to this shutdown's completed prefix.
+        let producers_at_close = self
+            .inner
+            .producer_gate
+            .fetch_or(PRODUCER_CLOSED_BIT, Ordering::AcqRel);
+        // Include admission between the initial observation and atomic close.
+        observed_outstanding |= producers_at_close & PRODUCER_COUNT_MASK != 0;
+        let context = CancellationContext::new(TerminationReason::Cancelled);
+        let mut context = CancellationContext {
+            cleanup_deadline: context.cleanup_deadline.min(deadline),
+            ..context
+        };
+        let _cleanup = CleanupGuard::enter(context);
+        let cancelled = self.cancel_all_with(context);
+        context = tighten_current_cleanup(context);
+        loop {
+            let outstanding = self.inner.producer_count() != 0
+                || self.inner.active_tasks.load(Ordering::Acquire) != 0
+                || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
+                || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
+            observed_outstanding |= outstanding;
+            context = tighten_current_cleanup(context);
+            // An empty shutdown still succeeds at zero D. After actual work
+            // was observed, check its deadline even at the drained exit.
+            if observed_outstanding && Instant::now() >= context.cleanup_deadline {
+                self.record_cleanup_timeout();
+                self.inner.cleanup_unfinished_tasks.fetch_add(
+                    self.inner.active_tasks.load(Ordering::Acquire),
+                    Ordering::Relaxed,
+                );
                 return Err(KuError::structured(
                     crate::error::KuErrorKind::Runtime,
                     "task",
@@ -643,41 +1707,255 @@ impl TaskRuntime {
                     Span::default(),
                 ));
             }
-            if !self.help_one_bounded()? {
-                thread::sleep(Duration::from_millis(2));
+            if !outstanding {
+                break;
             }
+            let retired = self.retire_cancelled_queue_prefix(context);
+            // The queue node's actual Drop may carry a smaller D back through
+            // its CleanupGuard. Observe it before continuing or sleeping.
+            context = tighten_current_cleanup(context);
+            if retired {
+                continue;
+            }
+            // Cleanup must not execute an unrelated queued user continuation.
+            // A live head or busy receiver remains the existing workers'
+            // responsibility; cancellation does not invoke scheduler help.
+            thread::sleep(
+                Duration::from_millis(2).min(
+                    context
+                        .cleanup_deadline
+                        .saturating_duration_since(Instant::now()),
+                ),
+            );
         }
         Ok(cancelled)
+    }
+
+    /// Retire at most one already-cleaned cancellation node without entering a
+    /// user body. A live head remains ahead of every later channel node, with
+    /// its original logical queue credit. This is progress, not a full owner
+    /// or runtime cleanup acknowledgement.
+    pub(crate) fn retire_cancelled_queue_prefix(&self, context: CancellationContext) -> bool {
+        let _cleanup = CleanupGuard::enter(context);
+        let context = current_cleanup_context().expect("cleanup guard installs its context");
+        if Instant::now() >= context.cleanup_deadline {
+            return false;
+        }
+        let job = {
+            let mut receiver = match self.inner.task_rx.try_lock() {
+                Ok(receiver) => receiver,
+                // A waiting worker already owns recv. Poison is still reported
+                // by ordinary consumers; cleanup must not claim retirement
+                // from a receiver it cannot safely inspect this turn.
+                Err(_) => return false,
+            };
+            if Instant::now() >= context.cleanup_deadline {
+                return false;
+            }
+            let job = match receiver.try_recv() {
+                Ok(job) => job,
+                Err(_) => return false,
+            };
+            if !job.state.is_terminal()
+                || !job.state.is_cancelled()
+                || !job.state.completion_cleanup_done.load(Ordering::SeqCst)
+            {
+                // try_recv took the only cached head, if present. Installing
+                // this same node neither drops it nor adds another queue slot.
+                receiver.head = Some(job);
+                return false;
+            }
+            self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
+            job
+        };
+        // Keep the internal state alive until the actual queue node is gone.
+        // The guard follows real Drop on normal return and native unwind; no
+        // payload destructor or registry update runs under the receiver lock.
+        let state = Arc::clone(&job.state);
+        let _retirement = QueueRetirement {
+            inner: &self.inner,
+            state: &state,
+        };
+        let job = job;
+        drop(job);
+        true
+    }
+
+    pub(crate) fn record_cleanup_suppressed(&self) {
+        self.inner
+            .suppressed_cleanup_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cleanup_timeout(&self) {
+        self.inner.cleanup_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn cancel_handles_and_wait(
+        &self,
+        handles: &[TaskHandle],
+        context: CancellationContext,
+    ) -> KuResult<()> {
+        let _cleanup = CleanupGuard::enter(context);
+        let mut batch = TaskCancelBatch::prepare(handles, context);
+        self.wait_prepared_cancel_batch(&mut batch)
+    }
+
+    /// Drive the same terminal observation after an exit state has already
+    /// broadcast cancellation. The caller supplies its synchronous guard; this
+    /// helper neither rebroadcasts nor claims await or runs scheduler help.
+    pub(crate) fn wait_prepared_cancel_batch<H: AsRef<[TaskHandle]>>(
+        &self,
+        batch: &mut TaskCancelBatch<H>,
+    ) -> KuResult<()> {
+        loop {
+            let now = Instant::now();
+            match batch.poll(self, now) {
+                CancelBatchPoll::TerminalObserved => return Ok(()),
+                CancelBatchPoll::TimedOut(context) => {
+                    return Err(KuError::termination(context, Span::default()));
+                }
+                CancelBatchPoll::Pending { first_index, .. } => {
+                    self.wait_prepared_cancel_once(batch, first_index)?;
+                }
+            }
+        }
+    }
+
+    /// One original bounded Condvar wait. A persistent exit resumes its own
+    /// phase afterward; this never claims await or executes unrelated help.
+    pub(crate) fn wait_prepared_cancel_once<H: AsRef<[TaskHandle]>>(
+        &self,
+        batch: &TaskCancelBatch<H>,
+        first_index: usize,
+    ) -> KuResult<()> {
+        batch.handles()[first_index].state.wait(
+            batch
+                .context()
+                .cleanup_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(2)),
+        )
     }
 
     pub fn run_blocking<F>(&self, run: F, _span: Span) -> KuResult<Value>
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
+        ensure_task_operations_allowed(_span)?;
+        if self.inner.closing.load(Ordering::Acquire) {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(task_error(
+                "blocking_pool_stopped",
+                "blocking pool is closing",
+            ));
+        }
         if self.inner.blocking_workers.load(Ordering::Acquire) == 0 {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(task_error(
                 "blocking_pool_stopped",
                 "blocking pool has no available workers",
             ));
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        self.inner
+        // Share the task admission lock with shutdown's registry snapshot. A
+        // shutdown cannot observe an empty pool just before this submission.
+        let admission = self.inner.states.lock().map_err(|_| {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            KuError::runtime("async task registry is poisoned", _span)
+        })?;
+        if self.inner.closing.load(Ordering::Acquire) {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(task_error(
+                "blocking_pool_stopped",
+                "blocking pool is closing",
+            ));
+        }
+        let retirement = BlockingRetirement::new(
+            CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().and_then(Weak::upgrade)),
+            Arc::clone(&self.inner.blocking_metrics),
+            _span,
+        )
+        .inspect_err(|_| {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+        })?;
+        let queued = self
+            .inner
             .queued_blocking_jobs
-            .fetch_add(1, Ordering::AcqRel);
-        match self.inner.blocking_tx.try_send(BlockingJob {
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.inner
+            .blocking_metrics
+            .peak_queued
+            .fetch_max(queued, Ordering::Relaxed);
+        let mut job = BlockingJob {
             run: Box::new(run),
             response: response_tx,
-            cancelled: CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().cloned()),
-        }) {
+            retirement,
+        };
+        // A successful send can be consumed and retired before try_send returns.
+        // Mark the movable final guard first, then clear it on either rejection.
+        job.retirement.accepted = true;
+        let mut submitted = self.inner.blocking_tx.try_send(job);
+        match &mut submitted {
+            Ok(()) => {
+                self.inner
+                    .blocking_metrics
+                    .accepted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(job)) => {
+                job.retirement.accepted = false;
+                self.inner
+                    .blocking_metrics
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .blocking_metrics
+                    .rejected_queue
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                job.retirement.accepted = false;
+                self.inner
+                    .blocking_metrics
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // No rejected captures/response fields are destroyed under admission.
+        // Snapshot fields are independent observations; only quiescent totals
+        // reconcile accepted and finished, never response delivery or Task state.
+        drop(admission);
+        match submitted {
             Ok(()) => loop {
-                if current_task_cancelled() {
-                    break Ok(task_error(
-                        "cancelled",
-                        format!("task {} was cancelled", current_task_id()),
-                    ));
+                if let Some(context) = current_task_cancellation() {
+                    break Err(KuError::termination(context, _span));
                 }
                 match response_rx.try_recv() {
-                    Ok(result) => break result,
+                    Ok(result) => {
+                        if let Some(context) = current_task_cancellation() {
+                            let _cleanup = CleanupGuard::enter(context);
+                            drop_owner_result_synchronously(result);
+                            break Err(KuError::termination(context, _span));
+                        }
+                        break result;
+                    }
                     Err(TryRecvError::Disconnected) => {
                         break Ok(task_error(
                             "blocking_pool_stopped",
@@ -687,7 +1965,14 @@ impl TaskRuntime {
                     Err(TryRecvError::Empty) => {
                         if !self.help_one_bounded()? {
                             match response_rx.recv_timeout(Duration::from_millis(2)) {
-                                Ok(result) => break result,
+                                Ok(result) => {
+                                    if let Some(context) = current_task_cancellation() {
+                                        let _cleanup = CleanupGuard::enter(context);
+                                        drop_owner_result_synchronously(result);
+                                        break Err(KuError::termination(context, _span));
+                                    }
+                                    break result;
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                                     break Ok(task_error(
@@ -725,21 +2010,23 @@ impl TaskRuntime {
     }
 
     fn help_one_bounded(&self) -> KuResult<bool> {
-        let allowed = AWAIT_HELP_DEPTH.with(|depth| {
+        let previous = AWAIT_HELP_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= MAX_AWAIT_DEPTH {
-                false
+                None
             } else {
                 depth.set(current + 1);
-                true
+                Some(current)
             }
         });
-        if !allowed {
+        let Some(previous) = previous else {
             return Ok(false);
-        }
-        let result = self.help_one();
-        AWAIT_HELP_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-        result
+        };
+        let _depth = AwaitHelpDepthGuard {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        };
+        self.help_one()
     }
 
     fn help_one(&self) -> KuResult<bool> {
@@ -749,7 +2036,7 @@ impl TaskRuntime {
             // so an awaiting worker must not block behind it. When every worker is
             // busy (notably the one-worker nested-await case), the lock is free and
             // this helper can execute one queued child to avoid starvation.
-            let receiver = match self.inner.task_rx.try_lock() {
+            let mut receiver = match self.inner.task_rx.try_lock() {
                 Ok(receiver) => receiver,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -788,9 +2075,14 @@ impl TaskRuntime {
     }
 
     fn remove_state(&self, id: i64) {
-        if let Ok(mut states) = self.inner.states.lock() {
-            states.remove(&id);
-        }
+        // Cleanup must retire its actual Weak registration even after another
+        // native panic poisoned this lock. New registration still rejects the
+        // poison above; recovery here grants no new admission or user effect.
+        self.inner
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
     }
 
     fn register_wait(&self, current: i64, target: i64) -> KuResult<Option<&'static str>> {
@@ -835,8 +2127,31 @@ impl Drop for TaskRuntimeInner {
 }
 
 impl TaskHandle {
+    #[cfg(test)]
+    pub(crate) fn test_with_result_slot<T>(
+        &self,
+        observe: impl FnOnce(Option<&KuResult<Value>>) -> T,
+    ) -> KuResult<T> {
+        let slot = self
+            .state
+            .result
+            .lock()
+            .map_err(|_| KuError::runtime("task result mutex is poisoned", Span::default()))?;
+        Ok(observe(slot.as_ref()))
+    }
+
     pub fn id(&self) -> i64 {
         self.id
+    }
+
+    pub(crate) fn internal_identity_key(&self) -> (i64, usize) {
+        // IDs are local to a runtime. This key is only compared while the
+        // handle/witness retains the actual state; it is never exposed to Ku.
+        (self.id, Arc::as_ptr(&self.state) as usize)
+    }
+
+    pub(crate) fn retirement_witness(&self) -> TaskRetirementWitness {
+        TaskRetirementWitness::new(Arc::clone(&self.state), self.runtime.clone())
     }
 
     pub fn await_result(&self) -> KuResult<Value> {
@@ -851,6 +2166,17 @@ impl TaskHandle {
         self.state.request_cancel()
     }
 
+    pub(crate) fn request_cancel_with(&self, context: CancellationContext) -> bool {
+        self.state.request_cancel_with(context)
+    }
+
+    pub(crate) fn release_scope_owner(&self, context: CancellationContext) {
+        // Readonly captures can retain an internal handle proxy after the real
+        // owning scope exits. That proxy may observe identity, not retain the
+        // unawaited result or regain ownership of a late completion.
+        self.state.release_owner(context);
+    }
+
     pub fn status(&self) -> &'static str {
         self.state.status_name()
     }
@@ -862,6 +2188,7 @@ impl Clone for TaskHandle {
             id: self.id,
             state: Arc::clone(&self.state),
             runtime: self.runtime.clone(),
+            owner: Arc::clone(&self.owner),
         }
     }
 }
@@ -879,45 +2206,404 @@ impl PartialEq for TaskHandle {
 }
 
 impl TaskState {
-    fn complete(&self, result: KuResult<Value>) {
-        self.complete_with_status(result, None);
-    }
-
-    fn complete_with_status(&self, result: KuResult<Value>, status: Option<u8>) {
-        if let Ok(mut slot) = self.result.lock() {
-            if slot.is_none() {
-                let status = status.unwrap_or_else(|| {
-                    if self.cancelled.load(Ordering::Acquire) {
-                        TASK_CANCELLED
-                    } else if result.is_err() {
-                        TASK_FAILED
-                    } else {
-                        TASK_COMPLETED
-                    }
-                });
-                *slot = Some(result);
-                self.status.store(status, Ordering::Release);
-                self.ready.notify_all();
+    fn remember_cleanup_deadline(&self) {
+        let Some(cleanup) = current_cleanup_context() else {
+            return;
+        };
+        // Match completion/cancellation's result -> cancellation lock order.
+        // Only metadata is touched here; no user payload drops under a lock.
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut cancellation = self
+            .cancellation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = cancellation.as_mut() {
+            // Actual TLS may have an earlier cause. Persist only its tighter D
+            // before the caller's cleanup guard restores its outer TLS window.
+            existing.cleanup_deadline = existing.cleanup_deadline.min(cleanup.cleanup_deadline);
+            if let Some(Err(error)) = slot.as_mut() {
+                if error.runtime_termination().is_some() {
+                    // A terminal error may already be published while losing
+                    // payloads are being released. Tighten its existing D too;
+                    // keep the first cause and all public diagnostic fields.
+                    error.remember_scope_cleanup(*existing);
+                }
             }
         }
     }
 
+    // Finish the remaining ordered cleanup stages before propagating the first
+    // native destructor panic. The caller retains its original cleanup window.
+    fn catch_cleanup_panic(&self, first: &mut Option<CleanupPanic>, cleanup: impl FnOnce()) {
+        let outcome = catch_unwind(AssertUnwindSafe(cleanup));
+        // Nested native Drop guards have restored the caller's live window,
+        // carrying their smaller D. Persist it before continuing or unwinding.
+        self.remember_cleanup_deadline();
+        if let Err(panic) = outcome {
+            if first.is_none() {
+                *first = Some(panic);
+            } else {
+                if let Some(runtime) = self.runtime.upgrade() {
+                    runtime
+                        .suppressed_cleanup_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                drop(panic);
+            }
+        }
+    }
+
+    fn install_run(&self, run: impl Into<TaskStart>) {
+        let mut uninstalled = Some(run.into());
+        let context = {
+            let slot = self
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let context = self.cancellation();
+            if context.is_none() && slot.is_none() && !self.is_terminal() {
+                *self
+                    .pending_run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = uninstalled.take();
+            }
+            context
+        };
+        if uninstalled.is_some() {
+            // Cancellation may arrive while the deferred frame is being built.
+            // The builder, not a worker, owns cleanup of that not-yet-queued frame.
+            let _cleanup = context.map(CleanupGuard::enter);
+            let mut first_panic = None;
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_synchronously(uninstalled.take());
+            });
+            self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            self.remember_cleanup_deadline();
+            self.catch_cleanup_panic(&mut first_panic, || {
+                self.complete(self.id, Ok(Value::Null));
+            });
+            self.remember_cleanup_deadline();
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    fn claim_run(&self) -> Option<TaskStart> {
+        let _slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.is_cancelled() || self.is_terminal() {
+            return None;
+        }
+        let run = self
+            .pending_run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if run.is_some() {
+            self.status.store(TASK_RUNNING, Ordering::Release);
+        }
+        run
+    }
+
+    fn reject_queued(&self, id: i64, result: KuResult<Value>) {
+        let (run, cancellation_owns_completion) = {
+            let _slot = self
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let run = self
+                .pending_run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let cancellation_owns_completion = run.is_none() && self.is_cancelled();
+            (run, cancellation_owns_completion)
+        };
+        let _cleanup = self.cancellation().map(CleanupGuard::enter);
+        let mut first_panic = None;
+        self.catch_cleanup_panic(&mut first_panic, || {
+            drop_owner_synchronously(run);
+        });
+        self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+        self.remember_cleanup_deadline();
+        if !cancellation_owns_completion {
+            self.catch_cleanup_panic(&mut first_panic, || self.complete(id, result));
+        }
+        self.remember_cleanup_deadline();
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn release_owner(self: &Arc<Self>, context: CancellationContext) {
+        let (first_release, abandoned) = {
+            let mut slot = self
+                .result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Scope release and the final logical lease can race. The loser
+            // must not acknowledge the winner's detached, still-live payload.
+            let first_release = !self.owner_released.swap(true, Ordering::AcqRel);
+            (first_release, slot.take())
+        };
+        let _cleanup = CleanupGuard::enter(context);
+        let mut first_panic = None;
+        let mut deferred_payload = false;
+        match abandoned {
+            Some(result) if result.as_ref().is_ok_and(has_single_task_leaf) => {
+                assert!(
+                    first_release,
+                    "only the first owner release detaches a result"
+                );
+                deferred_payload = true;
+                OWNER_RESULT_RELEASE_HEAD.with(|head| {
+                    let mut head = head.borrow_mut();
+                    *self
+                        .owner_result_release
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        Some(OwnerResultRelease::Pending {
+                            result,
+                            context,
+                            next: head.take(),
+                        });
+                    *head = Some(Arc::clone(self));
+                });
+                self.catch_cleanup_panic(&mut first_panic, drain_owner_results);
+            }
+            Some(result) => {
+                assert!(
+                    first_release,
+                    "only the first owner release detaches a result"
+                );
+                self.catch_cleanup_panic(&mut first_panic, || {
+                    drop_owner_result_synchronously(result);
+                });
+            }
+            None => {}
+        }
+        // Keep queued-frame cancellation synchronous: its terminal ACK must
+        // still follow capture destruction, including a concurrent queue take.
+        // A native payload panic must not skip that remaining obligation.
+        // Duplicate calls retain cancellation/deadline tightening, but do not
+        // publish either obligation on behalf of the first release call.
+        self.catch_cleanup_panic(&mut first_panic, || {
+            let mut cancellation = context;
+            if let Some(cleanup) = current_cleanup_context() {
+                cancellation.cleanup_deadline =
+                    cancellation.cleanup_deadline.min(cleanup.cleanup_deadline);
+            }
+            self.request_cancel_with(cancellation);
+        });
+        self.remember_cleanup_deadline();
+        if first_release {
+            // During an active deferred drain, a nested release may return
+            // after merely enqueuing its descendants. Its payload publication
+            // belongs exclusively to the outermost real drain above.
+            if !OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get) {
+                self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            }
+            if !deferred_payload {
+                self.owner_payload_done.store(true, Ordering::SeqCst);
+            }
+            self.owner_call_done.store(true, Ordering::SeqCst);
+            self.finish_owner_cleanup();
+        }
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn finish_owner_cleanup(&self) {
+        // Sequentially consistent obligation publications prevent concurrent
+        // release/drain finishers from both missing the other completed stage.
+        // This acknowledges owner cleanup only, never execution retirement,
+        // result delivery, scope teardown or registry accounting.
+        if self.owner_call_done.load(Ordering::SeqCst)
+            && self.owner_payload_done.load(Ordering::SeqCst)
+            && !self.owner_cleanup_done.swap(true, Ordering::AcqRel)
+        {
+            self.ready.notify_all();
+        }
+    }
+
+    fn complete(&self, id: i64, result: KuResult<Value>) {
+        self.complete_with_status(id, result, None);
+    }
+
+    fn complete_with_status(&self, id: i64, result: KuResult<Value>, status: Option<u8>) {
+        // Cancellation and completion use the same lock. The worker's earlier
+        // cancellation check is only advisory: a request may win before commit.
+        // Keep losing payloads here so their destructors run after unlocking.
+        let mut uncommitted = Some(result);
+        let mut abandoned = None;
+        let mut discard_context = None;
+        let mut published = false;
+        if let Ok(mut slot) = self.result.lock() {
+            if slot.is_none() && !self.is_terminal() {
+                let incoming = uncommitted
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .and_then(KuError::runtime_termination);
+                let context = {
+                    let mut cancellation = self
+                        .cancellation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if let Some(incoming) = incoming {
+                        match cancellation.as_mut() {
+                            Some(existing) => {
+                                existing.cleanup_deadline =
+                                    existing.cleanup_deadline.min(incoming.cleanup_deadline)
+                            }
+                            None => *cancellation = Some(incoming),
+                        }
+                    }
+                    *cancellation
+                };
+                discard_context = context;
+                let (result, status) = if let Some(context) = context {
+                    self.cancelled.store(true, Ordering::Release);
+                    let mut error = KuError::termination(context, Span::default());
+                    error.message = format!(
+                        "task {id} was {}",
+                        match context.reason {
+                            TerminationReason::Cancelled => "cancelled",
+                            TerminationReason::TimedOut => "timed out",
+                        }
+                    );
+                    (
+                        Err(error),
+                        match context.reason {
+                            TerminationReason::Cancelled => TASK_CANCELLED,
+                            TerminationReason::TimedOut => TASK_TIMED_OUT,
+                        },
+                    )
+                } else {
+                    let result = uncommitted.take().expect("completion owns its result");
+                    let status = status.unwrap_or_else(|| {
+                        if result.is_err() {
+                            TASK_FAILED
+                        } else {
+                            TASK_COMPLETED
+                        }
+                    });
+                    (result, status)
+                };
+                if self.owner_released.load(Ordering::Acquire) {
+                    abandoned = Some(result);
+                } else {
+                    *slot = Some(result);
+                }
+                self.status.store(status, Ordering::Release);
+                published = true;
+                self.ready.notify_all();
+            }
+        }
+        let _cleanup = discard_context.map(CleanupGuard::enter);
+        let mut first_panic = None;
+        if let Some(result) = uncommitted.take() {
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_result_synchronously(result);
+            });
+        }
+        if let Some(result) = abandoned.take() {
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_result_synchronously(result);
+            });
+        }
+        self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+        if published {
+            // Losing and abandoned payloads, including their real native drop
+            // glue, have finished before accounting may acknowledge this task.
+            // A duplicate completion must not acknowledge the winning cleanup.
+            // Sequentially consistent obligation publications prevent the two
+            // finishing threads from both missing the other completed stage.
+            self.completion_cleanup_done.store(true, Ordering::SeqCst);
+        }
+        if let Some(runtime) = self.runtime.upgrade() {
+            finish_task_accounting(&runtime, self);
+        }
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     fn request_cancel(&self) -> bool {
+        self.request_cancel_with(CancellationContext::new(TerminationReason::Cancelled))
+    }
+
+    fn request_cancel_with(&self, context: CancellationContext) -> bool {
         let Ok(slot) = self.result.lock() else {
             return false;
         };
-        if slot.is_some() || self.cancelled.load(Ordering::Acquire) {
+        if slot.is_some() || self.is_terminal() {
             return false;
+        }
+        {
+            let mut cancellation = self
+                .cancellation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = &mut *cancellation {
+                existing.cleanup_deadline = existing.cleanup_deadline.min(context.cleanup_deadline);
+                return false;
+            }
+            *cancellation = Some(context);
         }
         self.cancelled.store(true, Ordering::Release);
         self.status.store(TASK_CANCELLING, Ordering::Release);
+        let queued = self
+            .pending_run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         drop(slot);
         self.ready.notify_all();
+        if let Some(queued) = queued {
+            let _cleanup = CleanupGuard::enter(context);
+            let mut first_panic = None;
+            // Real capture drop glue exits before terminal cancellation is
+            // published, even when a native destructor starts unwinding.
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_synchronously(queued);
+            });
+            self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            self.catch_cleanup_panic(&mut first_panic, || {
+                self.complete(self.id, Ok(Value::Null));
+            });
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
         true
     }
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancellation(&self) -> Option<CancellationContext> {
+        if !self.is_cancelled() {
+            return None;
+        }
+        self.cancellation
+            .lock()
+            .map(|context| *context)
+            .unwrap_or_else(|error| *error.into_inner())
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.load(Ordering::Acquire),
+            TASK_COMPLETED | TASK_FAILED | TASK_CANCELLED | TASK_PANICKED | TASK_TIMED_OUT
+        )
     }
 
     fn claim_await(&self) -> bool {
@@ -927,8 +2613,12 @@ impl TaskState {
     }
 
     fn set_status(&self, status: u8) {
-        if !self.is_cancelled() {
-            self.status.store(status, Ordering::Release);
+        // Do not overwrite a cancellation or terminal state between a separate
+        // cancelled load and the status store.
+        if let Ok(slot) = self.result.lock() {
+            if slot.is_none() && !self.is_cancelled() && !self.is_terminal() {
+                self.status.store(status, Ordering::Release);
+            }
         }
     }
 
@@ -942,15 +2632,80 @@ impl TaskState {
             TASK_CANCELLED => "cancelled",
             TASK_CANCELLING => "cancelling",
             TASK_PANICKED => "panicked",
+            TASK_TIMED_OUT => "timed_out",
             _ => "unknown",
         }
     }
 
-    fn result(&self) -> KuResult<Option<KuResult<Value>>> {
-        self.result
+    fn observe_result(&self, consume: bool) -> KuResult<(Option<KuResult<Value>>, bool)> {
+        let mut slot = self
+            .result
             .lock()
-            .map(|slot| slot.clone())
-            .map_err(|_| KuError::runtime("async task state is poisoned", Span::default()))
+            .map_err(|_| KuError::runtime("async task state is poisoned", Span::default()))?;
+        // A pending empty slot and a consumed terminal slot must be distinguished
+        // under the completion lock. A later terminal load could otherwise see a
+        // newly installed payload and incorrectly report the first await as used.
+        let terminal = self.is_terminal();
+        let result = if consume { slot.take() } else { slot.clone() };
+        Ok((result, terminal))
+    }
+
+    fn observe_result_admitted(
+        &self,
+        policy: await_ticket::AwaitPayloadPolicy,
+    ) -> Result<
+        (
+            Option<KuResult<Value>>,
+            bool,
+            await_ticket::AwaitPayloadCharge,
+        ),
+        await_ticket::AwaitObservationError,
+    > {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| await_ticket::AwaitObservationError::Poisoned)?;
+        let terminal = self.is_terminal();
+        // Only immutable shape/capacity reads and checked integer arithmetic
+        // occur before take. Rejection leaves this sole payload in its real
+        // Task owner; no KuError/String allocation, Drop, wait or ACK occurs
+        // under this result lock. The caller formats rejection after unlock.
+        let charge = match slot.as_ref() {
+            Some(result) => policy
+                .admit(result)
+                .map_err(await_ticket::AwaitObservationError::Rejected)?,
+            None => await_ticket::AwaitPayloadCharge::default(),
+        };
+        Ok((slot.take(), terminal, charge))
+    }
+
+    fn observe_result_string_admitted(
+        &self,
+        policy: await_ticket::AwaitStringPayloadPolicy,
+    ) -> Result<StringAwaitObservation, await_ticket::AwaitObservationError> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| await_ticket::AwaitObservationError::Poisoned)?;
+        let terminal = self.is_terminal();
+        // Same lock, before take: real buffer capacity, immutable fixed-shape
+        // metadata, and checked integer quota arithmetic only. Rejected
+        // payloads remain owned by the original Task result slot unchanged.
+        let (charge, string_charge) = match slot.as_ref() {
+            Some(result) => policy
+                .admit(result)
+                .map_err(await_ticket::AwaitObservationError::Rejected)?,
+            None => (
+                await_ticket::AwaitPayloadCharge::default(),
+                await_ticket::AwaitStringPayloadCharge::default(),
+            ),
+        };
+        Ok((slot.take(), terminal, charge, string_charge))
+    }
+
+    #[cfg(test)]
+    fn result(&self) -> KuResult<Option<KuResult<Value>>> {
+        self.observe_result(false).map(|(result, _)| result)
     }
 
     fn wait(&self, timeout: Duration) -> KuResult<()> {
@@ -980,7 +2735,7 @@ fn spawn_task_workers(inner: &Arc<TaskRuntimeInner>, count: usize) {
     }
 }
 
-fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<TaskJob>>>) {
+fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<TaskQueueReceiver>>) {
     loop {
         let Some(shutdown) = weak
             .upgrade()
@@ -992,7 +2747,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
             return;
         }
         let job = {
-            let Ok(receiver) = receiver.lock() else {
+            let Ok(mut receiver) = receiver.lock() else {
                 return;
             };
             receiver.recv()
@@ -1003,65 +2758,90 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
                     return;
                 };
                 inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                execute_task_job(&inner, job)
+                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| execute_task_job(&inner, job)))
+                {
+                    // Ordinary callback panics keep their existing task
+                    // classification. An escaping cleanup panic has already
+                    // retired its queue node; keep the winning terminal result
+                    // and the original panic-hook diagnostic, then serve again.
+                    inner
+                        .suppressed_cleanup_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(panic);
+                }
             }
             Err(_) => return,
         }
     }
 }
 
-fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
-    if job.state.is_cancelled() {
-        job.state.complete_with_status(
-            Ok(task_error(
-                "cancelled",
-                format!("task {} was cancelled", job.id),
-            )),
-            Some(TASK_CANCELLED),
-        );
-        finish_task_job(inner, job.id);
-        return;
-    }
-    job.state.set_status(TASK_RUNNING);
-    let previous = CURRENT_TASK_ID.with(|current| {
-        let previous = current.get();
-        current.set(job.id);
-        previous
-    });
-    let previous_state =
-        CURRENT_TASK_STATE.with(|current| current.replace(Some(Arc::downgrade(&job.state))));
-    let result = catch_unwind(AssertUnwindSafe(job.run))
-        .map_err(|_| task_error("panic", "async task panicked"));
-    let panicked = result.is_err();
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => Ok(error),
-    };
-    CURRENT_TASK_STATE.with(|current| {
-        current.replace(previous_state);
-    });
-    CURRENT_TASK_ID.with(|current| current.set(previous));
-    if job.state.is_cancelled() {
-        job.state.complete_with_status(
-            Ok(task_error(
-                "cancelled",
-                format!("task {} was cancelled", job.id),
-            )),
-            Some(TASK_CANCELLED),
-        );
-    } else {
-        job.state
-            .complete_with_status(result, panicked.then_some(TASK_PANICKED));
-    }
-    finish_task_job(inner, job.id);
+struct QueueRetirement<'a> {
+    inner: &'a TaskRuntimeInner,
+    state: &'a TaskState,
 }
 
-fn finish_task_job(inner: &TaskRuntimeInner, id: i64) {
-    if let Ok(mut states) = inner.states.lock() {
-        states.remove(&id);
+impl Drop for QueueRetirement<'_> {
+    fn drop(&mut self) {
+        // Primitive retirement only: no callback, payload cleanup, completion
+        // or wait is started by this destructor while another panic unwinds.
+        finish_task_job(self.inner, self.state);
     }
+}
+
+fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
+    // Cover helper admission rejection and completion as well as dispatch's
+    // Task window; those real cleanup phases can run with caller_state=None.
+    let _blocking_parent = BlockingOwnerParentGuard::enter(None);
+    local_driver::execute(inner, job);
+}
+
+fn finish_task_job(inner: &TaskRuntimeInner, state: &TaskState) {
+    state.queue_consumed.store(true, Ordering::Release);
+    // Call only after the claimant frame/queue node has actually been dropped.
+    // This says nothing about retained result ownership or scope teardown.
+    state.execution_queue_retired.store(true, Ordering::SeqCst);
+    finish_task_accounting(inner, state);
+}
+
+fn finish_task_accounting(inner: &TaskRuntimeInner, state: &TaskState) {
+    // Terminal publication can precede discarded payload cleanup. A cancelled
+    // queue consumer and the completion thread may finish in either order;
+    // neither can acknowledge work still owned by the other.
+    if !state.execution_queue_retired.load(Ordering::SeqCst)
+        || !state.completion_cleanup_done.load(Ordering::SeqCst)
+        || !state.is_terminal()
+        || state.accounting_finished.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    // Poison rejects new registration elsewhere, but existing retirement
+    // must actually remove its Weak entry before publishing accounting_done.
+    inner
+        .states
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&state.id);
     inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
     inner.finished_tasks.fetch_add(1, Ordering::Relaxed);
+    // Count the winning terminal outcome only after the same real retirement
+    // gates as finished_tasks; cancellation requests and diagnostic waits do
+    // not themselves retire a task. The once-claim above excludes retries.
+    match state.status.load(Ordering::Acquire) {
+        TASK_CANCELLED => {
+            inner
+                .finished_cancelled_tasks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TASK_TIMED_OUT => {
+            inner
+                .finished_timed_out_tasks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    // accounting_finished above is a once-claim, not proof of these updates.
+    state.accounting_done.store(true, Ordering::Release);
+    state.ready.notify_all();
 }
 
 fn spawn_blocking_workers(
@@ -1105,19 +2885,23 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
+                let _running = RunningBlockingJob::claim(&inner);
                 inner.queued_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
-                inner.running_blocking_jobs.fetch_add(1, Ordering::AcqRel);
                 let cancelled = job
-                    .cancelled
+                    .retirement
+                    .state
                     .as_ref()
-                    .and_then(Weak::upgrade)
-                    .is_some_and(|state| state.is_cancelled());
-                let result = if cancelled {
-                    Ok(task_error(
-                        "cancelled",
-                        "blocking job was cancelled before it started",
-                    ))
+                    .and_then(|state| state.cancellation());
+                let result = if let Some(context) = cancelled {
+                    let _cleanup = BlockingCleanupWindow::enter(
+                        job.retirement.state.as_deref(),
+                        Some(context),
+                    );
+                    drop(job.run);
+                    Err(KuError::termination(context, Span::default()))
                 } else {
+                    let _blocking_parent =
+                        BlockingOwnerParentGuard::enter(job.retirement.state.as_ref());
                     match catch_unwind(AssertUnwindSafe(job.run)).map_err(|_| {
                         KuError::structured(
                             crate::error::KuErrorKind::Runtime,
@@ -1131,11 +2915,40 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                         Err(error) => Err(error),
                     }
                 };
-                let _ = job.response.send(result);
-                inner.running_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
+                let result = if let Some(context) = job
+                    .retirement
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.cancellation())
+                {
+                    let _cleanup = BlockingCleanupWindow::enter(
+                        job.retirement.state.as_deref(),
+                        Some(context),
+                    );
+                    drop_owner_result_synchronously(result);
+                    Err(KuError::termination(context, Span::default()))
+                } else {
+                    result
+                };
+                send_blocking_result(&job.response, job.retirement.state.as_deref(), result);
             }
             Err(_) => return,
         }
+    }
+}
+
+fn send_blocking_result(
+    response: &SyncSender<KuResult<Value>>,
+    parent: Option<&TaskState>,
+    result: KuResult<Value>,
+) {
+    if let Err(unsent) = response.send(result) {
+        // The parent can terminate after the worker's post-operation check and
+        // drop its receiver before send. Re-read here so nested Task owners in
+        // the undeliverable payload keep that first cause and absolute deadline.
+        let _cleanup =
+            BlockingCleanupWindow::enter(parent, parent.and_then(TaskState::cancellation));
+        drop_owner_result_synchronously(unsent.0);
     }
 }
 
@@ -1167,6 +2980,26 @@ pub fn current_task_cancelled() -> bool {
     })
 }
 
+pub(crate) fn current_task_cancellation() -> Option<CancellationContext> {
+    CURRENT_TASK_STATE.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|state| state.cancellation())
+    })
+}
+
+pub(crate) fn request_current_task_cancel_with(context: CancellationContext) -> bool {
+    CURRENT_TASK_STATE.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|state| state.request_cancel_with(context))
+    })
+}
+
 fn await_help_depth() -> usize {
     AWAIT_HELP_DEPTH.with(Cell::get)
 }
@@ -1178,6 +3011,1972 @@ fn task_error(code: &str, message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_server::native_test_harness as owner_release_bounded_process;
+
+    fn completion_state() -> TaskState {
+        TaskState {
+            id: 41,
+            runtime: Weak::new(),
+            submission: AtomicU8::new(SUBMISSION_PENDING),
+            pending_blocking: AtomicUsize::new(0),
+            queue_consumed: AtomicBool::new(false),
+            execution_queue_retired: AtomicBool::new(false),
+            completion_cleanup_done: AtomicBool::new(false),
+            accounting_finished: AtomicBool::new(false),
+            accounting_done: AtomicBool::new(false),
+            result: Mutex::new(None),
+            pending_run: Mutex::new(None),
+            owner_released: AtomicBool::new(false),
+            owner_call_done: AtomicBool::new(false),
+            owner_payload_done: AtomicBool::new(false),
+            owner_cleanup_done: AtomicBool::new(false),
+            owner_result_release: Mutex::new(None),
+            ready: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            cancellation: Mutex::new(None),
+            awaited: AtomicBool::new(false),
+            status: AtomicU8::new(TASK_RUNNING),
+        }
+    }
+
+    fn spawn_task<F>(runtime: &TaskRuntime, run: F) -> TaskHandle
+    where
+        F: FnOnce() -> KuResult<Value> + Send + 'static,
+    {
+        runtime.spawn(run).expect("ordinary test task admission")
+    }
+
+    fn assert_cancelled(error: KuError) {
+        assert_eq!(
+            error.runtime_termination().map(|context| context.reason),
+            Some(TerminationReason::Cancelled),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn task_submission_fast_path_stays_set_after_completed_owner_is_dropped() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        assert!(!runtime.has_task_submissions());
+        // Admission rejection still creates a completed Task owning its error.
+        let task = runtime.spawn(|| Ok(Value::Null)).unwrap();
+        assert!(runtime.has_task_submissions());
+        assert!(task.state.is_terminal());
+        assert_eq!(runtime.inner.active_tasks.load(Ordering::Acquire), 0);
+        drop(task);
+        assert!(runtime.has_task_submissions());
+    }
+
+    // Track destruction using actual move-only payload ownership, without a
+    // running job, an OS worker, a real socket, or a timing-dependent allocator.
+    fn tracked_owned_result() -> (KuResult<Value>, Weak<TaskState>, Weak<TaskRuntimeInner>) {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let weak_state = Arc::downgrade(&state);
+        let weak_runtime = Arc::downgrade(&runtime.inner);
+        let result = Ok(Value::Result {
+            ok: true,
+            value: Box::new(Value::Array(vec![
+                Value::String("owned completion".repeat(128)),
+                Value::Task(TaskHandle {
+                    id: 99,
+                    owner: Arc::new(TaskOwnerLease {
+                        state: Arc::downgrade(&state),
+                    }),
+                    state,
+                    runtime,
+                }),
+            ])),
+        });
+        (result, weak_state, weak_runtime)
+    }
+
+    fn handle_for_state(runtime: &TaskRuntime, state: &Arc<TaskState>) -> TaskHandle {
+        TaskHandle {
+            id: state.id,
+            state: Arc::clone(state),
+            runtime: runtime.clone(),
+            owner: Arc::new(TaskOwnerLease {
+                state: Arc::downgrade(state),
+            }),
+        }
+    }
+
+    struct OrderedOwnerDrop {
+        label: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+        listener_address: Option<std::net::SocketAddr>,
+    }
+
+    impl Drop for OrderedOwnerDrop {
+        fn drop(&mut self) {
+            if let Some(parent) = self.pending.as_ref().and_then(Weak::upgrade) {
+                assert_eq!(parent.status_name(), "cancelling");
+                assert!(!parent.accounting_finished.load(Ordering::Acquire));
+                assert!(parent.result().unwrap().is_none());
+                let runtime = parent.runtime.upgrade().unwrap();
+                assert_eq!(runtime.active_tasks.load(Ordering::Acquire), 1);
+                assert_eq!(runtime.finished_tasks.load(Ordering::Acquire), 0);
+            }
+            if let Some(address) = self.listener_address {
+                assert!(
+                    std::net::TcpListener::bind(address).is_err(),
+                    "the following listener must remain open until this Task payload is dropped"
+                );
+            }
+            self.events.lock().unwrap().push(self.label);
+        }
+    }
+
+    fn completed_with_value(runtime: &TaskRuntime, value: Value) -> TaskHandle {
+        let state = Arc::new(completion_state());
+        state.complete(state.id, Ok(value));
+        handle_for_state(runtime, &state)
+    }
+
+    fn single_task_leaf_wrapper(value: Value, kind: usize) -> Value {
+        match kind % 5 {
+            0 => Value::Result {
+                ok: kind < 5,
+                value: Box::new(value),
+            },
+            1 => Value::Array(vec![value]),
+            2 => Value::Object(HashMap::from([("payload".into(), value)])),
+            3 => Value::Struct {
+                name: "Holder".into(),
+                fields: HashMap::from([("payload".into(), value)]),
+            },
+            _ => Value::Enum {
+                name: "Choice".into(),
+                variant: "Only".into(),
+                fields: vec![value],
+            },
+        }
+    }
+
+    fn single_task_leaf_wrappers(mut value: Value, depth: usize) -> Value {
+        for kind in 0..depth {
+            value = single_task_leaf_wrapper(value, kind);
+        }
+        value
+    }
+
+    #[test]
+    fn owner_single_task_leaf_classifier_is_readonly_and_rejects_other_shapes() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let new_task = || Value::Task(handle_for_state(&runtime, &Arc::new(completion_state())));
+        for kind in 0..10 {
+            let leaf = Arc::new(completion_state());
+            let value =
+                single_task_leaf_wrapper(Value::Task(handle_for_state(&runtime, &leaf)), kind);
+            let strong = Arc::strong_count(&leaf);
+            assert!(has_single_task_leaf(&value));
+            assert_eq!(Arc::strong_count(&leaf), strong);
+            assert!(!leaf.owner_released.load(Ordering::Acquire));
+            drop_owner_result_synchronously(Ok(value));
+            assert!(leaf.owner_released.load(Ordering::Acquire));
+        }
+        let nested = single_task_leaf_wrappers(new_task(), 31);
+        assert!(has_single_task_leaf(&nested));
+        drop_owner_result_synchronously(Ok(nested));
+        let mut sparse = HashMap::with_capacity(4_096);
+        sparse.insert("only".into(), new_task());
+        let sparse = Value::Object(sparse);
+        assert!(has_single_task_leaf(&sparse));
+        drop_owner_result_synchronously(Ok(sparse));
+
+        let mut captures = crate::env::Env::new();
+        captures
+            .define_owned("captured".into(), new_task(), false, Span::default())
+            .unwrap();
+        let function = Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: Vec::new(),
+            captures,
+            self_name: None,
+            is_async: false,
+        };
+        let borrowed_root = Arc::new(new_task());
+        let borrowed = Value::Borrowed(crate::value::BorrowedValue::new(&borrowed_root));
+        for value in [
+            Value::Null,
+            Value::Int(1),
+            Value::Result {
+                ok: false,
+                value: Box::new(Value::String("plain error".into())),
+            },
+            Value::Array(Vec::new()),
+            Value::Array(vec![new_task(), Value::String("sibling".into())]),
+            Value::Object(HashMap::new()),
+            Value::Object(HashMap::from([
+                ("first".into(), new_task()),
+                ("second".into(), new_task()),
+            ])),
+            Value::Struct {
+                name: "Empty".into(),
+                fields: HashMap::new(),
+            },
+            Value::Struct {
+                name: "Pair".into(),
+                fields: HashMap::from([
+                    ("first".into(), new_task()),
+                    ("second".into(), Value::Int(0)),
+                ]),
+            },
+            Value::Enum {
+                name: "Choice".into(),
+                variant: "None".into(),
+                fields: Vec::new(),
+            },
+            Value::Enum {
+                name: "Choice".into(),
+                variant: "Pair".into(),
+                fields: vec![new_task(), new_task()],
+            },
+            single_task_leaf_wrappers(function, 7),
+            single_task_leaf_wrappers(borrowed, 7),
+            Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(-1)),
+        ] {
+            assert!(!has_single_task_leaf(&value));
+            drop_owner_result_synchronously(Ok(value));
+        }
+        drop(borrowed_root);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+    }
+
+    #[test]
+    fn plain_owner_leaf_classification_keeps_buffers_and_task_queue_contract() {
+        fn string_backing(mut value: &Value) -> Option<(usize, usize)> {
+            loop {
+                value = match value {
+                    Value::String(text) => return Some((text.as_ptr() as usize, text.capacity())),
+                    Value::Result { value, .. } => value,
+                    Value::Array(values) | Value::Enum { fields: values, .. } => &values[0],
+                    Value::Object(fields) | Value::Struct { fields, .. } => {
+                        fields.values().next().unwrap()
+                    }
+                    _ => return None,
+                };
+            }
+        }
+
+        for leaf in [
+            Value::Int(i64::MIN),
+            Value::Float(f64::from_bits(1)),
+            Value::Bool(true),
+            Value::Null,
+            Value::String(String::with_capacity(4_096)),
+        ] {
+            let value = single_task_leaf_wrappers(leaf, 31);
+            let before = string_backing(&value);
+            assert!(has_single_plain_leaf(&value));
+            assert!(!has_single_task_leaf(&value));
+            // Classification borrows the original allocation; it neither
+            // takes the sole result nor creates a logical Task owner.
+            assert!(has_single_plain_leaf(&value));
+            assert_eq!(string_backing(&value), before);
+            drop_owner_result_synchronously(Ok(value));
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        }
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let task = handle_for_state(&runtime, &Arc::new(completion_state()));
+        let root = Arc::new(Value::Int(7));
+        let mut captures = crate::env::Env::new();
+        captures
+            .define_owned("captured".into(), Value::Int(3), false, Span::default())
+            .unwrap();
+        for value in [
+            Value::Array(Vec::new()),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Object(HashMap::from([
+                ("first".into(), Value::Int(1)),
+                ("second".into(), Value::Int(2)),
+            ])),
+            Value::Task(task),
+            Value::Borrowed(crate::value::BorrowedValue::new(&root)),
+            Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(-1)),
+            Value::Function {
+                params: Vec::new(),
+                param_modes: Vec::new(),
+                body: Vec::new(),
+                captures,
+                self_name: None,
+                is_async: false,
+            },
+        ] {
+            let value = single_task_leaf_wrappers(value, 7);
+            assert!(!has_single_plain_leaf(&value));
+            drop_owner_result_synchronously(Ok(value));
+        }
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+    }
+
+    fn ordered_completed_owner(
+        runtime: &TaskRuntime,
+        label: &'static str,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+        listener_address: Option<std::net::SocketAddr>,
+    ) -> TaskHandle {
+        let leaf = Arc::new(completion_state());
+        let probe = OrderedOwnerDrop {
+            label,
+            events: Arc::clone(events),
+            pending,
+            listener_address,
+        };
+        leaf.install_run(Box::new(move || {
+            drop(probe);
+            Ok(Value::Null)
+        }));
+        completed_with_value(runtime, Value::Task(handle_for_state(runtime, &leaf)))
+    }
+
+    fn ordered_completed_fork(
+        runtime: &TaskRuntime,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+    ) -> Value {
+        let first = ordered_completed_owner(runtime, "A1", events, pending.clone(), None);
+        let second = ordered_completed_owner(runtime, "A2", events, pending.clone(), None);
+        let a = completed_with_value(
+            runtime,
+            Value::Array(vec![Value::Task(first), Value::Task(second)]),
+        );
+        let b = ordered_completed_owner(runtime, "B1", events, pending, None);
+        Value::Array(vec![Value::Task(a), Value::Task(b)])
+    }
+
+    #[test]
+    fn owner_result_fork_preserves_nested_vec_depth_first_drop_order() {
+        for wrapped in [false, true] {
+            for explicit in [false, true] {
+                let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let payload = ordered_completed_fork(&runtime, &events, None);
+                let payload = if wrapped {
+                    Value::Result {
+                        ok: true,
+                        value: Box::new(payload),
+                    }
+                } else {
+                    payload
+                };
+                let owner = completed_with_value(&runtime, payload);
+                let context = CancellationContext::new(TerminationReason::Cancelled);
+                let _cleanup = CleanupGuard::enter(context);
+                if explicit {
+                    owner.release_scope_owner(context);
+                }
+                drop(owner);
+                assert_eq!(*events.lock().unwrap(), ["A1", "A2", "B1"]);
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            }
+        }
+    }
+
+    #[test]
+    fn owner_result_fork_queued_capture_finishes_before_parent_ack() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        initial.queue_consumed.store(true, Ordering::Release);
+        // This kernel fixture represents an already-retired claimant node.
+        initial
+            .execution_queue_retired
+            .store(true, Ordering::SeqCst);
+        let pending = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(pending.id, Arc::downgrade(&pending));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captures = ordered_completed_fork(&runtime, &events, Some(Arc::downgrade(&pending)));
+        let ran = Arc::new(AtomicBool::new(false));
+        let child_ran = Arc::clone(&ran);
+        pending.install_run(Box::new(move || {
+            child_ran.store(true, Ordering::Release);
+            drop(captures);
+            Ok(Value::Null)
+        }));
+        let outer =
+            completed_with_value(&runtime, Value::Task(handle_for_state(&runtime, &pending)));
+        let context = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        let _cleanup = CleanupGuard::enter(context);
+        drop(outer);
+        assert_eq!(*events.lock().unwrap(), ["A1", "A2", "B1"]);
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(pending.cancellation(), Some(context));
+        assert_eq!(pending.status_name(), "timed_out");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.registered_tasks, 0);
+    }
+
+    #[test]
+    fn owner_result_fork_preserves_task_before_listener_release() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener_id = crate::runtime::http_listener_registry::insert(listener).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let task = ordered_completed_owner(&runtime, "task", &events, None, Some(address));
+        let owner = completed_with_value(
+            &runtime,
+            Value::Array(vec![
+                Value::Task(task),
+                Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(
+                    listener_id,
+                )),
+            ]),
+        );
+        drop(owner);
+        assert_eq!(*events.lock().unwrap(), ["task"]);
+        std::net::TcpListener::bind(address).expect("listener closes after the preceding Task");
+        assert!(
+            crate::runtime::http_listener_registry::take(listener_id, Span::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn owner_result_fork_panic_restores_mode_and_allows_next_independent_release() {
+        struct PanickingCapture {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for PanickingCapture {
+            fn drop(&mut self) {
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                self.events.lock().unwrap().push("A");
+                panic!("intentional queued capture destructor panic");
+            }
+        }
+
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let leaf = Arc::new(completion_state());
+        let capture = PanickingCapture {
+            events: Arc::clone(&events),
+        };
+        leaf.install_run(Box::new(move || {
+            drop(capture);
+            Ok(Value::Null)
+        }));
+        let a = completed_with_value(&runtime, Value::Task(handle_for_state(&runtime, &leaf)));
+        let b = ordered_completed_owner(&runtime, "B", &events, None, None);
+        let outer =
+            completed_with_value(&runtime, Value::Array(vec![Value::Task(a), Value::Task(b)]));
+        let context = CancellationContext::new(TerminationReason::Cancelled);
+        let _cleanup = CleanupGuard::enter(context);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(outer))).is_err());
+        assert_eq!(*events.lock().unwrap(), ["A", "B"]);
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        drop(ordered_completed_owner(&runtime, "C", &events, None, None));
+        assert_eq!(*events.lock().unwrap(), ["A", "B", "C"]);
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+    }
+
+    #[test]
+    fn completed_owner_result_chain_drains_on_real_worker_without_recursive_drop() {
+        const CHILD: &str = "KU_TASK_OWNER_RESULT_CHAIN_CHILD";
+        const COMPLETED: &str = "completed owner result chain regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::completed_owner_result_chain_drains_on_real_worker_without_recursive_drop",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("completed owner cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "completed owner cleanup subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "completed owner cleanup subprocess did not finish its regression\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct CaptureAckProbe {
+            pending: Arc<Mutex<Option<Weak<TaskState>>>>,
+            observed: Arc<AtomicBool>,
+        }
+        impl Drop for CaptureAckProbe {
+            fn drop(&mut self) {
+                let pending = self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                assert_eq!(pending.status_name(), "cancelling");
+                assert!(!pending.accounting_finished.load(Ordering::Acquire));
+                assert!(pending.result().unwrap().is_none());
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
+        // Both direct and wrapped variants leave two cancelled queue nodes
+        // each for the sole worker to retire after this parent returns.
+        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 5);
+        let child_runtime = runtime.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            for wrapped in [false, true] {
+                for release_path in 0..4 {
+                    let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                    let leaf = Arc::new(completion_state());
+                    let capture_pending = Arc::new(Mutex::new(None));
+                    let capture_observed = Arc::new(AtomicBool::new(false));
+                    if release_path == 3 {
+                        let probe = CaptureAckProbe {
+                            pending: Arc::clone(&capture_pending),
+                            observed: Arc::clone(&capture_observed),
+                        };
+                        leaf.install_run(Box::new(move || {
+                            drop(probe);
+                            Ok(Value::Null)
+                        }));
+                    }
+                    let mut owner = handle_for_state(&inert, &leaf);
+                    let mut weak_states = Vec::with_capacity(16_384);
+                    for _ in 0..16_384 {
+                        let state = Arc::new(completion_state());
+                        weak_states.push(Arc::downgrade(&state));
+                        let payload = if wrapped {
+                            single_task_leaf_wrapper(Value::Task(owner), weak_states.len())
+                        } else {
+                            Value::Task(owner)
+                        };
+                        state.complete(state.id, Ok(payload));
+                        owner = handle_for_state(&inert, &state);
+                    }
+                    let context = CancellationContext {
+                        reason: TerminationReason::TimedOut,
+                        cleanup_deadline: Instant::now(),
+                    };
+                    if release_path >= 2 {
+                        // The only worker is this parent. Cancellation must drop
+                        // the queued capture before publishing its terminal ACK,
+                        // without running the child's continuation.
+                        let ran = Arc::new(AtomicBool::new(false));
+                        let child_ran = Arc::clone(&ran);
+                        let child = spawn_task(&child_runtime, move || {
+                            child_ran.store(true, Ordering::Release);
+                            Ok(Value::Task(owner))
+                        });
+                        let _cleanup = CleanupGuard::enter(context);
+                        let child_state = Arc::clone(&child.state);
+                        if release_path == 3 {
+                            *capture_pending.lock().unwrap() = Some(Arc::downgrade(&child_state));
+                            let outer = Arc::new(completion_state());
+                            let payload = if wrapped {
+                                single_task_leaf_wrappers(Value::Task(child), 5)
+                            } else {
+                                Value::Task(child)
+                            };
+                            outer.complete(outer.id, Ok(payload));
+                            drop(handle_for_state(&inert, &outer));
+                            assert!(capture_observed.load(Ordering::Acquire));
+                            assert!(outer.result().unwrap().is_none());
+                        } else {
+                            child.release_scope_owner(context);
+                            drop(child);
+                        }
+                        assert_eq!(child_state.status_name(), "timed_out");
+                        assert!(!ran.load(Ordering::Acquire));
+                        assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
+                    } else if release_path == 1 {
+                        let _cleanup = CleanupGuard::enter(context);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        assert_eq!(observer.status(), "completed");
+                        assert!(observer.state.result().unwrap().is_none());
+                        drop(observer);
+                        drop(owner);
+                    } else {
+                        let _cleanup = CleanupGuard::enter(context);
+                        drop(owner);
+                    }
+                    assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
+                    assert!(leaf.owner_released.load(Ordering::Acquire));
+                    assert_eq!(leaf.cancellation(), Some(context));
+                    assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                    assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                    assert_eq!(inert.snapshot().unwrap().active_tasks, 0);
+                }
+            }
+            done_tx.send(current_task_id()).unwrap();
+            Ok(Value::Null)
+        });
+        // No await/help runs on the parent while the deep cleanup executes.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            job.id()
+        );
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 5);
+        assert_eq!(snapshot.wait_edges, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn concurrent_scope_and_final_lease_release_detach_completed_result_once() {
+        for _ in 0..32 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+            let state = Arc::new(completion_state());
+            let owner = handle_for_state(&runtime, &state);
+            let release_state = Arc::clone(&state);
+            let (payload, payload_state, payload_runtime) = tracked_owned_result();
+            state.complete(state.id, payload);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release_barrier = Arc::clone(&barrier);
+            let context = CancellationContext::new(TerminationReason::Cancelled);
+            let release = thread::spawn(move || {
+                release_barrier.wait();
+                release_state.release_owner(context);
+            });
+            barrier.wait();
+            drop(owner);
+            release.join().unwrap();
+            assert!(payload_state.upgrade().is_none());
+            assert!(payload_runtime.upgrade().is_none());
+            assert!(state.result().unwrap().is_none());
+            assert!(state.owner_result_release.lock().unwrap().is_none());
+            assert_eq!(state.status_name(), "completed");
+            assert!(!state.request_cancel());
+        }
+    }
+
+    #[test]
+    fn deep_single_task_leaf_wrappers_and_losing_results_drop_on_real_worker() {
+        const CHILD: &str = "KU_TASK_SINGLE_LEAF_WRAPPER_CHILD";
+        const COMPLETED: &str = "single Task leaf wrapper regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::deep_single_task_leaf_wrappers_and_losing_results_drop_on_real_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("single leaf wrapper cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "single leaf wrapper subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "single leaf wrapper regression never reached its completion marker"
+            );
+            return;
+        }
+
+        struct DiscardProbe {
+            observed: Arc<Mutex<Vec<Option<CancellationContext>>>>,
+            parent: Option<Weak<TaskState>>,
+        }
+        impl Drop for DiscardProbe {
+            fn drop(&mut self) {
+                if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
+                    assert!(!parent.accounting_finished.load(Ordering::Acquire));
+                    let runtime = parent.runtime.upgrade().unwrap();
+                    assert_eq!(runtime.active_tasks.load(Ordering::Acquire), 1);
+                    assert_eq!(runtime.finished_tasks.load(Ordering::Acquire), 0);
+                }
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(current_cleanup_context());
+            }
+        }
+
+        let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            assert!(thread::current().name().unwrap().starts_with("ku-task-"));
+            for discard_path in 0..7 {
+                let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                let tracks_accounting = matches!(discard_path, 2 | 4 | 6);
+                let mut parent = completion_state();
+                if tracks_accounting {
+                    parent.runtime = Arc::downgrade(&inert.inner);
+                    parent.queue_consumed.store(true, Ordering::Release);
+                    // The fixture has no live runner or physical queue node.
+                    parent.execution_queue_retired.store(true, Ordering::SeqCst);
+                    inert.inner.active_tasks.store(1, Ordering::Release);
+                }
+                let parent = Arc::new(parent);
+                if tracks_accounting {
+                    inert
+                        .inner
+                        .states
+                        .lock()
+                        .unwrap()
+                        .insert(parent.id, Arc::downgrade(&parent));
+                }
+                let leaf = Arc::new(completion_state());
+                let weak_leaf = Arc::downgrade(&leaf);
+                let observed = Arc::new(Mutex::new(Vec::with_capacity(1)));
+                let probe = DiscardProbe {
+                    observed: Arc::clone(&observed),
+                    parent: tracks_accounting.then(|| Arc::downgrade(&parent)),
+                };
+                let ran = Arc::new(AtomicBool::new(false));
+                let child_ran = Arc::clone(&ran);
+                leaf.install_run(Box::new(move || {
+                    child_ran.store(true, Ordering::Release);
+                    drop(probe);
+                    Ok(Value::Null)
+                }));
+                let payload =
+                    single_task_leaf_wrappers(Value::Task(handle_for_state(&inert, &leaf)), 16_384);
+                let context = CancellationContext {
+                    reason: TerminationReason::TimedOut,
+                    cleanup_deadline: Instant::now(),
+                };
+                let _cleanup = CleanupGuard::enter(context);
+                match discard_path {
+                    0 => {
+                        parent.complete(parent.id, Ok(payload));
+                        drop(handle_for_state(&inert, &parent));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(parent.result().unwrap().is_none());
+                    }
+                    1 => {
+                        parent.complete(parent.id, Ok(payload));
+                        let owner = handle_for_state(&inert, &parent);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        drop(owner);
+                        assert_eq!(observer.status(), "completed");
+                        assert!(parent.result().unwrap().is_none());
+                        drop(observer);
+                    }
+                    2 => {
+                        assert!(parent.request_cancel_with(context));
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(parent.status_name(), "timed_out");
+                        assert_eq!(parent.cancellation(), Some(context));
+                    }
+                    3 => {
+                        parent.complete(parent.id, Ok(Value::Int(7)));
+                        parent.complete_with_status(parent.id, Ok(payload), Some(TASK_PANICKED));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(matches!(parent.result().unwrap(), Some(Ok(Value::Int(7)))));
+                    }
+                    4 => {
+                        let owner = handle_for_state(&inert, &parent);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(observer.status(), "timed_out");
+                        assert_eq!(parent.cancellation(), Some(context));
+                        assert!(parent.result().unwrap().is_none());
+                        drop(owner);
+                        drop(observer);
+                    }
+                    5 => {
+                        assert!(parent.request_cancel_with(context));
+                        let (send, receive) = mpsc::sync_channel(1);
+                        drop(receive);
+                        send_blocking_result(&send, Some(&parent), Ok(payload));
+                        assert_eq!(parent.cancellation(), Some(context));
+                    }
+                    _ => {
+                        // Reproduce release_owner's unlocked interval between
+                        // marking the owner released and requesting cancellation:
+                        // completion may win, but must discard the owned result.
+                        parent.owner_released.store(true, Ordering::Release);
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(!parent.request_cancel_with(context));
+                        assert!(parent.result().unwrap().is_none());
+                    }
+                }
+                assert_eq!(*observed.lock().unwrap(), [Some(context)]);
+                assert!(!ran.load(Ordering::Acquire));
+                assert!(leaf.owner_released.load(Ordering::Acquire));
+                assert_eq!(leaf.cancellation(), Some(context));
+                assert_eq!(leaf.status_name(), "timed_out");
+                assert!(parent.result.try_lock().is_ok());
+                if tracks_accounting {
+                    assert!(parent.accounting_finished.load(Ordering::Acquire));
+                    let snapshot = inert.snapshot().unwrap();
+                    assert_eq!(snapshot.active_tasks, 0);
+                    assert_eq!(snapshot.finished_tasks, 1);
+                    assert_eq!(snapshot.registered_tasks, 0);
+                }
+                drop(leaf);
+                assert!(weak_leaf.upgrade().is_none());
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            }
+            done_tx.send(current_task_id()).unwrap();
+            Ok(Value::Null)
+        });
+        // The parent cannot execute cleanup through await/help before success.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            job.id()
+        );
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(runtime.snapshot().unwrap().active_tasks, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn deep_plain_owner_results_drop_on_worker_and_reuse_same_worker() {
+        const CHILD: &str = "KU_TASK_PLAIN_OWNER_LEAF_CHILD";
+        const COMPLETED: &str = "plain owner leaf regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::deep_plain_owner_results_drop_on_worker_and_reuse_same_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("plain leaf cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "plain leaf cleanup subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "plain leaf cleanup never reached its completion marker"
+            );
+            return;
+        }
+
+        let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 2);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            assert!(thread::current().name().unwrap().starts_with("ku-task-"));
+            for kind in 0..5 {
+                for release_path in 0..6 {
+                    let leaf = match kind {
+                        0 => Value::String("plain owned buffer 中文\0".repeat(256)),
+                        1 => Value::Int(i64::MIN),
+                        2 => Value::Float(f64::from_bits(1)),
+                        3 => Value::Bool(true),
+                        _ => Value::Null,
+                    };
+                    let payload = single_task_leaf_wrappers(leaf, 16_384);
+                    assert!(!has_single_task_leaf(&payload));
+                    let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                    let state = Arc::new(completion_state());
+                    let weak_state = Arc::downgrade(&state);
+                    let mut owner = Some(handle_for_state(&inert, &state));
+                    let context = CancellationContext {
+                        reason: TerminationReason::TimedOut,
+                        cleanup_deadline: Instant::now(),
+                    };
+                    {
+                        let _cleanup = CleanupGuard::enter(context);
+                        match release_path {
+                            0 => {
+                                state.complete(state.id, Ok(payload));
+                                drop(owner.take());
+                                assert_eq!(state.status_name(), "completed");
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            1 => {
+                                state.complete(state.id, Ok(payload));
+                                owner.as_ref().unwrap().release_scope_owner(context);
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            2 => {
+                                assert!(state.request_cancel_with(context));
+                                state.complete(state.id, Ok(payload));
+                                assert_eq!(state.status_name(), "timed_out");
+                                assert_eq!(state.cancellation(), Some(context));
+                            }
+                            3 => {
+                                state.complete(state.id, Ok(Value::Int(7)));
+                                state.complete_with_status(
+                                    state.id,
+                                    Ok(payload),
+                                    Some(TASK_PANICKED),
+                                );
+                                assert_eq!(state.status_name(), "completed");
+                                assert!(matches!(state.result().unwrap(), Some(Ok(Value::Int(7)))));
+                            }
+                            4 => {
+                                owner.as_ref().unwrap().release_scope_owner(context);
+                                state.complete(state.id, Ok(payload));
+                                assert_eq!(state.status_name(), "timed_out");
+                                assert_eq!(state.cancellation(), Some(context));
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            _ => {
+                                assert!(state.request_cancel_with(context));
+                                let (send, receive) = mpsc::sync_channel(1);
+                                drop(receive);
+                                send_blocking_result(&send, Some(&state), Ok(payload));
+                                assert_eq!(state.cancellation(), Some(context));
+                            }
+                        }
+                        drop(owner.take());
+                        assert!(state.owner_cleanup_done.load(Ordering::Acquire));
+                        assert!(state.owner_result_release.lock().unwrap().is_none());
+                        assert!(state.result.try_lock().is_ok());
+                        assert_eq!(current_cleanup_context(), Some(context));
+                    }
+                    assert_eq!(current_cleanup_context(), None);
+                    drop(state);
+                    assert!(weak_state.upgrade().is_none());
+                    assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                    assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                }
+            }
+            done_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Null)
+        });
+        // Host receipt waiting does not let await/help execute either body.
+        let worker = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        let (healthy_tx, healthy_rx) = mpsc::sync_channel(1);
+        let healthy = spawn_task(&runtime, move || {
+            assert_eq!(current_cleanup_context(), None);
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            healthy_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Int(19))
+        });
+        assert_eq!(
+            healthy_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            worker
+        );
+        assert_eq!(healthy.await_result().unwrap(), Value::Int(19));
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 2);
+        assert_eq!(snapshot.wait_edges, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn concurrent_single_task_leaf_scope_and_final_lease_release_detach_once() {
+        for _ in 0..32 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+            let state = Arc::new(completion_state());
+            let owner = handle_for_state(&runtime, &state);
+            let events = Arc::new(Mutex::new(Vec::with_capacity(1)));
+            let leaf = ordered_completed_owner(&runtime, "leaf", &events, None, None);
+            state.complete(
+                state.id,
+                Ok(single_task_leaf_wrappers(Value::Task(leaf), 64)),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release_barrier = Arc::clone(&barrier);
+            let release_state = Arc::clone(&state);
+            let context = CancellationContext {
+                reason: TerminationReason::TimedOut,
+                cleanup_deadline: Instant::now(),
+            };
+            let release = thread::spawn(move || {
+                release_barrier.wait();
+                release_state.release_owner(context);
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            });
+            let _cleanup = CleanupGuard::enter(context);
+            barrier.wait();
+            drop(owner);
+            release.join().unwrap();
+            assert_eq!(*events.lock().unwrap(), ["leaf"]);
+            assert!(state.result().unwrap().is_none());
+            assert!(state.owner_result_release.lock().unwrap().is_none());
+            assert_eq!(state.status_name(), "completed");
+            assert!(!state.request_cancel());
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        }
+    }
+
+    #[test]
+    fn linear_discard_panic_restores_outer_drain_and_next_owner_cleanup() {
+        struct PanickingProbe {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for PanickingProbe {
+            fn drop(&mut self) {
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                self.events.lock().unwrap().push("panic");
+                panic!("intentional single-leaf discard destructor panic");
+            }
+        }
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let events = Arc::new(Mutex::new(Vec::with_capacity(2)));
+        let leaf = Arc::new(completion_state());
+        let probe = PanickingProbe {
+            events: Arc::clone(&events),
+        };
+        leaf.install_run(Box::new(move || {
+            drop(probe);
+            Ok(Value::Null)
+        }));
+        let payload = single_task_leaf_wrappers(Value::Task(handle_for_state(&runtime, &leaf)), 31);
+        let previous = OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(true));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            drop_owner_result_synchronously(Ok(payload));
+        }));
+        let restored_outer = OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get);
+        OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(previous));
+        assert!(panic.is_err());
+        assert!(restored_outer);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        drop(ordered_completed_owner(
+            &runtime, "next", &events, None, None,
+        ));
+        assert_eq!(*events.lock().unwrap(), ["panic", "next"]);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+    }
+
+    #[test]
+    fn last_owner_releases_completed_payload_while_scheduler_state_survives() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let transferred = owner.clone();
+        let (payload, payload_state, payload_runtime) = tracked_owned_result();
+        state.complete(state.id, payload);
+        drop(owner);
+        assert!(payload_state.upgrade().is_some());
+        assert!(!state.owner_released.load(Ordering::Acquire));
+        drop(transferred);
+        assert!(payload_state.upgrade().is_none());
+        assert!(payload_runtime.upgrade().is_none());
+        assert!(state.result().unwrap().is_none());
+        assert_eq!(state.status_name(), "completed");
+        assert!(!state.request_cancel());
+    }
+
+    #[test]
+    fn explicit_scope_release_drops_success_and_failure_payloads_with_observer_alive() {
+        for ok in [true, false] {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+            let state = Arc::new(completion_state());
+            let owner = handle_for_state(&runtime, &state);
+            let observer = owner.clone();
+            let (payload, payload_state, payload_runtime) = tracked_owned_result();
+            let mut payload = payload.unwrap();
+            let Value::Result { ok: result_ok, .. } = &mut payload else {
+                unreachable!();
+            };
+            *result_ok = ok;
+            state.complete(state.id, Ok(payload));
+            let context = CancellationContext::new(TerminationReason::Cancelled);
+            owner.release_scope_owner(context);
+            assert!(payload_state.upgrade().is_none());
+            assert!(payload_runtime.upgrade().is_none());
+            assert!(state.result().unwrap().is_none());
+            assert_eq!(observer.id(), state.id);
+            assert_eq!(observer.status(), "completed");
+
+            // Only a non-owning internal alias remains after scope exit. It
+            // cannot recover the released payload through ordinary await.
+            let Value::Result { ok: false, value } = observer.await_result().unwrap() else {
+                panic!("released scope owner cannot be awaited through an observer");
+            };
+            let Value::Object(fields) = *value else {
+                panic!("expected already_awaited task error");
+            };
+            assert_eq!(
+                fields.get("code"),
+                Some(&Value::String("already_awaited".into()))
+            );
+            owner.release_scope_owner(context);
+            drop(owner);
+            drop(observer);
+            assert!(state.result().unwrap().is_none());
+            assert_eq!(state.status_name(), "completed");
+        }
+    }
+
+    #[test]
+    fn explicit_scope_release_discards_late_completion_with_observer_alive() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let observer = owner.clone();
+        let context = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        owner.release_scope_owner(context);
+        assert_eq!(state.cancellation(), Some(context));
+        for _ in 0..2 {
+            let (payload, payload_state, payload_runtime) = tracked_owned_result();
+            state.complete(state.id, payload);
+            assert!(payload_state.upgrade().is_none());
+            assert!(payload_runtime.upgrade().is_none());
+            assert!(state.result().unwrap().is_none());
+            assert_eq!(state.status_name(), "timed_out");
+        }
+        observer.release_scope_owner(context);
+        drop(owner);
+        assert_eq!(observer.id(), state.id);
+        drop(observer);
+        assert_eq!(state.cancellation(), Some(context));
+        assert!(state.result().unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_await_moves_payload_and_taken_terminal_cannot_be_cancelled() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let (payload, payload_state, payload_runtime) = tracked_owned_result();
+        state.complete(state.id, payload);
+        let taken = owner.await_result().expect("completed owned payload");
+        assert!(state.result().unwrap().is_none());
+        assert!(!state.request_cancel());
+        assert_eq!(state.status_name(), "completed");
+        drop(owner);
+        assert!(payload_state.upgrade().is_some());
+        drop(taken);
+        assert!(payload_state.upgrade().is_none());
+        assert!(payload_runtime.upgrade().is_none());
+    }
+
+    #[test]
+    fn await_pending_observation_then_completion_delivers_owned_payload_once() {
+        let timeout = Duration::from_secs(2);
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let payload = "owned result".repeat(1024);
+        let allocation = payload.as_ptr() as usize;
+        let (complete_tx, complete_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker = thread::spawn(move || {
+            complete_rx.recv_timeout(timeout).unwrap();
+            worker_state.complete(worker_state.id, Ok(Value::String(payload)));
+            done_tx.send(()).unwrap();
+        });
+        // This is the first await's claim and its first pending observation.
+        // Force completion before the awaiting side examines that observation.
+        assert!(state.claim_await());
+        let pending = state.observe_result(true).unwrap();
+        complete_tx.send(()).unwrap();
+        done_rx.recv_timeout(timeout).unwrap();
+        worker.join().unwrap();
+        assert!(pending.0.is_none());
+        assert!(
+            !pending.1,
+            "completion cannot rewrite the earlier pending observation"
+        );
+        assert!(state.is_terminal());
+        let delivered = runtime.await_task_until(&owner, None, true).unwrap();
+        let Value::String(delivered) = delivered else {
+            panic!("the first await must deliver the actual owned result");
+        };
+        assert_eq!(
+            delivered.as_ptr() as usize,
+            allocation,
+            "await must move, not clone"
+        );
+        assert!(state.result().unwrap().is_none());
+        let Value::Result { ok: false, value } = owner.await_result().unwrap() else {
+            panic!("only the second await is already_awaited");
+        };
+        let Value::Object(fields) = *value else {
+            panic!("expected structured task error");
+        };
+        assert_eq!(
+            fields.get("code"),
+            Some(&Value::String("already_awaited".into()))
+        );
+    }
+
+    #[test]
+    fn diagnostic_peek_after_pending_observation_does_not_consume_completion() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let pending = state.observe_result(false).unwrap();
+        let payload = "peek remains nonconsuming".repeat(128);
+        let allocation = payload.as_ptr();
+        state.complete(state.id, Ok(Value::String(payload)));
+        assert!(pending.0.is_none());
+        assert!(!pending.1);
+        let Value::String(peeked) = owner.await_timeout(Duration::ZERO).unwrap() else {
+            panic!("diagnostic peek must see the completed payload");
+        };
+        assert_ne!(
+            peeked.as_ptr(),
+            allocation,
+            "peek retains its internal clone contract"
+        );
+        assert!(!state.awaited.load(Ordering::Acquire));
+        let Value::String(delivered) = owner.await_result().unwrap() else {
+            panic!("ordinary await must still own the original payload");
+        };
+        assert_eq!(delivered.as_ptr(), allocation);
+        assert!(state.result().unwrap().is_none());
+    }
+
+    #[test]
+    fn cancellation_reason_is_first_winner_and_deadline_only_shortens() {
+        let state = completion_state();
+        let now = Instant::now();
+        let first = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: now + Duration::from_secs(1),
+        };
+        assert!(state.request_cancel_with(first));
+        assert!(!state.request_cancel_with(CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: now,
+        }));
+        assert!(!state.request_cancel_with(CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: now + Duration::from_secs(5),
+        }));
+        state.complete(state.id, Ok(Value::String("late".into())));
+        assert_eq!(state.status_name(), "timed_out");
+        assert_eq!(
+            state
+                .result()
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .runtime_termination(),
+            Some(CancellationContext {
+                reason: TerminationReason::TimedOut,
+                cleanup_deadline: now,
+            })
+        );
+    }
+
+    #[test]
+    fn nested_cleanup_preserves_deadline_and_rejects_new_task_operations() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        let now = Instant::now();
+        let outer = CleanupGuard::enter(CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: now + Duration::from_secs(1),
+        });
+        {
+            let _inner = CleanupGuard::enter(CancellationContext {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: now,
+            });
+            assert_eq!(current_cleanup_context().unwrap().cleanup_deadline, now);
+        }
+        let effective = current_cleanup_context().unwrap();
+        assert_eq!(effective.reason, TerminationReason::TimedOut);
+        assert_eq!(effective.cleanup_deadline, now);
+        assert_eq!(
+            CancellationContext::new(TerminationReason::Cancelled),
+            effective
+        );
+        let built = AtomicBool::new(false);
+        let error = runtime
+            .spawn_deferred(|| {
+                built.store(true, Ordering::Release);
+                || Ok(Value::Null)
+            })
+            .expect_err("cleanup cannot construct a task");
+        assert_eq!(error.runtime_termination(), Some(effective));
+        assert!(!built.load(Ordering::Acquire));
+        assert_eq!(
+            owner.await_result().unwrap_err().runtime_termination(),
+            Some(effective)
+        );
+        assert_eq!(
+            runtime
+                .run_blocking(
+                    || panic!("cleanup submitted blocking work"),
+                    Span::default()
+                )
+                .unwrap_err()
+                .runtime_termination(),
+            Some(effective)
+        );
+        assert_eq!(runtime.snapshot().unwrap().total_submissions, 0);
+        assert!(!state.awaited.load(Ordering::Acquire));
+        drop(outer);
+        assert!(current_cleanup_context().is_none());
+    }
+
+    #[test]
+    fn expired_cleanup_broadcasts_all_children_before_counting_one_timeout() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let first = Arc::new(completion_state());
+        let second = Arc::new(completion_state());
+        let handles = [
+            handle_for_state(&runtime, &first),
+            handle_for_state(&runtime, &second),
+        ];
+        let context = CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: Instant::now(),
+        };
+        let error = runtime
+            .cancel_handles_and_wait(&handles, context)
+            .unwrap_err();
+        assert_eq!(error.runtime_termination(), Some(context));
+        assert_eq!(first.cancellation(), Some(context));
+        assert_eq!(second.cancellation(), Some(context));
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.cleanup_timeouts, 1);
+        assert_eq!(snapshot.cleanup_unfinished_tasks, 2);
+    }
+
+    #[test]
+    fn single_worker_parent_cancels_queued_child_without_executing_child() {
+        let timeout = Duration::from_secs(2);
+        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 4);
+        let child_runtime = runtime.clone();
+        let (cleaned_tx, cleaned_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let executed = Arc::new(AtomicBool::new(false));
+        let child_executed = Arc::clone(&executed);
+        let (payload, payload_state, payload_runtime) = tracked_owned_result();
+        let parent = spawn_task(&runtime, move || {
+            let child = child_runtime.spawn(move || {
+                child_executed.store(true, Ordering::Release);
+                payload
+            })?;
+            let context = CancellationContext::new(TerminationReason::Cancelled);
+            child_runtime.cancel_handles_and_wait(std::slice::from_ref(&child), context)?;
+            assert_eq!(child.status(), "cancelled");
+            cleaned_tx.send(child_runtime.snapshot()?).unwrap();
+            release_rx.recv_timeout(timeout).expect("release parent");
+            Ok(Value::Null)
+        });
+        let snapshot = cleaned_rx
+            .recv_timeout(timeout)
+            .expect("queued child cleanup");
+        assert!(!executed.load(Ordering::Acquire));
+        assert!(payload_state.upgrade().is_none());
+        assert!(payload_runtime.upgrade().is_none());
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.queued_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.cleanup_timeouts, 0);
+        release_tx.send(()).unwrap();
+        assert_eq!(parent.await_result().unwrap(), Value::Null);
+        runtime
+            .cancel_all_and_wait(timeout)
+            .expect("drain queue tombstone");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.accepted_submissions, 2);
+        assert_eq!(snapshot.finished_tasks, 2);
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.queued_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+    }
+
+    #[test]
+    fn dropping_queued_owner_releases_frame_before_worker_is_available() {
+        let timeout = Duration::from_secs(2);
+        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 4);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let blocker = spawn_task(&runtime, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(timeout).expect("release blocker");
+            Ok(Value::Null)
+        });
+        started_rx.recv_timeout(timeout).expect("worker blocked");
+        let (payload, payload_state, payload_runtime) = tracked_owned_result();
+        let child = spawn_task(&runtime, move || payload);
+        let scheduler_observer = Arc::clone(&child.state);
+        drop(child);
+        assert!(payload_state.upgrade().is_none());
+        assert!(payload_runtime.upgrade().is_none());
+        assert_eq!(scheduler_observer.status_name(), "cancelled");
+        assert!(scheduler_observer.result().unwrap().is_none());
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 0);
+        release_tx.send(()).unwrap();
+        blocker.await_result().unwrap();
+        runtime.cancel_all_and_wait(timeout).unwrap();
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 2);
+    }
+
+    #[test]
+    fn queued_claim_cancel_race_drops_capture_once() {
+        struct DropProbe {
+            tx: mpsc::SyncSender<()>,
+        }
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.tx.send(()).unwrap();
+            }
+        }
+        let timeout = Duration::from_secs(2);
+        for _ in 0..32 {
+            let state = Arc::new(completion_state());
+            state.status.store(TASK_PENDING, Ordering::Release);
+            let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+            let probe = DropProbe { tx: dropped_tx };
+            state.install_run(Box::new(move || {
+                drop(probe);
+                Ok(Value::Int(7))
+            }));
+            let (worker_start_tx, worker_start_rx) = mpsc::sync_channel(1);
+            let (cancel_start_tx, cancel_start_rx) = mpsc::sync_channel(1);
+            let (worker_done_tx, worker_done_rx) = mpsc::sync_channel(1);
+            let (cancel_done_tx, cancel_done_rx) = mpsc::sync_channel(1);
+            let worker_state = Arc::clone(&state);
+            let worker = thread::spawn(move || {
+                worker_start_rx.recv_timeout(timeout).unwrap();
+                if let Some(run) = worker_state.claim_run() {
+                    let TaskStart::Callback(run) = run else {
+                        panic!("this callback race fixture must claim its callback start");
+                    };
+                    worker_state.complete(worker_state.id, run());
+                }
+                worker_done_tx.send(()).unwrap();
+            });
+            let cancel_state = Arc::clone(&state);
+            let canceller = thread::spawn(move || {
+                cancel_start_rx.recv_timeout(timeout).unwrap();
+                cancel_done_tx.send(cancel_state.request_cancel()).unwrap();
+            });
+            worker_start_tx.send(()).unwrap();
+            cancel_start_tx.send(()).unwrap();
+            worker_done_rx.recv_timeout(timeout).unwrap();
+            let cancelled = cancel_done_rx.recv_timeout(timeout).unwrap();
+            worker.join().unwrap();
+            canceller.join().unwrap();
+            dropped_rx.recv_timeout(timeout).unwrap();
+            assert!(matches!(
+                dropped_rx.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
+            let result = state.result().unwrap().unwrap();
+            if cancelled {
+                assert_cancelled(result.unwrap_err());
+                assert_eq!(state.status_name(), "cancelled");
+            } else {
+                assert_eq!(result.unwrap(), Value::Int(7));
+                assert_eq!(state.status_name(), "completed");
+            }
+        }
+    }
+
+    #[test]
+    fn consumed_cancelled_queue_node_stays_active_until_frame_drop_finishes() {
+        struct PausedDrop {
+            state: Weak<TaskState>,
+            entered: mpsc::SyncSender<bool>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for PausedDrop {
+            fn drop(&mut self) {
+                let unlocked = self.state.upgrade().unwrap().result.try_lock().is_ok();
+                self.entered.send(unlocked).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        }
+        let timeout = Duration::from_secs(2);
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        initial.status.store(TASK_PENDING, Ordering::Release);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let probe = PausedDrop {
+            state: Arc::downgrade(&state),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        state.install_run(Box::new(move || {
+            drop(probe);
+            Ok(Value::Null)
+        }));
+        let cancel_state = Arc::clone(&state);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let canceller = thread::spawn(move || {
+            done_tx.send(cancel_state.request_cancel()).unwrap();
+        });
+        assert!(
+            entered_rx.recv_timeout(timeout).unwrap(),
+            "drop held result lock"
+        );
+        // Reproduce a worker consuming the now-empty queue node while its
+        // canceller is still in frame destruction; no user job is run here.
+        assert!(state.claim_run().is_none());
+        finish_task_job(&runtime.inner, &state);
+        assert_eq!(runtime.snapshot().unwrap().active_tasks, 1);
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 0);
+        assert_eq!(state.status_name(), "cancelling");
+        assert!(state.execution_queue_retired.load(Ordering::Acquire));
+        assert!(!state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(!state.accounting_done.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        assert!(done_rx.recv_timeout(timeout).unwrap());
+        canceller.join().unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        finish_task_job(&runtime.inner, &state);
+        state.complete(state.id, Ok(Value::Null));
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 1);
+    }
+
+    #[test]
+    fn last_owner_release_discards_late_owned_completion_with_observer_alive() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let owner = handle_for_state(&runtime, &state);
+        drop(owner);
+        let (payload, payload_state, payload_runtime) = tracked_owned_result();
+        state.complete(state.id, payload);
+        assert!(payload_state.upgrade().is_none());
+        assert!(payload_runtime.upgrade().is_none());
+        assert!(state.result().unwrap().is_none());
+        assert_eq!(state.status_name(), "cancelled");
+    }
+
+    #[test]
+    fn http_style_temporary_owner_drop_inherits_latched_timeout_without_cleanup_guard() {
+        let _execution = ExecutionTerminationGuard::enter();
+        assert!(current_task_cancellation().is_none());
+        assert!(current_cleanup_context().is_none());
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let temporary = handle_for_state(&runtime, &state);
+        let context = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        // Model an earlier call argument owning a Task while a later HTTP
+        // argument detects timeout, before interpreter finally cleanup begins.
+        set_execution_termination(context);
+        drop(temporary);
+        assert_eq!(state.cancellation(), Some(context));
+        assert_eq!(current_execution_termination(), Some(context));
+        assert!(current_cleanup_context().is_none());
+        state.complete(state.id, Ok(Value::Null));
+        assert_eq!(state.status_name(), "timed_out");
+        assert!(state.result().unwrap().is_none());
+    }
+
+    #[test]
+    fn executing_helped_task_isolates_and_restores_callers_termination_context() {
+        let _execution = ExecutionTerminationGuard::enter();
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        state.install_run(Box::new(|| {
+            assert!(current_execution_termination().is_none());
+            ensure_task_operations_allowed(Span::default())?;
+            Ok(Value::Int(7))
+        }));
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        let parent = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        set_execution_termination(parent);
+        execute_task_job(
+            &runtime.inner,
+            TaskJob {
+                id: state.id,
+                state: Arc::clone(&state),
+            },
+        );
+        assert_eq!(current_execution_termination(), Some(parent));
+        assert_eq!(state.result().unwrap().unwrap().unwrap(), Value::Int(7));
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 1);
+    }
+
+    #[test]
+    fn blocking_queue_handoff_never_exposes_empty_shutdown_accounting() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        runtime
+            .inner
+            .queued_blocking_jobs
+            .store(1, Ordering::Release);
+        let queued = runtime.snapshot().unwrap();
+        assert_eq!(queued.queued_blocking_jobs, 1);
+        assert_eq!(queued.running_blocking_jobs, 0);
+
+        // Deterministically stop at the actual handoff phase used by the worker:
+        // running is already owned, but queued has not been removed yet.
+        let running = RunningBlockingJob::claim(&runtime.inner);
+        let transferring = runtime.snapshot().unwrap();
+        assert_eq!(transferring.queued_blocking_jobs, 1);
+        assert_eq!(transferring.running_blocking_jobs, 1);
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::ZERO)
+                .unwrap_err()
+                .code
+                .as_deref(),
+            Some("shutdown_timeout")
+        );
+        runtime
+            .inner
+            .queued_blocking_jobs
+            .fetch_sub(1, Ordering::AcqRel);
+        let claimed = runtime.snapshot().unwrap();
+        assert_eq!(claimed.queued_blocking_jobs, 0);
+        assert_eq!(claimed.running_blocking_jobs, 1);
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::ZERO)
+                .unwrap_err()
+                .code
+                .as_deref(),
+            Some("shutdown_timeout")
+        );
+        drop(running);
+        runtime.cancel_all_and_wait(Duration::ZERO).unwrap();
+        let finished = runtime.snapshot().unwrap();
+        assert_eq!(finished.queued_blocking_jobs, 0);
+        assert_eq!(finished.running_blocking_jobs, 0);
+    }
+
+    #[test]
+    fn failed_blocking_send_inherits_cancellation_after_workers_last_check() {
+        let timeout = Duration::from_secs(2);
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let parent = Arc::new(completion_state());
+        let nested = Arc::new(completion_state());
+        let nested_owner = handle_for_state(&runtime, &nested);
+        let result = Ok(Value::Result {
+            ok: true,
+            value: Box::new(Value::Array(vec![
+                Value::String("late owned result".repeat(128)),
+                Value::Task(nested_owner),
+            ])),
+        });
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (checked_tx, checked_rx) = mpsc::sync_channel(1);
+        let (send_tx, send_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker_parent = Arc::clone(&parent);
+        let worker = thread::spawn(move || {
+            assert!(worker_parent.cancellation().is_none());
+            checked_tx.send(()).unwrap();
+            send_rx.recv_timeout(timeout).unwrap();
+            send_blocking_result(&response_tx, Some(&worker_parent), result);
+            done_tx.send(()).unwrap();
+        });
+        checked_rx.recv_timeout(timeout).unwrap();
+        let context = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        assert!(parent.request_cancel_with(context));
+        assert!(!parent.request_cancel_with(CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: context.cleanup_deadline + Duration::from_secs(1),
+        }));
+        drop(response_rx);
+        send_tx.send(()).unwrap();
+        done_rx.recv_timeout(timeout).unwrap();
+        worker.join().unwrap();
+        assert!(nested.owner_released.load(Ordering::Acquire));
+        assert_eq!(nested.cancellation(), Some(context));
+        assert_eq!(parent.cancellation(), Some(context));
+    }
+
+    #[test]
+    fn cancel_between_worker_check_and_completion_commits_cancelled_result() {
+        let state = completion_state();
+        // Reproduce the exact reachable ordering in execute_task_job: its
+        // cancellation check has passed, but the result lock is not held yet.
+        assert!(!state.is_cancelled());
+        assert!(state.request_cancel());
+        state.complete_with_status(41, Ok(Value::String("late success".into())), None);
+        assert_eq!(state.status_name(), "cancelled");
+        let error = state.result().unwrap().unwrap().unwrap_err();
+        assert_eq!(error.message, "task 41 was cancelled");
+        assert_cancelled(error);
+    }
+
+    #[test]
+    fn task_completion_first_rejects_cancel_and_releases_duplicate_owned_result() {
+        let state = completion_state();
+        let (first, first_state, first_runtime) = tracked_owned_result();
+        state.complete(41, first);
+        assert_eq!(state.status_name(), "completed");
+        assert!(!state.request_cancel());
+        assert!(!state.request_cancel());
+        let (late, late_state, late_runtime) = tracked_owned_result();
+        state.complete_with_status(41, late, Some(TASK_PANICKED));
+        assert_eq!(state.status_name(), "completed");
+        assert!(late_state.upgrade().is_none());
+        assert!(late_runtime.upgrade().is_none());
+        assert!(first_state.upgrade().is_some());
+        assert!(first_runtime.upgrade().is_some());
+        drop(state);
+        assert!(first_state.upgrade().is_none());
+        assert!(first_runtime.upgrade().is_none());
+    }
+
+    #[test]
+    fn task_cancel_first_releases_late_owned_results_and_stays_terminal() {
+        let state = completion_state();
+        assert!(state.request_cancel());
+        assert!(!state.request_cancel());
+        for supplied_status in [None, Some(TASK_PANICKED)] {
+            let (late, late_state, late_runtime) = tracked_owned_result();
+            state.complete_with_status(41, late, supplied_status);
+            assert_eq!(state.status_name(), "cancelled");
+            assert!(late_state.upgrade().is_none());
+            assert!(late_runtime.upgrade().is_none());
+            assert!(!state.request_cancel());
+        }
+        assert!(state.result.try_lock().is_ok());
+    }
+
+    #[test]
+    fn task_status_updates_cannot_overwrite_cancellation_or_terminal_states() {
+        let cancelling = completion_state();
+        assert!(cancelling.request_cancel());
+        for update in [TASK_RUNNING, TASK_WAITING] {
+            cancelling.set_status(update);
+            assert_eq!(cancelling.status_name(), "cancelling");
+        }
+        for (result, supplied_status, expected) in [
+            (Ok(Value::Null), None, "completed"),
+            (
+                Ok(task_error("application", "recoverable Result")),
+                None,
+                "completed",
+            ),
+            (
+                Err(KuError::runtime("runtime failure", Span::default())),
+                None,
+                "failed",
+            ),
+            (
+                Ok(task_error("panic", "async task panicked")),
+                Some(TASK_PANICKED),
+                "panicked",
+            ),
+        ] {
+            let state = completion_state();
+            state.complete_with_status(41, result, supplied_status);
+            assert_eq!(state.status_name(), expected);
+            for update in [TASK_RUNNING, TASK_WAITING] {
+                state.set_status(update);
+                assert_eq!(state.status_name(), expected);
+            }
+            assert!(!state.request_cancel());
+        }
+    }
+
+    #[test]
+    fn task_cancel_before_panicked_completion_keeps_cancellation_result() {
+        let state = completion_state();
+        assert!(state.request_cancel());
+        state.complete_with_status(
+            41,
+            Ok(task_error("panic", "async task panicked")),
+            Some(TASK_PANICKED),
+        );
+        assert_eq!(state.status_name(), "cancelled");
+        assert_cancelled(state.result().unwrap().unwrap().unwrap_err());
+    }
+
+    #[test]
+    fn task_cancel_and_complete_two_thread_race_keeps_outcome_consistent() {
+        enum Finished {
+            Cancel(bool),
+            Complete,
+        }
+        let timeout = Duration::from_secs(2);
+        for round in 0..32 {
+            let id = 100 + round;
+            let state = Arc::new(completion_state());
+            let (cancel_start, cancel_ready) = mpsc::channel();
+            let (complete_start, complete_ready) = mpsc::channel();
+            let (finished, results) = mpsc::channel();
+            let cancel_state = Arc::clone(&state);
+            let cancel_finished = finished.clone();
+            let canceller = thread::spawn(move || {
+                cancel_ready.recv_timeout(timeout).expect("cancel start");
+                let accepted = cancel_state.request_cancel();
+                cancel_finished
+                    .send(Finished::Cancel(accepted))
+                    .expect("cancel result");
+            });
+            let complete_state = Arc::clone(&state);
+            let completer = thread::spawn(move || {
+                complete_ready
+                    .recv_timeout(timeout)
+                    .expect("complete start");
+                complete_state.complete(id, Ok(Value::Int(round)));
+                finished
+                    .send(Finished::Complete)
+                    .expect("completion result");
+            });
+            // Alternate the launch order, without requiring either race winner.
+            if round % 2 == 0 {
+                cancel_start.send(()).unwrap();
+                complete_start.send(()).unwrap();
+            } else {
+                complete_start.send(()).unwrap();
+                cancel_start.send(()).unwrap();
+            }
+            let mut cancelled = None;
+            let mut completed = false;
+            for _ in 0..2 {
+                match results
+                    .recv_timeout(timeout)
+                    .expect("bounded completion race")
+                {
+                    Finished::Cancel(accepted) => cancelled = Some(accepted),
+                    Finished::Complete => completed = true,
+                }
+            }
+            // Join only after both closures have reported completion; no lock or
+            // unbounded barrier is used to wait for the competing operations.
+            canceller.join().expect("canceller exited");
+            completer.join().expect("completer exited");
+            assert!(completed);
+            let actual = state.result().unwrap().unwrap();
+            if cancelled.expect("cancel outcome") {
+                assert_eq!(state.status_name(), "cancelled");
+                let error = actual.unwrap_err();
+                assert_eq!(error.message, format!("task {id} was cancelled"));
+                assert_cancelled(error);
+            } else {
+                assert_eq!(state.status_name(), "completed");
+                assert_eq!(actual.unwrap(), Value::Int(round));
+            }
+            assert!(!state.request_cancel());
+        }
+    }
+
+    #[test]
+    fn task_worker_panic_and_accepted_cancellation_preserve_classification() {
+        let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
+        let timeout = Duration::from_secs(2);
+        for cancel_before_exit in [false, true] {
+            let (started, start_result) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let task = spawn_task(&runtime, move || -> KuResult<Value> {
+                started
+                    .send((
+                        current_task_id(),
+                        thread::current().name().unwrap_or("").to_string(),
+                    ))
+                    .expect("worker start signal");
+                released
+                    .recv_timeout(timeout)
+                    .expect("bounded worker release");
+                panic!("intentional task worker panic");
+            });
+            // No await/helping is entered until the real worker is running.
+            let (running_id, worker_name) =
+                start_result.recv_timeout(timeout).expect("worker start");
+            assert_eq!(running_id, task.id());
+            assert!(worker_name.starts_with("ku-task-"), "{worker_name}");
+            if cancel_before_exit {
+                assert!(task.cancel());
+                assert_eq!(task.status(), "cancelling");
+                assert!(!task.cancel());
+            }
+            release.send(()).unwrap();
+            let result = task.await_timeout(timeout);
+            if cancel_before_exit {
+                assert_eq!(task.status(), "cancelled");
+                assert_cancelled(result.unwrap_err());
+            } else {
+                assert_eq!(task.status(), "panicked");
+                assert_eq!(result.unwrap(), task_error("panic", "async task panicked"));
+            }
+            assert!(!task.cancel());
+        }
+        runtime
+            .cancel_all_and_wait(timeout)
+            .expect("worker cleanup");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+    }
 
     fn wait_until(timeout: Duration, message: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
@@ -1206,7 +5005,7 @@ mod tests {
     #[test]
     fn timeout_does_not_cancel_target_task() {
         let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
-        let task = runtime.spawn(|| {
+        let task = spawn_task(&runtime, || {
             thread::sleep(Duration::from_millis(20));
             Ok(Value::Int(7))
         });
@@ -1220,12 +5019,19 @@ mod tests {
             Value::Int(7)
         );
         assert_eq!(task.status(), "completed");
+        runtime
+            .cancel_all_and_wait(Duration::from_secs(1))
+            .expect("diagnostic timeout target should retire normally");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.finished_cancelled_tasks, 0);
+        assert_eq!(snapshot.finished_timed_out_tasks, 0);
     }
 
     #[test]
     fn await_result_consumes_task_once() {
         let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
-        let task = runtime.spawn(|| Ok(Value::Int(7)));
+        let task = spawn_task(&runtime, || Ok(Value::Int(7)));
 
         assert_eq!(
             task.await_result().expect("first await should finish"),
@@ -1251,8 +5057,8 @@ mod tests {
     fn one_worker_nested_await_executes_the_queued_child() {
         let runtime = TaskRuntime::with_limits(1, 4, 1, 1, 4);
         let nested_runtime = runtime.clone();
-        let parent = runtime.spawn(move || {
-            let child = nested_runtime.spawn(|| Ok(Value::Int(7)));
+        let parent = spawn_task(&runtime, move || {
+            let child = spawn_task(&nested_runtime, || Ok(Value::Int(7)));
             child.await_timeout(Duration::from_secs(1))
         });
 
@@ -1267,7 +5073,7 @@ mod tests {
     #[test]
     fn cancellation_is_idempotent_and_wakes_waiters() {
         let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
-        let task = runtime.spawn(|| {
+        let task = spawn_task(&runtime, || {
             while !current_task_cancelled() {
                 thread::yield_now();
             }
@@ -1282,11 +5088,16 @@ mod tests {
                 .expect("bounded shutdown should drain cancelled tasks"),
             0
         );
-        let value = task
+        let error = task
             .await_timeout(Duration::from_secs(1))
-            .expect("cancelled task should wake waiters");
-        assert!(matches!(value, Value::Result { ok: false, .. }));
+            .expect_err("cancelled task should wake waiters with internal termination");
+        assert_cancelled(error);
         assert_eq!(task.status(), "cancelled");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.cancelled_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.finished_cancelled_tasks, 1);
+        assert_eq!(snapshot.finished_timed_out_tasks, 0);
     }
 
     #[test]
@@ -1296,7 +5107,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let first_started = Arc::clone(&started);
         let first_release = Arc::clone(&release);
-        let first = runtime.spawn(move || {
+        let first = spawn_task(&runtime, move || {
             first_started.store(true, Ordering::Release);
             while !first_release.load(Ordering::Acquire) {
                 thread::yield_now();
@@ -1307,8 +5118,8 @@ mod tests {
             started.load(Ordering::Acquire)
         });
 
-        let second = runtime.spawn(|| Ok(Value::Int(2)));
-        let third = runtime.spawn(|| Ok(Value::Int(3)));
+        let second = spawn_task(&runtime, || Ok(Value::Int(2)));
+        let third = spawn_task(&runtime, || Ok(Value::Int(3)));
         let snapshot = runtime.snapshot().expect("snapshot queued tasks");
         assert_eq!(snapshot.active_tasks, 3);
         assert_eq!(snapshot.registered_tasks, 3);
@@ -1324,7 +5135,8 @@ mod tests {
         assert!(matches!(timed, Value::Result { ok: false, .. }));
         let snapshot = runtime.snapshot().expect("snapshot cancelled task");
         assert_eq!(snapshot.queued_tasks, 2);
-        assert_eq!(snapshot.cancelling_tasks, 1);
+        assert_eq!(snapshot.cancelled_tasks, 1);
+        assert_eq!(snapshot.cancelling_tasks, 0);
 
         release.store(true, Ordering::Release);
         assert_eq!(
@@ -1333,12 +5145,11 @@ mod tests {
                 .expect("first task"),
             Value::Int(1)
         );
-        assert!(matches!(
+        assert_cancelled(
             second
                 .await_timeout(Duration::from_secs(1))
-                .expect("cancelled second task"),
-            Value::Result { ok: false, .. }
-        ));
+                .expect_err("cancelled second task"),
+        );
         assert_eq!(
             third
                 .await_timeout(Duration::from_secs(1))
@@ -1368,7 +5179,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let task_started = Arc::clone(&started);
         let task_release = Arc::clone(&release);
-        let task = runtime.spawn(move || {
+        let task = spawn_task(&runtime, move || {
             task_started.store(true, Ordering::Release);
             while !task_release.load(Ordering::Acquire) {
                 thread::yield_now();
@@ -1392,11 +5203,10 @@ mod tests {
         assert_eq!(snapshot.cancelling_tasks, 1);
 
         release.store(true, Ordering::Release);
-        assert!(matches!(
+        assert_cancelled(
             task.await_timeout(Duration::from_secs(1))
-                .expect("cancelled task should finish after release"),
-            Value::Result { ok: false, .. }
-        ));
+                .expect_err("cancelled task should finish after release"),
+        );
         runtime
             .cancel_all_and_wait(Duration::from_secs(1))
             .expect("runtime should drain after release");
@@ -1404,35 +5214,80 @@ mod tests {
     }
 
     #[test]
+    fn blocking_response_delivery_does_not_acknowledge_running_guard_retirement() {
+        let timeout = Duration::from_secs(1);
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let inner = Arc::clone(&runtime.inner);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            // Exercise the actual accounting guard and publication helper in
+            // their worker order. This channel only holds the guard's lifetime;
+            // receiving a result must not be treated as cleanup acknowledgement.
+            let running = RunningBlockingJob::claim(&inner);
+            send_blocking_result(&response_tx, None, Ok(Value::Int(7)));
+            release_rx
+                .recv_timeout(timeout)
+                .expect("bounded blocking retirement release");
+            drop(running);
+        });
+        assert_eq!(
+            response_rx
+                .recv_timeout(timeout)
+                .expect("blocking response published")
+                .expect("blocking result"),
+            Value::Int(7)
+        );
+        let delivered = runtime.snapshot().expect("delivered result snapshot");
+        assert_eq!(delivered.queued_blocking_jobs, 0);
+        assert_eq!(delivered.running_blocking_jobs, 1);
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::ZERO)
+                .expect_err("live blocking guard still owns cleanup")
+                .code
+                .as_deref(),
+            Some("shutdown_timeout")
+        );
+        release_tx.send(()).expect("release blocking retirement");
+        worker.join().expect("blocking guard retired");
+        runtime
+            .cancel_all_and_wait(Duration::ZERO)
+            .expect("retired blocking guard permits shutdown");
+        let reclaimed = runtime.snapshot().expect("retired guard snapshot");
+        assert_eq!(reclaimed.queued_blocking_jobs, 0);
+        assert_eq!(reclaimed.running_blocking_jobs, 0);
+    }
+
+    #[test]
     fn snapshot_tracks_blocking_queue_reclamation() {
         let runtime = TaskRuntime::with_limits(1, 1, 1, 2, 1);
-        let started = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        let timeout = Duration::from_secs(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
 
         let first_runtime = runtime.clone();
-        let first_started = Arc::clone(&started);
-        let first_release = Arc::clone(&release);
         let first = thread::spawn(move || {
             first_runtime.run_blocking(
                 move || {
-                    first_started.store(true, Ordering::Release);
-                    while !first_release.load(Ordering::Acquire) {
-                        thread::yield_now();
-                    }
+                    started_tx.send(()).expect("blocking start notification");
+                    release_rx
+                        .recv_timeout(timeout)
+                        .expect("bounded blocking job release");
                     Ok(Value::Int(1))
                 },
                 Span::default(),
             )
         });
-        wait_until(Duration::from_secs(1), "blocking job did not start", || {
-            started.load(Ordering::Acquire)
-        });
+        started_rx
+            .recv_timeout(timeout)
+            .expect("blocking job did not start");
 
         let second_runtime = runtime.clone();
         let second = thread::spawn(move || {
             second_runtime.run_blocking(|| Ok(Value::Int(2)), Span::default())
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + timeout;
         loop {
             let snapshot = runtime.snapshot().expect("snapshot blocking queue");
             if snapshot.running_blocking_jobs == 1 && snapshot.queued_blocking_jobs == 1 {
@@ -1445,7 +5300,7 @@ mod tests {
             thread::yield_now();
         }
 
-        release.store(true, Ordering::Release);
+        release_tx.send(()).expect("release first blocking job");
         assert_eq!(
             first
                 .join()
@@ -1460,6 +5315,11 @@ mod tests {
                 .expect("second job"),
             Value::Int(2)
         );
+        // Caller joins prove response delivery, not worker-side cleanup ACK:
+        // send_blocking_result runs before RunningBlockingJob's final drop.
+        runtime
+            .cancel_all_and_wait(timeout)
+            .expect("blocking worker accounting should drain after replies");
         let snapshot = runtime.snapshot().expect("reclaimed blocking queue");
         assert_eq!(snapshot.queued_blocking_jobs, 0);
         assert_eq!(snapshot.running_blocking_jobs, 0);
@@ -1473,7 +5333,7 @@ mod tests {
         let task_runtime = runtime.clone();
         let job_started = Arc::clone(&started);
         let job_release = Arc::clone(&release);
-        let task = runtime.spawn(move || {
+        let task = spawn_task(&runtime, move || {
             task_runtime.run_blocking(
                 move || {
                     job_started.store(true, Ordering::Release);
@@ -1504,9 +5364,10 @@ mod tests {
         );
 
         release.store(true, Ordering::Release);
-        let _ = task
-            .await_timeout(Duration::from_secs(1))
-            .expect("cancelled task should finish");
+        assert_cancelled(
+            task.await_timeout(Duration::from_secs(1))
+                .expect_err("cancelled task should finish"),
+        );
         runtime
             .cancel_all_and_wait(Duration::from_secs(1))
             .expect("runtime should drain after blocking job release");
@@ -1547,5 +5408,251 @@ mod tests {
             report.demand as f64 / (report.submit_ms.max(1) as f64 / 1000.0),
             report.accepted as f64 / (report.total_ms.max(1) as f64 / 1000.0)
         );
+    }
+
+    #[test]
+    fn terminal_completion_cleanup_does_not_acknowledge_execution_queue_retirement() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+
+        state.complete(state.id, Ok(Value::Int(17)));
+        assert!(state.is_terminal());
+        assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(!state.execution_queue_retired.load(Ordering::Acquire));
+        finish_task_accounting(&runtime.inner, &state);
+        assert!(!state.accounting_finished.load(Ordering::Acquire));
+        assert!(!state.accounting_done.load(Ordering::Acquire));
+        assert_eq!(runtime.snapshot().unwrap().active_tasks, 1);
+
+        // Kernel reproduction of the real claimant's post-frame-drop callback.
+        finish_task_job(&runtime.inner, &state);
+        assert!(state.execution_queue_retired.load(Ordering::Acquire));
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        finish_task_job(&runtime.inner, &state);
+        state.complete(state.id, Ok(Value::Null));
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 1);
+        // A successful retained result remains owned by the caller; this is
+        // execution/accounting evidence, never a full owner-resource ACK.
+        assert!(!state.owner_released.load(Ordering::Acquire));
+        assert_eq!(state.result().unwrap(), Some(Ok(Value::Int(17))));
+    }
+
+    #[test]
+    fn finished_termination_counters_require_real_retirement_and_count_first_cause_once() {
+        for first_reason in [TerminationReason::Cancelled, TerminationReason::TimedOut] {
+            for execution_first in [false, true] {
+                let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+                let mut initial = completion_state();
+                initial.runtime = Arc::downgrade(&runtime.inner);
+                let state = Arc::new(initial);
+                runtime.inner.active_tasks.store(1, Ordering::Release);
+                runtime
+                    .inner
+                    .states
+                    .lock()
+                    .unwrap()
+                    .insert(state.id, Arc::downgrade(&state));
+
+                let now = Instant::now();
+                assert!(state.request_cancel_with(CancellationContext {
+                    reason: first_reason,
+                    cleanup_deadline: now + Duration::from_secs(1),
+                }));
+                let losing_reason = match first_reason {
+                    TerminationReason::Cancelled => TerminationReason::TimedOut,
+                    TerminationReason::TimedOut => TerminationReason::Cancelled,
+                };
+                assert!(!state.request_cancel_with(CancellationContext {
+                    reason: losing_reason,
+                    cleanup_deadline: now,
+                }));
+                if execution_first {
+                    finish_task_job(&runtime.inner, &state);
+                }
+                let requested = runtime.snapshot().unwrap();
+                assert_eq!(requested.finished_tasks, 0);
+                assert_eq!(requested.finished_cancelled_tasks, 0);
+                assert_eq!(requested.finished_timed_out_tasks, 0);
+
+                state.complete(state.id, Ok(Value::Null));
+                assert_eq!(
+                    state.cancellation(),
+                    Some(CancellationContext {
+                        reason: first_reason,
+                        cleanup_deadline: now,
+                    })
+                );
+                if !execution_first {
+                    let terminal = runtime.snapshot().unwrap();
+                    assert_eq!(terminal.finished_tasks, 0);
+                    assert_eq!(terminal.finished_cancelled_tasks, 0);
+                    assert_eq!(terminal.finished_timed_out_tasks, 0);
+                    assert_eq!(
+                        terminal.cancelled_tasks,
+                        usize::from(first_reason == TerminationReason::Cancelled)
+                    );
+                    finish_task_job(&runtime.inner, &state);
+                }
+                let retired = runtime.snapshot().unwrap();
+                assert_eq!(retired.active_tasks, 0);
+                assert_eq!(retired.registered_tasks, 0);
+                assert_eq!(retired.cancelled_tasks, 0);
+                assert_eq!(retired.finished_tasks, 1);
+                assert_eq!(
+                    retired.finished_cancelled_tasks,
+                    usize::from(first_reason == TerminationReason::Cancelled)
+                );
+                assert_eq!(
+                    retired.finished_timed_out_tasks,
+                    usize::from(first_reason == TerminationReason::TimedOut)
+                );
+                assert!(!state.request_cancel());
+                state.complete(state.id, Ok(Value::Null));
+                finish_task_job(&runtime.inner, &state);
+                finish_task_accounting(&runtime.inner, &state);
+                assert_eq!(runtime.snapshot().unwrap(), retired);
+            }
+        }
+    }
+
+    #[test]
+    fn accounting_claim_is_not_the_post_registry_and_counter_witness() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        state.complete(state.id, Ok(Value::Null));
+
+        let registry = runtime.inner.states.lock().unwrap();
+        let inner = Arc::clone(&runtime.inner);
+        let retiring = Arc::clone(&state);
+        let worker = thread::spawn(move || finish_task_job(&inner, &retiring));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.accounting_finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let claimed = state.accounting_finished.load(Ordering::Acquire);
+        let done_before_unlock = state.accounting_done.load(Ordering::Acquire);
+        let active_before_unlock = runtime.inner.active_tasks.load(Ordering::Acquire);
+        let finished_before_unlock = runtime.inner.finished_tasks.load(Ordering::Acquire);
+        let registered_before_unlock = registry.contains_key(&state.id);
+        // Unlock before assertions and join even on a failed observation.
+        drop(registry);
+        worker
+            .join()
+            .expect("retirement thread exits after registry unlock");
+
+        assert!(claimed);
+        assert!(!done_before_unlock);
+        assert_eq!(active_before_unlock, 1);
+        assert_eq!(finished_before_unlock, 0);
+        assert!(registered_before_unlock);
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+    }
+
+    #[test]
+    fn poisoned_registry_retirement_removes_the_real_weak_entry_before_done() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        let poison = catch_unwind(AssertUnwindSafe(|| {
+            let _registry = runtime.inner.states.lock().unwrap();
+            panic!("formal poisoned registry retirement probe");
+        }));
+        assert!(poison.is_err());
+        assert!(runtime.inner.states.is_poisoned());
+        state.complete(state.id, Ok(Value::Null));
+        finish_task_job(&runtime.inner, &state);
+
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        assert_eq!(runtime.inner.active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.inner.finished_tasks.load(Ordering::Acquire), 1);
+        assert!(runtime
+            .inner
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        // Cleanup recovery does not unpoison the registration API.
+        assert!(runtime.inner.states.is_poisoned());
+        finish_task_job(&runtime.inner, &state);
+        assert_eq!(runtime.inner.finished_tasks.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn concurrent_completion_and_execution_retirement_never_lose_the_accounting_trigger() {
+        for _ in 0..64 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+            let mut initial = completion_state();
+            initial.runtime = Arc::downgrade(&runtime.inner);
+            let state = Arc::new(initial);
+            runtime.inner.active_tasks.store(1, Ordering::Release);
+            runtime
+                .inner
+                .states
+                .lock()
+                .unwrap()
+                .insert(state.id, Arc::downgrade(&state));
+            let (complete_tx, complete_rx) = mpsc::sync_channel(1);
+            let (retire_tx, retire_rx) = mpsc::sync_channel(1);
+            let completing = Arc::clone(&state);
+            let completion = thread::spawn(move || {
+                complete_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("bounded completion start");
+                completing.complete(completing.id, Ok(Value::Int(17)));
+            });
+            let retiring = Arc::clone(&state);
+            let inner = Arc::clone(&runtime.inner);
+            let execution = thread::spawn(move || {
+                retire_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("bounded retirement start");
+                finish_task_job(&inner, &retiring);
+            });
+            complete_tx.send(()).expect("release completion start");
+            retire_tx.send(()).expect("release retirement start");
+            completion.join().expect("completion thread exits");
+            execution.join().expect("retirement thread exits");
+            assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+            assert!(state.execution_queue_retired.load(Ordering::Acquire));
+            assert!(state.accounting_done.load(Ordering::Acquire));
+            let snapshot = runtime.snapshot().unwrap();
+            assert_eq!(snapshot.active_tasks, 0);
+            assert_eq!(snapshot.registered_tasks, 0);
+            assert_eq!(snapshot.finished_tasks, 1);
+        }
     }
 }

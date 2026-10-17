@@ -50,6 +50,7 @@ fn CloneResult(&value: str!): str! { return value.clone() }
 fn CloneMessage(&value: Message): Message { return value.clone() }
 fn MessageText(value: Message): str { return match value { Message.Text(text) => text } }
 fn JsonArray(&values: [int]): str! { return json.stringify(values) }
+fn JsonEncode(&values: [int]): str! { return json.encode(values) }
 fn ReadCode(&code: Code): int { return match code { Code.Number(value) => value } }
 fn Finish(&text: str): str! {
     try { return ok(text.clone()) } finally { println(text) }
@@ -79,9 +80,9 @@ fn main(): null! {
     if (Age(user) != 7 || Age(user) != 7) { panic("borrowed Copy struct projection") }
     changeAge = fn(): int { user.age = 9 return 1 }
     if (Combine(user.age, changeAge()) != 71 || Age(user) != 9) { panic("Copy field snapshot before later argument effect") }
-    if (JsonArray(numbers)? != "[1,2,3]" || numbers.len() != 3) { panic("borrowed JSON array") }
+    if (JsonEncode(numbers)? != JsonArray(numbers)? || JsonEncode(numbers)? != "[1,2,3]" || numbers.len() != 3) { panic("borrowed JSON array") }
     object = { name: "Ku" }
-    if (json.stringify(object)? != json.stringify(object)?) { panic("borrowed JSON object") }
+    if (json.encode(object)? != json.stringify(object)? || json.encode(object)? != json.encode(object)?) { panic("borrowed JSON object") }
     failure: str! = err("expected")
     caught = 0
     finalized = 0
