@@ -2332,7 +2332,26 @@ static KuTaskValueV1 array_start(ArrayRuntime* runtime,bool stop) {
 static void array_finish(ArrayRuntime* runtime) {
   array_idle(runtime); CHECK(!array_snapshot(runtime).resident&&!array_snapshot(runtime).reserved_bytes);
   uint64_t deadline=array_deadline(); CHECK(ku_task_driver_shutdown(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_driver_join(&runtime->driver,deadline)==KU_TASK_DRIVER_OK); CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+  uint64_t effective=runtime->driver.shutdown_deadline;
+  KuTaskDriverSnapshotV1 snapshot=array_snapshot(runtime);
+  CHECK(snapshot.workers_created==1u && snapshot.workers_exited==1u && !snapshot.workers_joined
+      && !snapshot.workers_waiting && !snapshot.resident && !snapshot.reserved_bytes
+      && !snapshot.building && !snapshot.queued && !snapshot.running);
+#if defined(_WIN32)
+  // As in fixture_reap, observe the OS-return tail separately after logical
+  // EXITED and all Task storage is gone. This never renews the original D.
+  if (ku_task_driver_now_ms()>=effective)
+    CHECK(WaitForSingleObject(runtime->driver.workers[0].thread,2000)==WAIT_OBJECT_0);
+#else
+  alarm(2); // Existing independent observation bound for the POSIX join tail.
+#endif
+  CHECK(ku_task_driver_join(&runtime->driver,effective)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver.shutdown_deadline==effective && runtime->driver.workers_joined==1u
+      && runtime->driver.workers[0].joined && runtime->driver.workers[0].closed);
+  CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
   CHECK(ku_test_event_destroy(&array_entered)); CHECK(ku_test_event_destroy(&array_proceed));
   CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes&&!fixture_ledger().overflow);
 }
