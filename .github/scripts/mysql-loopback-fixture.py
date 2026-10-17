@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Opt-in, disposable Windows MySQL 8.0.29 fixture; never a system service.
+"""Opt-in, disposable MySQL/MariaDB fixtures; never a system service.
 
 prepare --installed-root PATH
 verify --fixture PATH --test-binary PATH --ku-binary PATH
 cleanup --fixture PATH
+exercise --product mysql|mariadb --installed-root PATH --test-binary PATH --ku-binary PATH
 
-Only newly generated credentials and data under target/mysql-loopback-8.0.29-UUID
-are used. Installation executables/DLLs/share/include are trusted inputs, copied
-without configuration or component manifests. No software is downloaded. A
-same-user administrator replacing files/processes concurrently is outside this
-fixture's isolation boundary. This old server version is NOT a production advice.
+Windows keeps its exact 8.0.29 snapshot under target/mysql-loopback-8.0.29-UUID.
+POSIX uses a private ku-{mysql,mariadb}-live-UUID temporary root, trusted explicit
+installed executables/share files, and a bounded matching client SDK copy. Only
+newly generated credentials and data are used; no configuration is copied and
+this script downloads no software. A same-user administrator replacing files or
+processes concurrently is outside the fixture boundary. The Windows server pin
+is a compatibility fixture, not a production version recommendation.
 
 MySQL 8.0 still reads .mylogin.cnf with --no-defaults. MYSQL_TEST_LOGIN_FILE is
 therefore forced to an absent private path; --no-login-paths needs MySQL 8.2.
@@ -26,8 +29,10 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import stat
+import signal
 import subprocess
 import sys
 import threading
@@ -124,6 +129,8 @@ def write_private(path: Path, text: str, *, replace: bool = False) -> None:
         if not replace:
             raise ValueError("Refusing to overwrite a fixture file")
     with path.open("w" if replace else "x", encoding="utf-8", newline="\n") as output:
+        if os.name != "nt":
+            os.fchmod(output.fileno(), 0o600)
         output.write(text)
 
 
@@ -665,21 +672,563 @@ def cleanup_locked(root: Path) -> None:
     print("Removed the stopped private MySQL fixture and its generated credentials (not recoverable).", flush=True)
 
 
+# POSIX uses trusted installed executables in place and copies only its explicit
+# matching client SDK. The Windows 8.0.29 path above keeps its original contract.
+POSIX_FORMAT = 2
+MAX_DATA_BYTES = 768 * 1024 * 1024
+POSIX_LIVE_TESTS = {
+    "darwin": "native_mysql_client_live_macos_loopback_roundtrip",
+    "linux": "native_mysql_client_live_linux_loopback_roundtrip",
+}
+
+
+def posix_only() -> None:
+    if os.name != "posix" or sys.platform not in POSIX_LIVE_TESTS:
+        raise ValueError("POSIX MySQL fixture requires macOS or Linux")
+    if os.geteuid() == 0:
+        raise ValueError("Run the disposable database as a non-root user")
+
+
+def posix_temporary_root() -> Path:
+    # macOS per-user TMPDIR can exceed the Unix socket path bound. This short
+    # system temporary parent still receives an exclusive 0700 random root.
+    return plain(Path("/tmp").resolve(), directory=True)
+
+
+def posix_fixture_root(path: Path) -> Path:
+    root = plain(path, directory=True)
+    temporary = posix_temporary_root()
+    if root.parent != temporary or not re.fullmatch(r"ku-(?:mysql|mariadb)-live-[0-9a-f]{32}", root.name):
+        raise ValueError("Only a dedicated POSIX temporary fixture is accepted")
+    info = root.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("POSIX fixture must be private to the current user")
+    return root
+
+
+def posix_manifest(root: Path) -> dict:
+    value = read_json(root / "fixture.json")
+    fields = {"format", "product", "version", "server", "basedir", "client", "admin", "initializer",
+              "client_library_source", "client_include_source", "client_library_family",
+              "client_version", "client_version_id"}
+    if set(value) != fields or type(value["format"]) is not int or value["format"] != POSIX_FORMAT:
+        raise ValueError("Unexpected POSIX MySQL fixture metadata")
+    product, version = value["product"], value["version"]
+    if product not in ("mysql", "mariadb") or not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", version):
+        raise ValueError("Unexpected POSIX database identity")
+    if ("MariaDB" in version) != (product == "mariadb") or not root.name.startswith(f"ku-{product}-live-"):
+        raise ValueError("POSIX fixture product and version disagree")
+    for key in ("server", "client", "admin", "initializer"):
+        path = Path(value[key])
+        plain(path)
+        if not os.access(path, os.X_OK):
+            raise ValueError("Fixture executable is not executable")
+    plain(Path(value["basedir"]), directory=True)
+    plain(Path(value["client_include_source"]), directory=True)
+    plain(Path(value["client_library_source"]))
+    if value["client_library_family"] not in ("mysqlclient", "mariadb") or not isinstance(value["client_version"], str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value["client_version"]):
+        raise ValueError("Unexpected actual client library identity")
+    if type(value["client_version_id"]) is not int or value["client_version_id"] <= 0:
+        raise ValueError("Invalid actual client version ID")
+    return value
+
+
+def posix_executable(installed: Path, *names: str) -> Path:
+    for name in names:
+        candidate = installed / name
+        if candidate.exists():
+            resolved = plain(candidate.resolve())
+            if os.access(resolved, os.X_OK):
+                return resolved
+    raise ValueError("Required database executable is absent from the specified installation")
+
+
+def check_posix_tree(root: Path, *, volatile: bool = False) -> tuple[int, int]:
+    count = total = 0
+    pending = [root]
+    deadline = time.monotonic() + 2
+    while pending:
+        candidate = pending.pop()
+        try:
+            directory = plain(candidate, directory=True)
+            iterator = os.scandir(directory)
+        except FileNotFoundError:
+            if volatile and candidate != root:
+                continue
+            raise
+        with iterator as entries:
+            for entry in entries:
+                count += 1
+                if count > MAX_CLEANUP_FILES or time.monotonic() > deadline:
+                    raise ValueError("POSIX fixture file scan exceeds its bound")
+                path = Path(entry.path)
+                try:
+                    info = path.lstat()
+                    # The private local socket is the sole non-regular leaf.
+                    if path == root / "mysql.sock" and stat.S_ISSOCK(info.st_mode):
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(plain(path, directory=True))
+                    else:
+                        plain(path)
+                        total += info.st_size
+                        if total > MAX_DATA_BYTES:
+                            raise ValueError("POSIX fixture data exceeds its byte bound")
+                except FileNotFoundError:
+                    # A running initializer/server can remove its own temporary
+                    # files between enumeration and stat. Stopped cleanup uses
+                    # the strict default; links and other errors never pass.
+                    if not volatile:
+                        raise
+    return count, total
+
+
+def copy_posix_sdk(root: Path, include: Path, library: Path) -> None:
+    include = plain(include.resolve(), directory=True)
+    library = plain(library.resolve())
+    if not re.fullmatch(r"lib(?:mysqlclient|mariadb)(?:\.so(?:\.[0-9]+)*|(?:\.[0-9]+)*\.dylib)", library.name):
+        raise ValueError("Explicit SDK library must identify a shared MySQL or MariaDB client")
+    if not (include / "mysql.h").is_file():
+        raise ValueError("Explicit SDK include directory has no mysql.h")
+    sdk = root / "sdk"
+    (sdk / "include").mkdir(parents=True)
+    (sdk / "lib").mkdir()
+    count = total = 0
+    deadline = time.monotonic() + 30
+    pending = [(include, sdk / "include")]
+
+    def copy(source: Path, destination: Path) -> None:
+        nonlocal count, total
+        source = plain(source)
+        count += 1
+        if count > MAX_FILES or source.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError("POSIX SDK copy exceeds its file bound")
+        with source.open("rb") as incoming, destination.open("xb") as outgoing:
+            while chunk := incoming.read(65536):
+                total += len(chunk)
+                if total > MAX_COPY_BYTES or time.monotonic() > deadline:
+                    raise ValueError("POSIX SDK copy exceeds its byte/time bound")
+                outgoing.write(chunk)
+    while pending:
+        source, destination = pending.pop()
+        with os.scandir(source) as entries:
+            for entry in entries:
+                count += 1
+                if count > MAX_FILES or time.monotonic() > deadline:
+                    raise ValueError("POSIX SDK walk exceeds its bound")
+                child = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    plain(child, directory=True)
+                    target = destination / entry.name
+                    target.mkdir()
+                    pending.append((child, target))
+                else:
+                    copy(child, destination / entry.name)
+    copy(library, sdk / "lib" / library.name)
+
+
+def posix_sdk_identity(root: Path, include: Path, library: Path) -> dict:
+    include, library = plain(include.resolve(), directory=True), plain(library.resolve())
+    family = "mysqlclient" if library.name.startswith("libmysqlclient") else "mariadb"
+    header = root / "sdk" / "include" / ("mysql_version.h" if family == "mysqlclient" else "mariadb_version.h")
+    text = bounded_bytes(header, 65536).decode("utf-8")
+    macro = "LIBMYSQL_VERSION_ID" if family == "mysqlclient" else "MARIADB_PACKAGE_VERSION_ID"
+    match = re.search(r"(?m)^#define\s+" + macro + r"\s+([0-9]{1,9})\s*$", text)
+    if match is None:
+        raise ValueError("Explicit SDK header does not identify its client ABI version")
+    # Query the actual bounded library copy in a child with an absolute limit.
+    # Loading the public client ABI and reading static version strings performs
+    # no connection, initialization or service discovery.
+    probe = ("import ctypes,json,sys; lib=ctypes.CDLL(sys.argv[1]); "
+             "lib.mysql_get_client_info.restype=ctypes.c_char_p; "
+             "lib.mysql_get_client_version.restype=ctypes.c_ulong; "
+             "print(json.dumps({'version':lib.mysql_get_client_info().decode('ascii'),"
+             "'version_id':lib.mysql_get_client_version()}))")
+    output = run([sys.executable, "-B", "-I", "-c", probe, str(root / "sdk" / "lib" / library.name)],
+                 root, "read explicit client SDK version", 5)
+    if len(output) > 1024:
+        raise ValueError("SDK version output exceeds its byte bound")
+    identity = json.loads(output, object_pairs_hook=no_duplicates)
+    if not isinstance(identity, dict) or set(identity) != {"version", "version_id"} or type(identity["version_id"]) is not int or identity["version_id"] != int(match[1]):
+        raise ValueError("Explicit SDK library and header ABI versions disagree")
+    if not isinstance(identity["version"], str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", identity["version"]):
+        raise ValueError("Unexpected actual client version")
+    return {"client_library_source": str(library), "client_include_source": str(include),
+            "client_library_family": family, "client_version": identity["version"],
+            "client_version_id": identity["version_id"]}
+
+
+@contextmanager
+def posix_environment(root: Path) -> Iterator[None]:
+    global PRIVATE_LOG_ROOT
+    previous, previous_log_root = dict(os.environ), PRIVATE_LOG_ROOT
+    allowed = {"PATH", "DEVELOPER_DIR", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET"}
+    env = {key: value for key, value in previous.items() if key in allowed}
+    env.update({"HOME": str(root), "TMPDIR": str(root.parent), "TMP": str(root / "tmp"),
+                "TEMP": str(root / "tmp"), "LANG": "C", "LC_ALL": "C", "TZ": "UTC",
+                "MYSQL_TEST_LOGIN_FILE": str(root / "never-created.mylogin.cnf"), "MYSQL_HISTFILE": os.devnull})
+    if sys.platform == "linux":
+        # Only this fixture's bounded, explicit SDK copy enters the loader path.
+        env["LD_LIBRARY_PATH"] = str(root / "sdk" / "lib")
+    os.environ.clear()
+    os.environ.update(env)
+    PRIVATE_LOG_ROOT = root
+    previous_umask = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous_umask)
+        os.environ.clear()
+        os.environ.update(previous)
+        PRIVATE_LOG_ROOT = previous_log_root
+
+
+class PosixMysqlProcess(MysqlProcess):
+    """A directly owned session leader; no service manager or PID discovery."""
+
+    def __init__(self, root: Path, command: list[str]) -> None:
+        super().__init__(root, command)
+        self.monitor_stop = threading.Event()
+        self.monitor = None
+
+    def start(self) -> None:
+        if self.process is not None or self.stop_complete:
+            raise RuntimeError("An owned POSIX database cannot be restarted")
+        write_private(self.root / "server.active", "startup pending\n")
+        try:
+            self.process = subprocess.Popen(self.command, cwd=self.root, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            bufsize=0, start_new_session=True)
+            write_private(self.root / "server.active", f"{self.process.pid}\n", replace=True)
+            self.reader = threading.Thread(target=self.drain, daemon=True)
+            self.reader_start_state = "unknown"
+            self.reader.start()
+            self.reader_start_state = "started"
+            self.monitor = threading.Thread(target=self.watch_tree, daemon=True)
+            self.monitor.start()
+        except BaseException as primary:
+            cleanup = BOUNDS.CleanupErrors()
+            if self.process is None:
+                cleanup.attempt("active_marker_unlink", lambda: (self.root / "server.active").unlink())
+            else:
+                cleanup.attempt("server_stop", self.stop)
+            cleanup.raise_if_any(primary)
+
+    def watch_tree(self) -> None:
+        try:
+            while not self.monitor_stop.wait(0.25):
+                check_posix_tree(self.root, volatile=True)
+        except BaseException as error:
+            self.reader_error = "fixture_monitor_" + type(error).__name__
+            self.failed.set()
+            try:
+                BOUNDS.kill_process_tree(self.process, None)
+            except BaseException:
+                self.cleanup_uncertain = True
+
+    def stop(self) -> None:
+        self.monitor_stop.set()
+        if self.monitor is not None and self.monitor.ident is not None:
+            self.monitor.join(timeout=3)
+            if self.monitor.is_alive():
+                self.cleanup_uncertain = True
+        super().stop()
+
+
+def initialize_posix(root: Path, command: list[str]) -> None:
+    owner = PosixMysqlProcess(root, command)
+    primary = None
+    cleanup = BOUNDS.CleanupErrors()
+    try:
+        owner.start()
+        if owner.process.wait(timeout=120) != 0 or owner.failed.is_set():
+            raise RuntimeError("Private POSIX initialization failed; inspect its bounded private log")
+    except BaseException as error:
+        primary = error
+    finally:
+        cleanup.attempt("initializer_stop", owner.stop)
+    cleanup.raise_if_any(primary)
+
+
+def posix_server_resources(root: Path, installed: Path) -> list[str]:
+    share = plain((installed / "share" / "mysql").resolve(), directory=True)
+    plain(share / "english" / "errmsg.sys")
+    charsets = plain(share / "charsets", directory=True)
+    return [f"--plugin-dir={root / 'empty-plugins'}", f"--lc-messages-dir={share}",
+            f"--character-sets-dir={charsets}"]
+
+
+def posix_server_command(root: Path, manifest: dict, port: int) -> list[str]:
+    command = [manifest["server"], "--no-defaults", "--skip-name-resolve", "--bind-address=127.0.0.1",
+               f"--port={port}", f"--basedir={manifest['basedir']}", f"--datadir={root / 'data'}",
+               f"--pid-file={root / 'server.pid'}", f"--socket={root / 'mysql.sock'}",
+               f"--init-file={root / 'init.sql'}", f"--tmpdir={root / 'tmp'}",
+               "--max-connections=10", "--innodb-buffer-pool-size=33554432", "--skip-log-bin",
+               "--local-infile=OFF", "--general-log=OFF", "--slow-query-log=OFF", "--default-time-zone=+00:00"]
+    command.extend(posix_server_resources(root, Path(manifest["basedir"])))
+    if manifest["product"] == "mysql":
+        command.extend(("--mysqlx=OFF", "--port-open-timeout=0", "--persisted-globals-load=OFF",
+                        "--innodb-redo-log-capacity=33554432"))
+    else:
+        command.extend(("--innodb-log-file-size=8388608", "--skip-symbolic-links"))
+    return command
+
+
+def write_posix_startup(root: Path, config: dict, admin: dict, product: str) -> None:
+    write_startup_files(root, config, admin)
+    # Oracle's ssl-mode is not a MariaDB command-line option. Encryption settings
+    # are intentionally outside this local disposable connection fixture.
+    text = (root / "admin.cnf").read_text(encoding="utf-8")
+    text = text.replace("ssl-mode=REQUIRED\n", "")
+    write_private(root / "admin.cnf", text, replace=True)
+
+
+def posix_failure_summary(phase: str, error: BaseException, root: Path) -> None:
+    # Never format error text, command output or log lines: initialization can
+    # contain a root password not present in SECRETS. Only fixed labels and a
+    # bounded number of structural MySQL error codes may reach the CI console.
+    phase = phase if phase in ("prepare", "verify") else "unknown"
+    kind = type(error).__name__
+    if kind not in {"RuntimeError", "ValueError", "OSError", "PermissionError", "FileNotFoundError",
+                    "FileExistsError", "TimeoutExpired", "TimeoutError", "InterruptedError",
+                    "KeyboardInterrupt", "SystemExit"}:
+        kind = "unknown"
+    codes: list[str] = []
+    for name in ("server.log", "command-error.log"):
+        try:
+            output = bounded_bytes(root / name, MAX_SERVER_LOG_BYTES)
+        except (OSError, ValueError):
+            continue
+        for match in re.finditer(rb"\[ERROR\]\s+\[(MY-[0-9]{6})\]", output):
+            code = match[1].decode("ascii")
+            if code not in codes:
+                codes.append(code)
+            if len(codes) == 6:
+                break
+        if len(codes) == 6:
+            break
+    summary = f"POSIX database fixture failure: phase={phase} error={kind} mysql_errors={','.join(codes) or 'unknown'}"
+    try:
+        print(summary, file=sys.stderr, flush=True)
+    except (OSError, RuntimeError, ValueError):
+        # Diagnostics must not replace the primary failure or prevent cleanup.
+        pass
+
+
+def posix_prepare(args: argparse.Namespace) -> Path:
+    posix_only()
+    installed = plain(args.installed_root.resolve(), directory=True)
+    client_root = plain((args.client_root or args.installed_root).resolve(), directory=True)
+    product = args.product
+    if product not in ("mysql", "mariadb"):
+        raise ValueError("Select mysql or mariadb explicitly on POSIX")
+    server = posix_executable(installed, *(('bin/mysqld', 'sbin/mysqld') if product == 'mysql' else ('bin/mariadbd', 'sbin/mariadbd')))
+    client = posix_executable(client_root, "bin/mysql", "bin/mariadb")
+    admin = posix_executable(client_root, "bin/mysqladmin", "bin/mariadb-admin")
+    initializer = server if product == "mysql" else posix_executable(installed, "bin/mariadb-install-db", "scripts/mariadb-install-db", "bin/mysql_install_db")
+    include = args.sdk_include or client_root / "include" / "mysql"
+    if not include.exists() and args.sdk_include is None:
+        include = client_root / "include"
+    library = args.sdk_library
+    if library is None:
+        family = "mysqlclient" if (client_root / "lib" / "libmysqlclient.dylib").exists() else "mariadb"
+        library = client_root / "lib" / f"lib{family}.dylib"
+    root = posix_temporary_root() / f"ku-{product}-live-{secrets.token_hex(16)}"
+    root.mkdir(mode=0o700)
+    try:
+        (root / "tmp").mkdir(mode=0o700)
+        (root / "empty-plugins").mkdir(mode=0o700)
+        with posix_environment(root):
+            output = run([str(server), "--no-defaults", "--version"], root, "check installed POSIX server version", 5)
+            match = re.search(rb"\bVer ([A-Za-z0-9._-]{1,128})\b", output)
+            if match is None or (b"MariaDB" in match[1]) != (product == "mariadb"):
+                raise ValueError("Installed server version does not match the selected product")
+            manifest = {"format": POSIX_FORMAT, "product": product, "version": match[1].decode("ascii"),
+                        "server": str(server), "basedir": str(installed), "client": str(client),
+                        "admin": str(admin), "initializer": str(initializer)}
+            copy_posix_sdk(root, include, library)
+            manifest.update(posix_sdk_identity(root, include, library))
+            write_json(root / "fixture.json", manifest)
+            receipt = getattr(args, "receipt_file", None)
+            if receipt is not None:
+                write_private(receipt.absolute(), str(root) + "\n")
+            write_private(root / "fixture.txt", f"{product}\n{manifest['version']}\n{root / 'sdk'}\n")
+            with operation(root):
+                if product == "mysql":
+                    command = [str(server), "--no-defaults", "--initialize", f"--basedir={installed}",
+                               f"--datadir={root / 'data'}", "--innodb-buffer-pool-size=33554432", "--innodb-redo-log-capacity=33554432"]
+                else:
+                    command = [str(initializer), "--no-defaults", f"--basedir={installed}", f"--datadir={root / 'data'}",
+                               "--auth-root-authentication-method=socket", "--skip-test-db", "--skip-name-resolve",
+                               "--innodb-buffer-pool-size=33554432", "--innodb-log-file-size=8388608"]
+                command.extend(posix_server_resources(root, installed))
+                initialize_posix(root, command)
+                check_posix_tree(root)
+                with socket.socket() as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    port = reservation.getsockname()[1]
+                config = {"host": "127.0.0.1", "port": port, "user": "ku_test_" + secrets.token_hex(8),
+                          "password": secrets.token_hex(32), "database": "ku_db_" + secrets.token_hex(8)}
+                operator = {"user": "ku_admin_" + secrets.token_hex(8), "password": secrets.token_hex(32)}
+                validate_config(config, operator)
+                write_json(root / "db.json", config)
+                write_json(root / "admin.json", operator)
+    except BaseException as error:
+        posix_failure_summary("prepare", error, root)
+        # Only paths under the new exclusive root are removed. No process was
+        # started by prepare after the bounded initializer returned.
+        if not any(present(root / name) for name in ("server.active", "server.pid", "operation.lock")):
+            shutil.rmtree(root)
+        raise
+    print(f"Prepared private {product} {manifest['version']} fixture (server not running): {root}", flush=True)
+    print(f"Explicit client SDK: {manifest['client_library_family']} {manifest['client_version']}; header/library ABI {manifest['client_version_id']}.", flush=True)
+    return root
+
+
+def posix_verify(args: argparse.Namespace) -> None:
+    posix_only()
+    root = posix_fixture_root(args.fixture)
+    manifest = posix_manifest(root)
+    config, admin = read_json(root / "db.json"), read_json(root / "admin.json")
+    validate_config(config, admin)
+    SECRETS[:] = [config["password"], admin["password"]]
+    test, ku = plain(args.test_binary), plain(args.ku_binary)
+    with operation(root):
+        record = root / "verification.json"
+        record.unlink(missing_ok=True)
+        if present(root / "server.pid") or present(root / "server.active"):
+            raise ValueError("POSIX database markers already exist; refusing reuse")
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", config["port"]))
+        owner = None
+        primary = None
+        cleanup = BOUNDS.CleanupErrors()
+        text = ""
+        try:
+            with posix_environment(root):
+                write_posix_startup(root, config, admin, manifest["product"])
+                for name in ("server.log",):
+                    (root / name).unlink(missing_ok=True)
+                owner = PosixMysqlProcess(root, posix_server_command(root, manifest, config["port"]))
+                owner.start()
+                owner.wait_ready()
+                client = [manifest["client"], f"--defaults-file={root / 'admin.cnf'}", "--batch", "--raw", "--skip-column-names"]
+                identity = run(client + ["--execute=SELECT VERSION(), @@datadir, @@port, @@basedir, @@plugin_dir, @@lc_messages_dir, @@character_sets_dir"], root, "verify private POSIX server identity", 5).decode("utf-8").strip().split("\t")
+                expected_paths = [root / "data", Path(manifest["basedir"]), root / "empty-plugins",
+                                  Path(manifest["basedir"]) / "share" / "mysql",
+                                  Path(manifest["basedir"]) / "share" / "mysql" / "charsets"]
+                if len(identity) != 7 or identity[0] != manifest["version"] or identity[2] != str(config["port"]):
+                    raise RuntimeError("POSIX server identity does not match its newly created fixture")
+                if any(Path(actual).resolve() != expected.resolve() for actual, expected in zip([identity[1], *identity[3:]], expected_paths)):
+                    raise RuntimeError("POSIX server resources do not match the explicit private installation")
+                os.environ.update({"KU_MYSQL_TEST_CONFIG_FILE": str(root / "db.json"), "KU_BIN": str(ku),
+                                   "KU_MYSQL_LIB": str(root / "sdk" / "lib"), "KU_MYSQL_INCLUDE": str(root / "sdk" / "include")})
+                output = run([str(test), "--exact", POSIX_LIVE_TESTS[sys.platform], "--ignored", "--nocapture", "--test-threads=1"], REPO, "live POSIX MySQL query acceptance", TEST_TIMEOUT)
+                text = require_live_pass(output)
+                if owner.failed.is_set() or owner.process.poll() is not None:
+                    raise RuntimeError("POSIX server did not remain healthy during acceptance")
+                run([manifest["admin"], f"--defaults-file={root / 'admin.cnf'}", "shutdown"], root, "stop private POSIX server", 15)
+                owner.process.wait(timeout=15)
+        except BaseException as error:
+            primary = error
+        finally:
+            if owner is not None:
+                cleanup.attempt("server_stop", owner.stop)
+            for name in ("init.sql", "admin.cnf"):
+                cleanup.attempt(f"{name}_unlink", lambda name=name: (root / name).unlink(missing_ok=True))
+        cleanup.raise_if_any(primary)
+        write_private(root / "live-test.log", text, replace=True)
+        write_json(record, {"format": POSIX_FORMAT, "product": manifest["product"], "version": manifest["version"],
+                            "live_test_passed": True, "server_stopped": True,
+                            **{key: manifest[key] for key in ("client_library_source", "client_include_source", "client_library_family", "client_version", "client_version_id")},
+                            "verified_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    print(f"Live {manifest['product']} {manifest['version']} test passed; owned POSIX server stopped.", flush=True)
+    print(text.rstrip(), flush=True)
+
+
+def posix_cleanup(args: argparse.Namespace) -> None:
+    posix_only()
+    receipt = getattr(args, "receipt_file", None)
+    if receipt is not None:
+        receipt = plain(receipt.absolute())
+        locator = bounded_bytes(receipt, 4096).decode("utf-8")
+        if not locator.endswith("\n") or "\n" in locator[:-1]:
+            raise ValueError("Invalid private fixture receipt")
+        candidate = Path(locator[:-1])
+        if not present(candidate):
+            receipt.unlink()
+            print("Private POSIX fixture already removed.", flush=True)
+            return
+    else:
+        candidate = args.fixture
+    root = posix_fixture_root(candidate)
+    posix_manifest(root)
+    if any(present(root / name) for name in ("operation.lock", "server.pid", "server.active")):
+        raise ValueError("POSIX database shutdown is not confirmed; refusing deletion")
+    with operation(root):
+        check_posix_tree(root)
+        # Socket leaves are validated above and belong only to this stopped
+        # private root. Unlike a recursive service cleanup, no process is found
+        # or killed from a path, PID marker, port or installation location.
+        shutil.rmtree(root)
+    if receipt is not None:
+        receipt.unlink()
+    print("Removed the stopped private POSIX database fixture and generated credentials.", flush=True)
+
+
+def posix_exercise(args: argparse.Namespace) -> None:
+    root = posix_prepare(args)
+    primary = None
+    cleanup = BOUNDS.CleanupErrors()
+    try:
+        posix_verify(argparse.Namespace(fixture=root, test_binary=args.test_binary, ku_binary=args.ku_binary))
+    except BaseException as error:
+        posix_failure_summary("verify", error, root)
+        primary = error
+    finally:
+        cleanup.attempt("fixture_cleanup", lambda: posix_cleanup(argparse.Namespace(fixture=root, receipt_file=getattr(args, "receipt_file", None))))
+    cleanup.raise_if_any(primary)
+
+
 def main() -> None:
+    if os.name == "posix":
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("--installed-root", type=Path, required=True)
+    prepare_parser.add_argument("--product", choices=("mysql", "mariadb"))
+    prepare_parser.add_argument("--client-root", type=Path)
+    prepare_parser.add_argument("--sdk-include", type=Path)
+    prepare_parser.add_argument("--sdk-library", type=Path)
+    prepare_parser.add_argument("--receipt-file", type=Path)
     verify_parser = commands.add_parser("verify")
     verify_parser.add_argument("--fixture", type=Path, required=True)
     verify_parser.add_argument("--test-binary", type=Path, required=True)
     verify_parser.add_argument("--ku-binary", type=Path, required=True)
+    exercise_parser = commands.add_parser("exercise")
+    exercise_parser.add_argument("--product", choices=("mysql", "mariadb"), required=True)
+    exercise_parser.add_argument("--installed-root", type=Path, required=True)
+    exercise_parser.add_argument("--client-root", type=Path)
+    exercise_parser.add_argument("--sdk-include", type=Path)
+    exercise_parser.add_argument("--sdk-library", type=Path)
+    exercise_parser.add_argument("--test-binary", type=Path, required=True)
+    exercise_parser.add_argument("--ku-binary", type=Path, required=True)
+    exercise_parser.add_argument("--receipt-file", type=Path)
     cleanup_parser = commands.add_parser("cleanup")
-    cleanup_parser.add_argument("--fixture", type=Path, required=True)
+    cleanup_root = cleanup_parser.add_mutually_exclusive_group(required=True)
+    cleanup_root.add_argument("--fixture", type=Path)
+    cleanup_root.add_argument("--receipt-file", type=Path)
     args = parser.parse_args()
     try:
-        {"prepare": prepare, "verify": verify, "cleanup": cleanup}[args.command](args)
-    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        operations = ({"prepare": prepare, "verify": verify, "cleanup": cleanup} if os.name == "nt" else
+                      {"prepare": posix_prepare, "verify": posix_verify, "cleanup": posix_cleanup, "exercise": posix_exercise})
+        if args.command not in operations or (os.name == "nt" and getattr(args, "receipt_file", None) is not None):
+            raise ValueError("The selected fixture operation requires POSIX")
+        operations[args.command](args)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt):
         # JSON/parser/OS exceptions can contain sensitive data. Keep diagnostics
         # categorical, never include raw command output or credential documents.
         raise SystemExit("MySQL fixture failed; no success recorded. Inspect the private fixture without publishing credentials.") from None

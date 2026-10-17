@@ -260,13 +260,13 @@ fn run_live_fixture(root: PathBuf, password: String, expected_version: Option<&s
     );
 }
 
-#[cfg(target_os = "macos")]
-fn private_macos_fixture() -> (PathBuf, String, String) {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn private_posix_fixture() -> (PathBuf, String, String) {
     use std::os::unix::fs::MetadataExt;
 
     let config = PathBuf::from(
         env::var_os("KU_MYSQL_TEST_CONFIG_FILE")
-            .expect("supply a newly created private macOS loopback fixture"),
+            .expect("supply a newly created private POSIX loopback fixture"),
     );
     plain(&config, false);
     assert_eq!(config.file_name().and_then(|v| v.to_str()), Some("db.json"));
@@ -405,7 +405,15 @@ fn private_macos_fixture() -> (PathBuf, String, String) {
 #[test]
 #[ignore = "requires a newly created private macOS MySQL or MariaDB loopback instance"]
 fn native_mysql_client_live_macos_loopback_roundtrip() {
-    let (root, password, version) = private_macos_fixture();
+    let (root, password, version) = private_posix_fixture();
+    run_live_fixture(root, password, Some(&version));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a newly created private Linux MySQL or MariaDB loopback instance"]
+fn native_mysql_client_live_linux_loopback_roundtrip() {
+    let (root, password, version) = private_posix_fixture();
     run_live_fixture(root, password, Some(&version));
 }
 

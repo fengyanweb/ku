@@ -1034,5 +1034,345 @@ class MysqlFixtureTests(unittest.TestCase):
         self.assertTrue((self.root / "db.json").exists())
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX fixture contracts")
+class PosixMysqlFixtureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="ku-posix-mysql-contract-")
+        self.base = Path(self.temporary.name).resolve()
+        self.root = self.base / ("ku-mysql-live-" + "0" * 32)
+        self.root.mkdir(mode=0o700)
+        for name in ("data", "tmp", "empty-plugins", "sdk/lib", "sdk/include"):
+            (self.root / name).mkdir(parents=True, mode=0o700)
+        self.installed = self.base / "installed"
+        (self.installed / "bin").mkdir(parents=True)
+        for name in ("mysqld", "mysql", "mysqladmin"):
+            path = self.installed / "bin" / name
+            path.write_bytes(b"fixture contract, never executed")
+            path.chmod(0o700)
+        self.manifest = {"format": F.POSIX_FORMAT, "product": "mysql", "version": "8.0.42",
+                         "server": str(self.installed / "bin/mysqld"), "basedir": str(self.installed),
+                         "client": str(self.installed / "bin/mysql"), "admin": str(self.installed / "bin/mysqladmin"),
+                         "initializer": str(self.installed / "bin/mysqld")}
+        share = self.installed / "share/mysql"
+        (share / "english").mkdir(parents=True)
+        (share / "charsets").mkdir()
+        (share / "english/errmsg.sys").write_bytes(b"fixture messages")
+        self.manifest.update({"client_library_source": str(self.installed / "bin/mysql"),
+                              "client_include_source": str(self.root / "sdk/include"),
+                              "client_library_family": "mysqlclient", "client_version": "8.0.42",
+                              "client_version_id": 80042})
+        self.config = {"host": "127.0.0.1", "port": 23456, "user": "ku_test_" + "1" * 16,
+                       "password": "a" * 64, "database": "ku_db_" + "2" * 16}
+        self.admin = {"user": "ku_admin_" + "3" * 16, "password": "b" * 64}
+        for name, value in (("fixture.json", self.manifest), ("db.json", self.config), ("admin.json", self.admin)):
+            F.write_json(self.root / name, value)
+        self.test, self.ku = self.base / "test", self.base / "ku"
+        self.test.write_bytes(b"not executable")
+        self.ku.write_bytes(b"not executable")
+        self.args = argparse.Namespace(fixture=self.root, test_binary=self.test, ku_binary=self.ku)
+        self.stack = ExitStack()
+        self.stack.enter_context(patch.object(F, "posix_temporary_root", return_value=self.base))
+        self.stack.enter_context(patch.object(F, "SECRETS", []))
+        self.stack.enter_context(patch("sys.stdout", new_callable=io.StringIO))
+        self.stderr = self.stack.enter_context(patch("sys.stderr", new_callable=io.StringIO))
+        self.stack.enter_context(patch.object(F.BOUNDS, "run_bounded", side_effect=AssertionError("unexpected process execution")))
+
+    def tearDown(self) -> None:
+        self.stack.close()
+        self.temporary.cleanup()
+
+    def verification(self, *, identity=None, output=PASS):
+        stack = ExitStack()
+        owner = MagicMock()
+        owner.failed.is_set.return_value = False
+        owner.process.poll.return_value = None
+        stack.enter_context(patch.object(F, "PosixMysqlProcess", return_value=owner))
+        stack.enter_context(patch.object(F.socket, "socket"))
+        identity = identity if identity is not None else f"8.0.42\t{self.root / 'data'}/\t23456\t{self.installed}/\t{self.root / 'empty-plugins'}/\t{self.installed / 'share/mysql'}/\t{self.installed / 'share/mysql/charsets'}/\n".encode()
+        def run(command, cwd, label, timeout=30):
+            if "identity" in label:
+                return identity
+            if "acceptance" in label:
+                return output
+            if "stop" in label:
+                return b""
+            raise AssertionError("unexpected command")
+        call = stack.enter_context(patch.object(F, "run", side_effect=run))
+        return stack, owner, call
+
+    def test_private_root_rejects_other_owner_permissions_and_foreign_names(self):
+        self.assertEqual(self.root, F.posix_fixture_root(self.root))
+        self.root.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "private"):
+            F.posix_fixture_root(self.root)
+        self.root.chmod(0o700)
+        with patch.object(F.os, "geteuid", return_value=os.geteuid() + 1), self.assertRaisesRegex(ValueError, "private"):
+            F.posix_fixture_root(self.root)
+        outside = self.base / "business-database"
+        outside.mkdir()
+        with self.assertRaisesRegex(ValueError, "dedicated"):
+            F.posix_fixture_root(outside)
+
+    def test_manifest_rejects_product_confusion_and_extra_fields(self):
+        self.assertEqual(self.manifest, F.posix_manifest(self.root))
+        for change in ({"product": "mariadb"}, {"format": True}, {"unexpected": "value"}):
+            F.write_json(self.root / "fixture.json", {**self.manifest, **change}, replace=True)
+            with self.assertRaises(ValueError):
+                F.posix_manifest(self.root)
+
+    def test_environment_excludes_database_secrets_and_returns_original_state(self):
+        original = {"PATH": "/usr/bin:/bin", "MYSQL_PWD": "business", "LD_PRELOAD": "foreign",
+                    "HOME": "business", "KU_BIN": "foreign", "DYLD_LIBRARY_PATH": "foreign"}
+        with patch.dict(os.environ, original, clear=True):
+            with F.posix_environment(self.root):
+                for name in ("MYSQL_PWD", "LD_PRELOAD", "KU_BIN", "DYLD_LIBRARY_PATH"):
+                    self.assertNotIn(name, os.environ)
+                self.assertEqual(str(self.root), os.environ["HOME"])
+                self.assertEqual(str(self.root / "never-created.mylogin.cnf"), os.environ["MYSQL_TEST_LOGIN_FILE"])
+                F.write_private(self.root / "private.txt", "credential fixture")
+                self.assertEqual(0o600, (self.root / "private.txt").stat().st_mode & 0o777)
+            self.assertEqual(original, dict(os.environ))
+
+    def test_commands_keep_loopback_owned_paths_and_product_specific_options(self):
+        command = F.posix_server_command(self.root, self.manifest, 23456)
+        for required in ("--no-defaults", "--bind-address=127.0.0.1", "--skip-name-resolve",
+                         f"--datadir={self.root / 'data'}", f"--socket={self.root / 'mysql.sock'}", "--mysqlx=OFF",
+                         f"--plugin-dir={self.root / 'empty-plugins'}", f"--lc-messages-dir={self.installed / 'share/mysql'}"):
+            self.assertIn(required, command)
+        self.assertFalse(any("password" in item or "install" == item for item in command))
+        maria = F.posix_server_command(self.root, {**self.manifest, "product": "mariadb"}, 23456)
+        self.assertNotIn("--mysqlx=OFF", maria)
+        self.assertIn("--skip-symbolic-links", maria)
+        F.write_posix_startup(self.root, self.config, self.admin, "mariadb")
+        self.assertNotIn("ssl-mode", (self.root / "admin.cnf").read_text())
+        self.assertIn("ACCOUNT LOCK", (self.root / "init.sql").read_text())
+        self.assertIn(self.config["database"].replace("_", r"\_"), (self.root / "init.sql").read_text())
+
+    def test_tree_scan_checks_all_entries_before_cleanup_and_never_follows_links(self):
+        (self.root / "data" / "payload").write_bytes(b"12345")
+        outside = self.base / "outside"
+        outside.write_bytes(b"preserved")
+        link = self.root / "data" / "foreign"
+        link.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "Symlinks"):
+            F.posix_cleanup(self.args)
+        self.assertTrue((self.root / "data" / "payload").exists())
+        link.unlink()
+        with patch.object(F, "MAX_DATA_BYTES", 1), self.assertRaisesRegex(ValueError, "byte bound"):
+            F.posix_cleanup(self.args)
+        F.posix_cleanup(self.args)
+        self.assertFalse(self.root.exists())
+        self.assertEqual(b"preserved", outside.read_bytes())
+
+    def test_cleanup_refuses_every_active_marker_without_touching_tree(self):
+        for name in ("operation.lock", "server.pid", "server.active"):
+            F.write_private(self.root / name, "marker")
+            with self.assertRaisesRegex(ValueError, "not confirmed"):
+                F.posix_cleanup(self.args)
+            self.assertTrue((self.root / "db.json").exists())
+            (self.root / name).unlink()
+
+    def test_sdk_snapshot_copies_only_explicit_shared_library_and_headers_with_bounds(self):
+        include = self.base / "include"
+        include.mkdir()
+        (include / "mysql.h").write_bytes(b"public header")
+        (include / "nested").mkdir()
+        (include / "nested" / "version.h").write_bytes(b"version header")
+        library = self.base / "libmysqlclient.so.21"
+        library.write_bytes(b"shared client fixture")
+        dest = self.base / "snapshot"
+        dest.mkdir()
+        F.copy_posix_sdk(dest, include, library)
+        self.assertEqual(library.read_bytes(), (dest / "sdk/lib/libmysqlclient.so.21").read_bytes())
+        self.assertEqual(b"version header", (dest / "sdk/include/nested/version.h").read_bytes())
+        limited = self.base / "limited"
+        limited.mkdir()
+        with patch.object(F, "MAX_COPY_BYTES", 1), self.assertRaisesRegex(ValueError, "bound"):
+            F.copy_posix_sdk(limited, include, library)
+        static = self.base / "libmysqlclient.a"
+        static.write_bytes(b"unsupported static archive")
+        with self.assertRaisesRegex(ValueError, "shared"):
+            F.copy_posix_sdk(self.root, include, static)
+
+    def test_verify_requires_real_single_live_pass_and_matching_server_identity(self):
+        stack, owner, call = self.verification()
+        with stack:
+            F.posix_verify(self.args)
+        owner.start.assert_called_once()
+        owner.wait_ready.assert_called_once()
+        owner.stop.assert_called_once()
+        command = call.call_args_list[1].args[0]
+        self.assertEqual(F.POSIX_LIVE_TESTS[sys.platform], command[2])
+        record = F.read_json(self.root / "verification.json")
+        self.assertTrue(record["live_test_passed"])
+        self.assertTrue(record["server_stopped"])
+        for name in ("init.sql", "admin.cnf", "operation.lock"):
+            self.assertFalse((self.root / name).exists())
+
+    def test_identity_mismatch_and_skipped_live_test_always_stop_without_success(self):
+        for identity, output in ((b"8.0.42\t/foreign/data\t23456\n", PASS), (None, PASS + b"skip: unavailable")):
+            stack, owner, _ = self.verification(identity=identity, output=output)
+            with stack, self.assertRaises(RuntimeError):
+                F.posix_verify(self.args)
+            owner.stop.assert_called_once()
+            self.assertFalse((self.root / "verification.json").exists())
+            self.assertFalse((self.root / "init.sql").exists())
+            self.assertFalse((self.root / "admin.cnf").exists())
+
+    def test_sdk_identity_reads_actual_library_version_and_rejects_header_mismatch(self):
+        include = self.root / "sdk/include"
+        (include / "mysql_version.h").write_text("#define LIBMYSQL_VERSION_ID 80042\n")
+        library = self.base / "libmysqlclient.so.21"
+        library.write_bytes(b"never loaded: subprocess mocked")
+        with patch.object(F, "run", return_value=b'{"version":"8.0.42","version_id":80042}\n') as run:
+            identity = F.posix_sdk_identity(self.root, include, library)
+        self.assertEqual("mysqlclient", identity["client_library_family"])
+        self.assertEqual("8.0.42", identity["client_version"])
+        self.assertEqual(80042, identity["client_version_id"])
+        self.assertEqual(5, run.call_args.args[3])
+        self.assertIn(str(self.root / "sdk/lib/libmysqlclient.so.21"), run.call_args.args[0])
+        with patch.object(F, "run", return_value=b'{"version":"8.0.43","version_id":80043}'), \
+             self.assertRaisesRegex(ValueError, "ABI versions disagree"):
+            F.posix_sdk_identity(self.root, include, library)
+        # Connector version is not the MariaDB server version from the header.
+        (include / "mariadb_version.h").write_text("#define MARIADB_PACKAGE_VERSION_ID 30308\n#define MYSQL_VERSION_ID 101113\n")
+        maria = self.base / "libmariadb.so.3"
+        maria.write_bytes(b"never loaded: subprocess mocked")
+        with patch.object(F, "run", return_value=b'{"version":"3.3.8","version_id":30308}'):
+            identity = F.posix_sdk_identity(self.root, include, maria)
+        self.assertEqual("mariadb", identity["client_library_family"])
+        self.assertEqual(30308, identity["client_version_id"])
+
+    def test_server_resource_mismatch_stops_before_the_live_test(self):
+        identity = f"8.0.42\t{self.root / 'data'}/\t23456\t{self.installed}/\t/usr/lib/mysql/plugin/\t{self.installed / 'share/mysql'}/\t{self.installed / 'share/mysql/charsets'}/\n".encode()
+        stack, owner, call = self.verification(identity=identity)
+        with stack, self.assertRaisesRegex(RuntimeError, "resources"):
+            F.posix_verify(self.args)
+        self.assertEqual(1, call.call_count)
+        owner.stop.assert_called_once()
+        self.assertFalse((self.root / "verification.json").exists())
+
+    def test_initializer_wait_failure_still_stops_the_owned_process(self):
+        owner = MagicMock()
+        owner.process.wait.side_effect = subprocess.TimeoutExpired("private", 120)
+        with patch.object(F, "PosixMysqlProcess", return_value=owner), self.assertRaises(subprocess.TimeoutExpired):
+            F.initialize_posix(self.root, ["owned initializer"])
+        owner.start.assert_called_once()
+        owner.stop.assert_called_once()
+
+    def test_exercise_failure_cleans_its_exact_created_root_and_preserves_failure(self):
+        args = argparse.Namespace(test_binary=self.test, ku_binary=self.ku, receipt_file=None)
+        with patch.object(F, "posix_prepare", return_value=self.root), \
+             patch.object(F, "posix_verify", side_effect=RuntimeError("controlled test fault")), \
+             patch.object(F, "posix_cleanup") as cleanup, \
+             self.assertRaisesRegex(RuntimeError, "controlled test fault"):
+            F.posix_exercise(args)
+        self.assertEqual(self.root, cleanup.call_args.args[0].fixture)
+
+    def test_failure_summary_is_bounded_and_never_formats_credentials_or_sql(self):
+        unknown_root_password = "initializer-password-never-added-to-SECRETS"
+        sql = "CREATE USER sensitive_sql_payload IDENTIFIED BY 'sensitive-password'"
+        log = unknown_root_password + "\n" + sql + "\n" + (self.config["password"] + "\n")
+        log += "".join(f"[ERROR] [MY-{number:06d}] {unknown_root_password}\n" for number in range(20))
+        F.write_private(self.root / "server.log", log)
+        args = argparse.Namespace(test_binary=self.test, ku_binary=self.ku, receipt_file=None)
+        with patch.object(F, "posix_prepare", return_value=self.root), \
+             patch.object(F, "posix_verify", side_effect=RuntimeError(sql)), \
+             self.assertRaises(RuntimeError):
+            F.posix_exercise(args)
+        self.assertFalse(self.root.exists(), "failure must still remove its stopped private tree")
+        summary = self.stderr.getvalue()
+        self.assertIn("phase=verify error=RuntimeError", summary)
+        self.assertEqual(6, summary.count("MY-"))
+        self.assertLessEqual(len(summary.encode()), 256)
+        self.assertEqual(1, len(summary.splitlines()))
+        for secret in (unknown_root_password, sql, self.config["password"], "sensitive-password"):
+            self.assertNotIn(secret, summary)
+
+    def test_failure_summary_keeps_unknown_types_and_unreadable_logs_categorical(self):
+        secret_type = type("private_credential_should_not_appear", (RuntimeError,), {})
+        # A symbolic log must never be followed to a foreign diagnostic file.
+        (self.root / "server.log").symlink_to(self.test)
+        F.posix_failure_summary("secret phase text", secret_type("secret error text"), self.root)
+        self.assertEqual("POSIX database fixture failure: phase=unknown error=unknown mysql_errors=unknown\n", self.stderr.getvalue())
+        with patch("sys.stderr") as broken:
+            broken.write.side_effect = OSError("secret writer fault")
+            F.posix_failure_summary("verify", RuntimeError("secret error text"), self.root)
+
+    def test_prepare_failure_reports_before_its_private_log_is_deleted(self):
+        args = argparse.Namespace(product="mysql", installed_root=self.installed,
+                                  client_root=self.installed, sdk_include=self.base,
+                                  sdk_library=self.test, receipt_file=None)
+        created = self.base / ("ku-mysql-live-" + "e" * 32)
+        def failed_version(command, cwd, label, timeout):
+            F.write_private(cwd / "server.log", "[ERROR] [MY-010267] untracked-initializer-password\n")
+            return b"mysqld Ver 10.11.13-MariaDB"
+        with patch.object(F.secrets, "token_hex", return_value="e" * 32), \
+             patch.object(F, "run", side_effect=failed_version), self.assertRaises(ValueError):
+            F.posix_prepare(args)
+        self.assertFalse(created.exists())
+        self.assertIn("phase=prepare error=ValueError mysql_errors=MY-010267", self.stderr.getvalue())
+        self.assertNotIn("untracked-initializer-password", self.stderr.getvalue())
+
+    def test_prepare_version_mismatch_never_initializes_and_removes_new_root(self):
+        args = argparse.Namespace(product="mysql", installed_root=self.installed,
+                                  client_root=self.installed, sdk_include=self.base,
+                                  sdk_library=self.test, receipt_file=None)
+        with patch.object(F.secrets, "token_hex", return_value="f" * 32), \
+             patch.object(F, "run", return_value=b"mysqld Ver 10.11.13-MariaDB"), \
+             patch.object(F, "initialize_posix") as initialize, self.assertRaisesRegex(ValueError, "product"):
+            F.posix_prepare(args)
+        initialize.assert_not_called()
+        self.assertFalse((self.base / ("ku-mysql-live-" + "f" * 32)).exists())
+
+    def test_volatile_scan_only_tolerates_disappeared_entries(self):
+        vanished = MagicMock()
+        vanished.path = str(self.root / "vanished")
+        fake_scan = MagicMock()
+        fake_scan.__enter__.return_value = iter([vanished])
+        with patch.object(F.os, "scandir", return_value=fake_scan):
+            self.assertEqual((1, 0), F.check_posix_tree(self.root, volatile=True))
+        fake_scan.__enter__.return_value = iter([vanished])
+        with patch.object(F.os, "scandir", return_value=fake_scan), self.assertRaises(FileNotFoundError):
+            F.check_posix_tree(self.root)
+        link = self.root / "foreign-link"
+        link.symlink_to(self.test)
+        with self.assertRaisesRegex(ValueError, "Symlinks"):
+            F.check_posix_tree(self.root, volatile=True)
+
+    def test_receipt_cleanup_is_bounded_and_rejects_foreign_or_active_roots(self):
+        receipt = self.base / "receipt.txt"
+        args = argparse.Namespace(fixture=None, receipt_file=receipt)
+        F.write_private(receipt, str(self.root) + "\n")
+        F.write_private(self.root / "server.active", "1234\n")
+        with self.assertRaisesRegex(ValueError, "not confirmed"):
+            F.posix_cleanup(args)
+        self.assertTrue(receipt.exists())
+        (self.root / "server.active").unlink()
+        F.posix_cleanup(args)
+        self.assertFalse(receipt.exists())
+        self.assertFalse(self.root.exists())
+        F.write_private(receipt, str(self.root) + "\n")
+        F.posix_cleanup(args)
+        self.assertFalse(receipt.exists())
+        F.write_private(receipt, str(self.base) + "\n")
+        with self.assertRaisesRegex(ValueError, "dedicated"):
+            F.posix_cleanup(args)
+        self.assertTrue(self.base.exists())
+
+    def test_partial_start_and_stop_failure_never_record_success_or_delete_unknown_server(self):
+        stack, owner, _ = self.verification()
+        owner.start.side_effect = RuntimeError("controlled start fault")
+        with stack, self.assertRaises(RuntimeError):
+            F.posix_verify(self.args)
+        owner.stop.assert_called_once()
+        self.assertFalse((self.root / "verification.json").exists())
+        stack, owner, _ = self.verification()
+        owner.stop.side_effect = RuntimeError("controlled stop fault")
+        with stack, self.assertRaises(RuntimeError):
+            F.posix_verify(self.args)
+        self.assertFalse((self.root / "verification.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
