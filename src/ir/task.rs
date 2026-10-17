@@ -453,6 +453,24 @@ fn copy_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Int | IrType::Bool | IrType::Null)
 }
 
+/// The source lowering commits an owned replacement through this exact pair.
+/// Share the bounded predicate with the adapter so typed charge reconciliation
+/// never references owned locals omitted from the persistent frame plan.
+pub(crate) fn replaces_owned_value(
+    function: &TaskFunction,
+    previous: Option<&TaskOp>,
+    operation: &TaskOp,
+) -> bool {
+    let (Some(TaskOp::DropIfInit { slot }), TaskOp::Move { dst, .. }) = (previous, operation)
+    else {
+        return false;
+    };
+    slot == dst
+        && matches!(function.slots.get(dst.0), Some(TaskSlot {
+            ty: TaskSlotType::Value { ty, borrowed: false }
+        }) if matches!(ty, IrType::Str | IrType::Result(_)) || flat_array(ty) || error_type(ty))
+}
+
 fn slot_type(slot: &TaskSlot) -> KuResult<(&IrType, bool)> {
     match &slot.ty {
         TaskSlotType::Value { ty, borrowed } => Ok((ty, *borrowed)),
@@ -806,7 +824,7 @@ fn validate_shape(
     }
     for state in &function.states {
         budget.spend()?;
-        for operation in &state.operations {
+        for (operation_index, operation) in state.operations.iter().enumerate() {
             budget.spend()?;
             match operation {
                 TaskOp::FinallyEnter { cleanup } | TaskOp::FinallyLeave { cleanup } => {
@@ -959,6 +977,20 @@ fn validate_shape(
                             return Err(invalid("move requires an owned source"))
                         }
                         _ => {}
+                    }
+                    // Replacing a Value can reduce its active capacity without
+                    // an allocating projection. The adapter must reconcile that
+                    // change, which requires every owned slot to be persistent.
+                    // Validate the Move first; the prior-op lookup is O(1) in
+                    // this existing budgeted traversal, not another graph scan.
+                    if replaces_owned_value(
+                        function,
+                        operation_index
+                            .checked_sub(1)
+                            .and_then(|index| state.operations.get(index)),
+                        operation,
+                    ) {
+                        has_error_projection = true;
                     }
                 }
                 TaskOp::Unary { dst, op, src } => {

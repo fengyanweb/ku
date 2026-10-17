@@ -219,13 +219,77 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
         error.message.contains("a mismatched Copy reassignment"),
         "{error}"
     );
+    for (ty, initial, replacement) in [
+        ("str", "\"first\"", "\"second\""),
+        ("[int]", "[1]", "[]"),
+        ("[bool]", "[true]", "[false]"),
+        ("[str]", "[\"first\"]", "[]"),
+        ("int!", "ok(1)", "ok(2)"),
+        ("bool!", "ok(true)", "ok(false)"),
+        ("null!", "ok(null)", "ok(null)"),
+        ("str!", "ok(\"first\")", "ok(\"second\")"),
+        ("[int]!", "ok([1])", "ok([2])"),
+        ("[bool]!", "ok([true])", "ok([false])"),
+        ("[str]!", "ok([\"first\"])", "ok([\"second\"])"),
+    ] {
+        let source = format!("async fn main(): null! {{ value: {ty} = {initial} value = value value = {replacement} return ok(null) }}");
+        let native = task_lower::lower_program(&checked(&source)).unwrap();
+        let function = &native.tasks.functions[native.entry.0];
+        let operations = &function.states[function.entry.0].operations;
+        let self_reads: Vec<_> = operations
+            .iter()
+            .filter_map(|op| match op {
+                TaskOp::Read { slot } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(self_reads.len(), 1, "{ty}: exactly one true self Read");
+        let target = self_reads[0];
+        let replacement = operations
+            .windows(2)
+            .position(|pair| {
+                matches!(&pair[0], TaskOp::DropIfInit {slot} if *slot==target)
+                    && matches!(&pair[1], TaskOp::Move {dst,src} if *dst==target && *src!=target)
+            })
+            .unwrap_or_else(|| panic!("{ty}: missing replacement of self-read slot {target:?}"));
+        assert!(operations[..replacement]
+            .iter()
+            .any(|op| matches!(op,TaskOp::Read {slot} if *slot==target)));
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| matches!(op,TaskOp::Move {dst,..} if *dst==target))
+                .count(),
+            2
+        );
+        task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+        // The lowering makes replacement explicit; raw IR must still refuse
+        // a second Owned Move if its preceding drop is removed.
+        let mut invalid = native.tasks.clone();
+        invalid.functions[native.entry.0].states[function.entry.0]
+            .operations
+            .remove(replacement);
+        let error = task::verify_and_plan(&invalid, TaskLimits::default()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("overwriting a possibly initialized owned slot without drop"),
+            "{ty}: {error}"
+        );
+    }
+    let mismatched =
+        parsed("async fn main(): null! { value = \"first\" value = [1] return ok(null) }");
+    assert!(Checker::new().check(&mismatched).is_err());
+    assert!(task_lower::lower_program(&mismatched)
+        .unwrap_err()
+        .message
+        .contains("a mismatched Owned reassignment"));
     for source in [
-        "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
-        "async fn main(): null! { value = ok(1) value = ok(2) return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { child = Child() child = Child() return ok(null) }",
+        "async fn Child(): int! { return ok(1) } async fn main(): null! { selected = Child selected = Child return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).unwrap_err();
-        assert!(error.message.contains("reassignment of Owned or Task values"), "{error}");
+        assert!(error.message.contains("reassignment of Task or Callable values"), "{error}");
     }
     let duplicate =
         parsed("async fn main(): null! { value: int = 1 value: int = 2 return ok(null) }");
@@ -1045,13 +1109,36 @@ async fn main(): null! { return ok(null) }
 #[test]
 fn native_task_if_owned_reassignment_cross_scope_task_moves_and_nested_arrays_stay_gated() {
     for source in [
-        "async fn main(): null! { value = \"first\" if (true) { value = \"second\" } return ok(null) }",
+        "async fn Probe(gate: bool): null! { value = \"first\" if (gate) { value = \"second\" } println(value) moved = value value = \"third\" println(value) return ok(null) } async fn main(): null! { return ok(null) }",
+        "async fn Probe(gate: bool): null! { value = [\"first\"] if (gate) { moved = value } value = [] println(value.len()) return ok(null) } async fn main(): null! { return ok(null) }",
+        "async fn main(): null! { try { fail \"first\" } catch (first) { problem = first problem = problem try { fail \"second\" } catch (second) { problem = second } println(problem.message) } return ok(null) }",
+    ] {
+        let native=task_lower::lower_program(&checked(source)).unwrap();
+        task::verify_and_plan(&native.tasks,TaskLimits::default()).unwrap();
+        assert!(native.tasks.functions.iter().flat_map(|function| &function.states).any(|state|state.operations.windows(2).any(|pair| matches!(&pair[0],TaskOp::DropIfInit{slot} if matches!(&pair[1],TaskOp::Move{dst,..} if dst==slot)))));
+    }
+    for source in [
         "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
         "async fn main(): null! { for item in [[1], [2]] { println(item) } return ok(null) }",
+        "async fn main(): null! { values=[1] values[0]=2 return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).expect_err("outside the admitted slice");
         assert!(error.to_string().contains("native async subset"), "{error}");
     }
+    let no_context =
+        parsed("async fn main(): null! { values=ok([1]) values=ok([]) return ok(null) }");
+    assert!(
+        task_lower::lower_program(&no_context).is_err(),
+        "a Result target must not contextualize ok([])"
+    );
+    let moved_self =
+        parsed("async fn main(): null! { value=\"old\" moved=value value=value return ok(null) }");
+    assert!(Checker::new().check(&moved_self).is_err());
+    let error = task_lower::lower_program(&moved_self).unwrap_err();
+    assert!(
+        error.message.contains("not definitely initialized"),
+        "a true self Read still requires an initialized owner: {error}"
+    );
 }
 
 #[test]

@@ -429,13 +429,18 @@ AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包
 展开后所有顶层 item 必须是非泛型 async 函数；普通值参数限 primitive/对应 Result 与平面数组，返回支持 primitive 或平面数组 Result，另支持下述有限 Callable 形参。
 支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
-普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
+普通赋值在 RHS 成功端点 Copy 回原槽；str/平面数组/单层 Result/Error 的 Owned
+普通赋值则连续发 DropIfInit(target)、Move(target, source)，中间没有跳转或可失败步骤。
+自赋值发 Read；moved/maybe-initialized 目标按原 must/may 规则重建，祖先 VALUE 槽
+保留原清理来源。RHS 失败不执行这次替换，但不撤销 RHS 自身的显式 move；求值期间
+旧新 owner 的真实峰值仍计费。裸 `[]` 仅从已有平面数组赋值目标推断，入口消耗原
+表达式预算一次。原 raw IR 的直接覆盖拒绝和初始化/别名检查保持不变。
 源码 while 的回边指向条件求值入口，而非 Await.ready 或旧 bool Branch；本轮正常
 ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不能省略让出。
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组 Result 形参/Callable 数组形参、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
+Task/Callable 重赋值、复合赋值与自增/自减、嵌套数组/数组 Result 形参/Callable 数组形参、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和下述平面数组以外的动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -539,7 +544,7 @@ Owned 释放，但不继续用户代码；本层算术、输出或分配失败�
 正常 scope timeout 使用 `finish_finally` 消费一次入口，再允许 `finish_exit_values`；
 重复 receipt/ACK 不能重跑 body，未消费入口不能跳过 body 提前完成值清理。
 
-body 首版支持有限 primitive/字符串/Error、Copy 赋值、输出、分支和局部 try/catch。
+body 支持有限 primitive/字符串/Error、Copy 与现有 Owned 值赋值、输出、分支和局部 try/catch。
 其中创建新 Task、Await、sleep、循环或再次嵌 finally 仍拒绝；try body 中的多层
 finally 链可用。普通算术 fatal 仍跳过用户 finally。实际执行与精确提交CI结果见日志，
 这些能力不代表完整 async、I/O、M:N 或发布验收。

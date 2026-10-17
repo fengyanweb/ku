@@ -304,6 +304,11 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
                 .operations
                 .iter()
                 .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+        })
+        || function.states.iter().any(|state| {
+            state.operations.windows(2).any(|pair| {
+                crate::ir::task::replaces_owned_value(function, Some(&pair[0]), &pair[1])
+            })
         });
     let mut reconcile_fields = if blocking {
         "  bytes=instance->blocking.charged_bytes;\n".to_owned()
@@ -872,8 +877,8 @@ const SCOPE_RESUME: &str = r#"
 "#;
 
 const RECONCILE_HELPER: &str = r#"
-/* This opt-in typed scan belongs only to functions that allocate Error-field
- * projections. Every owned slot in these hosted frames is persistent. */
+/* Opt-in typed scans cover dynamic projections, blocking I/O and owned Value
+ * replacements. Every owned slot in these hosted frames is persistent. */
 static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
   KuTaskInstance_@ID@* instance=(KuTaskInstance_@ID@*)raw;
   if (!instance->registered) return KU_TASK_DRIVER_OK;

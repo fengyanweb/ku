@@ -3480,6 +3480,48 @@ async fn PartialRows(): [str]! {
     rows = [fs.read("first.txt")?, fs.read("missing.txt")?]
     return ok(rows)
 }
+async fn ReassignText(): null! {
+    text = fs.read("first.txt")?
+    text = text
+    println(text)
+    try { text = fs.read("missing.txt")? }
+    catch (err) { println(err.code) }
+    println(text)
+    text = fs.read("second.txt")?
+    println(text)
+    if (true) { text = fs.read("first.txt")? }
+    println(text)
+    return ok(null)
+}
+async fn ReassignArrays(): null! {
+    rows = (await TextRows())?
+    rows = rows
+    rows = []
+    println(rows.len())
+    rows = (await TextRows())?
+    moved = rows
+    rows = []
+    println(moved.len())
+    println(rows.is_empty())
+    for row in moved { println(row) }
+    return ok(null)
+}
+async fn ReassignResults(): null! {
+    result: [str]! = await MissingRows()
+    result = await TextRows()
+    result = result
+    rows = result?
+    for row in rows { println(row) }
+    number: int! = ok(1)
+    number = ok(2)
+    println(number?)
+    try { fail "old-error" } catch (err) {
+        held = err
+        try { fail "new-error" } catch (next) { held = next }
+        println(held.message)
+    }
+    return ok(null)
+}
 async fn CheckErrors(): null! {
     try {
         unexpected = (await MissingRows())?
@@ -3499,11 +3541,14 @@ async fn main(): null! {
     (await UseNumbers())?;
     (await UseRows())?;
     (await CheckErrors())?;
+    (await ReassignText())?;
+    (await ReassignArrays())?;
+    (await ReassignResults())?;
     return ok(null)
 }
 "#;
     fs::write(dir.join("main.ku"), program).unwrap();
-    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n");
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n");
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(dir).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)

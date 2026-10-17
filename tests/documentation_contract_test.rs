@@ -152,8 +152,10 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
     assert!(!ir.contains("源码 if/loop/finally 尚未接入"));
     for boundary in [
         "两臂都必须通过静态类型、所有权和资源预算检查",
-        "已有 int/bool/null 局部支持普通赋值",
-        "Owned/Task 重赋值、复合赋值与自增/自减仍不支持",
+        "已有 int/bool/null、字符串、平面数组、单层 Result 和 Error 局部",
+        "Owned 值在同一成功端点先释放旧值再 move",
+        "Task/Callable 重赋值、复合赋值",
+        "不开放无类型空数组声明或一般 `ok([])` 推断",
         "源码 `while` 每轮从条件表达式入口重新求值",
         "通过强制 Suspend 回到条件",
         "不能将 Task move 到另一个词法作用域",

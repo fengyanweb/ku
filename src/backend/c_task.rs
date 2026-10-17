@@ -212,6 +212,13 @@ impl<'a> FrameEmitter<'a> {
                             .operations
                             .iter()
                             .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+                            || state.operations.windows(2).any(|pair| {
+                                crate::ir::task::replaces_owned_value(
+                                    function,
+                                    Some(&pair[0]),
+                                    &pair[1],
+                                )
+                            })
                     }))
         {
             return Err(unsupported(

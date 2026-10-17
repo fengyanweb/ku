@@ -2809,3 +2809,314 @@ int main(void) {
   puts("array-result-owners-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_owned_reassignment_replaces_only_after_rhs_and_retires_cancelled_children() {
+    let source = r#"
+async fn Incoming(value: str, stop: bool): str! {
+    println("rhs")
+    if (stop) { fail "rhs failed" }
+    return ok(value)
+}
+async fn Assign(old: str, replacement: str, mode: int): str! {
+    value=old
+    value=value
+    if (mode==2) {
+        value=(await Incoming(value,true))?
+    } else {
+        value=(await Incoming(replacement,mode==1))?
+    }
+    return ok(value)
+}
+async fn AssignArray(old: [str], replacement: [str]): [str]! {
+    value=old
+    value=replacement
+    value=value
+    return ok(value)
+}
+async fn AssignSaved(old: [str], replacement: [str]): [str]! {
+    value: [str]! = ok(old)
+    value=ok(replacement)
+    value=value
+    return value
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let mut native = ir::task_lower::lower_program(&ast).unwrap();
+    let parent = &native.tasks.functions[1];
+    assert_eq!(parent.name, "Assign");
+    let initial: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::Move { dst, src } if *src == parent.parameters[0] => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(initial.len(), 1, "one original owned local");
+    // This legacy Complete graph has no source Exit/Task/array admission to
+    // select hosted storage accidentally. Planner and C emitter must agree
+    // that the owned replacement itself requires persistent fee projection.
+    let raw_id = native.tasks.functions.len();
+    assert_eq!(raw_id, 5);
+    native.tasks.functions.push(TaskFunction {
+        id: TaskFunctionId(raw_id),
+        name: "RawOwnedReplace".into(),
+        slots: vec![
+            slot(IrType::Str),
+            slot(IrType::Str),
+            slot(result(IrType::Str)),
+        ],
+        parameters: vec![SlotId(0), SlotId(1)],
+        entry: StateId(0),
+        result: result(IrType::Str),
+        states: vec![TaskState {
+            operations: vec![
+                TaskOp::DropIfInit { slot: SlotId(0) },
+                TaskOp::Move {
+                    dst: SlotId(0),
+                    src: SlotId(1),
+                },
+                TaskOp::WrapOk {
+                    dst: SlotId(2),
+                    src: SlotId(0),
+                },
+            ],
+            terminator: TaskTerminator::Complete { value: SlotId(2) },
+        }],
+    });
+    let hooks = r#"
+static KuTestEvent assignment_entered,assignment_proceed;
+static void *assignment_parent,*assignment_child;
+static uintptr_t assignment_pointers[5];
+static size_t assignment_frees[5];
+static unsigned assignment_gate_calls;
+static void assignment_free(void*);
+static size_t assignment_write(const void*,size_t,size_t,FILE*);
+#undef free
+#define free assignment_free
+#define fwrite assignment_write
+"#;
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let instrumentation = format!(
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{ALLOCATION_HOOK}\n{}\n{hooks}",
+        native_task_ledger::LEDGER_LOCK,
+        native_task_ledger::LOCKED_ALLOCATIONS
+    );
+    assert_eq!(generated.matches("typedef struct KuString {").count(), 1);
+    let generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!("{instrumentation}typedef struct KuString {{"),
+        1,
+    );
+    assert_eq!(generated.matches("int main(void) {").count(), 1);
+    let mut generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_unmodified_assignment_main(void) {",
+        1,
+    );
+    for (id, name) in [(0, "child"), (1, "parent")] {
+        let resume = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        assert_eq!(generated.matches(&resume).count(), 1);
+        generated = generated.replacen(&resume, &format!("{resume}\n  assignment_{name}=raw;"), 1);
+    }
+    generated.push_str(&OWNED_ASSIGNMENT_MAIN.replace("@VALUE@", &initial[0].0.to_string()));
+    run_finally_adapter_generated(
+        generated,
+        "native-task-owned-assignment",
+        "\n\n\n\nowned-assignment-owners-ok\n",
+    );
+}
+
+const OWNED_ASSIGNMENT_MAIN: &str = r#"
+typedef struct AssignmentRuntime { KuTaskDriverV1 driver; KuTaskDriverSlotV1 slots[4]; size_t ring[4]; } AssignmentRuntime;
+static uint64_t assignment_deadline(void) { return ku_task_driver_now_ms()+2000u; }
+static void assignment_track(unsigned index,void* pointer) {
+  CHECK(index<5u); fixture_alloc_lock(); assignment_pointers[index]=(uintptr_t)pointer; fixture_alloc_unlock();
+}
+static size_t assignment_freed(unsigned index) {
+  CHECK(index<5u); fixture_alloc_lock(); size_t value=assignment_frees[index]; fixture_alloc_unlock(); return value;
+}
+static void assignment_free(void* pointer) {
+  fixture_alloc_lock();
+  for (unsigned i=0;i<5u;i++) if (pointer&&(uintptr_t)pointer==assignment_pointers[i]) assignment_frees[i]++;
+  fixture_alloc_unlock(); fixture_free(pointer);
+}
+static size_t assignment_write(const void* bytes,size_t size,size_t count,FILE* stream) {
+  (void)stream;
+  CHECK(size==1u&&count==3u&&!memcmp(bytes,"rhs",3u)&&!assignment_gate_calls++);
+  assignment_track(4u,assignment_child);
+  CHECK(ku_test_event_set(&assignment_entered)); CHECK(ku_test_event_wait(&assignment_proceed,2000));
+  return count;
+}
+static KuTaskDriverSnapshotV1 assignment_snapshot(AssignmentRuntime* runtime) {
+  KuTaskDriverSnapshotV1 value={0}; CHECK(ku_task_driver_snapshot(&runtime->driver,&value)==KU_TASK_DRIVER_OK); return value;
+}
+static void assignment_idle(AssignmentRuntime* runtime) {
+  CHECK(ku_task_driver_wait_idle(&runtime->driver,assignment_deadline())==KU_TASK_DRIVER_OK);
+}
+static void assignment_init(AssignmentRuntime* runtime) {
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  memset(runtime,0,sizeof(*runtime)); assignment_parent=NULL; assignment_child=NULL; assignment_gate_calls=0;
+  memset(assignment_pointers,0,sizeof(assignment_pointers)); memset(assignment_frees,0,sizeof(assignment_frees));
+  CHECK(ku_test_event_init(&assignment_entered)); CHECK(ku_test_event_init(&assignment_proceed));
+  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
+      runtime->slots,4u,runtime->ring,4u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)
+      +sizeof(KuTaskInstance_2)+sizeof(KuTaskInstance_3)+4096u,1u,assignment_deadline())==KU_TASK_DRIVER_OK);
+}
+static void assignment_finish(AssignmentRuntime* runtime) {
+  assignment_idle(runtime); KuTaskDriverSnapshotV1 snapshot=assignment_snapshot(runtime);
+  CHECK(!snapshot.resident&&!snapshot.reserved_bytes&&!snapshot.fault);
+  uint64_t deadline=runtime->driver.closing ? runtime->driver.shutdown_deadline : assignment_deadline();
+  CHECK(ku_task_driver_shutdown(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  uint64_t effective=runtime->driver.shutdown_deadline; snapshot=assignment_snapshot(runtime);
+  CHECK(snapshot.workers_exited==1u&&!snapshot.workers_joined&&!snapshot.running&&!snapshot.queued);
+#if defined(_WIN32)
+  if (ku_task_driver_now_ms()>=effective)
+    CHECK(WaitForSingleObject(runtime->driver.workers[0].thread,2000)==WAIT_OBJECT_0);
+#else
+  alarm(2);
+#endif
+  CHECK(ku_task_driver_join(&runtime->driver,effective)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver.shutdown_deadline==effective&&runtime->driver.workers_joined==1u
+      &&runtime->driver.workers[0].joined&&runtime->driver.workers[0].closed);
+  CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
+  CHECK(ku_test_event_destroy(&assignment_entered)); CHECK(ku_test_event_destroy(&assignment_proceed));
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes&&!fixture_ledger().overflow);
+}
+static KuString assignment_string(unsigned index) {
+  size_t capacity=index ? 37u : 31u,length=index ? 6u : 5u;
+  uint8_t* pointer=(uint8_t*)malloc(capacity); CHECK(pointer); memcpy(pointer,index ? "second" : "first",length);
+  assignment_track(index,pointer); return (KuString){pointer,length,capacity,KU_STRING_OWNED};
+}
+static void assignment_string_case(int64_t mode) {
+  AssignmentRuntime runtime; assignment_init(&runtime);
+  KuString old=assignment_string(0u),replacement=assignment_string(1u); KuTaskValueV1 task={0};
+  CHECK(ku_task_1_start_value(&runtime.driver,&old,&replacement,&mode,&task)==KU_TASK_DRIVER_OK&&!old.ptr&&!replacement.ptr);
+  CHECK(ku_test_event_wait(&assignment_entered,2000));
+  KuTaskInstance_1* parent=(KuTaskInstance_1*)assignment_parent;
+  KuTaskInstance_0* child=(KuTaskInstance_0*)assignment_child;
+  CHECK(parent&&child&&parent->frame.header.status==KU_TASK_FRAME_PENDING&&assignment_gate_calls==1u);
+  CHECK(!assignment_freed(0u)&&!assignment_freed(1u)&&!assignment_freed(4u));
+  if (mode==2) {
+    // An explicitly consumed RHS input is in the child, never resurrected in
+    // the old destination merely because the replacement has not succeeded.
+    CHECK(!(parent->frame.header.initialized&(UINT64_C(1)<<@VALUE@)));
+    CHECK(!parent->frame.s_@VALUE@.ptr&&!parent->frame.s_@VALUE@.len&&!parent->frame.s_@VALUE@.capacity);
+    CHECK((uintptr_t)child->frame.s_0.ptr==assignment_pointers[0]);
+  } else {
+    CHECK(parent->frame.header.initialized&(UINT64_C(1)<<@VALUE@));
+    CHECK((uintptr_t)parent->frame.s_@VALUE@.ptr==assignment_pointers[0]);
+    CHECK(parent->frame.s_@VALUE@.capacity==31u&&parent->frame.s_@VALUE@.len==5u);
+    CHECK((uintptr_t)child->frame.s_0.ptr==assignment_pointers[1]);
+  }
+  size_t pending=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+31u+37u;
+  CHECK(assignment_snapshot(&runtime).resident==2u&&assignment_snapshot(&runtime).reserved_bytes==pending);
+  CHECK(fixture_ledger().bytes==pending);
+  if (mode==3) {
+    KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+    uint64_t deadline=ku_task_driver_now_ms()+30u; KuTaskDriverCleanupReceiptV1 receipt={0};
+    CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK);
+    task=(KuTaskValueV1){0}; CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+    CHECK(ku_task_driver_shutdown(&runtime.driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+    CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+    CHECK(!assignment_freed(0u)&&!assignment_freed(1u)&&!assignment_freed(4u)&&fixture_ledger().bytes==pending);
+    CHECK(ku_test_event_set(&assignment_proceed)); assignment_idle(&runtime);
+    CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+    CHECK(ku_task_control_cleanup_deadline(late.control)==deadline&&ku_task_control_status(&late)==KU_TASK_CONTROL_CANCELLED);
+    CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u&&assignment_freed(4u)==1u);
+    CHECK(assignment_snapshot(&runtime).resident==1u&&assignment_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_1));
+    CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_1)&&late.control->frame_destroyed);
+    CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); assignment_finish(&runtime); return;
+  }
+  CHECK(ku_test_event_set(&assignment_proceed));
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime);
+  CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==(mode ? 1u : 0u)&&assignment_freed(4u)==1u);
+  KuTaskDriverSnapshotV1 settled=assignment_snapshot(&runtime);
+  size_t expected=sizeof(KuTaskInstance_1)+(mode ? 0u : 37u);
+  if (settled.reserved_bytes!=expected || fixture_ledger().bytes!=expected)
+    fprintf(stderr,"assignment mode=%lld reserved=%zu expected=%zu heap=%zu parent=%zu resident=%zu old_frees=%zu new_frees=%zu child_frees=%zu\n",
+        (long long)mode,settled.reserved_bytes,expected,fixture_ledger().bytes,sizeof(KuTaskInstance_1),settled.resident,
+        assignment_freed(0u),assignment_freed(1u),assignment_freed(4u));
+  CHECK(settled.reserved_bytes==expected);
+  CHECK(fixture_ledger().bytes==expected);
+  size_t calls=fixture_ledger().calls; KuTaskAdapterOutcomeV1 output={0};
+  CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK&&output.result_kind==4u&&output.value.string.ok==(mode==0));
+  CHECK(output.exit_class==KU_TASK_EXIT_USER_RESULT&&fixture_ledger().calls==calls);
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_1));
+  if (!mode) {
+    CHECK((uintptr_t)output.value.string.value.ptr==assignment_pointers[1]&&output.value.string.value.capacity==37u);
+    CHECK(output.value.string.value.len==6u&&!memcmp(output.value.string.value.ptr,"second",6u));
+  } else {
+    CHECK(output.value.string.error.message.len==10u&&!memcmp(output.value.string.error.message.ptr,"rhs failed",10u));
+  }
+  ku_task_outcome_drop(&output); CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u);
+  CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+static KuArray_str assignment_array(unsigned replacement) {
+  KuArray_str value={1u,NULL,replacement ? 2u : 4u};
+  value.data=(KuString*)calloc(value.capacity,sizeof(*value.data)); CHECK(value.data);
+  assignment_track(2u+replacement,value.data); value.data[0]=assignment_string(replacement); return value;
+}
+static void assignment_array_case(unsigned wrapped) {
+  AssignmentRuntime runtime; assignment_init(&runtime);
+  KuArray_str old=assignment_array(0u),replacement=assignment_array(1u); KuTaskValueV1 task={0};
+  uint32_t started=wrapped ? ku_task_3_start_value(&runtime.driver,&old,&replacement,&task)
+      : ku_task_2_start_value(&runtime.driver,&old,&replacement,&task);
+  CHECK(started==KU_TASK_DRIVER_OK&&!old.data&&!replacement.data);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime); size_t frame=wrapped ? sizeof(KuTaskInstance_3) : sizeof(KuTaskInstance_2);
+  size_t active=2u*sizeof(KuString)+37u;
+  CHECK(assignment_freed(0u)==1u&&assignment_freed(2u)==1u&&!assignment_freed(1u)&&!assignment_freed(3u));
+  CHECK(assignment_snapshot(&runtime).resident==1u&&assignment_snapshot(&runtime).reserved_bytes==frame+active);
+  CHECK(fixture_ledger().bytes==frame+active);
+  size_t calls=fixture_ledger().calls; KuTaskAdapterOutcomeV1 output={0};
+  CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK&&output.result_kind==7u&&output.value.string_array.ok);
+  KuArray_str value=output.value.string_array.value;
+  CHECK((uintptr_t)value.data==assignment_pointers[3]&&value.len==1u&&value.capacity==2u);
+  CHECK((uintptr_t)value.data[0].ptr==assignment_pointers[1]&&value.data[0].capacity==37u);
+  CHECK(fixture_ledger().calls==calls&&assignment_snapshot(&runtime).reserved_bytes==frame);
+  ku_task_outcome_drop(&output);
+  CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u&&assignment_freed(2u)==1u&&assignment_freed(3u)==1u);
+  CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+static void assignment_raw_complete_case(void) {
+  AssignmentRuntime runtime; assignment_init(&runtime);
+  KuString old=assignment_string(0u),replacement=assignment_string(1u); KuTaskValueV1 task={0};
+  CHECK(ku_task_5_start_value(&runtime.driver,&old,&replacement,&task)==KU_TASK_DRIVER_OK&&!old.ptr&&!replacement.ptr);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime);
+  CHECK(!assignment_gate_calls&&assignment_freed(0u)==1u&&!assignment_freed(1u));
+  size_t expected=sizeof(KuTaskInstance_5)+37u; KuTaskDriverSnapshotV1 settled=assignment_snapshot(&runtime);
+  if (settled.reserved_bytes!=expected||fixture_ledger().bytes!=expected)
+    fprintf(stderr,"raw assignment reserved=%zu expected=%zu heap=%zu frame=%zu\n",
+        settled.reserved_bytes,expected,fixture_ledger().bytes,sizeof(KuTaskInstance_5));
+  CHECK(settled.resident==1u&&settled.reserved_bytes==expected&&fixture_ledger().bytes==expected);
+  size_t calls=fixture_ledger().calls; KuTaskAdapterOutcomeV1 output={0};
+  CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK&&output.result_kind==4u&&output.value.string.ok);
+  CHECK(output.exit_class==KU_TASK_EXIT_USER_RESULT&&fixture_ledger().calls==calls);
+  CHECK((uintptr_t)output.value.string.value.ptr==assignment_pointers[1]&&output.value.string.value.capacity==37u);
+  CHECK(output.value.string.value.len==6u&&!memcmp(output.value.string.value.ptr,"second",6u));
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_5));
+  ku_task_outcome_drop(&output); CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u);
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_5));
+  CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u&&KU_TASK_CONTROL_ABI_VERSION==2u&&KU_TASK_DRIVER_ABI_VERSION==10u);
+  assignment_raw_complete_case();
+  for (int64_t mode=0;mode<4;mode++) assignment_string_case(mode);
+  assignment_array_case(0u); assignment_array_case(1u);
+  puts("owned-assignment-owners-ok"); return 0;
+}
+"#;

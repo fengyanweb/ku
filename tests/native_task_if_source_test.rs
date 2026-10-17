@@ -251,6 +251,76 @@ async fn main(): null! {
             "37\n",
             Some("division by zero"),
         ),
+        (
+            r#"
+async fn Branch(gate: bool): null! {
+    values=["old"]
+    if (gate) { moved=values println(moved.len()) }
+    values=[]
+    println(values.len())
+    return ok(null)
+}
+async fn More(): null! {
+    numbers=[1] numbers=[] println(numbers.len())
+    flags=[true] flags=[false,true] println(flags.len())
+    saved=ok("old") saved=ok("new") println(saved?)
+    rows=ok([1]) rows=ok([2,3]) values=rows? println(values.len())
+    return ok(null)
+}
+async fn main(): null! {
+    value="first" value=value value="second"
+    if (true) { value="third" }
+    if (true) { value: str="shadow" value="inner" println(value) }
+    println(value);
+    (await More())?;
+    (await Branch(true))?;
+    (await Branch(false))?;
+    return ok(null)
+}
+"#,
+            "inner\nthird\n0\n2\nnew\n2\n1\n0\n0\n",
+            None,
+        ),
+        (
+            r#"
+async fn main(): null! {
+    try { fail "first" } catch (first) {
+        problem=first
+        problem=problem
+        try { fail "second" } catch (second) { problem=second }
+        println(problem.message)
+    }
+    return ok(null)
+}
+"#,
+            "second\n",
+            None,
+        ),
+        (
+            r#"
+async fn Broken(): str! { fail "owned RHS failed" }
+async fn main(): null! {
+    value="old"
+    try { value=(await Broken())? } finally { println(value) value="new" println(value) }
+    return ok(null)
+}
+"#,
+            "old\nnew\n",
+            Some("owned RHS failed"),
+        ),
+        (
+            r#"
+async fn Broken(value: str): str! { println(value) fail "consumed RHS failed" }
+async fn main(): null! {
+    value="old"
+    value=(await Broken(value))?
+    println(value)
+    return ok(null)
+}
+"#,
+            "old\n",
+            Some("consumed RHS failed"),
+        ),
     ];
     for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
         run_case(100 + index, source, stdout, failure);
@@ -803,12 +873,12 @@ fn assert_no_native_artifacts(root: &Path, binary: &Path) {
 fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_path() {
     let cases = [
         (
-            "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
-            "native async subset does not support reassignment of Owned or Task values",
+            "async fn Child(): int! { return ok(1) } async fn main(): null! { selected = Child selected = Child return ok(null) }",
+            "native async subset does not support reassignment of Task or Callable values",
         ),
         (
             "async fn Child(): int! { return ok(1) } async fn main(): null! { child = Child() child = Child() return ok(null) }",
-            "native async subset does not support reassignment of Owned or Task values",
+            "native async subset does not support reassignment of Task or Callable values",
         ),
         (
             "async fn main(): null! { LIMIT = 1 LIMIT = 2 return ok(null) }",

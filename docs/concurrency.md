@@ -64,9 +64,14 @@ If 包括嵌套 `else if`，条件必须是 bool，可使用当前子集的 Awai
 结束时，先移交并等待它仍拥有的 Task 的真实清理 ACK，再释放本臂局部 Owned Value，
 之后才能进入汇合点。return/fail/`?` 错误退出复用最终退出清理，不执行另一臂或汇合点。
 内层可以用显式类型声明 shadow 外层同名局部；初始化表达式先读取原环境，离开分支
-后恢复外层名字。已有 int/bool/null 局部支持普通赋值 `name = expression`：RHS 在原
-环境完整求值后才写回原槽，自赋值只读、不消费；失败的 RHS 不写回。常量和函数参数
-仍不可赋值，由 checker 前置拒绝。Owned/Task 重赋值、复合赋值与自增/自减仍不支持。
+后恢复外层名字。已有 int/bool/null、字符串、平面数组、单层 Result 和 Error 局部
+支持普通赋值 `name = expression`：RHS 在原环境完整求值后才写回原槽。Copy 值复制，
+Owned 值在同一成功端点先释放旧值再 move；自赋值只读、不消费。失败的 RHS 不执行
+赋值自身的旧值释放，但 RHS 已显式 move 的值不会因失败而恢复。旧值和新值在求值
+期间同时存活的容量仍计入原预算。`rows = []` 沿用已有平面数组目标的元素类型，
+不开放无类型空数组声明或一般 `ok([])` 推断。祖先 VALUE 绑定保留原词法清理来源。
+常量和函数参数仍不可赋值，由 checker 前置拒绝；Task/Callable 重赋值、复合赋值
+与自增/自减仍不支持。
 分支可以直接 await 尚可用的祖先 Task，
 但不能将 Task move 到另一个词法作用域；只有每条仍会到达汇合点的路径都保有同一
 Task 时，才能在汇合后 await 它。臂内局部不能在臂外访问。
@@ -77,7 +82,7 @@ Await、`?` 与短路。循环体正常结束先完成本轮 Task drain 与局�
 通过强制 Suspend 回到条件；空循环体也保留这条协作让出边。return/fail/`?` 错误
 退出不进入下一轮，取消走原绝对期限下的清理。循环外 Copy 初值不在回边重新初始化，
 body 内 typed shadow 不替代外层值。Owned/Task 的逐轮重复消费仍受 checker 与
-原始 IR MUST/MAY 双重检查；原生尚不支持它们的重赋值。有限用例的实际运行、内部
+原始 IR MUST/MAY 双重检查；现有 Owned 值可重赋值，Task 重赋值仍拒绝。有限用例的实际运行、内部
 Scope 两轮取消与完整发布门禁分别记录，不推断任意循环终止、公平时限或性能。
 
 整数 `for item in limit` 在进入循环前只求值并保存一次上限，依次绑定 `0` 到
@@ -148,10 +153,10 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝嵌套数组、数组 Result 形参与 Callable 数组形参、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
+仍拒绝嵌套数组、数组 Result 形参与 Callable 数组形参、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写与 exists 以外的异步标准库 I/O。
-finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
+finally 体只接有限 primitive/字符串/Error 操作、Copy 与现有 Owned 值赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
 未支持形式在生成 artifact 前明确报错。

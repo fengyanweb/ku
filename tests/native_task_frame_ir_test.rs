@@ -388,6 +388,44 @@ fn native_task_frame_ir_wrap_ok_updates_suspension_liveness_and_cleanup() {
 }
 
 #[test]
+fn native_task_frame_ir_owned_replacement_hosts_plain_complete_and_preserves_owned_slots() {
+    let mut fixture = program(
+        vec![IrType::Str, IrType::Str, result(IrType::Str)],
+        &[0, 1],
+        vec![state(
+            vec![
+                drop_if(0),
+                TaskOp::Move {
+                    dst: SlotId(0),
+                    src: SlotId(1),
+                },
+                TaskOp::WrapOk {
+                    dst: SlotId(2),
+                    src: SlotId(0),
+                },
+            ],
+            complete(2),
+        )],
+    );
+    fixture.functions[0].result = result(IrType::Str);
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].hosted);
+    assert_eq!(
+        plan.functions[0].slots,
+        vec![SlotId(0), SlotId(1), SlotId(2)],
+        "replacement accounting needs every Owned field even without suspension or Exit"
+    );
+    fixture.functions[0].states[0].operations.remove(0);
+    let error = verify_and_plan(&fixture, TaskLimits::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("overwriting a possibly initialized owned slot without drop"),
+        "{error}"
+    );
+}
+
+#[test]
 fn native_task_frame_ir_rejects_unknown_ids_without_index_allocation() {
     accepted(&minimal());
     let mut fixture = minimal();

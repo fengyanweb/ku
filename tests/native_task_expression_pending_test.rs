@@ -55,6 +55,24 @@ async fn main(): null! { return ok(null) }
     );
 }
 
+#[test]
+fn native_task_owned_assignment_repeated_pending_preserves_old_value_and_commits_once() {
+    for right in ["return ok(\"new\")", "fail \"owned RHS failed\""] {
+        let source = format!(
+            r#"
+async fn Parent(base: int): str! {{
+    current="old"
+    current=(await Right())?
+    return ok(current)
+}}
+async fn Right(): str! {{ {right} }}
+async fn main(): null! {{ return ok(null) }}
+"#
+        );
+        run_repeated_pending_expression(&source);
+    }
+}
+
 fn run_repeated_pending_expression(source: &str) {
     let ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
@@ -64,6 +82,27 @@ fn run_repeated_pending_expression(source: &str) {
     assert_eq!(native.tasks.functions[0].name, "Parent");
     assert_eq!(native.tasks.functions[1].name, "Right");
     let parent = &native.tasks.functions[0];
+    let owned = parent.slots.iter().any(|slot| {
+        matches!(
+            slot.ty,
+            task::TaskSlotType::Value {
+                ty: ku::ir::IrType::Str,
+                ..
+            }
+        )
+    });
+    let failure = owned && source.contains("owned RHS failed");
+    let replacements: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| state.operations.windows(2))
+        .filter_map(|pair| match pair {
+            [TaskOp::DropIfInit { slot }, TaskOp::Move { dst, src }] if slot == dst => {
+                Some((*dst, *src))
+            }
+            _ => None,
+        })
+        .collect();
     let lhs: Vec<_> = parent
         .states
         .iter()
@@ -77,14 +116,23 @@ fn run_repeated_pending_expression(source: &str) {
             _ => None,
         })
         .collect();
-    assert_eq!(lhs.len(), 1);
-    let lhs = lhs[0];
+    let lhs = if owned {
+        assert_eq!(replacements.len(), 1);
+        assert!(lhs.is_empty());
+        replacements[0].0
+    } else {
+        assert_eq!(lhs.len(), 1);
+        lhs[0]
+    };
     let frozen_sources: Vec<_> = parent
         .states
         .iter()
         .flat_map(|state| &state.operations)
         .filter_map(|op| match op {
-            TaskOp::Copy { dst, src } if *dst == lhs => Some(*src),
+            TaskOp::Copy { dst, src } if !owned && *dst == lhs => Some(*src),
+            TaskOp::Move { dst, src } if owned && *dst == lhs && *src != replacements[0].1 => {
+                Some(*src)
+            }
             _ => None,
         })
         .collect();
@@ -108,7 +156,7 @@ fn run_repeated_pending_expression(source: &str) {
     assert!(plan.functions[0].slots.contains(&child_slot));
     let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_lhs(void);\nstatic void fixture_start(void);\nstatic void fixture_drive(uint32_t);\nstatic uint32_t fixture_hold_right(void*);\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_lhs(void);\nstatic void fixture_commit(void);\nstatic void fixture_start(void);\nstatic void fixture_drive(uint32_t);\nstatic uint32_t fixture_hold_right(void*);\n"
     );
     let generated = replace_once(
         generated,
@@ -120,12 +168,27 @@ fn run_repeated_pending_expression(source: &str) {
     } else {
         format!("slot_{}", frozen_source.0)
     };
-    let lhs_assignment = format!("  frame->s_{} = {source_place};\n", lhs.0);
-    let generated = replace_once(
+    let lhs_assignment = if owned {
+        format!("  frame->s_{} = ku_string_move(&{source_place});\n", lhs.0)
+    } else {
+        format!("  frame->s_{} = {source_place};\n", lhs.0)
+    };
+    let mut generated = replace_once(
         generated,
         &lhs_assignment,
         &format!("  fixture_lhs();\n{lhs_assignment}"),
     );
+    if owned {
+        let assignment = format!(
+            "  frame->s_{} = ku_string_move(&frame->s_{});\n",
+            lhs.0, replacements[0].1 .0
+        );
+        generated = replace_once(
+            generated,
+            &assignment,
+            &format!("  fixture_commit();\n{assignment}"),
+        );
+    }
     let generated = replace_once(
         generated,
         "static uint32_t ku_task_frame_0_drive(KuTaskFrame_0* frame, const KuTaskFrameClockV1* clock, int cleanup) {",
@@ -146,6 +209,11 @@ fn run_repeated_pending_expression(source: &str) {
         "int main(void) {",
         "static int fixture_unmodified_source_main(void) {",
     );
+    generated.push_str(&format!(
+        "\n#define FIXTURE_OWNED {}\n#define FIXTURE_FAILURE {}\n",
+        usize::from(owned),
+        usize::from(failure)
+    ));
     generated.push_str(
         &C_MAIN
             .replace("@LHS@", &lhs.0.to_string())
@@ -186,7 +254,9 @@ const C_MAIN: &str = r#"
 static KuAtomicRefcount fixture_hold;
 static KuTestEvent fixture_right_parked;
 static unsigned fixture_lhs_count,fixture_start_count,fixture_drive_count,fixture_right_count;
+static unsigned fixture_commit_count;
 static void fixture_lhs(void) { CHECK(!fixture_lhs_count++); }
+static void fixture_commit(void) { CHECK(!fixture_commit_count++); }
 static void fixture_start(void) { CHECK(!fixture_start_count++); }
 static void fixture_drive(uint32_t state) {
   CHECK(state==(fixture_drive_count ? @AWAIT@u : @ENTRY@u));
@@ -225,7 +295,12 @@ static void fixture_wait(KuTaskInstance_0* parent,const KuTaskDriverWaitTokenV1*
   CHECK(wait.child_slot==child->slot && wait.child_generation==child->generation);
   CHECK(parent->frame.header.state==@AWAIT@u && parent->frame.header.status==KU_TASK_FRAME_PENDING);
   CHECK(parent->frame.header.initialized&(UINT64_C(1)<<@LHS@));
+#if FIXTURE_OWNED
+  CHECK(parent->frame.s_@LHS@.ptr&&parent->frame.s_@LHS@.len==3u&&parent->frame.s_@LHS@.storage==KU_STRING_STATIC);
+  CHECK(!memcmp(parent->frame.s_@LHS@.ptr,"old",3u)&&!fixture_commit_count);
+#else
   CHECK(parent->frame.s_@LHS@==37);
+#endif
   CHECK(parent->frame.header.initialized&(UINT64_C(1)<<@CHILD@));
   CHECK(parent->frame.s_@CHILD@.tag==KU_TASK_VALUE_LIVE && parent->frame.s_@CHILD@.ticket.driver==child->driver
       && parent->frame.s_@CHILD@.ticket.slot==child->slot && parent->frame.s_@CHILD@.ticket.generation==child->generation);
@@ -282,23 +357,39 @@ int main(void) {
     FixtureLedger unchanged=fixture_ledger();
     CHECK(unchanged.allocations==before.allocations && unchanged.bytes==before.bytes && unchanged.calls==before.calls);
   }
-  /* Only now may the real Right frame produce 5. Real Await takes its Result,
-   * the generated checked Add consumes the preserved 37, and the host drops
-   * Right's actual source owner. The observation lease protects later reads. */
+  /* Only now may the real Right frame finish. Real Await takes its Result,
+   * the generated continuation performs Add or one Owned replacement, and
+   * the host drops Right's source owner. The lease protects later reads. */
   ku_task_control_atomic_store(&fixture_hold,0);
   CHECK(ku_task_driver_wake(&child)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_wait_result(&root.ticket,&root.owner.lease,deadline)==KU_TASK_DRIVER_WAIT_READY);
   KuTaskDriverSnapshotV1 ready=fixture_idle(driver,deadline);
   CHECK(ready.resident==2u && ready.reserved_bytes==instances);
   CHECK(fixture_drive_count==5u && fixture_lhs_count==1u && fixture_start_count==1u && fixture_right_count==2u);
+  CHECK(fixture_commit_count==(FIXTURE_OWNED&&!FIXTURE_FAILURE ? 1u : 0u));
   CHECK(!parent->wait.driver && !parent->frame.header.initialized && parent->control.frame_destroyed);
-  CHECK(ku_task_control_atomic_load(&observer.control->phase)==KU_TASK_CONTROL_COMPLETED);
+  uint32_t expected_phase=FIXTURE_FAILURE ? KU_TASK_CONTROL_FAILED : KU_TASK_CONTROL_COMPLETED;
+  uint32_t child_phase=ku_task_control_atomic_load(&observer.control->phase);
+  if (child_phase!=expected_phase)
+    fprintf(stderr,"pending child phase=%u expected=%u owned=%u failure=%u root_phase=%u fault=%u\n",
+        child_phase,expected_phase,(unsigned)FIXTURE_OWNED,(unsigned)FIXTURE_FAILURE,
+        (unsigned)ku_task_control_atomic_load(&root.owner.lease.control->phase),(unsigned)ready.fault);
+  CHECK(child_phase==expected_phase);
   CHECK(ku_task_control_atomic_load(&observer.control->payload)==KU_TASK_CONTROL_PAYLOAD_TAKEN);
   CHECK(observer.control->frame_destroyed && !ku_task_control_atomic_load(&observer.control->lifecycle_pin));
   CHECK(fixture_ledger().calls==before.calls);
   KuTaskAdapterOutcomeV1 outcome={0};
   CHECK(ku_task_value_take(&root,NULL,&outcome)==KU_TASK_CONTROL_OK);
-  CHECK(outcome.result_kind==1u && outcome.exit_class==KU_TASK_EXIT_USER_RESULT && outcome.value.integer.ok && outcome.value.integer.value==42);
+  CHECK(outcome.exit_class==KU_TASK_EXIT_USER_RESULT);
+#if FIXTURE_OWNED
+  CHECK(outcome.result_kind==4u&&outcome.value.string.ok==!FIXTURE_FAILURE);
+  if (FIXTURE_FAILURE) {
+    KuString message=outcome.value.string.error.message;
+    CHECK(message.len==strlen("owned RHS failed")&&!memcmp(message.ptr,"owned RHS failed",message.len));
+  } else CHECK(outcome.value.string.value.len==3u&&!memcmp(outcome.value.string.value.ptr,"new",3u));
+#else
+  CHECK(outcome.result_kind==1u && outcome.value.integer.ok && outcome.value.integer.value==42);
+#endif
   CHECK(!outcome.has_cleanup_deadline && !outcome.cleanup_deadline);
   ku_task_outcome_drop(&outcome);
   uint64_t cleanup_now=ku_task_driver_now_ms();

@@ -1487,6 +1487,39 @@ impl<'a> FunctionLowerer<'a> {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    // An existing flat array binding supplies the missing element type for
+    // `items = []`. Keep expected-type materialization out of recursive
+    // expression frames and do not extend inference to Result constructors.
+    #[inline(never)]
+    fn reassignment_expression(
+        &mut self,
+        value: &Expr,
+        expected: &TaskSlotType,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if let (
+            ExprKind::Array(elements),
+            TaskSlotType::Value {
+                ty: IrType::Array(element),
+                borrowed: false,
+            },
+        ) = (&value.kind, expected)
+        {
+            if elements.is_empty()
+                && matches!(element.as_ref(), IrType::Int | IrType::Bool | IrType::Str)
+            {
+                self.budget.expression(depth, value.span)?;
+                return self.array_expression(
+                    elements,
+                    Some(element.as_ref().clone()),
+                    value.span,
+                    depth,
+                );
+            }
+        }
+        self.expression(value, depth)
+    }
+
     fn bind(
         &mut self,
         name: &str,
@@ -1499,29 +1532,56 @@ impl<'a> FunctionLowerer<'a> {
         if !declaration {
             if let Some(destination) = self.local(name) {
                 let expected = self.function.slots[destination.0].ty.clone();
-                if !copy_value(&expected) {
+                let copy = copy_value(&expected);
+                let owned = matches!(
+                    expected,
+                    TaskSlotType::Value {
+                        borrowed: false,
+                        ..
+                    }
+                ) && owned_value(&expected);
+                if !copy && !owned {
                     return Err(unsupported(
-                        "reassignment of Owned or Task values in the native Task subset",
+                        "reassignment of Task or Callable values in the native Task subset",
                         span,
                     ));
                 }
                 self.budget.text(name.len(), span)?;
                 // Resolve and finish the RHS in the original lexical environment.
                 // Await, ? and short circuit may change the current state; only
-                // their successful endpoint may commit to the existing Copy slot.
-                let source = self.expression(value, depth)?;
+                // their successful endpoint may replace the existing binding.
+                // An explicit RHS move still consumes its source as usual.
+                let source = self.reassignment_expression(value, &expected, depth)?;
                 if self.function.slots[source.0].ty != expected {
-                    return Err(unsupported("a mismatched Copy reassignment", span));
+                    return Err(unsupported(
+                        if copy {
+                            "a mismatched Copy reassignment"
+                        } else {
+                            "a mismatched Owned reassignment"
+                        },
+                        span,
+                    ));
                 }
-                return self.emit(if source == destination {
-                    // Copy's distinct-slot ABI remains unchanged. A self-assignment
-                    // still proves that the source is initialized, without consuming it.
-                    TaskOp::Read { slot: source }
-                } else {
-                    TaskOp::Copy {
+                if source == destination {
+                    // The raw Move/Copy ABI still requires distinct slots. A
+                    // self-assignment proves initialization without destroying
+                    // or consuming the binding's current owner.
+                    return self.emit(TaskOp::Read { slot: source });
+                }
+                if copy {
+                    return self.emit(TaskOp::Copy {
                         dst: destination,
                         src: source,
-                    }
+                    });
+                }
+                // The successful RHS now owns a distinct initialized slot.
+                // DropIfInit also permits reinitializing a moved or MAY-live
+                // destination. Neither operation suspends or can fail at runtime;
+                // keep both at this same endpoint and preserve slot provenance.
+                self.emit(TaskOp::DropIfInit { slot: destination })?;
+                return self.emit(TaskOp::Move {
+                    dst: destination,
+                    src: source,
                 });
             }
         }
