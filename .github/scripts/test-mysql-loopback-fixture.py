@@ -308,8 +308,13 @@ class MysqlFixtureTests(unittest.TestCase):
 
     def test_job_setup_exception_reaps_suspended_child(self) -> None:
         process = MagicMock()
+        # Crossing 2**8 makes the rounded absolute deadline subtract to a
+        # value just above ten seconds, even when this clock has not advanced.
+        cleanup_now = 251.1
+        self.assertGreater((cleanup_now + 10.0) - cleanup_now, 10.0)
         with patch.object(F.subprocess, "Popen", return_value=process), \
              patch.object(F.BOUNDS.WindowsJob, "attach", side_effect=OSError("job failure")), \
+             patch.object(F.time, "monotonic", return_value=cleanup_now), \
              patch.object(F.BOUNDS, "kill_process_tree") as kill:
             with self.assertRaises(OSError):
                 F.MysqlProcess(self.root, ["not executed"]).start()

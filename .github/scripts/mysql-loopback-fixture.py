@@ -472,7 +472,7 @@ class MysqlProcess:
                 return None
 
         attempt("tree_terminate", lambda: BOUNDS.kill_process_tree(self.process, self.job))
-        attempt("root_wait", lambda: self.process.wait(timeout=max(0, deadline - time.monotonic())))
+        attempt("root_wait", lambda: self.process.wait(timeout=min(10.0, max(0.0, deadline - time.monotonic()))))
         if self.job is not None:
             if attempt("job_drain", lambda: self.job.wait_empty(deadline)) is not True:
                 cleanup.add("job_drain_unconfirmed")
