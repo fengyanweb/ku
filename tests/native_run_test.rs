@@ -431,6 +431,15 @@ fn native_emit_c(dir: &Path, entry_rel: &str) -> String {
 /// library pragmas and provide local stubs, so they exercise generated runtime
 /// guards without requiring a live service or its development library.
 fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBuf> {
+    compile_c_harness_with_libraries(dir, source, out_stem, &[])
+}
+
+fn compile_c_harness_with_libraries(
+    dir: &Path,
+    source: &Path,
+    out_stem: &str,
+    libraries: &[&str],
+) -> Option<PathBuf> {
     let output = dir.join(exe_name(out_stem));
     let mut candidates: Vec<(PathBuf, Vec<String>)> = Vec::new();
     if let Ok(spec) = env::var("KU_CC") {
@@ -458,6 +467,9 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
             command.arg("-pthread");
         }
         command.arg("-o").arg(&output);
+        for library in libraries {
+            command.arg(format!("-l{library}"));
+        }
         match run_bounded(&mut command, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS) {
             Ok(done) if done.status.success() => return Some(output),
             Ok(done) => panic!(
@@ -517,14 +529,27 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
         }
         let script = dir.join("compile-harness.bat");
         let object = dir.join(format!("{out_stem}.obj"));
+        let link_libraries = if libraries.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " /link {}",
+                libraries
+                    .iter()
+                    .map(|library| format!("{library}.lib"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
         fs::write(
             &script,
             format!(
-                "@echo off\r\ncall \"{}\" >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\ncl.exe /nologo /std:c11 /utf-8 \"{}\" /Fe:\"{}\" /Fo:\"{}\"\r\n",
+                "@echo off\r\ncall \"{}\" >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\ncl.exe /nologo /std:c11 /utf-8 \"{}\" /Fe:\"{}\" /Fo:\"{}\"{}\r\n",
                 vcvars.display(),
                 source.display(),
                 output.display(),
-                object.display()
+                object.display(),
+                link_libraries
             ),
         )
         .expect("write MSVC harness script");
@@ -683,6 +708,233 @@ int main(void) {{
         String::from_utf8_lossy(&output.stderr)
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_read_callbacks_recheck_original_deadlines() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("http-original-read-deadlines"));
+    let dir = &cleanup.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    app = http.server({ max_active_requests: 1 })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write original HTTP read deadline source");
+
+    let generated = native_emit_c(dir, "main.ku");
+    let clock = "static unsigned long long ku_http_now_ms(void) {";
+    let recv =
+        "static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    assert_eq!(generated.matches(recv).count(), 1);
+    // Replace only the platform-function definitions. Every real generated
+    // callback continues to call the original typed names supplied below.
+    let generated = generated.replacen(
+        clock,
+        "static unsigned long long ku_http_now_ms(void);\nstatic unsigned long long ku_http_fixture_real_now_ms(void) {",
+        1,
+    );
+    let generated = generated.replacen(
+        recv,
+        "static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len);\nstatic int ku_http_fixture_real_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {",
+        1,
+    );
+    let declaration = "typedef struct KuString {";
+    assert!(generated.contains(declaration));
+    let generated = generated.replacen(
+        declaration,
+        &format!(
+            "{}{declaration}",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    let checks = r#"
+static unsigned long long ku_http_fixture_now;
+static size_t ku_http_fixture_recv_calls;
+static const char* ku_http_fixture_received;
+static size_t ku_http_fixture_received_length;
+static int ku_http_fixture_would_block;
+static unsigned long long ku_http_now_ms(void) { return ku_http_fixture_now; }
+static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {
+  (void)socket_value;
+  ku_http_fixture_recv_calls++;
+  if (ku_http_fixture_would_block) {
+#if defined(_WIN32)
+    WSASetLastError(WSAEWOULDBLOCK);
+#else
+    errno = EAGAIN;
+#endif
+    return -1;
+  }
+  size_t count = ku_http_fixture_received_length < len ? ku_http_fixture_received_length : len;
+  if (count) memcpy(data, ku_http_fixture_received, count);
+  return (int)count;
+}
+static int ku_http_fixture_zero(void) {
+  return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
+}
+static int ku_http_fixture_read_case(KuHttpWake* wake, int kind, unsigned long long now) {
+  KuHttpQueue queue;
+  if (!ku_http_queue_init(&queue, 1, wake)) return 0;
+  KuHttpServer server = {0};
+  server.max_header_bytes = 1024;
+  server.max_body_bytes = 1024;
+  server.idle_timeout_ms = 333;
+  server.read_header_timeout_ms = 111;
+  server.read_body_timeout_ms = 222;
+  server.write_timeout_ms = 77;
+  server.handler_timeout_ms = 100;
+  KuHttpConnection connection = {0};
+  connection.socket_value = KU_HTTP_INVALID_SOCKET;
+  ku_http_fixture_now = now;
+  ku_http_fixture_recv_calls = 0;
+  ku_http_fixture_would_block = now < 100;
+  if (kind < 2) {
+    ku_http_connection_start(&connection, KU_HTTP_INVALID_SOCKET, &server);
+    if (!connection.header) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    if (kind == 1) {
+      static const char prefix[] = "POST /ok HTTP/1.1\r\nHost: localhost\r\n";
+      memcpy(connection.header, prefix, sizeof(prefix) - 1);
+      connection.buffered = sizeof(prefix) - 1;
+      ku_http_fixture_received = "Content-Length: 1\r\n\r\nx";
+    } else {
+      ku_http_fixture_received = "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    }
+    ku_http_fixture_received_length = strlen(ku_http_fixture_received);
+  } else {
+    connection.phase = KU_HTTP_IO_BODY;
+    memcpy(connection.input.method, "POST", 5);
+    connection.input.target = ku_string_to_cstr(ku_string_static((const uint8_t*)"/ok", 3));
+    connection.input.path_len = 3;
+    connection.input.headers = ku_object_new(0);
+    connection.input.body_len = 2;
+    connection.input.body = (char*)malloc(2);
+    if (!connection.input.body) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    connection.input.body[0] = 'x';
+    connection.body_received = 1;
+    ku_http_fixture_received = "y";
+    ku_http_fixture_received_length = 1;
+  }
+  connection.deadline = 100; /* The already-created idle/header/body D. */
+  const int original_phase = connection.phase;
+  char* original_header = connection.header;
+  const size_t original_capacity = connection.capacity;
+  const size_t original_buffered = connection.buffered;
+  char* original_body = connection.input.body;
+  const size_t original_body_received = connection.body_received;
+  if (kind < 2) ku_http_connection_read_header(&connection, &server, &queue, 1);
+  else ku_http_connection_read_body(&connection, &server, &queue, 1);
+
+  const int observed_phase = connection.phase;
+  const int64_t observed_status = connection.output.response.status;
+  const size_t observed_calls = ku_http_fixture_recv_calls;
+  int passed;
+  if (now >= 100) {
+    passed = connection.phase == KU_HTTP_IO_WRITE
+      && connection.output.response.status == 408
+      && ku_http_fixture_recv_calls == 0
+      && connection.deadline == now + 77
+      && !connection.header && !connection.input.body
+      && !connection.input.target && !connection.input.headers && !connection.job;
+  } else {
+    passed = connection.phase == original_phase && connection.deadline == 100
+      && ku_http_fixture_recv_calls == 1
+      && connection.header == original_header
+      && connection.capacity == original_capacity
+      && connection.buffered == original_buffered
+      && connection.input.body == original_body
+      && connection.body_received == original_body_received
+      && !connection.job;
+  }
+  /* Old callbacks can wrongly queue the completed legal input. Abort that
+     actual queued owner first, then release the connection's remaining owner,
+     so the intentional red assertion never skips input/job/response cleanup. */
+  ku_http_queue_close(&queue, 0);
+  ku_http_connection_close(&connection);
+  const int retired = queue.count == 0 && ku_http_queue_resident(&queue) == 0;
+  ku_http_queue_free(&queue);
+  const int zero = ku_http_fixture_zero();
+  if (!passed || !retired || !zero) {
+    fprintf(stderr,
+      "HTTP original read deadline failed after cleanup: kind=%d now=%llu phase=%d status=%lld recv_calls=%zu retired=%d allocations_zero=%d\n",
+      kind, now, observed_phase, (long long)observed_status, observed_calls, retired, zero);
+    return 0;
+  }
+  return 1;
+}
+int main(void) {
+  if (ku_http_net_init() != 0) return 20;
+  KuHttpWake wake;
+  if (!ku_http_wake_init(&wake)) { ku_http_net_cleanup(); return 21; }
+  int passed = 1;
+  for (int kind = 0; kind < 3; kind++) {
+    for (unsigned long long now = 99; now <= 101; now++) {
+      if (!ku_http_fixture_read_case(&wake, kind, now)) passed = 0;
+    }
+  }
+  ku_http_wake_close(&wake);
+  ku_http_net_cleanup();
+  if (!ku_http_fixture_zero()) {
+    fputs("HTTP original read deadline fixture retained allocations\n", stderr);
+    return 22;
+  }
+  if (!passed) return 1;
+  puts("http-read-original-deadlines-ok");
+  return 0;
+}
+"#;
+    let harness = dir.join("http-original-read-deadlines-harness.c");
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{checks}"),
+    )
+    .expect("write original HTTP read deadline C harness");
+    // Keep generated ws2_32 pragmas for MSVC and supply the same library
+    // explicitly for Windows clang/gcc. Existing harness calls keep no extras.
+    let libraries: &[&str] = if cfg!(windows) { &["ws2_32"] } else { &[] };
+    let Some(exe) =
+        compile_c_harness_with_libraries(dir, &harness, "http-original-read-deadlines", libraries)
+    else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output =
+        run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap_or_else(|error| {
+            panic!("original HTTP read deadline harness was not bounded: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "original HTTP read deadline harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "http-read-original-deadlines-ok\n"
+    );
 }
 
 #[test]

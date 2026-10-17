@@ -3368,6 +3368,217 @@ mod finally_tests {
     }
 
     #[test]
+    fn interpreter_http_peer_accept_errors_preserve_real_queued_requests() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_peer_accept_errors_preserve_real_queued_requests",
+            "KU_HTTP_ACCEPT_PEER_CHILD",
+        ) {
+            return;
+        }
+        let mut errors = vec![
+            std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        ];
+        #[cfg(unix)]
+        errors.push(std::io::Error::from_raw_os_error(libc::ECONNABORTED));
+        #[cfg(target_os = "linux")]
+        errors.extend(
+            [
+                libc::ENETDOWN,
+                libc::EPROTO,
+                libc::ENOPROTOOPT,
+                libc::EHOSTDOWN,
+                libc::ENONET,
+                libc::EHOSTUNREACH,
+                libc::EOPNOTSUPP,
+                libc::ENETUNREACH,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        #[cfg(windows)]
+        errors.extend(
+            [
+                windows_sys::Win32::Networking::WinSock::WSAECONNABORTED,
+                windows_sys::Win32::Networking::WinSock::WSAECONNRESET,
+                windows_sys::Win32::Networking::WinSock::WSAEINTR,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        for error in errors {
+            let label = error.to_string();
+            let raw = error.raw_os_error();
+            let kind = error.kind();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut client = http_reactor_client(
+                address,
+                b"POST /recovered HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
+            );
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let observed_attempts = Arc::clone(&attempts);
+            let mut remaining = 2;
+            let mut limits = http_test_limits();
+            limits.handler_timeout = Duration::from_secs(2);
+            limits.write_timeout = Duration::from_secs(1);
+            let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+                if remaining > 0 {
+                    observed_attempts.lock().unwrap().push(Instant::now());
+                    remaining -= 1;
+                    return Err(raw.map_or_else(|| kind.into(), std::io::Error::from_raw_os_error));
+                }
+                listener.accept()
+            })
+            .unwrap();
+            let job = io
+                .next_job(Duration::from_secs(2))
+                .unwrap_or_else(|failure| panic!("peer accept {label} stopped reactor: {failure}"))
+                .expect("healthy queued request after peer accept errors");
+            assert_eq!(job.request.path, "/recovered");
+            assert_eq!(job.request.body, "body");
+            let times = attempts.lock().unwrap();
+            assert_eq!(times.len(), 2);
+            assert!(
+                times[1].duration_since(times[0]) >= HTTP_EVENT_LOOP_SLEEP,
+                "peer accept retries must yield for the existing event-loop interval: {label}"
+            );
+            drop(times);
+            job.reply
+                .respond(job.token, status_response(200, "recovered界🙂\0"))
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            assert!(
+                response.starts_with(b"HTTP/1.1 200 "),
+                "{label}: {response:?}"
+            );
+            assert!(response.ends_with("recovered界🙂\0".as_bytes()));
+            drop(io);
+        }
+
+        // Keep a real listener backlog readable while every subsequent accept
+        // reports a peer abort. The previously admitted request must still read,
+        // dispatch and write its response while the listener is yielding.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client =
+            http_reactor_client(address, b"GET /active HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut backlog =
+            http_reactor_client(address, b"GET /backlog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let (retry_tx, retry_rx) = mpsc::sync_channel(1);
+        let mut admitted = false;
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.write_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+            if !admitted {
+                let accepted = listener.accept()?;
+                admitted = true;
+                return Ok(accepted);
+            }
+            let _ = retry_tx.try_send(());
+            Err(std::io::ErrorKind::ConnectionAborted.into())
+        })
+        .unwrap();
+        let job = io
+            .next_job(Duration::from_secs(2))
+            .unwrap()
+            .expect("active request progresses during continued peer accept errors");
+        assert_eq!(job.request.path, "/active");
+        job.reply
+            .respond(job.token, status_response(200, "active-during-retry界🙂\0"))
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 "), "{response:?}");
+        assert!(response.ends_with("active-during-retry界🙂\0".as_bytes()));
+        // Observe a new retry after the response, then stop with that path
+        // still live. Drop must wake/join rather than wait for more accepts.
+        let _ = retry_rx.try_recv();
+        retry_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stop_started = Instant::now();
+        drop(io);
+        assert!(stop_started.elapsed() < Duration::from_secs(2));
+        http_assert_closed(&mut backlog);
+    }
+
+    #[test]
+    fn interpreter_http_fatal_accept_errors_keep_the_original_failure() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_fatal_accept_errors_keep_the_original_failure",
+            "KU_HTTP_ACCEPT_FATAL_CHILD",
+        ) {
+            return;
+        }
+        let mut errors = vec![
+            std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            std::io::Error::from(std::io::ErrorKind::NetworkDown),
+            std::io::Error::from(std::io::ErrorKind::Unsupported),
+        ];
+        #[cfg(unix)]
+        errors.extend(
+            [
+                libc::EBADF,
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOBUFS,
+                libc::ENOMEM,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        #[cfg(windows)]
+        errors.extend(
+            [
+                windows_sys::Win32::Networking::WinSock::WSAENOTSOCK,
+                windows_sys::Win32::Networking::WinSock::WSAEMFILE,
+                windows_sys::Win32::Networking::WinSock::WSAENOBUFS,
+                windows_sys::Win32::Networking::WinSock::WSAENETDOWN,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        for error in errors {
+            let raw = error.raw_os_error();
+            let kind = error.kind();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut client =
+                http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut pending =
+                http_reactor_client(address, b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut backlog =
+                http_reactor_client(address, b"GET /backlog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed_attempts = Arc::clone(&attempts);
+            let mut limits = http_test_limits();
+            limits.max_connections = 2;
+            let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+                if observed_attempts.fetch_add(1, Ordering::AcqRel) < 2 {
+                    listener.accept()
+                } else {
+                    Err(raw.map_or_else(|| kind.into(), std::io::Error::from_raw_os_error))
+                }
+            })
+            .unwrap();
+            let failure = match io.next_job(Duration::from_secs(2)) {
+                Err(failure) => failure,
+                Ok(_) => panic!("fatal accept error must stop reactor"),
+            };
+            assert_eq!(failure.raw_os_error(), raw);
+            assert_eq!(failure.kind(), kind);
+            assert_eq!(attempts.load(Ordering::Acquire), 3);
+            http_assert_closed(&mut client);
+            http_assert_closed(&mut pending);
+            http_assert_closed(&mut backlog);
+            drop(io);
+        }
+    }
+
+    #[test]
     fn interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes() {
         if !http_bounded_test_child(
             "runtime::interpreter::finally_tests::interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes",

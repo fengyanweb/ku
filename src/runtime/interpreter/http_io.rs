@@ -73,6 +73,19 @@ impl HttpIo {
         listener: TcpListener,
         limits: HttpServerRuntimeLimits,
     ) -> io::Result<Self> {
+        Self::start_with_accept(listener, limits, TcpListener::accept)
+    }
+
+    // Keep the real reactor and socket ownership path available to controlled
+    // accept-error regressions, without replacing readiness or connection I/O.
+    pub(super) fn start_with_accept<F>(
+        listener: TcpListener,
+        limits: HttpServerRuntimeLimits,
+        accept: F,
+    ) -> io::Result<Self>
+    where
+        F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
+    {
         listener.set_nonblocking(true)?;
         let wake_pair = netpoll::WakePair::new()?;
         let wake = wake_pair.sender.clone();
@@ -81,7 +94,7 @@ impl HttpIo {
         let reactor = Reactor::new(listener, limits, job_tx, wake_pair, Arc::clone(&stop));
         let thread = thread::Builder::new()
             .name("ku-http-io".into())
-            .spawn(move || reactor.run())?;
+            .spawn(move || reactor.run(accept))?;
         Ok(Self {
             jobs,
             stop,
@@ -148,6 +161,7 @@ struct Reactor {
     free: Vec<usize>,
     rejecting: Option<HttpRejection>,
     rejection_generation: u64,
+    accept_retry_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -183,10 +197,14 @@ impl Reactor {
             free: (0..limits.max_active_requests).rev().collect(),
             rejecting: None,
             rejection_generation: 0,
+            accept_retry_deadline: None,
         }
     }
 
-    fn run(mut self) -> io::Result<()> {
+    fn run<F>(mut self, mut accept: F) -> io::Result<()>
+    where
+        F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)>,
+    {
         loop {
             if self.stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -219,12 +237,24 @@ impl Reactor {
             // Match the existing single extra rejection owner: do not accept
             // another excess socket while its drain/write is still resident.
             if self.rejecting.is_none() {
-                interests.push(netpoll::Interest {
-                    socket: netpoll::Socket::Listener(&self.listener),
-                    read: true,
-                    write: false,
-                });
-                owners.push(PollOwner::Listener);
+                if let Some(retry) = self
+                    .accept_retry_deadline
+                    .filter(|retry| Instant::now() < *retry)
+                {
+                    // A peer abort yields only the listener. Active reads,
+                    // responses, handler replies and stop wakes still progress.
+                    tighten_deadline(&mut deadline, Some(retry));
+                } else {
+                    // Never retain an expired retry as the nearest deadline:
+                    // that would turn subsequent readiness waits into poll(0).
+                    self.accept_retry_deadline = None;
+                    interests.push(netpoll::Interest {
+                        socket: netpoll::Socket::Listener(&self.listener),
+                        read: true,
+                        write: false,
+                    });
+                    owners.push(PollOwner::Listener);
+                }
             }
             for (slot, entry) in self.slots.iter().enumerate() {
                 let Some(connection) = &entry.connection else {
@@ -267,7 +297,7 @@ impl Reactor {
                 };
                 match owner {
                     PollOwner::Wake => self.wake.drain()?,
-                    PollOwner::Listener => self.accept_connections()?,
+                    PollOwner::Listener => self.accept_connections(&mut accept)?,
                     PollOwner::Connection(token) => {
                         let Some(slot) = self.slots.get_mut(token.slot) else {
                             continue;
@@ -365,15 +395,23 @@ impl Reactor {
         Ok(())
     }
 
-    fn accept_connections(&mut self) -> io::Result<()> {
+    fn accept_connections<F>(&mut self, accept: &mut F) -> io::Result<()>
+    where
+        F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)>,
+    {
         for _ in 0..HTTP_ACCEPT_BATCH {
             if self.rejecting.is_some() || self.stop.load(Ordering::Acquire) {
                 break;
             }
-            let stream = match self.listener.accept() {
+            let stream = match accept(&self.listener) {
                 Ok((stream, _)) => stream,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if accept_error_is_peer_transient(&error) => {
+                    // Reuse the existing interpreter observation interval; no
+                    // connection/handler deadline or public limit is extended.
+                    self.accept_retry_deadline = Some(http_deadline(super::HTTP_EVENT_LOOP_SLEEP));
+                    break;
+                }
                 Err(error) => return Err(error),
             };
             stream.set_nonblocking(true)?;
@@ -438,6 +476,42 @@ impl Reactor {
         }
         Ok(())
     }
+}
+
+fn accept_error_is_peer_transient(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    // Linux accept(2) can report these pending TCP errors from a new
+    // connection. Match raw errno, not broad NetworkDown/Unsupported kinds.
+    #[cfg(target_os = "linux")]
+    if matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
+    ) {
+        return true;
+    }
+    // Rust 1.89 maps WSAECONNABORTED/RESET to the kinds above, but not
+    // WSAEINTR to Interrupted. Preserve that exact native-runtime case too.
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEINTR) {
+        return true;
+    }
+    false
 }
 
 fn tighten_deadline(saved: &mut Option<Instant>, deadline: Option<Instant>) {

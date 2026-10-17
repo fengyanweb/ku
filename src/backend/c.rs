@@ -16146,6 +16146,7 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   }
 }
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
+  if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
   char incoming[KU_HTTP_READ_CHUNK];
   int received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
   if (received < 0) {
@@ -16195,6 +16196,7 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   }
 }
 static void ku_http_connection_read_body(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
+  if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
   size_t remaining = connection->input.body_len - connection->body_received;
   if (remaining > (size_t)65536) remaining = (size_t)65536;
   int received = ku_http_socket_recv(connection->socket_value, connection->input.body + connection->body_received, remaining);
