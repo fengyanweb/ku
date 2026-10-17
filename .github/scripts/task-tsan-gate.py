@@ -32,6 +32,7 @@ TARGETS = (
     ("native_task_cleanup_commit_test", "native_task_requested_cancel_tightens_unacked_child_before_cleanup_commit", False),
     ("native_task_adapter_test", "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline", False),
     ("native_task_adapter_test", "native_task_flat_array_snapshots_charge_partial_owners_and_release_each_failure", False),
+    ("native_task_start_charge_test", "native_task_start_charge_multihop_active_results_and_late_observers_execute_in_c", False),
 )
 TSAN_OPTIONS = "halt_on_error=1:exitcode=66"
 

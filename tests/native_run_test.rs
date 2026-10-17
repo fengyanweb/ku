@@ -3291,6 +3291,43 @@ async fn Early(): str! {
     } finally { println("early-finally") }
     fail "empty"
 }
+async fn SumValues(values: [int], offset: int): int! {
+    total = offset
+    for value in values { time.sleep(0)? total = total + value }
+    return ok(total)
+}
+async fn ForwardValues(values: [int], offset: int): int! {
+    return (await SumValues(values, offset))
+}
+async fn EchoTexts(values: [str]): null! {
+    for text in values { (await Show(text))? }
+    return ok(null)
+}
+async fn ForwardTexts(values: [str]): null! { return (await EchoTexts(values)) }
+async fn CountFlags(values: [bool]): int! {
+    count = 0
+    for flag in values { if (flag) { count = count + 1 } }
+    return ok(count)
+}
+async fn ParameterNumbers(): null! {
+    values = [10, 20]
+    println((await ForwardValues(values.clone(), (await Next(5))?))?)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn ParameterTexts(): null! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?];
+    (await ForwardTexts(words))?;
+    return ok(null)
+}
+async fn ParameterEmptyAndBool(): null! {
+    flags = [false, true, true]
+    println((await CountFlags(flags))?)
+    empty: [int] = []
+    println((await SumValues(empty, 0))?)
+    println((await SumValues([], 0))?)
+    return ok(null)
+}
 async fn Recover(): null! {
     values = [1, 2]
     try {
@@ -3309,12 +3346,15 @@ async fn main(): null! {
     (await EmptyAndBool())?;
     (await Nested())?;
     println((await Early())?);
+    (await ParameterNumbers())?;
+    (await ParameterTexts())?;
+    (await ParameterEmptyAndBool())?;
     (await Recover())?;
     return ok(null)
 }
 "#;
     fs::write(dir.join("main.ku"), program).unwrap();
-    let expected = format!("1\n2\n3\n4\n1\n2\n3\n{first}\n乙\n{first}\n乙\n未遍历\n3\ntrue\ntrue\nfalse\n3\nearly-finally\n{first}\n1\nrow\nerror-finally\n1\n2\n");
+    let expected = format!("1\n2\n3\n4\n1\n2\n3\n{first}\n乙\n{first}\n乙\n未遍历\n3\ntrue\ntrue\nfalse\n3\nearly-finally\n{first}\n5\n35\n10\n20\n{first}\n乙\n2\n0\n0\n1\nrow\nerror-finally\n1\n2\n");
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(dir).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)

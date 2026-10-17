@@ -87,15 +87,10 @@ fn owned(ty: &IrType) -> bool {
 fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> String {
     match ty {
         IrType::Str => body(place),
-        IrType::Array(inner) if crate::ir::task::flat_array(ty) => {
-            let element = super::c_type(inner).expect("flat array element C type");
-            let leaf = if inner.as_ref() == &IrType::Str {
-                format!("    for (size_t array_index=0;array_index<({place}).len;array_index++) {{\n{}    }}\n",body(&format!("({place}).data[array_index]")))
-            } else {
-                String::new()
-            };
-            format!("  if (({place}).len>({place}).capacity || ({place}).capacity>64u || (({place}).capacity && !({place}).data) || ({place}).capacity>SIZE_MAX/sizeof({element}) || ({place}).capacity*sizeof({element})>SIZE_MAX-bytes) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  bytes+=({place}).capacity*sizeof({element});\n{leaf}")
-        }
+        IrType::Array(inner) if inner.as_ref() == &IrType::Str => format!(
+            "  for (size_t array_index=0;array_index<({place}).len;array_index++) {{\n{}  }}\n",
+            body(&format!("({place}).data[array_index]"))
+        ),
         IrType::Result(inner) => format!(
             "  if (({place}).ok) {{\n{}  }} else {{\n{}{}{}  }}\n",
             active_strings(inner, &format!("({place}).value"), body),
@@ -111,6 +106,21 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
         ),
         _ => String::new(),
     }
+}
+
+// Charging is separate from pure leaf traversal: vector bytes are counted
+// once, while alias callbacks must never mutate any accounting variable.
+fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
+    if let IrType::Array(element) = ty {
+        let c_element = super::c_type(element).expect("flat element C type");
+        let leaves = active_strings(ty, place, &|leaf| {
+            format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
+        });
+        return format!("  {{ KuTaskAdapterBufferV1 vector={{0}}; checked=ku_task_adapter_array_buffer(({place}).data,({place}).len,({place}).capacity,sizeof({c_element}),KU_TASK_FRAME_ALIGNOF({c_element}),&vector); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (vector.bytes>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=vector.bytes;\n{leaves}  }}\n");
+    }
+    active_strings(ty, place, &|leaf| {
+        format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
+    })
 }
 
 pub(super) fn parameter_c_type(ty: &TaskSlotType) -> KuResult<String> {
@@ -160,6 +170,58 @@ fn parameter_drop(ty: &TaskSlotType, place: &str) -> KuResult<String> {
     }
 }
 
+fn array_input_guard(
+    id: &str,
+    parameters: &[(usize, &TaskSlotType)],
+    declarations: &str,
+) -> KuResult<String> {
+    let range_capacity = parameters
+        .iter()
+        .map(|(_, ty)| match ty {
+            TaskSlotType::Value {
+                ty: IrType::Result(_),
+                ..
+            } => 3,
+            TaskSlotType::Value {
+                ty: IrType::Str | IrType::Array(_),
+                ..
+            } => 1,
+            TaskSlotType::Value { ty, .. } if crate::ir::task::error_type(ty) => 3,
+            _ => 0,
+        })
+        .sum::<usize>()
+        .max(1);
+    let vector_capacity=parameters.iter().filter(|(_,ty)|matches!(ty,TaskSlotType::Value {ty:IrType::Array(inner),..} if inner.as_ref()==&IrType::Str)).count().max(1);
+    let mut code=format!("static uint32_t ku_task_{id}_inputs(KuTaskDriverV1* driver,const KuTaskAdapterBufferV1* extra,size_t extra_count,int read_leaves{declarations},size_t* owned_bytes) {{\n  KuTaskAdapterBufferV1 base[{range_capacity}]={{0}},headers[{}]={{0}};\n  KuTaskAdapterStringVectorV1 vectors[{vector_capacity}]={{0}};\n  size_t base_count=0,vector_count=0,total=0; uint32_t checked=KU_TASK_DRIVER_OK;\n",parameters.len().max(1));
+    for index in 0..parameters.len() {
+        code.push_str(&format!(
+            "  headers[{index}]=(KuTaskAdapterBufferV1){{arg_{index},sizeof(*arg_{index}),0}};\n"
+        ));
+    }
+    let validate_base=format!("  checked=ku_task_adapter_buffer_excludes(base[base_count-1u],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  for (size_t prior=0;prior+1u<base_count;prior++) if (ku_task_adapter_buffers_overlap(base[base_count-1u],base[prior])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n",parameters.len());
+    for (index, (_, ty)) in parameters.iter().enumerate() {
+        if let TaskSlotType::Value {
+            ty: IrType::Array(element),
+            ..
+        } = ty
+        {
+            let element_c = c_type(element)?;
+            code.push_str(&format!("  checked=ku_task_adapter_array_buffer(arg_{index}->data,arg_{index}->len,arg_{index}->capacity,sizeof({element_c}),KU_TASK_FRAME_ALIGNOF({element_c}),&base[base_count]); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (base[base_count].bytes>SIZE_MAX-total) return KU_TASK_DRIVER_LIMIT; total+=base[base_count++].bytes;\n"));
+            code.push_str(&validate_base);
+            if element.as_ref() == &IrType::Str {
+                code.push_str(&format!("  vectors[vector_count++]=(KuTaskAdapterStringVectorV1){{arg_{index}->data,arg_{index}->len}};\n"));
+            }
+        } else {
+            code.push_str(&parameter_strings(ty,&format!("(*arg_{index})"),&|leaf|format!("  checked=ku_task_adapter_string_charge({leaf},&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  base[base_count++]=ku_task_adapter_string_buffer({leaf});\n{validate_base}")));
+        }
+    }
+    code.push_str(&format!("  for (size_t i=0;i<base_count;i++) {{\n    checked=ku_task_adapter_buffer_excludes(base[i],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n    for (size_t j=0;j<i;j++) if (ku_task_adapter_buffers_overlap(base[i],base[j])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }}\n",parameters.len()));
+    code.push_str("  if (!read_leaves) return KU_TASK_DRIVER_OK;\n  for (size_t vector=0;vector<vector_count;vector++) {\n    for (size_t leaf=0;leaf<vectors[vector].len;leaf++) {\n      KuString value=vectors[vector].data[leaf];\n      checked=ku_task_adapter_string_charge(value,&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n      KuTaskAdapterBufferV1 buffer=ku_task_adapter_string_buffer(value);\n      checked=ku_task_adapter_buffer_excludes(buffer,headers,");
+    code.push_str(&parameters.len().to_string());
+    code.push_str("u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n      for (size_t i=0;i<base_count;i++) if (ku_task_adapter_buffers_overlap(buffer,base[i])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n      for (size_t previous=0;previous<=vector;previous++) {\n        size_t end=previous==vector ? leaf : vectors[previous].len;\n        for (size_t j=0;j<end;j++) if (ku_task_adapter_buffers_overlap(buffer,ku_task_adapter_string_buffer(vectors[previous].data[j]))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n      }\n    }\n  }\n  if (owned_bytes) *owned_bytes=total; return KU_TASK_DRIVER_OK;\n}\n");
+    Ok(code)
+}
+
 fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let IrType::Result(inner) = &function.result else {
         return Err(unsupported(
@@ -180,7 +242,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             TaskSlotType::Value {
                 ty,
                 borrowed: false,
-            } if supported_type(ty) => {}
+            } if supported_type(ty) || crate::ir::task::flat_array(ty) => {}
             TaskSlotType::Callable { .. } => {}
             _ => return Err(unsupported("native task adapter parameter is unsupported")),
         }
@@ -220,18 +282,21 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             {
                 if owned(ty) {
                     reconcile_fields.push_str(&format!("  if (instance->frame.header.initialized & (UINT64_C(1)<<{index})) {{\n{}  }}\n",
-                        active_strings(ty, &format!("instance->frame.s_{index}"), &|place|
-                            format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+                        active_charge(ty,&format!("instance->frame.s_{index}"),"bytes").replace("checked","status")));
                 }
             }
         }
-        reconcile_fields.push_str(&format!("  if (instance->frame.header.result_initialized) {{\n{}  }}\n",
-            active_strings(&function.result, "instance->frame.result", &|place|
-                format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+        reconcile_fields.push_str(&format!(
+            "  if (instance->frame.header.result_initialized) {{\n{}  }}\n",
+            active_charge(&function.result, "instance->frame.result", "bytes")
+                .replace("checked", "status")
+        ));
         reconcile_fields.push_str("  }\n");
-        reconcile_fields.push_str(&format!("  if (instance->payload_initialized) {{\n{}  }}\n",
-            active_strings(&function.result, "instance->payload", &|place|
-                format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+        reconcile_fields.push_str(&format!(
+            "  if (instance->payload_initialized) {{\n{}  }}\n",
+            active_charge(&function.result, "instance->payload", "bytes")
+                .replace("checked", "status")
+        ));
     }
     let result_type = c_type(&function.result)?;
     let mut declarations = String::new();
@@ -349,6 +414,23 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             ));
         }
     }
+    let has_array_parameters = parameters
+        .iter()
+        .any(|(_, ty)| matches!(ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty)));
+    let mut hosted_runtime_inputs = String::new();
+    if has_array_parameters {
+        out.push_str(&array_input_guard(&id, &parameters, &declarations)?);
+        charge=format!("  size_t input_charge=0;\n  checked=ku_task_{id}_inputs(driver,(KuTaskAdapterBufferV1[]){{{{output,sizeof(*output),0}},{{source,source ? sizeof(*source) : 0,0}}}},2u,1{arguments},&input_charge);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (input_charge>SIZE_MAX-charge) return KU_TASK_DRIVER_LIMIT; charge+=input_charge;\n");
+        source_buffers.clear();
+        hosted_charge=format!("  checked=ku_task_{id}_inputs(NULL,(KuTaskAdapterBufferV1[]){{{{host,sizeof(*host),0}},{{output,sizeof(*output),0}},{{&source,sizeof(source),0}}}},3u,0{arguments},NULL);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n");
+        hosted_ticket_aliases.clear();
+        for index in 0..parameters.len() {
+            hosted_ticket_aliases.push_str(&format!("  if (ku_task_frame_ranges_overlap(parent,sizeof(*parent),arg_{index},sizeof(*arg_{index})) || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"));
+        }
+        let extra="(KuTaskAdapterBufferV1[]){{host,sizeof(*host),0},{output,sizeof(*output),0},{&source,sizeof(source),0},{parent,sizeof(*parent),0},{host->control,sizeof(KuTaskControlV1),0}}";
+        hosted_ticket_aliases.push_str(&format!("  checked=ku_task_{id}_inputs(NULL,{extra},5u,1{arguments},NULL); if (checked!=KU_TASK_DRIVER_OK) return checked;\n"));
+        hosted_runtime_inputs=format!("  checked=ku_task_{id}_inputs(driver,{extra},5u,1{arguments},&charge); if (checked!=KU_TASK_DRIVER_OK) return checked;\n");
+    }
     let payload_aliases = active_strings(&function.result, "instance->payload", &|place| {
         format!(
             "  if (ku_task_adapter_string_overlaps({place}, outcome, sizeof(*outcome)) || ku_task_adapter_string_overlaps({place}, request, sizeof(*request)) || (request->parent && ku_task_adapter_string_overlaps({place},request->parent,sizeof(*request->parent)))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n"
@@ -450,6 +532,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@HOSTED_HEADERS@", &hosted_headers)
         .replace("@HOSTED_CHARGE@", &hosted_charge)
         .replace("@HOSTED_TICKET_ALIASES@", &hosted_ticket_aliases)
+        .replace("@HOSTED_RUNTIME_INPUTS@", &hosted_runtime_inputs)
         .replace("@RESTORE@", &restore)
         .replace("@REJECTED_DROPS@", &rejected_drops)
         .replace("@PAYLOAD_CHARGE@", &payload_charge)
@@ -522,6 +605,32 @@ static int ku_task_adapter_string_overlaps_runtime(KuString value, KuTaskDriverV
       || ku_task_adapter_string_overlaps(value, driver->slots, driver->capacity * sizeof(*driver->slots))
       || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring))
       || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes));
+}
+/* Internal finite parameter guards: only base ranges are retained. String
+ * array leaves are compared as a stream, never a 64-by-64 stack allocation. */
+typedef struct KuTaskAdapterBufferV1 { const void* pointer; size_t bytes; uint32_t owned; } KuTaskAdapterBufferV1;
+typedef struct KuTaskAdapterStringVectorV1 { const KuString* data; size_t len; } KuTaskAdapterStringVectorV1;
+static uint32_t ku_task_adapter_array_buffer(const void* data,size_t len,size_t capacity,
+    size_t element_bytes,size_t alignment,KuTaskAdapterBufferV1* output) {
+  if (len>capacity || capacity>64u || !element_bytes || capacity>SIZE_MAX/element_bytes
+      || (!capacity && data)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t bytes=capacity*element_bytes;
+  if (bytes && !ku_task_frame_storage_valid(data,bytes,bytes,alignment)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  *output=(KuTaskAdapterBufferV1){data,bytes,1u}; return KU_TASK_DRIVER_OK;
+}
+static KuTaskAdapterBufferV1 ku_task_adapter_string_buffer(KuString value) {
+  return (KuTaskAdapterBufferV1){value.ptr,ku_task_adapter_string_extent(value),value.storage==KU_STRING_OWNED};
+}
+static int ku_task_adapter_buffers_overlap(KuTaskAdapterBufferV1 left,KuTaskAdapterBufferV1 right) {
+  return (left.owned || right.owned) && ku_task_frame_ranges_overlap(left.pointer,left.bytes,right.pointer,right.bytes);
+}
+static uint32_t ku_task_adapter_buffer_excludes(KuTaskAdapterBufferV1 buffer,
+    const KuTaskAdapterBufferV1* headers,size_t header_count,
+    const KuTaskAdapterBufferV1* extra,size_t extra_count,KuTaskDriverV1* driver) {
+  for (size_t i=0;i<header_count;i++) if (ku_task_frame_ranges_overlap(buffer.pointer,buffer.bytes,headers[i].pointer,headers[i].bytes)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  for (size_t i=0;i<extra_count;i++) if (ku_task_frame_ranges_overlap(buffer.pointer,buffer.bytes,extra[i].pointer,extra[i].bytes)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (driver && buffer.bytes && !ku_task_driver_external_storage(driver,buffer.pointer,buffer.bytes,1u)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  return KU_TASK_DRIVER_OK;
 }
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault) {
   /* Callbacks run outside the queue mutex. The registered task or BUILDING
@@ -1146,8 +1255,12 @@ static uint32_t ku_task_@ID@_start_value(KuTaskDriverV1* driver@PARAM_DECLS@, Ku
 }
 static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_DECLS@, KuTaskValueV1* output) {
   KuTaskDriverStartChargeV1 source={0};
-  /* No host/ticket/output field read before complete known-header and active
-   * buffer overlap rejection. Integer-range validity is not pointer mapping. */
+  /* The raw caller provides complete readable typed headers and vector
+   * extents. Reject known header/base aliases first, then discover the host's
+   * parent/control pointers. Array leaves are checked against those ranges
+   * before parent fields are read; driver backing becomes known afterwards.
+   * Output fields are inspected only after the final complete input guard.
+   * Integer-range checks do not establish arbitrary pointer mappings. */
   if (!ku_task_frame_storage_valid(host,sizeof(*host),sizeof(*host),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterHostV1))
       || !ku_task_frame_storage_valid(output,sizeof(*output),sizeof(*output),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))
       || ku_task_frame_ranges_overlap(host,sizeof(*host),output,sizeof(*output))
@@ -1158,6 +1271,11 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
   uint32_t checked=KU_TASK_DRIVER_OK;
   size_t charge=0;
 @HOSTED_CHARGE@
+  /* The raw caller supplies a complete mapped host header. Array vectors are
+   * checked against known ranges before leaf metadata. parent/control pointer
+   * values become known here; their deep aliases are rejected before reading
+   * parent fields. Driver backing ranges are known only after that read and
+   * are rechecked in the final pass. Integer ranges are not a mapping oracle. */
   const KuTaskDriverTicketV1* parent=host->ticket;
   if (!ku_task_frame_storage_valid(parent,sizeof(*parent),sizeof(*parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
       || !ku_task_frame_storage_valid(host->control,sizeof(KuTaskControlV1),sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1))
@@ -1177,6 +1295,7 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
       || !ku_task_driver_external_storage(driver,parent,sizeof(*parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
       || !ku_task_driver_external_storage(driver,host->control,sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1)))
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@HOSTED_RUNTIME_INPUTS@
 @CALLABLE_CHECKS@
   source=(KuTaskDriverStartChargeV1){*parent,host->control,host->minimum_charge,charge};
   return ku_task_@ID@_start_value_impl(driver,&source@PARAM_ARGS@,output);

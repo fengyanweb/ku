@@ -1720,7 +1720,50 @@ fn native_task_flat_array_ir_validates_owned_elements_and_parameter_boundary() {
     assert!(verify_and_plan(&duplicate, TaskLimits::default()).is_err());
     let mut parameter = fixture.clone();
     parameter.functions[0].parameters.push(SlotId(1));
-    assert!(verify_and_plan(&parameter, TaskLimits::default()).is_err());
+    let error = verify_and_plan(&parameter, TaskLimits::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("overwriting a possibly initialized owned slot without drop"),
+        "{error}"
+    );
+    for element in [IrType::Int, IrType::Bool, IrType::Str] {
+        let array = IrType::Array(Box::new(element));
+        let valid = program(
+            vec![array.clone(), result(IrType::Null)],
+            &[0],
+            vec![state(
+                vec![
+                    drop_slot(0),
+                    init(1, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+                ],
+                complete(1),
+            )],
+        );
+        let plan = verify_and_plan(&valid, TaskLimits::default()).unwrap();
+        assert!(plan.functions[0].hosted && plan.functions[0].slots.contains(&SlotId(0)));
+        let twice = program(
+            vec![array.clone(), array.clone(), array, result(IrType::Null)],
+            &[0],
+            vec![state(
+                vec![
+                    TaskOp::Move {
+                        dst: SlotId(1),
+                        src: SlotId(0),
+                    },
+                    TaskOp::Move {
+                        dst: SlotId(2),
+                        src: SlotId(0),
+                    },
+                    drop_slot(1),
+                    drop_slot(2),
+                    init(3, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+                ],
+                complete(3),
+            )],
+        );
+        assert!(verify_and_plan(&twice, TaskLimits::default()).is_err());
+    }
     let mut nested = fixture.clone();
     nested.functions[0].slots[1].ty = TaskSlotType::Value {
         ty: IrType::Array(Box::new(IrType::Array(Box::new(IrType::Str)))),

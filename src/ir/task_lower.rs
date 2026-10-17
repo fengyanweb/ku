@@ -276,9 +276,6 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                 return Err(unsupported("borrowed async parameters", parameter.span));
             }
             budget.text(parameter.name.len(), parameter.span)?;
-            if matches!(parameter.ty.as_ref(), Some(TypeName::Array(_))) {
-                return Err(unsupported("array async parameters", parameter.span));
-            }
             parameters.push(local_type(
                 parameter
                     .ty
@@ -958,6 +955,9 @@ impl<'a> FunctionLowerer<'a> {
                     span,
                 ));
             };
+            if task::flat_array(&ty) {
+                return Err(unsupported("array parameters in a callable value", span));
+            }
             parameters.push(ty);
         }
         let slot = self.slot(TaskSlotType::Callable {
@@ -1186,7 +1186,11 @@ impl<'a> FunctionLowerer<'a> {
         }
         let mut arguments = Vec::new();
         for (argument, expected) in args.iter().zip(&signature.parameters) {
-            let source = self.expression(argument, depth + 1)?;
+            let source = if matches!(&argument.kind, ExprKind::Array(_)) {
+                self.direct_argument_expression(argument, expected, depth + 1)?
+            } else {
+                self.expression(argument, depth + 1)?
+            };
             if &self.function.slots[source.0].ty != expected {
                 return Err(unsupported(
                     "mismatched async argument types",
@@ -1206,6 +1210,34 @@ impl<'a> FunctionLowerer<'a> {
             arguments,
         })?;
         Ok(destination)
+    }
+
+    // Expected array element construction stays outside recursive ordinary
+    // call frames. Match the ordinary expression entrance's budget exactly.
+    #[inline(never)]
+    fn direct_argument_expression(
+        &mut self,
+        argument: &Expr,
+        expected: &TaskSlotType,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if let (
+            ExprKind::Array(elements),
+            TaskSlotType::Value {
+                ty: IrType::Array(inner),
+                borrowed: false,
+            },
+        ) = (&argument.kind, expected)
+        {
+            self.budget.expression(depth, argument.span)?;
+            return self.array_expression(
+                elements,
+                Some(inner.as_ref().clone()),
+                argument.span,
+                depth,
+            );
+        }
+        self.expression(argument, depth)
     }
 
     #[inline(never)]

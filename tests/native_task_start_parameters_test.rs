@@ -174,6 +174,66 @@ fn native_task_indirect_start_owned_inputs_restore_and_invalid_identity_do_not_c
     run_owned_sparse_start(true);
 }
 
+#[test]
+fn native_task_direct_flat_array_parameters_preflight_and_sparse_rollback_execute_in_c() {
+    let source = r#"
+async fn Inspect(numbers: [int], flags: [bool], texts: [str]): int! {
+    return ok(numbers.len()+flags.len()+texts.len())
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let mut native = task_lower::lower_program(&ast).unwrap();
+    move_to_slot_63(&mut native.tasks.functions[0], SlotId(2));
+    let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    assert!(plan.functions[0].slots.contains(&SlotId(63)));
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
+    let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic int array_fail_calloc;\nstatic void* array_calloc(size_t count,size_t bytes) {{ if (array_fail_calloc) {{ array_fail_calloc=0; return NULL; }} return fixture_calloc(count,bytes); }}\n#undef calloc\n#define calloc array_calloc\n");
+    let generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{instrumentation}typedef struct KuString {{"),
+    );
+    let generated = replace_once(generated, "static uint32_t ku_task_driver_commit(", "static uint32_t ku_task_driver_commit(const KuTaskDriverTicketV1*,KuTaskControlOwnerV1*,uint32_t,uint64_t);\nstatic uint32_t array_real_commit(");
+    let mut generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unmodified_source_main(void) {",
+    );
+    generated.push_str(ARRAY_PARAMETER_MAIN);
+    let directory = TempDir::new("native-task-array-parameters");
+    let path = directory.path().join("program.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute array parameter ownership"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("array parameter watchdog");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-array-parameters-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 fn run_owned_sparse_start(indirect: bool) {
     let source = r#"
 async fn Parent(value: str!, extra: str, count: int, flag: bool): str! {
@@ -604,5 +664,236 @@ static void fixture_invalid_id_case(void) {
   CHECK(ku_task_frame_0_destroy(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_OK);
   CHECK(fixture_frees[0]==1u && fixture_frees[1]==1u);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+}
+"#;
+
+const ARRAY_PARAMETER_MAIN: &str = r#"
+typedef struct ArrayParameterRuntime {
+  KuTaskDriverV1 driver;
+  KuTaskDriverSlotV1 slots[1];
+  size_t ring[1];
+} ArrayParameterRuntime;
+typedef struct ArrayParameterInputs {
+  KuArray_int numbers;
+  KuArray_bool flags;
+  KuArray_str texts;
+} ArrayParameterInputs;
+static ArrayParameterInputs array_expected;
+static ArrayParameterInputs* array_source;
+static unsigned array_fail_commit,array_commits,array_rejections;
+static uintptr_t array_leaf[2];
+static uint64_t array_deadline(void) {
+  uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-2000u);
+  return now+2000u;
+}
+static size_t array_bytes(ArrayParameterInputs* input) {
+  return input->numbers.capacity*sizeof(*input->numbers.data)
+      +input->flags.capacity*sizeof(*input->flags.data)
+      +input->texts.capacity*sizeof(*input->texts.data)+32u;
+}
+static ArrayParameterInputs array_input(void) {
+  ArrayParameterInputs input={0};
+  input.numbers=(KuArray_int){2,calloc(4,sizeof(int64_t)),4};
+  input.flags=(KuArray_bool){2,calloc(4,sizeof(bool)),4};
+  input.texts=(KuArray_str){3,calloc(4,sizeof(KuString)),4};
+  CHECK(input.numbers.data && input.flags.data && input.texts.data);
+  input.numbers.data[0]=17; input.numbers.data[1]=-9;
+  input.flags.data[0]=true;
+  input.texts.data[0]=(KuString){malloc(31u),7u,31u,KU_STRING_OWNED};
+  input.texts.data[1]=(KuString){malloc(1u),0u,0u,KU_STRING_OWNED};
+  input.texts.data[2]=ku_string_static((const uint8_t*)"\xe4\xb8\xad",3u);
+  CHECK(input.texts.data[0].ptr && input.texts.data[1].ptr);
+  memcpy(input.texts.data[0].ptr,"payload",7u);
+  array_leaf[0]=(uintptr_t)input.texts.data[0].ptr; array_leaf[1]=(uintptr_t)input.texts.data[1].ptr;
+  return input;
+}
+static void array_unchanged(ArrayParameterInputs* value) {
+  CHECK(value->numbers.data==array_expected.numbers.data && value->numbers.len==2u && value->numbers.capacity==4u);
+  CHECK(value->flags.data==array_expected.flags.data && value->flags.len==2u && value->flags.capacity==4u);
+  CHECK(value->texts.data==array_expected.texts.data && value->texts.len==3u && value->texts.capacity==4u);
+  CHECK(value->numbers.data[0]==17 && value->numbers.data[1]==-9);
+  CHECK(value->flags.data[0] && !value->flags.data[1]);
+  CHECK((uintptr_t)value->texts.data[0].ptr==array_leaf[0] && value->texts.data[0].len==7u
+      && value->texts.data[0].capacity==31u && !memcmp(value->texts.data[0].ptr,"payload",7u));
+  CHECK((uintptr_t)value->texts.data[1].ptr==array_leaf[1] && !value->texts.data[1].len && !value->texts.data[1].capacity);
+}
+static KuTaskDriverSnapshotV1 array_snapshot(ArrayParameterRuntime* runtime) {
+  KuTaskDriverSnapshotV1 result={0};
+  CHECK(ku_task_driver_snapshot(&runtime->driver,&result)==KU_TASK_DRIVER_OK); return result;
+}
+static void array_idle(ArrayParameterRuntime* runtime) {
+  CHECK(ku_task_driver_wait_idle(&runtime->driver,array_deadline())==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 snapshot=array_snapshot(runtime);
+  CHECK(!snapshot.fault && !snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
+}
+static void array_init(ArrayParameterRuntime* runtime,size_t budget) {
+  memset(runtime,0,sizeof(*runtime));
+  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
+      runtime->slots,1u,runtime->ring,1u,fixed+budget,1u,array_deadline())==KU_TASK_DRIVER_OK);
+}
+static void array_finish(ArrayParameterRuntime* runtime) {
+  array_idle(runtime); uint64_t deadline=array_deadline();
+  CHECK(ku_task_driver_shutdown(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_join(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver.workers_created==1u && runtime->driver.workers_joined==1u);
+  CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+}
+static uint32_t ku_task_driver_commit(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlOwnerV1* owner,uint32_t mode,uint64_t deadline) {
+  CHECK(mode==KU_TASK_DRIVER_START); array_commits++;
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)owner->lease.control;
+  CHECK(instance->frame.header.initialized==(UINT64_C(3)|(UINT64_C(1)<<63)));
+  CHECK(instance->frame.s_0.data==array_expected.numbers.data && instance->frame.s_0.capacity==4u);
+  CHECK(instance->frame.s_1.data==array_expected.flags.data && instance->frame.s_1.capacity==4u);
+  CHECK(instance->frame.s_63.data==array_expected.texts.data && instance->frame.s_63.capacity==4u);
+  CHECK((uintptr_t)instance->frame.s_63.data[0].ptr==array_leaf[0] && (uintptr_t)instance->frame.s_63.data[1].ptr==array_leaf[1]);
+  CHECK(!array_source->numbers.data && !array_source->numbers.len && !array_source->numbers.capacity);
+  CHECK(!array_source->flags.data && !array_source->flags.len && !array_source->flags.capacity);
+  CHECK(!array_source->texts.data && !array_source->texts.len && !array_source->texts.capacity);
+  CHECK(!ku_task_driver_lock(ticket->driver));
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  CHECK(slot && slot->charged_bytes==sizeof(*instance)+array_bytes(&array_expected));
+  CHECK(!ku_task_driver_unlock(ticket->driver));
+  KuTaskDriverTicketV1 stale=*ticket; stale.generation++;
+  return array_real_commit(array_fail_commit ? &stale : ticket,owner,mode,deadline);
+}
+/* Capture actual live input storage separately from deliberately malformed raw
+ * argument headers. Never dereference a forged candidate vector to inspect it. */
+static void array_reject(ArrayParameterRuntime* runtime,KuArray_int* numbers,
+    KuArray_bool* flags,KuArray_str* texts,unsigned variant) {
+  KuArray_int before_numbers=*numbers; KuArray_bool before_flags=*flags; KuArray_str before_texts=*texts;
+  int64_t saved_numbers[4]; bool saved_flags[4]; KuString saved_texts[4];
+  memcpy(saved_numbers,array_expected.numbers.data,sizeof(saved_numbers));
+  memcpy(saved_flags,array_expected.flags.data,sizeof(saved_flags));
+  memcpy(saved_texts,array_expected.texts.data,sizeof(saved_texts));
+  FixtureLedger ledger=fixture_ledger(); KuTaskDriverSnapshotV1 before=array_snapshot(runtime);
+  KuTaskHandle_0 output={0}; KuTaskValueV1 value={0}; uint32_t status;
+  KuTaskDriverTicketV1 ticket={&runtime->driver,0,0}; KuTaskControlV1 control={0};
+  KuTaskDriverTicketV1 original_ticket=ticket;
+  KuTaskAdapterHostV1 host={&ticket,&control,NULL,sizeof(KuTaskInstance_0)};
+  /* The mapped ticket is deliberately only sizeof(ticket), smaller than one
+   * KuString. Known parent overlap must reject before scanning a vector leaf. */
+  KuArray_str ticket_vector={variant==12 ? 2u : 1u,(KuString*)&ticket,variant==12 ? 2u : 1u};
+  if (variant==1) status=ku_task_0_try_start(&runtime->driver,numbers,flags,texts,(KuTaskHandle_0*)numbers);
+  else if (variant==2) status=ku_task_0_try_start(&runtime->driver,numbers,flags,texts,(KuTaskHandle_0*)numbers->data);
+  else if (variant==3) status=ku_task_0_try_start(&runtime->driver,numbers,flags,texts,(KuTaskHandle_0*)texts->data[0].ptr);
+  else if (variant==4) status=ku_task_0_try_start_impl(&runtime->driver,(const KuTaskDriverStartChargeV1*)texts->data,numbers,flags,texts,&output);
+  else if (variant==5) status=ku_task_0_start_hosted((const KuTaskAdapterHostV1*)numbers->data,numbers,flags,texts,&value);
+  else if (variant==6) { host.ticket=(const KuTaskDriverTicketV1*)numbers->data; status=ku_task_0_start_hosted(&host,numbers,flags,texts,&value); }
+  else if (variant==7) { host.control=(KuTaskControlV1*)texts->data[0].ptr; status=ku_task_0_start_hosted(&host,numbers,flags,texts,&value); }
+  else if (variant==8) status=ku_task_0_try_start(&runtime->driver,numbers,flags,texts,(KuTaskHandle_0*)&texts->data[3]);
+  else if (variant==9) status=ku_task_0_try_start(&runtime->driver,numbers,(KuArray_bool*)numbers,texts,&output);
+  /* This is the genuine one-byte malloc owned by an empty string. Do not pad
+   * it into a readable ticket merely to make premature parent reads harmless. */
+  else if (variant==10) { host.ticket=(const KuTaskDriverTicketV1*)texts->data[1].ptr; status=ku_task_0_start_hosted(&host,numbers,flags,texts,&value); }
+  else if (variant==11 || variant==12) status=ku_task_0_start_hosted(&host,numbers,flags,&ticket_vector,&value);
+  else status=ku_task_0_try_start(&runtime->driver,numbers,flags,texts,&output);
+  CHECK(status==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(numbers->data==before_numbers.data && numbers->len==before_numbers.len && numbers->capacity==before_numbers.capacity);
+  CHECK(flags->data==before_flags.data && flags->len==before_flags.len && flags->capacity==before_flags.capacity);
+  CHECK(texts->data==before_texts.data && texts->len==before_texts.len && texts->capacity==before_texts.capacity);
+  CHECK(!memcmp(saved_numbers,array_expected.numbers.data,sizeof(saved_numbers)));
+  CHECK(!memcmp(saved_flags,array_expected.flags.data,sizeof(saved_flags)));
+  CHECK(!memcmp(saved_texts,array_expected.texts.data,sizeof(saved_texts)));
+  CHECK(!output.owner.lease.control && !output.ticket.driver && !value.tag && !value.owner.lease.control && !value.ticket.driver);
+  CHECK(ticket.driver==original_ticket.driver && ticket.slot==original_ticket.slot && ticket.generation==original_ticket.generation);
+  CHECK(ticket_vector.data==(KuString*)&ticket && ticket_vector.len==(variant==12 ? 2u : 1u)
+      && ticket_vector.capacity==(variant==12 ? 2u : 1u));
+  FixtureLedger after_ledger=fixture_ledger(); KuTaskDriverSnapshotV1 after=array_snapshot(runtime);
+  CHECK(after_ledger.calls==ledger.calls && after_ledger.allocations==ledger.allocations && after_ledger.bytes==ledger.bytes);
+  CHECK(after.resident==before.resident && after.building==before.building && after.reserved_bytes==before.reserved_bytes);
+  CHECK(after.queued==before.queued && after.running==before.running && after.fault==before.fault);
+  CHECK(runtime->slots[0].state==KU_TASK_DRIVER_FREE && !runtime->slots[0].generation);
+  array_rejections++;
+}
+static void array_preflight(ArrayParameterRuntime* runtime,ArrayParameterInputs* input) {
+  KuArray_int bad=input->numbers;
+  bad.len=5u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.capacity=65u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.capacity=SIZE_MAX; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.data=NULL; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.len=bad.capacity=0u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.data=(int64_t*)((uint8_t*)input->numbers.data+1u); array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.data=(int64_t*)(uintptr_t)(UINTPTR_MAX-7u); bad.capacity=2u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.data=(int64_t*)&input->flags; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.data=(int64_t*)runtime->slots; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  KuArray_str bad_texts=input->texts;
+  bad_texts.data=(KuString*)((uint8_t*)input->texts.data+1u); array_reject(runtime,&input->numbers,&input->flags,&bad_texts,0);
+  bad_texts=input->texts; bad_texts.data=(KuString*)runtime->slots; array_reject(runtime,&input->numbers,&input->flags,&bad_texts,0);
+  KuString saved=input->texts.data[0];
+  input->texts.data[0].len=32u; array_reject(runtime,&input->numbers,&input->flags,&input->texts,0);
+  input->texts.data[0]=saved; input->texts.data[0].ptr=(uint8_t*)(uintptr_t)UINTPTR_MAX;
+  input->texts.data[0].len=1u; input->texts.data[0].capacity=2u; array_reject(runtime,&input->numbers,&input->flags,&input->texts,0);
+  input->texts.data[0]=saved; input->texts.data[0].ptr=(uint8_t*)&runtime->driver;
+  array_reject(runtime,&input->numbers,&input->flags,&input->texts,0); input->texts.data[0]=saved;
+  input->texts.data[0].ptr=(uint8_t*)&input->flags;
+  array_reject(runtime,&input->numbers,&input->flags,&input->texts,0); input->texts.data[0]=saved;
+  input->texts.data[0].ptr=(uint8_t*)input->texts.data;
+  array_reject(runtime,&input->numbers,&input->flags,&input->texts,0); input->texts.data[0]=saved;
+  KuString second=input->texts.data[1]; input->texts.data[1]=saved;
+  array_reject(runtime,&input->numbers,&input->flags,&input->texts,0); input->texts.data[1]=second;
+  for (unsigned variant=1;variant<=12u;variant++) array_reject(runtime,&input->numbers,&input->flags,&input->texts,variant);
+  array_unchanged(input); CHECK(array_rejections==29u);
+}
+static void array_case(unsigned mode) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  array_fail_calloc=array_fail_commit=array_commits=0;
+  ArrayParameterInputs input=array_input(); array_expected=input; array_source=&input;
+  ArrayParameterRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_0)+array_bytes(&input));
+  if (!mode) array_preflight(&runtime,&input);
+  FixtureLedger baseline=fixture_ledger(); KuTaskHandle_0 handle={0};
+  if (mode==1u) array_fail_calloc=1;
+  if (mode==2u) array_fail_commit=1;
+  uint32_t status=ku_task_0_try_start(&runtime.driver,&input.numbers,&input.flags,&input.texts,&handle);
+  CHECK(!array_fail_calloc); array_fail_commit=0;
+  if (mode) {
+    CHECK(status==(mode==1u ? KU_TASK_ADAPTER_OUT_OF_MEMORY : KU_TASK_DRIVER_STALE));
+    array_unchanged(&input); CHECK(!handle.owner.lease.control && !handle.ticket.driver);
+    array_idle(&runtime); FixtureLedger after=fixture_ledger();
+    CHECK(after.allocations==baseline.allocations && after.bytes==baseline.bytes);
+    CHECK(after.calls==baseline.calls+(mode==2u ? 1u : 0u));
+    CHECK(array_commits==(mode==2u ? 1u : 0u));
+    ku_array_drop_int(&input.numbers); ku_array_drop_bool(&input.flags); ku_array_drop_str(&input.texts);
+  } else {
+    CHECK(status==KU_TASK_DRIVER_OK && array_commits==1u);
+    CHECK(!input.numbers.data && !input.flags.data && !input.texts.data);
+    CHECK(ku_task_driver_wait_result(&handle.ticket,&handle.owner.lease,array_deadline())==KU_TASK_DRIVER_WAIT_READY);
+    CHECK(ku_task_driver_wait_idle(&runtime.driver,array_deadline())==KU_TASK_DRIVER_OK);
+    KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_0_take(&handle,&output)==KU_TASK_CONTROL_OK);
+    CHECK(output.result_kind==1u && output.value.integer.ok && output.value.integer.value==7);
+    ku_task_outcome_drop(&output); CHECK(ku_task_0_drop(&handle,array_deadline())==KU_TASK_DRIVER_OK);
+  }
+  array_finish(&runtime);
+}
+static void array_rejected_value(unsigned mode) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  array_fail_calloc=array_fail_commit=array_commits=0;
+  ArrayParameterInputs input=array_input(); array_expected=input; array_source=&input;
+  ArrayParameterRuntime runtime;
+  size_t budget=sizeof(KuTaskInstance_0)+array_bytes(&input)-(mode==0u ? 1u : 0u);
+  array_init(&runtime,budget);
+  if (mode==1u) CHECK(ku_task_driver_shutdown(&runtime.driver,array_deadline())==KU_TASK_DRIVER_OK);
+  if (mode==2u) array_fail_calloc=1u;
+  FixtureLedger before=fixture_ledger(); KuTaskValueV1 value={0};
+  CHECK(ku_task_0_start_value(&runtime.driver,&input.numbers,&input.flags,&input.texts,&value)==KU_TASK_DRIVER_OK);
+  CHECK(!array_fail_calloc && !array_commits);
+  CHECK(value.tag==KU_TASK_VALUE_INLINE_FAILED && value.result_kind==1u && !value.function_id
+      && value.rejection_code==(mode==0u ? KU_TASK_DRIVER_LIMIT : mode==1u ? KU_TASK_DRIVER_CLOSED : KU_TASK_ADAPTER_OUT_OF_MEMORY));
+  CHECK(!value.owner.lease.control && !value.ticket.driver);
+  CHECK(!input.numbers.data && !input.numbers.len && !input.numbers.capacity);
+  CHECK(!input.flags.data && !input.flags.len && !input.flags.capacity);
+  CHECK(!input.texts.data && !input.texts.len && !input.texts.capacity);
+  CHECK(fixture_ledger().calls==before.calls && !fixture_ledger().allocations && !fixture_ledger().bytes);
+  KuTaskDriverSnapshotV1 snapshot=array_snapshot(&runtime);
+  CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
+  CHECK(ku_task_value_drop(&value,array_deadline())==KU_TASK_DRIVER_OK);
+  array_finish(&runtime);
+}
+int main(void) {
+  for (unsigned mode=0;mode<3u;mode++) array_case(mode);
+  for (unsigned mode=0;mode<3u;mode++) array_rejected_value(mode);
+  puts("task-array-parameters-ok"); return 0;
 }
 "#;

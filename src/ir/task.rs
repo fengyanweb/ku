@@ -778,12 +778,8 @@ fn validate_shape(
     for &parameter in &function.parameters {
         match &get_slot(parameter)?.ty {
             TaskSlotType::Value {
-                ty,
-                borrowed: false,
-            } if !flat_array(ty) => {}
-            TaskSlotType::Value {
                 borrowed: false, ..
-            } => return Err(invalid("array parameters are unsupported")),
+            } => {}
             TaskSlotType::Callable { .. } => {}
             TaskSlotType::Value { borrowed: true, .. } => {
                 return Err(invalid("borrowed parameter cannot enter a task frame"));

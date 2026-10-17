@@ -153,7 +153,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 及对应单层 Result、move-only `Task { result }` 与无捕获 `Callable` 槽。操作显式区分 Init、Copy、Move、
 WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print、ScopeEnter；控制边包括 Jump、Branch、Suspend
 （resume / cleanup）、Await、TryResult、ScopeDrain、Complete、内部 Exit 和 Terminate。
-局部数组限平面 `[int]/[bool]/[str]`；object/struct/enum、数组与 Task 参数/返回或借用参数仍拒绝，Callable 的有限扩展见下文。
+局部数组和直接 owned 参数限平面 `[int]/[bool]/[str]`；object/struct/enum、数组返回、Callable 数组签名、Task 参数/返回或借用参数仍拒绝，Callable 的有限扩展见下文。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
 初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组参数或返回、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组返回/Callable 数组签名、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和下述平面数组以外的动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -477,7 +477,10 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 ### 平面数组的局部帧与运行期 for
 
 ArrayMake、ArrayClone、ArrayLen、ArrayTake 支持局部 flat int/bool/str vector。
-普通参数、Callable 签名、结果和 raw IR 的参数入口继续拒绝数组；不扩 outcome kinds。
+普通 direct Start 与 raw IR 的 owned 参数接通这些 flat array；Callable 数组签名与
+数组结果继续拒绝，不扩 outcome kinds。factory 在 malloc/move 前验证全部 header、vector
+及活跃字符串叶子的已知别名，vector capacity*sizeof(T) 与 Owned leaf capacity 只累计一次；
+hosted Start 沿原 commit 原子转交父子费用，try_start 失败保留或恢复来源 header/init 位。
 Task slot 的元素类型加入原 C typedef/prototype/body 收集，复用 KuArray_T 表示和 drop，
 构造/快照使用 Task 可失败分配入口，不调用同步 make/clone 的直接 exit 路径。
 

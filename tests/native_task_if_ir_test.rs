@@ -1540,9 +1540,27 @@ async fn main(): null! { total=(await Inspect())? return ok(null) }
         .states
         .iter()
         .any(|state| matches!(state.terminator, TaskTerminator::Suspend { .. })));
+    for (element, literal) in [("int", "1"), ("bool", "true"), ("str", "\"Ku\"")] {
+        let source = format!("async fn Child(values: [{element}]): int! {{ return ok(values.len()) }} async fn main(): null! {{ empty=(await Child([]))? values=[{literal}] child=Child(values.clone()) println(values.len()) count=(await child)? println(count+empty) return ok(null) }}");
+        let admitted = task_lower::lower_program(&checked(&source)).unwrap();
+        task::verify_and_plan(&admitted.tasks, TaskLimits::default()).unwrap();
+        assert!(matches!(
+            &admitted.tasks.functions[0].slots[0].ty,
+            TaskSlotType::Value {
+                ty: IrType::Array(_),
+                borrowed: false
+            }
+        ));
+    }
     for source in [
-        "async fn Bad(values: [int]): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+        "async fn Bad(values: [[int]]): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+        "async fn Bad(call: async fn([int]): int!): int! { return ok(1) } async fn main(): null! { return ok(null) }",
         "async fn Bad(): [int]! { return ok([1]) } async fn main(): null! { return ok(null) }",
         "async fn main(): null! { values=[[1]] return ok(null) }",
+        "async fn Child(values: [int]): int! { return ok(values.len()) } async fn main(): null! { selected=Child total=(await selected([1]))? println(total) return ok(null) }",
     ] { assert!(task_lower::lower_program(&checked(source)).is_err()); }
+    let borrowed = parsed("async fn Bad(&values: [int]): int! { return ok(values.len()) } async fn main(): null! { return ok(null) }");
+    assert!(task_lower::lower_program(&borrowed).is_err());
+    let repeated = parsed("async fn Bad(left: [str], right: [str]): int! { return ok(left.len()+right.len()) } async fn main(): null! { values=[\"owned\"] total=(await Bad(values,values))? println(total) return ok(null) }");
+    assert!(Checker::new().check(&repeated).is_err());
 }
