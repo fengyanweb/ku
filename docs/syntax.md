@@ -733,7 +733,7 @@ Task 清理采用当前所有权作用域规则：合法 move 会转移清理责
 
 普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
 
-上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await、函数级多 child scope drain 及 If 分支的正常 scope drain。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，实际结果与历史失败/修复见工作日志，不是正式发布。M:N、netpoll、事件驱动 HTTP、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成。
+上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await、函数级多 child scope drain 及 If 分支的正常 scope drain。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，实际结果与历史失败/修复见工作日志，不是正式发布。M:N、通用 Task 网络等待/netpoll、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；解释器与 native HTTP 已接入各自的单 I/O 线程。
 
 当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；普通值参数限 `int/bool/null/str`、owned 平面 `[int]/[bool]/[str]` 及各自单层 Result，另支持接收相同值类型的顶层无捕获 async 函数值参数；返回为显式 primitive 或平面数组 `T!`，无捕获函数值也可返回数组结果。函数体支持可恢复错误的 try/catch/finally、Error 字段读取/重抛、顶层 async 函数值的绑定/move/clone/调用、局部绑定、已有 int/bool/null、字符串、平面数组、单层 Result/Error 局部的普通赋值、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；Copy 表达式支持 checked int 的一元 `-`、`+ - * / %` 和 `== != < <= > >=`，bool 的 `!`、`== !=` 及 `&& ||` 短路。普通二元式左值先求值并保存，右侧 Await 不会丢失该快照；未选中的逻辑右侧或 If 分支不执行其调用、move 或 Await，但仍静态检查。溢出/除零保持不可恢复 runtime failure，不因 async 返回 `T!` 就改成普通 Err。字符串支持静态字面量、len()/byte_len()/clone() 与 +；len 计 Unicode 标量、byte_len 计 UTF-8 字节且不消费输入。拼接先快照左侧再求右侧，原峰值预算覆盖快照和新结果。另支持平面 `[int]/[bool]/[str]` 局部数组、只读 `try_get(index)` 和运行期 `for`，详见下述并发文档；嵌套数组、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、float/混合类型算术、str/null/Result/Task 比较和平面数组以外的动态堆表达式仍拒绝。finally 体首版不接受新 Task、Await、sleep、文件读写、循环或其中再嵌 finally；支持有限分支、局部 catch 和 primitive 操作。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
 
@@ -1855,10 +1855,10 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 
 `writer` 会保留给受控流式响应，但它不是普通 handler 参数。后续 `http.stream(fn(writer) { ... })` 落地时，`writer.write(value)` 必须返回 Result 并由调用方处理；`writer.status(code)` / `writer.header(name, value)` 只能在第一次 write 前调用；不会给普通用户暴露 `writer.end()`，stream 函数正常返回后 runtime 自动结束。当前一次性响应 runtime 还没有开放 `http.stream/sse/websocket`。
 
-当前 runtime 是有界阻塞 server：
+当前 runtime 使用有界接纳与单 I/O 线程推进连接；listen/run 对调用者仍是阻塞入口：
 
 - `max_connections` 表示同时在线连接上限；超过时立即返回 503。
-- `max_active_requests` 控制同时工作的连接/handler worker 数。
+- `max_active_requests` 控制同时处理的活动请求槽位数；native handler worker 另有既有的64线程上限。
 - `max_pending_requests` 是有界等待队列；队列满时立即返回 503，不无限排队。
 - `handler_timeout_ms` 到时返回 504。解释器逐步检查 deadline；native 在循环回边和 Ku 调用返回点插入协作式 safepoint。
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
@@ -1909,7 +1909,11 @@ fn main(): null! {
 
 `ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
 
-解释器的 socket 读取、handler 等待和响应写出由单 I/O 线程推进，Ku handler 仍串行执行；等待连接不会逐个创建 OS 线程。native C 暂保留固定连接 worker，完整事件化仍待接入。两端继续使用原连接/队列限制、各阶段绝对期限和 Connection: close，不新增 keep-alive 或配置字段。
+解释器的 socket 读取、handler 等待和响应写出由单 I/O 线程推进，Ku handler 仍串行执行。native C 已接通 poll（Linux/macOS）与 WSAPoll（Windows）：调用 listen 的线程独占 socket 接受、读写和关闭，完整请求输入独立持有后交给既有的最多64个 handler worker，等待连接不创建逐连接线程，也不占用 handler worker。槽位等实际 job 引用归还后才复用，部分读写不刷新原阶段期限。
+
+native handler 仍在执行线程按原期限协作检查与清理，阻塞系统/FFI 调用不会被 I/O 线程强制打断；全部 worker 创建失败时保留原 inline 降级，此时 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，真实排空已接受的读取、job、响应及引用，join worker 后退出。
+
+两端继续使用原连接/队列限制、各阶段绝对期限和 Connection: close，不新增 keep-alive 或配置字段。通用 Task 网络等待、跨模块缓冲预算/指标和完整负载验收仍未完成。
 
 native 与解释器的主要已知差异：
 
@@ -2315,7 +2319,7 @@ LLVM 数组、enum、闭包、HTTP、async lowering、& 借用参数
 LLVM 递归 struct 和更复杂 Result payload
 覆盖全部语言特性（尤其 async/递归值类型）的完整 native C 后端
 registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
-超出上述有限 primitive/Result/平面数组子集的 native async lowering、捕获及返回函数值、M:N/netpoll/事件驱动 HTTP/剩余 blocking/完整 RSS 与 soak；闭包捕获 catch/match binding、local-function self、`for` 迭代变量或 Task；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
+超出上述有限 primitive/Result/平面数组子集的 native async lowering、捕获及返回函数值、M:N/通用 Task 网络等待与 netpoll/剩余 blocking/完整 RSS 与 soak；闭包捕获 catch/match binding、local-function self、`for` 迭代变量或 Task；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
 native C HTTP 对阻塞系统/FFI 调用的可取消 transport，以及超时首次发生在 `finally` 中时的完整剩余清理语义
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句

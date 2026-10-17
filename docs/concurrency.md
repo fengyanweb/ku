@@ -358,7 +358,7 @@ async fn main(): null! {
 才退休 job、释放费用并允许 ACK，取消与晚完成不续原 D。
 
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
-M:N、netpoll、事件驱动 HTTP、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；
+M:N、通用 Task 网络等待/netpoll、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；HTTP 的单 I/O 线程接入见下文。
 真实双 worker 重叠执行的定向测试不等于吞吐、扩展性或长期低 CPU 占用验收。
 
 ## 同步只读借用与 async
@@ -393,11 +393,15 @@ await 深度上限: 64
 超过上限时，Ku 不会无限排队，也不会无限重试；超出的提交会结构化拒绝并进入 runtime 指标。
 空闲 task/blocking worker 阻塞等待有界队列并由新任务唤醒，不做固定间隔轮询；单 worker 内部仍可在 `await` 时执行一个已排队子任务，避免嵌套等待饥饿。这些都是 runtime 内部行为，不增加用户级并发 API。
 但当前 await、blocking completion 等待和 shutdown 路径仍含短间隔检查；取消清理期间不再帮跑用户任务。
-固定 worker 和有界队列不等于已经实现可挂起的 stackless M:N 调度或事件驱动连接管理。
+固定 worker 和有界队列不等于已经实现可挂起的 stackless M:N 调度或通用 Task 网络等待。
 
 v0.0.18 开发分支的解释器 HTTP 已将 socket 读取、等待 handler、分段写出和关闭交给每个 listener 的单个 I/O 线程。Linux/macOS 使用批量 poll，Windows 使用 WSAPoll；主线程仍串行运行 Ku handler，不把 Ku 值或闭包送往 I/O 线程。max_connections、max_active_requests 和 max_pending_requests 保留原连接许可、活动连接和 FIFO 等待队列的含义；等待读写不会创建逐连接 OS 线程。空闲 I/O 线程阻塞等待 readiness 或原绝对期限，handler 完成和退出使用内部通知唤醒；主解释器仍保留原有短间隔取消检查。
 
-各读取、handler、写出阶段沿用一次创建的期限；读取请求后转交原有字符串，响应头与 body 分段持有。每个请求有独立一次性返回通道；连接超时或关闭后迟到结果只释放数据，槽位复用以 generation 区分。该接入仍采用 Connection: close，不增加 keep-alive、公开配置或用户调度 API。native C 目前仍由固定连接 worker 负责读写与 handler；通用 Task 网络等待、native HTTP 事件化、跨模块缓冲预算/指标和完整负载验收仍未完成。连接上限与单请求字节限制不等于整个进程的内存上限。
+解释器各读取、handler、写出阶段沿用一次创建的期限；读取请求后转交原有字符串，响应头与 body 分段持有。每个请求有独立一次性返回通道；连接超时或关闭后迟到结果只释放数据，槽位复用以 generation 区分。
+
+native C HTTP 也已接通 Linux/macOS 的 poll 与 Windows 的 WSAPoll。调用 listen 的线程独占接受连接、请求读取、分段响应写出及 socket 关闭；完整请求输入独立持有后交给既有的最多64个 handler worker，等待读写不占用 handler worker。连接槽位在队列/worker 的实际 job 引用归还后才复用，部分读写不会刷新原阶段绝对期限。native handler 的期限仍从实际调用时建立，沿原协作检查与清理路径返回；阻塞系统/FFI 调用不会被 I/O 线程强制打断。若所有 worker 都创建失败，保留原 inline 降级，此时执行 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，实际排空已接受的读取、job、响应及引用，再 join worker 并退出。
+
+两端继续使用 Connection: close，不增加 keep-alive、公开配置或用户调度 API。通用 Task 网络等待、跨模块缓冲预算/指标和完整负载验收仍未完成；连接上限与单请求字节限制不等于整个进程的内存上限。
 
 ## 开发者 HTTP 压测 demo
 
@@ -440,7 +444,7 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 HTTP server 当前提供：
 
 - `max_connections`：同时在线连接上限。
-- `max_active_requests`：同时处理的请求/handler worker 上限。
+- `max_active_requests`：同时处理的活动请求槽位上限；native handler worker 另有既有的64线程上限。
 - `max_pending_requests`：等待队列上限。
 - `handler_timeout_ms`：handler 执行超时返回 504。
 - `idle_timeout_ms`：连接首字节等待超时。
@@ -468,4 +472,4 @@ handler 不能修改外层捕获（E0703）。路由注册后，直接或间接�
 
 这不是冻结所有 Copy 或函数变量。正常调用、未共享绑定的赋值、同名新局部及原有参数规则保持不变；直接传函数值注册不会仅因此冻结保存该值的原变量，但不会擦除函数值内部的捕获关系。闭包 clone 共享环境，环境引用计数只负责存活期，不等于对捕获内容加锁或创建快照。
 
-普通 Copy 初始化未被 E0704 一并禁止，不代表允许 handler 写共享状态，也不证明任意外层并发写入无竞态。这里不引入 `std.atomic` / `std.sync` 或新的共享状态接口；资源预算、事件驱动 HTTP、性能与 soak 的未完成边界不因新增静态检查而改变。
+普通 Copy 初始化未被 E0704 一并禁止，不代表允许 handler 写共享状态，也不证明任意外层并发写入无竞态。这里不引入 `std.atomic` / `std.sync` 或新的共享状态接口；完整资源预算、通用 Task 网络等待、性能与 soak 的未完成边界不因新增静态检查而改变。

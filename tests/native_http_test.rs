@@ -24,7 +24,7 @@ use std::io::Read;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -105,7 +105,7 @@ fn unused_local_address() -> String {
 /// Compile `source` (with `__ADDRESS__` replaced) to a native binary and spawn
 /// it. Returns `None` when no C compiler is available (skip the test).
 fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<NativeHttpServer> {
-    spawn_native_server_inner(name, source, address, false)
+    spawn_native_server_inner(name, source, address, false, None)
 }
 
 // Only the lexical positive currently opts into checked completion. Other
@@ -116,7 +116,16 @@ fn spawn_observed_native_server(
     source: &str,
     address: &str,
 ) -> Option<NativeHttpServer> {
-    spawn_native_server_inner(name, source, address, true)
+    spawn_native_server_inner(name, source, address, true, None)
+}
+
+fn spawn_finite_native_server(
+    name: &str,
+    source: &str,
+    address: &str,
+    max_requests: usize,
+) -> Option<NativeHttpServer> {
+    spawn_native_server_inner(name, source, address, false, Some(max_requests))
 }
 
 fn spawn_native_server_inner(
@@ -124,6 +133,7 @@ fn spawn_native_server_inner(
     source: &str,
     address: &str,
     observed: bool,
+    max_requests: Option<usize>,
 ) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
@@ -173,8 +183,12 @@ fn spawn_native_server_inner(
             c_source,
         });
     }
-    let child = match Command::new(&exe)
-        .current_dir(&dir)
+    let mut command = Command::new(&exe);
+    command.current_dir(&dir);
+    if let Some(max_requests) = max_requests {
+        command.env("KU_HTTP_MAX_REQUESTS", max_requests.to_string());
+    }
+    let child = match command
         // The long-lived server is supervised by `NativeServerWatchdog` and
         // never consumes process output. Null streams prevent an unbounded
         // pipe backlog from stalling the server under a diagnostic flood.
@@ -291,6 +305,7 @@ struct NativeHttpServer {
 struct NativeServerWatchdog {
     cancel: Option<mpsc::Sender<()>>,
     timed_out: Arc<AtomicBool>,
+    natural_exit: Arc<Mutex<Option<ExitStatus>>>,
     worker: Option<thread::JoinHandle<()>>,
     dir: Option<PathBuf>,
 }
@@ -298,6 +313,24 @@ struct NativeServerWatchdog {
 impl NativeServerWatchdog {
     fn timed_out(&self) -> bool {
         self.timed_out.load(Ordering::Acquire)
+    }
+
+    fn wait_for_natural_exit(&self, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = *self.natural_exit.lock().expect("native exit receipt") {
+                return status;
+            }
+            assert!(
+                !self.timed_out(),
+                "native server required its external watchdog"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "finite native server did not exit naturally"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -347,10 +380,15 @@ impl NativeHttpServer {
         let (cancel_tx, cancel_rx) = mpsc::channel();
         let timed_out = Arc::new(AtomicBool::new(false));
         let worker_timed_out = Arc::clone(&timed_out);
+        let natural_exit = Arc::new(Mutex::new(None));
+        let worker_natural_exit = Arc::clone(&natural_exit);
         let worker = thread::spawn(move || {
             let started = Instant::now();
             loop {
-                if let Ok(Some(_)) = child.try_wait() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    *worker_natural_exit
+                        .lock()
+                        .expect("record native exit receipt") = Some(status);
                     return;
                 }
 
@@ -373,6 +411,7 @@ impl NativeHttpServer {
         NativeServerWatchdog {
             cancel: Some(cancel_tx),
             timed_out,
+            natural_exit,
             worker: Some(worker),
             dir: Some(dir),
         }
@@ -962,7 +1001,9 @@ fn native_http_routing_matches_interpreter() {
     assert!(generated.contains("#define KU_NATIVE_RUNTIME_HTTP_SOCKET 1"));
     assert!(generated.contains("typedef SOCKET KuHttpSocket;"));
     assert!(generated.contains("typedef int KuHttpSocket;"));
-    assert!(generated.contains("poll(&descriptor, 1, wait_ms)"));
+    assert!(generated.contains("poll(items, (nfds_t)count, timeout_ms)"));
+    assert!(generated.contains("WSAPoll(items, (ULONG)count, timeout_ms)"));
+    assert!(generated.contains("ku_http_socket_nonblocking(cli)"));
     assert!(generated.contains("send(socket_value, data, chunk, MSG_NOSIGNAL)"));
     assert!(generated.contains("setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE"));
     assert!(generated.contains("pthread_create(&worker, NULL, ku_http_worker, &ctx)"));
@@ -2043,6 +2084,145 @@ fn native_http_backpressure_matches_interpreter() {
         Duration::from_secs(3),
     );
     assert_status(&recovered, "HTTP/1.1 200 OK");
+}
+
+// Reading a socket must not consume one of the capped handler workers. The
+// 64 incomplete bodies precede the healthy request in accept/queue order; the
+// old 64-worker socket queue cannot read that request before a body is released.
+const SHARED_IO_SOURCE: &str = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.server({
+        idle_timeout_ms: 5000,
+        read_header_timeout_ms: 10000,
+        read_body_timeout_ms: 10000,
+        write_timeout_ms: 2000,
+        handler_timeout_ms: 5000,
+        max_connections: 192,
+        max_active_requests: 128,
+        max_pending_requests: 128
+    })
+    app.post("/echo/{id}", fn(req) {
+        return http.text(req.params.id + ":" + req.query.q + ":" + req.headers.host + ":" + req.body)
+    })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_http_partial_bodies_leave_handler_workers_available() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    // No readiness connection or retry after a successful connect: exactly 64
+    // partial requests, one healthy request and one recovery request are accepted.
+    let Some(mut server) =
+        spawn_finite_native_server("shared-io-partial-bodies", SHARED_IO_SOURCE, &address, 66)
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let directory = server.dir().to_path_buf();
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let request = |id: &str, query: &str, body: &str| {
+        format!(
+            "POST /echo/{id}?q={query} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let check_response = |response: &[u8], expected: &str| {
+        let response = std::str::from_utf8(response).expect("native HTTP response UTF-8");
+        assert_status(response, "HTTP/1.1 200 OK");
+        assert_eq!(
+            response.split_once("\r\n\r\n").expect("HTTP headers").1,
+            expected,
+            "native handler must use this request's params, query, headers and owned body"
+        );
+    };
+    let mut partials = Vec::with_capacity(64);
+    for index in 0..64 {
+        let id = format!("partial-{index}");
+        let query = format!("held-{index}");
+        let body = format!("正文-{index}-界🙂\0!");
+        let bytes = request(&id, &query, &body).into_bytes();
+        let mut stream = connect_with_retry(&address, Duration::from_secs(2));
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("partial write timeout");
+        stream
+            .write_all(&bytes[..bytes.len() - 1])
+            .expect("hold final body byte");
+        partials.push((stream, format!("{id}:{query}:localhost:{body}")));
+    }
+
+    // This is a progress requirement while all bodies are incomplete, not a
+    // short scheduling race or a thread-count assertion. The configured body
+    // D remains 10s; only the external healthy-response observation is 2s.
+    let healthy_body = "健康-界🙂\0!";
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut healthy = connect_with_retry(&address, Duration::from_secs(2));
+    healthy
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("healthy write timeout");
+    healthy
+        .write_all(request("healthy", "progress", healthy_body).as_bytes())
+        .expect("write healthy request");
+    let response = read_http_stream_bytes_until(&mut healthy, deadline)
+        .expect("incomplete socket bodies must leave a handler worker available");
+    check_response(
+        &response,
+        &format!("healthy:progress:localhost:{healthy_body}"),
+    );
+    drop(healthy);
+
+    // Release every retained input before reading responses, then apply one
+    // shared external deadline to the entire drain, rather than 64 fresh waits.
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    for (stream, _) in &mut partials {
+        stream.write_all(b"!").expect("release final body byte");
+    }
+    for (stream, expected) in &mut partials {
+        let response = read_http_stream_bytes_until(stream, drain_deadline)
+            .expect("released request must complete within the shared drain deadline");
+        check_response(&response, expected);
+    }
+    drop(partials);
+
+    let recovered_body = "恢复-界🙂\0!";
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut recovered = connect_with_retry(&address, Duration::from_secs(2));
+    recovered
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("recovery write timeout");
+    recovered
+        .write_all(request("recovered", "after-drain", recovered_body).as_bytes())
+        .expect("write recovery request");
+    let response = read_http_stream_bytes_until(&mut recovered, deadline)
+        .expect("native HTTP service must recover after releasing partial bodies");
+    check_response(
+        &response,
+        &format!("recovered:after-drain:localhost:{recovered_body}"),
+    );
+    drop(recovered);
+
+    // The finite accepted-connection bound must drain accepted work, join the
+    // runtime threads and return success. A watchdog kill never records this
+    // receipt and cannot satisfy the natural-exit assertion.
+    let status = watchdog.wait_for_natural_exit(Duration::from_secs(3));
+    assert!(
+        status.success(),
+        "finite native HTTP server failed: {status}"
+    );
+    assert!(!watchdog.timed_out());
+    drop(watchdog);
+    assert!(
+        !directory.exists(),
+        "native HTTP temporary artifacts remain"
+    );
 }
 
 // Request-target limit. `KU_HTTP_MAX_TARGET` (8192) is pinned to the
