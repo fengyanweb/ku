@@ -1,4 +1,4 @@
-//! Fixed-work native Driver8 observation tool, not a performance acceptance test.
+//! Fixed-work native Driver9 observation tool, not a performance acceptance test.
 //! Generate once, compile the same C with KU_BENCH_OBSERVE=0 and =1 at identical
 //! optimization/link settings, then run each binary through the bounded matrix.
 #[allow(dead_code)]
@@ -447,7 +447,7 @@ static size_t bench_argument(const char* input, size_t maximum) {
   CHECK(result && result <= maximum); return result;
 }
 int main(int argc, char** argv) {
-  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 8u && KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_CONTROL_ABI_VERSION == 2u);
+  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 9u && KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   size_t workers = bench_argument(argv[1], BENCH_MAX_WORKERS);
   bench_count = bench_argument(argv[2], BENCH_MAX_TASKS);
   size_t quanta = bench_argument(argv[3], 65536);
