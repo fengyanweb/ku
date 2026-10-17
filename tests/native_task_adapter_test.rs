@@ -2410,3 +2410,252 @@ int main(void) {
   puts("array-snapshot-owners-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_flat_array_results_keep_staged_owners_and_release_replaced_or_cancelled_payloads() {
+    let source = r#"
+async fn Choose(value: [str], replacement: [str], mode: int): [str]! {
+    try {
+        if (mode==3) { fail "before" }
+        return ok(value)
+    } finally {
+        println("gate")
+        if (mode==1) { return ok(replacement) }
+        if (mode==2) { fail "replacement" }
+    }
+    empty: [str]=[]
+    return ok(empty)
+}
+async fn Broken(): str! { fail "partial" }
+async fn Partial(first: str): [str]! { return ok([first,(await Broken())?]) }
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let native = ir::task_lower::lower_program(&ast).unwrap();
+    let function = &native.tasks.functions[0];
+    assert_eq!(function.name, "Choose");
+    let input = function.parameters[0];
+    let wrapped: Vec<_> = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::WrapOk { dst, src } if *src == input => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wrapped.len(), 1, "one primary array return");
+    let saved: Vec<_> = function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|operation| match operation {
+            TaskOp::Move { dst, src } if *src == wrapped[0] => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(saved.len(), 1, "finally preserves one owned return slot");
+    let hooks = r#"
+static KuTestEvent result_entered,result_proceed;
+static unsigned result_gate_calls;
+static int result_block;
+static void* result_instance;
+static size_t result_write(const void*,size_t,size_t,FILE*);
+#define fwrite result_write
+"#;
+    let mut generated = finally_adapter_generated(source, hooks);
+    let resume = "static uint32_t ku_task_0_resume(void* raw) {";
+    assert_eq!(generated.matches(resume).count(), 1);
+    generated = generated.replacen(resume, &format!("{resume}\n  result_instance=raw;"), 1);
+    generated.push_str(
+        &ARRAY_RESULT_MAIN
+            .replace("@INPUT@", &input.0.to_string())
+            .replace("@SAVED@", &saved[0].0.to_string()),
+    );
+    run_finally_adapter_generated(
+        generated,
+        "native-task-flat-array-results",
+        "\n\n\n\n\n\narray-result-owners-ok\n",
+    );
+}
+
+const ARRAY_RESULT_MAIN: &str = r#"
+typedef struct ResultRuntime { KuTaskDriverV1 driver; KuTaskDriverSlotV1 slots[4]; size_t ring[4]; } ResultRuntime;
+static uintptr_t result_original,result_replacement;
+static size_t result_original_charge,result_replacement_charge;
+static uint64_t result_deadline(void) { return ku_task_driver_now_ms()+2000u; }
+static KuTaskDriverSnapshotV1 result_snapshot(ResultRuntime* runtime) {
+  KuTaskDriverSnapshotV1 snapshot={0}; CHECK(ku_task_driver_snapshot(&runtime->driver,&snapshot)==KU_TASK_DRIVER_OK); return snapshot;
+}
+static void result_idle(ResultRuntime* runtime) {
+  CHECK(ku_task_driver_wait_idle(&runtime->driver,result_deadline())==KU_TASK_DRIVER_OK);
+}
+static size_t result_write(const void* bytes,size_t size,size_t count,FILE* stream) {
+  (void)stream;
+  if (size==1u && count==4u && !memcmp(bytes,"gate",4u)) {
+    CHECK(!result_gate_calls++);
+    if (result_block) {
+      KuTaskInstance_0* instance=(KuTaskInstance_0*)result_instance;
+      // Ordinary finally runs while the return is in its dedicated owned
+      // frame slot. Exit stages frame.result only after this body finishes.
+      CHECK(instance && !instance->frame.header.result_initialized && !instance->payload_initialized);
+      CHECK(instance->frame.finally_unwind_active);
+      CHECK(instance->frame.header.initialized&(UINT64_C(1)<<@SAVED@));
+      CHECK(!(instance->frame.header.initialized&(UINT64_C(1)<<@INPUT@)));
+      CHECK(!instance->frame.s_@INPUT@.data&&!instance->frame.s_@INPUT@.len&&!instance->frame.s_@INPUT@.capacity);
+      CHECK(instance->frame.s_@SAVED@.ok && (uintptr_t)instance->frame.s_@SAVED@.value.data==result_original);
+      CHECK(instance->frame.s_@SAVED@.value.capacity==4u && instance->frame.s_@SAVED@.value.len==2u);
+      CHECK(ku_test_event_set(&result_entered)); CHECK(ku_test_event_wait(&result_proceed,2000));
+    }
+  }
+  return count;
+}
+static void result_init(ResultRuntime* runtime) {
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  memset(runtime,0,sizeof(*runtime)); result_gate_calls=0; result_block=0; result_instance=NULL;
+  CHECK(ku_test_event_init(&result_entered)); CHECK(ku_test_event_init(&result_proceed));
+  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
+      runtime->slots,4u,runtime->ring,4u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2)+4096u,
+      1u,result_deadline())==KU_TASK_DRIVER_OK);
+}
+static KuArray_str result_input(int replacement) {
+  KuArray_str value={replacement ? 1u : 2u,NULL,replacement ? 2u : 4u};
+  value.data=(KuString*)calloc(value.capacity,sizeof(*value.data)); CHECK(value.data);
+  size_t capacity=replacement ? 37u : 31u;
+  uint8_t* leaf=(uint8_t*)malloc(capacity); CHECK(leaf);
+  memcpy(leaf,replacement ? "second" : "first",replacement ? 6u : 5u);
+  value.data[0]=(KuString){leaf,replacement ? 6u : 5u,capacity,KU_STRING_OWNED};
+  size_t charge=value.capacity*sizeof(KuString)+capacity;
+  if (replacement) { result_replacement=(uintptr_t)value.data; result_replacement_charge=charge; }
+  else {
+    uint8_t* empty=(uint8_t*)malloc(1u); CHECK(empty); empty[0]=0;
+    value.data[1]=(KuString){empty,0u,0u,KU_STRING_OWNED};
+    result_original=(uintptr_t)value.data; result_original_charge=charge+1u;
+  }
+  return value;
+}
+static KuTaskValueV1 result_start(ResultRuntime* runtime,int64_t mode) {
+  KuArray_str value=result_input(0),replacement=result_input(1); KuTaskValueV1 task={0};
+  CHECK(ku_task_0_start_value(&runtime->driver,&value,&replacement,&mode,&task)==KU_TASK_DRIVER_OK);
+  CHECK(task.tag==KU_TASK_VALUE_LIVE&&!value.data&&!value.len&&!value.capacity&&!replacement.data&&!replacement.len&&!replacement.capacity);
+  return task;
+}
+static void result_finish(ResultRuntime* runtime) {
+  result_idle(runtime); KuTaskDriverSnapshotV1 snapshot=result_snapshot(runtime);
+  CHECK(!snapshot.resident&&!snapshot.reserved_bytes&&!snapshot.fault);
+  uint64_t deadline=runtime->driver.closing ? runtime->driver.shutdown_deadline : result_deadline();
+  CHECK(ku_task_driver_shutdown(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  uint64_t effective=runtime->driver.shutdown_deadline; snapshot=result_snapshot(runtime);
+  CHECK(snapshot.workers_created==1u&&snapshot.workers_exited==1u&&!snapshot.workers_joined
+      &&!snapshot.workers_waiting&&!snapshot.resident&&!snapshot.reserved_bytes&&!snapshot.running&&!snapshot.queued);
+#if defined(_WIN32)
+  // Logical EXITED precedes native handle signalling. Observe that tail with
+  // the existing OS bound, then join using the original D without renewal.
+  if (ku_task_driver_now_ms()>=effective)
+    CHECK(WaitForSingleObject(runtime->driver.workers[0].thread,2000)==WAIT_OBJECT_0);
+#else
+  alarm(2);
+#endif
+  CHECK(ku_task_driver_join(&runtime->driver,effective)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver.shutdown_deadline==effective&&runtime->driver.workers_joined==1u
+      &&runtime->driver.workers[0].joined&&runtime->driver.workers[0].closed);
+  CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
+  CHECK(ku_test_event_destroy(&result_entered)); CHECK(ku_test_event_destroy(&result_proceed));
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes&&!fixture_ledger().overflow);
+}
+static void result_case(unsigned mode) {
+  ResultRuntime runtime; result_init(&runtime);
+  KuTaskValueV1 task=result_start(&runtime,mode==4u ? 0 : (int64_t)mode);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,result_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  result_idle(&runtime); CHECK(result_gate_calls==1u);
+  const size_t active=mode==1u ? result_replacement_charge : mode==2u||mode==3u ? 0u : result_original_charge;
+  CHECK(result_snapshot(&runtime).resident==1u&&result_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0)+active);
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0)+active);
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  if (mode==4u) {
+    // Untaken published arrays are dropped by the real payload destructor.
+    CHECK(ku_task_value_drop(&task,result_deadline())==KU_TASK_DRIVER_OK); result_idle(&runtime);
+  } else {
+    KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+    if (mode==2u||mode==3u) {
+      CHECK(instance->payload_initialized&&!instance->payload.ok);
+      // An Err's inactive array must never be validated, scanned or freed.
+      instance->payload.value=(KuArray_str){SIZE_MAX,(KuString*)(uintptr_t)1u,SIZE_MAX};
+    }
+    size_t calls=fixture_ledger().calls;
+    KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK);
+    CHECK(output.result_kind==7u&&output.value.string_array.ok==(mode<2u));
+    CHECK(output.exit_class==KU_TASK_EXIT_USER_RESULT&&!output.has_cleanup_deadline&&!output.cleanup_deadline);
+    CHECK(fixture_ledger().calls==calls&&result_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+    if (mode<2u) {
+      KuArray_str value=output.value.string_array.value;
+      CHECK((uintptr_t)value.data==(mode ? result_replacement : result_original));
+      CHECK(value.capacity==(mode ? 2u : 4u)&&value.len==(mode ? 1u : 2u));
+      CHECK(value.data[0].storage==KU_STRING_OWNED&&value.data[0].capacity==(mode ? 37u : 31u));
+      CHECK(value.data[0].len==(mode ? 6u : 5u)&&!memcmp(value.data[0].ptr,mode ? "second" : "first",value.data[0].len));
+      if (!mode) CHECK(value.data[1].storage==KU_STRING_OWNED&&!value.data[1].len&&!value.data[1].capacity&&!value.data[1].ptr[0]);
+      CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0)+active);
+    } else {
+      KuString message=output.value.string_array.error.message;
+      const char* expected=mode==2u ? "replacement" : "before";
+      CHECK(message.len==strlen(expected)&&!memcmp(message.ptr,expected,message.len));
+    }
+    ku_task_outcome_drop(&output); CHECK(ku_task_outcome_empty(&output,7u));
+    CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0));
+    CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_RESULT_TAKEN);
+    CHECK(ku_task_value_drop(&task,result_deadline())==KU_TASK_DRIVER_OK); result_idle(&runtime);
+  }
+  CHECK(result_snapshot(&runtime).resident==1u&&result_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0));
+  CHECK(late.control->frame_destroyed&&!ku_task_control_atomic_load(&late.control->lifecycle_pin));
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); result_finish(&runtime);
+}
+static void result_partial(void) {
+  ResultRuntime runtime; result_init(&runtime);
+  uint8_t* bytes=(uint8_t*)malloc(31u); CHECK(bytes); memcpy(bytes,"first",5u);
+  KuString first={bytes,5u,31u,KU_STRING_OWNED}; KuTaskValueV1 task={0};
+  size_t calls=fixture_ledger().calls;
+  CHECK(ku_task_2_start_value(&runtime.driver,&first,&task)==KU_TASK_DRIVER_OK&&!first.ptr);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,result_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  result_idle(&runtime);
+  CHECK(fixture_ledger().calls==calls+2u); // Parent and failed child; ArrayMake was never reached.
+  CHECK(result_snapshot(&runtime).resident==1u&&result_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_2));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_2));
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==7u&&!output.value.string_array.ok);
+  CHECK(output.value.string_array.error.message.len==7u&&!memcmp(output.value.string_array.error.message.ptr,"partial",7u));
+  ku_task_outcome_drop(&output); CHECK(ku_task_value_drop(&task,result_deadline())==KU_TASK_DRIVER_OK);
+  result_finish(&runtime);
+}
+static void result_cancel_staged(void) {
+  ResultRuntime runtime; result_init(&runtime); result_block=1;
+  KuTaskValueV1 task=result_start(&runtime,0);
+  CHECK(ku_test_event_wait(&result_entered,2000));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0)+result_original_charge+result_replacement_charge);
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  uint64_t deadline=ku_task_driver_now_ms()+30u; KuTaskDriverCleanupReceiptV1 receipt={0};
+  CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK); task=(KuTaskValueV1){0};
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_shutdown(&runtime.driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(ku_test_event_set(&result_proceed)); result_idle(&runtime);
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK&&result_gate_calls==1u);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(result_snapshot(&runtime).resident==1u&&result_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0));
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); result_finish(&runtime);
+}
+int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u&&KU_TASK_CONTROL_ABI_VERSION==2u&&KU_TASK_DRIVER_ABI_VERSION==10u);
+  for (unsigned mode=0;mode<5u;mode++) result_case(mode);
+  result_partial(); result_cancel_staged();
+  puts("array-result-owners-ok"); return 0;
+}
+"#;

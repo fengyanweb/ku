@@ -13,6 +13,12 @@ pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
         IrType::Bool => Ok("boolean"),
         IrType::Null => Ok("null_value"),
         IrType::Str => Ok("string"),
+        IrType::Array(inner) => match inner.as_ref() {
+            IrType::Int => Ok("integer_array"),
+            IrType::Bool => Ok("boolean_array"),
+            IrType::Str => Ok("string_array"),
+            _ => Err(unsupported("unsupported Task array outcome type")),
+        },
         _ => Err(unsupported("unsupported Task outcome type")),
     }
 }
@@ -23,6 +29,12 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
         IrType::Bool => Ok(2),
         IrType::Null => Ok(3),
         IrType::Str => Ok(4),
+        IrType::Array(inner) => match inner.as_ref() {
+            IrType::Int => Ok(5),
+            IrType::Bool => Ok(6),
+            IrType::Str => Ok(7),
+            _ => Err(unsupported("unsupported Task array outcome type")),
+        },
         _ => Err(unsupported("unsupported Task outcome type")),
     }
 }
@@ -70,8 +82,28 @@ typedef struct KuTaskAdapterOutcomeV1 {
   uint32_t result_kind, exit_class, has_cleanup_deadline;
   uint64_t cleanup_deadline;
   union { KuResult_int integer; KuResult_bool boolean;
-          KuResult_null null_value; KuResult_str string; } value;
+          KuResult_null null_value; KuResult_str string;
+          KuResult_array_int integer_array; KuResult_array_bool boolean_array;
+          KuResult_array_str string_array; } value;
 } KuTaskAdapterOutcomeV1;
+/* Appended kind 5--7 members must preserve the original kind 1--4 layout.
+ * These compile-time assertions apply to the C target's actual ABI. */
+typedef struct KuTaskAdapterOutcomeLegacyV1 {
+  uint32_t result_kind, exit_class, has_cleanup_deadline;
+  uint64_t cleanup_deadline;
+  union { KuResult_int integer; KuResult_bool boolean;
+          KuResult_null null_value; KuResult_str string; } value;
+} KuTaskAdapterOutcomeLegacyV1;
+typedef char KuTaskOutcomeSizeUnchangedV1[
+  sizeof(KuTaskAdapterOutcomeV1)==sizeof(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
+typedef char KuTaskOutcomeAlignmentUnchangedV1[
+  KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1)==KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
+typedef char KuTaskOutcomeOffsetsUnchangedV1[
+  offsetof(KuTaskAdapterOutcomeV1,result_kind)==offsetof(KuTaskAdapterOutcomeLegacyV1,result_kind)
+  && offsetof(KuTaskAdapterOutcomeV1,exit_class)==offsetof(KuTaskAdapterOutcomeLegacyV1,exit_class)
+  && offsetof(KuTaskAdapterOutcomeV1,has_cleanup_deadline)==offsetof(KuTaskAdapterOutcomeLegacyV1,has_cleanup_deadline)
+  && offsetof(KuTaskAdapterOutcomeV1,cleanup_deadline)==offsetof(KuTaskAdapterOutcomeLegacyV1,cleanup_deadline)
+  && offsetof(KuTaskAdapterOutcomeV1,value)==offsetof(KuTaskAdapterOutcomeLegacyV1,value) ? 1 : -1];
 typedef struct KuTaskAdapterTakeRequestV1 {
   KuTaskAdapterOutcomeV1* outcome;
   const KuTaskDriverTicketV1* parent;
@@ -202,6 +234,9 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
     case 2: if (output->value.boolean.ok || output->value.boolean.value) return 0; error=&output->value.boolean.error; break;
     case 3: if (output->value.null_value.ok || output->value.null_value.value) return 0; error=&output->value.null_value.error; break;
     case 4: if (output->value.string.ok || !ku_task_outcome_empty_string(output->value.string.value)) return 0; error=&output->value.string.error; break;
+    case 5: if (output->value.integer_array.ok || output->value.integer_array.value.data || output->value.integer_array.value.len || output->value.integer_array.value.capacity) return 0; error=&output->value.integer_array.error; break;
+    case 6: if (output->value.boolean_array.ok || output->value.boolean_array.value.data || output->value.boolean_array.value.len || output->value.boolean_array.value.capacity) return 0; error=&output->value.boolean_array.error; break;
+    case 7: if (output->value.string_array.ok || output->value.string_array.value.data || output->value.string_array.value.len || output->value.string_array.value.capacity) return 0; error=&output->value.string_array.error; break;
     default: return 0;
   }
   return ku_task_outcome_empty_string(error->domain) && ku_task_outcome_empty_string(error->code) && ku_task_outcome_empty_string(error->message);
@@ -212,6 +247,9 @@ static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* output) {
     case 2: ku_result_drop_bool(&output->value.boolean); break;
     case 3: ku_result_drop_null(&output->value.null_value); break;
     case 4: ku_result_drop_str(&output->value.string); break;
+    case 5: ku_result_drop_array_int(&output->value.integer_array); break;
+    case 6: ku_result_drop_array_bool(&output->value.boolean_array); break;
+    case 7: ku_result_drop_array_str(&output->value.string_array); break;
     default: break;
   }
   *output=(KuTaskAdapterOutcomeV1){0};
@@ -258,6 +296,9 @@ static uint32_t ku_task_value_take(KuTaskValueV1* value,
       case 2: output->value.boolean.error=error; break;
       case 3: output->value.null_value.error=error; break;
       case 4: output->value.string.error=error; break;
+      case 5: output->value.integer_array.error=error; break;
+      case 6: output->value.boolean_array.error=error; break;
+      case 7: output->value.string_array.error=error; break;
       default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
     }
     *value=(KuTaskValueV1){0}; return KU_TASK_DRIVER_OK;

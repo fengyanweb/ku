@@ -53,12 +53,26 @@ fn primitive(ty: &TypeName) -> Option<IrType> {
     }
 }
 
+fn result_payload(ty: &TypeName) -> Option<IrType> {
+    if let Some(primitive) = primitive(ty) {
+        return Some(primitive);
+    }
+    if let TypeName::Array(inner) = ty {
+        if let Some(element) =
+            primitive(inner).filter(|ty| matches!(ty, IrType::Int | IrType::Bool | IrType::Str))
+        {
+            return Some(IrType::Array(Box::new(element)));
+        }
+    }
+    None
+}
+
 fn value_type(ty: &TypeName, span: Span) -> KuResult<IrType> {
     if let Some(ty) = primitive(ty) {
         return Ok(ty);
     }
     if let TypeName::Result(inner) = ty {
-        if let Some(inner) = primitive(inner) {
+        if let Some(inner) = result_payload(inner) {
             return Ok(IrType::Result(Box::new(inner)));
         }
     }
@@ -105,7 +119,13 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
         return Ok(TaskSlotType::Callable {
             parameters: params
                 .iter()
-                .map(|ty| value_type(ty, span))
+                .map(|ty| {
+                    let ty = value_type(ty, span)?;
+                    if task::array_result(&ty) {
+                        return Err(unsupported("Result of array callable parameters", span));
+                    }
+                    Ok(ty)
+                })
                 .collect::<KuResult<_>>()?,
             result,
         });
@@ -262,12 +282,12 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
         budget.text(function.name.len(), function.span)?;
         let Some(TypeName::Result(inner)) = &function.return_type else {
             return Err(unsupported(
-                "an async function without an explicit primitive Result return type",
+                "an async function without an explicit supported Result return type",
                 function.span,
             ));
         };
         let result =
-            IrType::Result(Box::new(primitive(inner).ok_or_else(|| {
+            IrType::Result(Box::new(result_payload(inner).ok_or_else(|| {
                 unsupported("this async Result payload", function.span)
             })?));
         let mut parameters = Vec::new();
@@ -276,13 +296,17 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                 return Err(unsupported("borrowed async parameters", parameter.span));
             }
             budget.text(parameter.name.len(), parameter.span)?;
-            parameters.push(local_type(
+            let parameter_type = local_type(
                 parameter
                     .ty
                     .as_ref()
                     .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?,
                 parameter.span,
-            )?);
+            )?;
+            if matches!(&parameter_type, TaskSlotType::Value { ty, .. } if task::array_result(ty)) {
+                return Err(unsupported("Result of array parameters", parameter.span));
+            }
+            parameters.push(parameter_type);
         }
         let id = TaskFunctionId(declarations.len());
         if function.name == "main" {
@@ -955,7 +979,7 @@ impl<'a> FunctionLowerer<'a> {
                     span,
                 ));
             };
-            if task::flat_array(&ty) {
+            if task::flat_array(&ty) || task::array_result(&ty) {
                 return Err(unsupported("array parameters in a callable value", span));
             }
             parameters.push(ty);
@@ -1127,22 +1151,7 @@ impl<'a> FunctionLowerer<'a> {
         // builtin fallback. Native lowering must preserve that choice.
         let declared_function = self.signatures.contains_key(name);
         if !declared_function && name == "ok" {
-            if args.len() != 1 {
-                return Err(unsupported("ok with other than one argument", span));
-            }
-            let source = self.expression(&args[0], depth + 1)?;
-            let TaskSlotType::Value { ty, .. } = &self.function.slots[source.0].ty else {
-                return Err(unsupported("Task payloads inside Result", span));
-            };
-            if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) {
-                return Err(unsupported("nested Result values", span));
-            }
-            let destination = self.slot(value_slot(IrType::Result(Box::new(ty.clone()))))?;
-            self.emit(TaskOp::WrapOk {
-                dst: destination,
-                src: source,
-            })?;
-            return Ok(destination);
+            return self.ok_expression(args, span, depth);
         }
         if !declared_function && (name == "println" || name == "print") {
             if args.len() != 1 {
@@ -1208,6 +1217,30 @@ impl<'a> FunctionLowerer<'a> {
             dst: destination,
             function: signature.id,
             arguments,
+        })?;
+        Ok(destination)
+    }
+
+    // Result payload type construction stays outside recursive ordinary-call
+    // frames, including when the payload is a flat array.
+    #[inline(never)]
+    fn ok_expression(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        if args.len() != 1 {
+            return Err(unsupported("ok with other than one argument", span));
+        }
+        let source = self.expression(&args[0], depth + 1)?;
+        let TaskSlotType::Value { ty, .. } = &self.function.slots[source.0].ty else {
+            return Err(unsupported("Task payloads inside Result", span));
+        };
+        if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
+            && !task::flat_array(ty)
+        {
+            return Err(unsupported("nested Result values", span));
+        }
+        let destination = self.slot(value_slot(IrType::Result(Box::new(ty.clone()))))?;
+        self.emit(TaskOp::WrapOk {
+            dst: destination,
+            src: source,
         })?;
         Ok(destination)
     }

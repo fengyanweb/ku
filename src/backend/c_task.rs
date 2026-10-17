@@ -197,7 +197,8 @@ impl<'a> FrameEmitter<'a> {
             || frame.hosted
                 != (task_mask != 0
                     || exit_bridge
-                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty)))
+                    || crate::ir::task::array_result(&function.result)
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -1648,12 +1649,12 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner))
     {
         Ok(())
     } else {
         Err(unsupported(
-            "native task frame R1 requires Result<int|bool|null|str>",
+            "native task frame requires Result of a supported primitive or flat array",
         ))
     }
 }
@@ -1684,6 +1685,9 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),
         IrType::Str => Ok(format!(
             "({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0"
+        )),
+        IrType::Array(_) if crate::ir::task::flat_array(ty) => Ok(format!(
+            "({place}).data == NULL && ({place}).len == 0 && ({place}).capacity == 0"
         )),
         IrType::Result(inner) => Ok(format!(
             "!({place}).ok && ({}) && ({}) && ({}) && ({})",
@@ -1744,11 +1748,11 @@ fn constant_expr(value: &TaskConstant, ty: &IrType) -> KuResult<String> {
 }
 
 const FRAME_ABI: &str = r#"
-/* Internal frame ABI v4: single owner/executor, externally serialized calls.
+/* Internal frame ABI v5: single owner/executor, externally serialized calls.
  * Storage must be zero-filled, suitably aligned, caller-owned and live until
  * destroy finishes; destroy drops payloads but never frees that storage. Do not
  * mutate/copy a live frame. Owned argument headers and their deep payloads must
- * have unique, disjoint ownership. A successful init consumes only Str/Result
+ * have unique, disjoint ownership. A successful init consumes Owned Str/Result/array
  * parameters; failures consume nothing. Result output must be initialized empty and
  * disjoint. Pending -> terminate -> destroy is frame-layer cleanup, NOT a Ku
  * Task handle-drop implementation. Clock callbacks are trusted non-reentrant,

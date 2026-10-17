@@ -77,8 +77,40 @@ fn native_task_start_charge_multihop_active_results_and_late_observers_execute_i
             "integer",
             3,
         ),
+        (
+            6,
+            "[int]",
+            "[int]!",
+            "return ok(value)",
+            "KuArray_int",
+            "integer_array",
+            2,
+        ),
+        (
+            7,
+            "[bool]",
+            "[bool]!",
+            "return ok(value)",
+            "KuArray_bool",
+            "boolean_array",
+            2,
+        ),
+        (
+            8,
+            "[str]",
+            "[str]!",
+            "return ok(value)",
+            "KuArray_str",
+            "string_array",
+            3,
+        ),
     ] {
-        let source = format!("async fn Parent(value: {parameter}): {result} {{ child = Child(value) return await child }}\nasync fn Child(value: {parameter}): {result} {{ child = Grandchild(value) return await child }}\nasync fn Grandchild(value: {parameter}): {result} {{ {leaf} }}\nasync fn main(): null! {{ return ok(null) }}");
+        let parent_return = if index >= 6 {
+            "return ok((await child)?)"
+        } else {
+            "return await child"
+        };
+        let source = format!("async fn Parent(value: {parameter}): {result} {{ child = Child(value) {parent_return} }}\nasync fn Child(value: {parameter}): {result} {{ child = Grandchild(value) return await child }}\nasync fn Grandchild(value: {parameter}): {result} {{ {leaf} }}\nasync fn main(): null! {{ return ok(null) }}");
         let ast = Parser::new(Lexer::new(&source).lex().unwrap())
             .parse_program()
             .unwrap();
@@ -105,6 +137,14 @@ fn native_task_start_charge_multihop_active_results_and_late_observers_execute_i
             "static int fixture_unmodified_source_main(void) {",
         );
         generated.push_str(&format!("\ntypedef {input_c} FixtureInput;\n#define FIXTURE_KIND {index}\n#define FIXTURE_MODES {modes}\n"));
+        if index >= 6 {
+            let result_c = match index {
+                6 => "KuResult_array_int",
+                7 => "KuResult_array_bool",
+                _ => "KuResult_array_str",
+            };
+            generated.push_str(&format!("typedef {result_c} FixtureResult;\n"));
+        }
         generated.push_str(&C_MAIN.replace("@OUTPUT@", output_field));
         let directory = TempDir::new(&format!("native-task-start-multihop-{index}"));
         let path = directory.path().join("program.c");
@@ -142,6 +182,10 @@ static uint8_t* fixture_buffers[3];
 static KuTaskControlLeaseV1 fixture_observers[2];
 static KuTaskDriverTicketV1 fixture_observer_tickets[2];
 static size_t fixture_starts, fixture_takes;
+static int fixture_mode,fixture_failure_probe;
+#if FIXTURE_KIND==8
+static void fixture_take_rejections(KuTaskControlV1*,const KuTaskDriverTicketV1*,size_t);
+#endif
 static uintptr_t fixture_vector;
 static void fixture_sum(KuTaskDriverV1* driver) {
   size_t sum=0,resident=0;
@@ -181,15 +225,20 @@ static uint32_t ku_task_driver_commit_child(const KuTaskDriverTicketV1* ticket,
 }
 static uint32_t ku_task_driver_transfer_charge(const KuTaskDriverTicketV1* from,
     const KuTaskDriverTicketV1* to,size_t bytes,size_t minimum) {
+  if (fixture_failure_probe) return fixture_real_transfer_charge(from,to,bytes,minimum);
   KuTaskDriverV1* driver=from->driver;
   CHECK(!ku_task_driver_lock(driver));
   KuTaskDriverSlotV1* child=ku_task_driver_find(from);
   KuTaskDriverSlotV1* parent=ku_task_driver_find(to);
-  CHECK(child && parent && fixture_takes<2u && bytes==(FIXTURE_KIND>=3 ? 0u : fixture_expected_charge));
+  CHECK(child && parent && fixture_takes<2u && bytes==(FIXTURE_KIND>=3 && FIXTURE_KIND<=5 ? 0u : fixture_expected_charge));
   CHECK(child->wrapper_active && ku_task_control_atomic_load(&child->binding->payload)==KU_TASK_CONTROL_PAYLOAD_TAKING);
   CHECK(child->charged_bytes==minimum+bytes);
   size_t prior_parent=parent->charged_bytes,total=driver->reserved_bytes;
+  KuTaskControlV1* control=child->binding;
   fixture_sum(driver); CHECK(!ku_task_driver_unlock(driver));
+#if FIXTURE_KIND==8
+  if (!fixture_mode) fixture_take_rejections(control,to,minimum);
+#endif
   uint32_t status=fixture_real_transfer_charge(from,to,bytes,minimum);
   CHECK(status==KU_TASK_DRIVER_OK);
   CHECK(!ku_task_driver_lock(driver));
@@ -199,11 +248,89 @@ static uint32_t ku_task_driver_transfer_charge(const KuTaskDriverTicketV1* from,
   fixture_takes++; fixture_sum(driver); CHECK(!ku_task_driver_unlock(driver));
   return status;
 }
+#if FIXTURE_KIND==8
+static void fixture_take_rejections(KuTaskControlV1* control,const KuTaskDriverTicketV1* parent,size_t minimum) {
+  void* raw=control->context;
+  FixtureResult* payload=fixture_takes ? &((KuTaskInstance_1*)raw)->payload : &((KuTaskInstance_2*)raw)->payload;
+  FixtureResult saved; memcpy(&saved,payload,sizeof(saved));
+  CHECK(saved.ok && saved.value.data && saved.value.capacity==4u);
+  unsigned char vector[4u*sizeof(*saved.value.data)]; memcpy(vector,saved.value.data,sizeof(vector));
+  FixtureLedger before=fixture_ledger();
+  KuTaskDriverV1* driver=parent->driver;
+  const KuTaskDriverTicketV1* child_ticket=fixture_takes ? &((KuTaskInstance_1*)raw)->ticket : &((KuTaskInstance_2*)raw)->ticket;
+  size_t references=ku_task_control_atomic_load(&control->references);
+  CHECK(!ku_task_driver_lock(driver));
+  KuTaskDriverSlotV1* original_child=ku_task_driver_find(child_ticket);
+  KuTaskDriverSlotV1* original_parent=ku_task_driver_find(parent); CHECK(original_child&&original_parent);
+  size_t child_charge=original_child->charged_bytes,parent_charge_before=original_parent->charged_bytes;
+  uint32_t owner_location=original_child->owner_location;
+  CHECK(!ku_task_driver_unlock(driver));
+  KuTaskDriverSnapshotV1 snapshot={0}; CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+  unsigned rejected=0;
+  for (unsigned variant=0;variant<9u;variant++) {
+    KuTaskAdapterOutcomeV1 output={0};
+    KuTaskAdapterTakeRequestV1 request={&output,NULL};
+    void* destination=&request;
+    switch (variant) {
+      case 0: destination=saved.value.data; break;
+      case 1: request.outcome=(KuTaskAdapterOutcomeV1*)saved.value.data; break;
+      case 2: request.outcome=(KuTaskAdapterOutcomeV1*)(saved.value.data+saved.value.capacity-1u); break;
+      case 3: request.parent=(const KuTaskDriverTicketV1*)saved.value.data; break;
+      case 4: request.outcome=(KuTaskAdapterOutcomeV1*)payload; break;
+      case 5: destination=raw; break;
+      // These are genuine 1-byte allocations, never padded typed headers.
+      case 6: destination=saved.value.data[1].ptr; break;
+      case 7: request.outcome=(KuTaskAdapterOutcomeV1*)saved.value.data[1].ptr; break;
+      case 8: request.parent=(const KuTaskDriverTicketV1*)saved.value.data[1].ptr; break;
+    }
+    KuTaskAdapterTakeRequestV1 saved_request; memcpy(&saved_request,&request,sizeof(request));
+    CHECK(control->operations.take_payload(raw,destination)==KU_TASK_CONTROL_INVALID_ARGUMENT);
+    CHECK(ku_task_frame_zero_bytes(&output,sizeof(output)) && !memcmp(payload,&saved,sizeof(saved)));
+    CHECK(!memcmp(&request,&saved_request,sizeof(request)));
+    CHECK(!memcmp(vector,saved.value.data,sizeof(vector)));
+    CHECK(ku_task_control_atomic_load(&control->payload)==KU_TASK_CONTROL_PAYLOAD_TAKING);
+    CHECK((fixture_takes ? ((KuTaskInstance_1*)raw)->payload_initialized : ((KuTaskInstance_2*)raw)->payload_initialized));
+    FixtureLedger after=fixture_ledger(); CHECK(after.calls==before.calls&&after.allocations==before.allocations&&after.bytes==before.bytes);
+    KuTaskDriverSnapshotV1 after_snapshot={0}; CHECK(ku_task_driver_snapshot(driver,&after_snapshot)==KU_TASK_DRIVER_OK);
+    CHECK(after_snapshot.reserved_bytes==snapshot.reserved_bytes && after_snapshot.resident==snapshot.resident && !after_snapshot.fault);
+    CHECK(ku_task_control_atomic_load(&control->references)==references);
+    CHECK(!ku_task_driver_lock(driver));
+    CHECK(original_child->charged_bytes==child_charge&&original_parent->charged_bytes==parent_charge_before
+        &&original_child->owner_location==owner_location&&original_child->wrapper_active);
+    CHECK(!ku_task_driver_unlock(driver));
+    rejected++;
+  }
+  CHECK(rejected==9u);
+  // Fault injection is restricted to balanced charge metadata in this real
+  // TAKING window. A global byte-limit cannot make a net-zero transfer fail.
+  CHECK(!ku_task_driver_lock(driver));
+  KuTaskDriverSlotV1* child=ku_task_driver_find(fixture_takes ? &((KuTaskInstance_1*)raw)->ticket : &((KuTaskInstance_2*)raw)->ticket);
+  KuTaskDriverSlotV1* target=ku_task_driver_find(parent); CHECK(child&&target&&minimum);
+  size_t charge=child->charged_bytes,total=driver->reserved_bytes,parent_charge=target->charged_bytes;
+  CHECK(charge>=minimum);
+  child->charged_bytes=minimum-1u; driver->reserved_bytes-=charge-child->charged_bytes;
+  fixture_sum(driver); CHECK(!ku_task_driver_unlock(driver));
+  KuTaskAdapterOutcomeV1 output={0}; KuTaskAdapterTakeRequestV1 request={&output,parent};
+  fixture_failure_probe=1;
+  CHECK(control->operations.take_payload(raw,&request)==KU_TASK_DRIVER_LIMIT);
+  fixture_failure_probe=0;
+  CHECK(!memcmp(payload,&saved,sizeof(saved)) && ku_task_frame_zero_bytes(&output,sizeof(output)));
+  CHECK(!memcmp(vector,saved.value.data,sizeof(vector)) && !saved.value.data[1].ptr[0]);
+  CHECK(ku_task_control_atomic_load(&control->payload)==KU_TASK_CONTROL_PAYLOAD_TAKING);
+  CHECK(!ku_task_driver_lock(driver));
+  CHECK(child->charged_bytes==minimum-1u && target->charged_bytes==parent_charge && !driver->fault);
+  child->charged_bytes=charge; driver->reserved_bytes=total;
+  fixture_sum(driver); CHECK(!ku_task_driver_unlock(driver));
+  FixtureLedger after=fixture_ledger(); CHECK(after.calls==before.calls&&after.allocations==before.allocations&&after.bytes==before.bytes);
+  // The outer generated take now retries its original real transfer, with
+  // the exact prior metadata restored. No wrapper fabricates success.
+}
+#endif
 static KuString fixture_owned(size_t index,size_t capacity,const char* text) {
   size_t length=strlen(text),allocated=capacity ? capacity : 1u;
   CHECK(index<3u && length<=capacity);
   uint8_t* buffer=(uint8_t*)malloc(allocated); CHECK(buffer);
-  if (length) memcpy(buffer,text,length);
+  if (length) memcpy(buffer,text,length); else buffer[0]=0;
   fixture_buffers[index]=buffer; fixture_buffers_count++;
   fixture_expected_charge+=allocated;
   return (KuString){buffer,length,capacity,KU_STRING_OWNED};
@@ -223,14 +350,14 @@ static FixtureInput fixture_input(int mode) {
 #if FIXTURE_KIND>=3
   FixtureInput input={0};
   if (mode==1) return input;
-  input.capacity=4u; input.len=FIXTURE_KIND==5 ? 3u : 2u;
+  input.capacity=4u; input.len=(FIXTURE_KIND==5 || FIXTURE_KIND==8) ? 3u : 2u;
   input.data=calloc(input.capacity,sizeof(*input.data)); CHECK(input.data);
   fixture_vector=(uintptr_t)input.data;
   fixture_buffers[0]=(uint8_t*)input.data; fixture_buffers_count=1u;
   fixture_expected_charge=input.capacity*sizeof(*input.data);
-#if FIXTURE_KIND==3
+#if FIXTURE_KIND==3 || FIXTURE_KIND==6
   input.data[0]=17; input.data[1]=-9;
-#elif FIXTURE_KIND==4
+#elif FIXTURE_KIND==4 || FIXTURE_KIND==7
   input.data[0]=true; input.data[1]=false;
 #else
   if (mode==2) {
@@ -259,12 +386,33 @@ static FixtureInput fixture_input(int mode) {
 }
 static void fixture_validate(KuTaskAdapterOutcomeV1* output,int mode) {
   CHECK(output->exit_class==KU_TASK_EXIT_USER_RESULT && !output->has_cleanup_deadline && !output->cleanup_deadline);
-#if FIXTURE_KIND==2 || FIXTURE_KIND>=3
+#if FIXTURE_KIND>=6
+  CHECK(output->result_kind==FIXTURE_KIND-1u && output->value.@OUTPUT@.ok);
+#elif FIXTURE_KIND==2 || FIXTURE_KIND>=3
   CHECK(output->result_kind==1u);
 #else
   CHECK(output->result_kind==4u);
 #endif
-#if FIXTURE_KIND>=3
+#if FIXTURE_KIND>=6
+  FixtureInput value=output->value.@OUTPUT@.value;
+  CHECK(value.len==(mode==1 ? 0u : FIXTURE_KIND==8 && mode==0 ? 3u : 2u));
+  CHECK((uintptr_t)value.data==fixture_vector && value.capacity==(mode==1 ? 0u : 4u));
+  if (mode!=1) {
+#if FIXTURE_KIND==6
+    CHECK(value.data[0]==17 && value.data[1]==-9);
+#elif FIXTURE_KIND==7
+    CHECK(value.data[0] && !value.data[1]);
+#else
+    if (mode==2) CHECK(value.data[0].storage==KU_STRING_STATIC && value.data[1].ptr==value.data[0].ptr);
+    else {
+      CHECK(value.data[0].ptr==fixture_buffers[1] && value.data[0].len==7u && value.data[0].capacity==31u);
+      CHECK(!memcmp(value.data[0].ptr,"payload",7u));
+      CHECK(value.data[1].ptr==fixture_buffers[2] && !value.data[1].len && !value.data[1].capacity && value.data[1].storage==KU_STRING_OWNED);
+      CHECK(value.data[2].storage==KU_STRING_STATIC && value.data[2].len==3u && !memcmp(value.data[2].ptr,"\xe4\xb8\xad",3u));
+    }
+#endif
+  }
+#elif FIXTURE_KIND>=3
   CHECK(output->value.integer.ok && output->value.integer.value==(mode==1 ? 0 : FIXTURE_KIND==5 && mode==0 ? 3 : 2));
 #elif FIXTURE_KIND==0
   CHECK(output->value.string.ok);
@@ -295,7 +443,7 @@ static void fixture_validate(KuTaskAdapterOutcomeV1* output,int mode) {
 static void fixture_case(int mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   FixtureInput input=fixture_input(mode);
-  fixture_starts=0; fixture_takes=0;
+  fixture_starts=0; fixture_takes=0; fixture_mode=mode; fixture_failure_probe=0;
   memset(fixture_observers,0,sizeof(fixture_observers));
   memset(fixture_observer_tickets,0,sizeof(fixture_observer_tickets));
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
@@ -337,7 +485,7 @@ static void fixture_case(int mode) {
   CHECK(!ku_task_driver_lock(driver));
   fixture_sum(driver);
   CHECK(fixture_starts==2u && fixture_takes==2u && !driver->fault);
-  const size_t remaining_charge=FIXTURE_KIND>=3 ? 0u : fixture_expected_charge;
+  const size_t remaining_charge=FIXTURE_KIND>=3 && FIXTURE_KIND<=5 ? 0u : fixture_expected_charge;
   CHECK(driver->resident==3u && driver->reserved_bytes==instances+remaining_charge);
   for (size_t i=0;i<2;i++) {
     KuTaskDriverSlotV1* child=ku_task_driver_find(&fixture_observer_tickets[i]);
@@ -352,7 +500,7 @@ static void fixture_case(int mode) {
   CHECK(!ku_task_driver_unlock(driver));
   FixtureLedger ready=fixture_ledger();
   CHECK(ready.calls==before_calls+3u);
-  CHECK(ready.allocations==6u+(FIXTURE_KIND>=3 ? 0u : fixture_buffers_count)
+  CHECK(ready.allocations==6u+(FIXTURE_KIND>=3 && FIXTURE_KIND<=5 ? 0u : fixture_buffers_count)
       && ready.bytes==fixed+instances+remaining_charge);
   KuTaskAdapterOutcomeV1 output={0};
   CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_OK);

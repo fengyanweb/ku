@@ -351,6 +351,13 @@ fn generate_c_source_with_frames_bounded(
                     &mut frame_result_types,
                 )?;
             }
+            for element in [IrType::Int, IrType::Bool, IrType::Str] {
+                collect_result_type(
+                    &IrType::Result(Box::new(IrType::Array(Box::new(element.clone())))),
+                    &mut frame_result_types,
+                )?;
+                frame_array_elements.push(element);
+            }
         }
         for function in &frames.functions {
             collect_result_type(&function.result, &mut frame_result_types)?;
@@ -390,7 +397,7 @@ fn generate_c_source_with_frames_bounded(
         "#if defined(__linux__) && !defined(_GNU_SOURCE)\n#define _GNU_SOURCE\n#endif\n\
          #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)\n#define _DARWIN_C_SOURCE\n#endif\n\
          #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)\n#define _POSIX_C_SOURCE 200809L\n#endif\n\
-         #include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <errno.h>\n#include <limits.h>\n#include <math.h>\n\n\
+         #include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <errno.h>\n#include <limits.h>\n#include <math.h>\n\n\
          #if defined(_WIN32)\n\
          #if defined(_MSC_VER)\n__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);\n\
          #elif defined(__GNUC__) || defined(__clang__)\n__attribute__((dllimport)) unsigned long long __attribute__((stdcall)) GetTickCount64(void);\n\

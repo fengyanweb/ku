@@ -228,8 +228,16 @@ fn native_task_frame_ir_accepts_exact_r1_primitive_results() {
 }
 
 #[test]
-fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings() {
-    for ty in [IrType::Int, IrType::Bool, IrType::Null, IrType::Str] {
+fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings_and_arrays() {
+    for ty in [
+        IrType::Int,
+        IrType::Bool,
+        IrType::Null,
+        IrType::Str,
+        IrType::Array(Box::new(IrType::Int)),
+        IrType::Array(Box::new(IrType::Bool)),
+        IrType::Array(Box::new(IrType::Str)),
+    ] {
         let mut fixture = program(
             vec![ty.clone(), result(ty.clone())],
             &[0],
@@ -244,7 +252,7 @@ fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings() {
         fixture.functions[0].result = result(ty.clone());
         accepted(&fixture);
         fixture.functions[0].states[0].operations.push(read(0));
-        if ty == IrType::Str {
+        if matches!(ty, IrType::Str | IrType::Array(_)) {
             rejected(&fixture, "owned ok payload has moved from its source");
         } else {
             accepted(&fixture);
@@ -252,6 +260,21 @@ fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings() {
         fixture.functions[0].states[0].operations.pop();
         fixture.functions[0].parameters.clear();
         rejected(&fixture, "ok cannot read an uninitialized payload");
+        if matches!(ty, IrType::Array(_)) {
+            fixture.functions[0].states[0].operations = vec![init(
+                1,
+                TaskConstant::Err {
+                    result: result(ty.clone()),
+                    domain: "array".into(),
+                    code: "empty".into(),
+                    message: "no array payload".into(),
+                },
+            )];
+            accepted(&fixture);
+            fixture.functions[0].states[0].operations.clear();
+            fixture.functions[0].parameters.push(SlotId(1));
+            rejected(&fixture, "Result<Array> parameters remain outside the ABI");
+        }
     }
 }
 
@@ -322,38 +345,45 @@ fn native_task_frame_ir_wrap_ok_rejects_type_borrow_and_overwrite_errors() {
 
 #[test]
 fn native_task_frame_ir_wrap_ok_updates_suspension_liveness_and_cleanup() {
-    for wrap_before in [false, true] {
-        let wrap = TaskOp::WrapOk {
-            dst: SlotId(1),
-            src: SlotId(0),
-        };
-        let mut fixture = program(
-            vec![IrType::Str, result(IrType::Str)],
-            &[0],
-            vec![
-                state(
-                    if wrap_before {
-                        vec![wrap.clone()]
-                    } else {
-                        vec![]
-                    },
-                    suspend(1, 2),
-                ),
-                state(if wrap_before { vec![] } else { vec![wrap] }, complete(1)),
-                state(vec![drop_if(1), drop_if(0)], TaskTerminator::Terminate),
-            ],
-        );
-        fixture.functions[0].result = result(IrType::Str);
-        let plan = accepted(&fixture);
-        assert_eq!(
-            plan.functions[0].suspensions[0].slots,
-            vec![SlotId(usize::from(wrap_before))]
-        );
-        fixture.functions[0].states[2].operations.clear();
-        rejected(
-            &fixture,
-            "the active payload still needs cancellation cleanup",
-        );
+    for ty in [
+        IrType::Str,
+        IrType::Array(Box::new(IrType::Int)),
+        IrType::Array(Box::new(IrType::Bool)),
+        IrType::Array(Box::new(IrType::Str)),
+    ] {
+        for wrap_before in [false, true] {
+            let wrap = TaskOp::WrapOk {
+                dst: SlotId(1),
+                src: SlotId(0),
+            };
+            let mut fixture = program(
+                vec![ty.clone(), result(ty.clone())],
+                &[0],
+                vec![
+                    state(
+                        if wrap_before {
+                            vec![wrap.clone()]
+                        } else {
+                            vec![]
+                        },
+                        suspend(1, 2),
+                    ),
+                    state(if wrap_before { vec![] } else { vec![wrap] }, complete(1)),
+                    state(vec![drop_if(1), drop_if(0)], TaskTerminator::Terminate),
+                ],
+            );
+            fixture.functions[0].result = result(ty.clone());
+            let plan = accepted(&fixture);
+            assert_eq!(
+                plan.functions[0].suspensions[0].slots,
+                vec![SlotId(usize::from(wrap_before))]
+            );
+            fixture.functions[0].states[2].operations.clear();
+            rejected(
+                &fixture,
+                "the active payload still needs cancellation cleanup",
+            );
+        }
     }
 }
 
@@ -438,7 +468,7 @@ fn native_task_frame_ir_rejects_types_outside_the_r1_contract() {
     }
     let mut fixture = minimal();
     fixture.functions[0].result = IrType::Null;
-    rejected(&fixture, "function result must be Result primitive");
+    rejected(&fixture, "function result must be a supported Result");
 }
 
 #[test]

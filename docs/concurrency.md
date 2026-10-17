@@ -42,8 +42,8 @@ LLVM、`ku ir` 和 `--emit-ir` 的同步 IR 路径仍拒绝 async。
 ### 当前 native C 源码子集
 
 import 展开后只能有顶层、非泛型 async 函数；入口必须是无参数的
-`async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
-返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、直接 async 调用、
+`async fn main(): null!`。函数参数为 `int/bool/null/str`、对应单层 Result 或 owned 平面数组，
+返回类型必须显式为 primitive 或平面数组的 `T!`。函数体支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、直接 async 调用、
 Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
 Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以及 bool 的
 `!`、`== !=`、`&& ||`；不做 bool/int 隐式转换。整数运算先检查边界，溢出和除/余零
@@ -148,7 +148,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝嵌套数组、数组返回与 Callable 数组签名、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、
+仍拒绝嵌套数组、数组 Result 形参与 Callable 数组形参、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写以外的异步标准库 I/O。
 finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
@@ -222,9 +222,32 @@ vector 按实际 capacity 而非 len 计费；Owned 字符串叶子另外按实�
 快照部分构造即登记到持久 frame，复制失败只释放已完成叶子和 vector，不能提前退款。
 continue 保留快照进入原 latch；break/正常结束释放快照；return/fail/取消沿原清理顺序
 与绝对 D 处理当前元素、快照及来源。循环回边仍有 Suspend，原64槽/16KB frame、分析及
-总字节预算不提高。数组宽度受既有槽位限制；返回/Result、Callable 数组签名、嵌套、push、
+总字节预算不提高。数组宽度受既有槽位限制；数组 Result 形参、Callable 数组形参、嵌套、push、
 索引写入与捕获尚未开放，finally 体中的循环也仍拒绝。参数准入先检查 header、vector
 及活跃字符串叶子的范围与已知别名，再一次累计实际容量；失败不留下部分所有权移交。
+
+### Native 平面数组结果
+
+`[int]!/[bool]!/[str]!` 可通过 ok/return、Await 与 `?` 移交；未拆开的数组 Result
+也能跨等待保存。无捕获函数值沿相同路径返回数组。空结果先声明有类型的局部数组，
+不把 `ok([])` 当成已开放的普遍类型推断。返回前后的 vector 与 Owned 字符串容量仍
+归唯一 owner，取回分阶段排除与 request/结果输出/parent 的已知别名并核对费用，成功
+转交后才 move；失败保留原 payload 和费用。
+
+```ku
+async fn Words(): [str]! { values = ["甲", "乙"] return ok(values) }
+async fn main(): null! {
+    fetch: async fn(): [str]! = Words
+    result: [str]! = await fetch()
+    words = result?
+    for word in words { println(word) }
+    return ok(null)
+}
+```
+
+内部 outcome kinds1–4保持，5/6/7分别是三类数组结果；旧 union 的大小、对齐和偏移
+由 C 编译期断言核对。Frame5/Control2/Driver10及原预算不变，数组 capacity 仍最多64。
+这不表示 read_dir 已接通；目录接口原有更大输出上限需要另行完成容量和遍历预算。
 
 ### Native 函数值参数
 
@@ -242,8 +265,8 @@ async fn main(): null! {
 ```
 
 函数值参数默认 move；要继续使用原绑定需显式 clone。接收者可 clone、多次只读调用或
-再传给另一直接 async 调用；参数本身的签名仍只允许当前普通值参数和 primitive Result
-返回。把这种高阶 helper 本身再绑定成函数值、返回函数值或捕获 closure 仍明确拒绝。
+再传给另一直接 async 调用；参数本身的签名限 primitive/对应 Result 形参，允许 primitive
+或平面数组 Result 返回。把这种高阶 helper 本身再绑定成函数值、返回函数值或捕获 closure 仍明确拒绝。
 参数之间有 Await 时，前面已选中的函数身份只求值一次，使用原活跃值保存。
 
 编译器只传播各真实调用点已证明的 ID，不把全部同签名函数当作候选。生成入口在

@@ -153,7 +153,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 及对应单层 Result、move-only `Task { result }` 与无捕获 `Callable` 槽。操作显式区分 Init、Copy、Move、
 WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print、ScopeEnter；控制边包括 Jump、Branch、Suspend
 （resume / cleanup）、Await、TryResult、ScopeDrain、Complete、内部 Exit 和 Terminate。
-局部数组和直接 owned 参数限平面 `[int]/[bool]/[str]`；object/struct/enum、数组返回、Callable 数组签名、Task 参数/返回或借用参数仍拒绝，Callable 的有限扩展见下文。
+局部数组、直接 owned 参数和 Result 返回限平面 `[int]/[bool]/[str]`；object/struct/enum、数组 Result 形参、Callable 数组形参、Task 参数/返回或借用参数仍拒绝，Callable 的有限扩展见下文。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
 初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
@@ -426,7 +426,7 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
-展开后所有顶层 item 必须是非泛型 async 函数；普通值参数和返回限 primitive/单层 Result，另支持下述有限 Callable 形参。
+展开后所有顶层 item 必须是非泛型 async 函数；普通值参数限 primitive/对应 Result 与平面数组，返回支持 primitive 或平面数组 Result，另支持下述有限 Callable 形参。
 支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
 普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组返回/Callable 数组签名、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组 Result 形参/Callable 数组形参、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和下述平面数组以外的动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -477,8 +477,8 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 ### 平面数组的局部帧与运行期 for
 
 ArrayMake、ArrayClone、ArrayLen、ArrayTake 支持局部 flat int/bool/str vector。
-普通 direct Start 与 raw IR 的 owned 参数接通这些 flat array；Callable 数组签名与
-数组结果继续拒绝，不扩 outcome kinds。factory 在 malloc/move 前验证全部 header、vector
+普通 direct Start 与 raw IR 的 owned 参数及结果接通这些 flat array；Callable 数组形参与
+数组 Result 形参继续拒绝。原 outcome kinds1–4保持，新增5/6/7对应int/bool/str数组结果。factory 在 malloc/move 前验证全部 header、vector
 及活跃字符串叶子的已知别名，vector capacity*sizeof(T) 与 Owned leaf capacity 只累计一次；
 hosted Start 沿原 commit 原子转交父子费用，try_start 失败保留或恢复来源 header/init 位。
 Task slot 的元素类型加入原 C typedef/prototype/body 收集，复用 KuArray_T 表示和 drop，
@@ -490,7 +490,8 @@ ArrayClone 的目标槽持久化，预付 capacity*sizeof(T) 后 malloc；先登
 加各 Owned string 容量，预算检查在实际分配前。空数组仍是正常已初始化的数组值。
 for 隐藏 loop scope 保留 snapshot，body 的 str 项从该快照移动；continue 仅退出 body，
 break/正常结束走共同 epilogue，return/fail/取消走原 drain/finally。latch 仍 Suspend。
-Frame5/Control2/Driver10、outcome1–4、原状态/槽/代码输出与总预算不增加。
+Frame5/Control2/Driver10保持；新结果 union 通过与旧布局的大小/偏移/对齐 C 编译期断言，
+原状态/槽/代码输出与总预算不增加。
 
 ### Callable 参数的精确入口集合
 

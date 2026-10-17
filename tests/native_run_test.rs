@@ -3406,6 +3406,142 @@ async fn main(): null! {
     assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
 }
 #[test]
+fn native_async_array_results_cross_await_and_callable_boundaries() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-array-results"));
+    let dir = &cleanup.0;
+    let first = "返回🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn ArrayNumbers(values: [int]): [int]! {
+    try { if (!values.is_empty()) { return ok(values) } }
+    finally { println("numbers-finally") }
+    empty: [int] = []
+    return ok(empty)
+}
+async fn ForwardNumbers(): [int]! { return (await ArrayNumbers([1, 2, 3])) }
+async fn ArrayFlags(): [bool]! { flags = [true, false] return ok(flags) }
+async fn UseNumbers(): null! {
+    values = (await ForwardNumbers())?
+    for value in values { println(value) }
+    empty: [int] = []
+    nothing = (await ArrayNumbers(empty))?
+    println(nothing.is_empty())
+    flags = (await ArrayFlags())?
+    for flag in flags { println(flag) }
+    return ok(null)
+}
+async fn TextRows(): [str]! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try { if (!words.is_empty()) { return ok(words) } }
+    finally { println("texts-finally") }
+    fail "empty-texts"
+}
+async fn ForwardRows(): [str]! { return (await TextRows()) }
+async fn UseRows(): null! {
+    saved: [str]! = await ForwardRows()
+    time.sleep(0)?
+    rows = saved?
+    for row in rows { println(row) }
+    fetch: async fn(): [str]! = TextRows
+    again = (await fetch())?
+    for row in again { println(row) }
+    return ok(null)
+}
+async fn MissingRows(): [str]! { fail "array-failed" }
+async fn ReplacedRows(replace: bool): [str]! {
+    rows = [fs.read("first.txt")?]
+    try { if (!rows.is_empty()) { return ok(rows) } }
+    finally { if (replace) { fail "replaced-array" } }
+    empty: [str] = []
+    return ok(empty)
+}
+async fn PartialRows(): [str]! {
+    rows = [fs.read("first.txt")?, fs.read("missing.txt")?]
+    return ok(rows)
+}
+async fn CheckErrors(): null! {
+    try {
+        unexpected = (await MissingRows())?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await ReplacedRows(true))?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await PartialRows())?
+        println("unexpected")
+    } catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await UseNumbers())?;
+    (await UseRows())?;
+    (await CheckErrors())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter array Result comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "arrayresults") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "arrayresults")).unwrap();
+    for field in ["integer_array", "boolean_array", "string_array"] {
+        assert!(generated.contains(field));
+    }
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native array Result execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
 fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {

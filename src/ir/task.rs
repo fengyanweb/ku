@@ -181,7 +181,7 @@ pub enum TaskOp {
         left: SlotId,
         right: SlotId,
     },
-    /// Construct ok(source): Copy primitives remain initialized, owned str moves.
+    /// Construct ok(source): Copy primitives remain initialized, owned payloads move.
     WrapOk {
         dst: SlotId,
         src: SlotId,
@@ -422,14 +422,15 @@ fn primitive(ty: &IrType) -> bool {
 }
 
 fn value_type(ty: &IrType) -> bool {
-    primitive(ty)
-        || error_type(ty)
-        || flat_array(ty)
-        || matches!(ty, IrType::Result(inner) if primitive(inner))
+    primitive(ty) || error_type(ty) || flat_array(ty) || result_type(ty)
 }
 
 pub(crate) fn flat_array(ty: &IrType) -> bool {
     matches!(ty, IrType::Array(inner) if matches!(inner.as_ref(), IrType::Int | IrType::Bool | IrType::Str))
+}
+
+pub(crate) fn array_result(ty: &IrType) -> bool {
+    matches!(ty, IrType::Result(inner) if flat_array(inner))
 }
 
 pub(crate) fn error_type(ty: &IrType) -> bool {
@@ -437,7 +438,7 @@ pub(crate) fn error_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -563,7 +564,7 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
         // Inspect the shape without recursively formatting or cloning raw types.
         if !result_type(&function.result) {
             return Err(invalid(
-                "function completion must be Result of a supported primitive",
+                "function completion must be Result of a supported primitive or flat array",
             ));
         }
         for slot in &function.slots {
@@ -574,7 +575,7 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                     parameters.len() <= limits.max_slots
                         && parameters
                             .iter()
-                            .all(|ty| value_type(ty) && !flat_array(ty))
+                            .all(|ty| value_type(ty) && !flat_array(ty) && !array_result(ty))
                         && result_type(result)
                 }
             };
@@ -752,10 +753,10 @@ fn validate_shape(
     let mut has_scope_exit = false;
     let mut has_timer = false;
     let mut has_blocking = false;
-    let mut has_error_projection = function
+    let mut has_error_projection = array_result(&function.result) || function
         .slots
         .iter()
-        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty)));
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || array_result(ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -777,6 +778,9 @@ fn validate_shape(
     }
     for &parameter in &function.parameters {
         match &get_slot(parameter)?.ty {
+            TaskSlotType::Value { ty, .. } if array_result(ty) => {
+                return Err(invalid("Result of array parameters are unsupported"));
+            }
             TaskSlotType::Value {
                 borrowed: false, ..
             } => {}
@@ -1019,12 +1023,12 @@ fn validate_shape(
                     let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
                     if dst == src
                         || destination_borrowed
-                        || !primitive(source)
+                        || !(primitive(source) || flat_array(source))
                         || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
                         || (source_borrowed && !copy_type(source))
                     {
                         return Err(invalid(
-                            "ok requires a matching primitive payload without an owned borrow",
+                            "ok requires a matching supported payload without an owned borrow",
                         ));
                     }
                 }
