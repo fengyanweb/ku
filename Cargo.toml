@@ -30,6 +30,7 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 # unavailable when `ku build` invokes rustc for its self-contained runner.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",

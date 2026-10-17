@@ -395,6 +395,10 @@ await 深度上限: 64
 但当前 await、blocking completion 等待和 shutdown 路径仍含短间隔检查；取消清理期间不再帮跑用户任务。
 固定 worker 和有界队列不等于已经实现可挂起的 stackless M:N 调度或事件驱动连接管理。
 
+v0.0.18 开发分支的解释器 HTTP 已将 socket 读取、等待 handler、分段写出和关闭交给每个 listener 的单个 I/O 线程。Linux/macOS 使用批量 poll，Windows 使用 WSAPoll；主线程仍串行运行 Ku handler，不把 Ku 值或闭包送往 I/O 线程。max_connections、max_active_requests 和 max_pending_requests 保留原连接许可、活动连接和 FIFO 等待队列的含义；等待读写不会创建逐连接 OS 线程。空闲 I/O 线程阻塞等待 readiness 或原绝对期限，handler 完成和退出使用内部通知唤醒；主解释器仍保留原有短间隔取消检查。
+
+各读取、handler、写出阶段沿用一次创建的期限；读取请求后转交原有字符串，响应头与 body 分段持有。每个请求有独立一次性返回通道；连接超时或关闭后迟到结果只释放数据，槽位复用以 generation 区分。该接入仍采用 Connection: close，不增加 keep-alive、公开配置或用户调度 API。native C 目前仍由固定连接 worker 负责读写与 handler；通用 Task 网络等待、native HTTP 事件化、跨模块缓冲预算/指标和完整负载验收仍未完成。连接上限与单请求字节限制不等于整个进程的内存上限。
+
 ## 开发者 HTTP 压测 demo
 
 native 调度器维护者可使用[固定工作量观察工具](native-task-scheduler-probe.md)。

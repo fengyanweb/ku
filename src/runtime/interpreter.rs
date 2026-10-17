@@ -5,10 +5,8 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex,
+        Arc,
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -38,13 +36,25 @@ const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
-const HTTP_HANDLER_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
 const HTTP_MAX_METHOD_BYTES: usize = 32;
+
+// Existing nested regression modules share these parent test imports. The
+// production I/O owner keeps its channels and lock imports in http_io.rs.
+#[cfg(test)]
+use std::sync::{
+    mpsc::{self, Receiver, SyncSender},
+    Mutex,
+};
 
 const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
 mod cancellation;
+mod http_io;
+mod netpoll;
+
+#[cfg(test)]
+use std::thread;
 
 // The flat core handles statically closed scalar call trees. Other calling,
 // waiting and cleanup paths still require migration; P0 is not yet complete.
@@ -2553,139 +2563,25 @@ impl Interpreter {
             .ok_or_else(|| KuError::runtime("http listener missing compiled_router", span))?;
         let limits = HttpServerRuntimeLimits::from_service(&service, span)?;
         let tcp = take_http_listener(listener_id, span)?;
-        tcp.set_nonblocking(true).map_err(|err| {
-            KuError::runtime(
-                format!("http listener nonblocking setup failed: {err}"),
-                span,
-            )
+        let mut io = http_io::HttpIo::start(tcp, limits).map_err(|err| {
+            KuError::runtime(format!("http I/O reactor setup failed: {err}"), span)
         })?;
-
-        let connection_count = Arc::new(AtomicUsize::new(0));
-        let (connection_tx, connection_rx) =
-            mpsc::sync_channel::<PendingHttpConnection>(limits.max_pending_requests);
-        let shared_connection_rx = Arc::new(Mutex::new(connection_rx));
-        let (handler_tx, handler_rx) =
-            mpsc::sync_channel::<HttpHandlerJob>(limits.max_active_requests);
-        let worker_count = Arc::new(AtomicUsize::new(0));
-        let mut rejecting: Option<HttpRejection> = None;
-
         loop {
             self.poll_termination(span)?;
-            let mut made_progress = false;
-            if let Some(rejection) = rejecting.as_mut() {
-                if rejection.poll() {
-                    rejecting = None;
-                    made_progress = true;
-                }
-            }
-            for _ in 0..HTTP_ACCEPT_BATCH {
-                // Keep the acceptor's extra socket bounded to one. While it
-                // drains/writes, already admitted handler jobs still progress.
-                if rejecting.is_some() {
-                    break;
-                }
-                match tcp.accept() {
-                    Ok((stream, _)) => {
-                        made_progress = true;
-                        rejecting = Self::enqueue_http_connection(
-                            stream,
-                            &connection_tx,
-                            &shared_connection_rx,
-                            &handler_tx,
-                            &connection_count,
-                            &worker_count,
-                            limits,
-                        )?;
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        return Err(KuError::runtime(
-                            format!("http listener accept failed: {err}"),
-                            span,
-                        ));
-                    }
-                }
-            }
-
-            for _ in 0..HTTP_HANDLER_BATCH {
-                self.poll_termination(span)?;
-                if let Some(rejection) = rejecting.as_mut() {
-                    if rejection.poll() {
-                        rejecting = None;
-                        made_progress = true;
-                    }
-                }
-                match handler_rx.try_recv() {
-                    Ok(job) => {
-                        made_progress = true;
-                        let response = self.execute_http_handler_job(
-                            job.request,
-                            &compiled_router,
-                            span,
-                            job.deadline,
-                        );
-                        let _ = job.response_tx.send(response);
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        return Err(KuError::runtime(
-                            "http handler worker channel disconnected",
-                            span,
-                        ));
-                    }
-                }
-            }
-
-            if !made_progress {
-                thread::sleep(HTTP_EVENT_LOOP_SLEEP);
-            }
-        }
-    }
-
-    fn enqueue_http_connection(
-        stream: TcpStream,
-        connection_tx: &SyncSender<PendingHttpConnection>,
-        connection_rx: &Arc<Mutex<Receiver<PendingHttpConnection>>>,
-        handler_tx: &SyncSender<HttpHandlerJob>,
-        connection_count: &Arc<AtomicUsize>,
-        worker_count: &Arc<AtomicUsize>,
-        limits: HttpServerRuntimeLimits,
-    ) -> KuResult<Option<HttpRejection>> {
-        stream.set_nonblocking(false).map_err(|err| {
-            KuError::runtime(
-                format!("http connection blocking setup failed: {err}"),
-                entry_span(),
-            )
-        })?;
-        let Some(permit) =
-            HttpConnectionPermit::try_acquire(Arc::clone(connection_count), limits.max_connections)
-        else {
-            return Ok(HttpRejection::new(stream, None, limits));
-        };
-        match connection_tx.try_send(PendingHttpConnection {
-            stream,
-            _permit: permit,
-        }) {
-            Ok(()) => {
-                ensure_http_workers(
-                    connection_rx,
-                    handler_tx,
-                    connection_count,
-                    worker_count,
-                    limits,
-                )?;
-                Ok(None)
-            }
-            Err(TrySendError::Full(pending)) => Ok(HttpRejection::new(
-                pending.stream,
-                Some(pending._permit),
-                limits,
-            )),
-            Err(TrySendError::Disconnected(_)) => Err(KuError::runtime(
-                "http connection worker channel disconnected",
-                entry_span(),
-            )),
+            // Preserve the original termination observation interval. Socket
+            // readiness and every connection deadline progress independently on
+            // the single I/O thread, including while this handler is running.
+            let Some(job) = io
+                .next_job(HTTP_EVENT_LOOP_SLEEP)
+                .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
+            else {
+                continue;
+            };
+            let response =
+                self.execute_http_handler_job(job.request, &compiled_router, span, job.deadline);
+            job.reply.respond(job.token, response).map_err(|err| {
+                KuError::runtime(format!("http handler reply failed: {err}"), span)
+            })?;
         }
     }
 
@@ -3306,46 +3202,330 @@ mod finally_tests {
         }
     }
 
+    fn http_bounded_test_child(test: &str, variable: &str) -> bool {
+        if std::env::var_os(variable).is_some() {
+            return true;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env(variable, "1");
+        let output = finally_bounded_process::run_bounded(
+            &mut command,
+            Duration::from_secs(15),
+            finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+        )
+        .expect("HTTP transport test must terminate, including join failures");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn http_reactor_client(address: std::net::SocketAddr, request: &[u8]) -> TcpStream {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(request).unwrap();
+        client
+    }
+
+    fn http_assert_closed(client: &mut TcpStream) {
+        match client.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("reactor socket did not close: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpreter_http_reactor_reuses_slots_and_retires_all_socket_owners() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_reactor_reuses_slots_and_retires_all_socket_owners",
+            "KU_HTTP_REACTOR_OWNER_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut first = http_reactor_client(address, b"GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let first_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(first_job.request.path, "/a");
+        let mut expired = Vec::new();
+        first.read_to_end(&mut expired).unwrap();
+        assert!(expired.starts_with(b"HTTP/1.1 504 "), "{expired:?}");
+
+        let mut second =
+            http_reactor_client(address, b"GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let second_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        // There is exactly one active slot. Its distinct token therefore proves
+        // a new generation, rather than accidentally selecting another slot.
+        assert_ne!(first_job.token, second_job.token);
+        first_job
+            .reply
+            .respond(first_job.token, status_response(200, "stale界🙂\0"))
+            .unwrap();
+        // Exceed several transport write chunks, preserving every UTF-8/NUL
+        // byte across the separate head and incremental body writes.
+        let body = "current界🙂\0".repeat(4096);
+        second_job
+            .reply
+            .respond(second_job.token, status_response(200, &body))
+            .unwrap();
+        let mut received = Vec::new();
+        second.read_to_end(&mut received).unwrap();
+        assert!(received.starts_with(b"HTTP/1.1 200 "), "{received:?}");
+        let body_start = received
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&received[body_start..], body.as_bytes());
+        assert!(!received
+            .windows(b"stale".len())
+            .any(|bytes| bytes == b"stale"));
+        drop(io);
+
+        // A real unanswered handler must not prevent other activity slots from
+        // reading, classifying malformed input, expiring a partial body or
+        // writing their responses. No Ku handler is run by this test thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        limits.max_active_requests = 3;
+        limits.max_pending_requests = 2;
+        limits.max_connections = 4;
+        limits.handler_timeout = Duration::from_secs(5);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut held =
+            http_reactor_client(address, b"GET /held HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let held_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        let mut malformed = http_reactor_client(address, b"GET / HTTP/1.1\n");
+        let mut response = Vec::new();
+        malformed.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400 "), "{response:?}");
+        let mut partial = http_reactor_client(
+            address,
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na",
+        );
+        response.clear();
+        partial.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 408 "), "{response:?}");
+        assert!(io.next_job(Duration::from_millis(1)).unwrap().is_none());
+        drop(io);
+        http_assert_closed(&mut held);
+        held_job
+            .reply
+            .respond(held_job.token, status_response(200, "closed界🙂\0"))
+            .unwrap();
+
+        // No connection gives the poll no D. Dropping still has to wake and
+        // join it, and release the actual bound listener address.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(http_io::HttpIo::start(listener, limits).unwrap());
+        drop(TcpListener::bind(address).expect("idle reactor released its listener"));
+
+        // Establish active + pending admission with an observed 503, then
+        // shutdown with both real sockets held. Pending input is intentionally
+        // unread; platforms may close it with EOF or a connection reset.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        limits.max_active_requests = 1;
+        limits.max_pending_requests = 1;
+        limits.max_connections = 2;
+        limits.read_body_timeout = Duration::from_secs(5);
+        let io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut active = http_reactor_client(
+            address,
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na",
+        );
+        let mut pending =
+            http_reactor_client(address, b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut excess = http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut response = Vec::new();
+        excess.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
+        drop(io);
+        http_assert_closed(&mut active);
+        http_assert_closed(&mut pending);
+    }
+
+    #[test]
+    fn interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes",
+            "KU_HTTP_NETPOLL_CHILD",
+        ) {
+            return;
+        }
+        let (_first_peer, first) = http_test_pair();
+        let (mut second_peer, mut second) = http_test_pair();
+        first.set_nonblocking(true).unwrap();
+        second.set_nonblocking(true).unwrap();
+        let wake = netpoll::WakePair::new().unwrap();
+        let wake_sender = wake.sender.clone();
+        let body = "界🙂\0".as_bytes();
+        second_peer.write_all(body).unwrap();
+        second_peer.shutdown(Shutdown::Write).unwrap();
+        let interests = [
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&wake.reader),
+                read: true,
+                write: false,
+            },
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&first),
+                read: true,
+                write: false,
+            },
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&second),
+                read: true,
+                write: false,
+            },
+        ];
+        let deadline = http_deadline(Duration::from_secs(2));
+        let ready = netpoll::wait(&interests, Some(deadline)).unwrap();
+        assert!(ready.iter().any(|event| event.index == 2 && event.readable));
+        assert!(ready.iter().all(|event| event.index == 2));
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        for _ in 0..32 {
+            assert!(
+                Instant::now() < deadline,
+                "FIN drain retained its original D"
+            );
+            let mut buffer = [0; 64];
+            match second.read(&mut buffer) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let interests = [netpoll::Interest {
+                        socket: netpoll::Socket::Stream(&second),
+                        read: true,
+                        write: false,
+                    }];
+                    assert!(!netpoll::wait(&interests, Some(deadline))
+                        .unwrap()
+                        .is_empty());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("FIN drain failed: {error}"),
+            }
+        }
+        assert!(eof, "peer FIN must be observed after its data");
+        assert_eq!(bytes, body);
+
+        let idle = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&first),
+            read: true,
+            write: false,
+        }];
+        let deadline = http_deadline(Duration::from_millis(20));
+        assert!(netpoll::wait(&idle, Some(deadline)).unwrap().is_empty());
+        assert!(Instant::now() >= deadline);
+        assert!(netpoll::wait(&idle, Some(deadline)).unwrap().is_empty());
+
+        let wake_interest = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&wake.reader),
+            read: true,
+            write: false,
+        }];
+        wake_sender.notify().unwrap();
+        let ready =
+            netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2)))).unwrap();
+        assert!(ready.iter().any(|event| event.index == 0 && event.readable));
+        wake.drain().unwrap();
+        assert!(netpoll::wait(
+            &wake_interest,
+            Some(http_deadline(Duration::from_millis(20)))
+        )
+        .unwrap()
+        .is_empty());
+        wake_sender.notify().unwrap();
+        assert!(
+            !netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2))))
+                .unwrap()
+                .is_empty()
+        );
+        wake.drain().unwrap();
+        wake_sender.shutdown().unwrap();
+        let ready =
+            netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2)))).unwrap();
+        assert!(ready.iter().any(|event| event.index == 0 && event.readable));
+        assert_eq!(
+            wake.drain().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+
+        assert!(netpoll::wait(&[], None).unwrap().is_empty());
+        let no_interest = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&first),
+            read: false,
+            write: false,
+        }];
+        assert_eq!(
+            netpoll::wait(&no_interest, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let too_many = (0..4099)
+            .map(|_| netpoll::Interest {
+                socket: netpoll::Socket::Stream(&first),
+                read: true,
+                write: false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            netpoll::wait(&too_many, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     fn interpreter_http_full_handler_queue_rejects_without_waiting_for_capacity() {
-        let (mut client, server) = http_test_pair();
-        let (jobs, receiver) = mpsc::sync_channel(1);
-        let (response_tx, _) = mpsc::sync_channel(1);
-        jobs.send(HttpHandlerJob {
-            request: ParsedHttpRequest {
-                method: "GET".into(),
-                path: "/".into(),
-                query: HashMap::new(),
-                headers: HashMap::new(),
-                body: String::new(),
-            },
-            deadline: http_deadline(Duration::from_secs(1)),
-            response_tx,
-        })
-        .unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut first = TcpStream::connect(address).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let worker = thread::spawn(move || {
-            handle_http_connection(
-                PendingHttpConnection {
-                    stream: server,
-                    _permit: permit,
-                },
-                &jobs,
-                http_test_limits(),
-            );
-        });
+        first.write_all(request).unwrap();
+        // Leave the real job queued. Its socket times out independently of the
+        // interpreter, releasing the sole activity/connection slot while the
+        // bounded job queue still contains the expired request.
+        let mut expired = Vec::new();
+        first.read_to_end(&mut expired).unwrap();
+        assert!(expired.starts_with(b"HTTP/1.1 504 "), "{expired:?}");
+        let mut second = TcpStream::connect(address).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        second.write_all(request).unwrap();
         let mut response = Vec::new();
-        let read = client.read_to_end(&mut response);
-        // Release a blocked old sender even when the regression fails.
-        drop(receiver);
-        worker.join().unwrap();
-        read.unwrap();
+        second.read_to_end(&mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
-        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4321,67 +4501,6 @@ struct PendingHttpConnection {
     _permit: HttpConnectionPermit,
 }
 
-struct HttpHandlerJob {
-    request: ParsedHttpRequest,
-    deadline: Instant,
-    response_tx: SyncSender<HttpWireResponse>,
-}
-
-fn ensure_http_workers(
-    connection_rx: &Arc<Mutex<Receiver<PendingHttpConnection>>>,
-    handler_tx: &SyncSender<HttpHandlerJob>,
-    connection_count: &Arc<AtomicUsize>,
-    worker_count: &Arc<AtomicUsize>,
-    limits: HttpServerRuntimeLimits,
-) -> KuResult<()> {
-    let desired = connection_count
-        .load(Ordering::Acquire)
-        .min(limits.max_active_requests);
-    loop {
-        let current = worker_count.load(Ordering::Acquire);
-        if current >= desired {
-            return Ok(());
-        }
-        if worker_count
-            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            continue;
-        }
-        let connection_rx = Arc::clone(connection_rx);
-        let handler_tx = handler_tx.clone();
-        if let Err(err) = thread::Builder::new()
-            .name(format!("ku-http-{current}"))
-            .spawn(move || http_worker_loop(connection_rx, handler_tx, limits))
-        {
-            worker_count.fetch_sub(1, Ordering::AcqRel);
-            return Err(KuError::runtime(
-                format!("http worker spawn failed: {err}"),
-                entry_span(),
-            ));
-        }
-    }
-}
-
-fn http_worker_loop(
-    connection_rx: Arc<Mutex<Receiver<PendingHttpConnection>>>,
-    handler_tx: SyncSender<HttpHandlerJob>,
-    limits: HttpServerRuntimeLimits,
-) {
-    loop {
-        let pending = {
-            let Ok(receiver) = connection_rx.lock() else {
-                return;
-            };
-            match receiver.recv() {
-                Ok(pending) => pending,
-                Err(_) => return,
-            }
-        };
-        handle_http_connection(pending, &handler_tx, limits);
-    }
-}
-
 // Exactly one over-limit socket may remain on the acceptor. Each poll performs
 // at most one bounded read and one write; it never parks the interpreter while
 // admitted requests are waiting to execute. Dropping this owner closes the
@@ -4496,61 +4615,6 @@ impl HttpRejection {
     }
 }
 
-fn handle_http_connection(
-    mut pending: PendingHttpConnection,
-    handler_tx: &SyncSender<HttpHandlerJob>,
-    limits: HttpServerRuntimeLimits,
-) {
-    let request = match read_http_request(&mut pending.stream, limits, entry_span()) {
-        Ok(request) => request,
-        Err(response) => {
-            let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-    };
-    let deadline = http_deadline(limits.handler_timeout);
-    let (response_tx, response_rx) = mpsc::sync_channel(1);
-    match handler_tx.try_send(HttpHandlerJob {
-        request,
-        deadline,
-        response_tx,
-    }) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            let _ = write_http_response(
-                &mut pending.stream,
-                status_response(503, "Service Unavailable"),
-                limits.write_timeout,
-            );
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-    }
-
-    let response = match response_rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        Ok(response) => response,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = write_http_response(
-                &mut pending.stream,
-                status_response(504, "Gateway Timeout"),
-                limits.write_timeout,
-            );
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => status_response(500, "Internal Server Error"),
-    };
-    let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
-    let _ = pending.stream.shutdown(Shutdown::Write);
-}
-
 #[derive(Debug)]
 struct ParsedHttpRequest {
     method: String,
@@ -4566,34 +4630,21 @@ enum RouteLookup {
     NotFound,
 }
 
-fn read_http_request(
-    stream: &mut TcpStream,
-    limits: HttpServerRuntimeLimits,
-    span: Span,
-) -> Result<ParsedHttpRequest, HttpWireResponse> {
-    stream
-        .set_nonblocking(true)
-        .map_err(|_| status_response(500, "Internal Server Error"))?;
-    let result = read_http_request_nonblocking(stream, limits, span);
-    let restored = stream.set_nonblocking(false);
-    match (result, restored) {
-        (Ok(request), Ok(())) => Ok(request),
-        (Err(response), _) => Err(response),
-        (Ok(_), Err(_)) => Err(status_response(500, "Internal Server Error")),
-    }
+// Shared by the real incremental I/O state machine: transport framing is
+// separate from the one HTTP grammar and request conversion implementation.
+struct ParsedHttpHead {
+    method: String,
+    path: String,
+    query: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    content_length: usize,
 }
 
-fn read_http_request_nonblocking(
-    stream: &mut TcpStream,
+fn parse_http_head(
+    header: Vec<u8>,
     limits: HttpServerRuntimeLimits,
     span: Span,
-) -> Result<ParsedHttpRequest, HttpWireResponse> {
-    let (header, body_prefix) = read_http_header(
-        stream,
-        limits.max_header_bytes,
-        limits.idle_timeout,
-        limits.read_header_timeout,
-    )?;
+) -> Result<ParsedHttpHead, HttpWireResponse> {
     if header.is_empty() {
         return Err(status_response(400, "Bad Request"));
     }
@@ -4695,114 +4746,32 @@ fn read_http_request_nonblocking(
     {
         return Err(status_response(414, "URI Too Long"));
     }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        let prefix_len = body_prefix.len().min(content_length);
-        body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
-        if prefix_len < content_length {
-            read_http_body(stream, &mut body[prefix_len..], limits.read_body_timeout)?;
-        }
-    }
-    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
-    Ok(ParsedHttpRequest {
+    Ok(ParsedHttpHead {
         method,
         path,
         query,
         headers,
-        body,
+        content_length,
     })
 }
 
-fn read_http_header(
-    stream: &mut TcpStream,
-    max_header_bytes: usize,
-    idle_timeout: Duration,
-    read_header_timeout: Duration,
-) -> Result<(Vec<u8>, Vec<u8>), HttpWireResponse> {
-    const READ_CHUNK_BYTES: usize = 8192;
-    let mut bytes = Vec::new();
-    let mut incoming = [0u8; READ_CHUNK_BYTES];
-    let idle_deadline = http_deadline(idle_timeout);
-    let mut header_deadline = None;
-    loop {
-        let read = read_http_with_deadline(
-            stream,
-            &mut incoming,
-            header_deadline.unwrap_or(idle_deadline),
-        )?;
-        if read == 0 {
-            break;
-        }
-        let scan_from = bytes.len();
-        bytes.extend_from_slice(&incoming[..read]);
-        if scan_from == 0 {
-            header_deadline = Some(http_deadline(read_header_timeout));
-        }
-        for index in scan_from..bytes.len() {
-            if index + 1 > max_header_bytes {
-                return Err(status_response(431, "Request Header Fields Too Large"));
-            }
-            if bytes[index] == b'\n' && (index < 1 || bytes[index - 1] != b'\r') {
-                return Err(status_response(400, "Bad Request"));
-            }
-            if index >= 1 && bytes[index - 1] == b'\r' && bytes[index] != b'\n' {
-                return Err(status_response(400, "Bad Request"));
-            }
-            if index >= 3 && &bytes[index - 3..=index] == b"\r\n\r\n" {
-                let body_prefix = bytes.split_off(index + 1);
-                bytes.truncate(index - 3);
-                return Ok((bytes, body_prefix));
-            }
-        }
-    }
-    Err(status_response(400, "Bad Request"))
-}
-
-fn read_http_body(
-    stream: &mut TcpStream,
-    body: &mut [u8],
-    timeout: Duration,
-) -> Result<(), HttpWireResponse> {
-    let deadline = http_deadline(timeout);
-    let mut offset = 0usize;
-    while offset < body.len() {
-        match read_http_with_deadline(stream, &mut body[offset..], deadline)? {
-            0 => return Err(status_response(408, "Request Timeout")),
-            read => offset += read,
-        }
-    }
-    Ok(())
+fn finish_http_request(
+    head: ParsedHttpHead,
+    body: Vec<u8>,
+) -> Result<ParsedHttpRequest, HttpWireResponse> {
+    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
+    Ok(ParsedHttpRequest {
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        headers: head.headers,
+        body,
+    })
 }
 
 fn http_deadline(timeout: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(timeout).unwrap_or(now)
-}
-
-fn read_http_with_deadline(
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-    deadline: Instant,
-) -> Result<usize, HttpWireResponse> {
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(status_response(408, "Request Timeout"));
-        };
-        if remaining.is_zero() {
-            return Err(status_response(408, "Request Timeout"));
-        }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| status_response(408, "Request Timeout"))?;
-        match stream.read(buffer) {
-            Ok(read) => return Ok(read),
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(remaining.min(Duration::from_millis(2)));
-            }
-            Err(_) => return Err(status_response(408, "Request Timeout")),
-        }
-    }
 }
 
 fn is_http_token_byte(byte: u8) -> bool {
@@ -5128,11 +5097,10 @@ fn status_response(status: i64, message: &str) -> HttpWireResponse {
     }
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
-    response: HttpWireResponse,
-    timeout: Duration,
-) -> KuResult<()> {
+// Encode once before selecting the original total write deadline. Header and
+// body remain separate owners so a large body is not copied into a second wire
+// buffer; partial writes retain their offsets in the I/O connection state.
+fn encode_http_response(response: HttpWireResponse) -> (String, String) {
     let response = prepare_http_response(response);
     let reason = stdlib::http::status_text(response.status);
     let mut headers = response.headers;
@@ -5148,50 +5116,7 @@ fn write_http_response(
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
-    let deadline = http_deadline(timeout);
-    write_http_all(stream, head.as_bytes(), deadline)?;
-    write_http_all(stream, response.body.as_bytes(), deadline)
-}
-
-fn write_http_all(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> KuResult<()> {
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(KuError::runtime(
-                "http response write timed out",
-                Span::default(),
-            ));
-        };
-        if remaining.is_zero() {
-            return Err(KuError::runtime(
-                "http response write timed out",
-                Span::default(),
-            ));
-        }
-        stream.set_write_timeout(Some(remaining)).map_err(|err| {
-            KuError::runtime(
-                format!("http response write timeout setup failed: {err}"),
-                Span::default(),
-            )
-        })?;
-        match stream.write(&bytes[offset..]) {
-            Ok(0) => {
-                return Err(KuError::runtime(
-                    "http response connection closed during write",
-                    Span::default(),
-                ))
-            }
-            Ok(written) => offset += written,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                return Err(KuError::runtime(
-                    format!("http response write failed: {err}"),
-                    Span::default(),
-                ))
-            }
-        }
-    }
-    Ok(())
+    (head, response.body)
 }
 
 fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {

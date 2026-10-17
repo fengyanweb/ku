@@ -1909,6 +1909,8 @@ fn main(): null! {
 
 `ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
 
+解释器的 socket 读取、handler 等待和响应写出由单 I/O 线程推进，Ku handler 仍串行执行；等待连接不会逐个创建 OS 线程。native C 暂保留固定连接 worker，完整事件化仍待接入。两端继续使用原连接/队列限制、各阶段绝对期限和 Connection: close，不新增 keep-alive 或配置字段。
+
 native 与解释器的主要已知差异：
 
 - **native 的 `handler_timeout_ms` 是协作式，不是线程抢占**。`while` / `for` 回边及 Ku 调用返回点会检查 deadline；到期后沿正常清理路径展开并返回 504。超时展开中的 `finally` 获得固定一秒 cleanup grace，期间 safepoint 允许有限清理继续；grace 到期后的下一 safepoint 会转向超时出口，因此纯 Ku 的无限 `finally` 不能永久占用 worker。同步系统调用、libpq/其他 FFI 阻塞期间仍不能被它中断，必须给下游单独配置 timeout；`finally` 仍应有限且非阻塞。
