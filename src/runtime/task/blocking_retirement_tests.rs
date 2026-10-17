@@ -1318,6 +1318,132 @@ fn actual_blocking_full_rejection_keeps_count_until_both_capture_drops_finish() 
 }
 
 #[test]
+fn shutdown_waits_for_rejected_blocking_capture_after_other_jobs_retire() {
+    struct HeldCapture {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for HeldCapture {
+        fn drop(&mut self) {
+            let _ = self.entered.try_send(());
+            let released = self.release.recv_timeout(WAIT).is_ok();
+            if !released && !thread::panicking() {
+                panic!("release rejected blocking capture");
+            }
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    let budget = Duration::from_millis(10);
+    let mut outcomes = Vec::new();
+    for foreign_parent in [true, false] {
+        let _execution = ExecutionTerminationGuard::enter();
+        let parent_runtime = TaskRuntime::with_limits(1, 2, 0, 0, 3);
+        let pool = TaskRuntime::with_limits(0, 0, 1, 1, 1);
+        let (occupier, mut worker_release) = held_blocking(&pool);
+        let queued_pool = pool.clone();
+        let queued =
+            thread::spawn(move || queued_pool.run_blocking(|| Ok(Value::Int(2)), Span::default()));
+        assert!(until(|| pool
+            .inner
+            .queued_blocking_jobs
+            .load(Ordering::Acquire)
+            == 1));
+
+        let (mut capture_release, release) = Release::pair();
+        let (entered, ready) = mpsc::sync_channel(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = HeldCapture {
+            entered,
+            release,
+            drops: Arc::clone(&drops),
+        };
+        let ran = Arc::new(AtomicBool::new(false));
+        let callback_ran = Arc::clone(&ran);
+        let rejected_pool = pool.clone();
+        let reject = move || {
+            rejected_pool.run_blocking(
+                move || {
+                    callback_ran.store(true, Ordering::Release);
+                    drop(capture);
+                    Ok(Value::Int(3))
+                },
+                Span::default(),
+            )
+        };
+        let (parent, caller) = if foreign_parent {
+            (Some(parent_runtime.spawn(reject).unwrap()), None)
+        } else {
+            (None, Some(thread::spawn(reject)))
+        };
+        ready.recv_timeout(WAIT).unwrap();
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        if let Some(parent) = &parent {
+            // Its real Task belongs to another runtime, so the pool's active
+            // counter cannot stand in for this resident job's final capture.
+            assert_eq!(parent.state.pending_blocking.load(Ordering::Acquire), 1);
+            assert_eq!(parent_runtime.snapshot().unwrap().active_tasks, 1);
+        } else {
+            assert_eq!(parent_runtime.snapshot().unwrap().active_tasks, 0);
+        }
+
+        worker_release.release();
+        assert_eq!(occupier.join().unwrap().unwrap(), Value::Int(1));
+        assert_eq!(queued.join().unwrap().unwrap(), Value::Int(2));
+        assert!(until(|| {
+            let snapshot = pool.snapshot().unwrap();
+            snapshot.queued_blocking_jobs == 0
+                && snapshot.running_blocking_jobs == 0
+                && snapshot.resident_blocking_jobs == 1
+        }));
+        let held = pool.snapshot().unwrap();
+        assert_eq!(pool.inner.producer_count(), 0);
+        assert_eq!(held.active_tasks, 0);
+        assert_eq!(held.accepted_blocking_jobs, 2);
+        assert_eq!(held.finished_blocking_jobs, 2);
+        assert_eq!(held.rejected_blocking_jobs, 1);
+        assert_eq!(held.rejected_blocking_queue, 1);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+
+        let started = Instant::now();
+        let shutdown = pool.cancel_all_and_wait(budget);
+        let elapsed = started.elapsed();
+        assert_eq!(pool.snapshot().unwrap().resident_blocking_jobs, 1);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        capture_release.release();
+        let result = if let Some(parent) = parent {
+            parent.await_result().unwrap()
+        } else {
+            caller.unwrap().join().unwrap().unwrap()
+        };
+        assert_eq!(error_code(&result), Some("queue_full"));
+        assert!(until(
+            || pool.snapshot().unwrap().resident_blocking_jobs == 0
+        ));
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(pool.cancel_all_and_wait(Duration::ZERO).unwrap(), 0);
+        parent_runtime.cancel_all_and_wait(WAIT).unwrap();
+        outcomes.push((foreign_parent, shutdown, elapsed));
+    }
+
+    // Complete both real rejection paths and their cleanup before reporting
+    // either failure; the old empty-counter exit incorrectly succeeds in both.
+    assert!(
+        outcomes.iter().all(|(_, shutdown, elapsed)| {
+            shutdown.as_ref().is_err_and(|error| {
+                error.domain.as_deref() == Some("task")
+                    && error.code.as_deref() == Some("shutdown_timeout")
+            }) && *elapsed >= budget
+        }),
+        "resident capture shutdown outcomes: {outcomes:?}"
+    );
+}
+
+#[test]
 fn actual_blocking_body_and_capture_panics_retire_before_healthy_followup() {
     for panic_in_body in [false, true] {
         let _execution = ExecutionTerminationGuard::enter();

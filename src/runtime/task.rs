@@ -1664,7 +1664,10 @@ impl TaskRuntime {
         let mut observed_outstanding = self.inner.producer_count() != 0
             || self.inner.active_tasks.load(Ordering::Acquire) != 0
             || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
-            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
+            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
+            // A rejected job can have returned its queue credit while its
+            // actual capture still belongs to this pool's final retirement.
+            || self.inner.blocking_metrics.resident.load(Ordering::Acquire) != 0;
         self.inner.closing.store(true, Ordering::Release);
         // Only the atomic close linearizes producer admission. An attempt
         // that began earlier remains counted through its real final Drop;
@@ -1688,7 +1691,8 @@ impl TaskRuntime {
             let outstanding = self.inner.producer_count() != 0
                 || self.inner.active_tasks.load(Ordering::Acquire) != 0
                 || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
-                || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
+                || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
+                || self.inner.blocking_metrics.resident.load(Ordering::Acquire) != 0;
             observed_outstanding |= outstanding;
             context = tighten_current_cleanup(context);
             // An empty shutdown still succeeds at zero D. After actual work
