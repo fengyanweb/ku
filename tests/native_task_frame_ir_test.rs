@@ -110,6 +110,88 @@ fn rejected(program: &TaskProgram, case: &str) {
 }
 
 #[test]
+fn native_task_frame_ir_owns_bare_catch_errors_and_validates_projections() {
+    let error = IrType::Named("__ku_error_type".into());
+    let fixture = program(
+        vec![IrType::Str, error, IrType::Str, result(IrType::Null)],
+        &[],
+        vec![state(
+            vec![
+                init(0, TaskConstant::Str("中文😀".into())),
+                TaskOp::MakeError {
+                    dst: SlotId(1),
+                    message: SlotId(0),
+                },
+                TaskOp::ErrorField {
+                    dst: SlotId(2),
+                    src: SlotId(1),
+                    field: "message".into(),
+                },
+                drop_slot(2),
+                TaskOp::WrapError {
+                    dst: SlotId(3),
+                    src: SlotId(1),
+                },
+            ],
+            TaskTerminator::Exit { value: SlotId(3) },
+        )],
+    );
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].slots.contains(&SlotId(1)));
+    assert!(plan.functions[0].slots.contains(&SlotId(2)));
+
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations[2] = TaskOp::ErrorField {
+        dst: SlotId(2),
+        src: SlotId(1),
+        field: "unknown".into(),
+    };
+    rejected(&bad, "unknown Error field cannot reach C emission");
+    let mut bad = fixture.clone();
+    bad.functions[0].slots[2].ty = TaskSlotType::Value {
+        ty: IrType::Int,
+        borrowed: false,
+    };
+    rejected(&bad, "Error field destination must own a string");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations[4] = TaskOp::WrapError {
+        dst: SlotId(3),
+        src: SlotId(0),
+    };
+    rejected(&bad, "a string cannot replace the bare Error input");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0]
+        .operations
+        .push(TaskOp::ErrorField {
+            dst: SlotId(2),
+            src: SlotId(1),
+            field: "message".into(),
+        });
+    rejected(
+        &bad,
+        "projection cannot read an Error after it moved into Result",
+    );
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations.insert(
+        2,
+        TaskOp::MakeError {
+            dst: SlotId(1),
+            message: SlotId(0),
+        },
+    );
+    rejected(
+        &bad,
+        "a consumed message and initialized Error cannot be reused",
+    );
+    let mut bad = fixture.clone();
+    bad.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Str,
+        borrowed: true,
+    };
+    rejected(&bad, "MakeError cannot consume a borrowed message");
+}
+
+#[test]
 fn native_task_frame_ir_accepts_exact_r1_primitive_results() {
     for (ty, constant) in [
         (IrType::Int, TaskConstant::Int(7)),

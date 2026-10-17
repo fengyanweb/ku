@@ -67,6 +67,9 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 TaskOp::Copy { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
+                | TaskOp::WrapError { dst, src }
+                | TaskOp::MakeError { dst, message: src }
+                | TaskOp::ErrorField { dst, src, .. }
                 | TaskOp::Unary { dst, src, .. } => {
                     map(dst);
                     map(src);

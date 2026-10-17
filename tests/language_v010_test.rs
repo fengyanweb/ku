@@ -399,7 +399,7 @@ fn native_build_rejects_unsupported_async_control_before_artifacts() {
             let error = run_cli(args).expect_err("unsupported control must not emit or link C");
             assert_eq!(
                 error.message,
-                "native async subset does not support this statement; array for and try/catch/finally remain gated"
+                "native async subset does not support user finally in native Task source"
             );
             assert!(!file.with_extension("c").exists());
             assert!(!binary.exists());

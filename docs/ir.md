@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、非空用户 finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -456,6 +456,21 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
 不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 8 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+
+### 源码 try/catch 与 Error 字段计费
+
+普通 `fail` 和 `?` 选择最近的 catch；ScopeExitBegin/End 先 drain try 内子 Task、
+释放局部，再把 bare Error 交给 catch。`MakeError`、`WrapError`、`ErrorField` 使用
+初始化/移动事实；重复字段读取保持原 Error。catch 的 fail 可向外层传播；取消、
+期限耗尽和算术 runtime-failure 不转成可恢复 Result。非空用户 finally 仍拒绝，
+不能把普通 try/catch 通过写成完整 try/catch/finally 已完成。
+
+ErrorField 的 STATIC 字符串复用头；OWNED 字段在 malloc 前向当前 RUNNING ticket
+预留实际 clone 容量，失败先退款。仅含这种投影的函数启用有界 typed 活跃头扫描，
+最多64槽，覆盖 frame、暂存 Result 和 adapter payload；drop/移交后只收缩已释放
+的收费，成功 hosted take 沿用原转移账本。没有逐次递归树遍历或改动通用 Value。
+私有生成 host 的分配扩展有独立 ABI1/sizeof 门槛；Frame4/Control2/Driver8保持。
+这只覆盖新增 Error-field 分配，不代表外部库、网络或进程内存都已受控。
 
 ### 源码 sleep 与 Driver8 timer
 
@@ -493,8 +508,8 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
 对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支与 While 循环已复用该协议，
-并在真实作用域退出时 drain 子 Task。Task 源码的数组 for 与
-try/catch/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
+并在真实作用域退出时 drain 子 Task。Task 源码的数组 for 与非空用户 finally
+仍未接入；try/catch 已复用此退出协议，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
 

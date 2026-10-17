@@ -5,8 +5,9 @@
 //! remains valid, uniquely owned and disjoint from other live allocations. We
 //! validate representable ranges and header aliases, not arbitrary raw pointers.
 //! Source Start/Await and final scope drain reuse the fixed driver registration.
-//! Active result charge follows successful hosted takes; dynamic allocators and
-//! total RSS accounting remain outside this primitive-only implementation.
+//! Active result charge follows successful hosted takes. Error-field projections
+//! opt into typed active-byte reconciliation; other dynamic allocators and total
+//! RSS accounting remain outside this implementation.
 
 use crate::error::KuResult;
 use crate::ir::task::{TaskFunction, TaskOp, TaskProgram, TaskSlotType};
@@ -52,6 +53,9 @@ fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
 }
 
 fn supported_type(ty: &IrType) -> bool {
+    if crate::ir::task::error_type(ty) {
+        return true;
+    }
     match ty {
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => true,
         IrType::Result(inner) => matches!(
@@ -63,7 +67,7 @@ fn supported_type(ty: &IrType) -> bool {
 }
 
 fn owned(ty: &IrType) -> bool {
-    matches!(ty, IrType::Str | IrType::Result(_))
+    matches!(ty, IrType::Str | IrType::Result(_)) || crate::ir::task::error_type(ty)
 }
 
 // The generated branch itself guards the access: inactive Result fields must
@@ -77,6 +81,12 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
             body(&format!("({place}).error.domain")),
             body(&format!("({place}).error.code")),
             body(&format!("({place}).error.message")),
+        ),
+        ty if crate::ir::task::error_type(ty) => format!(
+            "{}{}{}",
+            body(&format!("({place}).domain")),
+            body(&format!("({place}).code")),
+            body(&format!("({place}).message"))
         ),
         _ => String::new(),
     }
@@ -108,6 +118,36 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
 
     let id = function.id.0.to_string();
+    let dynamic_projection = function.states.iter().any(|state| {
+        state
+            .operations
+            .iter()
+            .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+    });
+    let mut reconcile_fields = String::new();
+    if dynamic_projection {
+        reconcile_fields.push_str("  if (instance->frame_initialized) {\n");
+        for (index, slot) in function.slots.iter().enumerate() {
+            if let TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } = &slot.ty
+            {
+                if owned(ty) {
+                    reconcile_fields.push_str(&format!("  if (instance->frame.header.initialized & (UINT64_C(1)<<{index})) {{\n{}  }}\n",
+                        active_strings(ty, &format!("instance->frame.s_{index}"), &|place|
+                            format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+                }
+            }
+        }
+        reconcile_fields.push_str(&format!("  if (instance->frame.header.result_initialized) {{\n{}  }}\n",
+            active_strings(&function.result, "instance->frame.result", &|place|
+                format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+        reconcile_fields.push_str("  }\n");
+        reconcile_fields.push_str(&format!("  if (instance->payload_initialized) {{\n{}  }}\n",
+            active_strings(&function.result, "instance->payload", &|place|
+                format!("    status=ku_task_adapter_string_charge({place},&bytes); if (status!=KU_TASK_DRIVER_OK) return status;\n"))));
+    }
     let result_type = c_type(&function.result)?;
     let mut declarations = String::new();
     let mut arguments = String::new();
@@ -261,6 +301,13 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         }
     }
     let source = ADAPTER_FUNCTION
+        .replace("@RECONCILE_HELPER@", if dynamic_projection { RECONCILE_HELPER } else { "" })
+        .replace("@RECONCILE_FIELDS@", &reconcile_fields)
+        .replace("@ALLOCATION_HOST@", if dynamic_projection { "sizeof(KuTaskAdapterHostV1),KU_TASK_ALLOCATION_HOST_ABI_VERSION,instance,ku_task_@ID@_reconcile_charge" } else { "0,0,NULL,NULL" })
+        .replace("@RECONCILE_RETURN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;" } else { "" })
+        .replace("@RECONCILE_DRAIN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;" } else { "" })
+        .replace("@RECONCILE_TAKE@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
+        .replace("@RECONCILE_DROP@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
         .replace("@SCOPE_FIELDS@", if scoped { SCOPE_FIELDS } else { "" })
         .replace("@SCOPE_SELECT@", if scoped { SCOPE_SELECT } else { "" })
         .replace("@SCOPE_PREFLIGHT@", &scope_preflight)
@@ -490,6 +537,19 @@ const SCOPE_RESUME: &str = r#"
     status=ku_task_@ID@_scope_resume(instance);
 "#;
 
+const RECONCILE_HELPER: &str = r#"
+/* This opt-in typed scan belongs only to functions that allocate Error-field
+ * projections. Every owned slot in these hosted frames is persistent. */
+static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
+  KuTaskInstance_@ID@* instance=(KuTaskInstance_@ID@*)raw;
+  if (!instance->registered) return KU_TASK_DRIVER_OK;
+  size_t bytes=0;
+  uint32_t status=KU_TASK_DRIVER_OK;
+@RECONCILE_FIELDS@
+  return ku_task_driver_reconcile_charge(&instance->ticket,sizeof(*instance),bytes);
+}
+"#;
+
 const ADAPTER_FUNCTION: &str = r#"
 typedef struct KuTaskInstance_@ID@ {
   KuTaskControlV1 control;
@@ -512,6 +572,7 @@ typedef struct KuTaskHandle_@ID@ {
   KuTaskControlOwnerV1 owner;
   KuTaskDriverTicketV1 ticket;
 } KuTaskHandle_@ID@;
+@RECONCILE_HELPER@
 
 /* The sole executor calls this only after a READY frame. A staged bridge
  * exit is not READY until every Task owner was durably handed off and the
@@ -529,7 +590,7 @@ static uint32_t ku_task_@ID@_take_frame_payload(KuTaskInstance_@ID@* instance) {
 }
 
 static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@};
   if (instance->timer.driver) {
     uint32_t timer_status=ku_task_driver_timer_detach(&instance->timer);
     if (timer_status!=KU_TASK_DRIVER_OK && timer_status!=KU_TASK_DRIVER_STALE) return timer_status;
@@ -611,6 +672,7 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
     }
     instance->values_cleaned=1;
   }
+@RECONCILE_DRAIN@
   if (instance->wait.driver) {
     KuTaskDriverWaitSnapshotV1 snapshot={0};
     uint32_t status=ku_task_driver_wait_read(&instance->wait,&snapshot);
@@ -644,13 +706,14 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
   if (!instance->frame_initialized) return KU_TASK_CONTROL_INVALID_STATE;
   KuTaskAdapterClockV1 bridge = { instance->ticket.driver, NULL };
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@};
   KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
     if (ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
     status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
   }
+@RECONCILE_RETURN@
 @SCOPE_RESUME@
   if (status == KU_TASK_FRAME_PENDING) {
     return KU_TASK_CONTROL_PENDING;
@@ -698,6 +761,7 @@ static void ku_task_@ID@_drop_frame(void* raw) {
   uint32_t status = ku_task_frame_@ID@_destroy(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION);
   if (status != KU_TASK_FRAME_OK) { ku_task_adapter_fault(instance->ticket.driver, 0); return; }
   instance->frame_initialized = false;
+@RECONCILE_DROP@
 }
 static void ku_task_@ID@_drop_payload(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
@@ -705,6 +769,7 @@ static void ku_task_@ID@_drop_payload(void* raw) {
     instance->payload_initialized = false;
     ku_result_drop_@SUFFIX@(&instance->payload);
   }
+@RECONCILE_DROP@
 }
 static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
@@ -736,6 +801,7 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   outcome->result_kind=@KIND@u; outcome->exit_class=instance->exit_class;
   outcome->has_cleanup_deadline=instance->has_cleanup_deadline; outcome->cleanup_deadline=instance->cleanup_deadline;
   instance->payload_initialized = false;
+@RECONCILE_TAKE@
   return KU_TASK_CONTROL_OK;
 }
 static void ku_task_@ID@_dispose(KuTaskControlV1* control, void* raw) {

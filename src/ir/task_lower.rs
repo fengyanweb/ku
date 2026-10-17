@@ -73,13 +73,8 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 }
 
 fn owned_value(ty: &TaskSlotType) -> bool {
-    matches!(
-        ty,
-        TaskSlotType::Value {
-            ty: IrType::Str | IrType::Result(_),
-            ..
-        }
-    )
+    matches!(ty, TaskSlotType::Value { ty, borrowed: false }
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::error_type(ty))
 }
 
 fn copy_value(ty: &TaskSlotType) -> bool {
@@ -285,6 +280,7 @@ struct FunctionLowerer<'a> {
     scopes: Vec<TaskScopeId>,
     next_scope: usize,
     loops: Vec<LoopContext>,
+    handlers: Vec<ErrorHandler>,
     next_scope_exit: usize,
     scope_drop_states: Vec<(StateId, TaskScopeId)>,
     current: Option<StateId>,
@@ -300,6 +296,14 @@ struct LoopContext {
     continue_target: StateId,
     retained_depth: usize,
     has_continue: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ErrorHandler {
+    target: StateId,
+    error: SlotId,
+    retained_depth: usize,
+    used: bool,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -328,6 +332,7 @@ impl<'a> FunctionLowerer<'a> {
             scopes: Vec::new(),
             next_scope: 0,
             loops: Vec::new(),
+            handlers: Vec::new(),
             next_scope_exit: 0,
             scope_drop_states: Vec::new(),
             current: None,
@@ -443,6 +448,25 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn raise_error(&mut self, error: SlotId) -> KuResult<()> {
+        if let Some(handler) = self.handlers.last_mut() {
+            handler.used = true;
+            let handler = *handler;
+            self.emit(TaskOp::Move {
+                dst: handler.error,
+                src: error,
+            })?;
+            self.lower_scoped_jump(handler.target, handler.retained_depth)
+        } else {
+            let result = self.slot(value_slot(self.function.result.clone()))?;
+            self.emit(TaskOp::WrapError {
+                dst: result,
+                src: error,
+            })?;
+            self.exit_result(result)
+        }
+    }
+
     fn constant(&mut self, value: TaskConstant, ty: IrType) -> KuResult<SlotId> {
         let slot = self.slot(value_slot(ty))?;
         self.emit(TaskOp::Init { dst: slot, value })?;
@@ -545,6 +569,22 @@ impl<'a> FunctionLowerer<'a> {
                     expression.span,
                 )
             }),
+            ExprKind::Field { target, name } => {
+                let source = self.expression(target, depth + 1)?;
+                if !matches!(&self.function.slots[source.0].ty,
+                    TaskSlotType::Value { ty, .. } if task::error_type(ty))
+                    || !matches!(name.as_str(), "domain" | "code" | "message")
+                {
+                    return Err(unsupported("this field projection", expression.span));
+                }
+                let destination = self.slot(value_slot(IrType::Str))?;
+                self.emit(TaskOp::ErrorField {
+                    dst: destination,
+                    src: source,
+                    field: name.clone(),
+                })?;
+                Ok(destination)
+            }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Field {
                     target: object,
@@ -711,9 +751,18 @@ impl<'a> FunctionLowerer<'a> {
                     return Err(unsupported("? on a non-Result value", expression.span));
                 };
                 let destination = self.slot(value_slot(inner.as_ref().clone()))?;
-                let error = self.slot(value_slot(self.function.result.clone()))?;
+                let catches_error = !self.handlers.is_empty();
+                let error = self.slot(value_slot(if catches_error {
+                    super::error_ir_type()
+                } else {
+                    self.function.result.clone()
+                }))?;
                 let ok = self.state(TaskTerminator::Terminate)?;
-                let err = self.state(TaskTerminator::Exit { value: error })?;
+                let err = self.state(if catches_error {
+                    TaskTerminator::Terminate
+                } else {
+                    TaskTerminator::Exit { value: error }
+                })?;
                 self.terminate(TaskTerminator::TryResult {
                     src: source,
                     ok_value: destination,
@@ -721,6 +770,10 @@ impl<'a> FunctionLowerer<'a> {
                     ok,
                     err,
                 })?;
+                if catches_error {
+                    self.current = Some(err);
+                    self.raise_error(error)?;
+                }
                 self.current = Some(ok);
                 Ok(destination)
             }
@@ -883,6 +936,28 @@ impl<'a> FunctionLowerer<'a> {
                 } => self.lower_for(name, iterable, body, *span, depth)?,
                 Stmt::Break { span } => self.lower_loop_exit(false, *span)?,
                 Stmt::Continue { span } => self.lower_loop_exit(true, *span)?,
+                Stmt::Try {
+                    body,
+                    catch_name,
+                    catch_body,
+                    finally_body,
+                    span,
+                } => {
+                    self.lower_try(
+                        body,
+                        catch_name.as_deref(),
+                        catch_body,
+                        finally_body,
+                        *span,
+                        depth,
+                    )?;
+                    if self.current.is_none() {
+                        // The checker requires a direct Result exit even when
+                        // both Try routes already exit. Its validated tail is
+                        // unreachable; do not invent a second native exit.
+                        break;
+                    }
+                }
                 Stmt::Assign { name, value, span } => {
                     self.bind(name, None, value, *span, false, depth)?
                 }
@@ -899,25 +974,42 @@ impl<'a> FunctionLowerer<'a> {
                     let result = self.expression(value, depth)?;
                     self.exit_result(result)?;
                 }
-                Stmt::Fail {
-                    value:
-                        Expr {
-                            kind: ExprKind::Literal(Literal::String(message)),
-                            ..
-                        },
-                    span,
-                } => {
-                    self.budget.text(message.len(), *span)?;
-                    let result = self.constant(
-                        TaskConstant::Err {
-                            result: self.function.result.clone(),
-                            domain: "ku".into(),
-                            code: "fail".into(),
-                            message: message.clone(),
-                        },
-                        self.function.result.clone(),
-                    )?;
-                    self.exit_result(result)?;
+                Stmt::Fail { value, span } => {
+                    if self.handlers.is_empty() {
+                        if let ExprKind::Literal(Literal::String(message)) = &value.kind {
+                            self.budget.text(message.len(), *span)?;
+                            let result = self.constant(
+                                TaskConstant::Err {
+                                    result: self.function.result.clone(),
+                                    domain: "ku".into(),
+                                    code: "fail".into(),
+                                    message: message.clone(),
+                                },
+                                self.function.result.clone(),
+                            )?;
+                            self.exit_result(result)?;
+                            continue;
+                        }
+                    }
+                    let source = self.expression(value, depth)?;
+                    let error = if self.function.slots[source.0].ty == value_slot(IrType::Str) {
+                        let error = self.slot(value_slot(super::error_ir_type()))?;
+                        self.emit(TaskOp::MakeError {
+                            dst: error,
+                            message: source,
+                        })?;
+                        error
+                    } else if matches!(&self.function.slots[source.0].ty,
+                        TaskSlotType::Value { ty, .. } if task::error_type(ty))
+                    {
+                        source
+                    } else {
+                        return Err(unsupported(
+                            "fail of a value other than str or Error",
+                            *span,
+                        ));
+                    };
+                    self.raise_error(error)?;
                 }
                 Stmt::Print { value, .. } => {
                     let temporary = !matches!(&value.kind, ExprKind::Variable(_));
@@ -944,7 +1036,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => {
                     return Err(unsupported(
-                        "this statement; array for and try/catch/finally remain gated",
+                        "this statement; array for and user finally remain gated",
                         self.span,
                     ))
                 }
@@ -980,6 +1072,10 @@ impl<'a> FunctionLowerer<'a> {
         } else {
             context.break_target
         };
+        self.lower_scoped_jump(target, retained_depth)
+    }
+
+    fn lower_scoped_jump(&mut self, target: StateId, retained_depth: usize) -> KuResult<()> {
         let exit = TaskScopeExitId(self.next_scope_exit);
         self.next_scope_exit += 1; // Each ID consumes two bounded states.
         let begin = self.state(TaskTerminator::Terminate)?;
@@ -1002,6 +1098,73 @@ impl<'a> FunctionLowerer<'a> {
         self.emit_at(end, TaskOp::ScopeExitEnd { exit })?;
         // The compiler's lexical stack remains active for the other branch;
         // this generated path alone has drained down to the loop's parent.
+        Ok(())
+    }
+
+    fn lower_try(
+        &mut self,
+        body: &[Stmt],
+        catch_name: Option<&str>,
+        catch_body: &[Stmt],
+        finally_body: &[Stmt],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        if depth >= 32 {
+            return Err(unsupported("statement nesting beyond 32 Task levels", span));
+        }
+        // User finally needs additional cancellation and timeout routes. Do not
+        // admit it until every exit can execute that body with the same budget.
+        if !finally_body.is_empty() {
+            return Err(unsupported("user finally in native Task source", span));
+        }
+        let has_catch = catch_name.is_some() || !catch_body.is_empty();
+        let body_entry = self.state(TaskTerminator::Terminate)?;
+        let catch_entry = self.state(TaskTerminator::Terminate)?;
+        let after = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: body_entry })?;
+        let error = if has_catch {
+            let error = self.slot(value_slot(super::error_ir_type()))?;
+            self.handlers.push(ErrorHandler {
+                target: catch_entry,
+                error,
+                retained_depth: self.scopes.len(),
+                used: false,
+            });
+            Some(error)
+        } else {
+            None
+        };
+        let body_end = self.lower_arm(body, body_entry, depth + 1)?;
+        let used = if has_catch {
+            self.handlers
+                .pop()
+                .expect("active recoverable handler")
+                .used
+        } else {
+            false
+        };
+        if let Some(end) = body_end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: after };
+        }
+        let catch_end = if used {
+            self.lower_bound_arm(catch_body, catch_entry, depth + 1, catch_name.zip(error))?
+        } else {
+            // The checker already checked the unreachable catch. Do not create
+            // a lexical owner declaration with no incoming recoverable edge.
+            None
+        };
+        if let Some(end) = catch_end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: after };
+        }
+        if used && catch_name.is_none() {
+            // An unnamed catch still consumes its error before continuing.
+            // No Error local was introduced into the catch scope.
+            if let Some(error) = error {
+                self.emit_at(catch_entry, TaskOp::DropIfInit { slot: error })?;
+            }
+        }
+        self.current = (body_end.is_some() || catch_end.is_some()).then_some(after);
         Ok(())
     }
 

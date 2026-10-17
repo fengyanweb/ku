@@ -79,7 +79,43 @@ typedef struct KuTaskAdapterHostV1 {
   KuTaskDriverWaitTokenV1* wait;
   size_t minimum_charge; /* Generated sizeof(parent instance), not user input. */
   KuTaskDriverTimerTokenV1* timer;
+  /* Private generated-host extension. All code is emitted together; a caller
+   * using only older operations may leave these tail fields zero. Allocation
+   * operations require the current extension size and version explicitly. */
+  size_t allocation_host_bytes;
+  uint32_t allocation_host_abi;
+  void* allocation_context;
+  uint32_t (*reconcile_charge)(void*);
 } KuTaskAdapterHostV1;
+#define KU_TASK_ALLOCATION_HOST_ABI_VERSION 1u
+enum { KU_TASK_HOST_ALLOCATION_FAILED = 98u };
+static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,
+    KuString source, KuString* output) {
+  if (!host || !output || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge
+      || !host->ticket || !host->control) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (source.storage==KU_STRING_STATIC) {
+    if (source.capacity || (source.len && !source.ptr)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    *output=source; return KU_TASK_DRIVER_OK;
+  }
+  if (source.storage!=KU_STRING_OWNED || source.len>source.capacity
+      || (!source.ptr && (source.len || source.capacity))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (!source.ptr) { *output=(KuString){0}; return KU_TASK_DRIVER_OK; }
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  size_t capacity=source.len ? source.len : 1;
+  status=ku_task_driver_grow_charge(host->ticket,capacity);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  uint8_t* bytes=(uint8_t*)malloc(capacity);
+  if (!bytes) {
+    status=host->reconcile_charge(host->allocation_context);
+    return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;
+  }
+  if (source.len) memcpy(bytes,source.ptr,source.len);
+  *output=(KuString){bytes,source.len,capacity,KU_STRING_OWNED};
+  return KU_TASK_DRIVER_OK;
+}
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault);
 enum { KU_TASK_HOST_TIMER_OVERFLOW = 97u };
 /* One fixed registration is owned by the executing instance. A pending poll

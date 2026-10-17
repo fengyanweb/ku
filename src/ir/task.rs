@@ -140,6 +140,22 @@ pub enum TaskOp {
         dst: SlotId,
         src: SlotId,
     },
+    /// Move a string into the language's ordinary ku/fail Error payload.
+    MakeError {
+        dst: SlotId,
+        message: SlotId,
+    },
+    /// Move one bare Error into a Result, without changing its fields.
+    WrapError {
+        dst: SlotId,
+        src: SlotId,
+    },
+    /// Project an Error field as an independent owned string.
+    ErrorField {
+        dst: SlotId,
+        src: SlotId,
+        field: String,
+    },
     Read {
         slot: SlotId,
     },
@@ -310,7 +326,11 @@ fn primitive(ty: &IrType) -> bool {
 }
 
 fn value_type(ty: &IrType) -> bool {
-    primitive(ty) || matches!(ty, IrType::Result(inner) if primitive(inner))
+    primitive(ty) || error_type(ty) || matches!(ty, IrType::Result(inner) if primitive(inner))
+}
+
+pub(crate) fn error_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name == "__ku_error_type")
 }
 
 fn result_type(ty: &IrType) -> bool {
@@ -551,6 +571,7 @@ struct SlotMasks {
     scope_exit_count: usize,
     has_scope_exit: bool,
     has_timer: bool,
+    has_error_projection: bool,
 }
 
 fn validate_shape(
@@ -579,6 +600,7 @@ fn validate_shape(
     let mut scope_exit_count = 0;
     let mut has_scope_exit = false;
     let mut has_timer = false;
+    let mut has_error_projection = false;
     for (index, slot) in function.slots.iter().enumerate() {
         match &slot.ty {
             TaskSlotType::Value { borrowed: true, .. } => borrowed |= bit(SlotId(index)),
@@ -739,6 +761,49 @@ fn validate_shape(
                         ));
                     }
                 }
+                TaskOp::MakeError { dst, message } => {
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (source, source_borrowed) = slot_type(get_slot(*message)?)?;
+                    if dst == message
+                        || borrowed
+                        || source_borrowed
+                        || !error_type(destination)
+                        || source != &IrType::Str
+                    {
+                        return Err(invalid(
+                            "MakeError requires distinct owned Error and str slots",
+                        ));
+                    }
+                }
+                TaskOp::WrapError { dst, src } => {
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    if dst == src
+                        || borrowed
+                        || source_borrowed
+                        || !result_type(destination)
+                        || !error_type(source)
+                    {
+                        return Err(invalid(
+                            "WrapError requires distinct owned Result and Error slots",
+                        ));
+                    }
+                }
+                TaskOp::ErrorField { dst, src, field } => {
+                    has_error_projection = true;
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (source, _) = slot_type(get_slot(*src)?)?;
+                    if dst == src
+                        || borrowed
+                        || destination != &IrType::Str
+                        || !error_type(source)
+                        || !matches!(field.as_str(), "domain" | "code" | "message")
+                    {
+                        return Err(invalid(
+                            "ErrorField requires an Error, owned str destination and known field",
+                        ));
+                    }
+                }
                 TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                     if slot_type(get_slot(*slot)?)?.1 {
                         return Err(invalid("cannot drop a borrowed slot"));
@@ -864,7 +929,7 @@ fn validate_shape(
                     || ok_borrowed
                     || error_borrowed
                     || !matches!(source, IrType::Result(inner) if inner.as_ref() == ok_type)
-                    || error_type != &function.result
+                    || (error_type != &function.result && !self::error_type(error_type))
                 {
                     return Err(invalid(
                         "TryResult requires distinct matching owned Result and branch destinations",
@@ -893,6 +958,7 @@ fn validate_shape(
         scope_exit_count,
         has_scope_exit,
         has_timer,
+        has_error_projection,
     })
 }
 
@@ -1118,6 +1184,9 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
         | TaskOp::WrapOk { dst, .. }
+        | TaskOp::MakeError { dst, .. }
+        | TaskOp::WrapError { dst, .. }
+        | TaskOp::ErrorField { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::Binary { dst, .. } => Some(*dst),
@@ -1448,11 +1517,16 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         TaskOp::Init { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
+        | TaskOp::ErrorField { dst, .. }
         | TaskOp::Binary { dst, .. } => {
             state.must |= bit(*dst);
             state.may |= bit(*dst);
         }
         TaskOp::Move { dst, src } => {
+            state.must = (state.must & !bit(*src)) | bit(*dst);
+            state.may = (state.may & !bit(*src)) | bit(*dst);
+        }
+        TaskOp::MakeError { dst, message: src } | TaskOp::WrapError { dst, src } => {
             state.must = (state.must & !bit(*src)) | bit(*dst);
             state.may = (state.may & !bit(*src)) | bit(*dst);
         }
@@ -1663,6 +1737,9 @@ fn live_states(
                     TaskOp::Copy { dst, src }
                     | TaskOp::Move { dst, src }
                     | TaskOp::WrapOk { dst, src }
+                    | TaskOp::WrapError { dst, src }
+                    | TaskOp::MakeError { dst, message: src }
+                    | TaskOp::ErrorField { dst, src, .. }
                     | TaskOp::Unary { dst, src, .. } => live = (live & !bit(*dst)) | bit(*src),
                     TaskOp::Binary {
                         dst, left, right, ..
@@ -1701,7 +1778,8 @@ fn validate_ownership_and_plan(
     // Exit can return to the adapter even when the function has no Task slots.
     // Preserve every Owned Value for runtime-error and staged-result cleanup;
     // ordinary dead Copy temporaries still need no persistent storage.
-    let hosted = masks.tasks != 0 || masks.exit_bridge || masks.has_timer;
+    let hosted =
+        masks.tasks != 0 || masks.exit_bridge || masks.has_timer || masks.has_error_projection;
     let mut frame = masks.parameters | masks.tasks;
     if hosted {
         frame |= masks.owned;
@@ -1718,6 +1796,9 @@ fn validate_ownership_and_plan(
                 TaskOp::Copy { src, .. }
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
+                | TaskOp::WrapError { src, .. }
+                | TaskOp::MakeError { message: src, .. }
+                | TaskOp::ErrorField { src, .. }
                 | TaskOp::Unary { src, .. } => Some(*src),
                 TaskOp::Read { slot } | TaskOp::CheckForLimit { slot } | TaskOp::Drop { slot } => {
                     Some(*slot)

@@ -831,11 +831,11 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
         ),
         (
             "async fn main(): null! { while (false) { try { break } finally { println(0) } } return ok(null) }",
-            "native async subset does not support this statement",
+            "native async subset does not support user finally",
         ),
         (
             "async fn main(): null! { while (false) { try { continue } finally { println(0) } } return ok(null) }",
-            "native async subset does not support this statement",
+            "native async subset does not support user finally",
         ),
         (
             "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
@@ -926,5 +926,119 @@ fn native_task_sleep_uses_driver_wait_and_keeps_single_worker_available() {
     ];
     for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
         run_case_with_workers(900 + index, source, stdout, failure, Some(1));
+    }
+}
+
+#[test]
+fn native_task_recoverable_catch_routes_errors_and_drains_owned_scopes() {
+    let cases = [
+        (
+            r#"async fn main(): null! {
+                try { fail "bad 中文😀" } catch (problem) {
+                    println(problem.domain) println(problem.code)
+                    println(problem.message) println(problem.message)
+                }
+                println(8) return ok(null)
+            }"#,
+            "ku\nfail\nbad 中文😀\nbad 中文😀\n8\n",
+            None,
+        ),
+        (
+            r#"async fn Bad(): str! { fail "child error" }
+            async fn main(): null! {
+                try { value = (await Bad())? println(value) }
+                catch (problem) { println(problem.message) }
+                return ok(null)
+            }"#,
+            "child error\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try {
+                    try { fail "rethrow" } catch (inner) { fail inner }
+                } catch (outer) { println(outer.message) }
+                return ok(null)
+            }"#,
+            "rethrow\n",
+            None,
+        ),
+        (
+            r#"import time from "std.time"
+            async fn main(): null! {
+                count = 0
+                for item in 3 {
+                    try { time.sleep(-1)? count = 999 }
+                    catch (problem) { count = count + 1 println(problem.code) }
+                }
+                println(count) return ok(null)
+            }"#,
+            "invalid_duration\ninvalid_duration\ninvalid_duration\n3\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { println(2) } catch (unused) { println(999) }
+                try { return ok(null) } catch (unused) { println(999) }
+                println(998) return ok(null)
+            }"#,
+            "2\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { fail "first" } catch (problem) { fail "second" }
+                return ok(null)
+            }"#,
+            "",
+            Some("second"),
+        ),
+        (
+            r#"import time from "std.time"
+            async fn Child(): null! { time.sleep(100)? return ok(null) }
+            async fn main(): null! {
+                child = Child()
+                try {
+                    nested = Child()
+                    time.sleep(1)? fail "caught"
+                } catch (problem) { println(problem.message) }
+                time.sleep(1)? println(9) return ok(null)
+            }"#,
+            "caught\n9\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { value = 1 / 0 println(value) }
+                catch (problem) { println(999) }
+                return ok(null)
+            }"#,
+            "",
+            Some("division by zero"),
+        ),
+        (
+            r#"import time from "std.time"
+            async fn Child(): null! {
+                try { time.sleep(250)? }
+                catch (problem) { println(problem.message) println(999) }
+                return ok(null)
+            }
+            async fn main(): null! {
+                child = Child() time.sleep(20)? println(7) return ok(null)
+            }"#,
+            "7\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { fail "preserved" } catch (problem) { fail problem }
+                return ok(null)
+            }"#,
+            "",
+            Some("preserved"),
+        ),
+    ];
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case_with_workers(1000 + index, source, stdout, failure, Some(1));
     }
 }

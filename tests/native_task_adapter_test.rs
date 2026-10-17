@@ -205,6 +205,49 @@ fn fixture_source() -> String {
             },
         ],
     });
+    tasks.functions.push(TaskFunction {
+        id: TaskFunctionId(11),
+        name: "OwnedErrorProjections".into(),
+        slots: vec![
+            slot(IrType::Str),
+            slot(IrType::Named("__ku_error_type".into())),
+            slot(IrType::Str),
+            slot(result(IrType::Str)),
+        ],
+        parameters: vec![SlotId(0)],
+        entry: StateId(0),
+        result: result(IrType::Str),
+        states: vec![TaskState {
+            operations: vec![
+                TaskOp::MakeError {
+                    dst: SlotId(1),
+                    message: SlotId(0),
+                },
+                TaskOp::ErrorField {
+                    dst: SlotId(2),
+                    src: SlotId(1),
+                    field: "message".into(),
+                },
+                TaskOp::Drop { slot: SlotId(2) },
+                TaskOp::ErrorField {
+                    dst: SlotId(2),
+                    src: SlotId(1),
+                    field: "message".into(),
+                },
+                TaskOp::Drop { slot: SlotId(2) },
+                TaskOp::ErrorField {
+                    dst: SlotId(2),
+                    src: SlotId(1),
+                    field: "message".into(),
+                },
+                TaskOp::WrapOk {
+                    dst: SlotId(3),
+                    src: SlotId(2),
+                },
+            ],
+            terminator: TaskTerminator::Exit { value: SlotId(3) },
+        }],
+    });
     c::generate_task_frame_c_source(&sync, &tasks).unwrap()
 }
 
@@ -252,7 +295,7 @@ fn native_task_adapter_factory_ownership_budget_and_failure_execute_in_c() {
     let factories = &generated[instance_start..adapter_end];
     assert_eq!(
         factories.matches("calloc(").count(),
-        11,
+        12,
         "one inline instance allocation per factory"
     );
     assert!(!factories.contains("malloc(") && !factories.contains("realloc("));
@@ -328,7 +371,7 @@ static int fixture_fail_next_allocation;
 static int fixture_allocation_fails(void) {
   ++fixture_allocation_attempts;
   if (!fixture_fail_next_allocation) return 0;
-  fixture_fail_next_allocation = 0; return 1;
+  --fixture_fail_next_allocation; return !fixture_fail_next_allocation;
 }
 static void* fixture_malloc(size_t size) {
   fixture_alloc_lock();
@@ -356,6 +399,10 @@ static FixtureLedger fixture_ledger(void) {
 }
 static void fixture_fail_allocation(void) {
   fixture_alloc_lock(); fixture_fail_next_allocation = 1; fixture_alloc_unlock();
+}
+static void fixture_fail_allocation_after(int attempts) {
+  if (attempts<1) abort();
+  fixture_alloc_lock(); fixture_fail_next_allocation = attempts; fixture_alloc_unlock();
 }
 #define malloc fixture_malloc
 #define calloc fixture_calloc
@@ -454,6 +501,13 @@ static uint32_t fixture_resume_ten(void* storage, size_t bytes, uint32_t abi, co
   }
   return result;
 }
+static uint32_t fixture_resume_eleven(void* storage, size_t bytes, uint32_t abi, const KuTaskFrameClockV1* clock) {
+  if (fixture_resume_gate==11) {
+    CHECK(ku_test_event_set(&fixture_entered));
+    CHECK(ku_test_event_wait(&fixture_proceed,2000));
+  }
+  return ku_task_frame_11_resume(storage,bytes,abi,clock);
+}
 static uint64_t fixture_adapter_now(void) {
   if (fixture_clock_gate == 2) return UINT64_MAX;
   if (fixture_clock_gate) {
@@ -484,6 +538,7 @@ static uint32_t fixture_terminate_ten(void* storage, size_t bytes, uint32_t abi,
 #define ku_task_frame_3_resume fixture_resume_three
 #define ku_task_frame_8_resume fixture_resume_eight
 #define ku_task_frame_10_resume fixture_resume_ten
+#define ku_task_frame_11_resume fixture_resume_eleven
 #define ku_task_frame_10_terminate fixture_terminate_ten
 #define ku_task_driver_now_ms fixture_adapter_now
 "#;
@@ -499,6 +554,7 @@ const FACTORY_UNDEFS: &str = r#"
 #undef ku_task_frame_3_resume
 #undef ku_task_frame_8_resume
 #undef ku_task_frame_10_resume
+#undef ku_task_frame_11_resume
 #undef ku_task_frame_10_terminate
 #undef ku_task_driver_now_ms
 "#;
@@ -1056,6 +1112,50 @@ static void fixture_live_deadline_tightening(bool tighten) {
   CHECK(ku_task_10_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
   fixture_runtime_finish(&runtime); fixture_events_finish(); fixture_ledger_zero();
 }
+static void fixture_owned_error_projection_budget(void) {
+  for (int mode=0;mode<5;mode++) {
+    const size_t capacity=64, length=6;
+    FixtureRuntime runtime;
+    fixture_runtime_init(&runtime,sizeof(KuTaskInstance_11)+capacity+(mode==1 ? 0 : length));
+    fixture_events_init(); fixture_resume_gate=11;
+    KuString input=fixture_owned("error!",capacity);
+    KuTaskHandle_11 handle={0};
+    CHECK(ku_task_11_try_start(&runtime.driver,&input,&handle)==KU_TASK_DRIVER_OK);
+    CHECK(!input.ptr && ku_test_event_wait(&fixture_entered,2000));
+    FixtureLedger before=fixture_ledger();
+    KuTaskDriverSnapshotV1 held=fixture_snapshot(&runtime);
+    CHECK(held.reserved_bytes==sizeof(KuTaskInstance_11)+capacity);
+    CHECK(ku_task_driver_grow_charge(&handle.ticket,SIZE_MAX)==KU_TASK_DRIVER_LIMIT);
+    CHECK(ku_task_driver_reconcile_charge(&handle.ticket,sizeof(KuTaskInstance_11),capacity+1)==KU_TASK_DRIVER_INVALID_STATE);
+    KuTaskDriverTicketV1 stale=handle.ticket; stale.generation++;
+    CHECK(ku_task_driver_grow_charge(&stale,1)==KU_TASK_DRIVER_STALE);
+    CHECK(fixture_ledger().attempts==before.attempts);
+    if (mode>=2) fixture_fail_allocation_after(mode-1);
+    CHECK(ku_test_event_set(&fixture_proceed)); fixture_idle(&runtime);
+    fixture_resume_gate=0;
+    KuTaskDriverSnapshotV1 done=fixture_snapshot(&runtime);
+    CHECK(done.reserved_bytes==sizeof(KuTaskInstance_11)+(mode==0 ? length : 0));
+    CHECK(done.peak_reserved_bytes==sizeof(KuTaskInstance_11)+capacity+(mode==1 ? 0 : length));
+    CHECK(fixture_ledger().attempts==before.attempts+(mode==0 ? 3 : mode==1 ? 0 : (size_t)(mode-1)));
+    CHECK(fixture_ledger().allocations==(mode==0 ? 2u : 1u));
+    KuTaskAdapterOutcomeV1 output={0};
+    CHECK(ku_task_11_take(&handle,&output)==KU_TASK_CONTROL_OK);
+    CHECK(output.value.string.ok==(mode==0));
+    if (!mode) {
+      CHECK(output.value.string.value.len==length);
+      CHECK(!memcmp(output.value.string.value.ptr,"error!",length));
+    } else {
+      KuString code=output.value.string.error.code;
+      const char* expected=mode==1 ? "memory_limit" : "out_of_memory";
+      CHECK(code.len==strlen(expected) && !memcmp(code.ptr,expected,code.len));
+      CHECK(output.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+    }
+    CHECK(fixture_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_11));
+    CHECK(ku_task_11_drop(&handle,fixture_deadline())==KU_TASK_DRIVER_OK);
+    ku_task_outcome_drop(&output); fixture_runtime_finish(&runtime);
+    fixture_events_finish(); fixture_ledger_zero();
+  }
+}
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_DRIVER_ABI_VERSION == 8u);
   fixture_primitives(); fixture_strings(); fixture_results();
@@ -1064,6 +1164,7 @@ int main(void) {
   fixture_building_crosses_shutdown(false); fixture_building_crosses_shutdown(true);
   fixture_yield_fairness(); fixture_private_ready_loses_cancellation();
   fixture_live_deadline_tightening(false); fixture_live_deadline_tightening(true);
+  fixture_owned_error_projection_budget();
   puts("task-adapter-v1-ok"); return 0;
 }
 "#;

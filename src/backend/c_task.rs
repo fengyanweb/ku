@@ -124,7 +124,8 @@ impl<'a> FrameEmitter<'a> {
                     }
                     if frame.hosted
                         && !*borrowed
-                        && matches!(ty, IrType::Str | IrType::Result(_))
+                        && (matches!(ty, IrType::Str | IrType::Result(_))
+                            || crate::ir::task::error_type(ty))
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -146,10 +147,13 @@ impl<'a> FrameEmitter<'a> {
             || frame.hosted
                 != (task_mask != 0
                     || exit_bridge
-                    || function
-                        .states
-                        .iter()
-                        .any(|state| matches!(state.terminator, TaskTerminator::Timer { .. })))
+                    || function.states.iter().any(|state| {
+                        matches!(state.terminator, TaskTerminator::Timer { .. })
+                            || state
+                                .operations
+                                .iter()
+                                .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+                    }))
         {
             return Err(unsupported(
                 "native task frame plan has inconsistent exit ownership",
@@ -306,7 +310,9 @@ impl<'a> FrameEmitter<'a> {
         match &self.function.slots[slot.0].ty {
             TaskSlotType::Task { .. } => true,
             TaskSlotType::Value { ty, borrowed } => {
-                !*borrowed && matches!(ty, IrType::Str | IrType::Result(_))
+                !*borrowed
+                    && (matches!(ty, IrType::Str | IrType::Result(_))
+                        || crate::ir::task::error_type(ty))
             }
         }
     }
@@ -732,7 +738,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         c_move_value(self.slot_type(*ok_value)?, "taken.value")?
                     ));
                     self.set_init(out, *ok_value, true);
-                    out.push_str(&format!("    frame->header.state={}u;\n  }} else {{\n    {}.error=ku_error_move(&taken.error);\n",ok.0,self.place(*err_result)));
+                    let error_place = if crate::ir::task::error_type(self.slot_type(*err_result)?) {
+                        self.place(*err_result)
+                    } else {
+                        format!("{}.error", self.place(*err_result))
+                    };
+                    out.push_str(&format!("    frame->header.state={}u;\n  }} else {{\n    {error_place}=ku_error_move(&taken.error);\n",ok.0));
                     self.set_init(out, *err_result, true);
                     out.push_str(&format!("    frame->header.state={}u;\n  }}\n  ku_result_drop_{suffix}(&taken); }}\n  goto ku_task_dispatch;\n",err.0));
                 }
@@ -925,6 +936,35 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 if self.owns_slot(*src) {
                     self.set_init(out, *src, false);
                 }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::MakeError { dst, message } => {
+                out.push_str(&format!("  {}=ku_error_make(ku_string_static((const uint8_t*)\"ku\",2),ku_string_static((const uint8_t*)\"fail\",4),ku_string_move(&{}));\n", self.place(*dst), self.place(*message)));
+                self.set_init(out, *message, false);
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::WrapError { dst, src } => {
+                let IrType::Result(inner) = self.slot_type(*dst)? else {
+                    return Err(unsupported("WrapError requires Result destination"));
+                };
+                out.push_str(&format!(
+                    "  {}=({}){{false,{},ku_error_move(&{})}};\n",
+                    self.place(*dst),
+                    c_type(self.slot_type(*dst)?)?,
+                    c_zero_initializer(inner)?,
+                    self.place(*src)
+                ));
+                self.set_init(out, *src, false);
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::ErrorField { dst, src, field } => {
+                if !matches!(field.as_str(), "domain" | "code" | "message") {
+                    return Err(unsupported("unknown Task Error field"));
+                }
+                out.push_str(&format!("  {{ uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{}.{field},&{});\n  if (cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {{\n", self.place(*src), self.place(*dst)));
+                self.emit_runtime_error(out, &format!("ku_error_make({},cloned==KU_TASK_DRIVER_LIMIT ? {} : {},cloned==KU_TASK_DRIVER_LIMIT ? {} : {})",
+                    c_static_utf8_string("task"), c_static_utf8_string("memory_limit"), c_static_utf8_string("out_of_memory"), c_static_utf8_string("native Task allocation budget exceeded"), c_static_utf8_string("native Task allocation failed")))?;
+                out.push_str("  }\n  if (cloned!=KU_TASK_DRIVER_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  }\n");
                 self.set_init(out, *dst, true);
             }
             TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
@@ -1192,6 +1232,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 }
 
 fn require_slot_type(ty: &IrType) -> KuResult<()> {
+    if crate::ir::task::error_type(ty) {
+        return Ok(());
+    }
     match ty {
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => Ok(()),
         IrType::Result(_) => require_result_type(ty),
@@ -1226,6 +1269,14 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+    if crate::ir::task::error_type(ty) {
+        return Ok(format!(
+            "({}) && ({}) && ({})",
+            empty_value_expr(&IrType::Str, &format!("({place}).domain"))?,
+            empty_value_expr(&IrType::Str, &format!("({place}).code"))?,
+            empty_value_expr(&IrType::Str, &format!("({place}).message"))?
+        ));
+    }
     match ty {
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),
         IrType::Str => Ok(format!(

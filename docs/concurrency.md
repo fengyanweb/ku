@@ -105,7 +105,27 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
+可恢复错误的 `try/catch` 可接收 `fail`、`?` 和 `await` 后的普通 Result 错误，
+先清理 try 内的局部和子 Task，再进入最近的 catch。Error 的 domain/code/message
+支持重复读取，也可 `fail problem` 保留原错误继续向外传播。取消、handler 超时和
+算术运行错误继续走外层退出，不会误进业务 catch。完整 `try/catch/finally` 尚未完成：
+非空用户 finally 仍在生成产物前明确拒绝，用户 cleanup 不能 Await。
+
+```ku
+async fn Load(): int! { fail "读取失败" }
+async fn main(): null! {
+    try {
+        value = (await Load())?
+        println(value)
+    } catch (problem) {
+        println(problem.domain)
+        println(problem.message)
+    }
+    return ok(null)
+}
+```
+
+仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、非空用户 finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。

@@ -242,14 +242,17 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
         let error = Checker::new().check(&parsed(source)).unwrap_err();
         assert!(error.message.contains("cannot assign to immutable variable"), "{error}");
     }
-    for body in [
-        "value = 1 value += 1",
-        "value = 1 value++",
-        "while (false) { try { break } finally { println(0) } }",
+    for (body, diagnostic) in [
+        ("value = 1 value += 1", "this statement"),
+        ("value = 1 value++", "this statement"),
+        (
+            "while (false) { try { break } finally { println(0) } }",
+            "user finally in native Task source",
+        ),
     ] {
         let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
         let error = task_lower::lower_program(&checked(&source)).unwrap_err();
-        assert!(error.message.contains("this statement"), "{error}");
+        assert!(error.message.contains(diagnostic), "{error}");
     }
 }
 

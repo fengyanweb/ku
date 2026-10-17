@@ -1548,6 +1548,59 @@ static uint32_t ku_task_driver_cancel_bound(
   ku_task_driver_unlock(driver);
   return result;
 }
+/* Generated allocation glue grows only the currently executing instance.
+ * Reservation precedes malloc; the per-instance typed scan may only refund
+ * bytes after owners were dropped or transferred. Neither operation allocates
+ * storage, changes generation, or creates cancellation authority. */
+static uint32_t ku_task_driver_grow_charge(const KuTaskDriverTicketV1* ticket,
+    size_t bytes) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t result=!slot ? KU_TASK_DRIVER_STALE
+      : slot->state!=KU_TASK_DRIVER_RUNNING || !slot->driver_lease.control
+        || slot->binding!=slot->driver_lease.control ? KU_TASK_DRIVER_INVALID_STATE
+      : slot->cleanup_fault ? slot->cleanup_fault : KU_TASK_DRIVER_OK;
+  if (result==KU_TASK_DRIVER_OK && driver->fault) result=driver->fault;
+  if (result==KU_TASK_DRIVER_OK && (slot->charged_bytes>driver->reserved_bytes
+      || driver->fixed_bytes>driver->byte_limit
+      || driver->reserved_bytes>driver->byte_limit-driver->fixed_bytes))
+    result=KU_TASK_DRIVER_INTERNAL;
+  if (result==KU_TASK_DRIVER_OK && (bytes>SIZE_MAX-slot->charged_bytes
+      || bytes>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes))
+    result=KU_TASK_DRIVER_LIMIT;
+  if (result==KU_TASK_DRIVER_OK) {
+    slot->charged_bytes+=bytes; driver->reserved_bytes+=bytes;
+    if (driver->reserved_bytes>driver->peak_reserved_bytes)
+      driver->peak_reserved_bytes=driver->reserved_bytes;
+  }
+  ku_task_driver_unlock(driver);
+  return result;
+}
+static uint32_t ku_task_driver_reconcile_charge(const KuTaskDriverTicketV1* ticket,
+    size_t minimum_instance_bytes, size_t active_payload_bytes) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!minimum_instance_bytes || active_payload_bytes>SIZE_MAX-minimum_instance_bytes)
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t target=minimum_instance_bytes+active_payload_bytes;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t result=!slot ? KU_TASK_DRIVER_STALE
+      : slot->state==KU_TASK_DRIVER_BUILDING || !slot->binding
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (result==KU_TASK_DRIVER_OK && (slot->charged_bytes>driver->reserved_bytes
+      || target>slot->charged_bytes)) result=KU_TASK_DRIVER_INVALID_STATE;
+  if (result==KU_TASK_DRIVER_OK) {
+    driver->reserved_bytes-=slot->charged_bytes-target;
+    slot->charged_bytes=target;
+  }
+  ku_task_driver_unlock(driver);
+  return result;
+}
 /* Generated typed take glue calls this once, after all output/alias checks and
  * before its infallible move. `bytes` is the actual active Owned payload charge;
  * `minimum_from_bytes` is that generated child's sizeof(instance), not user
