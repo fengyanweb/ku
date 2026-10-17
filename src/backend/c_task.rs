@@ -94,6 +94,7 @@ struct FrameEmitter<'a> {
     scopes: &'a [TaskScopeFrame],
     scope_exits: &'a TaskScopeExitPlan,
     indirect_calls: &'a [TaskIndirectCallPlan],
+    callable_parameters: &'a [crate::ir::task::TaskCallableParameterPlan],
     finally: &'a TaskFinallyPlan,
 }
 
@@ -116,6 +117,29 @@ impl<'a> FrameEmitter<'a> {
         {
             return Err(unsupported(
                 "native task frame plan has invalid storage slots",
+            ));
+        }
+        let callable_parameters: Vec<_> = function
+            .parameters
+            .iter()
+            .copied()
+            .filter(|slot| matches!(function.slots[slot.0].ty, TaskSlotType::Callable { .. }))
+            .collect();
+        if callable_parameters.len() != frame.callable_parameters.len()
+            || callable_parameters
+                .iter()
+                .zip(&frame.callable_parameters)
+                .any(|(slot, parameter)| {
+                    *slot != parameter.slot
+                        || parameter.targets.len() > 64
+                        || parameter
+                            .targets
+                            .iter()
+                            .any(|target| target.0 > u32::MAX as usize)
+                })
+        {
+            return Err(unsupported(
+                "native callable parameter plan does not match parameters",
             ));
         }
         // These scans use the verifier's existing bounded slot/state lists;
@@ -197,6 +221,7 @@ impl<'a> FrameEmitter<'a> {
             scopes: &frame.scopes,
             scope_exits: &frame.scope_exits,
             indirect_calls: &frame.indirect_calls,
+            callable_parameters: &frame.callable_parameters,
             finally: &frame.finally,
         })
     }
@@ -629,13 +654,23 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     fn emit_init(&self, out: &mut COutput) -> KuResult<()> {
         let prefix = &self.prefix;
         let frame_type = &self.frame_type;
+        for parameter in self.callable_parameters {
+            out.push_str(&format!(
+                "static int {prefix}_callable_{}(uint32_t identity) {{\n  switch(identity) {{\n",
+                parameter.slot.0
+            ));
+            for target in &parameter.targets {
+                out.push_str(&format!("    case {}u: return 1;\n", target.0));
+            }
+            out.push_str("    default: return 0;\n  }\n}\n");
+        }
         out.push_str(&format!(
             "static uint32_t {prefix}_init(void* storage, size_t bytes, uint32_t abi"
         ));
         for (index, slot) in self.function.parameters.iter().enumerate() {
             out.push_str(&format!(
                 ", {}* arg_{index}",
-                c_type(self.slot_type(*slot)?)?
+                super::task_adapter::parameter_c_type(&self.function.slots[slot.0].ty)?
             ));
         }
         out.push_str(&format!(
@@ -649,17 +684,27 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         // is checked here; disjoint deep owned payloads remain the raw caller's
         // responsibility, just as for the existing generated native value ABI.
         for (index, slot) in self.function.parameters.iter().enumerate() {
-            let ty = c_type(self.slot_type(*slot)?)?;
+            let ty = super::task_adapter::parameter_c_type(&self.function.slots[slot.0].ty)?;
             out.push_str(&format!(
                 "  if (!ku_task_frame_storage_valid(arg_{index}, sizeof({ty}), sizeof({ty}), KU_TASK_FRAME_ALIGNOF({ty})) || ku_task_frame_ranges_overlap(storage, bytes, arg_{index}, sizeof({ty}))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n"
             ));
             for (previous, previous_slot) in self.function.parameters[..index].iter().enumerate() {
                 if self.owns_slot(*slot) || self.owns_slot(*previous_slot) {
-                    let previous_ty = c_type(self.slot_type(*previous_slot)?)?;
+                    let previous_ty = super::task_adapter::parameter_c_type(
+                        &self.function.slots[previous_slot.0].ty,
+                    )?;
                     out.push_str(&format!(
                         "  if (ku_task_frame_ranges_overlap(arg_{index}, sizeof({ty}), arg_{previous}, sizeof({previous_ty}))) return KU_TASK_FRAME_INVALID_ARGUMENT;\n"
                     ));
                 }
+            }
+        }
+        for (index, slot) in self.function.parameters.iter().enumerate() {
+            if matches!(
+                self.function.slots[slot.0].ty,
+                TaskSlotType::Callable { .. }
+            ) {
+                out.push_str(&format!("  if (!{prefix}_callable_{}(*arg_{index})) return KU_TASK_FRAME_INVALID_ARGUMENT;\n", slot.0));
             }
         }
         out.push_str(&format!(
@@ -676,7 +721,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             out.push_str(&format!(
                 "  {} = {};\n",
                 self.place(*slot),
-                c_move_value(self.slot_type(*slot)?, &format!("(*arg_{index})"))?
+                super::task_adapter::parameter_move(
+                    &self.function.slots[slot.0].ty,
+                    &format!("(*arg_{index})")
+                )?
             ));
             self.set_init(out, *slot, true);
         }

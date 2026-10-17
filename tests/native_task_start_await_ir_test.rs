@@ -214,7 +214,7 @@ fn native_task_start_await_ir_task_is_not_copy_drop_wrap_print_or_parameter() {
     }
     let mut parameter = await_program(IrType::Int);
     parameter.functions[0].parameters.push(SlotId(1));
-    rejected(&parameter, "requires a Value slot");
+    rejected(&parameter, "Task parameters are unsupported");
     let mut completion = await_program(IrType::Int);
     completion.functions[0].states[3].terminator = done(2);
     rejected(&completion, "requires a Value slot");

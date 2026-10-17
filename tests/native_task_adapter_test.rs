@@ -1911,3 +1911,191 @@ int main(void) {
   puts("blocking-write-ledger-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_callable_parameters_validate_all_ids_before_reserving_or_moving() {
+    let source = r#"
+async fn First(value: int): int! { return ok(value + 1) }
+async fn Second(value: int): int! { return ok(value + 2) }
+async fn Unused(value: int): int! { return ok(value + 3) }
+async fn Receiver(text: str, left: async fn(int): int!, right: async fn(int): int!): str! {
+    first = (await left(1))?
+    second = (await right(2))?
+    return ok(text)
+}
+async fn Dormant(selected: async fn(int): int!, value: int): int! {
+    return await selected(value)
+}
+async fn main(): null! {
+    text = "source"
+    ignored = await Receiver(text, Second, First)
+    return ok(null)
+}
+"#;
+    let generated = finally_adapter_generated(source, "");
+    let anchor = "/* Internal typed adapter ABI; not source Task syntax or a stable C FFI.";
+    assert_eq!(generated.matches(anchor).count(), 1);
+    let mut generated =
+        generated.replacen(anchor, &format!("{CALLABLE_PARAMETER_HOOKS}\n{anchor}"), 1);
+    generated.push_str(CALLABLE_PARAMETER_MAIN);
+    run_finally_adapter_generated(
+        generated,
+        "native-task-callable-parameters",
+        "callable-parameters-ok\n",
+    );
+}
+
+const CALLABLE_PARAMETER_HOOKS: &str = r#"
+static int fixture_parameter_fail_commit;
+static KuString* fixture_parameter_input;
+static uint32_t *fixture_parameter_left,*fixture_parameter_right;
+static uint32_t fixture_parameter_commit(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlOwnerV1* owner,uint32_t mode,uint64_t deadline) {
+  if (fixture_parameter_fail_commit) {
+    CHECK(mode==KU_TASK_DRIVER_START && !fixture_parameter_input->ptr);
+    CHECK(!*fixture_parameter_left && !*fixture_parameter_right);
+    return KU_TASK_DRIVER_INTERNAL;
+  }
+  return ku_task_driver_commit(ticket,owner,mode,deadline);
+}
+#define ku_task_driver_commit fixture_parameter_commit
+"#;
+
+const CALLABLE_PARAMETER_MAIN: &str = r#"
+#undef ku_task_driver_commit
+typedef struct FixtureParameterRuntime {
+  KuTaskDriverV1 driver;
+  KuTaskDriverSlotV1 slots[4];
+  size_t ring[4];
+} FixtureParameterRuntime;
+static uint64_t fixture_parameter_deadline(void) { return ku_task_driver_now_ms()+2000u; }
+static void fixture_parameter_init(FixtureParameterRuntime* runtime,size_t budget) {
+  memset(runtime,0,sizeof(*runtime));
+  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
+    runtime->slots,4u,runtime->ring,4u,fixed+budget,1u,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+}
+static void fixture_parameter_empty(FixtureParameterRuntime* runtime) {
+  CHECK(ku_task_driver_wait_idle(&runtime->driver,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 snapshot={0};
+  CHECK(ku_task_driver_snapshot(&runtime->driver,&snapshot)==KU_TASK_DRIVER_OK);
+  CHECK(!snapshot.fault && !snapshot.resident && !snapshot.reserved_bytes && !snapshot.building
+    && !snapshot.running && !snapshot.queued);
+}
+static void fixture_parameter_unreserved(FixtureParameterRuntime* runtime) {
+  fixture_parameter_empty(runtime);
+  KuTaskDriverSnapshotV1 snapshot={0};
+  CHECK(ku_task_driver_snapshot(&runtime->driver,&snapshot)==KU_TASK_DRIVER_OK);
+  /* A reserve followed by rollback must still leave a nonzero peak. */
+  CHECK(!snapshot.peak_resident && !snapshot.peak_reserved_bytes
+    && !snapshot.peak_queued && !snapshot.peak_running);
+}
+static void fixture_parameter_finish(FixtureParameterRuntime* runtime) {
+  fixture_parameter_empty(runtime);
+  CHECK(ku_task_driver_shutdown(&runtime->driver,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_join(&runtime->driver,runtime->driver.shutdown_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+}
+static KuString fixture_parameter_owned(void) {
+  uint8_t* bytes=(uint8_t*)malloc(64u); CHECK(bytes); memcpy(bytes,"owned!",6u);
+  return (KuString){bytes,6u,64u,KU_STRING_OWNED};
+}
+static int fixture_parameter_same(KuString a,KuString b) {
+  return a.ptr==b.ptr && a.len==b.len && a.capacity==b.capacity && a.storage==b.storage;
+}
+static void fixture_parameter_rejections(void) {
+  FixtureParameterRuntime runtime;
+  fixture_parameter_init(&runtime,sizeof(KuTaskInstance_3)+2u*sizeof(KuTaskInstance_0)+1024u);
+  KuString text=fixture_parameter_owned(),original=text;
+  uint32_t left=1u,right=2u; /* Same signature, but right=Unused was never proved. */
+  KuTaskHandle_3 handle={0}; KuTaskValueV1 value={0};
+  KuTaskFrame_3 frame={0};
+  FixtureLedger before=fixture_ledger();
+  CHECK(ku_task_frame_3_init(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&text,&left,&right)==KU_TASK_FRAME_INVALID_ARGUMENT);
+  CHECK(ku_task_frame_zero_bytes(&frame,sizeof(frame)));
+  CHECK(ku_task_3_try_start(&runtime.driver,&text,&left,&right,&handle)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(ku_task_3_start_value(&runtime.driver,&text,&left,&right,&value)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  KuTaskDriverTicketV1 parent={0}; parent.driver=&runtime.driver;
+  KuTaskControlV1 control={0};
+  KuTaskAdapterHostV1 host={0}; host.ticket=&parent; host.control=&control; host.minimum_charge=1u;
+  CHECK(ku_task_3_start_hosted(&host,&text,&left,&right,&value)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(left==1u && right==2u && fixture_parameter_same(text,original));
+  CHECK(ku_task_frame_zero_bytes(&handle,sizeof(handle)) && ku_task_frame_zero_bytes(&value,sizeof(value)));
+  CHECK(fixture_ledger().calls==before.calls);
+  fixture_parameter_unreserved(&runtime);
+  uint32_t dormant=0u; int64_t input=7;
+  KuTaskHandle_4 absent={0}; KuTaskFrame_4 absent_frame={0};
+  CHECK(ku_task_frame_4_init(&absent_frame,sizeof(absent_frame),KU_TASK_FRAME_ABI_VERSION,&dormant,&input)==KU_TASK_FRAME_INVALID_ARGUMENT);
+  CHECK(ku_task_4_try_start(&runtime.driver,&dormant,&input,&absent)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(dormant==0u && input==7 && ku_task_frame_zero_bytes(&absent_frame,sizeof(absent_frame)));
+  CHECK(fixture_ledger().calls==before.calls);
+  fixture_parameter_unreserved(&runtime);
+  ku_string_drop(&text);
+
+  /* An actual one-byte allocation cannot contain a uint32_t identity. The
+   * adapter must reject the deep alias before it tries reading that identity. */
+  KuString tiny=ku_string_concat((KuString){0},(KuString){0}),tiny_original=tiny;
+  CHECK(tiny.ptr && !tiny.len && !tiny.capacity && tiny.storage==KU_STRING_OWNED);
+  before=fixture_ledger(); left=1u;
+  uint32_t* alias=(uint32_t*)(void*)tiny.ptr;
+  CHECK(ku_task_3_try_start(&runtime.driver,&tiny,&left,alias,&handle)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(ku_task_3_start_value(&runtime.driver,&tiny,&left,alias,&value)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(ku_task_3_start_hosted(&host,&tiny,&left,alias,&value)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  CHECK(left==1u && fixture_parameter_same(tiny,tiny_original));
+  CHECK(fixture_ledger().calls==before.calls);
+  fixture_parameter_unreserved(&runtime);
+  ku_string_drop(&tiny);
+  fixture_parameter_finish(&runtime);
+}
+static void fixture_parameter_rollback_and_success(void) {
+  FixtureParameterRuntime runtime;
+  fixture_parameter_init(&runtime,sizeof(KuTaskInstance_3)+2u*sizeof(KuTaskInstance_0)+1024u);
+  KuString text=fixture_parameter_owned(),original=text;
+  uint32_t left=1u,right=0u; /* First really is function ID zero. */
+  KuTaskHandle_3 handle={0};
+  FixtureLedger before=fixture_ledger();
+  fixture_parameter_input=&text; fixture_parameter_left=&left; fixture_parameter_right=&right;
+  fixture_parameter_fail_commit=1;
+  CHECK(ku_task_3_try_start(&runtime.driver,&text,&left,&right,&handle)==KU_TASK_DRIVER_INTERNAL);
+  fixture_parameter_fail_commit=0;
+  CHECK(left==1u && right==0u && fixture_parameter_same(text,original));
+  CHECK(!memcmp(text.ptr,"owned!",6u));
+  CHECK(ku_task_frame_zero_bytes(&handle,sizeof(handle)));
+  CHECK(fixture_ledger().calls==before.calls+1u
+    && fixture_ledger().bytes==before.bytes && fixture_ledger().allocations==before.allocations);
+  fixture_parameter_empty(&runtime);
+  before=fixture_ledger();
+  CHECK(ku_task_3_try_start(&runtime.driver,&text,&left,&right,&handle)==KU_TASK_DRIVER_OK);
+  CHECK(!text.ptr && left==0u && right==0u);
+  CHECK(ku_task_driver_wait_idle(&runtime.driver,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+  /* Receiver plus its two actual children; copying IDs allocates nothing. */
+  CHECK(fixture_ledger().calls==before.calls+3u);
+  KuTaskAdapterOutcomeV1 output={0};
+  CHECK(ku_task_3_take(&handle,&output)==KU_TASK_CONTROL_OK && output.value.string.ok);
+  CHECK(fixture_parameter_same(output.value.string.value,original));
+  CHECK(!memcmp(output.value.string.value.ptr,"owned!",6u));
+  CHECK(ku_task_3_drop(&handle,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+  ku_task_outcome_drop(&output);
+  fixture_parameter_finish(&runtime);
+}
+static void fixture_parameter_inline_rejection(void) {
+  for (unsigned closed=0;closed<2u;++closed) {
+    FixtureParameterRuntime runtime; fixture_parameter_init(&runtime,closed ? 1024u*1024u : 0u);
+    if (closed) CHECK(ku_task_driver_shutdown(&runtime.driver,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+    KuString text=fixture_parameter_owned(); uint32_t left=1u,right=0u;
+    KuTaskValueV1 rejected={0};
+    CHECK(ku_task_3_start_value(&runtime.driver,&text,&left,&right,&rejected)==KU_TASK_DRIVER_OK);
+    CHECK(rejected.tag==KU_TASK_VALUE_INLINE_FAILED
+      && rejected.rejection_code==(closed ? KU_TASK_DRIVER_CLOSED : KU_TASK_DRIVER_LIMIT));
+    CHECK(!text.ptr && !left && !right);
+    CHECK(ku_task_value_drop(&rejected,fixture_parameter_deadline())==KU_TASK_DRIVER_OK);
+    fixture_parameter_finish(&runtime);
+  }
+}
+int main(void) {
+  fixture_parameter_rejections(); fixture_parameter_rollback_and_success(); fixture_parameter_inline_rejection();
+  FixtureLedger final=fixture_ledger();
+  CHECK(!final.allocations && !final.bytes && !final.overflow);
+  puts("callable-parameters-ok"); return 0;
+}
+"#;

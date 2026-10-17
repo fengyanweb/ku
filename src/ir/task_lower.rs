@@ -32,7 +32,7 @@ pub struct NativeTaskProgram {
 #[derive(Clone)]
 struct Signature {
     id: TaskFunctionId,
-    parameters: Vec<IrType>,
+    parameters: Vec<TaskSlotType>,
     result: IrType,
 }
 
@@ -269,7 +269,7 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                 return Err(unsupported("borrowed async parameters", parameter.span));
             }
             budget.text(parameter.name.len(), parameter.span)?;
-            parameters.push(value_type(
+            parameters.push(local_type(
                 parameter
                     .ty
                     .as_ref()
@@ -428,7 +428,10 @@ impl<'a> FunctionLowerer<'a> {
         };
         lowerer.current = Some(lowerer.state(TaskTerminator::Terminate)?);
         for (parameter, ty) in declaration.params.iter().zip(&signature.parameters) {
-            let slot = lowerer.slot(value_slot(ty.clone()))?;
+            if let TaskSlotType::Callable { parameters, .. } = ty {
+                lowerer.budget.analysis(parameters.len(), parameter.span)?;
+            }
+            let slot = lowerer.slot(ty.clone())?;
             if lowerer.locals[0]
                 .insert(parameter.name.clone(), slot)
                 .is_some()
@@ -846,14 +849,43 @@ impl<'a> FunctionLowerer<'a> {
         if let Some(local) = self.local(name) {
             return Ok(local);
         }
-        let Some(signature) = self.signatures.get(name).cloned() else {
+        let Some(signature) = self.signatures.get(name) else {
             return Err(unsupported(
                 "an unknown local or first-class function value",
                 span,
             ));
         };
+        let work = signature
+            .parameters
+            .iter()
+            .try_fold(1usize, |work, parameter| {
+                work.checked_add(match parameter {
+                    TaskSlotType::Callable { parameters, .. } => parameters.len() + 1,
+                    _ => 1,
+                })
+            })
+            .ok_or_else(|| unsupported("signature work beyond the Task analysis budget", span))?;
+        self.budget.analysis(work, span)?;
+        let signature = signature.clone();
+        // Callable identities remain first-order. A helper that accepts a
+        // callable may be called directly, but is not itself a callable value.
+        let mut parameters = Vec::with_capacity(signature.parameters.len());
+        for parameter in signature.parameters {
+            self.budget.analysis(1, span)?;
+            let TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } = parameter
+            else {
+                return Err(unsupported(
+                    "a higher-order helper as a function value",
+                    span,
+                ));
+            };
+            parameters.push(ty);
+        }
         let slot = self.slot(TaskSlotType::Callable {
-            parameters: signature.parameters,
+            parameters,
             result: signature.result,
         })?;
         self.emit(TaskOp::InitCallable {
@@ -995,16 +1027,28 @@ impl<'a> FunctionLowerer<'a> {
                 span,
             ));
         }
-        let signature = self.signatures.get(name).cloned().ok_or_else(|| {
+        let signature = self.signatures.get(name).ok_or_else(|| {
             unsupported("a call other than a known top-level async function", span)
         })?;
+        let work = signature
+            .parameters
+            .iter()
+            .try_fold(1usize, |work, parameter| {
+                work.checked_add(match parameter {
+                    TaskSlotType::Callable { parameters, .. } => parameters.len() + 1,
+                    _ => 1,
+                })
+            })
+            .ok_or_else(|| unsupported("signature work beyond the Task analysis budget", span))?;
+        self.budget.analysis(work, span)?;
+        let signature = signature.clone();
         if args.len() != signature.parameters.len() || args.len() > 64 {
             return Err(unsupported("mismatched async call arguments", span));
         }
         let mut arguments = Vec::new();
         for (argument, expected) in args.iter().zip(&signature.parameters) {
             let source = self.expression(argument, depth + 1)?;
-            if self.function.slots[source.0].ty != value_slot(expected.clone()) {
+            if &self.function.slots[source.0].ty != expected {
                 return Err(unsupported(
                     "mismatched async argument types",
                     argument.span,

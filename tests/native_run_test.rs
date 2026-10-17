@@ -3059,6 +3059,85 @@ async fn main(): null! {
 }
 
 #[test]
+fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-callable-parameters"));
+    let dir = &cleanup.0;
+    let program = r#"async fn First(value: int): int! { println("first") return ok(value + 1) }
+async fn Second(value: int): int! { println("second") return ok(value + 2) }
+async fn Apply(action: async fn(int): int!, value: int): int! {
+    once = action.clone()
+    first = (await once(value))?
+    second = (await action(value))?
+    return ok(first + second)
+}
+async fn Forward(action: async fn(int): int!, value: int): int! {
+    return await Apply(action, value)
+}
+async fn UnusedSameSignature(value: int): int! {
+    return await Forward(First, value)
+}
+async fn Argument(): int! { println("arg") return ok(4) }
+async fn main(): null! {
+    action = First
+    println((await Forward(action.clone(), (await Argument())?))?)
+    println((await action(2))?)
+    println((await Apply(Second, 3))?)
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).expect("write callable parameter program");
+    let expected = "arg\nfirst\nfirst\n10\nfirst\n3\nsecond\nsecond\n10\n";
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded callable parameter interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "callableparameters") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "callableparameters")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut command = Command::new(executable);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native callable parameter execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_fs_intrinsic_gates_emit_complete_cross_platform_helpers() {
     let dir = unique_temp_dir("fs-gates-c");
     let cases = [

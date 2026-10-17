@@ -134,7 +134,7 @@ async fn main(): null! {
 顶层无捕获 async 函数可作为局部函数值，支持完整注解、默认 move、显式 clone 和
 重复调用。调用仍创建真实 Task；先保存 callee，再按从左到右的顺序求值参数，参数
 中的 Await 不会改变选择或重复执行已求值部分。只检查实际可能调用的目标集合，
-函数值别名也不能绕过无递归限制。捕获、函数值参数/返回及原绑定重赋值仍未开放。
+函数值别名也不能绕过无递归限制。捕获、函数值返回、高阶 helper 的函数值绑定及原绑定重赋值仍未开放。无捕获函数值参数的有限入口见下文。
 
 ```ku
 async fn Add(value: int): int! { return ok(value + 1) }
@@ -148,9 +148,9 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值参数/返回、
+仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
+float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及下述 sleep/文件写入以外的异步标准库 I/O。
 finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
@@ -192,6 +192,31 @@ async fn main(): null! {
     return ok(null)
 }
 ```
+
+### Native 函数值参数
+
+```ku
+async fn Add(value: int): int! { return ok(value + 1) }
+async fn Apply(action: async fn(int): int!, value: int): int! {
+    return await action(value)
+}
+async fn main(): null! {
+    action = Add
+    println((await Apply(action.clone(), 4))?)
+    println((await action(8))?)
+    return ok(null)
+}
+```
+
+函数值参数默认 move；要继续使用原绑定需显式 clone。接收者可 clone、多次只读调用或
+再传给另一直接 async 调用；参数本身的签名仍只允许当前普通值参数和 primitive Result
+返回。把这种高阶 helper 本身再绑定成函数值、返回函数值或捕获 closure 仍明确拒绝。
+参数之间有 Await 时，前面已选中的函数身份只求值一次，使用原活跃值保存。
+
+编译器只传播各真实调用点已证明的 ID，不把全部同签名函数当作候选。生成入口在
+任何其他 Owned 实参移动或实例预留前核对全部 callback ID，ID0仍可为合法函数。
+原始 C factory 只接受验证计划中已证明到达该形参的 ID；没有已证明来源的入口没有
+可接纳 ID，不能据此推导开放的外部函数指针 API。原64函数/64槽和分析预算不变。
 
 ### Native 文件写入的固定后台池
 

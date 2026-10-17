@@ -1416,7 +1416,10 @@ fn native_task_callable_ir_tracks_exact_targets_and_rejects_invalid_ownership() 
     rejected(&bad, "callable has already been dropped");
     let mut bad = fixture.clone();
     bad.functions[0].parameters.push(SlotId(0));
-    rejected(&bad, "callable parameters remain unsupported");
+    rejected(
+        &bad,
+        "callable parameter cannot be initialized over its live owner",
+    );
     let mut bad = fixture.clone();
     bad.functions[0].slots[0].ty = TaskSlotType::Callable {
         parameters: vec![IrType::Bool],

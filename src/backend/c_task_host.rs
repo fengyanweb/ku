@@ -1,9 +1,9 @@
 //! Fixed, generated source Task values and callback-only host operations.
 
 use super::super::output::COutput;
-use super::super::{c_type, unsupported};
+use super::super::unsupported;
 use crate::error::KuResult;
-use crate::ir::task::{TaskProgram, TaskSlotType};
+use crate::ir::task::TaskProgram;
 use crate::ir::IrType;
 
 pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
@@ -43,10 +43,10 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
                 function.id.0
             ));
             for (index, parameter) in function.parameters.iter().enumerate() {
-                let TaskSlotType::Value { ty, .. } = &function.slots[parameter.0].ty else {
-                    return Err(unsupported("Task parameters cannot be Task values"));
-                };
-                out.push_str(&format!(", {}* arg_{index}", c_type(ty)?));
+                out.push_str(&format!(
+                    ", {}* arg_{index}",
+                    super::parameter_c_type(&function.slots[parameter.0].ty)?
+                ));
             }
             out.push_str(", KuTaskValueV1* output);\n");
         }
@@ -93,6 +93,10 @@ typedef struct KuTaskAdapterHostV1 {
 } KuTaskAdapterHostV1;
 #define KU_TASK_ALLOCATION_HOST_ABI_VERSION 1u
 enum { KU_TASK_HOST_ALLOCATION_FAILED = 98u };
+/* Zero is a valid function ID. Initialization lives in the owner's bitmap. */
+static uint32_t ku_task_callable_move(uint32_t* source) {
+  uint32_t moved=*source; *source=0; return moved;
+}
 static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,
     KuString source, KuString* output) {
   if (!host || !output || host->allocation_host_bytes!=sizeof(*host)

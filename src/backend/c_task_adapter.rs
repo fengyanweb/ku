@@ -102,6 +102,53 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
     }
 }
 
+pub(super) fn parameter_c_type(ty: &TaskSlotType) -> KuResult<String> {
+    match ty {
+        TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        } => c_type(ty),
+        TaskSlotType::Callable { .. } => Ok("uint32_t".into()),
+        _ => Err(unsupported(
+            "native Task parameter is not an owned Value or callable",
+        )),
+    }
+}
+
+pub(super) fn parameter_move(ty: &TaskSlotType, place: &str) -> KuResult<String> {
+    match ty {
+        TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        } => c_move_value(ty, place),
+        TaskSlotType::Callable { .. } => Ok(format!("ku_task_callable_move(&{place})")),
+        _ => Err(unsupported("unsupported native Task parameter move")),
+    }
+}
+
+fn parameter_owned(ty: &TaskSlotType) -> bool {
+    match ty {
+        TaskSlotType::Value { ty, .. } => owned(ty),
+        TaskSlotType::Callable { .. } => true,
+        _ => false,
+    }
+}
+
+fn parameter_strings(ty: &TaskSlotType, place: &str, body: &impl Fn(&str) -> String) -> String {
+    match ty {
+        TaskSlotType::Value { ty, .. } => active_strings(ty, place, body),
+        _ => String::new(),
+    }
+}
+
+fn parameter_drop(ty: &TaskSlotType, place: &str) -> KuResult<String> {
+    match ty {
+        TaskSlotType::Value { ty, .. } => super::task::drop_statement(ty, place),
+        TaskSlotType::Callable { .. } => Ok(format!("{place}=0;")),
+        _ => Err(unsupported("unsupported native Task parameter drop")),
+    }
+}
+
 fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let IrType::Result(inner) = &function.result else {
         return Err(unsupported(
@@ -118,13 +165,18 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         let Some(slot_type) = function.slots.get(slot.0) else {
             return Err(unsupported("native task adapter parameter slot is missing"));
         };
-        let TaskSlotType::Value { ty, borrowed } = &slot_type.ty else {
-            return Err(unsupported("native Task parameters cannot be Task values"));
-        };
-        if *borrowed || !supported_type(ty) || slot.0 >= 64 {
+        match &slot_type.ty {
+            TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } if supported_type(ty) => {}
+            TaskSlotType::Callable { .. } => {}
+            _ => return Err(unsupported("native task adapter parameter is unsupported")),
+        }
+        if slot.0 >= 64 {
             return Err(unsupported("native task adapter parameter is unsupported"));
         }
-        parameters.push((slot.0, ty));
+        parameters.push((slot.0, &slot_type.ty));
     }
 
     let id = function.id.0.to_string();
@@ -171,6 +223,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let mut declarations = String::new();
     let mut arguments = String::new();
     let mut preflight = String::new();
+    let mut callable_checks = String::new();
     let mut charge = String::new();
     let mut restore = String::new();
     let mut rejected_drops = String::new();
@@ -180,7 +233,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let mut hosted_charge = String::new();
     let mut hosted_ticket_aliases = String::new();
     for (index, (slot, ty)) in parameters.iter().enumerate() {
-        let c_ty = c_type(ty)?;
+        let c_ty = parameter_c_type(ty)?;
         declarations.push_str(&format!(", {c_ty}* arg_{index}"));
         arguments.push_str(&format!(", arg_{index}"));
         preflight.push_str(&format!(
@@ -188,21 +241,25 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
              || ku_task_frame_ranges_overlap(output, sizeof(*output), arg_{index}, sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
         ));
         for (other, (_, other_ty)) in parameters.iter().enumerate().take(index) {
-            if owned(ty) || owned(other_ty) {
+            if parameter_owned(ty) || parameter_owned(other_ty) {
                 preflight.push_str(&format!(
                     "  if (ku_task_frame_ranges_overlap(arg_{index}, sizeof(*arg_{index}), arg_{other}, sizeof(*arg_{other}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
                 ));
             }
         }
-        charge.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
-            format!(
-                "  checked = ku_task_adapter_string_charge({place}, &charge);\n\
+        charge.push_str(&parameter_strings(
+            ty,
+            &format!("(*arg_{index})"),
+            &|place| {
+                format!(
+                    "  checked = ku_task_adapter_string_charge({place}, &charge);\n\
                  if (checked != KU_TASK_DRIVER_OK) return checked;\n"
-            )
-        }));
+                )
+            },
+        ));
         // Also prevent a move/handle publication from overwriting a buffer that
         // is being moved. This is cheap and bounded by the 64-slot IR limit.
-        charge.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+        charge.push_str(&parameter_strings(ty, &format!("(*arg_{index})"), &|place| {
             let mut checks = format!(
                 "  if (ku_task_adapter_string_overlaps({place}, output, sizeof(*output))\n\
                  || ku_task_adapter_string_overlaps_runtime({place}, driver)"
@@ -224,7 +281,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
              || ku_task_frame_ranges_overlap(&source,sizeof(source),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
         ));
         for (other, (_, other_ty)) in parameters.iter().enumerate().take(index) {
-            if owned(ty) || owned(other_ty) {
+            if parameter_owned(ty) || parameter_owned(other_ty) {
                 hosted_headers.push_str(&format!(
                     "  if (ku_task_frame_ranges_overlap(arg_{index},sizeof(*arg_{index}),arg_{other},sizeof(*arg_{other}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
                 ));
@@ -237,7 +294,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             "  if (ku_task_frame_ranges_overlap(parent,sizeof(*parent),arg_{index},sizeof(*arg_{index}))\n\
              || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
         ));
-        hosted_charge.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+        hosted_charge.push_str(&parameter_strings(ty, &format!("(*arg_{index})"), &|place| {
             let mut checks = format!(
                 "  checked=ku_task_adapter_string_charge({place},&charge);\n\
                  if (checked!=KU_TASK_DRIVER_OK) return checked;\n\
@@ -253,24 +310,28 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             checks.push_str(") return KU_TASK_DRIVER_INVALID_ARGUMENT;\n");
             checks
         }));
-        source_buffers.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+        source_buffers.push_str(&parameter_strings(ty, &format!("(*arg_{index})"), &|place| {
             format!("  if (source && ku_task_adapter_string_overlaps({place},source,sizeof(*source))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n")
         }));
-        hosted_ticket_aliases.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+        hosted_ticket_aliases.push_str(&parameter_strings(ty, &format!("(*arg_{index})"), &|place| {
             format!(
                 "  if (ku_task_adapter_string_overlaps({place},parent,sizeof(*parent))\n\
                  || ku_task_adapter_string_overlaps({place},host->control,sizeof(KuTaskControlV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
             )
         }));
-        if owned(ty) {
+        if matches!(ty, TaskSlotType::Callable { .. }) {
+            let check = format!("  if (!ku_task_frame_{id}_callable_{slot}(*arg_{index})) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n");
+            callable_checks.push_str(&check);
+        }
+        if parameter_owned(ty) {
             rejected_drops.push_str(&format!(
                 "  {}\n",
-                super::task::drop_statement(ty, &format!("(*arg_{index})"))?
+                parameter_drop(ty, &format!("(*arg_{index})"))?
             ));
             restore.push_str(&format!(
                 "  *arg_{index} = {};\n\
                  instance->frame.header.initialized &= ~(UINT64_C(1) << {slot});\n",
-                c_move_value(ty, &format!("instance->frame.s_{slot}"))?
+                parameter_move(ty, &format!("instance->frame.s_{slot}"))?
             ));
         }
     }
@@ -367,6 +428,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@PARAM_DECLS@", &declarations)
         .replace("@PARAM_ARGS@", &arguments)
         .replace("@PREFLIGHT@", &preflight)
+        .replace("@CALLABLE_CHECKS@", &callable_checks)
         .replace("@CHARGE@", &charge)
         .replace("@SOURCE_HEADERS@", &source_headers)
         .replace("@SOURCE_BUFFERS@", &source_buffers)
@@ -990,6 +1052,7 @@ static uint32_t ku_task_@ID@_try_start_impl(KuTaskDriverV1* driver,
   size_t charge = sizeof(KuTaskInstance_@ID@);
 @CHARGE@
 @SOURCE_BUFFERS@
+@CALLABLE_CHECKS@
   if (source && source->owned_bytes != charge-sizeof(KuTaskInstance_@ID@)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   /* Header/deep-alias rejection precedes typed output reads. A pointer into
    * an input int/string buffer need not actually contain a full Handle. */
@@ -1048,6 +1111,7 @@ static uint32_t ku_task_@ID@_start_value_impl(KuTaskDriverV1* driver,
   size_t charge=0;
 @CHARGE@
 @SOURCE_BUFFERS@
+@CALLABLE_CHECKS@
   (void)charge;
   if (output->tag || output->owner.lease.control || output->ticket.driver) return KU_TASK_DRIVER_INVALID_STATE;
   KuTaskHandle_@ID@ handle={0};
@@ -1098,6 +1162,7 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
       || !ku_task_driver_external_storage(driver,parent,sizeof(*parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
       || !ku_task_driver_external_storage(driver,host->control,sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1)))
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@CALLABLE_CHECKS@
   source=(KuTaskDriverStartChargeV1){*parent,host->control,host->minimum_charge,charge};
   return ku_task_@ID@_start_value_impl(driver,&source@PARAM_ARGS@,output);
 }

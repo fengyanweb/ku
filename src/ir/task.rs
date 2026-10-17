@@ -328,7 +328,16 @@ pub struct TaskFunctionFrame {
     pub suspensions: Vec<TaskSuspensionLive>,
     /// Verified reaching identities for each indirect Start, in source CFG order.
     pub indirect_calls: Vec<TaskIndirectCallPlan>,
+    /// Exact identities proved at admitted direct Start sites. Empty domains
+    /// make a callable-parameter factory unavailable, rather than inventing IDs.
+    pub callable_parameters: Vec<TaskCallableParameterPlan>,
     pub finally: TaskFinallyPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCallableParameterPlan {
+    pub slot: SlotId,
+    pub targets: Vec<TaskFunctionId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -716,9 +725,15 @@ fn validate_shape(
         }
     }
     for &parameter in &function.parameters {
-        let (_, is_borrowed) = slot_type(get_slot(parameter)?)?;
-        if is_borrowed {
-            return Err(invalid("borrowed parameter cannot enter a task frame"));
+        match &get_slot(parameter)?.ty {
+            TaskSlotType::Value {
+                borrowed: false, ..
+            }
+            | TaskSlotType::Callable { .. } => {}
+            TaskSlotType::Value { borrowed: true, .. } => {
+                return Err(invalid("borrowed parameter cannot enter a task frame"));
+            }
+            TaskSlotType::Task { .. } => return Err(invalid("Task parameters are unsupported")),
         }
         if parameters & bit(parameter) != 0 {
             return Err(invalid("duplicate parameter slot"));
@@ -992,18 +1007,35 @@ fn validate_shape(
                             .slots
                             .get(parameter.0)
                             .ok_or_else(|| invalid("unknown callee parameter slot"))?;
-                        let (expected, parameter_borrowed) = slot_type(parameter)?;
-                        let (actual, argument_borrowed) = slot_type(get_slot(argument)?)?;
-                        if argument == *dst
-                            || actual != expected
-                            || parameter_borrowed
-                            || (argument_borrowed && !copy_type(actual))
-                        {
-                            return Err(invalid(
-                                "Start argument type or ownership does not match parameter",
-                            ));
+                        let argument_slot = get_slot(argument)?;
+                        let consumed = match (&parameter.ty, &argument_slot.ty) {
+                            (TaskSlotType::Callable { .. }, TaskSlotType::Callable { .. })
+                                if parameter.ty == argument_slot.ty =>
+                            {
+                                true
+                            }
+                            (
+                                TaskSlotType::Value {
+                                    ty: expected,
+                                    borrowed: false,
+                                },
+                                TaskSlotType::Value {
+                                    ty: actual,
+                                    borrowed,
+                                },
+                            ) if actual == expected && (!*borrowed || copy_type(actual)) => {
+                                !copy_type(actual)
+                            }
+                            _ => {
+                                return Err(invalid(
+                                    "Start argument type or ownership does not match parameter",
+                                ))
+                            }
+                        };
+                        if argument == *dst {
+                            return Err(invalid("Start argument aliases its destination"));
                         }
-                        if !copy_type(actual) {
+                        if consumed {
                             if moved & bit(argument) != 0 {
                                 return Err(invalid(
                                     "Start cannot consume an owned argument twice",
@@ -2302,16 +2334,25 @@ fn validate_ownership_and_plan(
         slots: slots(frame),
         suspensions,
         indirect_calls: Vec::new(),
+        callable_parameters: Vec::new(),
         finally: TaskFinallyPlan::default(),
     })
+}
+
+struct CallableFlow {
+    calls: Vec<TaskIndirectCallPlan>,
+    arguments: Vec<(usize, SlotId, u64)>,
 }
 
 fn callable_call_plan(
     function: &TaskFunction,
     program: &TaskProgram,
     ids: &HashMap<TaskFunctionId, usize>,
+    seeds: &[u64; 64],
+    admitted: bool,
+    collect_arguments: bool,
     budget: &mut Budget,
-) -> KuResult<Vec<TaskIndirectCallPlan>> {
+) -> KuResult<CallableFlow> {
     let callable_slots: Vec<_> = function
         .slots
         .iter()
@@ -2321,35 +2362,50 @@ fn callable_call_plan(
         })
         .collect();
     if callable_slots.is_empty() {
-        return Ok(Vec::new());
+        return Ok(CallableFlow {
+            calls: Vec::new(),
+            arguments: Vec::new(),
+        });
     }
     budget.spend_many(function.slots.len())?;
     // Each cell is a subset of at most 64 verified program functions. The
     // work-list charges every visited op and merged cell to the shared budget.
     let mut inputs = vec![None::<[u64; 64]>; function.states.len()];
-    inputs[function.entry.0] = Some([0; 64]);
+    inputs[function.entry.0] = Some(*seeds);
     let mut queued = vec![false; function.states.len()];
     queued[function.entry.0] = true;
     let mut pending = VecDeque::from([function.entry]);
-    let transfer = |facts: &mut [u64; 64], operation: &TaskOp| match operation {
-        TaskOp::InitCallable { dst, function } => facts[dst.0] = 1u64 << ids[function],
-        TaskOp::CloneCallable { dst, src } => facts[dst.0] = facts[src.0],
-        TaskOp::Move { dst, src }
-            if matches!(function.slots[src.0].ty, TaskSlotType::Callable { .. }) =>
-        {
-            facts[dst.0] = facts[src.0];
-            facts[src.0] = 0;
-        }
-        TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => facts[slot.0] = 0,
-        _ => {}
-    };
+    let transfer =
+        |facts: &mut [u64; 64], operation: &TaskOp, budget: &mut Budget| -> KuResult<()> {
+            match operation {
+                TaskOp::InitCallable { dst, function } => facts[dst.0] = 1u64 << ids[function],
+                TaskOp::CloneCallable { dst, src } => facts[dst.0] = facts[src.0],
+                TaskOp::Move { dst, src }
+                    if matches!(function.slots[src.0].ty, TaskSlotType::Callable { .. }) =>
+                {
+                    facts[dst.0] = facts[src.0];
+                    facts[src.0] = 0;
+                }
+                TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => facts[slot.0] = 0,
+                TaskOp::Start { arguments, .. } => {
+                    budget.spend_many(arguments.len())?;
+                    for slot in arguments {
+                        if matches!(function.slots[slot.0].ty, TaskSlotType::Callable { .. }) {
+                            facts[slot.0] = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
     while let Some(id) = pending.pop_front() {
         budget.spend()?;
         queued[id.0] = false;
         let mut output = inputs[id.0].expect("queued callable state");
         for operation in &function.states[id.0].operations {
             budget.spend()?;
-            transfer(&mut output, operation);
+            transfer(&mut output, operation, budget)?;
         }
         for target in successors(&function.states[id.0].terminator)
             .into_iter()
@@ -2374,12 +2430,31 @@ fn callable_call_plan(
         }
     }
     let mut calls = Vec::new();
+    let mut arguments = Vec::new();
     for (state_id, state) in function.states.iter().enumerate() {
         budget.spend()?;
-        let reachable = inputs[state_id].is_some();
+        let reachable = admitted && inputs[state_id].is_some();
         let mut facts = inputs[state_id].unwrap_or([0; 64]);
         for (operation_id, operation) in state.operations.iter().enumerate() {
             budget.spend()?;
+            if collect_arguments && reachable {
+                if let TaskOp::Start {
+                    function: target,
+                    arguments: values,
+                    ..
+                } = operation
+                {
+                    let target = ids[target];
+                    for (&argument, &parameter) in
+                        values.iter().zip(&program.functions[target].parameters)
+                    {
+                        budget.spend()?;
+                        if matches!(function.slots[argument.0].ty, TaskSlotType::Callable { .. }) {
+                            arguments.push((target, parameter, facts[argument.0]));
+                        }
+                    }
+                }
+            }
             if let TaskOp::StartIndirect { callee, .. } = operation {
                 let targets = if reachable { facts[callee.0] } else { 0 };
                 if reachable && targets == 0 {
@@ -2403,10 +2478,129 @@ fn callable_call_plan(
                     targets: values,
                 });
             }
-            transfer(&mut facts, operation);
+            transfer(&mut facts, operation, budget)?;
         }
     }
-    Ok(calls)
+    Ok(CallableFlow { calls, arguments })
+}
+
+fn plan_callable_parameters(
+    program: &TaskProgram,
+    ids: &HashMap<TaskFunctionId, usize>,
+    frames: &mut [TaskFunctionFrame],
+    budget: &mut Budget,
+) -> KuResult<()> {
+    let has_parameters = program.functions.iter().any(|function| {
+        function
+            .parameters
+            .iter()
+            .any(|slot| matches!(function.slots[slot.0].ty, TaskSlotType::Callable { .. }))
+    });
+    if !has_parameters {
+        for (function, frame) in program.functions.iter().zip(frames) {
+            if function
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.ty, TaskSlotType::Callable { .. }))
+            {
+                frame.indirect_calls =
+                    callable_call_plan(function, program, ids, &[0; 64], true, false, budget)?
+                        .calls;
+            }
+        }
+        return Ok(());
+    }
+    let mut parameters = Vec::with_capacity(program.functions.len());
+    for function in &program.functions {
+        let mut callable = Vec::new();
+        for &slot in &function.parameters {
+            budget.spend()?;
+            if matches!(function.slots[slot.0].ty, TaskSlotType::Callable { .. }) {
+                callable.push(slot);
+            }
+        }
+        parameters.push(callable);
+    }
+    budget.spend_many(
+        program
+            .functions
+            .len()
+            .checked_mul(64)
+            .ok_or_else(|| invalid("callable summary work overflow"))?,
+    )?;
+    // Every summary cell only gains bits from an actual admitted Start site.
+    // There are at most 64 functions * 64 slots * 64 identities. Each work-list
+    // visit, local fixed-point cell and propagation is charged to the existing
+    // shared analysis budget; no recursion or signature-universe fallback.
+    let mut seeds = vec![[0u64; 64]; program.functions.len()];
+    let mut queued = vec![false; program.functions.len()];
+    let mut pending = VecDeque::new();
+    for (index, slots) in parameters.iter().enumerate() {
+        if slots.is_empty() {
+            pending.push_back(index);
+            queued[index] = true;
+        }
+    }
+    while let Some(index) = pending.pop_front() {
+        budget.spend()?;
+        queued[index] = false;
+        budget.spend_many(parameters[index].len())?;
+        if parameters[index]
+            .iter()
+            .any(|slot| seeds[index][slot.0] == 0)
+        {
+            continue;
+        }
+        let flow = callable_call_plan(
+            &program.functions[index],
+            program,
+            ids,
+            &seeds[index],
+            true,
+            true,
+            budget,
+        )?;
+        for (target, slot, identities) in flow.arguments {
+            budget.spend()?;
+            let combined = seeds[target][slot.0] | identities;
+            if combined != seeds[target][slot.0] {
+                seeds[target][slot.0] = combined;
+                if !queued[target] {
+                    queued[target] = true;
+                    pending.push_back(target);
+                }
+            }
+        }
+    }
+    for (index, (function, frame)) in program.functions.iter().zip(frames).enumerate() {
+        budget.spend_many(parameters[index].len())?;
+        let admitted = parameters[index]
+            .iter()
+            .all(|slot| seeds[index][slot.0] != 0);
+        frame.indirect_calls = callable_call_plan(
+            function,
+            program,
+            ids,
+            &seeds[index],
+            admitted,
+            false,
+            budget,
+        )?
+        .calls;
+        for &slot in &parameters[index] {
+            let mut targets = Vec::new();
+            for (target, function) in program.functions.iter().enumerate() {
+                budget.spend()?;
+                if seeds[index][slot.0] & (1u64 << target) != 0 {
+                    targets.push(function.id);
+                }
+            }
+            frame
+                .callable_parameters
+                .push(TaskCallableParameterPlan { slot, targets });
+        }
+    }
+    Ok(())
 }
 
 fn validate_start_graph(
@@ -2420,6 +2614,13 @@ fn validate_start_graph(
     let mut edges = vec![Vec::new(); program.functions.len()];
     let mut incoming = vec![0usize; program.functions.len()];
     for (index, function) in program.functions.iter().enumerate() {
+        if plans[index]
+            .callable_parameters
+            .iter()
+            .any(|parameter| parameter.targets.is_empty())
+        {
+            continue;
+        }
         for state in &function.states {
             budget.spend()?;
             for operation in &state.operations {
@@ -2698,11 +2899,9 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
         )?;
         frame.finally = finally;
         frame.scope_exits = scope_exits;
-        if masks.callables != 0 {
-            frame.indirect_calls = callable_call_plan(function, program, &ids, &mut budget)?;
-        }
         functions.push(frame);
     }
+    plan_callable_parameters(program, &ids, &mut functions, &mut budget)?;
     validate_start_graph(program, &ids, &functions, &mut budget)?;
     Ok(TaskFramePlan { functions })
 }

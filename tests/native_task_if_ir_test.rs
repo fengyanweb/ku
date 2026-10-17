@@ -1375,7 +1375,7 @@ async fn main(): null! {
 
     for source in [
         "async fn F(): int! { return ok(1) } async fn main(): null! { selected = F selected = F return ok(null) }",
-        "async fn F(op: async fn(): int!): int! { return (await op()) } async fn main(): null! { return ok(null) }",
+        "async fn Leaf(): int! { return ok(1) } async fn F(op: async fn(): int!): int! { return (await op()) } async fn main(): null! { selected = F result = await selected(Leaf) return ok(null) }",
         "async fn main(): null! { captured = 1 selected = (): int => captured return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).expect_err("outside the bounded callable group");
@@ -1416,4 +1416,79 @@ fn native_task_finally_source_nesting_and_local_name_clones_keep_existing_limits
             .contains("source text beyond the Task literal budget"),
         "{error}"
     );
+}
+
+#[test]
+fn native_task_callable_parameters_propagate_only_proved_ids_across_helpers() {
+    let source = r#"
+async fn First(value: int): int! { return ok(value + 1) }
+async fn Second(value: int): int! { return ok(value + 2) }
+async fn Apply(selected: async fn(int): int!, value: int): int! {
+    return await selected(value)
+}
+async fn Forward(selected: async fn(int): int!, value: int): int! {
+    return await Apply(selected, value)
+}
+async fn Unused(value: int): int! { return await Forward(First, value) }
+async fn Dormant(selected: async fn(int): int!, value: int): int! {
+    return await selected(value)
+}
+async fn main(): null! {
+    println((await Forward(First, 1))?)
+    println((await Forward(Second, 2))?)
+    return ok(null)
+}
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    let expected = vec![task::TaskFunctionId(0), task::TaskFunctionId(1)];
+    for index in [2, 3] {
+        assert_eq!(plan.functions[index].callable_parameters.len(), 1);
+        assert_eq!(plan.functions[index].callable_parameters[0].slot, SlotId(0));
+        assert_eq!(
+            plan.functions[index].callable_parameters[0].targets,
+            expected
+        );
+    }
+    assert_eq!(plan.functions[2].indirect_calls.len(), 1);
+    assert_eq!(plan.functions[2].indirect_calls[0].targets, expected);
+    // Unused has the same leaf signature, but never crosses a callable argument
+    // boundary. Adding it as a candidate would invent Apply -> Unused -> Forward
+    // -> Apply recursion and reject this valid program.
+    assert!(plan.functions[5].callable_parameters[0].targets.is_empty());
+    assert!(plan.functions[5].indirect_calls[0].targets.is_empty());
+
+    let mut uninitialized = native.tasks.clone();
+    uninitialized.functions[5].parameters.remove(0);
+    assert!(task::verify_and_plan(&uninitialized, Default::default()).is_err());
+
+    let recursive = source.replace(
+        "async fn Second(value: int): int! { return ok(value + 2) }",
+        "async fn Second(value: int): int! { return await Forward(Second, value) }",
+    );
+    let error = task_lower::lower_program(&checked(&recursive)).unwrap_err();
+    assert!(error.message.contains("recursive Start graph"), "{error}");
+
+    let higher_order = source.replace(
+        "println((await Forward(First, 1))?)",
+        "selected = Forward println((await selected(First, 1))?)",
+    );
+    let error = task_lower::lower_program(&checked(&higher_order)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("higher-order helper as a function value"),
+        "{error}"
+    );
+
+    assert!(task::verify_and_plan(
+        &native.tasks,
+        TaskLimits {
+            max_analysis_work: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap_err()
+    .message
+    .contains("analysis work limit exceeded"));
 }

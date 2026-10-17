@@ -150,10 +150,10 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 仅由 native C 的显式 async main 子集选用；同步 IR、LLVM 不通过清除 async 标志回退。
 
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
-及对应单层 Result，以及 move-only `Task { result }` 槽。操作显式区分 Init、Copy、Move、
+及对应单层 Result、move-only `Task { result }` 与无捕获 `Callable` 槽。操作显式区分 Init、Copy、Move、
 WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print、ScopeEnter；控制边包括 Jump、Branch、Suspend
 （resume / cleanup）、Await、TryResult、ScopeDrain、Complete、内部 Exit 和 Terminate。
-暂不支持 array/object/struct/enum、函数值、Task 参数/返回或借用参数进入 frame。
+array/object/struct/enum、Task 参数/返回或借用参数仍不支持进入 frame；Callable 的有限局部与形参扩展见下文。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
 初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
@@ -426,7 +426,7 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
-展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
+展开后所有顶层 item 必须是非泛型 async 函数；普通值参数和返回限 primitive/单层 Result，另支持下述有限 Callable 形参。
 支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
 普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、捕获闭包、函数值参数/返回、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -473,6 +473,19 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 取消和timer进入全局，已在本地的queued槽可原位提升，保持一个queue credit。
 全局优先并在连续8次全局选择后提供一次本地机会；原Marker进展断言未放宽。
 仍使用一个mutex，不宣称锁竞争或性能已改善；Frame5/Control2保持，旧C需重编译。
+
+### Callable 参数的精确入口集合
+
+直接 Start 可以移动 Callable 实参到对应形参；间接 callee 自身的签名仍只含普通值，
+不扩展函数值返回或通用高阶递归类型。TaskFunctionFrame 的 callable_parameters
+记录形参槽与已证明 ID 集合；有界 fixedpoint 将 direct Start 的实参事实传给接收者，
+helper 多跳传播后再固定间接边和无环检查。每次转移、参数扫描都沿原分析预算计费。
+
+frame init 与各 adapter 入口共用形参静态 predicate。验证计划之外的 ID 在任何其他
+Owned move、reserve 或 calloc 前拒绝；ID0不是空值，是否拥有值继续由初始化位表示。
+Callable 参数按 uint32 ID move/drop/restore，不使用同步 Closure env ABI，不新增堆分配。
+原始 factory 只接受已证明集合，没有入边的空集合拒绝全部输入，不捏造同签名候选。
+Frame5/Control2/Driver10以及现有Result outcome kinds保持。
 
 ### 源码 try/catch 与 Error 字段计费
 
