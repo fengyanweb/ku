@@ -1773,11 +1773,33 @@ static void blocking_setup(size_t capacity,size_t dynamic_budget) {
 }
 static void blocking_finish(uint64_t deadline) {
   CHECK(ku_task_driver_shutdown(&blocking_driver,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_blocking_finish(&blocking_pool,deadline)==KU_TASK_DRIVER_OK);
+  uint32_t finished=ku_task_blocking_finish(&blocking_pool,deadline);
+  if (finished!=KU_TASK_DRIVER_OK) fprintf(stderr,
+      "blocking finish status=%u deadline=%llu now=%llu exited=%zu created=%zu joined=%zu\n",
+      finished,(unsigned long long)deadline,(unsigned long long)ku_task_driver_now_ms(),
+      blocking_pool.workers_exited,blocking_pool.workers_created,blocking_pool.workers_joined);
+  CHECK(finished==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_join(&blocking_driver,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_destroy(&blocking_driver)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_event_destroy(&fixture_io_entered)); CHECK(ku_test_event_destroy(&fixture_io_release));
   FixtureLedger ledger=fixture_ledger(); CHECK(!ledger.allocations && !ledger.bytes && !ledger.overflow);
+}
+/* Logical EXITED precedes the native OS-return tail. This independent
+ * observer is used only after a late case has already proved timeout/ACK. */
+static void blocking_finish_late(uint64_t deadline) {
+  CHECK(blocking_driver.shutdown_deadline==deadline);
+#if defined(_WIN32)
+  CHECK(blocking_pool.workers_created==1u && blocking_driver.workers_created==1u);
+  CHECK(WaitForSingleObject(blocking_pool.workers[0].thread,2000)==WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(blocking_driver.workers[0].thread,2000)==WAIT_OBJECT_0);
+#else
+  alarm(2);
+#endif
+  CHECK(blocking_driver.shutdown_deadline==deadline);
+  blocking_finish(deadline);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
 }
 static KuTaskValueV1 blocking_start(const char* name) {
   KuString path=ku_string_static((const uint8_t*)name,strlen(name));
@@ -1896,7 +1918,7 @@ static void blocking_late_retirement_keeps_original_deadline(void) {
   uint8_t bytes[18]={0}; CHECK(fread(bytes,1,sizeof(bytes),file)==17u && !memcmp(bytes,"owned copy 世界",17u));
   CHECK(fclose(file)==0);
   CHECK(fixture_original_path_freed==1u && fixture_original_content_freed==1u);
-  CHECK(remove("late.txt")==0); blocking_finish(deadline);
+  CHECK(remove("late.txt")==0); blocking_finish_late(deadline);
 }
 static void blocking_close_skips_queued_files(void) {
   blocking_setup(2,3u*sizeof(KuTaskInstance_0)+1024u); fixture_gate_io=1;
@@ -2018,7 +2040,7 @@ static void blocking_read_cancel_holds_real_output_until_done(void) {
   CHECK(!ku_task_blocking_lock(&blocking_pool)); observer=blocking_observation_deadline();
   while (blocking_pool.workers_exited!=blocking_pool.workers_created) CHECK(ku_task_blocking_wait(&blocking_pool,observer)==0);
   ku_task_blocking_unlock(&blocking_pool);
-  CHECK(remove("read-cancel.txt")==0); blocking_finish(deadline);
+  CHECK(remove("read-cancel.txt")==0); blocking_finish_late(deadline);
 }
 static void blocking_read_done_cancellation_drops_owned_output(void) {
   blocking_setup(1,100000u+2u*sizeof(KuTaskInstance_2));
@@ -2178,17 +2200,7 @@ static void blocking_exists_cancel_retires_actual_job_with_original_deadline(voi
   ku_task_blocking_unlock(&blocking_pool);
   CHECK(!blocking_driver_snapshot().resident&&!blocking_driver_snapshot().reserved_bytes);
   CHECK(remove("exists-input.txt")==0);
-#if defined(_WIN32)
-  // An expired D is never renewed to wait for the native OS-return tail.
-  CHECK(WaitForSingleObject(blocking_pool.workers[0].thread,2000)==WAIT_OBJECT_0);
-  CHECK(WaitForSingleObject(blocking_driver.workers[0].thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
-#endif
-  blocking_finish(deadline);
-#if !defined(_WIN32)
-  alarm(0);
-#endif
+  blocking_finish_late(deadline);
 }
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
