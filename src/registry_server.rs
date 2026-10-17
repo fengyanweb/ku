@@ -269,6 +269,7 @@ impl RegistryServer {
                         queued.deadline,
                         None,
                         None,
+                        ConnectionWorkTiming::default(),
                     );
                     continue;
                 }
@@ -727,6 +728,14 @@ struct ConnectionEvidence {
     elapsed_ms: u128,
     deadline_expired: bool,
     status: Option<u16>,
+    dispatch_elapsed_ms: Option<u128>,
+    response_write_elapsed_ms: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectionWorkTiming {
+    dispatch_elapsed_ms: Option<u128>,
+    response_write_elapsed_ms: Option<u128>,
 }
 
 #[cfg(test)]
@@ -792,6 +801,7 @@ fn record_connection_failure(
     deadline: Instant,
     io_kind: Option<io::ErrorKind>,
     status: Option<u16>,
+    work_timing: ConnectionWorkTiming,
 ) {
     let now = Instant::now();
     let evidence = ConnectionEvidence {
@@ -800,16 +810,20 @@ fn record_connection_failure(
         elapsed_ms: now.saturating_duration_since(accepted_at).as_millis(),
         deadline_expired: now >= deadline,
         status,
+        dispatch_elapsed_ms: work_timing.dispatch_elapsed_ms,
+        response_write_elapsed_ms: work_timing.response_write_elapsed_ms,
     };
     // All fields are static classifications or numbers. Do not add a request
     // path, credentials, body, underlying error string, or filesystem path.
     eprintln!(
-        "ku-registry connection_failure phase={:?} io_kind={:?} elapsed_ms={} deadline_expired={} status={:?}",
+        "ku-registry connection_failure phase={:?} io_kind={:?} elapsed_ms={} deadline_expired={} status={:?} dispatch_elapsed_ms={:?} response_write_elapsed_ms={:?}",
         evidence.phase,
         evidence.io_kind,
         evidence.elapsed_ms,
         evidence.deadline_expired,
         evidence.status,
+        evidence.dispatch_elapsed_ms,
+        evidence.response_write_elapsed_ms,
     );
     #[cfg(test)]
     {
@@ -875,6 +889,8 @@ fn handle_connection(
     let tls = StreamOwned::new(connection, stream);
     let mut reader = BufReader::with_capacity(REGISTRY_TLS_INPUT_BUFFER_BYTES, tls);
     let mut quiet_idle_close = false;
+    // A segment stays None until it runs; Some(0) means it ran in under 1ms.
+    let mut work_timing = ConnectionWorkTiming::default();
     for request_number in 1..=MAX_REQUESTS_PER_CONNECTION {
         if Instant::now() >= deadline {
             record_connection_failure(
@@ -888,6 +904,7 @@ fn handle_connection(
                 deadline,
                 None,
                 None,
+                work_timing,
             );
             break;
         }
@@ -924,6 +941,7 @@ fn handle_connection(
                         deadline,
                         Some(error.kind()),
                         None,
+                        work_timing,
                     );
                 }
                 break;
@@ -944,11 +962,15 @@ fn handle_connection(
                         deadline,
                         failure.io_kind,
                         Some(failure.status),
+                        work_timing,
                     );
                 }
-                if let Err(error) =
-                    write_http_response(reader.get_mut(), failure.response(), deadline, 0)
-                {
+                let failure_response = failure.response();
+                let response_write_started = Instant::now();
+                let written = write_http_response(reader.get_mut(), failure_response, deadline, 0);
+                work_timing.response_write_elapsed_ms =
+                    Some(response_write_started.elapsed().as_millis());
+                if let Err(error) = written {
                     record_connection_failure(
                         state,
                         ConnectionPhase::ResponseWrite,
@@ -956,13 +978,17 @@ fn handle_connection(
                         deadline,
                         Some(error.kind()),
                         Some(failure.status),
+                        work_timing,
                     );
                 }
                 break;
             }
         };
         let request_keep_alive = request.keep_alive;
-        let response = match dispatch_request(state, request, &mut reader, deadline) {
+        let dispatch_started = Instant::now();
+        let dispatched = dispatch_request(state, request, &mut reader, deadline);
+        work_timing.dispatch_elapsed_ms = Some(dispatch_started.elapsed().as_millis());
+        let response = match dispatched {
             Ok(response) => response,
             Err(failure) => {
                 log_request_failure(&failure);
@@ -974,11 +1000,15 @@ fn handle_connection(
                         deadline,
                         failure.io_kind,
                         Some(failure.status),
+                        work_timing,
                     );
                 }
-                if let Err(error) =
-                    write_http_response(reader.get_mut(), failure.response(), deadline, 0)
-                {
+                let failure_response = failure.response();
+                let response_write_started = Instant::now();
+                let written = write_http_response(reader.get_mut(), failure_response, deadline, 0);
+                work_timing.response_write_elapsed_ms =
+                    Some(response_write_started.elapsed().as_millis());
+                if let Err(error) = written {
                     record_connection_failure(
                         state,
                         ConnectionPhase::ResponseWrite,
@@ -986,6 +1016,7 @@ fn handle_connection(
                         deadline,
                         Some(error.kind()),
                         Some(failure.status),
+                        work_timing,
                     );
                 }
                 break;
@@ -1000,9 +1031,10 @@ fn handle_connection(
             0
         };
         let response_status = response.status;
-        if let Err(error) =
-            write_http_response(reader.get_mut(), response, deadline, remaining_requests)
-        {
+        let response_write_started = Instant::now();
+        let written = write_http_response(reader.get_mut(), response, deadline, remaining_requests);
+        work_timing.response_write_elapsed_ms = Some(response_write_started.elapsed().as_millis());
+        if let Err(error) = written {
             record_connection_failure(
                 state,
                 ConnectionPhase::ResponseWrite,
@@ -1010,12 +1042,15 @@ fn handle_connection(
                 deadline,
                 Some(error.kind()),
                 Some(response_status),
+                work_timing,
             );
             break;
         }
         if remaining_requests == 0 {
             break;
         }
+        // Never attribute a previous keep-alive request's work to the next attempt.
+        work_timing = ConnectionWorkTiming::default();
     }
     reader.get_mut().sock.set_deadline(deadline);
     reader.get_mut().conn.send_close_notify();
@@ -1028,6 +1063,7 @@ fn handle_connection(
                 deadline,
                 Some(error.kind()),
                 None,
+                work_timing,
             );
         }
     }
@@ -8291,12 +8327,27 @@ mod tests {
             Duration::from_millis(300),
         );
         let mut server = TestServer::start(files.config, files.certificate);
+        let state = server.state.upgrade().expect("live stalled TLS server");
         let stream = TcpStream::connect(registry_test_address(&server.base_url))
             .expect("open stalled TLS socket");
+        wait_for_registry_accepts(
+            &server.accepted_connections,
+            1,
+            Instant::now() + TEST_HTTP_RESPONSE_TIMEOUT,
+        );
         thread::sleep(Duration::from_millis(500));
         let _ = stream.shutdown(Shutdown::Both);
         let started = Instant::now();
         server.stop();
         assert!(started.elapsed() < Duration::from_secs(2));
+        let recorded = state.connection_evidence.lock().unwrap();
+        assert_eq!(recorded.overflow, 0);
+        let handshake = recorded.entries[0].expect("stalled TLS deadline evidence");
+        assert_eq!(handshake.phase, ConnectionPhase::TlsOrFirstHead);
+        assert!(handshake.deadline_expired);
+        for event in recorded.entries[..recorded.len].iter().flatten() {
+            assert_eq!(event.dispatch_elapsed_ms, None);
+            assert_eq!(event.response_write_elapsed_ms, None);
+        }
     }
 }

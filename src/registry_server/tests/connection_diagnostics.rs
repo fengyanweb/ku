@@ -175,17 +175,30 @@ fn authenticated_partial_put_records_expired_dispatch_response_and_close_at_one_
         "the original deadline check is not a fabricated I/O error"
     );
     assert_eq!(dispatch.status, Some(408));
+    assert!(dispatch.dispatch_elapsed_ms.is_some());
+    assert_eq!(dispatch.response_write_elapsed_ms, None);
     let response = evidence.entries[1].expect("response write deadline evidence");
     assert_eq!(response.phase, ConnectionPhase::ResponseWrite);
     assert_eq!(response.io_kind, Some(io::ErrorKind::TimedOut));
     assert_eq!(response.status, Some(408));
+    assert_eq!(response.dispatch_elapsed_ms, dispatch.dispatch_elapsed_ms);
+    assert!(response.response_write_elapsed_ms.is_some());
     let close = evidence.entries[2].expect("close flush deadline evidence");
     assert_eq!(close.phase, ConnectionPhase::CloseFlush);
     assert_eq!(close.io_kind, Some(io::ErrorKind::TimedOut));
     assert_eq!(close.status, None);
+    assert_eq!(close.dispatch_elapsed_ms, response.dispatch_elapsed_ms);
+    assert_eq!(
+        close.response_write_elapsed_ms,
+        response.response_write_elapsed_ms,
+    );
     for event in [dispatch, response, close] {
         assert!(event.deadline_expired);
         assert!(event.elapsed_ms >= request_timeout.as_millis());
+        assert!(event.dispatch_elapsed_ms.unwrap() <= event.elapsed_ms);
+        if let Some(response_write_elapsed_ms) = event.response_write_elapsed_ms {
+            assert!(response_write_elapsed_ms <= event.elapsed_ms);
+        }
     }
     let client = client_result
         .expect("client lifetime retained its real thread")
