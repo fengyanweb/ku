@@ -3,6 +3,83 @@ use super::*;
 const WAIT: Duration = Duration::from_secs(3);
 const CAPTURE_PANIC: &str = "actual blocking capture destructor panic";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BlockingSubmissionCheckpoint {
+    OpenChecked,
+    BeforeUnlock,
+}
+
+type BlockingSubmissionHook = Box<dyn FnMut(BlockingSubmissionCheckpoint)>;
+
+thread_local! {
+    // Installed only by the submitting test thread. Other calls and workers
+    // retain the original path without a scheduler hook or global fixture.
+    static BLOCKING_SUBMISSION_HOOK: RefCell<Option<BlockingSubmissionHook>> = const { RefCell::new(None) };
+}
+
+pub(super) fn blocking_submission_checkpoint(stage: BlockingSubmissionCheckpoint) {
+    BLOCKING_SUBMISSION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+struct BlockingSubmissionHookGuard;
+
+impl BlockingSubmissionHookGuard {
+    fn install(hook: impl FnMut(BlockingSubmissionCheckpoint) + 'static) -> Self {
+        BLOCKING_SUBMISSION_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+        Self
+    }
+}
+
+impl Drop for BlockingSubmissionHookGuard {
+    fn drop(&mut self) {
+        BLOCKING_SUBMISSION_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+fn blocking_submission_child(test_name: &str) -> bool {
+    use crate::registry_server::native_test_harness as bounded_process;
+
+    const CHILD: &str = "KU_BLOCKING_SUBMISSION_CHILD";
+    if std::env::var(CHILD).is_ok_and(|value| value == test_name) {
+        return false;
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, test_name);
+    let output = bounded_process::run_bounded(
+        &mut command,
+        Duration::from_secs(20),
+        bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+    )
+    .expect("blocking submission regression has a bounded subprocess");
+    assert!(
+        output.status.success(),
+        "blocking submission subprocess failed: {:?}\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let completed = format!("blocking submission regression completed {test_name}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == completed),
+        "blocking submission subprocess did not complete\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 struct Release(Option<SyncSender<()>>);
 
 impl Release {
@@ -1315,6 +1392,225 @@ fn actual_blocking_full_rejection_keeps_count_until_both_capture_drops_finish() 
         assert_eq!(pool.inner.running_blocking_jobs.load(Ordering::Acquire), 0);
         assert_eq!(pool.inner.queued_blocking_jobs.load(Ordering::Acquire), 0);
     }
+}
+
+#[test]
+fn shutdown_keeps_admitted_blocking_work_after_late_retirement_before_registry_unlock() {
+    const TEST: &str = "runtime::task::blocking_retirement_tests::shutdown_keeps_admitted_blocking_work_after_late_retirement_before_registry_unlock";
+    if blocking_submission_child(TEST) {
+        return;
+    }
+    struct Capture(Arc<AtomicUsize>);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    let _execution = ExecutionTerminationGuard::enter();
+    let pool = TaskRuntime::with_limits(0, 0, 1, 1, 0);
+    let (mut open_release, open_rx) = Release::pair();
+    let (open_tx, opened) = mpsc::sync_channel(1);
+    let (mut registry_release, registry_rx) = Release::pair();
+    let (retired_tx, retired_rx) = mpsc::sync_channel(1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicBool::new(false));
+    let callback_ran = Arc::clone(&ran);
+    let capture = Capture(Arc::clone(&drops));
+    let submitting_pool = pool.clone();
+    let inner = Arc::clone(&pool.inner);
+    let caller = thread::spawn(move || {
+        let _hook = BlockingSubmissionHookGuard::install(move |stage| match stage {
+            BlockingSubmissionCheckpoint::OpenChecked => {
+                open_tx.send(()).expect("publish real open admission");
+                open_rx
+                    .recv_timeout(WAIT)
+                    .expect("release real open admission");
+            }
+            BlockingSubmissionCheckpoint::BeforeUnlock => {
+                // Receiving the response is not retirement. Observe all real
+                // worker obligations while retaining the actual registry lock.
+                let retired = until(|| {
+                    inner.blocking_metrics.resident.load(Ordering::Acquire) == 0
+                        && inner.queued_blocking_jobs.load(Ordering::Acquire) == 0
+                        && inner.running_blocking_jobs.load(Ordering::Acquire) == 0
+                });
+                retired_tx
+                    .send(retired)
+                    .expect("publish actual blocking retirement");
+                registry_rx
+                    .recv_timeout(WAIT)
+                    .expect("release real registry admission");
+            }
+        });
+        submitting_pool.run_blocking(
+            move || {
+                callback_ran.store(true, Ordering::Release);
+                drop(capture);
+                Ok(Value::Int(7))
+            },
+            Span::default(),
+        )
+    });
+
+    let open_seen = opened.recv_timeout(WAIT).is_ok();
+    let before = (
+        pool.inner.active_tasks.load(Ordering::Acquire),
+        pool.inner.queued_blocking_jobs.load(Ordering::Acquire),
+        pool.inner.running_blocking_jobs.load(Ordering::Acquire),
+        pool.inner.blocking_metrics.resident.load(Ordering::Acquire),
+    );
+    let shutdown_pool = pool.clone();
+    let shutdown = thread::spawn(move || shutdown_pool.cancel_all_and_wait(Duration::ZERO));
+    // This atomic close follows the original initial counter observations.
+    // The shutdown then waits for the submitter's real states mutex.
+    let closed_seen =
+        until(|| pool.inner.producer_gate.load(Ordering::Acquire) & PRODUCER_CLOSED_BIT != 0);
+    open_release.release();
+    let worker_retired = retired_rx.recv_timeout(WAIT).ok();
+    let after_worker = (
+        pool.inner.queued_blocking_jobs.load(Ordering::Acquire),
+        pool.inner.running_blocking_jobs.load(Ordering::Acquire),
+        pool.inner.blocking_metrics.resident.load(Ordering::Acquire),
+    );
+    registry_release.release();
+    let response = caller.join();
+    let shutdown = shutdown.join();
+    let drained = pool.cancel_all_and_wait(WAIT);
+    let empty_zero = pool.cancel_all_and_wait(Duration::ZERO);
+    let final_snapshot = pool.snapshot();
+
+    // All channel gates, callers and worker obligations have been released
+    // before either the old-code failure or the fixed-code result is asserted.
+    eprintln!("blocking admission race open={open_seen} closed={closed_seen} before={before:?} retired={worker_retired:?} after_worker={after_worker:?} response={response:?} shutdown={shutdown:?} drained={drained:?} empty_zero={empty_zero:?} final={final_snapshot:?}");
+    assert!(open_seen && closed_seen);
+    assert_eq!(before, (0, 0, 0, 0));
+    assert_eq!(worker_retired, Some(true));
+    assert_eq!(after_worker, (0, 0, 0));
+    assert_eq!(response.unwrap().unwrap(), Value::Int(7));
+    assert!(ran.load(Ordering::Acquire));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        shutdown.unwrap().unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_eq!(drained.unwrap(), 0);
+    assert_eq!(empty_zero.unwrap(), 0);
+    let final_snapshot = final_snapshot.unwrap();
+    assert_eq!(final_snapshot.accepted_blocking_jobs, 1);
+    assert_eq!(final_snapshot.finished_blocking_jobs, 1);
+    assert_eq!(final_snapshot.resident_blocking_jobs, 0);
+    assert_eq!(final_snapshot.running_blocking_jobs, 0);
+    assert_eq!(final_snapshot.queued_blocking_jobs, 0);
+    eprintln!("blocking submission regression completed {TEST}");
+}
+
+#[test]
+fn shutdown_tracks_early_blocking_capture_drop_without_reopening_closed_prefix() {
+    const TEST: &str = "runtime::task::blocking_retirement_tests::shutdown_tracks_early_blocking_capture_drop_without_reopening_closed_prefix";
+    if blocking_submission_child(TEST) {
+        return;
+    }
+
+    struct HeldCapture {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for HeldCapture {
+        fn drop(&mut self) {
+            let _ = self.entered.try_send(());
+            let released = self.release.recv_timeout(WAIT).is_ok();
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            if !released && !thread::panicking() {
+                panic!("release real early blocking capture");
+            }
+        }
+    }
+
+    let _execution = ExecutionTerminationGuard::enter();
+    let pool = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let independent_empty = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let initially_empty = independent_empty.cancel_all_and_wait(Duration::ZERO);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicBool::new(false));
+    let mut outcomes = Vec::new();
+
+    // First the real no-worker rejection starts before close; then an actual
+    // post-close call drops its captures without reopening the completed prefix.
+    for after_close in [false, true] {
+        let (mut release, release_rx) = Release::pair();
+        let (entered, ready) = mpsc::sync_channel(1);
+        let capture = HeldCapture {
+            entered,
+            release: release_rx,
+            drops: Arc::clone(&drops),
+        };
+        let callback_ran = Arc::clone(&ran);
+        let submitting_pool = pool.clone();
+        let caller = thread::spawn(move || {
+            submitting_pool.run_blocking(
+                move || {
+                    callback_ran.store(true, Ordering::Release);
+                    drop(capture);
+                    Ok(Value::Null)
+                },
+                Span::default(),
+            )
+        });
+        let capture_entered = ready.recv_timeout(WAIT).is_ok();
+        let while_drop = pool.snapshot();
+        let shutdown = pool.cancel_all_and_wait(Duration::ZERO);
+        release.release();
+        let response = caller.join();
+        let drained = pool.cancel_all_and_wait(WAIT);
+        outcomes.push((
+            after_close,
+            capture_entered,
+            while_drop,
+            shutdown,
+            response,
+            drained,
+        ));
+    }
+    let final_empty = pool.cancel_all_and_wait(Duration::ZERO);
+    let final_snapshot = pool.snapshot();
+    eprintln!("early blocking capture outcomes={outcomes:?} initial_empty={initially_empty:?} final_empty={final_empty:?} final={final_snapshot:?}");
+
+    // Cleanup and join both paths before reporting the missing early-drop
+    // responsibility on the original implementation.
+    assert_eq!(initially_empty.unwrap(), 0);
+    assert_eq!(final_empty.unwrap(), 0);
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(!ran.load(Ordering::Acquire));
+    for (after_close, capture_entered, while_drop, shutdown, response, drained) in outcomes {
+        assert!(capture_entered);
+        let while_drop = while_drop.unwrap();
+        assert_eq!(while_drop.active_tasks, 0);
+        assert_eq!(while_drop.resident_blocking_jobs, 0);
+        assert_eq!(while_drop.running_blocking_jobs, 0);
+        assert_eq!(while_drop.queued_blocking_jobs, 0);
+        assert_eq!(
+            error_code(&response.unwrap().unwrap()),
+            Some("blocking_pool_stopped")
+        );
+        if after_close {
+            assert_eq!(shutdown.unwrap(), 0);
+        } else {
+            assert_eq!(
+                shutdown.unwrap_err().code.as_deref(),
+                Some("shutdown_timeout")
+            );
+        }
+        assert_eq!(drained.unwrap(), 0);
+    }
+    let final_snapshot = final_snapshot.unwrap();
+    assert_eq!(final_snapshot.accepted_blocking_jobs, 0);
+    assert_eq!(final_snapshot.finished_blocking_jobs, 0);
+    assert_eq!(final_snapshot.rejected_blocking_jobs, 2);
+    assert_eq!(final_snapshot.resident_blocking_jobs, 0);
+    assert_eq!(final_snapshot.total_submissions, 0);
+    eprintln!("blocking submission regression completed {TEST}");
 }
 
 #[test]

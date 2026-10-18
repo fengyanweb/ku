@@ -380,6 +380,7 @@ struct TaskRuntimeInner {
     wait_edges: Mutex<HashMap<i64, i64>>,
     active_tasks: AtomicUsize,
     producer_gate: AtomicUsize,
+    blocking_producer_gate: AtomicUsize,
     queued_tasks: AtomicUsize,
     queued_blocking_jobs: AtomicUsize,
     running_blocking_jobs: AtomicUsize,
@@ -408,6 +409,10 @@ struct TaskRuntimeInner {
 impl TaskRuntimeInner {
     fn producer_count(&self) -> usize {
         self.producer_gate.load(Ordering::Acquire) & PRODUCER_COUNT_MASK
+    }
+
+    fn blocking_producer_count(&self) -> usize {
+        self.blocking_producer_gate.load(Ordering::Acquire) & PRODUCER_COUNT_MASK
     }
 }
 
@@ -1037,6 +1042,7 @@ impl TaskRuntime {
             wait_edges: Mutex::new(HashMap::new()),
             active_tasks: AtomicUsize::new(0),
             producer_gate: AtomicUsize::new(0),
+            blocking_producer_gate: AtomicUsize::new(0),
             queued_tasks: AtomicUsize::new(0),
             queued_blocking_jobs: AtomicUsize::new(0),
             running_blocking_jobs: AtomicUsize::new(0),
@@ -1662,6 +1668,7 @@ impl TaskRuntime {
         // blocks on its registry lock. Preserve having observed that work so a
         // late last retirement cannot bypass the same absolute deadline.
         let mut observed_outstanding = self.inner.producer_count() != 0
+            || self.inner.blocking_producer_count() != 0
             || self.inner.active_tasks.load(Ordering::Acquire) != 0
             || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
             || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
@@ -1679,6 +1686,11 @@ impl TaskRuntime {
             .fetch_or(PRODUCER_CLOSED_BIT, Ordering::AcqRel);
         // Include admission between the initial observation and atomic close.
         observed_outstanding |= producers_at_close & PRODUCER_COUNT_MASK != 0;
+        let blocking_producers_at_close = self
+            .inner
+            .blocking_producer_gate
+            .fetch_or(PRODUCER_CLOSED_BIT, Ordering::AcqRel);
+        observed_outstanding |= blocking_producers_at_close & PRODUCER_COUNT_MASK != 0;
         let context = CancellationContext::new(TerminationReason::Cancelled);
         let mut context = CancellationContext {
             cleanup_deadline: context.cleanup_deadline.min(deadline),
@@ -1689,6 +1701,8 @@ impl TaskRuntime {
         context = tighten_current_cleanup(context);
         loop {
             let outstanding = self.inner.producer_count() != 0
+                // Observe submission retirement before the resident handoff.
+                || self.inner.blocking_producer_count() != 0
                 || self.inner.active_tasks.load(Ordering::Acquire) != 0
                 || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
                 || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
@@ -1846,8 +1860,24 @@ impl TaskRuntime {
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
+        let producer_admission = ProducerAdmission::begin(&self.inner.blocking_producer_gate);
+        // Even early rejection owns this real callback until its capture Drop.
+        // Move the parameter after the admission guard so it retires first.
+        let callback = run;
         ensure_task_operations_allowed(_span)?;
-        if self.inner.closing.load(Ordering::Acquire) {
+        if matches!(&producer_admission, ProducerAdmission::Overflow) {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(KuError::runtime(
+                "internal blocking producer retirement counter overflow",
+                _span,
+            ));
+        }
+        if matches!(&producer_admission, ProducerAdmission::Closed)
+            || self.inner.closing.load(Ordering::Acquire)
+        {
             self.inner
                 .blocking_metrics
                 .rejected
@@ -1868,8 +1898,8 @@ impl TaskRuntime {
             ));
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        // Share the task admission lock with shutdown's registry snapshot. A
-        // shutdown cannot observe an empty pool just before this submission.
+        // Serialize admission with shutdown's registry snapshot. The separate
+        // producer gate remembers a submission that retires while it waits.
         let admission = self.inner.states.lock().map_err(|_| {
             self.inner
                 .blocking_metrics
@@ -1887,6 +1917,10 @@ impl TaskRuntime {
                 "blocking pool is closing",
             ));
         }
+        #[cfg(test)]
+        blocking_retirement_tests::blocking_submission_checkpoint(
+            blocking_retirement_tests::BlockingSubmissionCheckpoint::OpenChecked,
+        );
         let retirement = BlockingRetirement::new(
             CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().and_then(Weak::upgrade)),
             Arc::clone(&self.inner.blocking_metrics),
@@ -1908,7 +1942,7 @@ impl TaskRuntime {
             .peak_queued
             .fetch_max(queued, Ordering::Relaxed);
         let mut job = BlockingJob {
-            run: Box::new(run),
+            run: Box::new(callback),
             response: response_tx,
             retirement,
         };
@@ -1945,7 +1979,16 @@ impl TaskRuntime {
         // No rejected captures/response fields are destroyed under admission.
         // Snapshot fields are independent observations; only quiescent totals
         // reconcile accepted and finished, never response delivery or Task state.
+        #[cfg(test)]
+        blocking_retirement_tests::blocking_submission_checkpoint(
+            blocking_retirement_tests::BlockingSubmissionCheckpoint::BeforeUnlock,
+        );
         drop(admission);
+        if submitted.is_ok() {
+            // Resident was published before send; retire this submission only
+            // after releasing the registry. Waiting for a reply adds no owner.
+            drop(producer_admission);
+        }
         match submitted {
             Ok(()) => loop {
                 if let Some(context) = current_task_cancellation() {
@@ -1989,10 +2032,11 @@ impl TaskRuntime {
                     }
                 }
             },
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(job)) => {
                 self.inner
                     .queued_blocking_jobs
                     .fetch_sub(1, Ordering::AcqRel);
+                drop(job);
                 Ok(task_error(
                     "queue_full",
                     format!(
@@ -2001,10 +2045,11 @@ impl TaskRuntime {
                     ),
                 ))
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Disconnected(job)) => {
                 self.inner
                     .queued_blocking_jobs
                     .fetch_sub(1, Ordering::AcqRel);
+                drop(job);
                 Ok(task_error(
                     "blocking_pool_stopped",
                     "blocking pool is stopped",
