@@ -658,7 +658,32 @@ impl HttpIoReply {
             response,
             trace: self.trace,
         }) {
-            Ok(()) => self.wake.notify(),
+            Ok(()) => {
+                if let Some(flight) = &self.flight {
+                    // A return from try_send proves local acceptance, not
+                    // receiver acknowledgement. The reactor may have already
+                    // observed the completion before this thread resumes.
+                    flight.mark(Stage::PublishReturned);
+                    flight.mark(Stage::WakeAttempt);
+                }
+                let result = self.wake.notify();
+                if let Some(flight) = &self.flight {
+                    match &result {
+                        Ok(()) => {
+                            // A successful notify return is not an observation
+                            // acknowledgement from the receiving reactor.
+                            flight.mark(Stage::WakeReturned);
+                            if let Some(snapshot) = flight.snapshot(Stage::WakeReturned) {
+                                emit_flight(snapshot);
+                            }
+                        }
+                        Err(_) => {
+                            flight.observe_anomaly_at(Stage::WakeFailed, Instant::now());
+                        }
+                    }
+                }
+                result
+            }
             Err(TrySendError::Disconnected(_)) => {
                 if let Some(flight) = &self.flight {
                     flight.mark(Stage::LateReply);
@@ -2216,6 +2241,8 @@ mod buffer_tests {
         };
         let mut first = request(42);
         let mut job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        let published_flight = FlightRecord::new(Some(42), Instant::now(), job.deadline);
+        job.reply.flight = Some(Arc::clone(&published_flight));
         assert_eq!(counters.queued.load(Ordering::Acquire), 0);
         assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 0);
         job.reply.handler_started();
@@ -2226,6 +2253,15 @@ mod buffer_tests {
         job.reply
             .respond(job.token, status_response(200, "PRIVATE_BODY"))
             .unwrap();
+        for stage in [
+            Stage::Published,
+            Stage::PublishReturned,
+            Stage::WakeAttempt,
+            Stage::WakeReturned,
+        ] {
+            assert!(published_flight.checkpoint_ns(stage).is_some(), "{stage:?}");
+        }
+        assert!(published_flight.checkpoint_ns(Stage::WakeFailed).is_none());
         let mut response = String::new();
         first.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 "));
@@ -2262,6 +2298,51 @@ mod buffer_tests {
         assert!(output.contains("request_id=99 origin=reactor_handler_expired status=504"));
         assert!(output.contains("request_id=99 origin=late_reply status=504"));
         assert!(!output.contains("PRIVATE"));
+
+        // A real cap-1 channel accepts the completion even when the following
+        // wake write fails. Preserve that original error return and distinguish
+        // it from a failed publish; no reactor acknowledgement is assumed.
+        let wake = netpoll::WakePair::new().unwrap();
+        wake.sender.shutdown().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let token = HttpIoToken {
+            slot: 0,
+            generation: 1,
+        };
+        let now = Instant::now();
+        let failed_wake_flight = FlightRecord::new(Some(100), now, now + Duration::from_secs(1));
+        let reply = HttpIoReply {
+            token,
+            sender,
+            wake: wake.sender.clone(),
+            input_charge: budget.charge(0).unwrap(),
+            trace: None,
+            trace_config: None,
+            handler_credit: None,
+            flight: Some(Arc::clone(&failed_wake_flight)),
+        };
+        assert!(reply
+            .respond(token, status_response(200, "channel accepted"))
+            .is_err());
+        let completion = receiver.try_recv().unwrap();
+        assert_eq!(completion.token, token);
+        for stage in [
+            Stage::Published,
+            Stage::PublishReturned,
+            Stage::WakeAttempt,
+            Stage::WakeFailed,
+        ] {
+            assert!(
+                failed_wake_flight.checkpoint_ns(stage).is_some(),
+                "{stage:?}"
+            );
+        }
+        assert!(failed_wake_flight
+            .checkpoint_ns(Stage::WakeReturned)
+            .is_none());
+        assert!(failed_wake_flight.checkpoint_ns(Stage::Observed).is_none());
+        drop(completion);
+        assert_eq!(budget.snapshot().current, 0);
     }
 
     #[test]

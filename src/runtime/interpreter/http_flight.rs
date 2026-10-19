@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const STAGES: usize = 20;
+const STAGES: usize = 24;
 const MAX_SNAPSHOTS: usize = 32;
 const CPU_SAMPLE_INTERVAL_NS: u64 = 1_000_000;
 const PROGRESS_GAP_NS: u64 = 50_000_000;
@@ -30,6 +30,10 @@ pub(super) enum Stage {
     ReactorExpired,
     Finished,
     Published,
+    PublishReturned,
+    WakeAttempt,
+    WakeReturned,
+    WakeFailed,
     Observed,
     WriteStart,
     WriteEnd,
@@ -56,7 +60,13 @@ impl Stage {
             Self::InterpreterExpired => "interpreter_expired",
             Self::ReactorExpired => "reactor_expired",
             Self::Finished => "finished",
-            Self::Published => "published",
+            Self::Published => "publish_attempt",
+            // Sender/notify return timestamps are local observations, not
+            // receiver acknowledgements. Observed may precede either return.
+            Self::PublishReturned => "publish_returned",
+            Self::WakeAttempt => "wake_attempt",
+            Self::WakeReturned => "wake_returned",
+            Self::WakeFailed => "wake_failed",
             Self::Observed => "observed",
             Self::WriteStart => "write_start",
             Self::WriteEnd => "write_end",
@@ -82,6 +92,10 @@ const ALL_STAGES: [Stage; STAGES] = [
     Stage::ReactorExpired,
     Stage::Finished,
     Stage::Published,
+    Stage::PublishReturned,
+    Stage::WakeAttempt,
+    Stage::WakeReturned,
+    Stage::WakeFailed,
     Stage::Observed,
     Stage::WriteStart,
     Stage::WriteEnd,
@@ -197,6 +211,13 @@ impl FlightRecord {
 
     pub(super) fn mark(&self, stage: Stage) {
         self.mark_at(stage, Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(super) fn checkpoint_ns(&self, stage: Stage) -> Option<u64> {
+        let bit = 1_u32 << stage as usize;
+        (self.recorded_stages.load(Ordering::Relaxed) & bit != 0)
+            .then(|| self.stages[stage as usize].load(Ordering::Acquire))
     }
 
     // Diagnostic classification only; this must not extend, replace or decide
@@ -517,6 +538,13 @@ mod tests {
         record.mark_at(Stage::Dequeued, ready + Duration::from_millis(3));
         record.mark_at(Stage::ActualHandlerStart, ready + Duration::from_millis(4));
         record.mark_at(Stage::Dequeued, ready + Duration::from_millis(9));
+        record.mark_at(Stage::Published, ready + Duration::from_millis(12));
+        // The receiving thread can observe the queued completion before the
+        // sender records try_send's return. Do not impose a cross-thread order.
+        record.mark_at(Stage::Observed, ready + Duration::from_millis(13));
+        record.mark_at(Stage::PublishReturned, ready + Duration::from_millis(14));
+        record.mark_at(Stage::WakeAttempt, ready + Duration::from_millis(15));
+        record.mark_at(Stage::WakeReturned, ready + Duration::from_millis(16));
         record.progress(ready + Duration::from_millis(10));
         record.progress(ready + Duration::from_millis(90));
         record.progress(ready + Duration::from_millis(110));
@@ -538,6 +566,18 @@ mod tests {
                 3_000_000
             );
             let ready_ns = snapshot.stages[Stage::Ready as usize];
+            assert!(
+                snapshot.stages[Stage::Observed as usize]
+                    < snapshot.stages[Stage::PublishReturned as usize]
+            );
+            assert_eq!(
+                snapshot.stages[Stage::Published as usize] - ready_ns,
+                12_000_000
+            );
+            assert_eq!(
+                snapshot.stages[Stage::WakeReturned as usize] - ready_ns,
+                16_000_000
+            );
             assert_eq!(snapshot.gap_end_ns - snapshot.gap_start_ns, 80_000_000);
             assert_eq!(snapshot.previous_poll_ns - ready_ns, 110_000_000);
             assert_eq!(snapshot.last_pre_deadline_poll_ns - ready_ns, 90_000_000);
@@ -560,6 +600,7 @@ mod tests {
         // handler expiry; a later failure on another request cannot replace it.
         assert!(first.claim_anomaly(Stage::SlowResponse, ready));
         assert!(!second.claim_anomaly(Stage::WriteFailed, ready));
+        assert!(!second.claim_anomaly(Stage::WakeFailed, ready));
         assert!(!first.claim_anomaly(Stage::SlowResponse, ready));
         assert!(first.claim_anomaly(Stage::WriteExpired, ready));
         assert_eq!(
@@ -605,6 +646,12 @@ mod tests {
         assert!(output.contains("request_id=42 reason=ready"));
         assert!(output.contains("planned_deadline_ns="));
         assert!(output.contains("enqueue_returned_ns="));
+        assert!(output.contains("publish_attempt_ns="));
+        assert!(output.contains("publish_returned_ns="));
+        assert!(output.contains("wake_attempt_ns="));
+        assert!(output.contains("wake_returned_ns="));
+        assert!(output.contains("wake_failed_ns="));
+        assert!(!output.contains(" published_ns="));
         assert!(output.contains("last_pre_deadline_poll_ns="));
         assert!(output.contains("cross_deadline_gap_start_ns="));
         assert!(output.contains("slow_response_ns="));
