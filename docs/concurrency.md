@@ -11,6 +11,10 @@ Ku 的用户级并发模型保持简单：业务代码通过 `async fn` 启动�
 - `await task?` 等价于 `(await task)?`。
 - HTTP server 内部可以使用 task，但普通 handler 不需要管理 task。
 
+## 进程内存限制
+
+`ku supervise` 以整个程序为 worker 单元，由 Linux cgroup v2 或 Windows Job Object 执行内存限制；运行时账本和单 Task 预算仍分别计量。第三方库在 worker 内的分配也受对应系统指标约束。原生 macOS 暂不提供此模式，明确拒绝启动；详见 [进程执行与内存限制](process-execution.md)。
+
 ## Task 作用域与取消合同
 
 v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。完整合同见

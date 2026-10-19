@@ -865,6 +865,8 @@ Usage:
   ku init --template <template>
                         Initialize the current directory from a template
   ku template list      List built-in project templates
+  ku supervise [limits] -- <entry>...
+                        Run isolated workers with OS memory limits (see --help)
   ku run [--locked|--offline] [file.ku]
                         Run a package entry or Ku source file
   ku check [--locked|--offline] [file.ku]
@@ -937,6 +939,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
         Some("create") => run_create_command(&args),
         Some("init") => run_init_command(&args),
         Some("template") => run_template_command(&args),
+        Some("supervise") => crate::process_execution::run_supervise_command(&args),
         Some("run") => {
             if args.get(2).is_some_and(|arg| arg == "build") {
                 return Err(command_error(
