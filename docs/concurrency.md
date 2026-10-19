@@ -174,7 +174,7 @@ async fn main(): null! {
 
 仍拒绝嵌套数组、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写与 exists 以外的异步标准库 I/O。
+float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写、exists 与 read_dir 以外的异步标准库 I/O。
 finally 体只接有限 primitive/字符串/Error 操作、Copy 与现有 Owned 值赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
@@ -254,7 +254,7 @@ vector 按实际 capacity 而非 len 计费；Owned 字符串叶子另外按实�
 快照部分构造即登记到持久 frame，复制失败只释放已完成叶子和 vector，不能提前退款。
 continue 保留快照进入原 latch；break/正常结束释放快照；return/fail/取消沿原清理顺序
 与绝对 D 处理当前元素、快照及来源。循环回边仍有 Suspend，原64槽/16KB frame、分析及
-总字节预算不提高。数组宽度受既有槽位限制；嵌套、push、
+总字节预算不提高。数组字面量最多64个元素；运行期目录数组最多10000项，不等于增加 frame 槽位。嵌套、push、
 索引写入与捕获尚未开放，finally 体中的循环也仍拒绝。参数准入先检查 header、vector
 及活跃字符串叶子的范围与已知别名，再一次累计实际容量；失败不留下部分所有权移交。
 
@@ -278,8 +278,8 @@ async fn main(): null! {
 ```
 
 内部 outcome kinds1–4保持，5/6/7分别是三类数组结果；旧 union 的大小、对齐和偏移
-由 C 编译期断言核对。Frame5/Control2/Driver10及原预算不变，数组 capacity 仍最多64。
-这不表示 read_dir 已接通；目录接口原有更大输出上限需要另行完成容量和遍历预算。
+由 C 编译期断言核对。Frame5/Control2/Driver10及原预算不变，数组字面量仍最多64个元素；
+运行期数组可承载最多10000项的 read_dir 结果，返回、传参、clone 与遍历按实际容量和字符串叶子计费。
 
 ### Native 函数值参数
 
@@ -311,14 +311,14 @@ Result 成功分支先验证完整 vector 并计入实际容量，错误分支�
 原始 C factory 只接受验证计划中已证明到达该形参的 ID；没有已证明来源的入口没有
 可接纳 ID，不能据此推导开放的外部函数指针 API。原64函数/64槽和分析预算不变。
 
-### Native 文件读写的固定后台池
+### Native 文件与目录操作的固定后台池
 
 `import fs from "std.fs"` 后，async 函数可直接使用 `fs.read(path)?` / `fs.try_read(path)?`
 取得 `str!`，或以 `fs.write(path, content)?` / `fs.try_write(path, content)?` 取得 `null!`。
 调用本身可挂起，无需增加 await。View 输入不被消耗，参数按顺序求值一次，等待期间
 只持有原值和独立的后台副本。固定 worker 数沿用目标系统的
 `min(32, max(4, CPU 核心数))` 策略，job 表与队列上限1024，不新增公开配置。
-没有上述文件调用的程序不建立该池。read_dir、网络和其他阻塞操作不属于这一入口。
+没有上述文件或目录调用的程序不建立该池。网络和未列出的其他阻塞操作仍不属于这一入口。
 
 原生路径转换（包括 Windows 临时 UTF-16 缓冲）与内容复制在每次实际分配前计费；
 pool 固定存储按真实 sizeof 纳入 driver fixed_bytes。副本尚未退休时，finally 中的
@@ -356,6 +356,8 @@ async fn main(): null! {
 缺失、无效路径及 metadata 失败为 false。队列满、关闭、配额或分配失败保持 Task 运行错误，
 不能冒充不存在。它仅持有原生路径副本，不分配输出堆对象；真实查询和句柄关闭完成后
 才退休 job、释放费用并允许 ACK，取消与晚完成不续原 D。
+
+`fs.read_dir(path): [str]!` 也经同一后台池挂起恢复，保留 View 输入；结果按路径排序，沿用最多 10000 项及路径文本合计 1000000 字节的目录上限。目录 vector、字符串叶子、平台路径临时区和分配记录在分配前计入原 Task 字节预算；扩容期间新旧容量同时计费，原预算可能先拒绝，目录上限不是保证接纳。worker 关闭目录句柄后移交独立持有的结果，取消或迟到完成清理实际分配后才退款，不强行打断已经开始的 OS 调用。
 
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、通用 Task 网络等待/netpoll、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；HTTP 的单 I/O 线程接入见下文。
@@ -401,7 +403,11 @@ v0.0.18 开发分支的解释器 HTTP 已将 socket 读取、等待 handler、�
 
 native C HTTP 也已接通 Linux/macOS 的 poll 与 Windows 的 WSAPoll。调用 listen 的线程独占接受连接、请求读取、分段响应写出及 socket 关闭；完整请求输入独立持有后交给既有的最多64个 handler worker，等待读写不占用 handler worker。连接槽位在队列/worker 的实际 job 引用归还后才复用，部分读写不会刷新原阶段绝对期限。native handler 的期限仍从实际调用时建立，沿原协作检查与清理路径返回；阻塞系统/FFI 调用不会被 I/O 线程强制打断。若所有 worker 都创建失败，保留原 inline 降级，此时执行 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，实际排空已接受的读取、job、响应及引用，再 join worker 并退出。
 
-两端继续使用 Connection: close，不增加 keep-alive、公开配置或用户调度 API。通用 Task 网络等待、跨模块缓冲预算/指标和完整负载验收仍未完成；连接上限与单请求字节限制不等于整个进程的内存上限。
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+
+`max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
+
+通用 Task 网络等待、跨模块完整资源预算/指标和正式长期负载验收仍未完成。
 
 ## 开发者 HTTP 压测 demo
 
@@ -446,6 +452,7 @@ HTTP server 当前提供：
 - `max_connections`：同时在线连接上限。
 - `max_active_requests`：同时处理的活动请求槽位上限；native handler worker 另有既有的64线程上限。
 - `max_pending_requests`：等待队列上限。
+- `max_buffer_bytes`：HTTP transport 保留额度，默认64 MiB，最大1 GiB，必须为正整数；不表示整体进程内存上限。
 - `handler_timeout_ms`：handler 执行超时返回 504。
 - `idle_timeout_ms`：连接首字节等待超时。
 - header/body/write timeout：网络读写不无限等待。

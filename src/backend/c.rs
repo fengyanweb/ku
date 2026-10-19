@@ -14735,6 +14735,7 @@ fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
 #define KU_HTTP_MAX_TIMEOUT_MS 300000LL
 #define KU_HTTP_MAX_HEADER_BYTES 65536LL
 #define KU_HTTP_MAX_BODY_BYTES 16777216LL
+#define KU_HTTP_MAX_BUFFER_BYTES 1073741824LL
 #define KU_HTTP_MAX_CONNECTIONS 4096LL
 #define KU_HTTP_MAX_ACTIVE_REQUESTS 1024LL
 #define KU_HTTP_MAX_PENDING_REQUESTS 8192LL
@@ -14916,8 +14917,11 @@ typedef struct KuHttpNode {
    and `long` is 32-bit on Windows LLP64, which would silently truncate a limit
    above 2^31 (e.g. `max_body_bytes: 3_000_000_000` wrapping negative and
    disabling the 413 check). */
+typedef struct KuHttpBufferBudget KuHttpBufferBudget;
 struct KuHttpServer {
   KuHttpNode* root;
+  KuHttpBufferBudget* buffer_budget;
+  long long max_buffer_bytes;
   long long max_connections;
   long long max_active_requests;
   long long max_pending_requests;
@@ -14960,6 +14964,7 @@ static KuHttpServer* ku_http_server_new(void) {
   s->max_pending_requests = 1024;
   s->handler_timeout_ms = 15000;
   s->max_body_bytes = 1000000;
+  s->max_buffer_bytes = 64LL * 1024 * 1024;
   s->max_header_bytes = 16 * 1024;
   s->read_header_timeout_ms = 5000;
   s->read_body_timeout_ms = 10000;
@@ -15015,6 +15020,7 @@ static void ku_http_validate_server(KuHttpServer* s) {
     { "max_pending_requests", s->max_pending_requests, KU_HTTP_MAX_PENDING_REQUESTS },
     { "handler_timeout_ms", s->handler_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
     { "max_body_bytes", s->max_body_bytes, KU_HTTP_MAX_BODY_BYTES },
+    { "max_buffer_bytes", s->max_buffer_bytes, KU_HTTP_MAX_BUFFER_BYTES },
     { "max_header_bytes", s->max_header_bytes, KU_HTTP_MAX_HEADER_BYTES },
     { "read_header_timeout_ms", s->read_header_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
     { "read_body_timeout_ms", s->read_body_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
@@ -15035,9 +15041,9 @@ static int ku_http_server_config_key_allowed(KuString key) {
     "read_header_timeout_ms", "read_body_timeout_ms", "write_timeout_ms",
     "idle_timeout_ms", "handler_timeout_ms", "max_body_bytes",
     "max_header_bytes", "max_connections", "max_active_requests",
-    "max_pending_requests"
+    "max_pending_requests", "max_buffer_bytes"
   };
-  static const size_t lengths[] = { 22, 20, 16, 15, 18, 14, 16, 15, 19, 20 };
+  static const size_t lengths[] = { 22, 20, 16, 15, 18, 14, 16, 15, 19, 20, 16 };
   for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
     if (ku_string_equal(key, ku_string_static((const uint8_t*)allowed[i], lengths[i]))) return 1;
   }
@@ -15064,6 +15070,7 @@ static KuHttpServer* ku_http_server_new_cfg(KuObject* config) {
   s->max_pending_requests = ku_http_cfg_int(config, "max_pending_requests", s->max_pending_requests, KU_HTTP_MAX_PENDING_REQUESTS);
   s->handler_timeout_ms = ku_http_cfg_int(config, "handler_timeout_ms", s->handler_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
   s->max_body_bytes = ku_http_cfg_int(config, "max_body_bytes", s->max_body_bytes, KU_HTTP_MAX_BODY_BYTES);
+  s->max_buffer_bytes = ku_http_cfg_int(config, "max_buffer_bytes", s->max_buffer_bytes, KU_HTTP_MAX_BUFFER_BYTES);
   s->max_header_bytes = ku_http_cfg_int(config, "max_header_bytes", s->max_header_bytes, KU_HTTP_MAX_HEADER_BYTES);
   s->read_header_timeout_ms = ku_http_cfg_int(config, "read_header_timeout_ms", s->read_header_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
   s->read_body_timeout_ms = ku_http_cfg_int(config, "read_body_timeout_ms", s->read_body_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
@@ -15486,19 +15493,25 @@ static unsigned long long ku_http_deadline_ms(uint32_t timeout_ms) {
 }
 /* Shared-I/O request storage. No field borrows a connection buffer or worker
    stack. Once queued, the job owns this input through actual handler return. */
+static int ku_http_buffer_reserve(KuHttpBufferBudget* budget, size_t bytes);
+static void ku_http_buffer_refund(KuHttpBufferBudget* budget, size_t bytes);
 typedef struct {
+  KuHttpBufferBudget* budget; size_t body_charge, metadata_charge;
   char method[33];
   char* target;
   size_t path_len;
   KuObject* headers;
   char* body;
   size_t body_len;
+  int keep_alive;
 } KuHttpInput;
 static void ku_http_input_drop(KuHttpInput* input) {
   if (!input) return;
   if (input->headers) ku_object_drop(input->headers);
   free(input->target);
   free(input->body);
+  ku_http_buffer_refund(input->budget, input->body_charge);
+  ku_http_buffer_refund(input->budget, input->metadata_charge);
   *input = (KuHttpInput){0};
 }
 static KuStruct___ku_http_response ku_http_status_response(int64_t status, const char* message) {
@@ -15536,6 +15549,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
     return 400;
   }
   int host_count = 0, content_length_count = 0;
+  input->keep_alive = 1;
   { size_t i = (fl_end < hlen) ? fl_end + 2 : hlen;
     while (i < hlen) {
       size_t ls = i;
@@ -15557,6 +15571,18 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
         if (ku_http_name_eq(hdr + ls, colon - ls, "host")) {
           host_count++;
           if (host_count != 1 || vs == ve) { return 400; }
+        } else if (ku_http_name_eq(hdr + ls, colon - ls, "connection")) {
+          /* Every duplicate field participates; a later keep-alive can never
+             undo close. Match whole comma-separated, OWS-trimmed tokens. */
+          for (size_t start = vs; start < ve;) {
+            size_t end = start;
+            while (end < ve && hdr[end] != ',') end++;
+            size_t left = start, right = end;
+            while (left < right && (hdr[left] == ' ' || hdr[left] == '\t')) left++;
+            while (right > left && (hdr[right - 1] == ' ' || hdr[right - 1] == '\t')) right--;
+            if (ku_http_name_eq(hdr + left, right - left, "close")) input->keep_alive = 0;
+            start = end < ve ? end + 1 : ve;
+          }
         } else if (ku_http_name_eq(hdr + ls, colon - ls, "transfer-encoding")) {
           return 400;
         } else if (ku_http_name_eq(hdr + ls, colon - ls, "expect")) {
@@ -15577,6 +15603,12 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
      over-long target can never be truncated into a shorter one that matches a real
      route, and never reaches a handler. */
   if (target_len > (size_t)KU_HTTP_MAX_TARGET) { return 414; }
+  /* All header string allocations, including overwritten duplicate values,
+     fit within the raw block length. Reserve before target/map construction;
+     the HashMap control buckets are a separately documented fixed/type cost. */
+  size_t metadata_bound = target_len + 1 + hlen;
+  if (!ku_http_buffer_reserve(input->budget, metadata_bound)) return 503;
+  input->metadata_charge = metadata_bound;
   char* target = (char*)malloc(target_len + 1);
   if (!target) return 500;
   input->target = target;
@@ -15585,6 +15617,17 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
      strict content-length parse: present-but-non-numeric -> 400. */
   KuObject* headers = ku_http_parse_headers(hdr, (int)hlen);
   input->headers = headers;
+  size_t metadata_bytes = target_len + 1;
+  for (size_t slot=0; slot<headers->cap; slot++) {
+    KuEntry* entry=&headers->entries[slot];
+    if (!entry->used) continue;
+    if (entry->key.storage==KU_STRING_OWNED) metadata_bytes+=entry->key.capacity;
+    if (entry->value.tag==KU_STR && entry->value.as.s.storage==KU_STRING_OWNED)
+      metadata_bytes+=entry->value.as.s.capacity;
+  }
+  if (metadata_bytes > input->metadata_charge) { return 500; }
+  ku_http_buffer_refund(input->budget, input->metadata_charge-metadata_bytes);
+  input->metadata_charge=metadata_bytes;
   /* Content-Length is strict RFC decimal: one or more digits, no sign. Duplicate
      fields and Transfer-Encoding were rejected before the map was built.
 
@@ -15625,8 +15668,10 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   }
   input->body_len = (size_t)content_length;
   if (input->body_len) {
+    if (!ku_http_buffer_reserve(input->budget, input->body_len)) return 503;
+    input->body_charge = input->body_len;
     input->body = (char*)malloc(input->body_len);
-    if (!input->body) return 500;
+    if (!input->body) return 500; /* input_drop refunds after freeing the owner. */
   }
   return 0;
 }
@@ -15878,6 +15923,50 @@ static void ku_http_wake_drain(KuHttpWake* wake) {
   }
 }
 
+/* Payload backing quota, independent from Task/frame budgets. Mutex protects
+   worker input retirement against the socket owner's allocation admission.
+   Fixed slots, header maps, arbitrary Ku values and external libraries are not
+   charged here; pre-existing response backing is admitted at publication. */
+struct KuHttpBufferBudget {
+  KuHttpMutex lock;
+  size_t limit, current, peak, rejected;
+};
+static int ku_http_buffer_reserve(KuHttpBufferBudget* budget, size_t bytes) {
+  if (!bytes) return 1;
+  if (!budget) return 0;
+  ku_http_mutex_lock(&budget->lock);
+  int admitted = bytes <= budget->limit - budget->current;
+  if (admitted) {
+    budget->current += bytes;
+    if (budget->current > budget->peak) budget->peak = budget->current;
+  } else if (budget->rejected < SIZE_MAX) budget->rejected++;
+  ku_http_mutex_unlock(&budget->lock);
+  return admitted;
+}
+static void ku_http_buffer_refund(KuHttpBufferBudget* budget, size_t bytes) {
+  if (!bytes) return;
+  if (!budget) { fputs("http buffer budget owner missing\n",stderr); exit(1); }
+  ku_http_mutex_lock(&budget->lock);
+  if (bytes > budget->current) { fputs("http buffer budget underflow\n",stderr); exit(1); }
+  budget->current -= bytes;
+  ku_http_mutex_unlock(&budget->lock);
+}
+static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct___ku_http_response* response) {
+  size_t response_charge = 0;
+  KuString response_strings[3] = { response->body, response->content_type, response->location };
+  int response_fits = 1;
+  for (int index=0; index<3; index++) if (response_strings[index].storage == KU_STRING_OWNED) {
+    size_t bytes = response_strings[index].capacity;
+    if (bytes > SIZE_MAX - response_charge) { response_fits = 0; break; }
+    response_charge += bytes;
+  }
+  if (!response_fits || !ku_http_buffer_reserve(budget, response_charge)) {
+    ku_drop_struct___ku_http_response(response);
+    *response = ku_http_status_response(503, "Service Unavailable");
+    response_charge = 0;
+  }
+  return response_charge;
+}
 typedef struct KuHttpQueue {
   KuHttpJob** items;
   int cap; int head; int tail; int count; int closed; int abort;
@@ -15890,6 +15979,7 @@ struct KuHttpJob {
   KuAtomicRefcount owners;
   KuHttpMutex lock;
   KuHttpQueue* queue;
+  KuHttpBufferBudget* budget; size_t response_charge;
   KuHttpInput input;
   KuStruct___ku_http_response response;
   unsigned long long handler_deadline;
@@ -15912,6 +16002,7 @@ static KuHttpJob* ku_http_job_new(KuHttpQueue* queue, KuHttpInput* input) {
   if (!ku_http_mutex_init(&job->lock)) { free(job); return NULL; }
   ku_atomic_refcount_init(&job->owners);
   job->queue = queue;
+  job->budget = input->budget;
   job->input = *input; *input = (KuHttpInput){0};
   ku_http_mutex_lock(&queue->lock);
   queue->resident++;
@@ -15924,6 +16015,7 @@ static void ku_http_job_release(KuHttpJob* job) {
   if (ku_refcount_release(&job->owners, "http job")) {
     ku_http_input_drop(&job->input);
     ku_drop_struct___ku_http_response(&job->response);
+    ku_http_buffer_refund(job->budget, job->response_charge);
     ku_http_mutex_destroy(&job->lock);
     free(job);
     ku_http_mutex_lock(&queue->lock);
@@ -15957,7 +16049,9 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
 static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
   ku_http_input_drop(&job->input);
+  size_t response_charge = ku_http_buffer_admit_response(job->budget, &response);
   ku_http_mutex_lock(&job->lock);
+  job->response_charge = response_charge;
   job->response = response;
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
@@ -16059,6 +16153,7 @@ static void* ku_http_worker(void* argument) {
 typedef struct { const char* bytes; size_t length; } KuHttpPart;
 typedef struct {
   KuStruct___ku_http_response response;
+  size_t charge;
   char first[256]; char last[128];
   KuHttpPart parts[9];
   int count; int part;
@@ -16067,14 +16162,17 @@ typedef struct {
 enum {
   KU_HTTP_IO_FREE = 0, KU_HTTP_IO_HEADER = 1, KU_HTTP_IO_BODY = 2,
   KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
-  KU_HTTP_IO_REJECT = 6
+  KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7
 };
 typedef struct {
   KuHttpSocket socket_value;
+  KuHttpBufferBudget* budget;
   int phase; int poll_index;
   unsigned long long deadline;
   char* header; size_t capacity; size_t buffered;
   size_t body_received;
+  char* carry; size_t carry_length;
+  int keep_alive; int reused;
   KuHttpInput input;
   KuHttpJob* job;
   KuHttpOutput output;
@@ -16093,8 +16191,12 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
     ku_http_atomic_decrement(&ku_http_active_conns);
   }
   free(connection->header); connection->header = NULL;
+  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
+  free(connection->carry); connection->carry = NULL;
+  ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
   ku_http_input_drop(&connection->input);
   ku_drop_struct___ku_http_response(&connection->output.response);
+  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   if (connection->job && !ku_http_job_only_owner(connection->job)) {
     /* Keep the active slot charged until the queue/worker's real reference
        retires. No completed or disconnected request can create an unbounded
@@ -16107,17 +16209,23 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   memset(connection, 0, sizeof(*connection));
   connection->socket_value = KU_HTTP_INVALID_SOCKET;
 }
-static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response) {
+static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
   free(connection->header); connection->header = NULL;
+  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
   ku_http_input_drop(&connection->input);
   ku_drop_struct___ku_http_response(&connection->output.response);
+  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   memset(&connection->output, 0, sizeof(connection->output));
   if (response.status < 100 || response.status > 599 ||
       !ku_http_field_value_safe(response.content_type.ptr, response.content_type.len) ||
       !ku_http_field_value_safe(response.location.ptr, response.location.len)) {
     ku_drop_struct___ku_http_response(&response);
+    ku_http_buffer_refund(connection->budget, response_charge); response_charge = 0; admitted = 1;
     response = ku_http_status_response(500, "Internal Server Error");
   }
+  if (!admitted) response_charge = ku_http_buffer_admit_response(connection->budget, &response);
+  connection->output.charge = response_charge;
+  connection->keep_alive = connection->keep_alive && response.status >= 200 && response.status < 400;
   KuHttpOutput* output = &connection->output;
   output->response = response;
   size_t body_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
@@ -16138,8 +16246,8 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_http_output_part(output, "\r\n", 2);
   }
   int last_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
-    ? snprintf(output->last, sizeof(output->last), "connection: close\r\n\r\n")
-    : snprintf(output->last, sizeof(output->last), "content-length: %llu\r\nconnection: close\r\n\r\n", (unsigned long long)body_length);
+    ? snprintf(output->last, sizeof(output->last), "connection: %s\r\n\r\n", connection->keep_alive ? "keep-alive" : "close")
+    : snprintf(output->last, sizeof(output->last), "content-length: %llu\r\nconnection: %s\r\n\r\n", (unsigned long long)body_length, connection->keep_alive ? "keep-alive" : "close");
   if (last_length < 0 || (size_t)last_length >= sizeof(output->last)) {
     ku_http_connection_close(connection); return;
   }
@@ -16149,14 +16257,37 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->write_timeout_ms > 0 ? server->write_timeout_ms : 10000));
 }
 static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer* server, int status) {
-  ku_http_connection_response(connection, server, ku_http_status_response(status, ku_http_status_text(status)));
+  connection->keep_alive = 0;
+  ku_http_connection_response(connection, server, ku_http_status_response(status, ku_http_status_text(status)), 0, 0);
 }
 static void ku_http_connection_start(KuHttpConnection* connection, KuHttpSocket socket_value, KuHttpServer* server) {
   memset(connection, 0, sizeof(*connection));
   connection->socket_value = socket_value;
+  connection->budget = server->buffer_budget;
   connection->phase = KU_HTTP_IO_HEADER;
+  if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
   connection->capacity = 1024;
   connection->header = (char*)malloc(connection->capacity);
+  connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
+  if (!connection->header) ku_http_connection_status(connection, server, 500);
+}
+/* A response may be published before the worker releases its real reference.
+   Reuse the physical slot only after that owner retires, exactly as close does. */
+static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttpServer* server) {
+  if (!connection->keep_alive) { ku_http_connection_close(connection); return; }
+  if (connection->job && !ku_http_job_only_owner(connection->job)) {
+    connection->phase = KU_HTTP_IO_REUSE_WAIT; connection->deadline = 0; return;
+  }
+  if (connection->job) { ku_http_job_release(connection->job); connection->job = NULL; }
+  ku_drop_struct___ku_http_response(&connection->output.response);
+  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
+  memset(&connection->output, 0, sizeof(connection->output));
+  connection->keep_alive = 0; connection->reused = 1;
+  connection->buffered = 0; connection->body_received = 0;
+  if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
+  connection->capacity = 1024;
+  connection->header = (char*)malloc(connection->capacity);
+  connection->phase = KU_HTTP_IO_HEADER;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
   if (!connection->header) ku_http_connection_status(connection, server, 500);
 }
@@ -16181,13 +16312,24 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
   char incoming[KU_HTTP_READ_CHUNK];
-  int received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
+  int received;
+  if (connection->carry_length) {
+    if (connection->carry_length > sizeof(incoming)) { ku_http_connection_status(connection, server, 500); return; }
+    received = (int)connection->carry_length;
+    memcpy(incoming, connection->carry, connection->carry_length);
+    free(connection->carry); connection->carry = NULL;
+  ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
+  } else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
   if (received < 0) {
     int error = ku_http_socket_last_error();
     if (ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
     ku_http_connection_status(connection, server, 408); return;
   }
-  if (!received) { ku_http_connection_status(connection, server, 400); return; }
+  if (!received) {
+    if (connection->reused && !connection->buffered) ku_http_connection_close(connection);
+    else ku_http_connection_status(connection, server, 400);
+    return;
+  }
   size_t scan_from = connection->buffered;
   if ((size_t)received > SIZE_MAX - scan_from) { ku_http_connection_status(connection, server, 500); return; }
   size_t needed = scan_from + (size_t)received;
@@ -16197,8 +16339,14 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
       if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
       capacity *= 2;
     }
+    /* Reserve the full new backing while the old allocation may coexist. */
+    if (!ku_http_buffer_reserve(connection->budget, capacity)) { ku_http_connection_status(connection, server, 503); return; }
     char* grown = (char*)realloc(connection->header, capacity);
-    if (!grown) { ku_http_connection_status(connection, server, 500); return; }
+    if (!grown) {
+      ku_http_buffer_refund(connection->budget, capacity);
+      ku_http_connection_status(connection, server, 500); return;
+    }
+    ku_http_buffer_refund(connection->budget, connection->capacity);
     connection->header = grown; connection->capacity = capacity;
   }
   memcpy(connection->header + scan_from, incoming, (size_t)received);
@@ -16215,14 +16363,30 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
     if (index >= 1 && header[index - 1] == '\r' && byte != '\n') { ku_http_connection_status(connection, server, 400); return; }
     if (index < 3 || header[index - 3] != '\r' || header[index - 2] != '\n' || header[index - 1] != '\r' || byte != '\n') continue;
     size_t header_length = index - 3;
+    connection->input.budget = connection->budget;
     int status = ku_http_parse_complete_header(server, header, header_length, &connection->input);
     if (status) { ku_http_connection_status(connection, server, status); return; }
     connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_body_timeout_ms > 0 ? server->read_body_timeout_ms : 10000));
+    connection->keep_alive = connection->input.keep_alive;
     size_t prefix = needed - (index + 1);
     if (prefix > connection->input.body_len) prefix = connection->input.body_len;
+    size_t extra = needed - (index + 1) - prefix;
+    if (extra && connection->keep_alive) {
+      /* At most this one finite recv chunk can be ahead of the current body. */
+      if (extra > KU_HTTP_READ_CHUNK) { ku_http_connection_status(connection, server, 500); return; }
+      if (!ku_http_buffer_reserve(connection->budget, extra)) { ku_http_connection_status(connection, server, 503); return; }
+      connection->carry = (char*)malloc(extra);
+      if (!connection->carry) {
+        ku_http_buffer_refund(connection->budget, extra);
+        ku_http_connection_status(connection, server, 500); return;
+      }
+      memcpy(connection->carry, header + index + 1 + prefix, extra);
+      connection->carry_length = extra;
+    }
     if (prefix) memcpy(connection->input.body, header + index + 1, prefix);
     connection->body_received = prefix;
     free(connection->header); connection->header = NULL;
+  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
     if (prefix == connection->input.body_len) ku_http_connection_submit(connection, server, queue, workers);
     else connection->phase = KU_HTTP_IO_BODY;
     return;
@@ -16242,14 +16406,14 @@ static void ku_http_connection_read_body(KuHttpConnection* connection, KuHttpSer
   connection->body_received += (size_t)received;
   if (connection->body_received == connection->input.body_len) ku_http_connection_submit(connection, server, queue, workers);
 }
-static void ku_http_connection_write(KuHttpConnection* connection) {
+static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer* server) {
   KuHttpOutput* output = &connection->output;
   size_t bytes = 0;
   /* Each readiness turn is finite even for a peer that remains writable and a
      very large Ku response. Neither partial sends nor EINTR refresh write D. */
   for (int turn = 0; turn < 32 && bytes < (size_t)262144; turn++) {
     if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_close(connection); return; }
-    if (output->part >= output->count) { ku_http_connection_close(connection); return; }
+    if (output->part >= output->count) { ku_http_connection_next_request(connection, server); return; }
     KuHttpPart* part = &output->parts[output->part];
     size_t remaining = part->length - output->offset;
     if (remaining > (size_t)65536) remaining = (size_t)65536;
@@ -16265,9 +16429,12 @@ static void ku_http_connection_write(KuHttpConnection* connection) {
     bytes += (size_t)sent;
     if (output->offset == part->length) { output->part++; output->offset = 0; }
   }
-  if (output->part >= output->count) ku_http_connection_close(connection);
+  if (output->part >= output->count) ku_http_connection_next_request(connection, server);
 }
 static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpServer* server) {
+  if (connection->phase == KU_HTTP_IO_REUSE_WAIT) {
+    ku_http_connection_next_request(connection, server); return;
+  }
   if (connection->phase == KU_HTTP_IO_CLOSED_JOB) {
     if (ku_http_job_only_owner(connection->job)) ku_http_connection_close(connection);
     return;
@@ -16275,17 +16442,18 @@ static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpS
   if (connection->phase != KU_HTTP_IO_JOB) return;
   KuHttpJob* job = connection->job;
   KuStruct___ku_http_response response = {0};
+  size_t response_charge = 0;
   ku_http_mutex_lock(&job->lock);
   int completed = job->completed;
   int cancelled = job->cancelled;
   if (completed && !cancelled) {
-    response = job->response;
-    job->response = (KuStruct___ku_http_response){0};
+    response = job->response; response_charge = job->response_charge;
+    job->response = (KuStruct___ku_http_response){0}; job->response_charge = 0;
   }
   ku_http_mutex_unlock(&job->lock);
   if (!completed) return;
   if (cancelled) ku_http_connection_close(connection);
-  else ku_http_connection_response(connection, server, response);
+  else ku_http_connection_response(connection, server, response, response_charge, 1);
 }
 static void ku_http_reject_start(KuHttpConnection* connection, KuHttpSocket socket_value) {
   memset(connection, 0, sizeof(*connection));
@@ -16457,6 +16625,15 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
     ku_http_socket_close(srv); ku_http_net_cleanup();
     return ku_http_listen_err(server, "handler queue initialization failed");
   }
+  KuHttpBufferBudget buffer_budget = {0};
+  buffer_budget.limit = (size_t)server->max_buffer_bytes;
+  if (!ku_http_mutex_init(&buffer_budget.lock)) {
+    ku_http_queue_free(&queue); ku_http_wake_close(&wake);
+    free(connections); free(poll_items); free(pending.items);
+    ku_http_socket_close(srv); ku_http_net_cleanup();
+    return ku_http_listen_err(server, "buffer budget initialization failed");
+  }
+  server->buffer_budget = &buffer_budget;
   ku_http_atomic_store(&ku_http_active_conns, 0);
   KuHttpWorkerCtx ctx; ctx.server = server; ctx.queue = &queue;
 #if defined(_WIN32)
@@ -16504,7 +16681,16 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
     unsigned long long now = ku_http_now_ms();
     for (int index = 0; index < slot_count; index++) {
       KuHttpConnection* connection = &connections[index];
+      if (!listening || listen_failure || pending.count) connection->keep_alive = 0;
       ku_http_connection_observe_job(connection, server);
+      if (connection->phase == KU_HTTP_IO_HEADER && connection->carry_length)
+        ku_http_connection_read_header(connection, server, &queue, spawned);
+      /* Under pressure a genuinely idle persistent socket yields its slot.
+         Partial requests keep their original byte ownership and deadline. */
+      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&
+          connection->reused && !connection->buffered && !connection->carry_length) {
+        ku_http_connection_close(connection);
+      }
       if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)
         ku_http_connection_status(connection, server, 408);
       else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline)
@@ -16580,7 +16766,7 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
       else if (connection->phase == KU_HTTP_IO_BODY && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
         ku_http_connection_read_body(connection, server, &queue, spawned);
       else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
-        ku_http_connection_write(connection);
+        ku_http_connection_write(connection, server);
     }
     if (rejection.poll_index >= 0) {
       short events = poll_items[rejection.poll_index].revents;
@@ -16588,7 +16774,7 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
       else if (rejection.phase == KU_HTTP_IO_REJECT && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
         ku_http_reject_read(&rejection, server);
       else if (rejection.phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
-        ku_http_connection_write(&rejection);
+        ku_http_connection_write(&rejection, server);
     }
     /* Existing pending connections always acquire newly free slots first. */
     if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
@@ -16656,6 +16842,8 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
   }
   free(workers);
   ku_http_queue_free(&queue);
+  if (buffer_budget.current) { fputs("http transport buffers remain after drain\n",stderr); exit(1); }
+  ku_http_mutex_destroy(&buffer_budget.lock); server->buffer_budget = NULL;
   ku_http_wake_close(&wake);
   free(pending.items); free(poll_items); free(connections);
   ku_http_net_cleanup();

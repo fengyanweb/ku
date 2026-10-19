@@ -3017,6 +3017,7 @@ mod finally_tests {
         let span = Span::default();
         let expired = Instant::now() - Duration::from_millis(1);
         let request = |method: &str, path: &str| ParsedHttpRequest {
+            keep_alive: false,
             method: method.into(),
             path: path.into(),
             query: HashMap::new(),
@@ -3146,6 +3147,7 @@ mod finally_tests {
         }
 
         let request = ParsedHttpRequest {
+            keep_alive: false,
             method: owned("POST"),
             path: owned("/echo"),
             query: HashMap::from([(owned("term"), owned("中文🙂\0查询"))]),
@@ -3199,6 +3201,7 @@ mod finally_tests {
             max_connections: 1,
             max_active_requests: 1,
             max_pending_requests: 1,
+            max_buffer_bytes: stdlib::http::DEFAULT_MAX_BUFFER_BYTES,
         }
     }
 
@@ -3265,15 +3268,20 @@ mod finally_tests {
         let mut limits = http_test_limits();
         limits.handler_timeout = Duration::from_secs(1);
         let mut io = http_io::HttpIo::start(listener, limits).unwrap();
-        let mut first = http_reactor_client(address, b"GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut first = http_reactor_client(
+            address,
+            b"GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
         let first_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
         assert_eq!(first_job.request.path, "/a");
         let mut expired = Vec::new();
         first.read_to_end(&mut expired).unwrap();
         assert!(expired.starts_with(b"HTTP/1.1 504 "), "{expired:?}");
 
-        let mut second =
-            http_reactor_client(address, b"GET /b HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut second = http_reactor_client(
+            address,
+            b"GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
         let second_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
         // There is exactly one active slot. Its distinct token therefore proves
         // a new generation, rather than accidentally selecting another slot.
@@ -3313,8 +3321,10 @@ mod finally_tests {
         limits.max_connections = 4;
         limits.handler_timeout = Duration::from_secs(5);
         let mut io = http_io::HttpIo::start(listener, limits).unwrap();
-        let mut held =
-            http_reactor_client(address, b"GET /held HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut held = http_reactor_client(
+            address,
+            b"GET /held HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
         let held_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
         let mut malformed = http_reactor_client(address, b"GET / HTTP/1.1\n");
         let mut response = Vec::new();
@@ -3322,7 +3332,7 @@ mod finally_tests {
         assert!(response.starts_with(b"HTTP/1.1 400 "), "{response:?}");
         let mut partial = http_reactor_client(
             address,
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\na",
         );
         response.clear();
         partial.read_to_end(&mut response).unwrap();
@@ -3354,17 +3364,387 @@ mod finally_tests {
         let io = http_io::HttpIo::start(listener, limits).unwrap();
         let mut active = http_reactor_client(
             address,
-            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na",
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\na",
         );
-        let mut pending =
-            http_reactor_client(address, b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let mut excess = http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut pending = http_reactor_client(
+            address,
+            b"GET /pending HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut excess = http_reactor_client(
+            address,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
         let mut response = Vec::new();
         excess.read_to_end(&mut response).unwrap();
         assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
         drop(io);
         http_assert_closed(&mut active);
         http_assert_closed(&mut pending);
+    }
+
+    // Read exactly one framed response. Reading to EOF would turn a successful
+    // persistent reply into an idle-timeout test or consume the next response.
+    fn http_read_test_response(client: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16 * 1024, "bounded response headers");
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(length <= 1024 * 1024, "bounded response body");
+        let mut body = vec![0; length];
+        client.read_exact(&mut body).unwrap();
+        (head, body)
+    }
+
+    #[test]
+    fn interpreter_http_buffer_budget_rejects_without_allocating_another_error() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_buffer_budget_rejects_without_allocating_another_error",
+            "KU_HTTP_BUFFER_REJECT_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.max_buffer_bytes = 1;
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert_eq!(body, b"Service Unavailable");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        let snapshot = io.buffer_snapshot();
+        assert_eq!(snapshot.current, 0);
+        assert!(snapshot.peak <= snapshot.limit);
+        assert!(snapshot.rejected >= 1);
+    }
+
+    #[test]
+    fn interpreter_http_buffer_budget_follows_late_handler_and_rejects_large_reply() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_buffer_budget_follows_late_handler_and_rejects_large_reply",
+            "KU_HTTP_BUFFER_RETIRE_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.max_connections = 2;
+        limits.max_active_requests = 2;
+        limits.max_body_bytes = 4096;
+        limits.max_buffer_bytes = 4096;
+        limits.handler_timeout = Duration::from_millis(250);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        // Send headers first: the owner must reserve Content-Length before
+        // reading the body, rather than relying on how TCP groups writes.
+        let mut first = http_reactor_client(address, b"POST /one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current < 2048 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(io.buffer_snapshot().current >= 2048);
+        first.write_all(&[b'a'; 2048]).unwrap();
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(job.request.body.len(), 2048);
+        drop(job.request);
+        let held = io.buffer_snapshot().current;
+        assert!((2048..4096).contains(&held));
+        let mut second = http_reactor_client(address, b"POST /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n");
+        let (head, _) = http_read_test_response(&mut second);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        http_assert_closed(&mut second);
+        let (head, _) = http_read_test_response(&mut first);
+        assert!(head.starts_with("HTTP/1.1 504 "));
+        http_assert_closed(&mut first);
+        // Logical timeout closed the socket, but the real handler reply owner
+        // still holds its input credit until it finishes or is dropped.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current != held && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(io.buffer_snapshot().current, held);
+        job.reply
+            .respond(job.token, status_response(200, "late"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(io.buffer_snapshot().current, 0);
+        let mut third = http_reactor_client(
+            address,
+            b"GET /three HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        drop(job.request);
+        job.reply
+            .respond(job.token, status_response(200, &"x".repeat(5000)))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut third);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert_eq!(body, b"Service Unavailable");
+        http_assert_closed(&mut third);
+        let snapshot = io.buffer_snapshot();
+        assert_eq!(snapshot.current, 0);
+        assert!(snapshot.peak <= snapshot.limit);
+        assert!(snapshot.rejected >= 2);
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_preserves_pipeline_order_body_bytes_and_close_tokens() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_preserves_pipeline_order_body_bytes_and_close_tokens",
+            "KU_HTTP_KEEP_ALIVE_PIPELINE_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.write_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(
+            address,
+            concat!(
+                "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n界🙂",
+                "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "GET /three HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, ClOsE\r\n\r\n",
+            )
+            .as_bytes(),
+        );
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(first.request.path, "/one");
+        assert_eq!(first.request.body, "界🙂");
+        assert!(
+            io.next_job(Duration::from_millis(10)).unwrap().is_none(),
+            "pipeline must not dispatch a second concurrent handler"
+        );
+        let first_token = first.token;
+        first
+            .reply
+            .respond(first.token, status_response(200, "first界🙂\0"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 200 "));
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert_eq!(body, "first界🙂\0".as_bytes());
+        let second = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(second.request.path, "/two");
+        assert_ne!(
+            first_token, second.token,
+            "each request has a distinct generation"
+        );
+        second
+            .reply
+            .respond(second.token, status_response(204, "discarded-body"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 204 "));
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert!(!head.contains("content-length:"));
+        assert!(body.is_empty());
+        let third = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(third.request.path, "/three");
+        third
+            .reply
+            .respond(third.token, status_response(200, "third"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"third");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        drop(io);
+
+        // Combining repeated fields must retain an earlier close token. The
+        // second pipelined request is never dispatched on this closed socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(address, concat!(
+            "GET /close HTTP/1.1\r\nHost: localhost\r\nConnection: ClOsE\r\nConnection: keep-alive\r\n\r\n",
+            "GET /unclaimed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ).as_bytes());
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(job.request.path, "/close");
+        assert_eq!(
+            job.request.headers["connection"], "keep-alive",
+            "transport decisions must preserve the existing handler-visible map"
+        );
+        job.reply
+            .respond(job.token, status_response(200, "close"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"close");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_errors_and_idle_deadlines_close_without_extra_jobs() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_errors_and_idle_deadlines_close_without_extra_jobs",
+            "KU_HTTP_KEEP_ALIVE_ERRORS_CHILD",
+        ) {
+            return;
+        }
+        for (status, tail, next_status) in [
+            (500, "GET /unused HTTP/1.1\r\nHost: localhost\r\n\r\n", None),
+            (103, "GET /unused HTTP/1.1\r\nHost: localhost\r\n\r\n", None),
+            (200, "GET /malformed HTTP/1.1\n", Some(400)),
+            (200, "", Some(408)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut limits = http_test_limits();
+            limits.idle_timeout = Duration::from_millis(30);
+            limits.handler_timeout = Duration::from_secs(1);
+            let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+            let request = format!("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n{tail}");
+            let mut client = http_reactor_client(address, request.as_bytes());
+            let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+            job.reply
+                .respond(job.token, status_response(status, "first"))
+                .unwrap();
+            let (head, _) = http_read_test_response(&mut client);
+            if let Some(next_status) = next_status {
+                assert!(head.contains("connection: keep-alive\r\n"));
+                let (head, _) = http_read_test_response(&mut client);
+                assert!(head.starts_with(&format!("HTTP/1.1 {next_status} ")));
+                assert!(head.contains("connection: close\r\n"));
+            } else {
+                assert!(head.contains("connection: close\r\n"));
+            }
+            http_assert_closed(&mut client);
+            assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let mut client =
+            http_reactor_client(address, b"GET /done HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        job.reply
+            .respond(job.token, status_response(200, "done"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut client).1, b"done");
+        client.shutdown(Shutdown::Write).unwrap();
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        drop(io);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let mut client = http_reactor_client(
+            address,
+            b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+        );
+        let (head, _) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 400 "));
+        assert!(head.contains("connection: close\r\n"));
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_idle_and_pipeline_yield_capacity_to_pending_connections() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_idle_and_pipeline_yield_capacity_to_pending_connections",
+            "KU_HTTP_KEEP_ALIVE_CAPACITY_CHILD",
+        ) {
+            return;
+        }
+        // An already-idle persistent socket releases its only activity slot
+        // when a fresh admitted connection arrives; idle D is not shortened.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.idle_timeout = Duration::from_secs(10);
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.max_connections = 2;
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut idle =
+            http_reactor_client(address, b"GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        first
+            .reply
+            .respond(first.token, status_response(200, "idle"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut idle);
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert_eq!(body, b"idle");
+        let mut fresh = http_reactor_client(
+            address,
+            b"GET /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let next = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(next.request.path, "/fresh");
+        http_assert_closed(&mut idle);
+        next.reply
+            .respond(next.token, status_response(200, "fresh"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut fresh).1, b"fresh");
+        http_assert_closed(&mut fresh);
+        drop(io);
+
+        // An existing pending connection also wins at the response boundary,
+        // even when another request was already sent in the pipeline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut pipeline = http_reactor_client(
+            address,
+            concat!(
+                "GET /active HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "GET /unclaimed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .as_bytes(),
+        );
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        let mut pending = http_reactor_client(
+            address,
+            b"GET /pending HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut excess = http_reactor_client(
+            address,
+            b"GET /excess HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(http_read_test_response(&mut excess)
+            .0
+            .starts_with("HTTP/1.1 503 "));
+        first
+            .reply
+            .respond(first.token, status_response(200, "active"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut pipeline);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"active");
+        http_assert_closed(&mut pipeline);
+        let next = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(next.request.path, "/pending");
+        next.reply
+            .respond(next.token, status_response(200, "pending"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut pending).1, b"pending");
+        http_assert_closed(&mut pending);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
     }
 
     #[test]
@@ -3414,7 +3794,7 @@ mod finally_tests {
             let address = listener.local_addr().unwrap();
             let mut client = http_reactor_client(
                 address,
-                b"POST /recovered HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody",
+                b"POST /recovered HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbody",
             );
             let attempts = Arc::new(Mutex::new(Vec::new()));
             let observed_attempts = Arc::clone(&attempts);
@@ -3462,10 +3842,14 @@ mod finally_tests {
         // dispatch and write its response while the listener is yielding.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let mut client =
-            http_reactor_client(address, b"GET /active HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let mut backlog =
-            http_reactor_client(address, b"GET /backlog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut client = http_reactor_client(
+            address,
+            b"GET /active HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut backlog = http_reactor_client(
+            address,
+            b"GET /backlog HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
         let (retry_tx, retry_rx) = mpsc::sync_channel(1);
         let mut admitted = false;
         let mut limits = http_test_limits();
@@ -4637,6 +5021,7 @@ struct HttpServerRuntimeLimits {
     max_connections: usize,
     max_active_requests: usize,
     max_pending_requests: usize,
+    max_buffer_bytes: usize,
 }
 
 impl HttpServerRuntimeLimits {
@@ -4680,6 +5065,13 @@ impl HttpServerRuntimeLimits {
                 "max_pending_requests",
                 1024,
                 stdlib::http::MAX_PENDING_REQUESTS,
+                span,
+            )?,
+            max_buffer_bytes: bounded_service_int(
+                service,
+                "max_buffer_bytes",
+                stdlib::http::DEFAULT_MAX_BUFFER_BYTES,
+                stdlib::http::MAX_BUFFER_BYTES,
                 span,
             )?,
         })
@@ -4828,6 +5220,7 @@ impl HttpRejection {
 
 #[derive(Debug)]
 struct ParsedHttpRequest {
+    keep_alive: bool,
     method: String,
     path: String,
     query: HashMap<String, String>,
@@ -4844,6 +5237,7 @@ enum RouteLookup {
 // Shared by the real incremental I/O state machine: transport framing is
 // separate from the one HTTP grammar and request conversion implementation.
 struct ParsedHttpHead {
+    keep_alive: bool,
     method: String,
     path: String,
     query: HashMap<String, String>,
@@ -4894,6 +5288,7 @@ fn parse_http_head(
     let mut headers = HashMap::new();
     let mut saw_host = false;
     let mut content_length = None;
+    let mut keep_alive = true;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -4921,6 +5316,14 @@ fn parse_http_head(
                 }
                 saw_host = true;
             }
+            "connection" => {
+                if value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+                {
+                    keep_alive = false;
+                }
+            }
             "transfer-encoding" => return Err(status_response(400, "Bad Request")),
             "expect" => return Err(status_response(417, "Expectation Failed")),
             "content-length" => {
@@ -4938,6 +5341,8 @@ fn parse_http_head(
             }
             _ => {}
         }
+        // Keep the existing last-field map value for handler compatibility;
+        // transport close decisions independently inspect every field above.
         headers.insert(name, value);
     }
     if !saw_host {
@@ -4958,6 +5363,7 @@ fn parse_http_head(
         return Err(status_response(414, "URI Too Long"));
     }
     Ok(ParsedHttpHead {
+        keep_alive,
         method,
         path,
         query,
@@ -4972,6 +5378,7 @@ fn finish_http_request(
 ) -> Result<ParsedHttpRequest, HttpWireResponse> {
     let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
     Ok(ParsedHttpRequest {
+        keep_alive: head.keep_alive,
         method: head.method,
         path: head.path,
         query: head.query,
@@ -5269,26 +5676,24 @@ fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
         }
         return Some(status_response(500, "Internal Server Error"));
     }
-    let Value::Object(fields) = value else {
+    let Value::Object(mut fields) = value else {
         return None;
     };
-    let status = match fields.get("status") {
-        Some(Value::Int(status)) => *status,
-        _ => return None,
+    let Some(Value::Int(status)) = fields.remove("status") else {
+        return None;
     };
-    let headers = match fields.get("headers") {
-        Some(Value::Object(headers)) => headers
-            .iter()
-            .filter_map(|(name, value)| match value {
-                Value::String(value) => Some((name.clone(), value.clone())),
-                _ => None,
-            })
-            .collect(),
-        _ => return None,
+    let Some(Value::Object(headers)) = fields.remove("headers") else {
+        return None;
     };
-    let body = match fields.get("body") {
-        Some(Value::String(body)) => body.clone(),
-        _ => return None,
+    let headers = headers
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            Value::String(value) => Some((name, value)),
+            _ => None,
+        })
+        .collect();
+    let Some(Value::String(body)) = fields.remove("body") else {
+        return None;
     };
     Some(HttpWireResponse {
         status,
@@ -5311,8 +5716,11 @@ fn status_response(status: i64, message: &str) -> HttpWireResponse {
 // Encode once before selecting the original total write deadline. Header and
 // body remain separate owners so a large body is not copied into a second wire
 // buffer; partial writes retain their offsets in the I/O connection state.
-fn encode_http_response(response: HttpWireResponse) -> (String, String) {
+fn encode_http_response(response: HttpWireResponse, keep_alive: bool) -> (String, String, bool) {
     let response = prepare_http_response(response);
+    // A final response must have unambiguous framing. Errors and interim-only
+    // handler replies retire the connection, including a sanitized 500 reply.
+    let keep_alive = keep_alive && (200..400).contains(&response.status);
     let reason = stdlib::http::status_text(response.status);
     let mut headers = response.headers;
     if !((100..200).contains(&response.status) || matches!(response.status, 204 | 304)) {
@@ -5321,13 +5729,27 @@ fn encode_http_response(response: HttpWireResponse) -> (String, String) {
             response.body.len().to_string(),
         );
     }
-    headers.insert("connection".to_string(), "close".to_string());
-    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    headers.insert(
+        "connection".to_string(),
+        if keep_alive { "keep-alive" } else { "close" }.to_string(),
+    );
+    let first = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    let capacity = first.len()
+        + 2
+        + headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 4)
+            .sum::<usize>();
+    let mut head = String::with_capacity(capacity);
+    head.push_str(&first);
     for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    (head, response.body)
+    (head, response.body, keep_alive)
 }
 
 fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {

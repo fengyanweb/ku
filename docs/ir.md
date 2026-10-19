@@ -464,7 +464,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
 不从旧 SHA 的通过结果外推。Frame ABI 5、Control ABI 2、Driver ABI 10 不等于稳定外部 C FFI。
-M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+通用 Task 网络等待/netpoll、完整 M:N、剩余阻塞 I/O、完整 RSS 预算、性能基准与 soak 未完成；HTTP 单 I/O 线程与持久连接、文件/目录后台池已接入。
 
 ### 顶层 async 函数值与 Driver9 本地队列
 
@@ -586,7 +586,9 @@ blocking_pending 允许尚未退休的停放 job 预付扩容，取消/关闭后
 每次分配前计入新旧缓冲同时存在的峰值，增长失败不丢掉已预留的责任。typed reconcile
 在 pool 锁内把实际 job 输出收费加入实例费用，再按 pool→driver 顺序核对，避免读取
 快照与 worker 扩容之间发生提前退款。DONE 后结果移交/丢弃，初始化的 Result_str
-接手容量计费。原总预算不增加，read_dir/其他阻塞标准库、netpoll 与完整 M:N仍未接通。
+接手容量计费。原总预算不增加，其他未列出的阻塞标准库、通用 Task 网络等待/netpoll 与完整 M:N仍未接通。
+
+`BlockingReadDir { path, dst, ready, cleanup }` 将 `std.fs.read_dir` 降为共享后台池操作，只在 ready 初始化 `[str]!` 结果。保留最多 10000 项、路径合计 1000000 字节及排序合同；vector、叶子、平台临时区与输出追踪记录分配前预占，实际释放后归还。IR 数组字面量仍最多 64 项，运行期目录结果允许到原目录上限；大型字符串叶子校验使用受原预算约束的排序 scratch，失败不移走输入，避免两两比较。
 
 `BlockingExists { path, dst, ready, cleanup }` 同样只读 string 输入，在 ready 才初始化
 `bool` 目标；cleanup 保留原路径责任。与读写共享 pool，内部 `KuResult_bool` 只用于
@@ -736,7 +738,7 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 已接入的 primitive（含 str）/单层 Result；任意 Owned payload、数组 for、
 Task 源码受限 finally 另见上节，完整 async 仍未实现。
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
-结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
+结果分开验收；固定硬件性能、RSS、soak、完整 M:N 与通用 Task netpoll 仍未完成；事件 HTTP 已接入，正式长期负载结果另列。
 
 ### 内部 scope-exit 操作与源码循环退出
 

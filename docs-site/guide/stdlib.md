@@ -21,7 +21,7 @@ fn main(): null! {
 }
 ```
 
-`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。
+`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。`fs.read_dir(path): [str]!` 返回排序后的目录路径，最多10000项、路径文本合计1000000字节。受限 native Task 的 read/try_read、write/try_write、exists 与 read_dir 已通过固定后台池挂起恢复；路径和结果分配计入原 Task 字节预算，取消后的真实 job 退出与结果释放完成才退款，网络等待不在此范围。
 
 ## string
 
@@ -222,11 +222,12 @@ app = http.server({
     max_header_bytes: 16384,
     max_connections: 1024,
     max_active_requests: 256,
-    max_pending_requests: 1024
+    max_pending_requests: 1024,
+    max_buffer_bytes: 67108864
 })
 ```
 
-`http.service` / `http.server` 不再作为属性式默认对象运行。配置字段只有 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`；未知字段会被拒绝。
+`http.service` / `http.server` 不再作为属性式默认对象运行。配置字段只有 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`、`max_buffer_bytes`；未知字段会被拒绝。
 
 路由参数固定使用 `/user/{id}`，不支持 `:id`。删除路由固定调用 `del`，不提供 `delete` 别名：
 
@@ -255,6 +256,10 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 ```
 
 HTTP server 有连接上限、active/pending 背压、handler timeout、idle timeout、header/body/write timeout；队列满或连接超限会立即返回 503，不无限排队。
+
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+
+`max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
 
 响应 helper 支持默认状态码和显式状态码：
 

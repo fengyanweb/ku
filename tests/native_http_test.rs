@@ -3044,3 +3044,235 @@ fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
     // Marker writes prove actions occurred, not exactly-once counts or D values.
     // This is not a multi-worker, allocation-ledger or production-soak claim.
 }
+
+#[test]
+fn native_http_reuses_framed_requests_and_yields_idle_connections() {
+    use std::io::Read;
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import "std.http"
+fn main(): null! {
+    app = http.server({max_connections: 8, max_active_requests: 1, max_pending_requests: 4,
+        idle_timeout_ms: 1000, read_header_timeout_ms: 200, read_body_timeout_ms: 1000,
+        write_timeout_ms: 2000, handler_timeout_ms: 2000})
+    app.post("/echo/{id}", fn(req) { return http.text(req.params.id + ":" + req.body) })
+    app.get("/ok", fn() { return http.text("ok") })
+    app.del("/empty", fn() { return http.empty() })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server("keep-alive", source, &address) else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let mut stream = connect_with_retry(&address, Duration::from_secs(3));
+    // Read exactly one frame; a pipelined successor must remain in the socket.
+    let read_frame = |stream: &mut TcpStream| {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(
+                Instant::now() < deadline && bytes.len() < 65536,
+                "bounded response header"
+            );
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        let head = String::from_utf8(bytes.clone()).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(length < 65536);
+        let start = bytes.len();
+        bytes.resize(start + length, 0);
+        stream.read_exact(&mut bytes[start..]).unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    // The first read contains both a body and a complete following request.
+    stream.write_all(b"POST /echo/first HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nonePOST /echo/second HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\ntwo").unwrap();
+    for body in ["first:one", "second:two"] {
+        let response = read_frame(&mut stream);
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response
+            .to_ascii_lowercase()
+            .contains("connection: keep-alive\r\n"));
+        assert!(response.ends_with(body), "{response}");
+    }
+    stream
+        .write_all(b"DELETE /empty HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    assert_status(&read_frame(&mut stream), "HTTP/1.1 204 No Content");
+    stream.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, ClOsE\r\nConnection: keep-alive\r\n\r\nGET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let response = read_frame(&mut stream);
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("connection: close\r\n"));
+    assert_eq!(
+        stream.read(&mut [0; 1]).unwrap(),
+        0,
+        "close token wins across duplicate fields"
+    );
+
+    let mut idle = connect_with_retry(&address, Duration::from_secs(3));
+    idle.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    assert_status(&read_frame(&mut idle), "HTTP/1.1 200 OK");
+    let response = http_response(
+        &address,
+        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(700),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert_eq!(
+        idle.read(&mut [0; 1]).unwrap(),
+        0,
+        "idle reuse yields its active slot"
+    );
+
+    // Fill the pending FIFO while one body is incomplete. Observing the
+    // over-limit 503 is a real admission barrier, without scheduling sleeps.
+    let mut pipelined = connect_with_retry(&address, Duration::from_secs(3));
+    pipelined
+        .write_all(b"POST /echo/pressure HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n")
+        .unwrap();
+    let mut pending = Vec::new();
+    for _ in 0..4 {
+        let mut peer = connect_with_retry(&address, Duration::from_secs(3));
+        peer.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        pending.push(peer);
+    }
+    let rejected = http_response(
+        &address,
+        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(700),
+    );
+    assert_status(&rejected, "HTTP/1.1 503 Service Unavailable");
+    pipelined
+        .write_all(b"oneGET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = read_frame(&mut pipelined);
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("pressure:one"));
+    // Closing with unconsumed pipeline bytes can report TCP reset rather than
+    // FIN. Neither a timeout nor another response counts as yielding the slot.
+    match pipelined.read(&mut [0; 1]) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        outcome => panic!("pending peers must win at response boundary: {outcome:?}"),
+    }
+    for mut peer in pending {
+        assert_status(&read_frame(&mut peer), "HTTP/1.1 200 OK");
+    }
+
+    let mut partial = connect_with_retry(&address, Duration::from_secs(3));
+    partial
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    assert_status(&read_frame(&mut partial), "HTTP/1.1 200 OK");
+    partial
+        .write_all(b"POST /echo/timeout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nx")
+        .unwrap();
+    let response = read_frame(&mut partial);
+    assert_status(&response, "HTTP/1.1 408 Request Timeout");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("connection: close\r\n"));
+    assert_eq!(partial.read(&mut [0; 1]).unwrap(), 0);
+    drop(watchdog);
+    let finite_address = unused_local_address();
+    let Some(mut finite) =
+        spawn_finite_native_server("keep-alive-finite", source, &finite_address, 1)
+    else {
+        panic!("compiler already available")
+    };
+    let finite_watchdog = finite.arm_kill_watchdog(RUN_TIMEOUT);
+    let mut peer = connect_with_retry(&finite_address, Duration::from_secs(3));
+    peer.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    assert_status(&read_frame(&mut peer), "HTTP/1.1 200 OK");
+    assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+    assert!(finite_watchdog
+        .wait_for_natural_exit(Duration::from_secs(3))
+        .success());
+    assert!(!finite_watchdog.timed_out());
+}
+
+#[test]
+fn native_http_buffer_quota_rejects_aggregate_bodies_and_large_responses_then_recovers() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import "std.http"
+fn main(): null! {
+    app = http.server({max_connections: 16, max_active_requests: 8, max_pending_requests: 8,
+        max_buffer_bytes: 5000, max_body_bytes: 10000, idle_timeout_ms: 2000,
+        read_header_timeout_ms: 2000, read_body_timeout_ms: 2000,
+        write_timeout_ms: 2000, handler_timeout_ms: 2000})
+    app.post("/echo", fn(req) { return http.text(req.body) })
+    app.post("/double", fn(req) { return http.text(req.body + req.body) })
+    app.get("/ok", fn() { return http.text("ok") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server("buffer-quota", source, &address) else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let mut retained = Vec::new();
+    for _ in 0..2 {
+        let mut stream = connect_with_retry(&address, Duration::from_secs(3));
+        stream.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1700\r\nConnection: close\r\n\r\nx").unwrap();
+        retained.push(stream);
+    }
+    let response = http_response(&address,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1700\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(1));
+    assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("connection: close\r\n"));
+    let body = vec![b'x'; 1699];
+    for stream in &mut retained {
+        stream.write_all(&body).unwrap();
+    }
+    for mut stream in retained {
+        let response =
+            read_http_stream_bytes_until(&mut stream, Instant::now() + Duration::from_secs(3))
+                .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1.len(), 1700);
+    }
+    let request = format!("POST /double HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3000\r\nConnection: close\r\n\r\n{}", "x".repeat(3000));
+    let response = http_response(&address, &request, Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+    let response = http_response(
+        &address,
+        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("ok"));
+    drop(watchdog);
+}

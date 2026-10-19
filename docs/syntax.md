@@ -737,7 +737,7 @@ Task 清理采用当前所有权作用域规则：合法 move 会转移清理责
 
 当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；普通值参数限 `int/bool/null/str`、owned 平面 `[int]/[bool]/[str]` 及各自单层 Result，另支持接收相同值类型的顶层无捕获 async 函数值参数；返回为显式 primitive 或平面数组 `T!`，无捕获函数值也可返回数组结果。函数体支持可恢复错误的 try/catch/finally、Error 字段读取/重抛、顶层 async 函数值的绑定/move/clone/调用、局部绑定、已有 int/bool/null、字符串、平面数组、单层 Result/Error 局部的普通赋值、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；Copy 表达式支持 checked int 的一元 `-`、`+ - * / %` 和 `== != < <= > >=`，bool 的 `!`、`== !=` 及 `&& ||` 短路。普通二元式左值先求值并保存，右侧 Await 不会丢失该快照；未选中的逻辑右侧或 If 分支不执行其调用、move 或 Await，但仍静态检查。溢出/除零保持不可恢复 runtime failure，不因 async 返回 `T!` 就改成普通 Err。字符串支持静态字面量、len()/byte_len()/clone() 与 +；len 计 Unicode 标量、byte_len 计 UTF-8 字节且不消费输入。拼接先快照左侧再求右侧，原峰值预算覆盖快照和新结果。另支持平面 `[int]/[bool]/[str]` 局部数组、只读 `try_get(index)` 和运行期 `for`，详见下述并发文档；嵌套数组、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、float/混合类型算术、str/null/Result/Task 比较和平面数组以外的动态堆表达式仍拒绝。finally 体首版不接受新 Task、Await、sleep、文件读写、循环或其中再嵌 finally；支持有限分支、局部 catch 和 primitive 操作。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
 
-native Task 路径的 `std.fs.write(path, content)` 与兼容别名 `try_write` 保持 `null!` 返回，调用本身可挂起，无需增加 `await`。两个 View 参数从左到右求值一次，原字符串仍可继续使用；后台 job 独立持有原生路径与内容副本。沿用 32768 字节路径、1000000 字节 UTF-8 内容限制，复制分配先计入原 Task 字节预算，容量或分配失败在文件操作前返回明确错误。另接通 `fs.read/try_read(path): str!`，成功结果为可继续使用的 Owned 字符串；读取按实际容量渐进分配并计入原预算，保留 UTF-8 校验与 1000000 字节上限。另有 `fs.exists(path): bool` 通过同一池查询文件或目录，保留输入且无输出堆分配；缺失/非法路径/metadata 失败为 false，队列满、关闭或内存不足仍为 Task 运行错误。read_dir、网络及 finally 内提交这些文件操作仍未支持；取消后的已运行系统写入不能强行中断，也不能撤回已经写入的内容。清理与限制见[并发文档](concurrency.md#native-文件读写的固定后台池)。
+native Task 路径的 `std.fs.write(path, content)` 与兼容别名 `try_write` 保持 `null!` 返回，调用本身可挂起，无需增加 `await`。两个 View 参数从左到右求值一次，原字符串仍可继续使用；后台 job 独立持有原生路径与内容副本。沿用 32768 字节路径、1000000 字节 UTF-8 内容限制，复制分配先计入原 Task 字节预算，容量或分配失败在文件操作前返回明确错误。另接通 `fs.read/try_read(path): str!`，成功结果为可继续使用的 Owned 字符串；读取按实际容量渐进分配并计入原预算，保留 UTF-8 校验与 1000000 字节上限。另有 `fs.exists(path): bool` 通过同一池查询文件或目录，保留输入且无输出堆分配；缺失/非法路径/metadata 失败为 false，队列满、关闭或内存不足仍为 Task 运行错误。`fs.read_dir(path): [str]!` 也经同一池挂起，返回排序后的独立路径数组，沿用10000项和路径文本合计1000000字节上限；目录 vector、字符串叶子、平台临时区和分配记录在分配前计入原 Task 预算，扩容时按新旧容量的共同峰值预付。数组字面量仍最多64个元素，运行期目录数组可承载10000项。网络及 finally 内提交这些文件/目录操作仍未支持；取消后的已运行系统写入不能强行中断，也不能撤回已经写入的内容。清理与限制见[并发文档](concurrency.md#native-文件与目录操作的固定后台池)。
 
 该子集的函数退出先移交全部 sibling，再等待逻辑 cleanup ACK，所有 child 共用一个绝对期限；迟到 observer 不延长 payload 生命周期。普通 Result.err 仍是业务值，正常 scope 的 `task/shutdown_timeout` 是外层运行时失败，即使没有 `?` 也展开退出；取消/超时保留原原因。内部清理 continuation 可以等 ACK，但用户 cleanup 仍不能 Await。接纳/OOM 拒绝消费已 move 的源码实参并生成可 await 的静态失败 Task，不在错误路径再次分配。
 
@@ -1812,7 +1812,7 @@ print(service.max_body_bytes)
 print(service.routes[0].method)
 ```
 
-默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
+默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`、`max_buffer_bytes` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
 
 `http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
 
@@ -1860,13 +1860,14 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 - `max_connections` 表示同时在线连接上限；超过时立即返回 503。
 - `max_active_requests` 控制同时处理的活动请求槽位数；native handler worker 另有既有的64线程上限。
 - `max_pending_requests` 是有界等待队列；队列满时立即返回 503，不无限排队。
+- `max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
 - `handler_timeout_ms` 到时返回 504。解释器逐步检查 deadline；native 在循环回边和 Ku 调用返回点插入协作式 safepoint。
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
 - header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
 
 Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，request target 超过内部上限（固定 8192 bytes）返回 414（在复制和路由前判断，绝不截断），坏请求返回 400，handler timeout 返回 504，服务过载返回 503，handler panic/内部失败返回 500。
 
-服务配置字段是固定集合：`read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`。两种写法等价——构造时传 `http.server({ max_body_bytes: 4096 })`，或构造后逐个赋值 `service.max_body_bytes = 4096`。**未定义的配置字段在类型检查阶段报错**，不会被静默忽略：`http.server({ bogus: 1 })` 和 `service.bogus = 1` 都是 checker 错误。
+服务配置字段是固定集合：`read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`、`max_buffer_bytes`。两种写法等价——构造时传 `http.server({ max_body_bytes: 4096 })`，或构造后逐个赋值 `service.max_body_bytes = 4096`。**未定义的配置字段在类型检查阶段报错**，不会被静默忽略：`http.server({ bogus: 1 })` 和 `service.bogus = 1` 都是 checker 错误。
 
 #### HTTP 共享函数绑定规则
 
@@ -1913,7 +1914,9 @@ fn main(): null! {
 
 native handler 仍在执行线程按原期限协作检查与清理，阻塞系统/FFI 调用不会被 I/O 线程强制打断；全部 worker 创建失败时保留原 inline 降级，此时 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，真实排空已接受的读取、job、响应及引用，join worker 后退出。
 
-两端继续使用原连接/队列限制、各阶段绝对期限和 Connection: close，不新增 keep-alive 或配置字段。通用 Task 网络等待、跨模块缓冲预算/指标和完整负载验收仍未完成。
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+
+通用 Task 网络等待、跨模块完整资源预算/指标和正式长期负载验收仍未完成。
 
 native 与解释器的主要已知差异：
 

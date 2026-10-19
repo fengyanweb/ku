@@ -715,18 +715,29 @@ fn main() {
     if (server.max_pending_requests <= 0) {
         panic("bad pending limit")
     }
+    if (server.max_buffer_bytes != 67108864) {
+        panic("bad buffer budget default")
+    }
     tuned = http.server({
         max_body_bytes: 4,
         read_header_timeout_ms: 500,
         max_connections: 2,
         max_active_requests: 1,
-        max_pending_requests: 1
+        max_pending_requests: 1,
+        max_buffer_bytes: 4096
     })
     if (tuned.max_body_bytes != 4) {
         panic("bad configured server")
     }
     if (tuned.max_connections != 2 || tuned.max_active_requests != 1 || tuned.max_pending_requests != 1) {
         panic("bad configured backpressure")
+    }
+    if (tuned.max_buffer_bytes != 4096) {
+        panic("bad configured buffer budget")
+    }
+    tuned.max_buffer_bytes = 8192
+    if (tuned.max_buffer_bytes != 8192) {
+        panic("bad assigned buffer budget")
     }
     client2 = http.client({ timeout_ms: 1000 })
     if (client2.timeout_ms != 1000) {
@@ -785,6 +796,12 @@ fn main() {
 #[test]
 fn std_http_config_limits_must_be_positive() {
     for source in [
+        r#"
+import "std.http"
+fn main() {
+    http.server({ max_buffer_bytes: 0 })
+}
+"#,
         r#"
 import "std.http"
 

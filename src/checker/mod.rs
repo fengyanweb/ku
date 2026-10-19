@@ -10500,7 +10500,7 @@ const HTTP_REQUEST_CONFIG_FIELDS: [&str; 6] = [
     "timeout_ms",
     "max_body_bytes",
 ];
-const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
+const HTTP_SERVICE_CONFIG_FIELDS: [&str; 11] = [
     "read_header_timeout_ms",
     "read_body_timeout_ms",
     "write_timeout_ms",
@@ -10511,6 +10511,7 @@ const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
     "max_connections",
     "max_active_requests",
     "max_pending_requests",
+    "max_buffer_bytes",
 ];
 
 /// Reject a statically-known HTTP config field that the selected API does not
@@ -10547,6 +10548,7 @@ fn http_service_type() -> Type {
         ("max_connections".to_string(), Type::Int),
         ("max_active_requests".to_string(), Type::Int),
         ("max_pending_requests".to_string(), Type::Int),
+        ("max_buffer_bytes".to_string(), Type::Int),
         (
             "routes".to_string(),
             Type::Array(Box::new(http_route_type())),
