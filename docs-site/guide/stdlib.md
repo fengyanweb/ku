@@ -21,7 +21,7 @@ fn main(): null! {
 }
 ```
 
-`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。`fs.read_dir(path): [str]!` 返回排序后的目录路径，最多10000项、路径文本合计1000000字节。受限 native Task 的 read/try_read、write/try_write、exists 与 read_dir 已通过固定后台池挂起恢复；路径和结果分配计入原 Task 字节预算，取消后的真实 job 退出与结果释放完成才退款，网络等待不在此范围。
+`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。`fs.read_dir(path): [str]!` 返回排序后的目录路径，最多10000项、路径文本合计1000000字节。受限 native Task 的 read/try_read、write/try_write、exists 与 read_dir 已通过固定后台池挂起恢复；路径和结果分配计入原 Task 字节预算，取消后的真实 job 退出与结果释放完成才退款。native Task 局部 TCP connect/read/write/close 也经同一池挂起恢复，另支持局部 bytes 操作；内联配置沿用既有键，句柄/bytes 不作为 Task 参数或结果。DNS 不能强制中断，TLS pending/库内部和系统资源仍不计费。
 
 ## string
 

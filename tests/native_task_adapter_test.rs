@@ -3841,3 +3841,224 @@ int main(void) {
   puts("array-try-get-owners-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_net_jobs_retain_exclusive_owners_until_real_completion() {
+    let source = r#"
+import net from "std.net"
+import bytes from "std.bytes"
+async fn Operation(write: bool): null! {
+    client=net.client({host:"127.0.0.1",port:9,read_timeout_ms:50})?
+    if (write) { payload=bytes.from_array([65,0,66])? client.write(payload)? }
+    else { data=client.read(4096)? }
+    client.close()
+    return ok(null)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    ast.items
+        .retain(|item| !matches!(item, ku::ast::Item::Import(_)));
+    for name in ["std:net", "std:bytes"] {
+        ast.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: name.into(),
+                span: Default::default(),
+            }),
+        );
+    }
+    Checker::new().check(&ast).unwrap();
+    let native = ir::task_lower::lower_program(&ast).unwrap();
+    let function = &native.tasks.functions[0];
+    let client_slot = function
+        .states
+        .iter()
+        .find_map(|state| match state.terminator {
+            TaskTerminator::BlockingNet {
+                operation: TaskNetOperation::Read,
+                inputs,
+                ..
+            } => inputs[0],
+            _ => None,
+        })
+        .expect("read owns the local client slot")
+        .0;
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let instrumentation = format!(
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{ALLOCATION_HOOK}\n{}\n{NET_OWNER_HOOKS}\n",
+        native_task_ledger::LEDGER_LOCK,
+        native_task_ledger::LOCKED_ALLOCATIONS
+    );
+    let mut generated = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{instrumentation}typedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        );
+    let constructor="static KuResult_net_client ku_net_client_with_allocator(KuObject* config,\n    const KuNetAllocatorV1* allocator) {";
+    assert_eq!(generated.matches(constructor).count(), 1);
+    generated = generated.replacen(
+        constructor,
+        &format!("{constructor}\n{NET_OWNER_CONSTRUCTOR}"),
+        1,
+    );
+    let read="static KuResult_bytes ku_net_read_with_allocator(KuNetClient* client,\n    int64_t requested, const KuNetAllocatorV1* allocator) {";
+    assert_eq!(generated.matches(read).count(), 1);
+    generated = generated.replacen(read, &format!("{read}\n{NET_OWNER_READ}"), 1);
+    let write = "static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {";
+    assert_eq!(generated.matches(write).count(), 1);
+    generated = generated.replacen(write, &format!("{write}\n{NET_OWNER_WRITE}"), 1);
+    let close = "static uint8_t ku_net_close(KuNetClient* client) {\n  if (!client) return 0;";
+    assert_eq!(generated.matches(close).count(), 1);
+    generated = generated.replacen(
+        close,
+        &format!("{close}\n  fixture_alloc_lock(); fixture_net_closes++; fixture_alloc_unlock();"),
+        1,
+    );
+    let drained = "uint32_t status=ku_task_0_drain(instance,reason,budget);";
+    assert_eq!(generated.matches(drained).count(), 1);
+    generated=generated.replacen(drained,&format!("{drained}\n  if (instance->values_cleaned) CHECK(ku_test_event_set(&fixture_net_drained));"),1);
+    generated.push_str(&NET_OWNER_MAIN.replace("@CLIENT@", &client_slot.to_string()));
+    let directory = TempDir::new("native-task-net-job-owners");
+    let path = directory.path().join("owners.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "owners") else {
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "net-job-owners-ok"
+    );
+}
+
+const NET_OWNER_HOOKS: &str = r#"
+static KuTestEvent fixture_net_entered,fixture_net_release,fixture_net_drained;
+static size_t fixture_net_closes,fixture_net_calls,fixture_net_output_bytes;
+static uint64_t fixture_net_observed_deadline;
+static int fixture_net_mode=1;
+"#;
+const NET_OWNER_CONSTRUCTOR: &str = r#"
+  if (fixture_net_mode) {
+    KuNetClient* fake=(KuNetClient*)ku_net_allocate(allocator,sizeof(KuNetClient));
+    if (!fake) return (KuResult_net_client){false,NULL,ku_net_error("out_of_memory","fixture client allocation failed")};
+    memset(fake,0,sizeof(*fake)); fake->socket_value=KU_NET_INVALID_SOCKET;
+    ku_net_atomic_flag_init(&fake->poison_requested);
+    CHECK(ku_net_gate_init(&fake->gate)==0);
+    fake->read_timeout_ms=50u; fake->write_timeout_ms=50u; fake->max_read_bytes=4096u;
+    return (KuResult_net_client){true,fake,{0}};
+  }
+"#;
+const NET_OWNER_READ: &str = r#"
+  if (fixture_net_mode) {
+    CHECK(client && requested==4096);
+    KuBytes value={0}; value.ptr=(uint8_t*)ku_net_allocate(allocator,(size_t)requested);
+    if (value.ptr) {value.len=3u;value.capacity=(size_t)requested;value.storage=KU_BYTES_OWNED;memcpy(value.ptr,"A\0B",3u);}
+    fixture_alloc_lock();fixture_net_calls++;fixture_net_output_bytes=value.capacity;
+    fixture_net_observed_deadline=__ku_handler_deadline;fixture_alloc_unlock();
+    CHECK(ku_test_event_set(&fixture_net_entered));CHECK(ku_test_event_wait(&fixture_net_release,2000));
+    if (!value.ptr) return (KuResult_bytes){false,{0},ku_net_error("out_of_memory","fixture output allocation failed")};
+    return (KuResult_bytes){true,value,{0}};
+  }
+"#;
+const NET_OWNER_WRITE: &str = r#"
+  if (fixture_net_mode) {
+    CHECK(client);
+    fixture_alloc_lock();fixture_net_calls++;fixture_net_observed_deadline=__ku_handler_deadline;fixture_alloc_unlock();
+    CHECK(ku_test_event_set(&fixture_net_entered));CHECK(ku_test_event_wait(&fixture_net_release,2000));
+    CHECK(data.ptr && data.len==3u && data.ptr[0]==65u && data.ptr[1]==0u && data.ptr[2]==66u);
+    return (KuResult_null){true,0,{0}};
+  }
+"#;
+const NET_OWNER_MAIN: &str = r#"
+static KuTaskDriverV1 net_driver;
+static KuTaskDriverSlotV1 net_slots[2];static size_t net_ring[2];
+static KuTaskBlockingPoolV1 net_pool;
+static uint64_t net_deadline(void) {uint64_t now=ku_task_driver_now_ms();CHECK(now!=UINT64_MAX);return now+2000u;}
+static KuTaskDriverSnapshotV1 net_snapshot(void) {
+  KuTaskDriverSnapshotV1 snapshot={0};CHECK(ku_task_driver_snapshot(&net_driver,&snapshot)==KU_TASK_DRIVER_OK);return snapshot;
+}
+static void net_case(int write,int cancel,int limited) {
+  memset(&net_driver,0,sizeof(net_driver));memset(net_slots,0,sizeof(net_slots));memset(net_ring,0,sizeof(net_ring));memset(&net_pool,0,sizeof(net_pool));
+  fixture_net_calls=fixture_net_closes=fixture_net_output_bytes=0u;fixture_net_observed_deadline=0;
+  CHECK(ku_test_event_init(&fixture_net_entered));CHECK(ku_test_event_init(&fixture_net_release));CHECK(ku_test_event_init(&fixture_net_drained));
+  size_t fixed=sizeof(net_driver)+sizeof(net_slots)+sizeof(net_ring)+sizeof(net_pool);
+  size_t dynamic=sizeof(KuTaskInstance_0)+(limited?512u:16384u);uint64_t deadline=net_deadline();
+  CHECK(ku_task_driver_init(&net_driver,sizeof(net_driver),KU_TASK_DRIVER_ABI_VERSION,net_slots,2u,net_ring,2u,fixed+dynamic,1u,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_init(&net_pool,2u,1u,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_attach_blocking(&net_driver,&net_pool,sizeof(net_pool),ku_task_blocking_close,ku_task_blocking_ready)==KU_TASK_DRIVER_OK);
+  bool writing=write!=0;KuTaskValueV1 task={0};
+  CHECK(ku_task_0_start_value(&net_driver,&writing,&task)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_wait(&fixture_net_entered,2000));
+  CHECK(ku_task_driver_wait_idle(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control;
+  CHECK(instance->frame_initialized && instance->frame.s_@CLIENT@==NULL);
+  CHECK(instance->frame.header.initialized & (UINT64_C(1)<<@CLIENT@));
+  CHECK(instance->blocking.pool==&net_pool && instance->blocking.charged_bytes>=sizeof(KuNetClient));
+  CHECK(!fixture_net_closes && fixture_net_calls==1u);
+  CHECK(fixture_net_output_bytes==(write||limited?0u:4096u));
+  CHECK(net_snapshot().reserved_bytes==fixture_ledger().bytes);
+  CHECK(fixture_net_observed_deadline && fixture_net_observed_deadline<=net_deadline());
+  if (cancel) {
+    uint64_t original=net_deadline();
+    CHECK(ku_task_driver_request_cancel(&task.ticket,&task.owner.lease,KU_TASK_CONTROL_CANCELLED,original)==KU_TASK_CONTROL_OK);
+    CHECK(ku_test_event_wait(&fixture_net_drained,2000));
+    CHECK(ku_task_driver_wait_idle(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+    /* Pending cancellation terminates the frame's Values, retaining initialized
+     * terminal frame storage until the actual job retires. Only READY cleanup
+     * destroys storage immediately; frame_initialized is not a Value-owner bit. */
+    CHECK(instance->values_cleaned && instance->frame_initialized);
+    CHECK(instance->frame.header.status==KU_TASK_FRAME_CANCELLED);
+    CHECK(!instance->frame.header.initialized && instance->frame.s_@CLIENT@==NULL);
+    CHECK(!fixture_net_closes && instance->blocking.pool==&net_pool);
+    CHECK(ku_task_control_cleanup_deadline(task.owner.lease.control)==original);
+    CHECK(net_snapshot().reserved_bytes==fixture_ledger().bytes);
+  }
+  CHECK(ku_test_event_set(&fixture_net_release));
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,net_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  CHECK(ku_task_driver_wait_idle(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(fixture_net_closes==1u && !instance->blocking.pool);
+  CHECK(net_snapshot().reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0));
+  KuTaskAdapterOutcomeV1 outcome={0};uint32_t taken=ku_task_value_take(&task,NULL,&outcome);
+  if (cancel) CHECK(taken==KU_TASK_CONTROL_CANCELLED && ku_task_outcome_empty(&outcome,3u));
+  else {
+    CHECK(taken==KU_TASK_CONTROL_OK);
+    if (limited) CHECK(!outcome.value.null_value.ok && outcome.value.null_value.error.code.len==12u && !memcmp(outcome.value.null_value.error.code.ptr,"memory_limit",12u));
+    else CHECK(outcome.value.null_value.ok);
+  }
+  ku_task_outcome_drop(&outcome);CHECK(ku_task_value_drop(&task,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_wait_idle(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(!net_snapshot().resident && !net_snapshot().reserved_bytes);
+  CHECK(ku_task_driver_shutdown(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_finish(&net_pool,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_join(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&net_driver)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_destroy(&fixture_net_entered));CHECK(ku_test_event_destroy(&fixture_net_release));CHECK(ku_test_event_destroy(&fixture_net_drained));
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+}
+int main(void) {
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u);
+  net_case(0,0,0);net_case(1,0,0);net_case(0,0,1);net_case(0,1,0);net_case(1,1,0);
+  puts("net-job-owners-ok");return 0;
+}
+"#;

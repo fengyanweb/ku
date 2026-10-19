@@ -340,6 +340,33 @@ fn generate_c_source_with_frames_bounded(
     let checked_integer_runtime = sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
+    let task_net = frames.is_some_and(|(tasks, _, _)| {
+        tasks.functions.iter().any(|function| {
+            function.slots.iter().any(|slot| {
+                matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
+                    if crate::ir::task::local_net_type(ty))
+            })
+        })
+    });
+    let task_bytes = task_net
+        || frames.is_some_and(|(tasks, _, _)| {
+            tasks.functions.iter().any(|function| {
+                function.slots.iter().any(|slot| {
+                    matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
+                        if crate::ir::task::local_bytes_type(ty))
+                })
+            })
+        });
+    let task_fs = frames.is_some_and(|(tasks, _, _)| task::uses_blocking_fs(tasks));
+    let task_native_tls = frames.is_some_and(|(tasks, _, _)| {
+        tasks.functions.iter().any(|function| {
+            function.states.iter().any(|state| {
+                matches!(&state.terminator, crate::ir::task::TaskTerminator::BlockingNet {
+                    operation: crate::ir::task::TaskNetOperation::Connect, inputs, ..
+                } if inputs[6].is_some())
+            })
+        })
+    });
     let mut frame_result_types = Vec::new();
     let mut frame_array_elements = Vec::new();
     if let Some((frames, _, _)) = frames {
@@ -376,16 +403,33 @@ fn generate_c_source_with_frames_bounded(
             }
         }
     }
+    // Shared bytes/net helpers emit their whole API even when a Task calls only
+    // one operation. These private local Results do not extend Task outcomes.
+    if task_bytes {
+        for payload in [
+            IrType::Named("__ku_bytes".to_string()),
+            IrType::Int,
+            IrType::Str,
+        ] {
+            collect_result_type(&IrType::Result(Box::new(payload)), &mut frame_result_types)?;
+        }
+    }
+    if task_net {
+        for payload in [IrType::Named("__ku_net_client".to_string()), IrType::Null] {
+            collect_result_type(&IrType::Result(Box::new(payload)), &mut frame_result_types)?;
+        }
+    }
     for function in &program.functions {
         validate_cfg(function)?;
     }
     validate_layouts(program)?;
     let mut fs_usage = program_fs_usage(program);
-    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
+    if task_fs {
         fs_usage.write = true;
         fs_usage.read = true;
         fs_usage.exists = true;
-        fs_usage.read_dir = frames.is_some_and(|(tasks, _, _)| task::uses_blocking_read_dir(tasks));
+        fs_usage.read_dir |=
+            frames.is_some_and(|(tasks, _, _)| task::uses_blocking_read_dir(tasks));
     }
     if fs_usage.any() {
         if let NativeFsBase::Unavailable(reason) = &options.fs_base {
@@ -456,8 +500,10 @@ fn generate_c_source_with_frames_bounded(
     // The pg connection poller also needs WSAPoll/poll and shutdown(2). Keep a
     // PG-only artifact lean: it does not need the HTTP/Redis resolver, atomic,
     // or thread headers unless it also uses one of those runtimes.
-    let uses_native_socket_runtime =
-        program_uses_http(program) || program_uses_redis(program) || program_uses_net(program);
+    let uses_native_socket_runtime = program_uses_http(program)
+        || program_uses_redis(program)
+        || program_uses_net(program)
+        || task_net;
     if uses_native_socket_runtime {
         out.push_str(
             "#if defined(_WIN32)\n\
@@ -587,8 +633,8 @@ fn generate_c_source_with_frames_bounded(
     emit_pg_types(&mut out, program);
     emit_redis_types(&mut out, program);
     emit_mysql_types(&mut out, program);
-    emit_bytes_types(&mut out, program);
-    emit_net_types(&mut out, program);
+    emit_bytes_types(&mut out, program, task_bytes);
+    emit_net_types(&mut out, program, task_net);
     emit_layouts(&mut out, program)?;
     emit_named_ownership_helpers(&mut out, program)?;
     register_closure_invoke_symbols(program);
@@ -619,7 +665,12 @@ fn generate_c_source_with_frames_bounded(
         &mut closure_emitted,
         true,
     )?;
-    emit_object_abi(&mut out, program, options.object_oom_fault_injection)?;
+    emit_object_abi(
+        &mut out,
+        program,
+        task_net,
+        options.object_oom_fault_injection,
+    )?;
     // Object-valued typed arrays need KuObject/KuValue to be complete before
     // their typed KuArray helper bodies call ku_object_{clone,drop,move}.
     emit_late_array_typedefs(&mut out, program)?;
@@ -636,16 +687,16 @@ fn generate_c_source_with_frames_bounded(
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
     emit_array_helper_bodies(&mut out, program, &frame_array_elements)?;
-    emit_bytes_runtime(&mut out, program);
-    emit_windows_socket_runtime(&mut out, program);
-    emit_net_runtime(&mut out, program);
+    emit_bytes_runtime(&mut out, program, task_bytes);
+    emit_windows_socket_runtime(&mut out, program, task_net);
+    emit_net_runtime(&mut out, program, task_net, task_native_tls);
     emit_string_chars_helper(&mut out, program)?;
     emit_kuvalue_array_wrappers(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
     emit_fs_runtime(&mut out, fs_usage, &options.fs_base);
     if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
         out.push_str(
-            if matches!(options.fs_base, NativeFsBase::ExecutableRelative(_)) {
+            if task_fs && matches!(options.fs_base, NativeFsBase::ExecutableRelative(_)) {
                 "static void ku_fs_prepare_blocking_base(void) { (void)ku_fs_init_base(); }\n"
             } else {
                 "static void ku_fs_prepare_blocking_base(void) {}\n"
@@ -3688,10 +3739,11 @@ fn emit_result_abi_phase(
 fn emit_object_abi(
     out: &mut COutput,
     program: &IrProgram,
+    force: bool,
     object_oom_fault_injection: bool,
 ) -> KuResult<()> {
     out.check()?;
-    if !program_uses_object(program) {
+    if !force && !program_uses_object(program) {
         return Ok(());
     }
     out.push_str(if object_oom_fault_injection {
@@ -9798,11 +9850,11 @@ fn program_uses_net(program: &IrProgram) -> bool {
 /// Emit one process-level Winsock owner for the native transports that Ku owns
 /// directly. Net and Redis share the same successful WSAStartup reference; it is
 /// released once at normal process exit, never when an individual client closes.
-fn emit_windows_socket_runtime(out: &mut COutput, program: &IrProgram) {
+fn emit_windows_socket_runtime(out: &mut COutput, program: &IrProgram, force_net: bool) {
     if out.failed() {
         return;
     }
-    if !program_uses_net(program) && !program_uses_redis(program) {
+    if !force_net && !program_uses_net(program) && !program_uses_redis(program) {
         return;
     }
     out.push_str(
@@ -9862,11 +9914,11 @@ fn program_uses_bytes(program: &IrProgram) -> bool {
     program_uses_net(program) || program_uses_native_named(program, "__ku_bytes")
 }
 
-fn emit_bytes_types(out: &mut COutput, program: &IrProgram) {
+fn emit_bytes_types(out: &mut COutput, program: &IrProgram, force: bool) {
     if out.failed() {
         return;
     }
-    if !program_uses_bytes(program) {
+    if !force && !program_uses_bytes(program) {
         return;
     }
     out.push_str(
@@ -9878,11 +9930,11 @@ fn emit_bytes_types(out: &mut COutput, program: &IrProgram) {
     );
 }
 
-fn emit_net_types(out: &mut COutput, program: &IrProgram) {
+fn emit_net_types(out: &mut COutput, program: &IrProgram, force: bool) {
     if out.failed() {
         return;
     }
-    if !program_uses_net(program) {
+    if !force && !program_uses_net(program) {
         return;
     }
     out.push_str(concat!(
@@ -9893,11 +9945,11 @@ fn emit_net_types(out: &mut COutput, program: &IrProgram) {
     ));
 }
 
-fn emit_bytes_runtime(out: &mut COutput, program: &IrProgram) {
+fn emit_bytes_runtime(out: &mut COutput, program: &IrProgram, force: bool) {
     if out.failed() {
         return;
     }
-    if !program_uses_bytes(program) {
+    if !force && !program_uses_bytes(program) {
         return;
     }
     out.push_str(
@@ -10032,7 +10084,7 @@ static KuResult_str ku_bytes_to_str(KuBytes value) {
 }
 "#,
     );
-    if program_uses_intrinsic(program, "bytes.from_array") {
+    if force || program_uses_intrinsic(program, "bytes.from_array") {
         out.push_str(
             r#"
 static KuResult_bytes ku_bytes_from_array(KuArray_int values) {
@@ -10067,14 +10119,14 @@ static KuResult_bytes ku_bytes_from_array(KuArray_int values) {
     out.push('\n');
 }
 
-fn emit_net_runtime(out: &mut COutput, program: &IrProgram) {
+fn emit_net_runtime(out: &mut COutput, program: &IrProgram, force: bool, force_tls: bool) {
     if out.failed() {
         return;
     }
-    if !program_uses_net(program) {
+    if !force && !program_uses_net(program) {
         return;
     }
-    if program_mentions_native_tls_config(program) {
+    if force_tls || program_mentions_native_tls_config(program) {
         out.push_str("#define KU_FEATURE_NATIVE_TLS 1\n");
     }
     out.push_str(
@@ -10170,6 +10222,27 @@ static void ku_net_atomic_flag_set(KuNetAtomicFlag* flag) {
   atomic_store_explicit(flag, 1, memory_order_release);
 }
 #endif
+
+/* Allocations returned as Ku owners must remain ordinary-free compatible.
+ * The callback context is borrowed for this call only and is never retained
+ * by a client or bytes value. Resolver/TLS library allocations remain outside
+ * this adapter; the hostname, client header and read buffer use these hooks. */
+typedef struct KuNetAllocatorV1 {
+  void* context;
+  void* (*allocate)(void*, size_t);
+  void (*release)(void*, void*);
+} KuNetAllocatorV1;
+static void* ku_net_allocate(const KuNetAllocatorV1* allocator, size_t bytes) {
+  if (!allocator) return malloc(bytes);
+  if (!allocator->allocate || !allocator->release) return NULL;
+  return allocator->allocate(allocator->context, bytes);
+}
+static void ku_net_release(const KuNetAllocatorV1* allocator, void* pointer) {
+  if (!pointer) return;
+  if (allocator && allocator->allocate && allocator->release)
+    allocator->release(allocator->context, pointer);
+  else free(pointer);
+}
 
 struct KuNetClient {
   KuNetSocket socket_value;
@@ -11027,7 +11100,8 @@ static int ku_net_host_valid(KuString host) {
   return 1;
 }
 
-static KuResult_net_client ku_net_client(KuObject* config) {
+static KuResult_net_client ku_net_client_with_allocator(KuObject* config,
+    const KuNetAllocatorV1* allocator) {
   if (!config) return (KuResult_net_client){ false, NULL,
     ku_net_error("invalid_config", "net.client requires a config object") };
   for (size_t index = 0; index < config->cap; index++) {
@@ -11100,7 +11174,7 @@ static KuResult_net_client ku_net_client(KuObject* config) {
       ku_net_error("transport_error", "network runtime initialization failed") };
   }
   size_t hostname_bytes = host_value->as.s.len + 1;
-  char* hostname = (char*)malloc(hostname_bytes);
+  char* hostname = (char*)ku_net_allocate(allocator, hostname_bytes);
   if (!hostname) return (KuResult_net_client){ false, NULL,
     ku_net_error("out_of_memory", "net host allocation failed") };
   memcpy(hostname, host_value->as.s.ptr, host_value->as.s.len);
@@ -11109,7 +11183,7 @@ static KuResult_net_client ku_net_client(KuObject* config) {
   int port_length = snprintf(port_text, sizeof(port_text), "%lld",
       (long long)port_value->as.i);
   if (port_length <= 0 || (size_t)port_length >= sizeof(port_text)) {
-    free(hostname);
+    ku_net_release(allocator, hostname);
     return (KuResult_net_client){ false, NULL,
       ku_net_error("invalid_config", "net.client port is invalid") };
   }
@@ -11120,7 +11194,7 @@ static KuResult_net_client ku_net_client(KuObject* config) {
   hints.ai_protocol = IPPROTO_TCP;
   struct addrinfo* addresses = NULL;
   int resolver_status = getaddrinfo(hostname, port_text, &hints, &addresses);
-  free(hostname);
+  ku_net_release(allocator, hostname);
   if (ku_net_now_ms() >= deadline) {
     if (addresses) freeaddrinfo(addresses);
     return (KuResult_net_client){ false, NULL,
@@ -11181,7 +11255,7 @@ static KuResult_net_client ku_net_client(KuObject* config) {
     return (KuResult_net_client){ false, NULL,
       ku_net_error("connect_timeout", "net connect timed out") };
   }
-  KuNetClient* client = (KuNetClient*)malloc(sizeof(KuNetClient));
+  KuNetClient* client = (KuNetClient*)ku_net_allocate(allocator, sizeof(KuNetClient));
   if (!client) {
     ku_net_socket_close(connected);
     return (KuResult_net_client){ false, NULL,
@@ -11204,7 +11278,7 @@ static KuResult_net_client ku_net_client(KuObject* config) {
         &tls_config);
     if (status != KU_TLS_STATUS_OK || !tls_config) {
       if (tls_config) (void)ku_tls_v1_config_drop(tls_config);
-      ku_net_poison(client); free(client);
+      ku_net_poison(client); ku_net_release(allocator, client);
       return (KuResult_net_client){ false, NULL,
         ku_net_tls_status_error(status, "config_new") };
     }
@@ -11219,29 +11293,33 @@ static KuResult_net_client ku_net_client(KuObject* config) {
           : config_drop_status != KU_TLS_STATUS_OK
               ? ku_net_tls_status_error(config_drop_status, "config_drop")
               : ku_net_error("tls_error", "native TLS returned no session");
-      ku_net_poison(client); free(client);
+      ku_net_poison(client); ku_net_release(allocator, client);
       return (KuResult_net_client){ false, NULL, tls_error };
     }
     KuError tls_error = (KuError){0};
     if (!ku_net_tls_handshake_until(client, deadline, &tls_error)) {
-      ku_net_poison(client); free(client);
+      ku_net_poison(client); ku_net_release(allocator, client);
       return (KuResult_net_client){ false, NULL, tls_error };
     }
   }
 #endif
   if (ku_net_gate_init(&client->gate) != 0) {
-    ku_net_poison(client); free(client);
+    ku_net_poison(client); ku_net_release(allocator, client);
     return (KuResult_net_client){ false, NULL,
       ku_net_error("sync_error", "net client synchronization initialization failed") };
   }
   if (ku_net_now_ms() >= deadline) {
     ku_net_poison(client);
     ku_net_gate_destroy(&client->gate);
-    free(client);
+    ku_net_release(allocator, client);
     return (KuResult_net_client){ false, NULL,
       ku_net_error("connect_timeout", "net connect timed out") };
   }
   return (KuResult_net_client){ true, client, (KuError){0} };
+}
+
+static KuResult_net_client ku_net_client(KuObject* config) {
+  return ku_net_client_with_allocator(config, NULL);
 }
 
 static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
@@ -11315,7 +11393,8 @@ static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
   return (KuResult_null){ true, 0, (KuError){0} };
 }
 
-static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
+static KuResult_bytes ku_net_read_with_allocator(KuNetClient* client,
+    int64_t requested, const KuNetAllocatorV1* allocator) {
   if (!client || ku_net_atomic_flag_load(&client->poison_requested)) {
     return (KuResult_bytes){ false, (KuBytes){0},
       ku_net_error("client_closed", "net client is closed") };
@@ -11348,7 +11427,7 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
   if (client->tls_enabled && result.capacity > KU_TLS_MAX_IO_BYTES)
     result.capacity = KU_TLS_MAX_IO_BYTES;
 #endif
-  result.ptr = (uint8_t*)malloc(result.capacity);
+  result.ptr = (uint8_t*)ku_net_allocate(allocator, result.capacity);
   if (!result.ptr) {
     if (ku_net_gate_release(&client->gate) != 0) {
       ku_net_atomic_flag_set(&client->poison_requested);
@@ -11408,10 +11487,15 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
       error = ku_net_error("sync_error", "net client synchronization failed");
   }
   if (error.code.len != 0) {
-    ku_drop_bytes(&result);
+    ku_net_release(allocator, result.ptr);
+    result = (KuBytes){0};
     return (KuResult_bytes){ false, (KuBytes){0}, error };
   }
   return (KuResult_bytes){ true, result, (KuError){0} };
+}
+
+static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
+  return ku_net_read_with_allocator(client, requested, NULL);
 }
 
 static uint8_t ku_net_close(KuNetClient* client) {

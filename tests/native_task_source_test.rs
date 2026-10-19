@@ -837,3 +837,199 @@ async fn main(): null! {
     assert_eq!(lines[4], "0");
     assert_eq!(lines[5], "read_dir_failed");
 }
+
+fn native_task_transport_source(source: &str) -> String {
+    // Ku accepts embedded NUL bytes; its string escape set has no \0 spelling.
+    let source = source.replace("\\0", "\0");
+    let mut ast = Parser::new(Lexer::new(&source).lex().expect("transport source lexes"))
+        .parse_program()
+        .expect("transport source parses");
+    ast.items
+        .retain(|item| !matches!(item, ku::ast::Item::Import(_)));
+    for name in ["std:net", "std:bytes", "std:time"] {
+        ast.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: name.into(),
+                span: Default::default(),
+            }),
+        );
+    }
+    Checker::new()
+        .check(&ast)
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
+    let tasks = task_lower::lower_program(&ast).expect("transport source lowers");
+    c::generate_native_task_c_source(&tasks, &Default::default()).expect("transport C generation")
+}
+
+#[test]
+fn native_task_tcp_wait_yields_one_executor_and_preserves_partial_binary_data() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let source = format!(
+        r#"
+import net from "std.net"
+import bytes from "std.bytes"
+import time from "std.time"
+async fn Tick(): null! {{ time.sleep(10)? println("tick") return ok(null) }}
+async fn Exchange(port: int): null! {{
+    client=net.client({{host:"127.0.0.1",port:port,tls:false,read_timeout_ms:2000}})?
+    sent=bytes.from_str("A\0B")?
+    client.write(sent)?
+    println(sent.len())
+    total=0
+    sum=0
+    while (total<3) {{
+        part=client.read(3)?
+        for index in part.len() {{ sum=sum+part.get(index)? }}
+        total=total+part.len()
+    }}
+    println(total)
+    println(sum)
+    try {{ client.read(1)? }} catch(err) {{ println(err.code) }}
+    client.close()
+    return ok(null)
+}}
+async fn main(): null! {{
+    exchange=Exchange({port})
+    timer=Tick()
+    timer_done=(await timer)?
+    exchange_done=(await exchange)?
+    return ok(null)
+}}
+"#
+    );
+    let mut generated = native_task_transport_source(&source);
+    assert!(!generated.contains("#define KU_FEATURE_NATIVE_TLS 1"));
+    assert!(generated.contains("#define KU_TASK_BLOCKING_NETWORK 1"));
+    assert!(generated.contains("#define KU_TASK_BLOCKING_FILES 0"));
+    // One executor makes a blocking call on that executor observable: Tick
+    // must run before the delayed peer delivers the remaining response bytes.
+    let start = generated
+        .find("static size_t ku_task_root_worker_count(void) {")
+        .unwrap();
+    let end = start
+        + generated[start..]
+            .find("static uint64_t ku_task_root_deadline(")
+            .unwrap();
+    generated.replace_range(
+        start..end,
+        "static size_t ku_task_root_worker_count(void) { return 1u; }\n",
+    );
+    let directory = TempDir::new("native-task-tcp-yield");
+    let path = directory.path().join("transport.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "transport") else {
+        return;
+    };
+    listener.set_nonblocking(true).unwrap();
+    let peer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => panic!("bounded Task transport accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut input = [0u8; 3];
+        stream.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"A\0B");
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(b"A").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        stream.write_all(b"\0B").unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+    });
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    peer.join().expect("Task transport peer exits");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(
+        &lines[lines.len() - 3..],
+        &["3", "131", "end_of_stream"],
+        "{stdout:?}"
+    );
+    assert!(lines[..lines.len() - 3].contains(&"tick"));
+    assert!(lines[..lines.len() - 3].contains(&"3"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_local_bytes_use_existing_errors_and_owned_results() {
+    let source = r#"
+import net from "std.net"
+import bytes from "std.bytes"
+async fn Numbers(): null! {
+    input=bytes.from_array([65,0,255])?
+    cloned=input.clone()
+    println(input.len())
+    println(cloned.get(1)?)
+    println(cloned.get(2)?)
+    try { cloned.to_str()? } catch(err) { println(err.code) }
+    try { cloned.get(3)? } catch(err) { println(err.code) }
+    return ok(null)
+}
+async fn More(): null! {
+    try { bytes.from_array([256])? } catch(err) { println(err.code) }
+    text=bytes.from_str("中文😀\0尾")?
+    println(text.to_str()?)
+    try { net.client({host:"127.0.0.1",port:0})? } catch(err) { println(err.code) }
+    return ok(null)
+}
+async fn main(): null! {
+    numbers_done=(await Numbers())?
+    more_done=(await More())?
+    return ok(null)
+}
+"#;
+    let generated = native_task_transport_source(source);
+    let directory = TempDir::new("native-task-local-bytes");
+    let path = directory.path().join("bytes.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "bytes") else {
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "3\n0\n255\ninvalid_utf8\nindex_out_of_bounds\ninvalid_byte\n中文😀\0尾\ninvalid_config\n"
+    );
+    assert!(output.stderr.is_empty());
+}

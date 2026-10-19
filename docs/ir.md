@@ -839,3 +839,6 @@ Ku 要做高性能 native binary，IR 不能只做语法翻译。优化 pass 按
 8. stack allocation：不逃逸、定长或生命周期清楚的 native value 放栈上。
 9. monomorphization 泛型特化：对实际调用的泛型实例生成具体 IR，避免动态分派。
 10. bounds check 优化：循环范围和数组长度可证明时消除重复检查，但保留所有不能证明的运行时检查。
+
+
+`BlockingNet { operation, inputs, dst, ready, cleanup }` 使用 Connect/Read/Write/Close 四种固定操作，配置为最多九个已知类型输入槽，不引入通用 object 表达式。`__ku_net_client`、`__ku_bytes` 及其 Result 仅作为帧局部值；既有 async 参数、completion 和函数值载荷白名单不扩大。客户端只在成功提交后从帧移入 job，Pending 帧保留逻辑初始化位但物理指针为空；正常 take 交回连接及结果，取消清理在真实 DONE 后丢弃实际 owner。token 计入移走的连接头，输入副本和读结果计入原字节额度；没有先退款再释放。操作期限在提交前建立，包含队列时间，worker 暂存/恢复原线程期限上下文。DNS、TLS pending/库内存及系统资源的未计费边界见并发文档；固定池不代表通用网络 reactor 或完整 M:N。

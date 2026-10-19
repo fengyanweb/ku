@@ -4,15 +4,34 @@
 use super::output::COutput;
 use crate::error::KuResult;
 
-pub(super) fn emit(out: &mut COutput, enabled: bool, directory: bool) -> KuResult<()> {
+pub(super) fn emit(
+    out: &mut COutput,
+    enabled: bool,
+    files: bool,
+    directory: bool,
+    network: bool,
+) -> KuResult<()> {
     out.push_str(TOKEN);
     if enabled {
+        out.push_str(if files {
+            "#define KU_TASK_BLOCKING_FILES 1\n"
+        } else {
+            "#define KU_TASK_BLOCKING_FILES 0\n"
+        });
+        out.push_str(if network {
+            "#define KU_TASK_BLOCKING_NETWORK 1\n"
+        } else {
+            "#define KU_TASK_BLOCKING_NETWORK 0\n"
+        });
         out.push_str(if directory {
             "#define KU_TASK_BLOCKING_DIRECTORY 1\n"
         } else {
             "#define KU_TASK_BLOCKING_DIRECTORY 0\n"
         });
         out.push_str(RUNTIME);
+        if network {
+            out.push_str(NETWORK_RUNTIME);
+        }
     }
     out.check()
 }
@@ -43,7 +62,11 @@ typedef struct KuTaskBlockingJobV1 {
   uint32_t state, cancelled, kind;
   size_t output_charge;
   KuTaskDriverTicketV1 ticket;
+#if KU_TASK_BLOCKING_FILES
   KuFsNativeChar* path;
+#else
+  void* path;
+#endif
   KuString content;
   KuResult_null result;
   KuResult_str read_result;
@@ -51,6 +74,16 @@ typedef struct KuTaskBlockingJobV1 {
   KuResult_array_str directory_result;
 #endif
   bool exists_value;
+#if KU_TASK_BLOCKING_NETWORK
+  KuValue net_config[9];
+  uint16_t net_present;
+  uint64_t net_deadline;
+  int64_t net_requested;
+  KuNetClient* net_client;
+  KuBytes net_write;
+  KuResult_net_client net_connect_result;
+  KuResult_bytes net_read_result;
+#endif
 } KuTaskBlockingJobV1;
 typedef struct KuTaskBlockingWorkerV1 {
   KuTaskBlockingPoolV1* pool;
@@ -244,6 +277,66 @@ static void ku_task_blocking_output_release(void* raw, void* pointer) {
   }
   output->status=KU_TASK_DRIVER_INTERNAL;
 }
+#if KU_TASK_BLOCKING_NETWORK
+static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
+    KuTaskBlockingOutputV1* allocation) {
+  uint64_t previous_deadline=__ku_handler_deadline;
+  uint64_t previous_cleanup=__ku_handler_cleanup_deadline;
+  int previous_timeout=__ku_handler_timed_out;
+  unsigned long previous_unwind=__ku_handler_unwind_depth;
+  __ku_handler_deadline=job->net_deadline;
+  __ku_handler_cleanup_deadline=0; __ku_handler_timed_out=0; __ku_handler_unwind_depth=0;
+  KuNetAllocatorV1 allocator={allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
+  KuError error=cancelled ? ku_task_blocking_error("cancelled","network job cancelled before operation") : (KuError){0};
+  if (job->kind==5u) {
+    if (cancelled) job->net_connect_result=(KuResult_net_client){false,NULL,error};
+    else {
+      static const char* names[9]={"host","port","connect_timeout_ms","read_timeout_ms","write_timeout_ms","max_read_bytes","tls","tls_server_name","tls_ca_pem"};
+      KuEntry entries[16]; memset(entries,0,sizeof(entries));
+      KuObject config={0,16,entries};
+      for (size_t i=0;i<9u;i++) if (job->net_present & (uint16_t)(1u<<i)) {
+        KuString key=ku_string_static((const uint8_t*)names[i],strlen(names[i]));
+        size_t at=(size_t)ku_obj_hash(key)&15u;
+        while (entries[at].used) at=(at+1u)&15u;
+        entries[at]=(KuEntry){key,job->net_config[i],true}; config.len++;
+      }
+      job->net_connect_result=ku_net_client_with_allocator(&config,&allocator);
+    }
+  } else if (job->kind==6u) {
+    job->net_read_result=cancelled ? (KuResult_bytes){false,{0},error}
+        : ku_net_read_with_allocator(job->net_client,job->net_requested,&allocator);
+  } else if (job->kind==7u) {
+    job->result=cancelled ? (KuResult_null){false,0,error}
+        : ku_net_write(job->net_client,job->net_write);
+  } else {
+    /* Close has taken the exclusive source owner; no worker may borrow it. */
+    if (job->net_client) ku_net_close(job->net_client);
+    job->net_client=NULL; job->result=(KuResult_null){true,0,{0}};
+  }
+  __ku_handler_deadline=previous_deadline; __ku_handler_cleanup_deadline=previous_cleanup;
+  __ku_handler_timed_out=previous_timeout; __ku_handler_unwind_depth=previous_unwind;
+  /* Config and write snapshots use the private prepaid prefix allocator. */
+  for (size_t i=0;i<9u;i++) if ((job->net_present & (uint16_t)(1u<<i))
+      && job->net_config[i].tag==KU_STR) {
+    ku_task_blocking_free(job->net_config[i].as.s.ptr);
+    job->net_config[i].as.s=(KuString){0};
+  }
+  ku_task_blocking_free(job->net_write.ptr); job->net_write=(KuBytes){0};
+  if (allocation->status!=KU_TASK_DRIVER_OK) {
+    if (job->kind==5u) ku_result_drop_net_client(&job->net_connect_result);
+    else if (job->kind==6u) ku_result_drop_bytes(&job->net_read_result);
+    else ku_result_drop_null(&job->result);
+    error=ku_task_blocking_error(allocation->status==KU_TASK_DRIVER_LIMIT ? "memory_limit"
+        : allocation->status==KU_TASK_DRIVER_CLOSED ? "cancelled"
+        : allocation->status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "internal_error",
+        "network output allocation was rejected");
+    if (job->kind==5u) job->net_connect_result=(KuResult_net_client){false,NULL,error};
+    else if (job->kind==6u) job->net_read_result=(KuResult_bytes){false,{0},error};
+    else job->result=(KuResult_null){false,0,error};
+  }
+}
+#endif
+
 static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
   KuTaskBlockingPoolV1* pool=worker->pool;
   if (ku_task_blocking_lock(pool)) return;
@@ -262,7 +355,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     }
     job->state=KU_TASK_BLOCKING_RUNNING; pool->running++;
     if (pool->running>pool->peak_running) pool->peak_running=pool->running;
-    KuFsNativeChar* path=job->path;
+    void* path=job->path;
     KuString content=job->content;
     uint32_t start=ku_task_driver_blocking_can_start(&job->ticket);
     int cancelled=job->cancelled || pool->closing || start!=KU_TASK_DRIVER_OK;
@@ -277,8 +370,16 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     KuResult_array_str directory_result={0};
 #endif
     KuTaskBlockingOutputV1 allocation={pool,job,{NULL,NULL},{0,0},KU_TASK_DRIVER_OK,NULL,0,0,0};
+#if KU_TASK_BLOCKING_FILES
     KuFsAllocatorV1 allocator={&allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
+#endif
     bool ok=false,exists_value=false;
+#if KU_TASK_BLOCKING_NETWORK
+    if (kind>=5u) ku_task_blocking_net_run(job,cancelled,&allocation);
+    else
+#endif
+    {
+#if KU_TASK_BLOCKING_FILES
     if (!cancelled) {
 #if KU_TASK_BLOCKING_DIRECTORY
       if (kind==4u) {
@@ -301,6 +402,8 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
           allocation.status==KU_TASK_DRIVER_LIMIT ? "blocking output exceeds runtime byte budget" : allocation.status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "blocking output allocation failed" : allocation.status==KU_TASK_DRIVER_CLOSED ? "blocking read was cancelled before buffer growth" : "blocking output accounting failed");
       }
     }
+#endif
+    }
     /* Tracking storage is private to this worker, never part of a Ku value.
      * The directory implementation already freed every output on failure. */
     free(allocation.entries);
@@ -322,7 +425,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     else
 #endif
     if (kind==1u) job->read_result=(KuResult_str){ok,read_value,error};
-    else job->result=(KuResult_null){ok,0,error};
+    else if (kind<5u) job->result=(KuResult_null){ok,0,error};
     job->exists_value=exists_value;
     job->state=KU_TASK_BLOCKING_DONE; pool->running--;
     if (pool->finished!=UINT64_MAX) pool->finished++;
@@ -353,6 +456,7 @@ static void* ku_task_blocking_thread(void* raw) {
  * attempt, preserving absolute-path support and the old relative-path error. */
 static KuAtomicRefcount ku_task_blocking_base_prepared;
 static uint32_t ku_task_blocking_prepare_base(void) {
+#if KU_TASK_BLOCKING_FILES
   size_t expected=0;
   if (ku_task_control_atomic_cas(&ku_task_blocking_base_prepared,&expected,1)) {
     ku_fs_prepare_blocking_base();
@@ -360,6 +464,9 @@ static uint32_t ku_task_blocking_prepare_base(void) {
     return KU_TASK_DRIVER_OK;
   }
   return expected==2 ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;
+#else
+  return KU_TASK_DRIVER_OK;
+#endif
 }
 static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacity,
     size_t workers, uint64_t deadline) {
@@ -579,9 +686,14 @@ static uint32_t ku_task_blocking_cancel(const KuTaskDriverTicketV1* ticket,
   return status;
 }
 static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
-    KuTaskBlockingTokenV1* token, int cancel, uint32_t kind, void* output) {
+    KuTaskBlockingTokenV1* token, int cancel, uint32_t kind, void* owner_output, void* output) {
   KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)token->pool;
   if (!pool || !output || pool->initialized!=KU_TASK_DRIVER_STORAGE_LIVE) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+#if KU_TASK_BLOCKING_NETWORK
+  if ((kind==6u || kind==7u) && (!owner_output || *(KuNetClient**)owner_output)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+#else
+  (void)owner_output;
+#endif
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
   KuTaskBlockingJobV1* job=ku_task_blocking_find(pool,token);
   uint32_t status=!job || job->ticket.driver!=ticket->driver || job->ticket.slot!=ticket->slot
@@ -595,6 +707,14 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
         pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_unlock(pool); return status;
       }
       if (kind==2u) {
+#if KU_TASK_BLOCKING_NETWORK
+        if (job->kind>=5u) {
+          ku_drop_net_client(&job->net_client);
+          ku_result_drop_net_client(&job->net_connect_result);
+          ku_result_drop_bytes(&job->net_read_result);
+          ku_result_drop_null(&job->result);
+        } else
+#endif
 #if KU_TASK_BLOCKING_DIRECTORY
         if (job->kind==4u) ku_result_drop_array_str(&job->directory_result);
         else
@@ -604,6 +724,15 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
       }
 #if KU_TASK_BLOCKING_DIRECTORY
       else if (kind==4u) *(KuResult_array_str*)output=job->directory_result;
+#endif
+#if KU_TASK_BLOCKING_NETWORK
+      else if (kind==5u) *(KuResult_net_client*)output=job->net_connect_result;
+      else if (kind>=6u) {
+        if (!owner_output && kind!=8u) { ku_task_blocking_unlock(pool); return KU_TASK_DRIVER_INVALID_ARGUMENT; }
+        if (owner_output) *(KuNetClient**)owner_output=ku_move_net_client(&job->net_client);
+        if (kind==6u) *(KuResult_bytes*)output=job->net_read_result;
+        else *(KuResult_null*)output=job->result;
+      }
 #endif
       else if (kind==1u) *(KuResult_str*)output=job->read_result;
       else if (kind==3u) *(KuResult_bool*)output=(KuResult_bool){job->result.ok,job->exists_value,job->result.error};
@@ -624,26 +753,27 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
 }
 static uint32_t ku_task_blocking_read(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, int cancel, KuResult_null* output) {
-  return ku_task_blocking_take(ticket,token,cancel,0u,output);
+  return ku_task_blocking_take(ticket,token,cancel,0u,NULL,output);
 }
 static uint32_t ku_task_blocking_read_string(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, KuResult_str* output) {
-  return ku_task_blocking_take(ticket,token,0,1u,output);
+  return ku_task_blocking_take(ticket,token,0,1u,NULL,output);
 }
 static uint32_t ku_task_blocking_read_bool(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, KuResult_bool* output) {
-  return ku_task_blocking_take(ticket,token,0,3u,output);
+  return ku_task_blocking_take(ticket,token,0,3u,NULL,output);
 }
 #if KU_TASK_BLOCKING_DIRECTORY
 static uint32_t ku_task_blocking_read_directory(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, KuResult_array_str* output) {
-  return ku_task_blocking_take(ticket,token,0,4u,output);
+  return ku_task_blocking_take(ticket,token,0,4u,NULL,output);
 }
 #endif
 static uint32_t ku_task_blocking_discard(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token) {
-  uint32_t sentinel=0; return ku_task_blocking_take(ticket,token,1,2u,&sentinel);
+  uint32_t sentinel=0; return ku_task_blocking_take(ticket,token,1,2u,NULL,&sentinel);
 }
+#if KU_TASK_BLOCKING_FILES
 static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
     KuString path, KuString content, void* context,
@@ -772,5 +902,148 @@ static uint32_t ku_task_blocking_submit_exists(const KuTaskDriverTicketV1* ticke
   uint32_t status=ku_task_blocking_submit_impl(ticket,control,token,path,(KuString){0},context,reconcile,3u,&submitted);
   if (status==KU_TASK_DRIVER_OK) *output=(KuResult_bool){submitted.ok,false,submitted.error};
   return status;
+}
+#endif
+"#;
+
+const NETWORK_RUNTIME: &str = r#"
+/* A source frame never lends a live transport pointer to a blocking worker.
+ * The job owns that pointer until DONE; cancellation may clear the NULL frame
+ * slot first, then discards the real owner only after physical completion.
+ * DNS and native TLS-library allocations are external to this byte ledger.
+ * The bounded TLS ciphertext pending buffer is also not yet charged here. */
+static void ku_task_blocking_net_error_result(uint32_t kind, void* output, KuError error) {
+  if (kind==5u) *(KuResult_net_client*)output=(KuResult_net_client){false,NULL,error};
+  else if (kind==6u) *(KuResult_bytes*)output=(KuResult_bytes){false,{0},error};
+  else *(KuResult_null*)output=(KuResult_null){false,0,error};
+}
+static uint32_t ku_task_blocking_take_net(const KuTaskDriverTicketV1* ticket,
+    KuTaskBlockingTokenV1* token, uint32_t kind, KuNetClient** client, void* output) {
+  if (kind<5u || kind>8u) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  return ku_task_blocking_take(ticket,token,0,kind,client,output);
+}
+static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control, KuTaskBlockingTokenV1* token, uint32_t kind,
+    const KuValue fields[9], uint16_t present, KuNetClient** client,
+    KuBytes data, int64_t requested, void* context,
+    uint32_t (*reconcile)(void*), void* output) {
+  if (!ticket || !ticket->driver || !control || !token || token->pool || token->charged_bytes
+      || kind<5u || kind>8u || !context || !reconcile || !output
+      || (kind==5u && (!fields || (present&3u)!=3u || (present&~511u)))
+      || (kind!=5u && !client)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (kind==7u && ((data.len && !data.ptr) || data.len>(size_t)KU_BYTES_MAX_LENGTH)) {
+    ku_task_blocking_net_error_result(kind,output,ku_net_error("invalid_bytes","net write received invalid or oversized bytes"));
+    return KU_TASK_DRIVER_OK;
+  }
+  if (kind==5u) for (size_t i=0;i<9u;i++) if (present & (uint16_t)(1u<<i)) {
+    KuValueTag expected=(i==0u || i==7u || i==8u) ? KU_STR : i==6u ? KU_BOOL : KU_INT;
+    if (fields[i].tag!=expected || (expected==KU_STR && fields[i].as.s.len && !fields[i].as.s.ptr))
+      return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  }
+  KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)ticket->driver->blocking_pool;
+  if (!pool || pool->initialized!=KU_TASK_DRIVER_STORAGE_LIVE) {
+    ku_task_blocking_net_error_result(kind,output,ku_task_blocking_error("blocking_pool_stopped","blocking pool is not available"));
+    return KU_TASK_DRIVER_OK;
+  }
+  /* Capture once before queue admission: queue time consumes this same D.
+   * The existing handler's TLS deadline is included by this shared helper. */
+  uint32_t timeout=KU_NET_DEFAULT_TIMEOUT_MS;
+  if (kind==5u && (present & 4u) && fields[2].as.i>=1 && fields[2].as.i<=KU_NET_MAX_TIMEOUT_MS)
+    timeout=(uint32_t)fields[2].as.i;
+  else if (kind==6u && *client) timeout=(*client)->read_timeout_ms;
+  else if (kind==7u && *client) timeout=(*client)->write_timeout_ms;
+  uint64_t deadline=ku_net_deadline_after_ms(timeout);
+  if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
+  uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
+      ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
+  size_t index=0;
+  if (status==KU_TASK_DRIVER_OK) {
+    for (;index<pool->capacity;index++) if (pool->jobs[index].state==KU_TASK_BLOCKING_FREE
+        && pool->jobs[index].generation!=UINT64_MAX) break;
+    if (index==pool->capacity) status=KU_TASK_DRIVER_LIMIT;
+  }
+  if (status!=KU_TASK_DRIVER_OK) {
+    if (pool->rejected!=UINT64_MAX) pool->rejected++;
+    if (status==KU_TASK_DRIVER_LIMIT && pool->rejected_queue!=UINT64_MAX) pool->rejected_queue++;
+    ku_task_blocking_unlock(pool);
+    ku_task_blocking_net_error_result(kind,output,ku_task_blocking_error(status==KU_TASK_DRIVER_LIMIT ? "blocking_queue_full" : "blocking_pool_stopped",
+        status==KU_TASK_DRIVER_LIMIT ? "blocking queue is full" : "blocking pool is closing"));
+    return KU_TASK_DRIVER_OK;
+  }
+  KuTaskBlockingJobV1* job=&pool->jobs[index];
+  job->generation++; job->state=KU_TASK_BLOCKING_BUILDING; job->ticket=*ticket;
+  job->kind=kind; job->net_deadline=deadline; job->net_requested=requested;
+  *token=(KuTaskBlockingTokenV1){pool,index,0,job->generation};
+  pool->resident++; if (pool->resident>pool->peak_resident) pool->peak_resident=pool->resident;
+  ku_task_blocking_unlock(pool);
+  status=ku_task_driver_blocking_register(ticket);
+  int registered=status==KU_TASK_DRIVER_OK;
+  KuTaskBlockingBuilderV1 builder={ticket,token,context,reconcile,status};
+  KuValue copied[9]; memset(copied,0,sizeof(copied));
+  uint8_t* write_copy=NULL;
+  if (registered) {
+    builder.status=reconcile(context);
+    if (kind==5u) for (size_t i=0;i<9u && builder.status==KU_TASK_DRIVER_OK;i++) {
+      if (!(present & (uint16_t)(1u<<i))) continue;
+      copied[i]=fields[i];
+      if (fields[i].tag==KU_STR) {
+        KuString source=fields[i].as.s;
+        copied[i].as.s=(KuString){0};
+        if (source.len) {
+          uint8_t* bytes=(uint8_t*)ku_task_blocking_allocate(&builder,source.len);
+          if (!bytes) break;
+          memcpy(bytes,source.ptr,source.len);
+          copied[i].as.s=(KuString){bytes,source.len,source.len,KU_STRING_OWNED};
+        }
+      }
+    }
+    if (kind==7u && data.len && builder.status==KU_TASK_DRIVER_OK) {
+      write_copy=(uint8_t*)ku_task_blocking_allocate(&builder,data.len);
+      if (write_copy) memcpy(write_copy,data.ptr,data.len);
+    }
+  }
+  status=builder.status;
+  if (status!=KU_TASK_DRIVER_OK) goto ku_net_blocking_rejected;
+  if (kind!=5u && *client && sizeof(KuNetClient)>SIZE_MAX-token->charged_bytes) {
+    status=KU_TASK_DRIVER_LIMIT; goto ku_net_blocking_rejected;
+  }
+  if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
+  if (pool->closing || pool->fault || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE) {
+    status=KU_TASK_DRIVER_CLOSED; ku_task_blocking_unlock(pool); goto ku_net_blocking_rejected;
+  }
+  job=&pool->jobs[index];
+  if (kind==5u) { memcpy(job->net_config,copied,sizeof(copied)); job->net_present=present; }
+  else {
+    /* No allocation or fallible operation after this physical owner move. The
+     * existing driver reservation previously counted the very same frame owner. */
+    job->net_client=ku_move_net_client(client);
+    if (job->net_client) token->charged_bytes+=sizeof(KuNetClient);
+    job->net_write=(KuBytes){write_copy,data.len,data.len,KU_BYTES_OWNED};
+  }
+  job->state=KU_TASK_BLOCKING_QUEUED;
+  pool->ring[(pool->head+pool->queued)%pool->capacity]=index; pool->queued++;
+  if (pool->queued>pool->peak_queued) pool->peak_queued=pool->queued;
+  if (pool->accepted!=UINT64_MAX) pool->accepted++;
+  ku_task_blocking_signal(pool); ku_task_blocking_unlock(pool);
+  status=ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_WAIT);
+  return status==KU_TASK_DRIVER_OK ? KU_TASK_DRIVER_PENDING : status;
+ku_net_blocking_rejected:
+  for (size_t i=0;i<9u;i++) if ((present & (uint16_t)(1u<<i)) && copied[i].tag==KU_STR)
+    ku_task_blocking_release(&builder,copied[i].as.s.ptr);
+  ku_task_blocking_release(&builder,write_copy);
+  if (builder.status!=KU_TASK_DRIVER_OK) status=builder.status;
+  if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
+  job=&pool->jobs[index]; uint64_t generation=job->generation;
+  memset(job,0,sizeof(*job)); job->generation=generation;
+  pool->resident--; if (pool->rejected!=UINT64_MAX) pool->rejected++;
+  ku_task_blocking_signal(pool); ku_task_blocking_unlock(pool);
+  if (registered && ku_task_driver_blocking_retired(ticket)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;
+  *token=(KuTaskBlockingTokenV1){0};
+  uint32_t reconciled=reconcile(context);
+  if (reconciled!=KU_TASK_DRIVER_OK) return reconciled;
+  ku_task_blocking_net_error_result(kind,output,ku_task_blocking_error(
+      status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "blocking_pool_stopped",
+      status==KU_TASK_DRIVER_LIMIT ? "network input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "network input allocation failed" : "blocking pool is closing"));
+  return KU_TASK_DRIVER_OK;
 }
 "#;

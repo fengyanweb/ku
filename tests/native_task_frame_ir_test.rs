@@ -2095,3 +2095,154 @@ fn native_task_array_try_get_ir_preserves_inputs_and_owns_only_the_result() {
         rejected(&invalid, "try_get does not open nested arrays");
     }
 }
+
+#[test]
+fn native_task_net_values_remain_local_and_close_consumes_the_owner() {
+    use ku::ir::task::TaskNetOperation;
+    let net = IrType::Named("__ku_net_client".into());
+    let mut fixture = program(
+        vec![
+            IrType::Str,
+            IrType::Int,
+            result(net.clone()),
+            net.clone(),
+            IrType::Null,
+            result(IrType::Null),
+        ],
+        &[],
+        vec![
+            state(
+                vec![
+                    init(0, TaskConstant::Str("127.0.0.1".into())),
+                    init(1, TaskConstant::Int(9)),
+                ],
+                TaskTerminator::BlockingNet {
+                    operation: TaskNetOperation::Connect,
+                    inputs: [
+                        Some(SlotId(0)),
+                        Some(SlotId(1)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    dst: SlotId(2),
+                    ready: StateId(1),
+                    cleanup: StateId(5),
+                },
+            ),
+            state(
+                vec![],
+                TaskTerminator::TryResult {
+                    src: SlotId(2),
+                    ok_value: SlotId(3),
+                    err_result: SlotId(5),
+                    ok: StateId(2),
+                    err: StateId(4),
+                },
+            ),
+            state(
+                vec![],
+                TaskTerminator::BlockingNet {
+                    operation: TaskNetOperation::Close,
+                    inputs: [
+                        Some(SlotId(3)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    dst: SlotId(4),
+                    ready: StateId(3),
+                    cleanup: StateId(5),
+                },
+            ),
+            state(
+                vec![init(5, TaskConstant::Ok(Box::new(TaskConstant::Null)))],
+                TaskTerminator::Exit { value: SlotId(5) },
+            ),
+            state(vec![], TaskTerminator::Exit { value: SlotId(5) }),
+            state(
+                (0..6).rev().map(drop_if).collect(),
+                TaskTerminator::Terminate,
+            ),
+        ],
+    );
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].hosted);
+    assert!(plan.functions[0].slots.contains(&SlotId(3)));
+    fixture.functions[0].states[3].operations.insert(0, read(3));
+    rejected(&fixture, "client used after consuming close");
+    fixture.functions[0].states[3].operations.remove(0);
+    fixture.functions[0].parameters.push(SlotId(3));
+    rejected(&fixture, "opaque client entering an async parameter");
+    fixture.functions[0].parameters.clear();
+    fixture.functions[0].result = result(net);
+    rejected(&fixture, "opaque client escaping through Task completion");
+}
+
+#[test]
+fn native_task_net_ir_rejects_uninitialized_or_surplus_inputs() {
+    use ku::ir::task::TaskNetOperation;
+    let mut fixture = program(
+        vec![
+            IrType::Str,
+            IrType::Int,
+            result(IrType::Named("__ku_net_client".into())),
+            result(IrType::Null),
+        ],
+        &[],
+        vec![
+            state(
+                vec![
+                    init(0, TaskConstant::Str("127.0.0.1".into())),
+                    init(1, TaskConstant::Int(9)),
+                ],
+                TaskTerminator::BlockingNet {
+                    operation: TaskNetOperation::Connect,
+                    inputs: [
+                        Some(SlotId(0)),
+                        Some(SlotId(1)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    dst: SlotId(2),
+                    ready: StateId(1),
+                    cleanup: StateId(2),
+                },
+            ),
+            state(
+                vec![init(3, TaskConstant::Ok(Box::new(TaskConstant::Null)))],
+                TaskTerminator::Exit { value: SlotId(3) },
+            ),
+            state(
+                (0..4).rev().map(drop_if).collect(),
+                TaskTerminator::Terminate,
+            ),
+        ],
+    );
+    accepted(&fixture);
+    fixture.functions[0].states[0].operations.pop();
+    rejected(&fixture, "uninitialized port input");
+    fixture.functions[0].states[0]
+        .operations
+        .push(init(1, TaskConstant::Int(9)));
+    if let TaskTerminator::BlockingNet { inputs, .. } =
+        &mut fixture.functions[0].states[0].terminator
+    {
+        inputs[8] = Some(SlotId(1));
+    }
+    rejected(&fixture, "incorrectly typed config input");
+}

@@ -174,7 +174,7 @@ async fn main(): null! {
 
 仍拒绝嵌套数组、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写、exists 与 read_dir 以外的异步标准库 I/O。
+float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写、exists、read_dir 和局部 TCP/bytes 以外的异步标准库 I/O。
 finally 体只接有限 primitive/字符串/Error 操作、Copy 与现有 Owned 值赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
@@ -358,6 +358,16 @@ async fn main(): null! {
 才退休 job、释放费用并允许 ACK，取消与晚完成不续原 D。
 
 `fs.read_dir(path): [str]!` 也经同一后台池挂起恢复，保留 View 输入；结果按路径排序，沿用最多 10000 项及路径文本合计 1000000 字节的目录上限。目录 vector、字符串叶子、平台路径临时区和分配记录在分配前计入原 Task 字节预算；扩容期间新旧容量同时计费，原预算可能先拒绝，目录上限不是保证接纳。worker 关闭目录句柄后移交独立持有的结果，取消或迟到完成清理实际分配后才退款，不强行打断已经开始的 OS 调用。
+
+### native Task 的局部 TCP 与 bytes
+
+`net.client({ host: ..., port: ..., ... })`、`client.read(n)`、`client.write(data)` 和 `client.close()` 使用同一个固定后台池挂起恢复，调用处不额外加 `await`。配置必须为内联对象，沿用 host、port、connect_timeout_ms、read_timeout_ms、write_timeout_ms、max_read_bytes、tls、tls_server_name、tls_ca_pem 九个既有键；值按源码顺序求值。连接和 bytes 只能由当前帧局部持有，包括它们的局部 Result；不能作为 Task 参数、返回值、容器元素或函数值载荷。原 Task completion/参数 ABI 和 Driver10 不变。
+
+局部 bytes 支持 `bytes.from_str`、`bytes.from_array`、`clone`、`len`、`get` 和 `to_str`，保留二进制 NUL、UTF-8 检查和既有错误。读取可只返回当前可用的部分数据；EOF 与再次使用已关闭连接仍沿用原错误。写入读取 bytes，不消耗原值。
+
+提交成功后，job 独占连接，帧中的物理指针清空；read/write 完成后连接与结果一并交回。配置和写入内容使用独立副本。取消先清理帧时不能释放仍被操作使用的连接：等待实际 DONE 后丢弃 job 持有的数据并关闭连接，再退回额度。队列等待计入提交时建立的同一绝对期限；已经开始的 DNS 查询不能强制中断。Task 预算覆盖连接头、输入副本与读取结果；TLS ciphertext pending、TLS/解析器库内部、系统 socket 与线程资源仍不在此账本。
+
+此处只是已接入的 TCP 子集，通用网络 readiness provider、解释器完全可挂起调度和完整 M:N 仍未完成。
 
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、通用 Task 网络等待/netpoll、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；HTTP 的单 I/O 线程接入见下文。

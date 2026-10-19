@@ -9,9 +9,9 @@ use std::collections::HashSet;
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskConstant, TaskFinallyPlan, TaskFramePlan, TaskFunction,
-    TaskFunctionFrame, TaskIndirectCallPlan, TaskLimits, TaskOp, TaskProgram, TaskScopeExitPlan,
-    TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskBytesOperation, TaskConstant, TaskFinallyPlan, TaskFramePlan,
+    TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan, TaskLimits, TaskNetOperation, TaskOp,
+    TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -24,7 +24,7 @@ use super::{
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
 
-pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
+pub(super) fn uses_blocking_fs(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
         function.states.iter().any(|state| {
             matches!(
@@ -36,6 +36,18 @@ pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
             )
         })
     })
+}
+
+pub(super) fn uses_blocking_net(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
+        function
+            .states
+            .iter()
+            .any(|state| matches!(state.terminator, TaskTerminator::BlockingNet { .. }))
+    })
+}
+pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
+    uses_blocking_fs(tasks) || uses_blocking_net(tasks)
 }
 
 pub(super) fn uses_blocking_read_dir(tasks: &TaskProgram) -> bool {
@@ -82,7 +94,13 @@ pub(super) fn emit_frames(
     out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
-    super::task_blocking::emit(out, uses_blocking_io(tasks), uses_blocking_read_dir(tasks))?;
+    super::task_blocking::emit(
+        out,
+        uses_blocking_io(tasks),
+        uses_blocking_fs(tasks),
+        uses_blocking_read_dir(tasks),
+        uses_blocking_net(tasks),
+    )?;
     super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
         out.check()?;
@@ -176,7 +194,9 @@ impl<'a> FrameEmitter<'a> {
                         && !*borrowed
                         && (matches!(ty, IrType::Str | IrType::Result(_))
                             || crate::ir::task::flat_array(ty)
-                            || crate::ir::task::error_type(ty))
+                            || crate::ir::task::error_type(ty)
+                            || crate::ir::task::local_bytes_type(ty)
+                            || crate::ir::task::local_net_type(ty))
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -218,6 +238,7 @@ impl<'a> FrameEmitter<'a> {
                                 | TaskTerminator::BlockingWrite { .. }
                                 | TaskTerminator::BlockingRead { .. } | TaskTerminator::BlockingReadDir { .. }
                                 | TaskTerminator::BlockingExists { .. }
+                                | TaskTerminator::BlockingNet { .. }
                         ) || state
                             .operations
                             .iter()
@@ -396,7 +417,9 @@ impl<'a> FrameEmitter<'a> {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
                         || crate::ir::task::flat_array(ty)
-                        || crate::ir::task::error_type(ty))
+                        || crate::ir::task::error_type(ty)
+                        || crate::ir::task::local_bytes_type(ty)
+                        || crate::ir::task::local_net_type(ty))
             }
         }
     }
@@ -967,6 +990,79 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ready.0
                     ));
                 }
+                TaskTerminator::BlockingNet {
+                    operation,
+                    inputs,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!(
+                        "  {{\n  frame->header.cleanup_state={}u;\n",
+                        cleanup.0
+                    ));
+                    let kind = match operation {
+                        TaskNetOperation::Connect => 5,
+                        TaskNetOperation::Read => 6,
+                        TaskNetOperation::Write => 7,
+                        TaskNetOperation::Close => 8,
+                    };
+                    if *operation == TaskNetOperation::Connect {
+                        out.push_str("  KuValue config[9]; uint16_t present=0; memset(config,0,sizeof(config));\n");
+                        for (index, input) in inputs.iter().enumerate() {
+                            if let Some(input) = input {
+                                let wrapper = match index {
+                                    0 | 7 | 8 => "ku_v_str",
+                                    6 => "ku_v_bool",
+                                    _ => "ku_v_int",
+                                };
+                                out.push_str(&format!("  config[{index}]={wrapper}({}); present|=(uint16_t)(1u<<{index});\n", self.place(*input)));
+                            }
+                        }
+                        out.push_str(&format!("  uint32_t net_status=ku_task_host_net_connect((KuTaskAdapterHostV1*)clock->host,config,present,&{});\n", self.place(*dst)));
+                    } else {
+                        let client = self.place(
+                            inputs[0].ok_or_else(|| unsupported("net client input is absent"))?,
+                        );
+                        let argument = match operation {
+                            TaskNetOperation::Read | TaskNetOperation::Write => self.place(
+                                inputs[1].ok_or_else(|| unsupported("net data input is absent"))?,
+                            ),
+                            _ => "0".into(),
+                        };
+                        if *operation == TaskNetOperation::Read {
+                            out.push_str(&format!("  uint32_t net_status=ku_task_host_net_read((KuTaskAdapterHostV1*)clock->host,&{client},{argument},&{});\n", self.place(*dst)));
+                        } else {
+                            out.push_str("  KuResult_null net_result={0};\n");
+                            let bytes = if *operation == TaskNetOperation::Write {
+                                argument
+                            } else {
+                                "(KuBytes){0}".into()
+                            };
+                            out.push_str(&format!("  uint32_t net_status=ku_task_host_net_write_close((KuTaskAdapterHostV1*)clock->host,&{client},{bytes},{kind}u,&net_result);\n"));
+                        }
+                    }
+                    out.push_str("  if (net_status==KU_TASK_CONTROL_PENDING) { frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n  if (net_status!=KU_TASK_CONTROL_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
+                    if *operation == TaskNetOperation::Write {
+                        out.push_str(&format!("  {}=net_result;\n", self.place(*dst)));
+                    } else if *operation == TaskNetOperation::Close {
+                        out.push_str("  if (!net_result.ok) {\n");
+                        self.emit_runtime_error(out, "ku_error_move(&net_result.error)")?;
+                        out.push_str("  }\n");
+                        self.set_init(
+                            out,
+                            inputs[0].ok_or_else(|| unsupported("net close missing client"))?,
+                            false,
+                        );
+                        out.push_str(&format!("  {}=0;\n", self.place(*dst)));
+                    }
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
                 TaskTerminator::BlockingExists {
                     path,
                     dst,
@@ -1306,6 +1402,51 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!(
                     "  {destination}=({result_type}){{true,{value},(KuError){{0}}}};\n  }}\n"
                 ));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::Bytes {
+                operation,
+                dst,
+                src,
+                index,
+            } => {
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                match operation {
+                    TaskBytesOperation::Len => {
+                        out.push_str(&format!("  {destination}=ku_bytes_len({source});\n"))
+                    }
+                    TaskBytesOperation::Get => out.push_str(&format!(
+                        "  {destination}=ku_bytes_get({source},{});\n",
+                        self.place(index.ok_or_else(|| unsupported("bytes.get index absent"))?)
+                    )),
+                    TaskBytesOperation::FromStr | TaskBytesOperation::Clone => {
+                        if *operation == TaskBytesOperation::FromStr {
+                            out.push_str(&format!("  if ({source}.len>(size_t)KU_BYTES_MAX_LENGTH) {destination}=(KuResult_bytes){{false,{{0}},ku_bytes_error(\"too_large\",\"bytes input exceeds 64 MiB\")}}; else\n"));
+                        }
+                        out.push_str("  { KuBytes copied={0};\n");
+                        out.push_str(&format!("  uint32_t allocated=ku_task_host_copy_bytes((KuTaskAdapterHostV1*)clock->host,{source}.ptr,{source}.len,&copied);\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        if *operation == TaskBytesOperation::Clone {
+                            out.push_str(&format!("  {destination}=copied;\n"));
+                        } else {
+                            out.push_str(&format!(
+                                "  {destination}=(KuResult_bytes){{true,copied,{{0}}}};\n"
+                            ));
+                        }
+                        out.push_str("  }\n");
+                    }
+                    TaskBytesOperation::FromArray => {
+                        out.push_str(&format!("  if ({source}.len>(size_t)KU_BYTES_MAX_LENGTH) {destination}=(KuResult_bytes){{false,{{0}},ku_bytes_error(\"too_large\",\"byte array exceeds 64 MiB\")}}; else {{ bool valid=true;\n  for (size_t i=0;valid && i<{source}.len;i++) valid={source}.data[i]>=0 && {source}.data[i]<=255;\n  if (!valid) {destination}=(KuResult_bytes){{false,{{0}},ku_bytes_error(\"invalid_byte\",\"byte values must be between 0 and 255\")}};\n  else {{ KuBytes copied={{0}}; uint32_t allocated=ku_task_host_copy_bytes((KuTaskAdapterHostV1*)clock->host,NULL,{source}.len,&copied);\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str(&format!("  for (size_t i=0;i<{source}.len;i++) copied.ptr[i]=(uint8_t){source}.data[i];\n  {destination}=(KuResult_bytes){{true,copied,{{0}}}}; }} }}\n"));
+                    }
+                    TaskBytesOperation::ToStr => {
+                        out.push_str(&format!("  if (!ku_bytes_utf8_valid({source}.ptr,{source}.len)) {destination}=(KuResult_str){{false,{{0}},ku_bytes_error(\"invalid_utf8\",\"bytes value is not valid UTF-8\")}};\n  else {{ KuBytes copied={{0}}; uint32_t allocated=ku_task_host_copy_bytes((KuTaskAdapterHostV1*)clock->host,{source}.ptr,{source}.len,&copied);\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str(&format!("  {destination}=(KuResult_str){{true,{{copied.ptr,copied.len,copied.capacity,copied.storage}},{{0}}}}; }}\n"));
+                    }
+                }
                 self.set_init(out, *dst, true);
             }
             TaskOp::Copy { dst, src } => {
@@ -1750,7 +1891,10 @@ static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t ab
 }
 
 fn require_slot_type(ty: &IrType) -> KuResult<()> {
-    if crate::ir::task::error_type(ty) {
+    if crate::ir::task::error_type(ty)
+        || crate::ir::task::local_bytes_type(ty)
+        || crate::ir::task::local_net_type(ty)
+    {
         return Ok(());
     }
     match ty {
@@ -1797,6 +1941,8 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
         ));
     }
     match ty {
+        IrType::Named(name) if name == "__ku_net_client" => Ok(format!("({place}) == NULL")),
+        IrType::Named(name) if name == "__ku_bytes" => Ok(format!("({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0")),
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),
         IrType::Str => Ok(format!(
             "({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0"

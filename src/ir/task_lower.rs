@@ -89,7 +89,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -209,9 +209,35 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut entry = None;
     let mut std_time = false;
     let mut std_fs = false;
+    let mut std_net = false;
+    let mut std_bytes = false;
     for item in &program.items {
         budget.analysis(1, Span::default())?;
         match item {
+            Item::Module(module) if matches!(module.name.as_str(), "std:net" | "std:bytes") => {
+                std_net |= module.name == "std:net";
+                std_bytes |= module.name == "std:bytes";
+                continue;
+            }
+            Item::Import(import)
+                if matches!(import.path.as_str(), "std.net" | "std.bytes")
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind, ImportKind::Namespace(name) if Some(name.as_str()) == import.path.strip_prefix("std."))) =>
+            {
+                std_net |= import.path == "std.net";
+                std_bytes |= import.path == "std.bytes";
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std"
+                    && matches!(&import.kind, ImportKind::Named(names) if names.len() == 1 && matches!(names[0].source.as_str(), "net" | "bytes") && names[0].alias.is_none()) =>
+            {
+                if let ImportKind::Named(names) = &import.kind {
+                    std_net |= names[0].source == "net";
+                    std_bytes |= names[0].source == "bytes";
+                }
+                continue;
+            }
             Item::Module(module) if module.name == "std:fs" => {
                 std_fs = true;
                 continue;
@@ -325,8 +351,16 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut functions = Vec::new();
     for declaration in declarations {
         functions.push(
-            FunctionLowerer::new(declaration, &signatures, &mut budget, std_time, std_fs)?
-                .lower(declaration)?,
+            FunctionLowerer::new(
+                declaration,
+                &signatures,
+                &mut budget,
+                std_time,
+                std_fs,
+                std_net,
+                std_bytes,
+            )?
+            .lower(declaration)?,
         );
     }
     let tasks = TaskProgram { functions };
@@ -338,6 +372,8 @@ struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
     std_time: bool,
     std_fs: bool,
+    std_net: bool,
+    std_bytes: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
@@ -405,12 +441,16 @@ impl<'a> FunctionLowerer<'a> {
         budget: &'a mut Budget,
         std_time: bool,
         std_fs: bool,
+        std_net: bool,
+        std_bytes: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
             signatures,
             std_time,
             std_fs,
+            std_net,
+            std_bytes,
             budget,
             function: TaskFunction {
                 id: signature.id,
@@ -1253,6 +1293,81 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if matches!(&object.kind, ExprKind::Variable(module) if module == "net")
+            && name == "client"
+            && self.std_net
+            && self.local("net").is_none()
+            && !self.signatures.contains_key("net")
+        {
+            return self.blocking_net_connect(args, span, depth);
+        }
+        if matches!(&object.kind, ExprKind::Variable(module) if module == "bytes")
+            && matches!(name, "from_str" | "from_array")
+            && self.std_bytes
+            && self.local("bytes").is_none()
+            && !self.signatures.contains_key("bytes")
+        {
+            if args.len() != 1 {
+                return Err(unsupported(
+                    "bytes construction with other than one argument",
+                    span,
+                ));
+            }
+            let source = self.expression(&args[0], depth + 1)?;
+            let operation = if name == "from_str" {
+                task::TaskBytesOperation::FromStr
+            } else {
+                task::TaskBytesOperation::FromArray
+            };
+            let result = self.bytes_operation(source, operation, None, span)?;
+            if !matches!(&args[0].kind, ExprKind::Variable(_))
+                && owned_value(&self.function.slots[source.0].ty)
+            {
+                self.emit(TaskOp::Drop { slot: source })?;
+            }
+            return Ok(result);
+        }
+        if matches!(&object.kind, ExprKind::Variable(name) if self.local(name).is_some_and(|slot| matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value {ty, ..} if (task::local_net_type(ty) || task::local_bytes_type(ty)) && !matches!(ty, IrType::Result(_)))))
+        {
+            let source = self.expression(object, depth + 1)?;
+            let ty = &self.function.slots[source.0].ty;
+            if matches!(ty, TaskSlotType::Value {ty, ..} if task::local_net_type(ty) && !matches!(ty, IrType::Result(_)))
+            {
+                return self.blocking_net_method(source, name, args, span, depth);
+            }
+            if matches!(ty, TaskSlotType::Value {ty, ..} if task::local_bytes_type(ty) && !matches!(ty, IrType::Result(_)))
+            {
+                let operation = match name {
+                    "len" => task::TaskBytesOperation::Len,
+                    "get" => task::TaskBytesOperation::Get,
+                    "to_str" => task::TaskBytesOperation::ToStr,
+                    "clone" => task::TaskBytesOperation::Clone,
+                    _ => return Err(unsupported("this bytes method in a Task", span)),
+                };
+                let expected = usize::from(name == "get");
+                if args.len() != expected {
+                    return Err(unsupported("bytes method argument count", span));
+                }
+                let index = if let Some(argument) = args.first() {
+                    Some(self.expression(argument, depth + 1)?)
+                } else {
+                    None
+                };
+                let result = self.bytes_operation(source, operation, index, span)?;
+                if !matches!(&object.kind, ExprKind::Variable(_)) {
+                    self.emit(TaskOp::Drop { slot: source })?;
+                }
+                return Ok(result);
+            }
+            // The ordinary receiver helpers below evaluate their own source.
+            // A nontrivial receiver must not be evaluated twice.
+            if !matches!(&object.kind, ExprKind::Variable(_)) {
+                return Err(unsupported(
+                    "this nontrivial method receiver in a Task",
+                    span,
+                ));
+            }
+        }
         if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
             && matches!(
                 name,
@@ -1480,6 +1595,189 @@ impl<'a> FunctionLowerer<'a> {
             );
         }
         self.expression(argument, depth)
+    }
+
+    fn bytes_operation(
+        &mut self,
+        src: SlotId,
+        operation: task::TaskBytesOperation,
+        index: Option<SlotId>,
+        span: Span,
+    ) -> KuResult<SlotId> {
+        use task::TaskBytesOperation as B;
+        let bytes = IrType::Named("__ku_bytes".into());
+        let (source, destination) = match operation {
+            B::FromStr => (IrType::Str, IrType::Result(Box::new(bytes))),
+            B::FromArray => (
+                IrType::Array(Box::new(IrType::Int)),
+                IrType::Result(Box::new(bytes)),
+            ),
+            B::Clone => (bytes.clone(), bytes),
+            B::Len => (bytes, IrType::Int),
+            B::Get => (bytes, IrType::Result(Box::new(IrType::Int))),
+            B::ToStr => (bytes, IrType::Result(Box::new(IrType::Str))),
+        };
+        if self.function.slots[src.0].ty != value_slot(source)
+            || index.is_some_and(|slot| self.function.slots[slot.0].ty != value_slot(IrType::Int))
+        {
+            return Err(unsupported("invalid Task bytes argument", span));
+        }
+        let dst = self.slot(value_slot(destination))?;
+        self.emit(TaskOp::Bytes {
+            operation,
+            dst,
+            src,
+            index,
+        })?;
+        Ok(dst)
+    }
+
+    fn blocking_net_connect(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported("net.client in a Task finally body", span));
+        }
+        let [argument] = args else {
+            return Err(unsupported("net.client argument count", span));
+        };
+        self.budget.expression(depth + 1, argument.span)?;
+        let ExprKind::ObjectLiteral { fields } = &argument.kind else {
+            return Err(unsupported(
+                "net.client without an inline configuration object",
+                span,
+            ));
+        };
+        if fields.len() > 9 {
+            return Err(unsupported("net.client configuration field count", span));
+        }
+        const FIELDS: [&str; 9] = [
+            "host",
+            "port",
+            "connect_timeout_ms",
+            "read_timeout_ms",
+            "write_timeout_ms",
+            "max_read_bytes",
+            "tls",
+            "tls_server_name",
+            "tls_ca_pem",
+        ];
+        let mut inputs = [None; 9];
+        let mut seen = 0u16;
+        for (name, value) in fields {
+            let Some(index) = FIELDS.iter().position(|field| field == name) else {
+                return Err(unsupported("unknown net.client config field", value.span));
+            };
+            if seen & (1u16 << index) != 0 {
+                return Err(unsupported("duplicate net.client config field", value.span));
+            }
+            seen |= 1u16 << index;
+            // The default is false; preserve the existing plain-TCP artifact
+            // without pulling in the optional native TLS pack for a literal false.
+            if index == 6 && matches!(&value.kind, ExprKind::Literal(Literal::Bool(false))) {
+                continue;
+            }
+            let source = self.expression(value, depth + 2)?;
+            let expected = match index {
+                0 | 7 | 8 => IrType::Str,
+                6 => IrType::Bool,
+                _ => IrType::Int,
+            };
+            if self.function.slots[source.0].ty != value_slot(expected) {
+                return Err(unsupported("net.client config field type", value.span));
+            }
+            inputs[index] = Some(self.copy_or_move(source)?);
+        }
+        if inputs[0].is_none() || inputs[1].is_none() {
+            return Err(unsupported("net.client without host or port", span));
+        }
+        let dst = self.net_terminator(
+            task::TaskNetOperation::Connect,
+            inputs,
+            IrType::Result(Box::new(IrType::Named("__ku_net_client".into()))),
+        )?;
+        for source in inputs.into_iter().flatten() {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(dst)
+    }
+
+    fn blocking_net_method(
+        &mut self,
+        client: SlotId,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported("network wait in a Task finally body", span));
+        }
+        let mut inputs = [None; 9];
+        inputs[0] = Some(client);
+        let operation = match name {
+            "read" => task::TaskNetOperation::Read,
+            "write" => task::TaskNetOperation::Write,
+            "close" => task::TaskNetOperation::Close,
+            _ => return Err(unsupported("this net method in a Task", span)),
+        };
+        let count = usize::from(!matches!(operation, task::TaskNetOperation::Close));
+        if args.len() != count {
+            return Err(unsupported("net method argument count", span));
+        }
+        if let Some(argument) = args.first() {
+            let source = self.expression(argument, depth + 1)?;
+            let expected = if name == "read" {
+                IrType::Int
+            } else {
+                IrType::Named("__ku_bytes".into())
+            };
+            if self.function.slots[source.0].ty != value_slot(expected) {
+                return Err(unsupported("net method argument type", span));
+            }
+            inputs[1] = Some(source);
+        }
+        let ty = match operation {
+            task::TaskNetOperation::Read => {
+                IrType::Result(Box::new(IrType::Named("__ku_bytes".into())))
+            }
+            task::TaskNetOperation::Write => IrType::Result(Box::new(IrType::Null)),
+            _ => IrType::Null,
+        };
+        let dst = self.net_terminator(operation, inputs, ty)?;
+        if let Some(source) = inputs[1] {
+            if !matches!(&args[0].kind, ExprKind::Variable(_))
+                && owned_value(&self.function.slots[source.0].ty)
+            {
+                self.emit(TaskOp::Drop { slot: source })?;
+            }
+        }
+        Ok(dst)
+    }
+
+    fn net_terminator(
+        &mut self,
+        operation: task::TaskNetOperation,
+        inputs: [Option<SlotId>; 9],
+        ty: IrType,
+    ) -> KuResult<SlotId> {
+        let dst = self.slot(value_slot(ty))?;
+        let poll = self.state(TaskTerminator::Terminate)?;
+        let ready = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.cleanup_state()?;
+        self.terminate(TaskTerminator::Jump { target: poll })?;
+        self.function.states[poll.0].terminator = TaskTerminator::BlockingNet {
+            operation,
+            inputs,
+            dst,
+            ready,
+            cleanup,
+        };
+        self.current = Some(ready);
+        Ok(dst)
     }
 
     #[inline(never)]

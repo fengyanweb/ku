@@ -82,6 +82,8 @@ fn owned(ty: &IrType) -> bool {
     matches!(ty, IrType::Str | IrType::Result(_))
         || crate::ir::task::flat_array(ty)
         || crate::ir::task::error_type(ty)
+        || crate::ir::task::local_bytes_type(ty)
+        || crate::ir::task::local_net_type(ty)
 }
 
 // The generated branch itself guards the access: inactive Result fields must
@@ -119,6 +121,12 @@ fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
             active_charge(inner, &format!("({place}).value"), total),
             ["domain", "code", "message"].iter().map(|field| format!("  checked=ku_task_adapter_string_charge(({place}).error.{field},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")).collect::<String>()
         );
+    }
+    if matches!(ty, IrType::Named(name) if name == "__ku_bytes") {
+        return format!("  checked=ku_task_adapter_string_charge((KuString){{({place}).ptr,({place}).len,({place}).capacity,({place}).storage}},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n");
+    }
+    if matches!(ty, IrType::Named(name) if name == "__ku_net_client") {
+        return format!("  if ({place}) {{ if (sizeof(KuNetClient)>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=sizeof(KuNetClient); }}\n");
     }
     if let IrType::Array(element) = ty {
         let c_element = super::c_type(element).expect("flat element C type");
@@ -342,6 +350,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
                 | TaskTerminator::BlockingRead { .. }
                 | TaskTerminator::BlockingReadDir { .. }
                 | TaskTerminator::BlockingExists { .. }
+                | TaskTerminator::BlockingNet { .. }
         )
     });
     let dynamic_projection = blocking

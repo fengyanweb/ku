@@ -78,6 +78,28 @@ pub enum TaskConstant {
     },
 }
 
+/// Frame-local binary operations; opaque values never enter Task outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskBytesOperation {
+    FromStr,
+    FromArray,
+    Clone,
+    Len,
+    Get,
+    ToStr,
+}
+
+/// The fixed configuration order is host, port, connect/read/write timeout,
+/// maximum read, TLS, TLS server name, and TLS CA PEM. Other operations use
+/// only client at index zero and optional data/length at index one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskNetOperation {
+    Connect,
+    Read,
+    Write,
+    Close,
+}
+
 /// Copy-only operations: source lowering maps existing syntax to these tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUnaryOp {
@@ -185,6 +207,12 @@ pub enum TaskOp {
         dst: SlotId,
         array: SlotId,
         index: SlotId,
+    },
+    Bytes {
+        operation: TaskBytesOperation,
+        dst: SlotId,
+        src: SlotId,
+        index: Option<SlotId>,
     },
     Copy {
         dst: SlotId,
@@ -327,6 +355,16 @@ pub enum TaskTerminator {
         ready: StateId,
         cleanup: StateId,
     },
+    /// A bounded pool job takes the client's physical owner while Pending.
+    /// The logical slot remains initialized but contains NULL; normal DONE
+    /// restores it before ready, while cancellation drops the job owner later.
+    BlockingNet {
+        operation: TaskNetOperation,
+        inputs: [Option<SlotId>; 9],
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
     TryResult {
         src: SlotId,
         ok_value: SlotId,
@@ -460,8 +498,19 @@ fn primitive(ty: &IrType) -> bool {
     matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
 }
 
-fn value_type(ty: &IrType) -> bool {
+pub(crate) fn local_bytes_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name == "__ku_bytes")
+        || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_bytes"))
+}
+pub(crate) fn local_net_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name == "__ku_net_client")
+        || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_net_client"))
+}
+fn parameter_type(ty: &IrType) -> bool {
     primitive(ty) || error_type(ty) || flat_array(ty) || result_type(ty)
+}
+fn value_type(ty: &IrType) -> bool {
+    parameter_type(ty) || local_bytes_type(ty) || local_net_type(ty)
 }
 
 pub(crate) fn flat_array(ty: &IrType) -> bool {
@@ -491,7 +540,8 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
     // Only its str branch clones; int/bool branches neither clone nor allocate.
     matches!(
         operation,
-        TaskOp::ErrorField { .. }
+        TaskOp::Bytes { .. }
+            | TaskOp::ErrorField { .. }
             | TaskOp::StringClone { .. }
             | TaskOp::StringConcat { .. }
             | TaskOp::ArrayTryGet { .. }
@@ -644,7 +694,7 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                 TaskSlotType::Task { result } => result_type(result),
                 TaskSlotType::Callable { parameters, result } => {
                     parameters.len() <= limits.max_slots
-                        && parameters.iter().all(value_type)
+                        && parameters.iter().all(parameter_type)
                         && result_type(result)
                 }
             };
@@ -752,6 +802,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         | TaskTerminator::BlockingRead { ready, cleanup, .. }
         | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
         | TaskTerminator::BlockingExists { ready, cleanup, .. }
+        | TaskTerminator::BlockingNet { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
         TaskTerminator::Complete { .. }
@@ -850,8 +901,16 @@ fn validate_shape(
     for &parameter in &function.parameters {
         match &get_slot(parameter)?.ty {
             TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } if parameter_type(ty) => {}
+            TaskSlotType::Value {
                 borrowed: false, ..
-            } => {}
+            } => {
+                return Err(invalid(
+                    "opaque network values cannot enter async parameters",
+                ));
+            }
             TaskSlotType::Callable { .. } => {}
             TaskSlotType::Value { borrowed: true, .. } => {
                 return Err(invalid("borrowed parameter cannot enter a task frame"));
@@ -956,6 +1015,47 @@ fn validate_shape(
                             && destination != &IrType::Int)
                     {
                         return Err(invalid("array operation has invalid source or destination"));
+                    }
+                }
+                TaskOp::Bytes {
+                    operation,
+                    dst,
+                    src,
+                    index,
+                } => {
+                    has_error_projection = true;
+                    let (source, borrowed) = slot_type(get_slot(*src)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let bytes = IrType::Named("__ku_bytes".into());
+                    let (expected_source, expected_destination) = match operation {
+                        TaskBytesOperation::FromStr => {
+                            (IrType::Str, IrType::Result(Box::new(bytes)))
+                        }
+                        TaskBytesOperation::FromArray => (
+                            IrType::Array(Box::new(IrType::Int)),
+                            IrType::Result(Box::new(bytes)),
+                        ),
+                        TaskBytesOperation::Clone => (bytes.clone(), bytes),
+                        TaskBytesOperation::Len => (bytes, IrType::Int),
+                        TaskBytesOperation::Get => (bytes, IrType::Result(Box::new(IrType::Int))),
+                        TaskBytesOperation::ToStr => (bytes, IrType::Result(Box::new(IrType::Str))),
+                    };
+                    if dst == src
+                        || borrowed
+                        || destination_borrowed
+                        || source != &expected_source
+                        || destination != &expected_destination
+                        || (matches!(operation, TaskBytesOperation::Get) != index.is_some())
+                    {
+                        return Err(invalid(
+                            "Bytes operation has invalid local source or destination",
+                        ));
+                    }
+                    if let Some(index) = index {
+                        let (ty, borrowed) = slot_type(get_slot(*index)?)?;
+                        if index == dst || borrowed || ty != &IrType::Int {
+                            return Err(invalid("Bytes.get requires a distinct int index"));
+                        }
                     }
                 }
                 TaskOp::StringLen { dst, src, .. } | TaskOp::StringClone { dst, src } => {
@@ -1418,6 +1518,50 @@ fn validate_shape(
                     ));
                 }
             }
+            TaskTerminator::BlockingNet {
+                operation,
+                inputs,
+                dst,
+                ..
+            } => {
+                has_blocking = true;
+                budget.spend_many(inputs.len())?;
+                let net = IrType::Named("__ku_net_client".into());
+                let bytes = IrType::Named("__ku_bytes".into());
+                let destination_type = match operation {
+                    TaskNetOperation::Connect => IrType::Result(Box::new(net.clone())),
+                    TaskNetOperation::Read => IrType::Result(Box::new(bytes.clone())),
+                    TaskNetOperation::Write => IrType::Result(Box::new(IrType::Null)),
+                    TaskNetOperation::Close => IrType::Null,
+                };
+                let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                if borrowed || destination != &destination_type {
+                    return Err(invalid("BlockingNet result type mismatch"));
+                }
+                for (index, input) in inputs.iter().enumerate() {
+                    let expected = match operation {
+                        TaskNetOperation::Connect => Some(match index {
+                            0 | 7 | 8 => IrType::Str,
+                            6 => IrType::Bool,
+                            _ => IrType::Int,
+                        }),
+                        _ if index == 0 => Some(net.clone()),
+                        TaskNetOperation::Read if index == 1 => Some(IrType::Int),
+                        TaskNetOperation::Write if index == 1 => Some(bytes.clone()),
+                        _ => None,
+                    };
+                    if let Some(input) = input {
+                        let (ty, borrowed) = slot_type(get_slot(*input)?)?;
+                        if *input == *dst || borrowed || expected.as_ref() != Some(ty) {
+                            return Err(invalid("BlockingNet has an invalid input slot"));
+                        }
+                    } else if index == 0
+                        || (index == 1 && !matches!(operation, TaskNetOperation::Close))
+                    {
+                        return Err(invalid("BlockingNet is missing a required input"));
+                    }
+                }
+            }
             TaskTerminator::Await { task, dst, .. } => {
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed
@@ -1505,7 +1649,8 @@ fn validate_regions_and_progress(
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
-            | TaskTerminator::BlockingExists { ready, .. } => pending.push(*ready),
+            | TaskTerminator::BlockingExists { ready, .. }
+            | TaskTerminator::BlockingNet { ready, .. } => pending.push(*ready),
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
                 pending.push(*ready);
@@ -1547,6 +1692,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::BlockingExists {
+            cleanup: target, ..
+        }
+        | TaskTerminator::BlockingNet {
             cleanup: target, ..
         }
         | TaskTerminator::ScopeDrain {
@@ -1652,6 +1800,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::BlockingRead { .. }
                         | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
+                        | TaskTerminator::BlockingNet { .. }
                 )
             {
                 budget.spend()?;
@@ -1690,6 +1839,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::BlockingRead { .. }
                         | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
+                        | TaskTerminator::BlockingNet { .. }
                 )
             {
                 budget.spend()?;
@@ -1747,6 +1897,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::ArrayLen { dst, .. }
         | TaskOp::StringLen { dst, .. }
         | TaskOp::StringClone { dst, .. }
+        | TaskOp::Bytes { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
         | TaskOp::ArrayTryGet { dst, .. }
@@ -1892,7 +2043,8 @@ fn validate_scope_layout(
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
-            | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingExists { ready, .. }
+            | TaskTerminator::BlockingNet { ready, .. } => [Some(ready), None],
             ref term => successors(term),
         };
         for target in next.into_iter().flatten() {
@@ -2069,7 +2221,8 @@ fn validate_scope_exits(
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
-            | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingExists { ready, .. }
+            | TaskTerminator::BlockingNet { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
         };
@@ -2103,6 +2256,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::ArrayLen { dst, .. }
         | TaskOp::StringLen { dst, .. }
         | TaskOp::StringClone { dst, .. }
+        | TaskOp::Bytes { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
         | TaskOp::ArrayTryGet { dst, .. }
@@ -2223,8 +2377,27 @@ fn edge_states(
             ready,
             cleanup,
             ..
+        }
+        | TaskTerminator::BlockingNet {
+            dst,
+            ready,
+            cleanup,
+            ..
         } => [
-            Some((*ready, changed(0, bit(*dst)))),
+            Some((
+                *ready,
+                changed(
+                    match term {
+                        TaskTerminator::BlockingNet {
+                            operation: TaskNetOperation::Close,
+                            inputs,
+                            ..
+                        } => inputs[0].map_or(0, bit),
+                        _ => 0,
+                    },
+                    bit(*dst),
+                ),
+            )),
             Some((*cleanup, changed(tasks, 0))),
         ],
         TaskTerminator::Await {
@@ -2377,6 +2550,12 @@ fn live_states(
                     ready,
                     cleanup,
                     ..
+                }
+                | TaskTerminator::BlockingNet {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
                 } => (live_in[ready.0] & !bit(dst)) | (live_in[cleanup.0] & !tasks),
                 TaskTerminator::TryResult {
                     ok_value,
@@ -2404,6 +2583,12 @@ fn live_states(
                 TaskTerminator::BlockingRead { path, .. }
                 | TaskTerminator::BlockingReadDir { path, .. }
                 | TaskTerminator::BlockingExists { path, .. } => live |= bit(path),
+                TaskTerminator::BlockingNet { inputs, .. } => {
+                    live |= inputs
+                        .iter()
+                        .flatten()
+                        .fold(0, |mask, slot| mask | bit(*slot));
+                }
                 TaskTerminator::ScopeDrain { scope, .. } => live |= scopes.mask(scope),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
                 _ => {}
@@ -2433,6 +2618,11 @@ fn live_states(
                     | TaskOp::MakeError { dst, message: src }
                     | TaskOp::ErrorField { dst, src, .. }
                     | TaskOp::Unary { dst, src, .. } => live = (live & !bit(*dst)) | bit(*src),
+                    TaskOp::Bytes {
+                        dst, src, index, ..
+                    } => {
+                        live = (live & !bit(*dst)) | bit(*src) | index.map_or(0, bit);
+                    }
                     TaskOp::ArrayTake {
                         dst,
                         array: left,
@@ -2542,6 +2732,7 @@ fn validate_ownership_and_plan(
                 | TaskOp::ArrayLen { src, .. }
                 | TaskOp::StringLen { src, .. }
                 | TaskOp::StringClone { src, .. }
+                | TaskOp::Bytes { src, .. }
                 | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
@@ -2559,6 +2750,14 @@ fn validate_ownership_and_plan(
                 return Err(invalid(
                     "read, move or drop of a slot that is not definitely initialized",
                 ));
+            }
+            if let TaskOp::Bytes {
+                index: Some(index), ..
+            } = operation
+            {
+                if state.must & bit(*index) == 0 {
+                    return Err(invalid("Bytes.get reads an uninitialized index"));
+                }
             }
             if let TaskOp::Binary { left, right, .. }
             | TaskOp::StringConcat { left, right, .. }
@@ -2659,6 +2858,7 @@ fn validate_ownership_and_plan(
             | TaskTerminator::BlockingRead { .. }
             | TaskTerminator::BlockingReadDir { .. }
             | TaskTerminator::BlockingExists { .. }
+            | TaskTerminator::BlockingNet { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
                     if state.must & bit(task) == 0 {
@@ -2688,6 +2888,18 @@ fn validate_ownership_and_plan(
                     && state.may & masks.borrowed != 0
                 {
                     return Err(invalid("borrowed value cannot cross ScopeDrain boundary"));
+                }
+                if let TaskTerminator::BlockingNet { inputs, dst, .. } = block.terminator {
+                    let required = inputs
+                        .iter()
+                        .flatten()
+                        .fold(0, |mask, slot| mask | bit(*slot));
+                    if state.must & required != required {
+                        return Err(invalid("BlockingNet reads an uninitialized input"));
+                    }
+                    if state.may & bit(dst) != 0 {
+                        return Err(invalid("BlockingNet overwrites an initialized result"));
+                    }
                 }
                 if let TaskTerminator::BlockingWrite {
                     path, content, dst, ..
@@ -2719,6 +2931,10 @@ fn validate_ownership_and_plan(
                     }
                 }
                 let timer_argument = match block.terminator {
+                    TaskTerminator::BlockingNet { inputs, .. } => inputs
+                        .iter()
+                        .flatten()
+                        .fold(0, |mask, slot| mask | bit(*slot)),
                     TaskTerminator::Timer { millis, .. } => bit(millis),
                     TaskTerminator::BlockingWrite { path, content, .. } => bit(path) | bit(content),
                     TaskTerminator::BlockingRead { path, .. }
@@ -3206,6 +3422,7 @@ fn finally_plan(
             | TaskTerminator::BlockingRead { ready, cleanup, .. }
             | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
             | TaskTerminator::BlockingExists { ready, cleanup, .. }
+            | TaskTerminator::BlockingNet { ready, cleanup, .. }
             | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
                 if stack.last().is_some_and(|target| *target != cleanup)
                     || (stack.is_empty() && entries[cleanup.0])

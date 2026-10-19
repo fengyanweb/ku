@@ -74,6 +74,15 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(element);
                     }
                 }
+                TaskOp::Bytes {
+                    dst, src, index, ..
+                } => {
+                    map(dst);
+                    map(src);
+                    if let Some(index) = index {
+                        map(index);
+                    }
+                }
                 TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
                 | TaskOp::CloneCallable { dst, src }
@@ -149,6 +158,12 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
             | TaskTerminator::BlockingReadDir { path, dst, .. }
             | TaskTerminator::BlockingExists { path, dst, .. } => {
                 map(path);
+                map(dst);
+            }
+            TaskTerminator::BlockingNet { inputs, dst, .. } => {
+                for input in inputs.iter_mut().flatten() {
+                    map(input);
+                }
                 map(dst);
             }
             TaskTerminator::TryResult {

@@ -44,6 +44,12 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
     }
+    if tasks.functions.iter().any(|function| function.slots.iter().any(|slot| matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. } if crate::ir::task::local_bytes_type(ty)))) {
+        out.push_str(BYTES_HOST);
+    }
+    if super::super::task::uses_blocking_net(tasks) {
+        out.push_str(NET_HOST);
+    }
     for function in &tasks.functions {
         out.check()?;
         for (entry, context) in [
@@ -393,6 +399,7 @@ static uint32_t ku_task_host_await(KuTaskAdapterHostV1* host, KuTaskValueV1* val
 "#;
 
 const BLOCKING_HOST: &str = r#"
+#if KU_TASK_BLOCKING_FILES
 static uint32_t ku_task_host_blocking_write(KuTaskAdapterHostV1* host,
     KuString path, KuString content, KuResult_null* output) {
   if (!host || !host->ticket || !host->control || !host->blocking || !output
@@ -461,5 +468,76 @@ static uint32_t ku_task_host_blocking_exists(KuTaskAdapterHostV1* host,
   }
   return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
       : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
+}
+#endif
+"#;
+
+const BYTES_HOST: &str = r#"
+/* Local bytes use the same prepaid plain-allocation ownership as strings.
+ * Zero length owns no allocation; an optional NULL source requests zeroed output. */
+static uint32_t ku_task_host_copy_bytes(KuTaskAdapterHostV1* host,
+    const uint8_t* source, size_t length, KuBytes* output) {
+  if (!host || !output || length>(size_t)KU_BYTES_MAX_LENGTH
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge
+      || !host->ticket || !host->control) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  *output=(KuBytes){0};
+  if (!length) return KU_TASK_DRIVER_OK;
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  status=ku_task_driver_grow_charge(host->ticket,length);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  uint8_t* data=(uint8_t*)malloc(length);
+  if (!data) {
+    status=host->reconcile_charge(host->allocation_context);
+    return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;
+  }
+  if (source) memcpy(data,source,length); else memset(data,0,length);
+  *output=(KuBytes){data,length,length,KU_BYTES_OWNED};
+  return KU_TASK_DRIVER_OK;
+}
+"#;
+
+const NET_HOST: &str = r#"
+static int ku_task_host_net_valid(KuTaskAdapterHostV1* host) {
+  return host && host->ticket && host->control && host->blocking
+      && host->allocation_host_bytes==sizeof(*host)
+      && host->allocation_host_abi==KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      && host->allocation_context && host->reconcile_charge;
+}
+static uint32_t ku_task_host_net_status(uint32_t status) {
+  return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
+      : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
+}
+static uint32_t ku_task_host_net_connect(KuTaskAdapterHostV1* host,
+    KuValue fields[9], uint16_t present, KuResult_net_client* output) {
+  if (!ku_task_host_net_valid(host) || !fields || !output) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_take_net(host->ticket,host->blocking,5u,NULL,output)
+      : ku_task_blocking_submit_net(host->ticket,host->control,host->blocking,5u,
+          fields,present,NULL,(KuBytes){0},0,host->allocation_context,host->reconcile_charge,output);
+  return ku_task_host_net_status(status);
+}
+static uint32_t ku_task_host_net_read(KuTaskAdapterHostV1* host,
+    KuNetClient** client, int64_t requested, KuResult_bytes* output) {
+  if (!ku_task_host_net_valid(host) || !client || !output) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_take_net(host->ticket,host->blocking,6u,client,output)
+      : ku_task_blocking_submit_net(host->ticket,host->control,host->blocking,6u,
+          NULL,0,client,(KuBytes){0},requested,host->allocation_context,host->reconcile_charge,output);
+  return ku_task_host_net_status(status);
+}
+static uint32_t ku_task_host_net_write_close(KuTaskAdapterHostV1* host,
+    KuNetClient** client, KuBytes data, uint32_t kind, KuResult_null* output) {
+  if (!ku_task_host_net_valid(host) || !client || !output || (kind!=7u && kind!=8u)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_take_net(host->ticket,host->blocking,kind,client,output)
+      : ku_task_blocking_submit_net(host->ticket,host->control,host->blocking,kind,
+          NULL,0,client,data,0,host->allocation_context,host->reconcile_charge,output);
+  return ku_task_host_net_status(status);
 }
 "#;
