@@ -16689,7 +16689,13 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
          Partial requests keep their original byte ownership and deadline. */
       if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&
           connection->reused && !connection->buffered && !connection->carry_length) {
-        ku_http_connection_close(connection);
+        /* An empty user buffer is not idle when the next request is already
+           waiting in the socket. A single peek never consumes bytes or renews D. */
+        char next_byte;
+        int ready = recv(connection->socket_value, &next_byte, 1, MSG_PEEK);
+        if (ready == 0 || (ready < 0 &&
+            !ku_http_socket_error_interrupted(ku_http_socket_last_error())))
+          ku_http_connection_close(connection);
       }
       if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)
         ku_http_connection_status(connection, server, 408);

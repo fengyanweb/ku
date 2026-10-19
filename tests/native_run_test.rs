@@ -711,6 +711,181 @@ int main(void) {{
 }
 
 #[test]
+fn native_http_pending_connection_keeps_unread_next_request_bytes() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("http-pending-ready-reuse"));
+    let dir = &cleanup.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    app = http.server({ max_active_requests: 1 })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write pending ready HTTP source");
+    let generated = native_emit_c(dir, "main.ku");
+    let start = "/* Under pressure a genuinely idle persistent socket yields its slot.";
+    let end = "if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)";
+    assert_eq!(generated.matches(start).count(), 1);
+    // Execute the actual emitted promotion branch, rather than reimplementing
+    // its idle predicate in the fixture. Only its surrounding loop is removed.
+    let branch = generated
+        .split_once(start)
+        .expect("native pending promotion marker")
+        .1
+        .split_once(end)
+        .expect("native promotion ends before deadline processing")
+        .0;
+    let checks = r#"
+static int ku_http_fixture_ready(KuHttpSocket socket_value) {
+  KuHttpPollFd item = {0};
+  int count = 0;
+  ku_http_poll_add(&item, &count, socket_value, KU_HTTP_POLL_READ);
+  return ku_http_poll(&item, 1, 1000) == 1 && (item.revents & KU_HTTP_POLL_READ);
+}
+static int ku_http_fixture_tcp_pair(KuHttpSocket* peer, KuHttpSocket* accepted) {
+  KuHttpSocket listener = KU_HTTP_INVALID_SOCKET;
+  *peer = *accepted = KU_HTTP_INVALID_SOCKET;
+  listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listener == KU_HTTP_INVALID_SOCKET) goto failed;
+  struct sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(listener, (struct sockaddr*)&address, sizeof(address)) != 0
+      || listen(listener, 1) != 0 || !ku_http_socket_nonblocking(listener)) goto failed;
+#if defined(_WIN32)
+  int address_length = (int)sizeof(address);
+#else
+  socklen_t address_length = (socklen_t)sizeof(address);
+#endif
+  if (getsockname(listener, (struct sockaddr*)&address, &address_length) != 0) goto failed;
+  *peer = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (*peer == KU_HTTP_INVALID_SOCKET) goto failed;
+  /* This is a fresh private loopback listener with an empty backlog. The
+     existing process watchdog also bounds connect and every fixture exit. */
+  if (connect(*peer, (struct sockaddr*)&address, sizeof(address)) != 0
+      || !ku_http_fixture_ready(listener)) goto failed;
+  *accepted = accept(listener, NULL, NULL);
+  if (*accepted == KU_HTTP_INVALID_SOCKET || !ku_http_socket_nonblocking(*accepted)
+      || !ku_http_socket_nonblocking(*peer)
+      || ku_http_socket_suppress_sigpipe(*peer) != 0) goto failed;
+  ku_http_socket_close(listener);
+  return 1;
+failed:
+  ku_http_socket_close(listener);
+  ku_http_socket_close(*peer);
+  ku_http_socket_close(*accepted);
+  *peer = *accepted = KU_HTTP_INVALID_SOCKET;
+  return 0;
+}
+static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte) {
+  KuHttpSocket peer, accepted;
+  if (!ku_http_fixture_tcp_pair(&peer, &accepted)) return 0;
+  if (with_byte) {
+    char byte = 0;
+    /* A partial next request is enough: prove its first byte is already in
+       the TCP receive queue before promotion, without scheduling sleeps. */
+    if (ku_http_socket_send(peer, "G", 1) != 1 || !ku_http_fixture_ready(accepted)
+        || recv(accepted, &byte, 1, MSG_PEEK) != 1 || byte != 'G') {
+      ku_http_socket_close(peer);
+      ku_http_socket_close(accepted);
+      return 0;
+    }
+  }
+  KuHttpServer server = {0};
+  server.buffer_budget = budget;
+  server.idle_timeout_ms = 1000;
+  KuHttpConnection connection = {0};
+  ku_http_atomic_store(&ku_http_active_conns, 1);
+  ku_http_connection_start(&connection, accepted, &server);
+  connection.reused = 1;
+  char* original_header = connection.header;
+  const size_t original_capacity = connection.capacity;
+  const unsigned long long original_deadline = connection.deadline;
+  int passed = connection.phase == KU_HTTP_IO_HEADER && original_header
+      && original_capacity == 1024 && budget->current == original_capacity;
+  if (passed) ku_http_fixture_promote(&connection);
+  const int observed_phase = connection.phase;
+  const int same_socket = connection.socket_value == accepted;
+  if (with_byte) {
+    char byte = 0;
+    passed = passed && same_socket && connection.phase == KU_HTTP_IO_HEADER
+        && connection.header == original_header && connection.capacity == original_capacity
+        && connection.deadline == original_deadline && !connection.buffered
+        && budget->current == original_capacity
+        && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+  } else {
+    passed = passed && connection.socket_value == KU_HTTP_INVALID_SOCKET
+        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current;
+  }
+  /* Retire the actual connection owner before reporting an intentional red
+     result; the failing old branch has already retired this owner itself. */
+  ku_http_connection_close(&connection);
+  ku_http_socket_close(peer);
+  const int retired = budget->current == 0 && ku_http_active_conns == 0;
+  if (!passed || !retired) {
+    fprintf(stderr,
+      "HTTP pending reuse failed after cleanup: with_byte=%d phase=%d same_socket=%d retired=%d\n",
+      with_byte, observed_phase, same_socket, retired);
+    return 0;
+  }
+  return 1;
+}
+int main(void) {
+  if (ku_http_net_init() != 0) return 20;
+  KuHttpBufferBudget budget = {0};
+  budget.limit = 65536;
+  if (!ku_http_mutex_init(&budget.lock)) { ku_http_net_cleanup(); return 21; }
+  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1);
+  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0);
+  const int budget_zero = budget.current == 0;
+  ku_http_mutex_destroy(&budget.lock);
+  ku_http_net_cleanup();
+  if (!ready_passed || !idle_passed || !budget_zero) return 1;
+  puts("http-pending-ready-reuse-ok");
+  return 0;
+}
+"#;
+    let harness = dir.join("http-pending-ready-reuse-harness.c");
+    fs::write(
+        &harness,
+        format!(
+            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  {start}{branch}\n}}\n{checks}"
+        ),
+    )
+    .expect("write pending ready HTTP C harness");
+    let libraries: &[&str] = if cfg!(windows) { &["ws2_32"] } else { &[] };
+    let Some(exe) =
+        compile_c_harness_with_libraries(dir, &harness, "http-pending-ready-reuse", libraries)
+    else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("pending ready HTTP harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "pending ready HTTP harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "http-pending-ready-reuse-ok\n"
+    );
+}
+
+#[test]
 fn native_http_read_callbacks_recheck_original_deadlines() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {

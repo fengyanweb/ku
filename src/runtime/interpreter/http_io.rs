@@ -592,6 +592,11 @@ impl Reactor {
                 slot.connection.as_ref().is_some_and(|connection| {
                     connection.reused
                         && matches!(&connection.state, State::Header(header) if header.bytes.bytes.is_empty())
+                        && match connection.stream.peek(&mut [0_u8; 1]) {
+                            Ok(0) => true,
+                            Ok(_) => false,
+                            Err(error) => error.kind() != io::ErrorKind::Interrupted,
+                        }
                 })
             }) {
                 self.close_slot(index);
@@ -1238,6 +1243,82 @@ mod buffer_tests {
         assert_eq!(budget.snapshot().rejected, 1);
         drop(bytes);
         assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[test]
+    fn pending_connection_does_not_evict_a_reused_socket_with_unread_request_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let limits = HttpServerRuntimeLimits {
+            read_header_timeout: Duration::from_secs(1),
+            read_body_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+            handler_timeout: Duration::from_secs(1),
+            max_header_bytes: 1024,
+            max_body_bytes: 1024,
+            max_connections: 2,
+            max_active_requests: 1,
+            max_pending_requests: 1,
+            max_buffer_bytes: 65536,
+        };
+        let (jobs, _receiver) = mpsc::sync_channel(1);
+        let budget = BufferBudget::new(limits.max_buffer_bytes);
+        let mut reactor = Reactor::new(
+            listener,
+            limits,
+            jobs,
+            netpoll::WakePair::new().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&budget),
+        );
+        let count = Arc::clone(&reactor.connection_count);
+        let mut first_peer = TcpStream::connect(address).unwrap();
+        let (first, _) = reactor.listener.accept().unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        first_peer
+            .write_all(b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        // Observe actual kernel receive bytes before invoking promotion: this
+        // reproduces the ready-before-next-reactor-pass ordering without sleeps.
+        assert_eq!(first.peek(&mut [0; 1]).unwrap(), 1);
+        first.set_read_timeout(None).unwrap();
+        first.set_nonblocking(true).unwrap();
+        let mut connection = Connection::new(
+            PendingHttpConnection {
+                stream: first,
+                _permit: HttpConnectionPermit::try_acquire(Arc::clone(&count), 2).unwrap(),
+            },
+            limits,
+            Arc::clone(&budget),
+        );
+        connection.reused = true;
+        reactor.slots[0].generation = 7;
+        reactor.slots[0].connection = Some(connection);
+        reactor.free.clear();
+        let second_peer = TcpStream::connect(address).unwrap();
+        let (second, _) = reactor.listener.accept().unwrap();
+        second.set_nonblocking(true).unwrap();
+        reactor.pending.push_back(PendingHttpConnection {
+            stream: second,
+            _permit: HttpConnectionPermit::try_acquire(Arc::clone(&count), 2).unwrap(),
+        });
+        reactor.promote_pending().unwrap();
+        let generation = reactor.slots[0].generation;
+        let pending_count = reactor.pending.len();
+        let kept_bytes = reactor.slots[0]
+            .connection
+            .as_ref()
+            .map(|connection| connection.stream.peek(&mut [0; 1]).unwrap_or(0));
+        drop(reactor);
+        drop((first_peer, second_peer));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(budget.snapshot().current, 0);
+        assert_eq!(generation, 7, "pending promotion evicted a ready request");
+        assert_eq!(pending_count, 1);
+        assert_eq!(kept_bytes, Some(1));
     }
 
     #[test]
