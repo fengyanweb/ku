@@ -50,6 +50,7 @@ use std::sync::{
 const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
 mod cancellation;
+mod http_flight;
 mod http_io;
 mod netpoll;
 
@@ -127,6 +128,7 @@ struct HttpHandlerDeadline {
     deadline: Instant,
     timed_out: bool,
     cleanup_deadline: Option<Instant>,
+    flight: Option<Arc<http_flight::FlightRecord>>,
 }
 
 impl HttpHandlerDeadline {
@@ -135,10 +137,17 @@ impl HttpHandlerDeadline {
             deadline,
             timed_out: false,
             cleanup_deadline: None,
+            flight: http_flight::current(),
         }
     }
 
     fn poll(&mut self, now: Instant) -> bool {
+        if let Some(flight) = &self.flight {
+            flight.progress(now);
+            if now >= self.deadline {
+                flight.expire_at(http_flight::Stage::InterpreterExpired, now);
+            }
+        }
         self.timed_out |= now >= self.deadline;
         self.timed_out
     }
@@ -2700,6 +2709,7 @@ impl Interpreter {
                 continue;
             };
             job.reply.handler_started();
+            let _flight = http_flight::FlightGuard::enter(job.flight.clone());
             let trace_start = slow_trace
                 .as_ref()
                 .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
@@ -2747,7 +2757,11 @@ impl Interpreter {
         use http_io::HttpTraceOrigin;
         // Queueing spends the same handler deadline. Do not prepare an expired
         // job or enter its handler/cleanup state after the original deadline.
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
+            if let Some(flight) = http_flight::current() {
+                flight.expire_at(http_flight::Stage::QueueExpired, now);
+            }
             return (
                 status_response(504, "Gateway Timeout"),
                 HttpTraceOrigin::QueueExpired,
@@ -2825,6 +2839,13 @@ impl Interpreter {
         let previous_deadline = self
             .execution_deadline
             .replace(HttpHandlerDeadline::new(deadline));
+        if let Some(flight) = self
+            .execution_deadline
+            .as_ref()
+            .and_then(|state| state.flight.as_ref())
+        {
+            flight.mark(http_flight::Stage::ActualHandlerStart);
+        }
         let result = self.call_function_value(FunctionValueCall {
             params: &params,
             param_modes: &param_modes,

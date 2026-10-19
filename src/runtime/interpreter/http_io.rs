@@ -1,6 +1,7 @@
 //! One socket owner for the interpreter HTTP transport. Ku handlers and their
 //! Values remain on the caller; only parsed/wire data crosses this boundary.
 
+use super::http_flight::{self, FlightRecord, Stage};
 use super::{
     encode_http_response, entry_span, finish_http_request, http_deadline, netpoll, parse_http_head,
     status_response, HttpConnectionPermit, HttpRejection, HttpServerRuntimeLimits, HttpSlowTrace,
@@ -105,6 +106,7 @@ struct HttpTraceSinkState {
     slow: AtomicUsize,
     transport: AtomicUsize,
     snapshots: AtomicUsize,
+    flight: AtomicUsize,
     dropped: AtomicUsize,
 }
 
@@ -118,6 +120,7 @@ impl HttpTraceSink {
                     slow: AtomicUsize::new(0),
                     transport: AtomicUsize::new(0),
                     snapshots: AtomicUsize::new(0),
+                    flight: AtomicUsize::new(0),
                     dropped: AtomicUsize::new(0),
                 }),
             },
@@ -154,6 +157,7 @@ impl HttpTraceSink {
             HttpTraceEvent::Slow { .. } => (&self.state.slow, HttpSlowTrace::MAX_LINES),
             HttpTraceEvent::Transport { .. } => (&self.state.transport, TRACE_TRANSPORT_LINES),
             HttpTraceEvent::Snapshot { .. } => (&self.state.snapshots, TRACE_SNAPSHOT_LINES),
+            HttpTraceEvent::Flight(_) => (&self.state.flight, 32),
         };
         if counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
@@ -354,6 +358,7 @@ impl HttpRequestTrace {
 }
 
 enum HttpTraceEvent {
+    Flight(super::http_flight::Snapshot),
     Slow {
         token: HttpIoToken,
         id: Option<u64>,
@@ -408,6 +413,7 @@ fn trace_micros(value: Option<Duration>) -> String {
 impl HttpTraceEvent {
     fn write(&self, output: &mut impl Write) -> io::Result<()> {
         match self {
+            Self::Flight(snapshot) => snapshot.write(output),
             Self::Slow { token, id, sample, status } => writeln!(output,
                 "ku_http_slow token={token:?} queue_us={} handler_wall_us={} handler_cpu_us={} status={status} request_id={}",
                 sample.queued.as_micros(), sample.handler_wall.as_micros(), trace_micros(sample.handler_cpu), trace_number(*id)),
@@ -445,6 +451,12 @@ fn request_trace_id(request: &ParsedHttpRequest) -> Option<u64> {
         return None;
     }
     value.parse().ok()
+}
+
+pub(super) fn emit_flight(snapshot: super::http_flight::Snapshot) {
+    if let Some(sink) = HttpTraceSink::process() {
+        sink.emit(HttpTraceEvent::Flight(snapshot));
+    }
 }
 
 struct BufferCharge {
@@ -571,6 +583,7 @@ pub(super) struct HttpIoReply {
     trace: Option<HttpRequestTrace>,
     trace_config: Option<HttpTraceConfig>,
     handler_credit: Option<HttpTraceCredit>,
+    flight: Option<Arc<FlightRecord>>,
 }
 
 impl HttpIoReply {
@@ -587,6 +600,12 @@ impl HttpIoReply {
         status: i64,
         origin: HttpTraceOrigin,
     ) {
+        if let Some(flight) = &self.flight {
+            flight.mark(Stage::Finished);
+            if let Some(snapshot) = flight.snapshot(Stage::Finished) {
+                emit_flight(snapshot);
+            }
+        }
         if let (Some(trace), Some(config)) = (&mut self.trace, &self.trace_config) {
             trace.handler_finished = Some(Instant::now());
             trace.handler_cpu = sample.and_then(|sample| sample.handler_cpu);
@@ -628,6 +647,9 @@ impl HttpIoReply {
         if let Some(trace) = &mut self.trace {
             trace.published = Some(Instant::now());
         }
+        if let Some(flight) = &self.flight {
+            flight.mark(Stage::Published);
+        }
         // One consumed reply owns one initially empty cap-1 channel. A closed
         // receiver means timeout/close already won: dropping the response is
         // the complete late-result path, without touching any socket.
@@ -638,6 +660,12 @@ impl HttpIoReply {
         }) {
             Ok(()) => self.wake.notify(),
             Err(TrySendError::Disconnected(_)) => {
+                if let Some(flight) = &self.flight {
+                    flight.mark(Stage::LateReply);
+                    if let Some(snapshot) = flight.snapshot(Stage::LateReply) {
+                        emit_flight(snapshot);
+                    }
+                }
                 if let (Some(trace), Some(config)) = (self.trace, &self.trace_config) {
                     increment(&config.counters.late_replies);
                     trace.emit(config, HttpTraceOrigin::LateReply, Instant::now());
@@ -654,6 +682,7 @@ pub(super) struct HttpIoJob {
     pub(super) request: ParsedHttpRequest,
     pub(super) deadline: Instant,
     pub(super) reply: HttpIoReply,
+    pub(super) flight: Option<Arc<FlightRecord>>,
     queued_credit: Option<HttpTraceCredit>,
 }
 
@@ -702,6 +731,11 @@ impl HttpIo {
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
     {
+        // Set up the shared writer before accepting any diagnostic traffic;
+        // the first anomaly must only enqueue its fixed-size snapshot.
+        if http_flight::enabled() {
+            let _ = HttpTraceSink::process();
+        }
         listener.set_nonblocking(true)?;
         let wake_pair = netpoll::WakePair::new()?;
         let wake = wake_pair.sender.clone();
@@ -746,6 +780,9 @@ impl HttpIo {
         }
         match self.jobs.recv_timeout(timeout) {
             Ok(mut job) => {
+                if let Some(flight) = &job.flight {
+                    flight.mark(Stage::Dequeued);
+                }
                 job.queued_credit = None;
                 Ok(Some(job))
             }
@@ -1043,6 +1080,10 @@ impl Reactor {
                             generation: slot.generation,
                         }) =>
                 {
+                    if let Some(flight) = &connection.flight {
+                        flight.mark(Stage::Observed);
+                        flight.mark(Stage::WriteStart);
+                    }
                     connection.trace = completion.trace.map(|mut trace| {
                         trace.observed = Some(Instant::now());
                         trace.write_started = trace.observed;
@@ -1234,6 +1275,18 @@ impl Reactor {
                 });
             }
             let queued_bytes = input_charge.bytes;
+            let flight = http_flight::enabled().then(|| {
+                let record = FlightRecord::new(request_trace_id(&request), *ready_at, deadline);
+                if !connection.reused {
+                    record.mark_at(Stage::Accepted, connection.accepted_at);
+                    record.mark_at(Stage::SlotPromoted, connection.promoted_at);
+                }
+                if let Some(at) = connection.read_started {
+                    record.mark_at(Stage::ReadStarted, at);
+                }
+                record
+            });
+            connection.flight = flight.clone();
             let (sender, receiver) = mpsc::sync_channel(1);
             let job = HttpIoJob {
                 token,
@@ -1247,14 +1300,24 @@ impl Reactor {
                     trace: connection.trace,
                     trace_config: connection.trace_config.clone(),
                     handler_credit: None,
+                    flight: flight.clone(),
                 },
+                flight: flight.clone(),
                 queued_credit: connection
                     .trace_config
                     .as_ref()
                     .map(|config| HttpTraceCredit::acquire(&config.counters, false, queued_bytes)),
             };
+            if let Some(flight) = &flight {
+                flight.mark(Stage::EnqueueAttempt);
+            }
             match self.jobs.try_send(job) {
-                Ok(()) => connection.state = State::Handler { receiver, deadline },
+                Ok(()) => {
+                    if let Some(flight) = &flight {
+                        flight.mark(Stage::Enqueued);
+                    }
+                    connection.state = State::Handler { receiver, deadline };
+                }
                 Err(TrySendError::Full(_)) => {
                     if let Some(config) = &connection.trace_config {
                         increment(&config.counters.rejected_jobs);
@@ -1328,6 +1391,7 @@ struct Connection {
     read_started: Option<Instant>,
     trace: Option<HttpRequestTrace>,
     trace_config: Option<HttpTraceConfig>,
+    flight: Option<Arc<FlightRecord>>,
     _permit: HttpConnectionPermit,
     state: State,
     carry: Buffer,
@@ -1518,6 +1582,7 @@ impl Connection {
             read_started: None,
             trace: None,
             trace_config,
+            flight: None,
             _permit: pending._permit,
             state: State::Header(Header {
                 bytes: Buffer::empty(&budget),
@@ -1535,6 +1600,22 @@ impl Connection {
     }
 
     fn emit_trace(&mut self, origin: HttpTraceOrigin, now: Instant) {
+        if let Some(flight) = self.flight.take() {
+            if matches!(origin, HttpTraceOrigin::WriteFailed) {
+                flight.observe_anomaly_at(Stage::WriteFailed, now);
+            } else if matches!(origin, HttpTraceOrigin::WriteExpired) {
+                flight.observe_anomaly_at(Stage::WriteExpired, now);
+            } else {
+                flight.mark_at(Stage::WriteEnd, now);
+                if let Some(snapshot) = flight.snapshot(Stage::WriteEnd) {
+                    emit_flight(snapshot);
+                } else if flight.past_planned_deadline(now) {
+                    // This may be a 200 published before D and written later;
+                    // it is a slow response, not an invented handler timeout.
+                    flight.observe_anomaly_at(Stage::SlowResponse, now);
+                }
+            }
+        }
         if let (Some(mut trace), Some(config)) = (self.trace.take(), &self.trace_config) {
             if let State::Write(writing) = &self.state {
                 // Admission/encoding can replace an otherwise successful
@@ -1570,6 +1651,10 @@ impl Connection {
         let response = match self.state {
             State::Header(_) | State::Body(_) => status_response(408, "Request Timeout"),
             State::Handler { .. } => {
+                if let Some(flight) = &self.flight {
+                    flight.expire(Stage::ReactorExpired);
+                    flight.mark(Stage::WriteStart);
+                }
                 if let Some(config) = &self.trace_config {
                     increment(&config.counters.reactor_expired);
                     if let Some(trace) = &mut self.trace {
