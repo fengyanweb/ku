@@ -355,7 +355,13 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
                     span,
                 ));
             }
-            output.push_str(&value.to_string());
+            let text = value.to_string();
+            output.push_str(&text);
+            // Keep the existing spelling unless an integer-looking float would
+            // be rejected by the strict int64 decoder on the next roundtrip.
+            if !text.contains(['.', 'e', 'E']) && text.parse::<i64>().is_err() {
+                output.push_str(".0");
+            }
         }
         Value::String(value) => write_json_string(value, output, span)?,
         Value::Array(values) => {
@@ -430,6 +436,82 @@ fn write_json_string(value: &str, output: &mut String, span: Span) -> KuResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_floats_roundtrip_without_relaxing_integer_limits() {
+        for (number, expected) in [
+            (1e20, "100000000000000000000.0"),
+            (-1e20, "-100000000000000000000.0"),
+            (f64::from_bits(0x43e0000000000000), "9223372036854776000.0"),
+            (f64::from_bits(0xc3e0000000000000), "-9223372036854776000.0"),
+            (1.0, "1"),
+            (-0.0, "-0"),
+            (1.25, "1.25"),
+        ] {
+            assert_eq!(
+                stringify_value(&Value::Float(number), Span::default()).unwrap(),
+                expected
+            );
+        }
+        for bits in [
+            1e20f64.to_bits(),
+            (-1e20f64).to_bits(),
+            0x43dfffffffffffff, // Immediately below 2^63.
+            0x43e0000000000000,
+            0x43e0000000000001,
+            0xc3dfffffffffffff, // Immediately above -2^63.
+            0xc3e0000000000000,
+            0xc3e0000000000001,
+            f64::MAX.to_bits(),
+            (-f64::MAX).to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+            1, // Minimum subnormal.
+        ] {
+            let original = f64::from_bits(bits);
+            let text = stringify_value(&Value::Float(original), Span::default()).unwrap();
+            let decoded = parse_json(&text, Span::default()).expect("encoded float must decode");
+            let number = match decoded {
+                Value::Float(number) => number,
+                Value::Int(number) => number as f64,
+                _ => panic!("encoded float decoded as a non-number"),
+            };
+            assert_eq!(number.to_bits(), bits, "roundtrip changed {text}");
+            if text.ends_with(".0") {
+                assert!(matches!(
+                    parse_json(&text, Span::default()),
+                    Ok(Value::Float(_))
+                ));
+            }
+        }
+        for text in ["9223372036854775808", "-9223372036854775809"] {
+            assert!(parse_json(text, Span::default()).is_err());
+        }
+        for number in [i64::MIN, i64::MAX] {
+            let text = stringify_value(&Value::Int(number), Span::default()).unwrap();
+            assert_eq!(text, number.to_string());
+            assert_eq!(
+                parse_json(&text, Span::default()).unwrap(),
+                Value::Int(number)
+            );
+        }
+    }
+
+    #[test]
+    fn large_float_suffix_obeys_json_output_limit() {
+        let mut value = Value::Array(vec![Value::String("x".repeat(999_972)), Value::Float(1e20)]);
+        let text = stringify_value(&value, Span::default()).unwrap();
+        assert_eq!(text.len(), MAX_JSON_OUTPUT_BYTES);
+        assert!(text.ends_with(",100000000000000000000.0]"));
+        let Value::Array(values) = &mut value else {
+            unreachable!()
+        };
+        let Value::String(text) = &mut values[0] else {
+            unreachable!()
+        };
+        text.push('x');
+        let error = stringify_value(&value, Span::default()).expect_err("suffix counts toward cap");
+        assert!(error.message.contains("output is too large"));
+    }
 
     #[test]
     fn json_deep_input_is_bounded_and_decoded_values_are_owned() {

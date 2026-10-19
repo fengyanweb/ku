@@ -6066,6 +6066,20 @@ static bool ku_json_write_object(
   return ku_json_write_byte(output, '}', error);
 }
 
+/* Keep fixed decimal spelling, but prevent a float from becoming an overflowing
+ * integer token on decode. Compare text because binary64 rounds near i64 limits. */
+static bool ku_json_float_needs_fraction(const char* text, size_t len) {
+  for (size_t index = 0; index < len; index++) {
+    if (text[index] == '.' || text[index] == 'e' || text[index] == 'E') return false;
+  }
+  bool negative = len > 0 && text[0] == '-';
+  const char* digits = text + (negative ? 1 : 0);
+  size_t digit_count = len - (negative ? 1 : 0);
+  const char* limit = negative ? "9223372036854775808" : "9223372036854775807";
+  return digit_count > 19
+      || (digit_count == 19 && memcmp(digits, limit, 19) > 0);
+}
+
 static bool ku_json_write_value(
     KuJsonBuffer* output,
     KuValue value,
@@ -6093,7 +6107,9 @@ static bool ku_json_write_value(
         return ku_json_fail(error, "stringify_error",
             "json float formatting failed");
       }
-      return ku_json_write_bytes(output, number, len, error);
+      return ku_json_write_bytes(output, number, len, error)
+          && (!ku_json_float_needs_fraction(number, len)
+              || ku_json_write_bytes(output, ".0", 2, error));
     }
     case KU_BOOL:
       return value.as.b

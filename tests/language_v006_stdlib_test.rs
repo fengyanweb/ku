@@ -1901,3 +1901,44 @@ fn http_pg_example_serializes_database_text_and_avoids_dom_html_sinks() {
     assert!(frontend.contains("replaceChildren"));
     assert!(frontend.contains("textContent"));
 }
+
+#[test]
+fn std_json_large_float_roundtrip_preserves_integer_range() {
+    let source = r#"
+import json from "std.json"
+fn ExpectFloat(text: str, expected: str): null! {
+    value = json.decode(text)?
+    encoded = json.encode(value)?
+    if (encoded != expected || json.stringify(value)? != expected) {
+        panic("large float JSON spelling changed")
+    }
+    decoded = json.decode(encoded)?
+    if (decoded != value || json.encode(decoded)? != encoded) {
+        panic("large float JSON roundtrip changed its value")
+    }
+    if (json.stringify(json.parse(encoded)?)? != encoded) {
+        panic("legacy JSON aliases disagree")
+    }
+    return ok(null)
+}
+fn main(): null! {
+    ExpectFloat("1e20", "100000000000000000000.0")?
+    ExpectFloat("-1e20", "-100000000000000000000.0")?
+    ExpectFloat("9.223372036854776e18", "9223372036854776000.0")?
+    ExpectFloat("-9.223372036854776e18", "-9223372036854776000.0")?
+    nested = json.decode("{\"values\":[1e20,-1e20]}")?
+    decoded = json.decode(json.encode(nested)?)?
+    values = decoded["values"]?
+    original = nested["values"]?
+    if (values[0]? != original[0]? || values[1]? != original[1]?) {
+        panic("nested large float roundtrip changed its value")
+    }
+    if (json.encode(json.decode("1.0")?)? != "1" || json.encode(json.decode("-0.0")?)? != "-0") {
+        panic("existing small integral float spelling changed")
+    }
+    return ok(null)
+}
+"#;
+    check_source("json-large-float.ku", source).expect("large float JSON program should check");
+    run_source("json-large-float.ku", source).expect("large float JSON program should roundtrip");
+}

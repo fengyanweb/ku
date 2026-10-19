@@ -4839,6 +4839,21 @@ fn native_json_float_roundtrip_typed_array_and_non_finite_rejection() {
         dir.join("main.ku"),
         r#"import json from "std.json"
 
+struct LargeFloat {
+    value: float
+}
+
+fn ExpectIntegerReject(text: str): null! {
+    rejected = false
+    try {
+        json.decode(text)?
+    } catch (err) {
+        rejected = err.domain == "json" && err.code == "parse_error"
+    }
+    if (!rejected) { panic("bare out-of-range integer was accepted") }
+    return ok(null)
+}
+
 fn main(): null! {
     println(json.parse("1.5")?)
     println(json.stringify(json.parse("-0.25")?)?)
@@ -4847,6 +4862,42 @@ fn main(): null! {
     println(json.encode(json.decode("-9223372036854775808")?)?)
     duplicate = json.decode("{\"value\":1,\"value\":2}")?
     println(duplicate["value"]?.as_int()? + 1)
+
+    scale = 10000000000.0
+    positive = scale * scale
+    negative = -positive
+    if (json.encode(positive)? != "100000000000000000000.0" || json.stringify(negative)? != "-100000000000000000000.0") {
+        panic("large float must keep a decimal marker")
+    }
+    if (json.encode(json.decode(json.encode(positive)?)?)? != "100000000000000000000.0" || json.stringify(json.try_parse(json.stringify(negative)?)?)? != "-100000000000000000000.0") {
+        panic("large scalar float failed to roundtrip")
+    }
+    values = [positive, negative]
+    if (json.encode(values)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("typed float array used a different JSON formatter")
+    }
+    if (json.encode(json.decode(json.stringify(values)?)?)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("typed float array failed to roundtrip")
+    }
+    if (json.encode(values)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("encoding consumed the float array")
+    }
+    record = LargeFloat { value: positive }
+    if (json.encode(json.decode(json.stringify(record)?)?)? != "{\"value\":100000000000000000000.0}") {
+        panic("typed float field failed to roundtrip")
+    }
+    nested = json.parse("{\"nested\":[1e20,-1e20]}")?
+    if (json.stringify(json.decode(json.encode(nested)?)?)? != "{\"nested\":[100000000000000000000.0,-100000000000000000000.0]}") {
+        panic("nested dynamic float failed to roundtrip")
+    }
+    if (json.encode(nested)? != "{\"nested\":[100000000000000000000.0,-100000000000000000000.0]}") {
+        panic("encoding consumed the dynamic object")
+    }
+    if (json.encode(json.decode("1.0")?)? != "1" || json.encode(json.decode("0.0")?)? != "0" || json.encode(json.decode("-0.0")?)? != "-0") {
+        panic("existing small float spelling changed")
+    }
+    ExpectIntegerReject("9223372036854775808")?
+    ExpectIntegerReject("-9223372036854775809")?
     return ok(null)
 }
 "#,
@@ -4906,11 +4957,18 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
     let mut bits = vec![
         0.1f64.to_bits(),
         1e20f64.to_bits(),
+        (-1e20f64).to_bits(),
         1e-20f64.to_bits(),
         (-0.0f64).to_bits(),
         0x3fefffffffffffff, // predecessor of 1.0
         0x3ff0000000000000, // 1.0
         0x3ff0000000000001, // successor of 1.0
+        0x43dfffffffffffff, // predecessor of 2^63
+        0x43e0000000000000, // 2^63
+        0x43e0000000000001, // successor of 2^63
+        0xc3dfffffffffffff, // successor of -2^63
+        0xc3e0000000000000, // -2^63: shortest decimal is outside int64
+        0xc3e0000000000001, // predecessor of -2^63
         f64::MIN_POSITIVE.to_bits(),
         f64::MAX.to_bits(),
         0x0000000000000001, // minimum subnormal
@@ -4939,7 +4997,13 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
         .join(",");
     let expected = values
         .iter()
-        .map(f64::to_string)
+        .map(|value| {
+            ku::stdlib::json::stringify_value(
+                &ku::runtime::value::Value::Float(*value),
+                ku::span::Span::default(),
+            )
+            .expect("finite float JSON encoding")
+        })
         .collect::<Vec<_>>()
         .join(",");
     let source = format!(
@@ -4947,7 +5011,9 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
 
 fn main(): null! {{
     value = json.parse("[{input}]")?
-    print(json.stringify(value)?)
+    encoded = json.stringify(value)?
+    json.decode(encoded.clone())?
+    print(encoded)
     return ok(null)
 }}
 "#,
@@ -5137,6 +5203,11 @@ fn native_json_input_and_output_limits_are_hard_boundaries() {
     let dir = unique_temp_dir("json-limits");
     fs::write(dir.join("ok.txt"), vec![b'a'; 999_998]).expect("write boundary payload");
     fs::write(dir.join("too-large.txt"), vec![b'a'; 999_999]).expect("write oversized payload");
+    // This object has 47 bytes of JSON syntax/number text, including the new
+    // decimal marker on 1e20; the marker must count towards the same hard limit.
+    fs::write(dir.join("float-ok.txt"), vec![b'a'; 999_953]).expect("write float boundary payload");
+    fs::write(dir.join("float-too-large.txt"), vec![b'a'; 999_954])
+        .expect("write oversized float boundary payload");
     fs::write(
         dir.join("main.ku"),
         r#"import fs from "std.fs"
@@ -5145,6 +5216,13 @@ import json from "std.json"
 fn ParseTooLarge(): null! {
     text = "\"" + fs.read("too-large.txt")? + "\""
     json.try_parse(text)?
+    return ok(null)
+}
+
+fn FloatOutputTooLarge(): null! {
+    scale = 10000000000.0
+    number = scale * scale
+    json.encode({ number: number, padding: fs.read("float-too-large.txt")? })?
     return ok(null)
 }
 
@@ -5160,6 +5238,22 @@ fn main(): null! {
     }
     if (!caught) {
         panic("oversized json input should fail")
+    }
+    scale = 10000000000.0
+    number = scale * scale
+    float_text = json.encode({ number: number, padding: fs.read("float-ok.txt")? })?
+    if (float_text.byte_len() != 1000000) {
+        panic("float decimal marker was not included in output accounting")
+    }
+    json.decode(float_text)?
+    caught_float = false
+    try {
+        FloatOutputTooLarge()?
+    } catch (err) {
+        caught_float = err.domain == "json" && err.code == "stringify_error"
+    }
+    if (!caught_float) {
+        panic("float decimal marker exceeded the output limit")
     }
     return ok(null)
 }
