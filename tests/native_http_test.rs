@@ -3240,20 +3240,45 @@ fn main(): null! {
     };
     let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
     let mut retained = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let mut stream = connect_with_retry(&address, Duration::from_secs(3));
         stream.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1700\r\nConnection: close\r\n\r\nx").unwrap();
+        stream.set_nonblocking(true).unwrap();
         retained.push(stream);
     }
-    let response = http_response(&address,
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1700\r\nConnection: close\r\n\r\n",
-        Duration::from_secs(1));
+    // Socket writes do not acknowledge the reactor's admission order. Observe
+    // which partial request was actually rejected before completing the others.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let rejected = 'observe: loop {
+        assert!(
+            Instant::now() < deadline,
+            "buffer quota did not reject a request"
+        );
+        for (index, stream) in retained.iter().enumerate() {
+            match stream.peek(&mut [0_u8; 1]) {
+                Ok(0) => panic!("buffer quota response closed before its status"),
+                Ok(_) => break 'observe index,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("failed to observe buffer quota response: {error}"),
+            }
+        }
+        thread::yield_now();
+    };
+    let mut rejected = retained.remove(rejected);
+    rejected.set_nonblocking(false).unwrap();
+    let response =
+        String::from_utf8(read_http_stream_bytes_until(&mut rejected, deadline).unwrap()).unwrap();
     assert_status(&response, "HTTP/1.1 503 Service Unavailable");
     assert!(response
         .to_ascii_lowercase()
         .contains("connection: close\r\n"));
     let body = vec![b'x'; 1699];
     for stream in &mut retained {
+        stream.set_nonblocking(false).unwrap();
         stream.write_all(&body).unwrap();
     }
     for mut stream in retained {
