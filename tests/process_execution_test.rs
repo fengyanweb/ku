@@ -77,12 +77,11 @@ fn records(output: &BoundedOutput) -> Vec<&str> {
     std::str::from_utf8(&output.stdout)
         .expect("JSONL receipts must be UTF-8")
         .lines()
-        .map(|line| {
+        .inspect(|line| {
             assert!(
                 line.starts_with('{') && line.ends_with('}'),
                 "incomplete JSONL record: {line}"
             );
-            line
         })
         .collect()
 }
