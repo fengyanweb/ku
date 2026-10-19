@@ -146,6 +146,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 map(dst);
             }
             TaskTerminator::BlockingRead { path, dst, .. }
+            | TaskTerminator::BlockingReadDir { path, dst, .. }
             | TaskTerminator::BlockingExists { path, dst, .. } => {
                 map(path);
                 map(dst);
@@ -842,7 +843,7 @@ static void array_reject(ArrayParameterRuntime* runtime,KuArray_int* numbers,
 static void array_preflight(ArrayParameterRuntime* runtime,ArrayParameterInputs* input) {
   KuArray_int bad=input->numbers;
   bad.len=5u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
-  bad=input->numbers; bad.capacity=65u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
+  bad=input->numbers; bad.capacity=10001u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
   bad=input->numbers; bad.capacity=SIZE_MAX; array_reject(runtime,&bad,&input->flags,&input->texts,0);
   bad=input->numbers; bad.data=NULL; array_reject(runtime,&bad,&input->flags,&input->texts,0);
   bad=input->numbers; bad.len=bad.capacity=0u; array_reject(runtime,&bad,&input->flags,&input->texts,0);
@@ -945,7 +946,7 @@ static KuResult_array_str array_wrapped_input(unsigned error) {
 static void array_wrapped_reject(ArrayParameterRuntime* runtime,KuResult_array_str* source,unsigned variant) {
   KuResult_array_str input=*source;
   if (variant==0u) input.value.len=5u;
-  else if (variant==1u) input.value.capacity=65u;
+  else if (variant==1u) input.value.capacity=10001u;
   else if (variant==2u) input.value=(KuArray_str){1u,(KuString*)&input,1u};
   else if (variant==5u) input.error.code=input.error.domain;
   KuResult_array_str saved; memcpy(&saved,&input,sizeof(saved));

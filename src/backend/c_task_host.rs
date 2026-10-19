@@ -192,7 +192,7 @@ static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1* host,
  * the returned vector in its persistent slot before cloning any string leaf. */
 static uint32_t ku_task_host_allocate_array(KuTaskAdapterHostV1* host,
     size_t count, size_t element_bytes, void** output) {
-  if (!host || !output || !element_bytes || count>64u
+  if (!host || !output || !element_bytes || count>10000u
       || host->allocation_host_bytes!=sizeof(*host)
       || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
       || !host->allocation_context || !host->reconcile_charge
@@ -427,6 +427,23 @@ static uint32_t ku_task_host_blocking_read(KuTaskAdapterHostV1* host,
   return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
       : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
 }
+#if KU_TASK_BLOCKING_DIRECTORY
+static uint32_t ku_task_host_blocking_read_dir(KuTaskAdapterHostV1* host,
+    KuString path, KuResult_array_str* output) {
+  if (!host || !host->ticket || !host->control || !host->blocking || !output
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_read_directory(host->ticket,host->blocking,output)
+      : ku_task_blocking_submit_read_dir(host->ticket,host->control,host->blocking,path,host->allocation_context,host->reconcile_charge,output);
+  /* Reconciliation follows the caller setting its Result initialization bit.
+   * Until then the physical reservation remains conservatively charged. */
+  return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
+      : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
+}
+#endif
 static uint32_t ku_task_host_blocking_exists(KuTaskAdapterHostV1* host,
     KuString path, KuResult_bool* output) {
   if (!host || !host->ticket || !host->control || !host->blocking || !output

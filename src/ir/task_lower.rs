@@ -1254,15 +1254,18 @@ impl<'a> FunctionLowerer<'a> {
         depth: usize,
     ) -> KuResult<SlotId> {
         if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
-            && matches!(name, "write" | "try_write" | "read" | "try_read" | "exists")
+            && matches!(
+                name,
+                "write" | "try_write" | "read" | "try_read" | "exists" | "read_dir"
+            )
             && self.std_fs
             && self.local("fs").is_none()
             && !self.signatures.contains_key("fs")
         {
             return if name == "exists" {
                 self.blocking_exists(args, span, depth)
-            } else if matches!(name, "read" | "try_read") {
-                self.blocking_read(args, span, depth)
+            } else if matches!(name, "read" | "try_read" | "read_dir") {
+                self.blocking_read(args, span, depth, name == "read_dir")
             } else {
                 self.blocking_write(args, span, depth)
             };
@@ -1520,7 +1523,13 @@ impl<'a> FunctionLowerer<'a> {
         Ok(dst)
     }
 
-    fn blocking_read(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+    fn blocking_read(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+        directory: bool,
+    ) -> KuResult<SlotId> {
         if self.in_finally_body {
             return Err(unsupported(
                 "fs.read inside a native Task finally body",
@@ -1534,16 +1543,30 @@ impl<'a> FunctionLowerer<'a> {
         if self.function.slots[path.0].ty != value_slot(IrType::Str) {
             return Err(unsupported("fs.read argument other than string", span));
         }
-        let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
+        let payload = if directory {
+            IrType::Array(Box::new(IrType::Str))
+        } else {
+            IrType::Str
+        };
+        let dst = self.slot(value_slot(IrType::Result(Box::new(payload))))?;
         let poll = self.state(TaskTerminator::Terminate)?;
         let ready = self.state(TaskTerminator::Terminate)?;
         let cleanup = self.cleanup_state()?;
         self.terminate(TaskTerminator::Jump { target: poll })?;
-        self.function.states[poll.0].terminator = TaskTerminator::BlockingRead {
-            path,
-            dst,
-            ready,
-            cleanup,
+        self.function.states[poll.0].terminator = if directory {
+            TaskTerminator::BlockingReadDir {
+                path,
+                dst,
+                ready,
+                cleanup,
+            }
+        } else {
+            TaskTerminator::BlockingRead {
+                path,
+                dst,
+                ready,
+                cleanup,
+            }
         };
         self.current = Some(ready);
         if !matches!(args[0].kind, ExprKind::Variable(_)) {

@@ -31,9 +31,19 @@ pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
                 state.terminator,
                 TaskTerminator::BlockingWrite { .. }
                     | TaskTerminator::BlockingRead { .. }
+                    | TaskTerminator::BlockingReadDir { .. }
                     | TaskTerminator::BlockingExists { .. }
             )
         })
+    })
+}
+
+pub(super) fn uses_blocking_read_dir(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
+        function
+            .states
+            .iter()
+            .any(|state| matches!(state.terminator, TaskTerminator::BlockingReadDir { .. }))
     })
 }
 
@@ -72,7 +82,7 @@ pub(super) fn emit_frames(
     out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
-    super::task_blocking::emit(out, uses_blocking_io(tasks))?;
+    super::task_blocking::emit(out, uses_blocking_io(tasks), uses_blocking_read_dir(tasks))?;
     super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
         out.check()?;
@@ -206,7 +216,7 @@ impl<'a> FrameEmitter<'a> {
                             state.terminator,
                             TaskTerminator::Timer { .. }
                                 | TaskTerminator::BlockingWrite { .. }
-                                | TaskTerminator::BlockingRead { .. }
+                                | TaskTerminator::BlockingRead { .. } | TaskTerminator::BlockingReadDir { .. }
                                 | TaskTerminator::BlockingExists { .. }
                         ) || state
                             .operations
@@ -937,6 +947,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t read_status=ku_task_host_blocking_read((KuTaskAdapterHostV1*)clock->host,{}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", cleanup.0, self.place(*path), self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
+                TaskTerminator::BlockingReadDir {
+                    path,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t read_status=ku_task_host_blocking_read_dir((KuTaskAdapterHostV1*)clock->host,{}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", cleanup.0, self.place(*path), self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",

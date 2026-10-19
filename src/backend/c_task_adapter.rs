@@ -294,9 +294,13 @@ fn array_input_guard(
         }
     }
     code.push_str(&format!("  for (size_t i=0;i<base_count;i++) {{\n    checked=ku_task_adapter_buffer_excludes(base[i],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n    for (size_t j=0;j<i;j++) if (ku_task_adapter_buffers_overlap(base[i],base[j])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }}\n",parameters.len()));
-    code.push_str("  if (!read_leaves) return KU_TASK_DRIVER_OK;\n  for (size_t vector=0;vector<vector_count;vector++) {\n    for (size_t leaf=0;leaf<vectors[vector].len;leaf++) {\n      KuString value=vectors[vector].data[leaf];\n      checked=ku_task_adapter_string_charge(value,&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n      KuTaskAdapterBufferV1 buffer=ku_task_adapter_string_buffer(value);\n      checked=ku_task_adapter_buffer_excludes(buffer,headers,");
+    // The preliminary hosted pass knows parent/control ranges before their
+    // fields can be read. Validate all leaves against those known ranges but
+    // defer inter-leaf sorting until the final pass supplies the real driver
+    // for its scratch reservation. No ownership/output mutation precedes it.
+    code.push_str("  if (!read_leaves) return KU_TASK_DRIVER_OK;\n  size_t leaf_count=0;\n  for (size_t i=0;i<vector_count;i++) { if (vectors[i].len>640000u-leaf_count) return KU_TASK_DRIVER_LIMIT; leaf_count+=vectors[i].len; }\n  KuTaskAdapterBufferV1 local[64],*leaves=local; size_t scratch_bytes=0;\n  if (driver && leaf_count>64u) { checked=ku_task_adapter_scratch(driver,leaf_count,&leaves,&scratch_bytes); if (checked!=KU_TASK_DRIVER_OK) return checked; }\n  size_t at=0;\n  for (size_t vector=0;vector<vector_count && checked==KU_TASK_DRIVER_OK;vector++) {\n    for (size_t leaf=0;leaf<vectors[vector].len;leaf++) {\n      KuString value=vectors[vector].data[leaf];\n      checked=ku_task_adapter_string_charge(value,&total); if (checked!=KU_TASK_DRIVER_OK) break;\n      KuTaskAdapterBufferV1 buffer=ku_task_adapter_string_buffer(value);\n      checked=ku_task_adapter_buffer_excludes(buffer,headers,");
     code.push_str(&parameters.len().to_string());
-    code.push_str("u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n      for (size_t i=0;i<base_count;i++) if (ku_task_adapter_buffers_overlap(buffer,base[i])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n      for (size_t previous=0;previous<=vector;previous++) {\n        size_t end=previous==vector ? leaf : vectors[previous].len;\n        for (size_t j=0;j<end;j++) if (ku_task_adapter_buffers_overlap(buffer,ku_task_adapter_string_buffer(vectors[previous].data[j]))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n      }\n    }\n  }\n  if (owned_bytes) *owned_bytes=total; return KU_TASK_DRIVER_OK;\n}\n");
+    code.push_str("u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) break;\n      for (size_t i=0;i<base_count;i++) if (ku_task_adapter_buffers_overlap(buffer,base[i])) { checked=KU_TASK_DRIVER_INVALID_ARGUMENT; break; }\n      if (checked!=KU_TASK_DRIVER_OK) break;\n      if (driver) leaves[at++]=buffer;\n    }\n  }\n  if (driver && checked==KU_TASK_DRIVER_OK) checked=ku_task_adapter_ranges_disjoint(leaves,leaf_count);\n  if (scratch_bytes) checked=ku_task_adapter_scratch_free(driver,leaves,scratch_bytes,checked);\n  if (checked==KU_TASK_DRIVER_OK && owned_bytes) *owned_bytes=total; return checked;\n}\n");
     Ok(code)
 }
 
@@ -336,6 +340,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             state.terminator,
             TaskTerminator::BlockingWrite { .. }
                 | TaskTerminator::BlockingRead { .. }
+                | TaskTerminator::BlockingReadDir { .. }
                 | TaskTerminator::BlockingExists { .. }
         )
     });
@@ -697,13 +702,13 @@ static int ku_task_adapter_string_overlaps_runtime(KuString value, KuTaskDriverV
       || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring))
       || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes));
 }
-/* Internal finite parameter guards: only base ranges are retained. String
- * array leaves are compared as a stream, never a 64-by-64 stack allocation. */
+/* Bounded flat arrays retain the 64-element literal limit in verified IR.
+ * Runtime directory outputs may carry up to 10000 entries. */
 typedef struct KuTaskAdapterBufferV1 { const void* pointer; size_t bytes; uint32_t owned; } KuTaskAdapterBufferV1;
 typedef struct KuTaskAdapterStringVectorV1 { const KuString* data; size_t len; } KuTaskAdapterStringVectorV1;
 static uint32_t ku_task_adapter_array_buffer(const void* data,size_t len,size_t capacity,
     size_t element_bytes,size_t alignment,KuTaskAdapterBufferV1* output) {
-  if (len>capacity || capacity>64u || !element_bytes || capacity>SIZE_MAX/element_bytes
+  if (len>capacity || capacity>10000u || !element_bytes || capacity>SIZE_MAX/element_bytes
       || (!capacity && data)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   size_t bytes=capacity*element_bytes;
   if (bytes && !ku_task_frame_storage_valid(data,bytes,bytes,alignment)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
@@ -723,6 +728,51 @@ static uint32_t ku_task_adapter_buffer_excludes(KuTaskAdapterBufferV1 buffer,
   if (driver && buffer.bytes && !ku_task_driver_external_storage(driver,buffer.pointer,buffer.bytes,1u)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   return KU_TASK_DRIVER_OK;
 }
+static uint32_t ku_task_adapter_scratch(KuTaskDriverV1* driver,size_t count,
+    KuTaskAdapterBufferV1** output,size_t* bytes) {
+  *output=NULL; *bytes=0;
+  /* 64 parameters, each holding at most one 10000-entry directory result. */
+  if (count>640000u || count>SIZE_MAX/sizeof(**output)) return KU_TASK_DRIVER_LIMIT;
+  if (!count) return KU_TASK_DRIVER_OK;
+  size_t size=count*sizeof(**output);
+  uint32_t status=ku_task_driver_scratch_reserve(driver,size);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  void* pointer=malloc(size);
+  if (!pointer) {
+    status=ku_task_driver_scratch_refund(driver,size);
+    return status==KU_TASK_DRIVER_OK ? KU_TASK_ADAPTER_OUT_OF_MEMORY : status;
+  }
+  *output=(KuTaskAdapterBufferV1*)pointer; *bytes=size; return KU_TASK_DRIVER_OK;
+}
+static uint32_t ku_task_adapter_scratch_free(KuTaskDriverV1* driver,
+    KuTaskAdapterBufferV1* pointer,size_t bytes,uint32_t status) {
+  free(pointer);
+  if (bytes) {
+    uint32_t refunded=ku_task_driver_scratch_refund(driver,bytes);
+    if (refunded!=KU_TASK_DRIVER_OK) return refunded;
+  }
+  return status;
+}
+static int ku_task_adapter_range_compare(const void* left,const void* right) {
+  uintptr_t a=(uintptr_t)((const KuTaskAdapterBufferV1*)left)->pointer;
+  uintptr_t b=(uintptr_t)((const KuTaskAdapterBufferV1*)right)->pointer;
+  return a<b ? -1 : a>b ? 1 : 0;
+}
+static uint32_t ku_task_adapter_ranges_disjoint(KuTaskAdapterBufferV1* ranges,size_t count) {
+  if (count>1u) qsort(ranges,count,sizeof(*ranges),ku_task_adapter_range_compare);
+  uintptr_t all_end=0,owned_end=0;
+  for (size_t i=0;i<count;i++) {
+    KuTaskAdapterBufferV1 range=ranges[i];
+    if (!range.bytes) continue;
+    uintptr_t start=(uintptr_t)range.pointer;
+    if (!start || range.bytes>UINTPTR_MAX-start) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    if (start<owned_end || (range.owned && start<all_end)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    uintptr_t end=start+range.bytes;
+    if (end>all_end) all_end=end;
+    if (range.owned && end>owned_end) owned_end=end;
+  }
+  return KU_TASK_DRIVER_OK;
+}
 /* All pointed-to typed extents remain a raw caller precondition. Validate the
  * vector's full capacity against known headers/runtime storage before reading
  * any leaf metadata; stream prior leaves to keep temporary storage bounded. */
@@ -734,21 +784,27 @@ static uint32_t ku_task_adapter_array_excludes(KuTaskDriverV1* driver,
   if (checked!=KU_TASK_DRIVER_OK) return checked;
   checked=ku_task_adapter_buffer_excludes(vector,NULL,0,extra,extra_count,driver);
   if (checked!=KU_TASK_DRIVER_OK || !string_leaves) return checked;
+  KuTaskAdapterBufferV1 local[64],*ranges=local;
+  size_t scratch_bytes=0;
+  if (len>64u) {
+    checked=ku_task_adapter_scratch(driver,len,&ranges,&scratch_bytes);
+    if (checked!=KU_TASK_DRIVER_OK) return checked;
+  }
   const KuString* strings=(const KuString*)data;
   size_t charge=vector.bytes;
   for (size_t leaf=0;leaf<len;leaf++) {
     KuString value=strings[leaf];
     checked=ku_task_adapter_string_charge(value,&charge);
-    if (checked!=KU_TASK_DRIVER_OK) return checked;
-    KuTaskAdapterBufferV1 buffer=ku_task_adapter_string_buffer(value);
-    checked=ku_task_adapter_buffer_excludes(buffer,NULL,0,extra,extra_count,driver);
-    if (checked!=KU_TASK_DRIVER_OK) return checked;
-    if (ku_task_adapter_buffers_overlap(buffer,vector)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
-    for (size_t previous=0;previous<leaf;previous++)
-      if (ku_task_adapter_buffers_overlap(buffer,ku_task_adapter_string_buffer(strings[previous])))
-        return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    if (checked!=KU_TASK_DRIVER_OK) break;
+    ranges[leaf]=ku_task_adapter_string_buffer(value);
+    checked=ku_task_adapter_buffer_excludes(ranges[leaf],NULL,0,extra,extra_count,driver);
+    if (checked!=KU_TASK_DRIVER_OK) break;
+    if (ku_task_adapter_buffers_overlap(ranges[leaf],vector)) {
+      checked=KU_TASK_DRIVER_INVALID_ARGUMENT; break;
+    }
   }
-  return KU_TASK_DRIVER_OK;
+  if (checked==KU_TASK_DRIVER_OK) checked=ku_task_adapter_ranges_disjoint(ranges,len);
+  return scratch_bytes ? ku_task_adapter_scratch_free(driver,ranges,scratch_bytes,checked) : checked;
 }
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault) {
   /* Callbacks run outside the queue mutex. The registered task or BUILDING

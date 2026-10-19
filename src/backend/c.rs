@@ -385,6 +385,7 @@ fn generate_c_source_with_frames_bounded(
         fs_usage.write = true;
         fs_usage.read = true;
         fs_usage.exists = true;
+        fs_usage.read_dir = frames.is_some_and(|(tasks, _, _)| task::uses_blocking_read_dir(tasks));
     }
     if fs_usage.any() {
         if let NativeFsBase::Unavailable(reason) = &options.fs_base {
@@ -7165,32 +7166,47 @@ static bool ku_fs_exists(KuString path) {
             r#"typedef struct KuFsDirBuilder {
   KuArray_str values;
   size_t output_bytes;
+  KuFsAllocatorV1* allocator;
 } KuFsDirBuilder;
 
+static void ku_fs_dir_string_release(KuFsAllocatorV1* allocator, KuString value) {
+  if (value.storage==KU_STRING_OWNED) ku_fs_release(allocator,value.ptr);
+}
+static void* ku_fs_dir_resize(KuFsDirBuilder* builder,size_t next) {
+  if (!builder->allocator) {
+    KuString* grown = (KuString*)realloc(builder->values.data, next * sizeof(KuString));
+    return grown;
+  }
+  KuString* grown=(KuString*)ku_fs_allocate(builder->allocator,next*sizeof(KuString));
+  if (!grown) return NULL;
+  if (builder->values.len) memcpy(grown,builder->values.data,builder->values.len*sizeof(KuString));
+  ku_fs_release(builder->allocator,builder->values.data);
+  return grown;
+}
 static void ku_fs_dir_builder_drop(KuFsDirBuilder* builder) {
   if (!builder) return;
-  for (size_t i = 0; i < builder->values.len; i++) ku_string_drop(&builder->values.data[i]);
-  free(builder->values.data);
+  for (size_t i = builder->values.len; i > 0; i--) ku_fs_dir_string_release(builder->allocator,builder->values.data[i-1]);
+  ku_fs_release(builder->allocator,builder->values.data);
   *builder = (KuFsDirBuilder){0};
 }
 
 static bool ku_fs_dir_builder_push(KuFsDirBuilder* builder, KuString value, KuError* error) {
   if (builder->values.len >= KU_FS_MAX_DIRECTORY_ENTRIES) {
-    ku_string_drop(&value);
+    ku_fs_dir_string_release(builder->allocator,value);
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: directory has too many entries");
     return false;
   }
   if (value.len > KU_FS_MAX_DIRECTORY_OUTPUT_BYTES - builder->output_bytes) {
-    ku_string_drop(&value);
+    ku_fs_dir_string_release(builder->allocator,value);
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: directory listing is too large");
     return false;
   }
   if (builder->values.len == builder->values.capacity) {
     size_t next = builder->values.capacity == 0 ? 16 : builder->values.capacity * 2;
     if (next > KU_FS_MAX_DIRECTORY_ENTRIES) next = KU_FS_MAX_DIRECTORY_ENTRIES;
-    KuString* grown = (KuString*)realloc(builder->values.data, next * sizeof(KuString));
+    KuString* grown = (KuString*)ku_fs_dir_resize(builder,next);
     if (!grown) {
-      ku_string_drop(&value);
+      ku_fs_dir_string_release(builder->allocator,value);
       ku_fs_set_error(error, "read_dir_failed", "failed to read directory: out of memory");
       return false;
     }
@@ -7219,13 +7235,13 @@ static KuResult_array_str ku_fs_read_dir_error(KuFsDirBuilder* builder, KuError 
 }
 
 #if defined(_WIN32)
-static bool ku_fs_wide_to_string(const wchar_t* wide, size_t len, KuString* value, KuError* error) {
+static bool ku_fs_wide_to_string(const wchar_t* wide, size_t len, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {
   if (len > KU_FS_MAX_PATH_BYTES) {
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: directory entry path is too long");
     return false;
   }
   if (len == 0) {
-    uint8_t* data = (uint8_t*)malloc(1);
+    uint8_t* data = (uint8_t*)ku_fs_allocate(allocator,1);
     if (!data) {
       ku_fs_set_error(error, "read_dir_failed", "failed to read directory: out of memory");
       return false;
@@ -7242,13 +7258,13 @@ static bool ku_fs_wide_to_string(const wchar_t* wide, size_t len, KuString* valu
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: directory entry path is too long");
     return false;
   }
-  uint8_t* data = (uint8_t*)malloc((size_t)bytes);
+  uint8_t* data = (uint8_t*)ku_fs_allocate(allocator,(size_t)bytes);
   if (!data) {
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: out of memory");
     return false;
   }
   if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)len, (char*)data, bytes, NULL, NULL) != bytes) {
-    free(data);
+    ku_fs_release(allocator,data);
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: entry path is not valid UTF-8");
     return false;
   }
@@ -7256,23 +7272,20 @@ static bool ku_fs_wide_to_string(const wchar_t* wide, size_t len, KuString* valu
   return true;
 }
 
-static KuResult_array_str ku_fs_read_dir(KuString path) {
+static KuResult_array_str ku_fs_read_dir_native_impl(const KuFsNativeChar* native, KuFsAllocatorV1* allocator) {
   KuFsDirBuilder builder = (KuFsDirBuilder){0};
+  builder.allocator=allocator;
   KuError error = (KuError){0};
-  KuFsNativeChar* native = ku_fs_native_path(path, &error, "read_dir_failed", "failed to read directory: invalid path");
-  if (!native) return ku_fs_read_dir_error(&builder, error);
 
   size_t base_len = wcslen(native);
   bool separator = base_len != 0 && (native[base_len - 1] == L'\\' || native[base_len - 1] == L'/');
   if (base_len > SIZE_MAX - 3) {
-    free(native);
     ku_fs_set_error(&error, "read_dir_failed", "failed to read directory: path is too long");
     return ku_fs_read_dir_error(&builder, error);
   }
   size_t pattern_len = base_len + (separator ? 0 : 1) + 1;
-  wchar_t* pattern = (wchar_t*)malloc((pattern_len + 1) * sizeof(wchar_t));
+  wchar_t* pattern = (wchar_t*)ku_fs_allocate(allocator,(pattern_len + 1) * sizeof(wchar_t));
   if (!pattern) {
-    free(native);
     ku_fs_set_error(&error, "read_dir_failed", "failed to read directory: out of memory");
     return ku_fs_read_dir_error(&builder, error);
   }
@@ -7284,9 +7297,8 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
 
   WIN32_FIND_DATAW entry;
   HANDLE handle = FindFirstFileW(pattern, &entry);
-  free(pattern);
+  ku_fs_release(allocator,pattern);
   if (handle == INVALID_HANDLE_VALUE) {
-    free(native);
     ku_fs_set_error(&error, "read_dir_failed", "failed to read directory");
     return ku_fs_read_dir_error(&builder, error);
   }
@@ -7302,7 +7314,7 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
         failed = true;
       } else {
         size_t full_len = base_len + (separator ? 0 : 1) + name_len;
-        wchar_t* full = (wchar_t*)malloc((full_len + 1) * sizeof(wchar_t));
+        wchar_t* full = (wchar_t*)ku_fs_allocate(allocator,(full_len + 1) * sizeof(wchar_t));
         if (!full) {
           ku_fs_set_error(&error, "read_dir_failed", "failed to read directory: out of memory");
           failed = true;
@@ -7313,9 +7325,9 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
           if (name_len) memcpy(full + full_at, name, name_len * sizeof(wchar_t));
           full[full_len] = L'\0';
           KuString output = (KuString){0};
-          if (!ku_fs_wide_to_string(full, full_len, &output, &error) ||
+          if (!ku_fs_wide_to_string(full, full_len, &output, &error, allocator) ||
               !ku_fs_dir_builder_push(&builder, output, &error)) failed = true;
-          free(full);
+          ku_fs_release(allocator,full);
         }
       }
     }
@@ -7333,20 +7345,17 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
     ku_fs_set_error(&error, "read_dir_failed", "failed to close directory");
     failed = true;
   }
-  free(native);
   if (failed) return ku_fs_read_dir_error(&builder, error);
   if (builder.values.len > 1) qsort(builder.values.data, builder.values.len, sizeof(KuString), ku_fs_path_compare);
   return (KuResult_array_str){ true, builder.values, (KuError){0} };
 }
 #else
-static KuResult_array_str ku_fs_read_dir(KuString path) {
+static KuResult_array_str ku_fs_read_dir_native_impl(const KuFsNativeChar* native, KuFsAllocatorV1* allocator) {
   KuFsDirBuilder builder = (KuFsDirBuilder){0};
+  builder.allocator=allocator;
   KuError error = (KuError){0};
-  KuFsNativeChar* native = ku_fs_native_path(path, &error, "read_dir_failed", "failed to read directory: invalid path");
-  if (!native) return ku_fs_read_dir_error(&builder, error);
   DIR* directory = opendir(native);
   if (!directory) {
-    free(native);
     ku_fs_set_error(&error, "read_dir_failed", "failed to read directory");
     return ku_fs_read_dir_error(&builder, error);
   }
@@ -7384,7 +7393,7 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
       failed = true;
       break;
     }
-    uint8_t* full = (uint8_t*)malloc(full_len ? full_len : 1);
+    uint8_t* full = (uint8_t*)ku_fs_allocate(allocator,full_len ? full_len : 1);
     if (!full) {
       ku_fs_set_error(&error, "read_dir_failed", "failed to read directory: out of memory");
       failed = true;
@@ -7404,12 +7413,20 @@ static KuResult_array_str ku_fs_read_dir(KuString path) {
     ku_fs_set_error(&error, "read_dir_failed", "failed to close directory");
     failed = true;
   }
-  free(native);
   if (failed) return ku_fs_read_dir_error(&builder, error);
   if (builder.values.len > 1) qsort(builder.values.data, builder.values.len, sizeof(KuString), ku_fs_path_compare);
   return (KuResult_array_str){ true, builder.values, (KuError){0} };
 }
 #endif
+
+static KuResult_array_str ku_fs_read_dir(KuString path) {
+  KuError error={0};
+  KuFsNativeChar* native=ku_fs_native_path(path,&error,"read_dir_failed","failed to read directory: invalid path");
+  if (!native) return (KuResult_array_str){false,{0},error};
+  KuResult_array_str result=ku_fs_read_dir_native_impl(native,NULL);
+  free(native);
+  return result;
+}
 
 "#,
         );

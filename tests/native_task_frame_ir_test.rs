@@ -1796,6 +1796,36 @@ fn blocking_read_preserves_view_and_initializes_only_ready_string_result() {
 }
 
 #[test]
+fn blocking_read_dir_preserves_view_and_initializes_only_ready_array_result() {
+    let mut fixture = program(
+        vec![IrType::Str, result(IrType::Array(Box::new(IrType::Str)))],
+        &[0],
+        vec![
+            state(
+                vec![],
+                TaskTerminator::BlockingReadDir {
+                    path: SlotId(0),
+                    dst: SlotId(1),
+                    ready: StateId(1),
+                    cleanup: StateId(2),
+                },
+            ),
+            state(vec![read(0), drop_slot(0)], complete(1)),
+            state(vec![drop_if(0), drop_if(1)], TaskTerminator::Terminate),
+        ],
+    );
+    fixture.functions[0].result = result(IrType::Array(Box::new(IrType::Str)));
+    let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
+    assert!(plan.functions[0].hosted);
+    assert!(plan.functions[0].slots.contains(&SlotId(0)));
+    fixture.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: result(IrType::Null),
+        borrowed: false,
+    };
+    assert!(verify_and_plan(&fixture, TaskLimits::default()).is_err());
+}
+
+#[test]
 fn blocking_exists_preserves_view_and_initializes_only_ready_bool_at_slot_limit() {
     let mut types = vec![IrType::Int; 64];
     types[61] = result(IrType::Bool);

@@ -312,6 +312,13 @@ pub enum TaskTerminator {
         ready: StateId,
         cleanup: StateId,
     },
+    /// A directory read owns its independently allocated, sorted string array.
+    BlockingReadDir {
+        path: SlotId,
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
     /// A path check runs in the same fixed pool and initializes a Copy bool.
     /// Missing or invalid paths are false; admission failures are runtime exits.
     BlockingExists {
@@ -743,6 +750,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         | TaskTerminator::Timer { ready, cleanup, .. }
         | TaskTerminator::BlockingWrite { ready, cleanup, .. }
         | TaskTerminator::BlockingRead { ready, cleanup, .. }
+        | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
         | TaskTerminator::BlockingExists { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
@@ -1377,16 +1385,23 @@ fn validate_shape(
                     ));
                 }
             }
-            TaskTerminator::BlockingRead { path, dst, .. } => {
+            TaskTerminator::BlockingRead { path, dst, .. }
+            | TaskTerminator::BlockingReadDir { path, dst, .. } => {
                 has_blocking = true;
+                let payload = if matches!(state.terminator, TaskTerminator::BlockingReadDir { .. })
+                {
+                    IrType::Array(Box::new(IrType::Str))
+                } else {
+                    IrType::Str
+                };
                 let (path_ty, path_borrowed) = slot_type(get_slot(*path)?)?;
                 let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
                 if path_ty != &IrType::Str
                     || path_borrowed
                     || destination_borrowed
-                    || destination != &IrType::Result(Box::new(IrType::Str))
+                    || destination != &IrType::Result(Box::new(payload))
                 {
-                    return Err(invalid("BlockingRead requires an owned string source and string Result destination"));
+                    return Err(invalid("BlockingRead/ReadDir requires an owned string source and matching Result destination"));
                 }
             }
             TaskTerminator::BlockingExists { path, dst, .. } => {
@@ -1489,6 +1504,7 @@ fn validate_regions_and_progress(
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. } => pending.push(*ready),
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
@@ -1525,6 +1541,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::BlockingRead {
+            cleanup: target, ..
+        }
+        | TaskTerminator::BlockingReadDir {
             cleanup: target, ..
         }
         | TaskTerminator::BlockingExists {
@@ -1631,6 +1650,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
                         | TaskTerminator::BlockingRead { .. }
+                        | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
                 )
             {
@@ -1668,6 +1688,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
                         | TaskTerminator::BlockingRead { .. }
+                        | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
                 )
             {
@@ -1870,6 +1891,7 @@ fn validate_scope_layout(
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
             ref term => successors(term),
         };
@@ -2046,6 +2068,7 @@ fn validate_scope_exits(
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
             | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
@@ -2184,6 +2207,12 @@ fn edge_states(
             ..
         }
         | TaskTerminator::BlockingRead {
+            dst,
+            ready,
+            cleanup,
+            ..
+        }
+        | TaskTerminator::BlockingReadDir {
             dst,
             ready,
             cleanup,
@@ -2337,6 +2366,12 @@ fn live_states(
                     cleanup,
                     ..
                 }
+                | TaskTerminator::BlockingReadDir {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
+                }
                 | TaskTerminator::BlockingExists {
                     dst,
                     ready,
@@ -2367,6 +2402,7 @@ fn live_states(
                     live |= bit(path) | bit(content)
                 }
                 TaskTerminator::BlockingRead { path, .. }
+                | TaskTerminator::BlockingReadDir { path, .. }
                 | TaskTerminator::BlockingExists { path, .. } => live |= bit(path),
                 TaskTerminator::ScopeDrain { scope, .. } => live |= scopes.mask(scope),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
@@ -2621,6 +2657,7 @@ fn validate_ownership_and_plan(
             | TaskTerminator::Timer { .. }
             | TaskTerminator::BlockingWrite { .. }
             | TaskTerminator::BlockingRead { .. }
+            | TaskTerminator::BlockingReadDir { .. }
             | TaskTerminator::BlockingExists { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
@@ -2663,7 +2700,9 @@ fn validate_ownership_and_plan(
                         return Err(invalid("BlockingWrite overwrites an initialized Result"));
                     }
                 }
-                if let TaskTerminator::BlockingRead { path, dst, .. } = block.terminator {
+                if let TaskTerminator::BlockingRead { path, dst, .. }
+                | TaskTerminator::BlockingReadDir { path, dst, .. } = block.terminator
+                {
                     if state.must & bit(path) == 0 {
                         return Err(invalid("BlockingRead reads an uninitialized source"));
                     }
@@ -2683,6 +2722,7 @@ fn validate_ownership_and_plan(
                     TaskTerminator::Timer { millis, .. } => bit(millis),
                     TaskTerminator::BlockingWrite { path, content, .. } => bit(path) | bit(content),
                     TaskTerminator::BlockingRead { path, .. }
+                    | TaskTerminator::BlockingReadDir { path, .. }
                     | TaskTerminator::BlockingExists { path, .. } => bit(path),
                     _ => 0,
                 };
@@ -3164,6 +3204,7 @@ fn finally_plan(
             | TaskTerminator::Timer { ready, cleanup, .. }
             | TaskTerminator::BlockingWrite { ready, cleanup, .. }
             | TaskTerminator::BlockingRead { ready, cleanup, .. }
+            | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
             | TaskTerminator::BlockingExists { ready, cleanup, .. }
             | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
                 if stack.last().is_some_and(|target| *target != cleanup)

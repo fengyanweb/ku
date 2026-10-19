@@ -1755,6 +1755,29 @@ static uint32_t ku_task_driver_blocking_retired(const KuTaskDriverTicketV1* tick
   if (status==KU_TASK_DRIVER_OK) slot->blocking_pending=0;
   ku_task_driver_unlock(driver); return status;
 }
+/* Typed adapter scratch borrows only a byte reservation. The caller protects
+ * driver lifetime; the reservation itself also prevents physical reaping.
+ * It never modifies Task ownership and is returned after the real free. */
+static uint32_t ku_task_driver_scratch_reserve(KuTaskDriverV1* driver,size_t bytes) {
+  uint32_t status=ku_task_driver_check(driver);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  status=driver->fixed_bytes>driver->byte_limit
+      || driver->reserved_bytes>driver->byte_limit-driver->fixed_bytes ? KU_TASK_DRIVER_INTERNAL
+      : bytes>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes ? KU_TASK_DRIVER_LIMIT
+      : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK) {
+    driver->reserved_bytes+=bytes;
+    if (driver->reserved_bytes>driver->peak_reserved_bytes) driver->peak_reserved_bytes=driver->reserved_bytes;
+  }
+  ku_task_driver_unlock(driver); return status;
+}
+static uint32_t ku_task_driver_scratch_refund(KuTaskDriverV1* driver,size_t bytes) {
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  uint32_t status=bytes>driver->reserved_bytes ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK) driver->reserved_bytes-=bytes;
+  ku_task_driver_signal(driver); ku_task_driver_unlock(driver); return status;
+}
 /* Generated allocation glue grows only the currently executing instance.
  * Reservation precedes malloc; the per-instance typed scan may only refund
  * bytes after owners were dropped or transferred. Neither operation allocates

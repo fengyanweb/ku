@@ -753,3 +753,87 @@ fn native_task_sleep_recognizes_only_imported_unshadowed_std_time_integer_calls(
         assert!(task_lower::lower_program(&ast).is_err(),"must preserve rejected module/type boundary: {source}");
     }
 }
+
+#[test]
+fn native_task_read_dir_owns_large_sorted_outputs_and_preserves_paths() {
+    let source = r#"
+import fs from "std.fs"
+async fn Copy(values: [str]): [str]! { return ok(values) }
+async fn List(path: str): [str]! {
+    first = fs.read_dir(path)?
+    again = fs.read_dir(path)?
+    println(again.len())
+    return ok(first)
+}
+async fn main(): null! {
+    listed = (await List("listing"))?
+    cloned = listed.clone()
+    moved = (await Copy(cloned))?
+    println(moved.len())
+    println(listed.try_get(0)?)
+    println(moved.try_get(81)?)
+    empty = fs.read_dir("empty")?
+    println(empty.len())
+    try { fs.read_dir("missing")? } catch(err) { println(err.code) }
+    return ok(null)
+}
+"#;
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    ast.items
+        .retain(|item| !matches!(item, ku::ast::Item::Import(_)));
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:fs".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let lowered = task_lower::lower_program(&ast).unwrap();
+    let generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    assert!(generated.contains("ku_task_host_blocking_read_dir("));
+    let directory = TempDir::new("native-task-directory");
+    fs::create_dir(directory.path().join("listing")).unwrap();
+    fs::create_dir(directory.path().join("empty")).unwrap();
+    for index in 0..80 {
+        fs::write(directory.path().join(format!("listing/f{index:03}")), b"").unwrap();
+    }
+    fs::write(directory.path().join("listing/中文😀"), b"").unwrap();
+    fs::write(directory.path().join("listing/é"), b"").unwrap();
+    let path = directory.path().join("directory.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "directory") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires directory Task execution"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace('\r', "")
+        .replace('\\', "/");
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 6, "{text}");
+    assert_eq!(lines[0], "82");
+    assert_eq!(lines[1], "82");
+    assert!(lines[2].ends_with("listing/f000"), "{text}");
+    assert!(lines[3].ends_with("listing/中文😀"), "{text}");
+    assert_eq!(lines[4], "0");
+    assert_eq!(lines[5], "read_dir_failed");
+}

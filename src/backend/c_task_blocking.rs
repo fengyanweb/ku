@@ -4,9 +4,14 @@
 use super::output::COutput;
 use crate::error::KuResult;
 
-pub(super) fn emit(out: &mut COutput, enabled: bool) -> KuResult<()> {
+pub(super) fn emit(out: &mut COutput, enabled: bool, directory: bool) -> KuResult<()> {
     out.push_str(TOKEN);
     if enabled {
+        out.push_str(if directory {
+            "#define KU_TASK_BLOCKING_DIRECTORY 1\n"
+        } else {
+            "#define KU_TASK_BLOCKING_DIRECTORY 0\n"
+        });
         out.push_str(RUNTIME);
     }
     out.check()
@@ -42,6 +47,9 @@ typedef struct KuTaskBlockingJobV1 {
   KuString content;
   KuResult_null result;
   KuResult_str read_result;
+#if KU_TASK_BLOCKING_DIRECTORY
+  KuResult_array_str directory_result;
+#endif
   bool exists_value;
 } KuTaskBlockingJobV1;
 typedef struct KuTaskBlockingWorkerV1 {
@@ -142,47 +150,97 @@ static KuError ku_task_blocking_error(const char* code, const char* message) {
       ku_string_static((const uint8_t*)message,strlen(message)));
 }
 /* Output buffers use plain malloc, so ownership can pass directly to the
- * ordinary KuString drop ABI. Only this worker accesses the two live entries.
+ * ordinary KuString drop ABI. Only this worker accesses the bounded allocation metadata.
  * The job charge remains mutex-protected even when the parent is cleaning up. */
+typedef struct KuTaskBlockingOutputEntryV1 { void* pointer; size_t bytes; } KuTaskBlockingOutputEntryV1;
 typedef struct KuTaskBlockingOutputV1 {
   KuTaskBlockingPoolV1* pool;
   KuTaskBlockingJobV1* job;
   void* pointers[2];
   size_t bytes[2];
   uint32_t status;
+  KuTaskBlockingOutputEntryV1* entries;
+  size_t count, capacity, metadata_bytes;
 } KuTaskBlockingOutputV1;
-static void* ku_task_blocking_output_allocate(void* raw, size_t bytes) {
-  KuTaskBlockingOutputV1* output=(KuTaskBlockingOutputV1*)raw;
-  if (output->status!=KU_TASK_DRIVER_OK) return NULL;
-  if (ku_task_blocking_lock(output->pool)) { output->status=KU_TASK_DRIVER_INTERNAL; return NULL; }
+static uint32_t ku_task_blocking_output_reserve(KuTaskBlockingOutputV1* output,size_t bytes) {
+  if (ku_task_blocking_lock(output->pool)) return KU_TASK_DRIVER_INTERNAL;
   KuTaskBlockingJobV1* job=output->job;
   uint32_t status=job->cancelled || output->pool->closing ? KU_TASK_DRIVER_CLOSED
       : bytes>SIZE_MAX-job->output_charge ? KU_TASK_DRIVER_LIMIT
       : ku_task_driver_blocking_grow_charge(&job->ticket,bytes);
   if (status==KU_TASK_DRIVER_OK) job->output_charge+=bytes;
+  ku_task_blocking_unlock(output->pool); return status;
+}
+static void ku_task_blocking_output_refund(KuTaskBlockingOutputV1* output,size_t bytes) {
+  if (ku_task_blocking_lock(output->pool)) { output->status=KU_TASK_DRIVER_INTERNAL; return; }
+  if (bytes>output->job->output_charge) output->status=KU_TASK_DRIVER_INTERNAL;
+  else {
+    uint32_t status=ku_task_driver_blocking_refund_charge(&output->job->ticket,bytes);
+    if (status==KU_TASK_DRIVER_OK) output->job->output_charge-=bytes;
+    else output->status=status;
+  }
   ku_task_blocking_unlock(output->pool);
-  if (status!=KU_TASK_DRIVER_OK) { output->status=status; return NULL; }
+}
+static void* ku_task_blocking_output_allocate(void* raw, size_t bytes) {
+  KuTaskBlockingOutputV1* output=(KuTaskBlockingOutputV1*)raw;
+  if (output->status!=KU_TASK_DRIVER_OK) return NULL;
+  if (output->job->kind==4u) {
+    if (output->count==output->capacity) {
+      /* At most 10000 paths, an old/new vector and two platform temporaries. */
+      const size_t limit=10004u;
+      size_t next=output->capacity ? output->capacity*2u : 16u;
+      if (next>limit) next=limit;
+      if (next<=output->capacity || next>SIZE_MAX/sizeof(*output->entries)) {
+        output->status=KU_TASK_DRIVER_LIMIT; return NULL;
+      }
+      size_t metadata=next*sizeof(*output->entries);
+      output->status=ku_task_blocking_output_reserve(output,metadata);
+      if (output->status!=KU_TASK_DRIVER_OK) return NULL;
+      KuTaskBlockingOutputEntryV1* grown=(KuTaskBlockingOutputEntryV1*)malloc(metadata);
+      if (!grown) {
+        ku_task_blocking_output_refund(output,metadata);
+        if (output->status==KU_TASK_DRIVER_OK) output->status=KU_TASK_BLOCKING_OUT_OF_MEMORY;
+        return NULL;
+      }
+      if (output->count) memcpy(grown,output->entries,output->count*sizeof(*grown));
+      free(output->entries);
+      if (output->metadata_bytes) ku_task_blocking_output_refund(output,output->metadata_bytes);
+      output->entries=grown; output->capacity=next; output->metadata_bytes=metadata;
+      if (output->status!=KU_TASK_DRIVER_OK) return NULL;
+    }
+  }
+  output->status=ku_task_blocking_output_reserve(output,bytes);
+  if (output->status!=KU_TASK_DRIVER_OK) return NULL;
   void* pointer=malloc(bytes);
-  if (!pointer) { output->status=KU_TASK_BLOCKING_OUT_OF_MEMORY; return NULL; }
+  if (!pointer) {
+    ku_task_blocking_output_refund(output,bytes);
+    if (output->status==KU_TASK_DRIVER_OK) output->status=KU_TASK_BLOCKING_OUT_OF_MEMORY;
+    return NULL;
+  }
+  if (output->job->kind==4u) {
+    output->entries[output->count++]=(KuTaskBlockingOutputEntryV1){pointer,bytes}; return pointer;
+  }
   for (size_t i=0;i<2;i++) if (!output->pointers[i]) {
     output->pointers[i]=pointer; output->bytes[i]=bytes; return pointer;
   }
-  free(pointer); output->status=KU_TASK_DRIVER_INTERNAL; return NULL;
+  free(pointer); ku_task_blocking_output_refund(output,bytes);
+  output->status=KU_TASK_DRIVER_INTERNAL; return NULL;
 }
 static void ku_task_blocking_output_release(void* raw, void* pointer) {
   if (!pointer) return;
   KuTaskBlockingOutputV1* output=(KuTaskBlockingOutputV1*)raw;
-  for (size_t i=0;i<2;i++) if (output->pointers[i]==pointer) {
+  if (output->job->kind==4u) {
+    /* Builder teardown is reverse insertion order; vector growth releases
+     * only O(log N) older buffers. No directory-wide pairwise traversal. */
+    for (size_t i=output->count;i>0;i--) if (output->entries[i-1u].pointer==pointer) {
+      size_t bytes=output->entries[i-1u].bytes; free(pointer);
+      output->entries[i-1u]=output->entries[--output->count];
+      ku_task_blocking_output_refund(output,bytes); return;
+    }
+  } else for (size_t i=0;i<2;i++) if (output->pointers[i]==pointer) {
     size_t bytes=output->bytes[i]; free(pointer);
     output->pointers[i]=NULL; output->bytes[i]=0;
-    if (ku_task_blocking_lock(output->pool)) { output->status=KU_TASK_DRIVER_INTERNAL; return; }
-    if (bytes>output->job->output_charge) output->status=KU_TASK_DRIVER_INTERNAL;
-    else {
-      uint32_t status=ku_task_driver_blocking_refund_charge(&output->job->ticket,bytes);
-      if (status==KU_TASK_DRIVER_OK) output->job->output_charge-=bytes;
-      else output->status=status;
-    }
-    ku_task_blocking_unlock(output->pool); return;
+    ku_task_blocking_output_refund(output,bytes); return;
   }
   output->status=KU_TASK_DRIVER_INTERNAL;
 }
@@ -215,10 +273,19 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
         closing ? "blocking pool is closing" : "blocking job was cancelled before file operation") : (KuError){0};
     uint32_t kind=job->kind;
     KuString read_value={0};
-    KuTaskBlockingOutputV1 allocation={pool,job,{NULL,NULL},{0,0},KU_TASK_DRIVER_OK};
+#if KU_TASK_BLOCKING_DIRECTORY
+    KuResult_array_str directory_result={0};
+#endif
+    KuTaskBlockingOutputV1 allocation={pool,job,{NULL,NULL},{0,0},KU_TASK_DRIVER_OK,NULL,0,0,0};
     KuFsAllocatorV1 allocator={&allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
     bool ok=false,exists_value=false;
     if (!cancelled) {
+#if KU_TASK_BLOCKING_DIRECTORY
+      if (kind==4u) {
+        directory_result=ku_fs_read_dir_native_impl(path,&allocator);
+        ok=directory_result.ok; error=directory_result.error;
+      } else
+#endif
       if (kind==3u) {
         exists_value=ku_fs_exists_native_impl(path);
         ok=true;
@@ -234,12 +301,26 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
           allocation.status==KU_TASK_DRIVER_LIMIT ? "blocking output exceeds runtime byte budget" : allocation.status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "blocking output allocation failed" : allocation.status==KU_TASK_DRIVER_CLOSED ? "blocking read was cancelled before buffer growth" : "blocking output accounting failed");
       }
     }
+    /* Tracking storage is private to this worker, never part of a Ku value.
+     * The directory implementation already freed every output on failure. */
+    free(allocation.entries);
+    if (allocation.metadata_bytes) ku_task_blocking_output_refund(&allocation,allocation.metadata_bytes);
+#if KU_TASK_BLOCKING_DIRECTORY
+    if (kind==4u) {
+      if (!ok) { directory_result.value=(KuArray_str){0}; directory_result.error=error; }
+      directory_result.ok=ok;
+    }
+#endif
     /* No driver mutex, source frame, or original View storage is used here. */
     ku_task_blocking_free(path);
     ku_task_blocking_free(content.ptr);
     if (ku_task_blocking_lock(pool)) return;
     job=&pool->jobs[index];
     job->path=NULL; job->content=(KuString){0};
+#if KU_TASK_BLOCKING_DIRECTORY
+    if (kind==4u) job->directory_result=directory_result;
+    else
+#endif
     if (kind==1u) job->read_result=(KuResult_str){ok,read_value,error};
     else job->result=(KuResult_null){ok,0,error};
     job->exists_value=exists_value;
@@ -514,9 +595,17 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
         pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_unlock(pool); return status;
       }
       if (kind==2u) {
+#if KU_TASK_BLOCKING_DIRECTORY
+        if (job->kind==4u) ku_result_drop_array_str(&job->directory_result);
+        else
+#endif
         if (job->kind==1u) ku_result_drop_str(&job->read_result);
         else ku_result_drop_null(&job->result);
-      } else if (kind==1u) *(KuResult_str*)output=job->read_result;
+      }
+#if KU_TASK_BLOCKING_DIRECTORY
+      else if (kind==4u) *(KuResult_array_str*)output=job->directory_result;
+#endif
+      else if (kind==1u) *(KuResult_str*)output=job->read_result;
       else if (kind==3u) *(KuResult_bool*)output=(KuResult_bool){job->result.ok,job->exists_value,job->result.error};
       else *(KuResult_null*)output=job->result;
       uint64_t generation=job->generation;
@@ -545,6 +634,12 @@ static uint32_t ku_task_blocking_read_bool(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, KuResult_bool* output) {
   return ku_task_blocking_take(ticket,token,0,3u,output);
 }
+#if KU_TASK_BLOCKING_DIRECTORY
+static uint32_t ku_task_blocking_read_directory(const KuTaskDriverTicketV1* ticket,
+    KuTaskBlockingTokenV1* token, KuResult_array_str* output) {
+  return ku_task_blocking_take(ticket,token,0,4u,output);
+}
+#endif
 static uint32_t ku_task_blocking_discard(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token) {
   uint32_t sentinel=0; return ku_task_blocking_take(ticket,token,1,2u,&sentinel);
@@ -553,7 +648,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
     KuString path, KuString content, void* context,
     uint32_t (*reconcile)(void*), uint32_t kind, KuResult_null* output) {
-  if ((kind!=0u && kind!=1u && kind!=3u) || !ticket || !control || !token || token->pool || token->charged_bytes || !output
+  if ((kind!=0u && kind!=1u && kind!=3u && (kind!=4u || !KU_TASK_BLOCKING_DIRECTORY)) || !ticket || !control || !token || token->pool || token->charged_bytes || !output
       || !context || !reconcile) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   KuError error={0};
   if (!kind && !ku_fs_write_validate(content,&error)) { *output=(KuResult_null){false,0,error}; return KU_TASK_DRIVER_OK; }
@@ -594,7 +689,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     status=reconcile(context);
     builder.status=status;
     if (status==KU_TASK_DRIVER_OK)
-      native=ku_fs_native_path_with_allocator(path,&error,kind ? "read_failed" : "write_failed",kind ? "failed to read: invalid path" : "failed to write: invalid path",&allocator);
+      native=ku_fs_native_path_with_allocator(path,&error,kind==4u ? "read_dir_failed" : kind ? "read_failed" : "write_failed",kind ? "failed to read: invalid path" : "failed to write: invalid path",&allocator);
     if (native && builder.status==KU_TASK_DRIVER_OK && content.len) {
       copy=(uint8_t*)ku_task_blocking_allocate(&builder,content.len);
       if (copy) memcpy(copy,content.ptr,content.len);
@@ -658,6 +753,17 @@ static uint32_t ku_task_blocking_submit_read(const KuTaskDriverTicketV1* ticket,
   if (status==KU_TASK_DRIVER_OK) *output=(KuResult_str){false,{0},submitted.error};
   return status;
 }
+#if KU_TASK_BLOCKING_DIRECTORY
+static uint32_t ku_task_blocking_submit_read_dir(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
+    KuString path, void* context, uint32_t (*reconcile)(void*), KuResult_array_str* output) {
+  if (!output) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuResult_null submitted={0};
+  uint32_t status=ku_task_blocking_submit_impl(ticket,control,token,path,(KuString){0},context,reconcile,4u,&submitted);
+  if (status==KU_TASK_DRIVER_OK) *output=(KuResult_array_str){false,{0},submitted.error};
+  return status;
+}
+#endif
 static uint32_t ku_task_blocking_submit_exists(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
     KuString path, void* context, uint32_t (*reconcile)(void*), KuResult_bool* output) {

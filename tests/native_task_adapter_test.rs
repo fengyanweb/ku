@@ -1590,6 +1590,8 @@ async fn Probe(path: str): bool! {
     present=fs.exists(path)
     return ok(present)
 }
+async fn List(path: str): [str]! { return fs.read_dir(path) }
+async fn Carry(values: [str]): [str]! { return ok(values) }
 async fn main(): null! { return ok(null) }
 "#;
     let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
@@ -1634,6 +1636,10 @@ async fn main(): null! { return ok(null) }
             "static bool ku_fs_exists_native_impl(const KuFsNativeChar* native) {\n  fixture_io_gate();",
             1,
         )
+        .replace(
+            "static KuResult_array_str ku_fs_read_dir_native_impl(const KuFsNativeChar* native, KuFsAllocatorV1* allocator) {",
+            "static KuResult_array_str ku_fs_read_dir_native_impl(const KuFsNativeChar* native, KuFsAllocatorV1* allocator) {\n  fixture_io_gate();",
+        )
         .replacen("void* pointer=malloc(bytes);", "void* pointer=fixture_output_malloc(bytes);", 1)
         .replacen("job->state=KU_TASK_BLOCKING_DONE; pool->running--;", "job->state=KU_TASK_BLOCKING_DONE; pool->running--; fixture_blocking_done(job->kind);", 1)
         .replacen(
@@ -1648,6 +1654,11 @@ async fn main(): null! { return ok(null) }
         );
     generated.push_str(BLOCKING_FIXTURE_MAIN);
     let directory = TempDir::new("native-blocking-write-ledger");
+    fs::create_dir(directory.path().join("listing")).unwrap();
+    fs::create_dir(directory.path().join("empty")).unwrap();
+    for index in 0..80 {
+        fs::write(directory.path().join(format!("listing/f{index:03}")), b"").unwrap();
+    }
     let path = directory.path().join("blocking.c");
     fs::write(&path, generated).unwrap();
     let Some(executable) = compile_harness(directory.path(), &path, "blocking") else {
@@ -2202,6 +2213,85 @@ static void blocking_exists_cancel_retires_actual_job_with_original_deadline(voi
   CHECK(remove("exists-input.txt")==0);
   blocking_finish_late(deadline);
 }
+
+static KuTaskValueV1 blocking_directory_start(const char* name) {
+  KuString path=ku_string_static((const uint8_t*)name,strlen(name)); KuTaskValueV1 task={0};
+  CHECK(ku_task_4_start_value(&blocking_driver,&path,&task)==KU_TASK_DRIVER_OK);
+  CHECK(task.tag==KU_TASK_VALUE_LIVE); return task;
+}
+static void blocking_directory_take(KuTaskValueV1* task,size_t count,const char* code) {
+  CHECK(ku_task_driver_wait_result(&task->ticket,&task->owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==7u && output.value.string_array.ok==(code==NULL));
+  if (code) {
+    KuString got=output.value.string_array.error.code;
+    CHECK(got.len==strlen(code)&&!memcmp(got.ptr,code,got.len));
+  } else {
+    KuArray_str values=output.value.string_array.value;
+    CHECK(values.len==count&&values.capacity>=count);
+    for (size_t i=1;i<values.len;i++) CHECK(ku_fs_path_compare(&values.data[i-1],&values.data[i])<0);
+    CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_4));
+    if (count>64u) {
+      /* Moving a real large listing through another Task exercises the sorted
+       * Start scratch checks, and failed validation must preserve its owner. */
+      KuArray_str original=values; KuTaskValueV1 carried={0};
+      CHECK(ku_task_5_start_value(&blocking_driver,&values,&carried)==KU_TASK_DRIVER_OK&&!values.data);
+      output.value.string_array.value=(KuArray_str){0};
+      CHECK(ku_task_driver_wait_result(&carried.ticket,&carried.owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+      KuTaskAdapterOutcomeV1 copied={0}; CHECK(ku_task_value_take(&carried,NULL,&copied)==KU_TASK_CONTROL_OK);
+      CHECK(copied.value.string_array.ok&&copied.value.string_array.value.data==original.data);
+      ku_task_outcome_drop(&copied); CHECK(ku_task_value_drop(&carried,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+    }
+  }
+  ku_task_outcome_drop(&output);
+}
+static void blocking_directory_values_and_failures(void) {
+  for (unsigned mode=0;mode<3u;mode++) {
+    blocking_setup(2u,2u*1024u*1024u);
+    KuTaskValueV1 task=blocking_directory_start(mode==0 ? "listing" : mode==1 ? "empty" : "missing");
+    blocking_directory_take(&task,mode==0 ? 80u : 0u,mode==2 ? "read_dir_failed" : NULL);
+    blocking_drop(&task); blocking_idle();
+    CHECK(!blocking_driver_snapshot().reserved_bytes&&!blocking_pool_snapshot().resident);
+    blocking_finish(blocking_observation_deadline());
+  }
+  for (size_t fail=0;fail<12u;fail++) {
+    blocking_setup(2u,2u*1024u*1024u); fixture_fail_output_in=fail;
+    KuTaskValueV1 task=blocking_directory_start("listing");
+    blocking_directory_take(&task,0,"out_of_memory"); blocking_drop(&task); blocking_idle();
+    CHECK(!blocking_driver_snapshot().reserved_bytes&&!blocking_pool_snapshot().resident);
+    blocking_finish(blocking_observation_deadline());
+  }
+  blocking_setup(2u,sizeof(KuTaskInstance_4)+256u);
+  KuTaskValueV1 limited=blocking_directory_start("listing");
+  blocking_directory_take(&limited,0,"memory_limit"); blocking_drop(&limited); blocking_idle();
+  CHECK(!blocking_driver_snapshot().reserved_bytes); blocking_finish(blocking_observation_deadline());
+}
+static void blocking_directory_real_wait_and_cancel(void) {
+  blocking_setup(2u,2u*1024u*1024u); fixture_gate_io=1;
+  KuTaskValueV1 task=blocking_directory_start("listing");
+  CHECK(ku_test_event_wait(&fixture_io_entered,2000)); blocking_idle();
+  KuTaskValueV1 tick={0}; CHECK(ku_task_1_start_value(&blocking_driver,&tick)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_wait_result(&tick.ticket,&tick.owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&tick,NULL,&output)==KU_TASK_CONTROL_OK&&output.value.null_value.ok);
+  ku_task_outcome_drop(&output); blocking_drop(&tick);
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  uint64_t deadline=ku_task_driver_now_ms()+30u;
+  KuTaskDriverCleanupReceiptV1 receipt={0};
+  CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK);
+  task=(KuTaskValueV1){0}; blocking_idle();
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+  CHECK(blocking_pool_snapshot().resident==1u&&blocking_driver_snapshot().reserved_bytes>=sizeof(KuTaskInstance_4));
+  CHECK(ku_test_event_set(&fixture_io_release));
+  uint64_t observer=blocking_observation_deadline();
+  CHECK(!ku_task_blocking_lock(&blocking_pool));
+  while (blocking_pool.running||blocking_pool.queued) CHECK(!ku_task_blocking_wait(&blocking_pool,observer));
+  ku_task_blocking_unlock(&blocking_pool); blocking_idle();
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(!blocking_pool_snapshot().resident&&blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_4));
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); blocking_idle();
+  CHECK(!blocking_driver_snapshot().reserved_bytes); blocking_finish(blocking_observation_deadline());
+}
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
   blocking_queue_and_generation(); blocking_late_retirement_keeps_original_deadline();
@@ -2212,6 +2302,7 @@ int main(void) {
   blocking_exists_values_and_infrastructure_errors();
   blocking_exists_real_job_does_not_block_timers_or_hide_queue_errors();
   blocking_exists_cancel_retires_actual_job_with_original_deadline();
+  blocking_directory_values_and_failures(); blocking_directory_real_wait_and_cancel();
   puts("blocking-write-ledger-ok"); return 0;
 }
 "#;
