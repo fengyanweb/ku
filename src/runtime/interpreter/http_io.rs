@@ -3,8 +3,9 @@
 
 use super::{
     encode_http_response, entry_span, finish_http_request, http_deadline, netpoll, parse_http_head,
-    status_response, HttpConnectionPermit, HttpRejection, HttpServerRuntimeLimits,
-    HttpWireResponse, ParsedHttpHead, ParsedHttpRequest, PendingHttpConnection, HTTP_ACCEPT_BATCH,
+    status_response, HttpConnectionPermit, HttpRejection, HttpServerRuntimeLimits, HttpSlowTrace,
+    HttpSlowTraceSample, HttpWireResponse, ParsedHttpHead, ParsedHttpRequest,
+    PendingHttpConnection, HTTP_ACCEPT_BATCH,
 };
 use std::{
     borrow::Cow,
@@ -14,7 +15,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
-        Arc,
+        Arc, OnceLock,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -33,7 +34,6 @@ struct BufferBudget {
     rejected: AtomicUsize,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BufferSnapshot {
     pub(super) current: usize,
@@ -76,7 +76,6 @@ impl BufferBudget {
         }
     }
 
-    #[cfg(test)]
     fn snapshot(&self) -> BufferSnapshot {
         BufferSnapshot {
             current: self.current.load(Ordering::Acquire),
@@ -85,6 +84,367 @@ impl BufferBudget {
             limit: self.limit,
         }
     }
+}
+
+// Producers never perform diagnostic I/O. A single process-wide writer may
+// wait for stderr, but fixed-size try_send events cannot park either HTTP actor.
+// This thread is intentionally not joined: a stopped log consumer must not
+// prevent HTTP teardown. The OS retires this one thread at process exit.
+const TRACE_CHANNEL_CAPACITY: usize = 256;
+const TRACE_TRANSPORT_LINES: usize = 256;
+const TRACE_SNAPSHOT_LINES: usize = 512;
+const TRACE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct HttpTraceSink {
+    sender: SyncSender<HttpTraceEvent>,
+    state: Arc<HttpTraceSinkState>,
+}
+
+struct HttpTraceSinkState {
+    slow: AtomicUsize,
+    transport: AtomicUsize,
+    snapshots: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+impl HttpTraceSink {
+    fn channel() -> (Self, Receiver<HttpTraceEvent>) {
+        let (sender, receiver) = mpsc::sync_channel(TRACE_CHANNEL_CAPACITY);
+        (
+            Self {
+                sender,
+                state: Arc::new(HttpTraceSinkState {
+                    slow: AtomicUsize::new(0),
+                    transport: AtomicUsize::new(0),
+                    snapshots: AtomicUsize::new(0),
+                    dropped: AtomicUsize::new(0),
+                }),
+            },
+            receiver,
+        )
+    }
+
+    fn process() -> Option<Self> {
+        static SINK: OnceLock<Option<HttpTraceSink>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let (sink, receiver) = Self::channel();
+            let mut output = trace_output()?;
+            let state = Arc::clone(&sink.state);
+            thread::Builder::new()
+                .name("ku-http-trace".into())
+                .spawn(move || {
+                    for event in receiver {
+                        // A duplicated OS handle avoids holding std's global
+                        // stderr lock while the downstream consumer is stopped.
+                        if event.write(&mut output).is_err() {
+                            increment(&state.dropped);
+                            break;
+                        }
+                    }
+                })
+                .ok()?;
+            Some(sink)
+        })
+        .clone()
+    }
+
+    fn emit(&self, event: HttpTraceEvent) {
+        let (counter, limit) = match &event {
+            HttpTraceEvent::Slow { .. } => (&self.state.slow, HttpSlowTrace::MAX_LINES),
+            HttpTraceEvent::Transport { .. } => (&self.state.transport, TRACE_TRANSPORT_LINES),
+            HttpTraceEvent::Snapshot { .. } => (&self.state.snapshots, TRACE_SNAPSHOT_LINES),
+        };
+        if counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .is_err()
+        {
+            increment(&self.state.dropped);
+            return;
+        }
+        if self.sender.try_send(event).is_err() {
+            increment(&self.state.dropped);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn trace_output() -> Option<std::fs::File> {
+    use std::os::fd::AsFd;
+    io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(Into::into)
+}
+
+#[cfg(windows)]
+fn trace_output() -> Option<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    io::stderr()
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(Into::into)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trace_output() -> Option<std::fs::File> {
+    None
+}
+
+#[derive(Default)]
+struct HttpTraceCounters {
+    queued: AtomicUsize,
+    // Backing capacities of parsed input payloads retained by queued jobs;
+    // excludes map buckets, user Task heaps and allocator metadata.
+    queued_bytes: AtomicUsize,
+    peak_queued: AtomicUsize,
+    peak_queued_bytes: AtomicUsize,
+    rejected_jobs: AtomicUsize,
+    rejected_connections: AtomicUsize,
+    running: AtomicUsize,
+    completed: AtomicUsize,
+    reactor_expired: AtomicUsize,
+    queue_expired: AtomicUsize,
+    handler_expired: AtomicUsize,
+    write_expired: AtomicUsize,
+    write_failed: AtomicUsize,
+    late_replies: AtomicUsize,
+}
+
+fn increment(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+struct HttpTraceCredit {
+    counters: Arc<HttpTraceCounters>,
+    running: bool,
+    bytes: usize,
+}
+
+impl HttpTraceCredit {
+    fn acquire(counters: &Arc<HttpTraceCounters>, running: bool, bytes: usize) -> Self {
+        let counter = if running {
+            &counters.running
+        } else {
+            &counters.queued
+        };
+        let current = counter.fetch_add(1, Ordering::AcqRel) + 1;
+        if !running {
+            let queued_bytes = counters.queued_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+            counters.peak_queued.fetch_max(current, Ordering::Relaxed);
+            counters
+                .peak_queued_bytes
+                .fetch_max(queued_bytes, Ordering::Relaxed);
+        }
+        Self {
+            counters: Arc::clone(counters),
+            running,
+            bytes,
+        }
+    }
+}
+
+impl Drop for HttpTraceCredit {
+    fn drop(&mut self) {
+        let counter = if self.running {
+            &self.counters.running
+        } else {
+            &self.counters.queued
+        };
+        counter.fetch_sub(1, Ordering::AcqRel);
+        if !self.running {
+            self.counters
+                .queued_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpTraceConfig {
+    threshold: Duration,
+    sink: HttpTraceSink,
+    counters: Arc<HttpTraceCounters>,
+}
+
+impl HttpTraceConfig {
+    fn from_env() -> Option<Self> {
+        let trace = HttpSlowTrace::from_env()?;
+        Some(Self {
+            threshold: trace.threshold,
+            sink: HttpTraceSink::process()?,
+            counters: Arc::new(HttpTraceCounters::default()),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HttpTraceOrigin {
+    Response,
+    QueueExpired,
+    HandlerExpired,
+    ReactorExpired,
+    WriteExpired,
+    WriteFailed,
+    LateReply,
+}
+
+impl HttpTraceOrigin {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Response => "response",
+            Self::QueueExpired => "queue_expired",
+            Self::HandlerExpired => "handler_expired",
+            Self::ReactorExpired => "reactor_handler_expired",
+            Self::WriteExpired => "write_expired",
+            Self::WriteFailed => "write_failed",
+            Self::LateReply => "late_reply",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HttpRequestTrace {
+    id: Option<u64>,
+    token: HttpIoToken,
+    accepted: Option<Instant>,
+    promoted: Option<Instant>,
+    read_started: Option<Instant>,
+    ready: Instant,
+    handler_started: Option<Instant>,
+    handler_finished: Option<Instant>,
+    handler_cpu: Option<Duration>,
+    published: Option<Instant>,
+    observed: Option<Instant>,
+    write_started: Option<Instant>,
+    status: i64,
+    origin: HttpTraceOrigin,
+}
+
+impl HttpRequestTrace {
+    fn emit(self, config: &HttpTraceConfig, origin: HttpTraceOrigin, ended: Instant) {
+        let queue = self
+            .handler_started
+            .map(|at| at.saturating_duration_since(self.ready));
+        let handler = self
+            .handler_started
+            .zip(self.handler_finished)
+            .map(|(start, end)| end.saturating_duration_since(start));
+        let elapsed = ended.saturating_duration_since(self.ready);
+        if origin == HttpTraceOrigin::Response
+            && self.status < 500
+            && queue.is_none_or(|value| value < config.threshold)
+            && handler.is_none_or(|value| value < config.threshold)
+            && elapsed < config.threshold
+        {
+            return;
+        }
+        config.sink.emit(HttpTraceEvent::Transport {
+            trace: self,
+            origin,
+            ended,
+        });
+    }
+}
+
+enum HttpTraceEvent {
+    Slow {
+        token: HttpIoToken,
+        id: Option<u64>,
+        sample: HttpSlowTraceSample,
+        status: i64,
+    },
+    Transport {
+        trace: HttpRequestTrace,
+        origin: HttpTraceOrigin,
+        ended: Instant,
+    },
+    Snapshot {
+        elapsed: Duration,
+        connections: usize,
+        pending: usize,
+        active: usize,
+        headers: usize,
+        bodies: usize,
+        handler_slots: usize,
+        writing: usize,
+        queued: usize,
+        queued_bytes: usize,
+        peak_queued: usize,
+        peak_queued_bytes: usize,
+        rejected_jobs: usize,
+        rejected_connections: usize,
+        running: usize,
+        buffer: BufferSnapshot,
+        completed: usize,
+        reactor_expired: usize,
+        queue_expired: usize,
+        handler_expired: usize,
+        write_expired: usize,
+        write_failed: usize,
+        late_replies: usize,
+        dropped: usize,
+    },
+}
+
+fn trace_number(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+fn trace_micros(value: Option<Duration>) -> String {
+    value
+        .map(|value| value.as_micros().to_string())
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+impl HttpTraceEvent {
+    fn write(&self, output: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Slow { token, id, sample, status } => writeln!(output,
+                "ku_http_slow token={token:?} queue_us={} handler_wall_us={} handler_cpu_us={} status={status} request_id={}",
+                sample.queued.as_micros(), sample.handler_wall.as_micros(), trace_micros(sample.handler_cpu), trace_number(*id)),
+            Self::Transport { trace, origin, ended } => {
+                let since = |end: Option<Instant>, start: Option<Instant>| {
+                    end.zip(start).map(|(end, start)| end.saturating_duration_since(start))
+                };
+                writeln!(output,
+                    "ku_http_transport token={:?} request_id={} origin={} status={} accept_to_slot_us={} read_us={} queue_us={} handler_wall_us={} handler_cpu_us={} publish_attempt_to_observe_us={} response_phase_us={} ready_to_end_us={}",
+                    trace.token, trace_number(trace.id), origin.name(), trace.status,
+                    trace_micros(since(trace.promoted, trace.accepted)),
+                    trace_micros(since(Some(trace.ready), trace.read_started)),
+                    trace_micros(since(trace.handler_started, Some(trace.ready))),
+                    trace_micros(since(trace.handler_finished, trace.handler_started)), trace_micros(trace.handler_cpu),
+                    trace_micros(since(trace.observed, trace.published)),
+                    trace_micros(since(Some(*ended), trace.write_started)),
+                    ended.saturating_duration_since(trace.ready).as_micros())
+            }
+            Self::Snapshot { elapsed, connections, pending, active, headers, bodies,
+                handler_slots, writing, queued, queued_bytes, peak_queued, peak_queued_bytes,
+                rejected_jobs, rejected_connections, running, buffer, completed,
+                reactor_expired, queue_expired, handler_expired, write_expired,
+                write_failed, late_replies, dropped } => writeln!(output,
+                "ku_http_snapshot elapsed_ms={} connections={connections} pending={pending} active={active} headers={headers} bodies={bodies} handler_slots={handler_slots} writing={writing} queued={queued} queued_bytes={queued_bytes} peak_queued={peak_queued} peak_queued_bytes={peak_queued_bytes} rejected_jobs={rejected_jobs} rejected_connections={rejected_connections} running={running} buffer_current={} buffer_peak={} buffer_limit={} buffer_rejected={} completed={completed} reactor_expired={reactor_expired} queue_expired={queue_expired} handler_expired={handler_expired} write_expired={write_expired} write_failed={write_failed} late_replies={late_replies} trace_dropped={dropped}",
+                elapsed.as_millis(), buffer.current, buffer.peak, buffer.limit, buffer.rejected),
+        }
+    }
+}
+
+// A trace identifier is optional numeric metadata, never an arbitrary header
+// value. Invalid bytes, signs, spaces and overflowing decimal input are absent.
+fn request_trace_id(request: &ParsedHttpRequest) -> Option<u64> {
+    let value = request.headers.get("x-ku-trace-id")?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 struct BufferCharge {
@@ -200,6 +560,7 @@ struct Completion {
     token: HttpIoToken,
     // None is the fixed, allocation-free over-budget 503 response.
     response: Option<ChargedResponse>,
+    trace: Option<HttpRequestTrace>,
 }
 
 pub(super) struct HttpIoReply {
@@ -207,10 +568,55 @@ pub(super) struct HttpIoReply {
     sender: SyncSender<Completion>,
     wake: netpoll::WakeSender,
     input_charge: BufferCharge,
+    trace: Option<HttpRequestTrace>,
+    trace_config: Option<HttpTraceConfig>,
+    handler_credit: Option<HttpTraceCredit>,
 }
 
 impl HttpIoReply {
-    pub(super) fn respond(self, token: HttpIoToken, response: HttpWireResponse) -> io::Result<()> {
+    pub(super) fn handler_started(&mut self) {
+        if let (Some(trace), Some(config)) = (&mut self.trace, &self.trace_config) {
+            trace.handler_started = Some(Instant::now());
+            self.handler_credit = Some(HttpTraceCredit::acquire(&config.counters, true, 0));
+        }
+    }
+
+    pub(super) fn handler_finished(
+        &mut self,
+        sample: Option<&HttpSlowTraceSample>,
+        status: i64,
+        origin: HttpTraceOrigin,
+    ) {
+        if let (Some(trace), Some(config)) = (&mut self.trace, &self.trace_config) {
+            trace.handler_finished = Some(Instant::now());
+            trace.handler_cpu = sample.and_then(|sample| sample.handler_cpu);
+            trace.status = status;
+            trace.origin = origin;
+            match origin {
+                HttpTraceOrigin::QueueExpired => increment(&config.counters.queue_expired),
+                HttpTraceOrigin::HandlerExpired => increment(&config.counters.handler_expired),
+                _ => {}
+            }
+        }
+        self.handler_credit = None;
+    }
+
+    pub(super) fn slow_sample(&self, sample: HttpSlowTraceSample, status: i64) {
+        if let (Some(trace), Some(config)) = (&self.trace, &self.trace_config) {
+            config.sink.emit(HttpTraceEvent::Slow {
+                token: self.token,
+                id: trace.id,
+                sample,
+                status,
+            });
+        }
+    }
+
+    pub(super) fn respond(
+        mut self,
+        token: HttpIoToken,
+        response: HttpWireResponse,
+    ) -> io::Result<()> {
         if token != self.token {
             return Err(io::Error::other("HTTP reply token does not match its job"));
         }
@@ -219,12 +625,25 @@ impl HttpIoReply {
         // releases the request charge while this reply owner is still alive.
         drop(self.input_charge);
         let response = ChargedResponse::new(response, &budget);
+        if let Some(trace) = &mut self.trace {
+            trace.published = Some(Instant::now());
+        }
         // One consumed reply owns one initially empty cap-1 channel. A closed
         // receiver means timeout/close already won: dropping the response is
         // the complete late-result path, without touching any socket.
-        match self.sender.try_send(Completion { token, response }) {
+        match self.sender.try_send(Completion {
+            token,
+            response,
+            trace: self.trace,
+        }) {
             Ok(()) => self.wake.notify(),
-            Err(TrySendError::Disconnected(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => {
+                if let (Some(trace), Some(config)) = (self.trace, &self.trace_config) {
+                    increment(&config.counters.late_replies);
+                    trace.emit(config, HttpTraceOrigin::LateReply, Instant::now());
+                }
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => Err(io::Error::other("HTTP reply published twice")),
         }
     }
@@ -235,6 +654,7 @@ pub(super) struct HttpIoJob {
     pub(super) request: ParsedHttpRequest,
     pub(super) deadline: Instant,
     pub(super) reply: HttpIoReply,
+    queued_credit: Option<HttpTraceCredit>,
 }
 
 pub(super) struct HttpIo {
@@ -251,15 +671,33 @@ impl HttpIo {
         listener: TcpListener,
         limits: HttpServerRuntimeLimits,
     ) -> io::Result<Self> {
-        Self::start_with_accept(listener, limits, TcpListener::accept)
+        Self::start_with_accept_and_trace(
+            listener,
+            limits,
+            TcpListener::accept,
+            HttpTraceConfig::from_env(),
+        )
     }
 
     // Keep the real reactor and socket ownership path available to controlled
     // accept-error regressions, without replacing readiness or connection I/O.
+    #[cfg(test)]
     pub(super) fn start_with_accept<F>(
         listener: TcpListener,
         limits: HttpServerRuntimeLimits,
         accept: F,
+    ) -> io::Result<Self>
+    where
+        F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
+    {
+        Self::start_with_accept_and_trace(listener, limits, accept, None)
+    }
+
+    fn start_with_accept_and_trace<F>(
+        listener: TcpListener,
+        limits: HttpServerRuntimeLimits,
+        accept: F,
+        trace: Option<HttpTraceConfig>,
     ) -> io::Result<Self>
     where
         F: FnMut(&TcpListener) -> io::Result<(TcpStream, std::net::SocketAddr)> + Send + 'static,
@@ -270,7 +708,7 @@ impl HttpIo {
         let stop = Arc::new(AtomicBool::new(false));
         let (job_tx, jobs) = mpsc::sync_channel(limits.max_active_requests);
         let budget = BufferBudget::new(limits.max_buffer_bytes);
-        let reactor = Reactor::new(
+        let mut reactor = Reactor::new(
             listener,
             limits,
             job_tx,
@@ -278,6 +716,7 @@ impl HttpIo {
             Arc::clone(&stop),
             Arc::clone(&budget),
         );
+        reactor.trace = trace;
         let thread = thread::Builder::new()
             .name("ku-http-io".into())
             .spawn(move || reactor.run(accept))?;
@@ -306,7 +745,10 @@ impl HttpIo {
             return Err(io::Error::other("HTTP I/O reactor stopped"));
         }
         match self.jobs.recv_timeout(timeout) {
-            Ok(job) => Ok(Some(job)),
+            Ok(mut job) => {
+                job.queued_credit = None;
+                Ok(Some(job))
+            }
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
                 self.join()?;
@@ -356,6 +798,9 @@ struct Reactor {
     rejection_generation: u64,
     accept_retry_deadline: Option<Instant>,
     budget: Arc<BufferBudget>,
+    trace: Option<HttpTraceConfig>,
+    trace_started: Instant,
+    trace_next_snapshot: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -394,7 +839,61 @@ impl Reactor {
             rejection_generation: 0,
             accept_retry_deadline: None,
             budget,
+            trace: None,
+            trace_started: Instant::now(),
+            trace_next_snapshot: Instant::now(),
         }
+    }
+
+    fn trace_snapshot(&mut self, now: Instant) {
+        let Some(config) = &self.trace else {
+            return;
+        };
+        if now < self.trace_next_snapshot {
+            return;
+        }
+        self.trace_next_snapshot = now.checked_add(TRACE_SNAPSHOT_INTERVAL).unwrap_or(now);
+        let mut active = 0;
+        let (mut headers, mut bodies, mut handler_slots, mut writing) = (0, 0, 0, 0);
+        for slot in &self.slots {
+            if let Some(connection) = &slot.connection {
+                active += 1;
+                match connection.state {
+                    State::Header(_) => headers += 1,
+                    State::Body(_) => bodies += 1,
+                    State::Handler { .. } => handler_slots += 1,
+                    State::Write(_) => writing += 1,
+                    State::Request { .. } => {}
+                }
+            }
+        }
+        let counters = &config.counters;
+        config.sink.emit(HttpTraceEvent::Snapshot {
+            elapsed: now.saturating_duration_since(self.trace_started),
+            connections: self.connection_count.load(Ordering::Acquire),
+            pending: self.pending.len(),
+            active,
+            headers,
+            bodies,
+            handler_slots,
+            writing,
+            queued: counters.queued.load(Ordering::Acquire),
+            queued_bytes: counters.queued_bytes.load(Ordering::Acquire),
+            peak_queued: counters.peak_queued.load(Ordering::Relaxed),
+            peak_queued_bytes: counters.peak_queued_bytes.load(Ordering::Relaxed),
+            rejected_jobs: counters.rejected_jobs.load(Ordering::Relaxed),
+            rejected_connections: counters.rejected_connections.load(Ordering::Relaxed),
+            running: counters.running.load(Ordering::Acquire),
+            buffer: self.budget.snapshot(),
+            completed: counters.completed.load(Ordering::Relaxed),
+            reactor_expired: counters.reactor_expired.load(Ordering::Relaxed),
+            queue_expired: counters.queue_expired.load(Ordering::Relaxed),
+            handler_expired: counters.handler_expired.load(Ordering::Relaxed),
+            write_expired: counters.write_expired.load(Ordering::Relaxed),
+            write_failed: counters.write_failed.load(Ordering::Relaxed),
+            late_replies: counters.late_replies.load(Ordering::Relaxed),
+            dropped: config.sink.state.dropped.load(Ordering::Relaxed),
+        });
     }
 
     fn run<F>(mut self, mut accept: F) -> io::Result<()>
@@ -413,6 +912,7 @@ impl Reactor {
             self.promote_pending()?;
             self.advance_buffered_headers();
             self.dispatch_requests()?;
+            self.trace_snapshot(Instant::now());
             if let Some(rejection) = self.rejecting.as_mut() {
                 if rejection.poll() {
                     self.rejecting = None;
@@ -424,7 +924,7 @@ impl Reactor {
 
             let mut interests = Vec::with_capacity(self.slots.len() + 3);
             let mut owners = Vec::with_capacity(self.slots.len() + 3);
-            let mut deadline = None;
+            let mut deadline = self.trace.as_ref().map(|_| self.trace_next_snapshot);
             interests.push(netpoll::Interest {
                 socket: netpoll::Socket::Stream(&self.wake.reader),
                 read: true,
@@ -543,6 +1043,11 @@ impl Reactor {
                             generation: slot.generation,
                         }) =>
                 {
+                    connection.trace = completion.trace.map(|mut trace| {
+                        trace.observed = Some(Instant::now());
+                        trace.write_started = trace.observed;
+                        trace
+                    });
                     Some(completion.response)
                 }
                 Ok(_) | Err(TryRecvError::Disconnected) => Some(ChargedResponse::new(
@@ -617,6 +1122,7 @@ impl Reactor {
                 pending,
                 self.limits,
                 Arc::clone(&self.budget),
+                self.trace.clone(),
             ));
         }
         Ok(())
@@ -641,12 +1147,16 @@ impl Reactor {
                 }
                 Err(error) => return Err(error),
             };
+            let accepted_at = Instant::now();
             stream.set_nonblocking(true)?;
             let permit = HttpConnectionPermit::try_acquire(
                 Arc::clone(&self.connection_count),
                 self.limits.max_connections,
             );
             if permit.is_none() || self.pending.len() >= self.limits.max_pending_requests {
+                if let Some(config) = &self.trace {
+                    increment(&config.counters.rejected_connections);
+                }
                 self.rejection_generation = self
                     .rejection_generation
                     .checked_add(1)
@@ -656,6 +1166,7 @@ impl Reactor {
             }
             self.pending.push_back(PendingHttpConnection {
                 stream,
+                accepted_at,
                 _permit: permit.expect("checked connection permit"),
             });
             self.promote_pending()?;
@@ -686,6 +1197,7 @@ impl Reactor {
                 deadline,
                 carry,
                 input_charge,
+                ready_at,
             } = &mut connection.state
             else {
                 continue;
@@ -703,6 +1215,25 @@ impl Reactor {
                 slot: index,
                 generation: slot.generation,
             };
+            if connection.trace_config.is_some() {
+                connection.trace = Some(HttpRequestTrace {
+                    id: request_trace_id(&request),
+                    token,
+                    accepted: (!connection.reused).then_some(connection.accepted_at),
+                    promoted: (!connection.reused).then_some(connection.promoted_at),
+                    read_started: connection.read_started,
+                    ready: *ready_at,
+                    handler_started: None,
+                    handler_finished: None,
+                    handler_cpu: None,
+                    published: None,
+                    observed: None,
+                    write_started: None,
+                    status: 0,
+                    origin: HttpTraceOrigin::Response,
+                });
+            }
+            let queued_bytes = input_charge.bytes;
             let (sender, receiver) = mpsc::sync_channel(1);
             let job = HttpIoJob {
                 token,
@@ -713,11 +1244,25 @@ impl Reactor {
                     sender,
                     wake: self.wake.sender.clone(),
                     input_charge,
+                    trace: connection.trace,
+                    trace_config: connection.trace_config.clone(),
+                    handler_credit: None,
                 },
+                queued_credit: connection
+                    .trace_config
+                    .as_ref()
+                    .map(|config| HttpTraceCredit::acquire(&config.counters, false, queued_bytes)),
             };
             match self.jobs.try_send(job) {
                 Ok(()) => connection.state = State::Handler { receiver, deadline },
                 Err(TrySendError::Full(_)) => {
+                    if let Some(config) = &connection.trace_config {
+                        increment(&config.counters.rejected_jobs);
+                    }
+                    if let Some(trace) = &mut connection.trace {
+                        trace.status = 503;
+                        trace.write_started = Some(Instant::now());
+                    }
                     connection.state = State::Write(Writing::new(
                         status_response(503, "Service Unavailable"),
                         self.limits.write_timeout,
@@ -778,6 +1323,11 @@ fn tighten_deadline(saved: &mut Option<Instant>, deadline: Option<Instant>) {
 
 struct Connection {
     stream: TcpStream,
+    accepted_at: Instant,
+    promoted_at: Instant,
+    read_started: Option<Instant>,
+    trace: Option<HttpRequestTrace>,
+    trace_config: Option<HttpTraceConfig>,
     _permit: HttpConnectionPermit,
     state: State,
     carry: Buffer,
@@ -794,6 +1344,7 @@ enum State {
         deadline: Instant,
         carry: Buffer,
         input_charge: Option<BufferCharge>,
+        ready_at: Instant,
     },
     Handler {
         receiver: Receiver<Completion>,
@@ -808,6 +1359,7 @@ struct Header {
     eof: bool,
     idle_deadline: Instant,
     header_deadline: Option<Instant>,
+    read_started: Option<Instant>,
 }
 
 struct Body {
@@ -836,6 +1388,13 @@ enum WriteProgress {
 }
 
 impl Writing {
+    fn wire_status(&self) -> i64 {
+        self.head
+            .get(9..12)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(500)
+    }
+
     fn unavailable(timeout: Duration) -> Self {
         Self {
             head: Cow::Borrowed("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 19\r\nconnection: close\r\ncontent-type: text/plain; charset=utf-8\r\n\r\n"),
@@ -950,9 +1509,15 @@ impl Connection {
         pending: PendingHttpConnection,
         limits: HttpServerRuntimeLimits,
         budget: Arc<BufferBudget>,
+        trace_config: Option<HttpTraceConfig>,
     ) -> Self {
         Self {
             stream: pending.stream,
+            accepted_at: pending.accepted_at,
+            promoted_at: Instant::now(),
+            read_started: None,
+            trace: None,
+            trace_config,
             _permit: pending._permit,
             state: State::Header(Header {
                 bytes: Buffer::empty(&budget),
@@ -960,11 +1525,23 @@ impl Connection {
                 eof: false,
                 idle_deadline: http_deadline(limits.idle_timeout),
                 header_deadline: None,
+                read_started: None,
             }),
             carry: Buffer::empty(&budget),
             budget,
             keep_alive: false,
             reused: false,
+        }
+    }
+
+    fn emit_trace(&mut self, origin: HttpTraceOrigin, now: Instant) {
+        if let (Some(mut trace), Some(config)) = (self.trace.take(), &self.trace_config) {
+            if let State::Write(writing) = &self.state {
+                // Admission/encoding can replace an otherwise successful
+                // handler reply with the fixed over-budget response.
+                trace.status = writing.wire_status();
+            }
+            trace.emit(config, origin, now);
         }
     }
 
@@ -992,12 +1569,31 @@ impl Connection {
         }
         let response = match self.state {
             State::Header(_) | State::Body(_) => status_response(408, "Request Timeout"),
-            State::Handler { .. } => status_response(504, "Gateway Timeout"),
-            State::Write(_) => return true,
+            State::Handler { .. } => {
+                if let Some(config) = &self.trace_config {
+                    increment(&config.counters.reactor_expired);
+                    if let Some(trace) = &mut self.trace {
+                        trace.status = 504;
+                        trace.origin = HttpTraceOrigin::ReactorExpired;
+                        trace.emit(config, HttpTraceOrigin::ReactorExpired, now);
+                    }
+                }
+                status_response(504, "Gateway Timeout")
+            }
+            State::Write(_) => {
+                if let Some(config) = &self.trace_config {
+                    increment(&config.counters.write_expired);
+                }
+                self.emit_trace(HttpTraceOrigin::WriteExpired, now);
+                return true;
+            }
             State::Request { .. } => return false,
         };
         self.keep_alive = false;
         self.carry = Buffer::empty(&self.budget);
+        if let Some(trace) = &mut self.trace {
+            trace.write_started = Some(now);
+        }
         self.state = State::Write(Writing::new(
             response,
             limits.write_timeout,
@@ -1014,6 +1610,7 @@ impl Connection {
         let next = match &mut self.state {
             State::Header(header) => {
                 let next = header.poll(&mut self.stream, limits);
+                self.read_started = header.read_started;
                 if self.reused && header.eof {
                     return true;
                 }
@@ -1023,9 +1620,31 @@ impl Connection {
             State::Write(write) => {
                 return match write.poll(&mut self.stream) {
                     WriteProgress::Pending => false,
-                    WriteProgress::Failed => true,
-                    WriteProgress::Complete if !write.keep_alive || !allow_reuse => true,
+                    WriteProgress::Failed => {
+                        if let Some(config) = &self.trace_config {
+                            increment(&config.counters.write_failed);
+                        }
+                        self.emit_trace(HttpTraceOrigin::WriteFailed, Instant::now());
+                        true
+                    }
+                    WriteProgress::Complete if !write.keep_alive || !allow_reuse => {
+                        if let Some(config) = &self.trace_config {
+                            increment(&config.counters.completed);
+                        }
+                        let origin = self
+                            .trace
+                            .map_or(HttpTraceOrigin::Response, |trace| trace.origin);
+                        self.emit_trace(origin, Instant::now());
+                        true
+                    }
                     WriteProgress::Complete => {
+                        if let Some(config) = &self.trace_config {
+                            increment(&config.counters.completed);
+                        }
+                        let origin = self
+                            .trace
+                            .map_or(HttpTraceOrigin::Response, |trace| trace.origin);
+                        self.emit_trace(origin, Instant::now());
                         let bytes = std::mem::replace(&mut self.carry, Buffer::empty(&self.budget));
                         let header_deadline = (!bytes.bytes.is_empty())
                             .then(|| http_deadline(limits.read_header_timeout));
@@ -1035,7 +1654,9 @@ impl Connection {
                             eof: false,
                             idle_deadline: http_deadline(limits.idle_timeout),
                             header_deadline,
+                            read_started: None,
                         });
+                        self.read_started = None;
                         self.reused = true;
                         self.keep_alive = false;
                         false
@@ -1089,6 +1710,9 @@ impl Header {
                 }
                 Err(_) => return Some(Err(status_response(408, "Request Timeout"))),
             };
+            if self.read_started.is_none() {
+                self.read_started = Some(Instant::now());
+            }
             let needed = self.bytes.bytes.len() + read;
             if self.bytes.grow(needed.next_power_of_two()).is_none() {
                 return Some(Err(status_response(503, "Service Unavailable")));
@@ -1163,14 +1787,18 @@ impl Header {
                         charge: body_charge,
                     } = bytes;
                     head_charge.merge(body_charge);
-                    return Some(
-                        finish_http_request(head, body).map(|request| State::Request {
+                    return Some(finish_http_request(head, body).map(|request| {
+                        let ready_at = Instant::now();
+                        State::Request {
                             request: Some(request),
-                            deadline: http_deadline(limits.handler_timeout),
+                            deadline: ready_at
+                                .checked_add(limits.handler_timeout)
+                                .unwrap_or(ready_at),
+                            ready_at,
                             carry: prefix,
                             input_charge: Some(head_charge),
-                        }),
-                    );
+                        }
+                    }));
                 }
                 return Some(Ok(State::Body(Body {
                     head: Some(head),
@@ -1205,11 +1833,17 @@ impl Body {
                     let mut input_charge = self.head_charge.take().expect("one head charge");
                     input_charge.merge(charge);
                     finish_http_request(self.head.take().expect("one body completion"), bytes).map(
-                        |request| State::Request {
-                            request: Some(request),
-                            deadline: http_deadline(self.handler_timeout),
-                            carry: Buffer::empty(&budget),
-                            input_charge: Some(input_charge),
+                        |request| {
+                            let ready_at = Instant::now();
+                            State::Request {
+                                request: Some(request),
+                                deadline: ready_at
+                                    .checked_add(self.handler_timeout)
+                                    .unwrap_or(ready_at),
+                                ready_at,
+                                carry: Buffer::empty(&budget),
+                                input_charge: Some(input_charge),
+                            }
                         },
                     )
                 })
@@ -1230,6 +1864,365 @@ impl Body {
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    fn trace_fixture() -> HttpRequestTrace {
+        let at = Instant::now();
+        HttpRequestTrace {
+            id: Some(u64::MAX),
+            token: HttpIoToken {
+                slot: 7,
+                generation: 42,
+            },
+            accepted: Some(at),
+            promoted: Some(at),
+            read_started: Some(at),
+            ready: at,
+            handler_started: Some(at),
+            handler_finished: Some(at),
+            handler_cpu: Some(Duration::ZERO),
+            published: Some(at),
+            observed: Some(at),
+            write_started: Some(at),
+            status: 200,
+            origin: HttpTraceOrigin::Response,
+        }
+    }
+
+    #[test]
+    fn trace_producers_finish_while_the_actual_writer_is_blocked() {
+        struct BlockedWriter {
+            entered: Option<SyncSender<()>>,
+            release: Receiver<()>,
+        }
+        impl Write for BlockedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (sink, receiver) = HttpTraceSink::channel();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            let mut output = BlockedWriter {
+                entered: Some(entered_tx),
+                release: release_rx,
+            };
+            receiver.recv().unwrap().write(&mut output).unwrap();
+            receiver
+        });
+        sink.emit(HttpTraceEvent::Transport {
+            trace: trace_fixture(),
+            origin: HttpTraceOrigin::WriteFailed,
+            ended: Instant::now(),
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let producer_sink = sink.clone();
+        let producer = thread::spawn(move || {
+            // More attempts than channel and event limits. The caller must
+            // finish while the consumer is still blocked inside Write::write.
+            for _ in 0..TRACE_TRANSPORT_LINES + TRACE_CHANNEL_CAPACITY {
+                producer_sink.emit(HttpTraceEvent::Transport {
+                    trace: trace_fixture(),
+                    origin: HttpTraceOrigin::WriteFailed,
+                    ended: Instant::now(),
+                });
+            }
+            for _ in 0..HttpSlowTrace::MAX_LINES {
+                producer_sink.emit(HttpTraceEvent::Slow {
+                    token: HttpIoToken {
+                        slot: 0,
+                        generation: 1,
+                    },
+                    id: None,
+                    sample: HttpSlowTraceSample {
+                        queued: Duration::ZERO,
+                        handler_wall: Duration::ZERO,
+                        handler_cpu: None,
+                    },
+                    status: 504,
+                });
+            }
+            finished_tx.send(()).unwrap();
+        });
+        let producer_finished = finished_rx.recv_timeout(Duration::from_secs(2));
+        // Always release before assertions so a failure cannot retain a writer.
+        release_tx.send(()).unwrap();
+        let receiver = writer.join().unwrap();
+        if producer_finished.is_err() {
+            drop(receiver);
+            producer.join().unwrap();
+            panic!("diagnostics waited for the blocked writer");
+        }
+        producer.join().unwrap();
+        assert_eq!(
+            sink.state.transport.load(Ordering::Relaxed),
+            TRACE_TRANSPORT_LINES
+        );
+        assert!(sink.state.dropped.load(Ordering::Relaxed) > 0);
+        assert!(receiver.try_iter().count() <= TRACE_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn trace_ids_and_stage_output_only_contain_numeric_metadata() {
+        let mut request = ParsedHttpRequest {
+            keep_alive: false,
+            method: "PRIVATE_METHOD".into(),
+            path: "/PRIVATE_PATH".into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: "PRIVATE_BODY".into(),
+        };
+        for (text, expected) in [
+            ("0", Some(0)),
+            ("18446744073709551615", Some(u64::MAX)),
+            ("18446744073709551616", None),
+            ("-1", None),
+            ("+1", None),
+            ("1\nPRIVATE_HEADER", None),
+            (" 1", None),
+            ("1 ", None),
+            ("", None),
+            ("中文", None),
+        ] {
+            request.headers.insert("x-ku-trace-id".into(), text.into());
+            assert_eq!(request_trace_id(&request), expected);
+        }
+        let mut output = Vec::new();
+        for origin in [
+            HttpTraceOrigin::QueueExpired,
+            HttpTraceOrigin::HandlerExpired,
+            HttpTraceOrigin::ReactorExpired,
+            HttpTraceOrigin::WriteExpired,
+            HttpTraceOrigin::WriteFailed,
+            HttpTraceOrigin::LateReply,
+        ] {
+            HttpTraceEvent::Transport {
+                trace: trace_fixture(),
+                origin,
+                ended: Instant::now(),
+            }
+            .write(&mut output)
+            .unwrap();
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 6);
+        assert!(output.contains("request_id=18446744073709551615"));
+        for field in [
+            "queue_expired",
+            "handler_expired",
+            "reactor_handler_expired",
+            "write_expired",
+            "write_failed",
+            "late_reply",
+            "publish_attempt_to_observe_us=",
+            "response_phase_us=",
+        ] {
+            assert!(output.contains(field));
+        }
+        assert!(!output.contains("PRIVATE"));
+        assert!(!output.contains("中文"));
+    }
+
+    #[test]
+    fn trace_reports_wire_rejection_and_counts_suppressed_events() {
+        let budget = BufferBudget::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (sink, events) = HttpTraceSink::channel();
+        let limits = super::super::finally_tests::http_test_limits();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        let mut connection = Connection::new(
+            PendingHttpConnection {
+                stream,
+                accepted_at: Instant::now(),
+                _permit: permit,
+            },
+            limits,
+            Arc::clone(&budget),
+            Some(HttpTraceConfig {
+                threshold: Duration::from_secs(10),
+                sink: sink.clone(),
+                counters: Arc::new(HttpTraceCounters::default()),
+            }),
+        );
+        connection.trace = Some(trace_fixture());
+        connection.state = State::Write(Writing::new(
+            status_response(200, "ok"),
+            Duration::from_secs(1),
+            false,
+            &budget,
+        ));
+        connection.emit_trace(HttpTraceOrigin::Response, Instant::now());
+        let mut output = Vec::new();
+        events.try_recv().unwrap().write(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("status=503"), "{output}");
+        assert!(!output.contains("status=200"));
+        for _ in 0..TRACE_TRANSPORT_LINES + 1 {
+            sink.emit(HttpTraceEvent::Transport {
+                trace: trace_fixture(),
+                origin: HttpTraceOrigin::WriteFailed,
+                ended: Instant::now(),
+            });
+        }
+        assert!(sink.state.dropped.load(Ordering::Relaxed) >= 2);
+        drop((connection, client));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(budget.snapshot().current, 0);
+    }
+
+    #[test]
+    fn trace_queue_and_running_credits_retire_on_dequeue_and_abandonment() {
+        let counters = Arc::new(HttpTraceCounters::default());
+        let first = HttpTraceCredit::acquire(&counters, false, 120);
+        let second = HttpTraceCredit::acquire(&counters, false, 80);
+        let running = HttpTraceCredit::acquire(&counters, true, 0);
+        assert_eq!(counters.queued.load(Ordering::Acquire), 2);
+        assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 200);
+        drop(first);
+        assert_eq!(counters.queued.load(Ordering::Acquire), 1);
+        assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 80);
+        drop((second, running));
+        assert_eq!(counters.queued.load(Ordering::Acquire), 0);
+        assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(counters.running.load(Ordering::Acquire), 0);
+        assert_eq!(counters.peak_queued.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.peak_queued_bytes.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn traced_real_http_jobs_release_their_queue_bytes_and_late_reply_owners() {
+        let mut limits = super::super::finally_tests::http_test_limits();
+        limits.handler_timeout = Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sink, events) = HttpTraceSink::channel();
+        let counters = Arc::new(HttpTraceCounters::default());
+        let config = HttpTraceConfig {
+            threshold: Duration::ZERO,
+            sink,
+            counters: Arc::clone(&counters),
+        };
+        let mut io = HttpIo::start_with_accept_and_trace(
+            listener,
+            limits,
+            TcpListener::accept,
+            Some(config),
+        )
+        .unwrap();
+        let budget = Arc::clone(&io.budget);
+        let request = |id| {
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(client, "GET /PRIVATE_PATH HTTP/1.1\r\nHost: localhost\r\nx-ku-trace-id: {id}\r\nConnection: close\r\n\r\n").unwrap();
+            client
+        };
+        let mut first = request(42);
+        let mut job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(counters.queued.load(Ordering::Acquire), 0);
+        assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 0);
+        job.reply.handler_started();
+        drop(job.request);
+        assert_eq!(counters.running.load(Ordering::Acquire), 1);
+        job.reply
+            .handler_finished(None, 200, HttpTraceOrigin::Response);
+        job.reply
+            .respond(job.token, status_response(200, "PRIVATE_BODY"))
+            .unwrap();
+        let mut response = String::new();
+        first.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "));
+        assert!(response.ends_with("PRIVATE_BODY"));
+        let mut second = request(99);
+        let mut late = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        // The actual socket owner expires without waiting for the reply owner.
+        response.clear();
+        second.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 504 "));
+        assert_eq!(counters.reactor_expired.load(Ordering::Relaxed), 1);
+        assert!(budget.snapshot().current > 0);
+        late.reply.handler_started();
+        drop(late.request);
+        late.reply
+            .handler_finished(None, 504, HttpTraceOrigin::QueueExpired);
+        late.reply
+            .respond(late.token, status_response(504, "Gateway Timeout"))
+            .unwrap();
+        drop(io);
+        assert_eq!(counters.queued.load(Ordering::Acquire), 0);
+        assert_eq!(counters.queued_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(counters.running.load(Ordering::Acquire), 0);
+        assert_eq!(counters.queue_expired.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.late_replies.load(Ordering::Relaxed), 1);
+        assert_eq!(budget.snapshot().current, 0);
+        assert!(counters.peak_queued_bytes.load(Ordering::Relaxed) > 0);
+        let mut output = Vec::new();
+        for event in events.try_iter() {
+            event.write(&mut output).unwrap();
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("request_id=42 origin=response status=200"));
+        assert!(output.contains("request_id=99 origin=reactor_handler_expired status=504"));
+        assert!(output.contains("request_id=99 origin=late_reply status=504"));
+        assert!(!output.contains("PRIVATE"));
+    }
+
+    #[test]
+    fn trace_snapshots_have_an_independent_finite_allowance_and_show_zero_owners() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let limits = super::super::finally_tests::http_test_limits();
+        let (jobs, _receiver) = mpsc::sync_channel(limits.max_active_requests);
+        let budget = BufferBudget::new(limits.max_buffer_bytes);
+        let mut reactor = Reactor::new(
+            listener,
+            limits,
+            jobs,
+            netpoll::WakePair::new().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&budget),
+        );
+        let (sink, events) = HttpTraceSink::channel();
+        reactor.trace = Some(HttpTraceConfig {
+            threshold: Duration::from_millis(1),
+            sink: sink.clone(),
+            counters: Arc::new(HttpTraceCounters::default()),
+        });
+        let start = Instant::now();
+        let mut output = Vec::new();
+        for index in 0..TRACE_SNAPSHOT_LINES + 2 {
+            reactor.trace_snapshot(start + TRACE_SNAPSHOT_INTERVAL * (index as u32));
+            for event in events.try_iter() {
+                event.write(&mut output).unwrap();
+            }
+        }
+        assert_eq!(
+            sink.state.snapshots.load(Ordering::Relaxed),
+            TRACE_SNAPSHOT_LINES
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), TRACE_SNAPSHOT_LINES);
+        assert!(output
+            .lines()
+            .all(|line| line.contains("connections=0 pending=0 active=0")));
+        assert!(output
+            .lines()
+            .all(|line| line.contains("queued=0 queued_bytes=0")));
+        assert!(output
+            .lines()
+            .all(|line| line.contains("running=0 buffer_current=0")));
+    }
 
     #[test]
     fn failed_growth_preserves_old_credit_and_clear_retains_capacity() {
@@ -1289,10 +2282,12 @@ mod buffer_tests {
         let mut connection = Connection::new(
             PendingHttpConnection {
                 stream: first,
+                accepted_at: Instant::now(),
                 _permit: HttpConnectionPermit::try_acquire(Arc::clone(&count), 2).unwrap(),
             },
             limits,
             Arc::clone(&budget),
+            None,
         );
         connection.reused = true;
         reactor.slots[0].generation = 7;
@@ -1303,6 +2298,7 @@ mod buffer_tests {
         second.set_nonblocking(true).unwrap();
         reactor.pending.push_back(PendingHttpConnection {
             stream: second,
+            accepted_at: Instant::now(),
             _permit: HttpConnectionPermit::try_acquire(Arc::clone(&count), 2).unwrap(),
         });
         reactor.promote_pending().unwrap();

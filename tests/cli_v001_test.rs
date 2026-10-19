@@ -1148,6 +1148,92 @@ fn main(): null! {
     let _ = server.take().expect("server should exist").stop();
 }
 
+#[cfg(unix)]
+#[test]
+fn run_http_slow_trace_does_not_block_on_a_full_stderr_pipe() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import { http, time } from "std"
+fn main(): null! {
+    app = http.server({handler_timeout_ms: 2000, write_timeout_ms: 2000})
+    app.get("/trace", fn() { time.sleep(120); return http.text("trace") })
+    app.get("/health", fn() { return http.text("healthy") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    let path = unique_temp_path("http-blocked-trace");
+    fs::write(&path, source).expect("write bounded trace service");
+    let mut server = Some(KuServerProcess {
+        child: None,
+        stdout: None,
+        stderr: None,
+        source_path: path.clone(),
+    });
+    let mut descriptors = [-1; 2];
+    // A successful pipe transfers two distinct live descriptors to these Files.
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let reader = unsafe { fs::File::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { fs::File::from_raw_fd(descriptors[1]) };
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        // Neither the intentionally unread parent endpoint nor the original
+        // write endpoint may leak across exec; Stdio duplicates the latter.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut filled = 0usize;
+    let fill_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(Instant::now() < fill_deadline, "stderr prefill deadline");
+        match writer.write(&[b'x'; 4096]) {
+            Ok(0) => panic!("pipe stopped making progress without WouldBlock"),
+            Ok(bytes) => {
+                filled += bytes;
+                assert!(filled <= 16 * 1024 * 1024, "pipe prefill is bounded");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("fill actual stderr pipe: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    let child = Command::new(ku_binary())
+        .args(["run", &path_arg(&path)])
+        .env("KU_HTTP_TRACE_SLOW_MS", "50")
+        .current_dir(repo_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .expect("spawn service with blocked stderr");
+    server.as_mut().unwrap().child = Some(child);
+    let request =
+        |path| format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let response = http_response_or_stop(&mut server, &address, &request("/trace"));
+    assert_http_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("trace"));
+    // Receiving the slow reply is the publication barrier. The pipe remains
+    // full: a synchronous logger would now strand the next handler until 504.
+    let response = http_response_or_stop(&mut server, &address, &request("/health"));
+    assert_http_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("healthy"));
+    let _ = server.take().unwrap().stop();
+    drop(reader);
+}
+
 #[test]
 fn run_http_service_enforces_idle_and_handler_timeouts() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

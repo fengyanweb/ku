@@ -156,6 +156,7 @@ struct HttpSlowTraceStart {
     cpu_start: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
 struct HttpSlowTraceSample {
     queued: Duration,
     handler_wall: Duration,
@@ -200,6 +201,7 @@ impl HttpSlowTrace {
                 || sample.handler_wall >= self.threshold)
     }
 
+    #[cfg(test)]
     fn record(
         &mut self,
         token: &impl std::fmt::Debug,
@@ -2691,31 +2693,39 @@ impl Interpreter {
             // Preserve the original termination observation interval. Socket
             // readiness and every connection deadline progress independently on
             // the single I/O thread, including while this handler is running.
-            let Some(job) = io
+            let Some(mut job) = io
                 .next_job(HTTP_EVENT_LOOP_SLEEP)
                 .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
             else {
                 continue;
             };
+            job.reply.handler_started();
             let trace_start = slow_trace
                 .as_ref()
                 .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
-            let response =
-                self.execute_http_handler_job(job.request, &compiled_router, span, job.deadline);
+            let (response, origin) = self.execute_http_handler_job_traced(
+                job.request,
+                &compiled_router,
+                span,
+                job.deadline,
+            );
             let trace_sample = trace_start.map(HttpSlowTraceStart::finish);
             let status = response.status;
+            job.reply
+                .handler_finished(trace_sample.as_ref(), status, origin);
+            if let (Some(trace), Some(sample)) = (&mut slow_trace, trace_sample) {
+                if trace.should_record(&sample, status) {
+                    trace.emitted += 1;
+                    job.reply.slow_sample(sample, status);
+                }
+            }
             job.reply.respond(job.token, response).map_err(|err| {
                 KuError::runtime(format!("http handler reply failed: {err}"), span)
             })?;
-            if let (Some(trace), Some(sample)) = (&mut slow_trace, trace_sample) {
-                if trace.should_record(&sample, status) {
-                    // Publish the response before any diagnostic stderr I/O.
-                    let _ = trace.record(&job.token, sample, status, &mut std::io::stderr().lock());
-                }
-            }
         }
     }
 
+    #[cfg(test)]
     fn execute_http_handler_job(
         &mut self,
         request: ParsedHttpRequest,
@@ -2723,16 +2733,36 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> HttpWireResponse {
+        self.execute_http_handler_job_traced(request, compiled_router, span, deadline)
+            .0
+    }
+
+    fn execute_http_handler_job_traced(
+        &mut self,
+        request: ParsedHttpRequest,
+        compiled_router: &Value,
+        span: Span,
+        deadline: Instant,
+    ) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
+        use http_io::HttpTraceOrigin;
         // Queueing spends the same handler deadline. Do not prepare an expired
         // job or enter its handler/cleanup state after the original deadline.
         if Instant::now() >= deadline {
-            return status_response(504, "Gateway Timeout");
+            return (
+                status_response(504, "Gateway Timeout"),
+                HttpTraceOrigin::QueueExpired,
+            );
         }
         let route = match find_http_route(compiled_router, &request, span) {
             Ok(route) => route,
-            Err(_) => return status_response(500, "Internal Server Error"),
+            Err(_) => {
+                return (
+                    status_response(500, "Internal Server Error"),
+                    HttpTraceOrigin::Response,
+                )
+            }
         };
-        match route {
+        let response = match route {
             RouteLookup::Found(handler, params) => {
                 let req = http_request_value(request, params);
                 match self.call_http_handler(handler, req, span, deadline) {
@@ -2740,14 +2770,18 @@ impl Interpreter {
                         status_response(500, "handler did not return HttpResponse")
                     }),
                     Err(err) if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE => {
-                        status_response(504, "Gateway Timeout")
+                        return (
+                            status_response(504, "Gateway Timeout"),
+                            HttpTraceOrigin::HandlerExpired,
+                        );
                     }
                     Err(_) => status_response(500, "Internal Server Error"),
                 }
             }
             RouteLookup::MethodNotAllowed => status_response(405, "Method Not Allowed"),
             RouteLookup::NotFound => status_response(404, "Not Found"),
-        }
+        };
+        (response, HttpTraceOrigin::Response)
     }
 
     fn call_http_handler(
@@ -3391,7 +3425,7 @@ mod finally_tests {
         (client, server)
     }
 
-    fn http_test_limits() -> HttpServerRuntimeLimits {
+    pub(super) fn http_test_limits() -> HttpServerRuntimeLimits {
         HttpServerRuntimeLimits {
             read_header_timeout: Duration::from_secs(1),
             read_body_timeout: Duration::from_secs(1),
@@ -5303,6 +5337,7 @@ impl Drop for HttpConnectionPermit {
 
 struct PendingHttpConnection {
     stream: TcpStream,
+    accepted_at: Instant,
     _permit: HttpConnectionPermit,
 }
 
