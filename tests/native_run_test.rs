@@ -784,10 +784,11 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
 static int ku_http_fixture_zero(void) {
   return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
 }
-static int ku_http_fixture_read_case(KuHttpWake* wake, int kind, unsigned long long now) {
+static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budget, int kind, unsigned long long now) {
   KuHttpQueue queue;
   if (!ku_http_queue_init(&queue, 1, wake)) return 0;
   KuHttpServer server = {0};
+  server.buffer_budget = budget;
   server.max_header_bytes = 1024;
   server.max_body_bytes = 1024;
   server.idle_timeout_ms = 333;
@@ -818,6 +819,17 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, int kind, unsigned long l
     }
     ku_http_fixture_received_length = strlen(ku_http_fixture_received);
   } else {
+    connection.budget = budget;
+    connection.input.budget = budget;
+    /* Match the real parser's retained body and target backing owners. */
+    if (!ku_http_buffer_reserve(budget, 6)) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    connection.input.body_charge = 2;
+    connection.input.metadata_charge = 4;
     connection.phase = KU_HTTP_IO_BODY;
     memcpy(connection.input.method, "POST", 5);
     connection.input.target = ku_string_to_cstr(ku_string_static((const uint8_t*)"/ok", 3));
@@ -875,10 +887,11 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, int kind, unsigned long l
   const int retired = queue.count == 0 && ku_http_queue_resident(&queue) == 0;
   ku_http_queue_free(&queue);
   const int zero = ku_http_fixture_zero();
-  if (!passed || !retired || !zero) {
+  const int budget_zero = budget->current == 0;
+  if (!passed || !retired || !zero || !budget_zero) {
     fprintf(stderr,
-      "HTTP original read deadline failed after cleanup: kind=%d now=%llu phase=%d status=%lld recv_calls=%zu retired=%d allocations_zero=%d\n",
-      kind, now, observed_phase, (long long)observed_status, observed_calls, retired, zero);
+      "HTTP original read deadline failed after cleanup: kind=%d now=%llu phase=%d status=%lld recv_calls=%zu retired=%d allocations_zero=%d budget_zero=%d\n",
+      kind, now, observed_phase, (long long)observed_status, observed_calls, retired, zero, budget_zero);
     return 0;
   }
   return 1;
@@ -887,14 +900,27 @@ int main(void) {
   if (ku_http_net_init() != 0) return 20;
   KuHttpWake wake;
   if (!ku_http_wake_init(&wake)) { ku_http_net_cleanup(); return 21; }
+  KuHttpBufferBudget budget = {0};
+  budget.limit = 65536;
+  if (!ku_http_mutex_init(&budget.lock)) {
+    ku_http_wake_close(&wake);
+    ku_http_net_cleanup();
+    return 23;
+  }
   int passed = 1;
   for (int kind = 0; kind < 3; kind++) {
     for (unsigned long long now = 99; now <= 101; now++) {
-      if (!ku_http_fixture_read_case(&wake, kind, now)) passed = 0;
+      if (!ku_http_fixture_read_case(&wake, &budget, kind, now)) passed = 0;
     }
   }
+  const int budget_zero = budget.current == 0;
+  ku_http_mutex_destroy(&budget.lock);
   ku_http_wake_close(&wake);
   ku_http_net_cleanup();
+  if (!budget_zero) {
+    fputs("HTTP original read deadline fixture retained buffer credits\n", stderr);
+    return 24;
+  }
   if (!ku_http_fixture_zero()) {
     fputs("HTTP original read deadline fixture retained allocations\n", stderr);
     return 22;

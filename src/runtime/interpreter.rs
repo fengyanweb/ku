@@ -144,6 +144,125 @@ impl HttpHandlerDeadline {
     }
 }
 
+// Opt-in, bounded timing only. Request fields never enter this diagnostic.
+struct HttpSlowTrace {
+    threshold: Duration,
+    emitted: usize,
+}
+
+struct HttpSlowTraceStart {
+    start: Instant,
+    queued: Duration,
+    cpu_start: Option<Duration>,
+}
+
+struct HttpSlowTraceSample {
+    queued: Duration,
+    handler_wall: Duration,
+    handler_cpu: Option<Duration>,
+}
+
+impl HttpSlowTrace {
+    const MAX_LINES: usize = 128;
+
+    fn from_threshold_ms(value: Option<&str>) -> Option<Self> {
+        let millis = value?.parse::<u64>().ok().filter(|millis| *millis > 0)?;
+        Some(Self {
+            threshold: Duration::from_millis(millis),
+            emitted: 0,
+        })
+    }
+
+    fn from_env() -> Option<Self> {
+        Self::from_threshold_ms(std::env::var("KU_HTTP_TRACE_SLOW_MS").ok().as_deref())
+    }
+
+    fn begin(&self, deadline: Instant, handler_timeout: Duration) -> Option<HttpSlowTraceStart> {
+        if self.emitted >= Self::MAX_LINES {
+            return None;
+        }
+        let start = Instant::now();
+        let queued = deadline
+            .checked_sub(handler_timeout)
+            .map(|created| start.saturating_duration_since(created))
+            .unwrap_or_default();
+        Some(HttpSlowTraceStart {
+            start,
+            queued,
+            cpu_start: http_handler_thread_cpu_time(),
+        })
+    }
+
+    fn should_record(&self, sample: &HttpSlowTraceSample, status: i64) -> bool {
+        self.emitted < Self::MAX_LINES
+            && (status == 504
+                || sample.queued >= self.threshold
+                || sample.handler_wall >= self.threshold)
+    }
+
+    fn record(
+        &mut self,
+        token: &impl std::fmt::Debug,
+        sample: HttpSlowTraceSample,
+        status: i64,
+        output: &mut impl Write,
+    ) -> std::io::Result<()> {
+        if !self.should_record(&sample, status) {
+            return Ok(());
+        }
+        // Limit attempts too: a broken stderr must not cause unbounded retries.
+        self.emitted += 1;
+        let cpu_us = sample
+            .handler_cpu
+            .map(|cpu| cpu.as_micros().to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        writeln!(
+            output,
+            "ku_http_slow token={token:?} queue_us={} handler_wall_us={} handler_cpu_us={} status={status}",
+            sample.queued.as_micros(),
+            sample.handler_wall.as_micros(),
+            cpu_us,
+        )
+    }
+}
+
+impl HttpSlowTraceStart {
+    fn finish(self) -> HttpSlowTraceSample {
+        let handler_wall = self.start.elapsed();
+        let handler_cpu = self.cpu_start.and_then(|start| {
+            http_handler_thread_cpu_time().and_then(|end| end.checked_sub(start))
+        });
+        HttpSlowTraceSample {
+            queued: self.queued,
+            handler_wall,
+            handler_cpu,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn http_handler_thread_cpu_time() -> Option<Duration> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // The OS writes only the initialized local timespec. This clock measures
+    // the handler's current thread, independently of socket-owner CPU time.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) };
+    if result != 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(value.tv_sec).ok()?,
+        u32::try_from(value.tv_nsec).ok()?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn http_handler_thread_cpu_time() -> Option<Duration> {
+    None
+}
+
 struct FunctionValueCall<'a> {
     params: &'a [String],
     param_modes: &'a [ParamMode],
@@ -2563,6 +2682,7 @@ impl Interpreter {
             .ok_or_else(|| KuError::runtime("http listener missing compiled_router", span))?;
         let limits = HttpServerRuntimeLimits::from_service(&service, span)?;
         let tcp = take_http_listener(listener_id, span)?;
+        let mut slow_trace = HttpSlowTrace::from_env();
         let mut io = http_io::HttpIo::start(tcp, limits).map_err(|err| {
             KuError::runtime(format!("http I/O reactor setup failed: {err}"), span)
         })?;
@@ -2577,11 +2697,22 @@ impl Interpreter {
             else {
                 continue;
             };
+            let trace_start = slow_trace
+                .as_ref()
+                .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
             let response =
                 self.execute_http_handler_job(job.request, &compiled_router, span, job.deadline);
+            let trace_sample = trace_start.map(HttpSlowTraceStart::finish);
+            let status = response.status;
             job.reply.respond(job.token, response).map_err(|err| {
                 KuError::runtime(format!("http handler reply failed: {err}"), span)
             })?;
+            if let (Some(trace), Some(sample)) = (&mut slow_trace, trace_sample) {
+                if trace.should_record(&sample, status) {
+                    // Publish the response before any diagnostic stderr I/O.
+                    let _ = trace.record(&job.token, sample, status, &mut std::io::stderr().lock());
+                }
+            }
         }
     }
 
@@ -3177,6 +3308,77 @@ mod finally_tests {
         assert_map_entry(fields, "headers", "x-title", "中文🙂", header_buffers);
         assert_map_entry(fields, "params", "id", "参数🙂", param_buffers);
         drop(value);
+    }
+
+    #[test]
+    fn interpreter_http_slow_trace_is_opt_in_and_checks_thresholds() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("abc"),
+            Some("1.5"),
+        ] {
+            assert!(HttpSlowTrace::from_threshold_ms(value).is_none());
+        }
+        let mut trace = HttpSlowTrace::from_threshold_ms(Some("5")).unwrap();
+        let sample = |queued, handler_wall| HttpSlowTraceSample {
+            queued: Duration::from_micros(queued),
+            handler_wall: Duration::from_micros(handler_wall),
+            handler_cpu: Some(Duration::from_micros(21)),
+        };
+        let mut output = Vec::new();
+        trace
+            .record(&(7usize, 42u64), sample(4_999, 4_999), 200, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+        trace
+            .record(&(7usize, 42u64), sample(0, 5_000), 200, &mut output)
+            .unwrap();
+        trace
+            .record(&(7usize, 42u64), sample(5_000, 0), 200, &mut output)
+            .unwrap();
+        trace
+            .record(&(7usize, 42u64), sample(0, 1), 504, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 3);
+        assert!(output.contains("queue_us=0 handler_wall_us=5000 handler_cpu_us=21 status=200"));
+        assert!(output.contains("queue_us=5000 handler_wall_us=0 handler_cpu_us=21 status=200"));
+        assert!(output.contains("queue_us=0 handler_wall_us=1 handler_cpu_us=21 status=504"));
+    }
+
+    #[test]
+    fn interpreter_http_slow_trace_is_bounded_and_only_formats_numeric_metadata() {
+        let mut trace = HttpSlowTrace::from_threshold_ms(Some("1")).unwrap();
+        let mut output = Vec::new();
+        for _ in 0..=HttpSlowTrace::MAX_LINES {
+            trace
+                .record(
+                    &(7usize, 42u64),
+                    HttpSlowTraceSample {
+                        queued: Duration::from_micros(2),
+                        handler_wall: Duration::from_micros(3),
+                        handler_cpu: None,
+                    },
+                    504,
+                    &mut output,
+                )
+                .unwrap();
+        }
+        assert_eq!(trace.emitted, HttpSlowTrace::MAX_LINES);
+        assert!(trace
+            .begin(Instant::now(), Duration::from_secs(1))
+            .is_none());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), HttpSlowTrace::MAX_LINES);
+        for line in output.lines() {
+            assert_eq!(line, "ku_http_slow token=(7, 42) queue_us=2 handler_wall_us=3 handler_cpu_us=unavailable status=504");
+            for payload_field in ["path", "url", "body", "header", "credential"] {
+                assert!(!line.contains(payload_field));
+            }
+        }
     }
 
     fn http_test_pair() -> (TcpStream, TcpStream) {
