@@ -21,7 +21,7 @@ fn main(): null! {
 }
 ```
 
-`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。
+`fs.read/write` 返回 Result；`try_read/try_write` 是保留的同类型兼容别名。`fs.read_dir(path): [str]!` 返回排序后的目录路径，最多10000项、路径文本合计1000000字节。受限 native Task 的 read/try_read、write/try_write、exists 与 read_dir 已通过固定后台池挂起恢复；路径和结果分配计入原 Task 字节预算，取消后的真实 job 退出与结果释放完成才退款。native Task 局部 TCP connect/read/write/close 也经同一池挂起恢复，另支持局部 bytes 操作；内联配置沿用既有键，句柄/bytes 不作为 Task 参数或结果。DNS 不能强制中断，TLS pending/库内部和系统资源仍不计费。
 
 ## string
 
@@ -30,15 +30,24 @@ fn main(): null! {
 ## json
 
 ```ku
+import json from "std.json"
+
 fn main(): null! {
-    value = json.parse("{\"name\":\"Ku\"}")?
-    text = json.stringify(value)?
-    println(text)
+    value = { name: "中文😀", count: 7, active: true, absent: null, items: [[1, 2], [3]] }
+    text = json.encode(value)?
+    decoded = json.decode(text)?
+    println(decoded["name"]?.as_str()?)
+    println(decoded["count"]?.as_int()? + 1)
+    println(json.encode(value)?)
     return ok(null)
 }
 ```
 
-`json.parse` 返回 `KuValue!`，支持 JSON object、array 和标量值。`json.stringify` 返回 `str!`；`json.try_parse` 是 `json.parse` 的同类型兼容别名。
+`json.encode(&value:any): str!` 只读输入，默认紧凑输出；`json.decode(text:str): KuValue!` 返回自持有的 Ku 字符串、数组和对象，不引用输入的临时存储，可以继续索引、显式转换和运算。`stringify` 与 `encode`、`parse/try_parse` 与 `decode` 分别共用入口，旧接口继续兼容。
+
+当前底层恢复 Ku 原有的直接解析与编码实现。支持中文、emoji、转义与内嵌 NUL；对象键稳定排序，重复键解码保留最后一个值。整数严格限于 signed 64-bit，越界不会转成 float；float 使用有限 binary64，保持 Ku 最短固定小数输出；仅当该文本不含小数点/指数且超出 int64 范围时追加 `.0`，例如 `1e20` 输出 `100000000000000000000.0`，可再次解码为同一个 binary64 值。范围内的 float `1.0` 仍输出 `1`，`-0.0` 仍输出 `-0`；不承诺保留 float 标签或负零符号。追加 `.0` 同样计入输出上限。NaN、Infinity、函数、Task、资源句柄等返回错误。
+
+默认严格 JSON，错误为 `Err(Error)`，使用 `?` 或 `try/catch`；解析消息包含从 0 开始的 UTF-8 `byte N`。输入、输出各限 1,000,000 字节；深度预算为 32，保留 33 层空容器允许、34 层拒绝的旧边界。解释器、默认打包 runner、同步 native C 已接入；受限 native Task 子集与 LLVM 不支持 JSON。完整规则见 仓库 `docs/syntax.md` 的 JSON 接口章节，正常及错误处理示例见仓库 `examples/json.ku`。
 
 ## time
 
@@ -213,11 +222,12 @@ app = http.server({
     max_header_bytes: 16384,
     max_connections: 1024,
     max_active_requests: 256,
-    max_pending_requests: 1024
+    max_pending_requests: 1024,
+    max_buffer_bytes: 67108864
 })
 ```
 
-`http.service` / `http.server` 不再作为属性式默认对象运行。配置字段只有 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`；未知字段会被拒绝。
+`http.service` / `http.server` 不再作为属性式默认对象运行。配置字段只有 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`、`max_buffer_bytes`；未知字段会被拒绝。
 
 路由参数固定使用 `/user/{id}`，不支持 `:id`。删除路由固定调用 `del`，不提供 `delete` 别名：
 
@@ -246,6 +256,10 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 ```
 
 HTTP server 有连接上限、active/pending 背压、handler timeout、idle timeout、header/body/write timeout；队列满或连接超限会立即返回 503，不无限排队。
+
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+
+`max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
 
 响应 helper 支持默认状态码和显式状态码：
 

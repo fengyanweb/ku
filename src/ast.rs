@@ -1,5 +1,9 @@
 use crate::span::Span;
 
+mod compiled;
+mod match_pattern;
+pub(crate) use compiled::{reject_compiled_async, reject_compiled_async_expression};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
@@ -316,7 +320,6 @@ pub struct MatchArm {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 pub enum MatchPattern {
     Wildcard,
     Binding(String),

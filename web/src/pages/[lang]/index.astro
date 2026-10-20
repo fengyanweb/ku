@@ -1,0 +1,248 @@
+---
+import Website from '../../layouts/Website.astro';
+import { Code } from 'astro:components';
+import kuGrammar from '../../data/grammar';
+import hello from '../../../../examples/hello.ku?raw';
+import { project } from '../../data/site';
+import { locales, translate, type Locale } from '../../i18n/locales';
+export function getStaticPaths() {
+  return locales.map((lang) => ({ params: { lang } }));
+}
+const lang = Astro.params.lang as Locale;
+const t = translate(lang);
+const json =
+  'import json from "std.json"\n\nfn main(): null! {\n    message = { language: "Ku", hello: "world" }\n    text = json.stringify(message)?\n    println(text)\n    return ok(null)\n}';
+const resourceLabels = [
+  '01 / START',
+  '02 / LEARN',
+  '03 / BUILD',
+  '04 / UNDERSTAND',
+];
+---
+
+<Website locale={lang} title={t.siteTitle} description={t.siteDescription}>
+  <section class="hero shell" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <a class="release-pill" href={`/${lang}/releases/`}>
+        <span class="status-dot"></span>
+        <bdi>v{project.version}</bdi>
+        <span class="pill-divider">/</span>
+        {t.development}
+        <span aria-hidden="true">↗</span>
+      </a>
+      <p class="eyebrow" dir="ltr">
+        THE KU PROGRAMMING LANGUAGE
+      </p>
+      <h1 id="hero-title">
+        {t.heroTitle[0]}
+        <br />
+        {t.heroTitle[1] + ' '}
+        <span class="ku-highlight">{t.heroTitle[2]}</span>
+      </h1>
+      <p class="hero-description">{t.heroDescription}</p>
+      <div class="hero-actions">
+        <a
+          class="button button-primary"
+          href={`/${lang}/docs/getting-started/`}
+        >
+          {t.start}
+          <span aria-hidden="true">↗</span>
+        </a>
+        <a class="text-link" href={`/${lang}/docs/guide/language/`}>
+          {t.explore}
+          <span aria-hidden="true">→</span>
+        </a>
+      </div>
+      <p class="hero-note">
+        <span class="tiny-cross">+</span>
+        {t.heroNote}
+      </p>
+    </div>
+    <div class="hero-code-area" dir="ltr">
+      <div class="code-margin">
+        <span>LESS CEREMONY.</span>
+        <span>MORE EXPRESSION.</span>
+      </div>
+      <div class="editor-window">
+        <div class="editor-bar">
+          <div class="window-dots">
+            <i></i>
+            <i></i>
+            <i></i>
+          </div>
+          <span>hello.ku</span>
+          <span class="file-type">KU</span>
+        </div>
+        <div class="hero-source">
+          <span class="line-numbers" aria-hidden="true">
+            1<br />2<br />3
+          </span>
+          <Code
+            code={hello.trim()}
+            lang={kuGrammar}
+            themes={{ light: 'github-light', dark: 'github-dark' }}
+          />
+        </div>
+        <div class="terminal">
+          <div class="terminal-caption">
+            <span>TERMINAL</span>
+            <span>●</span>
+          </div>
+          <p>
+            <span class="terminal-prompt">❯</span> ku run hello.ku
+          </p>
+          <p class="terminal-output">
+            Hello Ku<span class="cursor" aria-hidden="true"></span>
+          </p>
+        </div>
+        <div class="editor-foot">
+          <span>
+            <span class="status-dot"></span>
+            {t.interpreter}
+          </span>
+          <a href={`${project.repository}/blob/v0.0.18/examples/hello.ku`}>
+            {t.viewSource} ↗
+          </a>
+        </div>
+      </div>
+      <div class="code-sticker" aria-hidden="true">
+        <span>{'{ }'}</span>
+        <small>
+          small language.
+          <br />
+          real possibilities.
+        </small>
+      </div>
+    </div>
+  </section>
+  <div class="principle-strip">
+    <div class="shell">
+      <span dir="ltr">SMALL LANGUAGE. CLEAR INTENT.</span>
+      <span>{t.principle}</span>
+      <span aria-hidden="true">↙</span>
+    </div>
+  </div>
+  <section class="approach shell" aria-labelledby="approach-title">
+    <div class="section-heading">
+      <p class="eyebrow" dir="ltr">
+        01 — THE APPROACH
+      </p>
+      <h2 id="approach-title">
+        {t.approachTitle[0]}
+        <br /> {t.approachTitle[1]}
+      </h2>
+      <p>{t.approachDescription}</p>
+    </div>
+    <div class="feature-list">
+      {t.features.map(([title, description, label, href], index) => (
+        <article>
+          <span class="feature-number" dir="ltr">
+            {String(index + 1).padStart(2, '0')}
+          </span>
+          <div>
+            <h3>{title}</h3>
+            <p>{description}</p>
+            <a class="text-link" href={`/${lang}/${href}/`}>
+              {label}
+              <span aria-hidden="true">→</span>
+            </a>
+          </div>
+        </article>
+      ))}
+    </div>
+  </section>
+  <section class="in-practice shell" aria-labelledby="practice-title">
+    <div class="practice-copy">
+      <p class="eyebrow" dir="ltr">
+        02 — IN PRACTICE
+      </p>
+      <h2 id="practice-title">
+        {t.practiceTitle[0]}
+        <br /> {t.practiceTitle[1]}
+      </h2>
+      <p>{t.practiceDescription}</p>
+      <a class="text-link" href={`/${lang}/docs/stdlib/json/`}>
+        {t.jsonReference}
+        <span aria-hidden="true">→</span>
+      </a>
+      <div class="example-note">{t.exampleNote}</div>
+    </div>
+    <div class="example-panel" dir="ltr">
+      <div class="example-caption">
+        <span>json.ku</span>
+        <button data-copy-json aria-label={t.copyExample}>
+          {t.copy} ⧉
+        </button>
+      </div>
+      <Code
+        code={json}
+        lang={kuGrammar}
+        themes={{ light: 'github-light', dark: 'github-dark' }}
+      />
+      <div class="example-result">
+        <span>OUTPUT</span>
+        <code>{'{"hello":"world","language":"Ku"}'}</code>
+      </div>
+    </div>
+  </section>
+  <section class="learn-section shell" aria-labelledby="learn-title">
+    <div class="learn-heading">
+      <div>
+        <p class="eyebrow" dir="ltr">
+          03 — FIND YOUR WAY
+        </p>
+        <h2 id="learn-title">{t.learnTitle}</h2>
+      </div>
+      <a class="text-link" href={`/${lang}/docs/install/`}>
+        {t.install}
+        <span aria-hidden="true">↗</span>
+      </a>
+    </div>
+    <div class="resource-grid">
+      {t.resources.map(([title, description, href], index) => (
+        <a class="resource-link" href={`/${lang}/${href}/`}>
+          <span class="resource-eyebrow" dir="ltr">
+            {resourceLabels[index]}
+          </span>
+          <h3>{title}</h3>
+          <p>{description}</p>
+          <span class="resource-arrow" aria-hidden="true">
+            ↗
+          </span>
+        </a>
+      ))}
+    </div>
+  </section>
+  <section class="project-section shell">
+    <div class="project-panel">
+      <div class="project-mark" aria-hidden="true" dir="ltr">
+        ku<span>.</span>
+      </div>
+      <div>
+        <p class="eyebrow" dir="ltr">
+          BUILDING WITH CARE, STILL IN PROGRESS
+        </p>
+        <h2>{t.projectTitle}</h2>
+        <p>{t.projectDescription}</p>
+        <div class="project-actions">
+          <a href={project.repository}>{t.github} ↗</a>
+          <a href={`/${lang}/releases/`}>{t.releases} →</a>
+        </div>
+        <small>{t.license}</small>
+      </div>
+    </div>
+  </section>
+  <script define:vars={{ json, copied: t.copied, fallback: t.copyFallback }}>
+    document
+      .querySelector('[data-copy-json]')
+      ?.addEventListener('click', async (event) => {
+        const button = event.currentTarget;
+        try {
+          await navigator.clipboard.writeText(json);
+          button.textContent = copied;
+        } catch {
+          button.textContent = fallback;
+        }
+      });
+  </script>
+</Website>

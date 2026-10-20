@@ -67,11 +67,13 @@ fn borrow_interpreter_json_stringify_and_sync_borrow_inside_async() {
         r#"
         import { json } from "std"
         fn encode(&value): str! { return json.stringify(value) }
+        fn encode_alias(&value): str! { return json.encode(value) }
         fn copy(&text: str): str { return text.clone() }
         async fn worker(text: str): str! { return ok(copy(text)) }
         async fn main(): null! {
             value = { name: "Ku", items: [1, 2] }
             text = encode(value)?
+            if (text != encode_alias(value)? || text != json.encode(value)?) { panic "JSON alias borrow" }
             if (!text.contains("Ku")) { panic "json" }
             println(value)
             result = (await worker("Ku"))?

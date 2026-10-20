@@ -90,11 +90,13 @@ pub(crate) fn borrow_roots_created() -> usize {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum BorrowProjection {
+pub(crate) enum ValueProjection {
     Field(String),
     Index(usize),
     EnumField(usize),
 }
+
+pub(crate) type BorrowProjection = ValueProjection;
 
 impl BorrowedValue {
     pub(crate) fn new(root: &Arc<Value>) -> Self {
@@ -106,6 +108,10 @@ impl BorrowedValue {
             owner_thread: std::thread::current().id(),
             owner_task_id: crate::runtime::task::current_task_id(),
         }
+    }
+
+    pub(crate) fn is_root_view(&self) -> bool {
+        self.path.is_empty()
     }
 
     pub(crate) fn is_current_owner(&self) -> bool {
@@ -130,6 +136,34 @@ impl BorrowedValue {
     ) -> KuResult<T> {
         self.check_owner(span)?;
         self.read_root(span, read)
+    }
+
+    /// Read another projection while the original weak root and owner checks
+    /// remain active. Match traversal keeps one shared relative path instead
+    /// of cloning a longer BorrowedValue for every ancestor.
+    pub(crate) fn with_projection_read<T>(
+        &self,
+        path: &[ValueProjection],
+        span: Span,
+        read: impl FnOnce(&Value) -> KuResult<T>,
+    ) -> KuResult<T> {
+        self.with_read(span, |mut value| {
+            for projection in path {
+                value = match (projection, value) {
+                    (
+                        ValueProjection::Field(name),
+                        Value::Object(fields) | Value::Struct { fields, .. },
+                    ) => fields.get(name),
+                    (ValueProjection::Index(index), Value::Array(values)) => values.get(*index),
+                    (ValueProjection::EnumField(index), Value::Enum { fields, .. }) => {
+                        fields.get(*index)
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| KuError::runtime("invalid borrowed projection", span))?;
+            }
+            read(value)
+        })
     }
 
     /// Only Env may use this for an ordinary read of the caller's owned source
@@ -177,6 +211,152 @@ impl BorrowedValue {
 }
 
 impl Value {
+    /// Inspect only values owned by this container. Closure capture environments
+    /// and weak borrowed roots are not descendants of its ownership tree.
+    /// Iterators keep scratch space proportional to depth, not array width.
+    fn visit_owned_values(
+        &self,
+        span: Span,
+        visit: impl FnMut(&Value) -> KuResult<bool>,
+    ) -> KuResult<bool> {
+        // Match the interpreter's existing continuation-work backing budget.
+        // Only traversal scratch is charged here, not the borrowed Value tree.
+        self.visit_owned_values_with_budget(span, 2 * 1024 * 1024, visit)
+    }
+
+    fn visit_owned_values_with_budget(
+        &self,
+        span: Span,
+        scratch_bytes: usize,
+        mut visit: impl FnMut(&Value) -> KuResult<bool>,
+    ) -> KuResult<bool> {
+        let mut ancestors: Vec<OwnedValueChildren<'_>> = Vec::new();
+        let mut next = Some(self);
+        loop {
+            if let Some(value) = next.take() {
+                if visit(value)? {
+                    return Ok(true);
+                }
+                if let Some(mut children) = OwnedValueChildren::of(value) {
+                    if let Some(child) = children.next() {
+                        reserve_value_ancestor(&mut ancestors, scratch_bytes, span)?;
+                        ancestors.push(children);
+                        next = Some(child);
+                        continue;
+                    }
+                }
+            }
+            while let Some(children) = ancestors.last_mut() {
+                if let Some(child) = children.next() {
+                    next = Some(child);
+                    break;
+                }
+                ancestors.pop();
+            }
+            if next.is_none() {
+                return Ok(false);
+            }
+        }
+    }
+
+    pub(crate) fn contains_owned_task(&self, span: Span) -> KuResult<bool> {
+        self.visit_owned_values(span, |value| Ok(matches!(value, Value::Task(_))))
+    }
+
+    pub(crate) fn collect_owned_tasks(
+        &self,
+        tasks: &mut Vec<TaskHandle>,
+        span: Span,
+    ) -> KuResult<()> {
+        self.visit_owned_values(span, |value| {
+            if let Value::Task(task) = value {
+                tasks.try_reserve(1).map_err(|_| {
+                    KuError::runtime("task ownership collection out of memory", span)
+                })?;
+                tasks.push(task.clone());
+            }
+            Ok(false)
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn contains_task_projection(
+        &self,
+        path: &[ValueProjection],
+        span: Span,
+    ) -> KuResult<bool> {
+        let mut selected = self;
+        for projection in path {
+            selected = match (projection, selected) {
+                (
+                    ValueProjection::Field(name),
+                    Value::Object(fields) | Value::Struct { fields, .. },
+                ) => {
+                    let Some(value) = fields.get(name) else {
+                        return Ok(false);
+                    };
+                    value
+                }
+                (ValueProjection::Index(index), Value::Array(values)) => {
+                    let Some(value) = values.get(*index) else {
+                        return Ok(false);
+                    };
+                    value
+                }
+                (ValueProjection::EnumField(index), Value::Enum { fields, .. }) => {
+                    let Some(value) = fields.get(*index) else {
+                        return Ok(false);
+                    };
+                    value
+                }
+                _ => return Ok(false),
+            };
+        }
+        selected.contains_owned_task(span)
+    }
+
+    /// The caller evaluates projection operands before entering this API. A
+    /// missing/ordinary projection is untouched so existing lookup diagnostics
+    /// and transparent non-Task snapshot reads remain the caller's responsibility.
+    pub(crate) fn take_task_projection(
+        &mut self,
+        path: &[ValueProjection],
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        let mut selected = self;
+        for projection in path {
+            selected = match (projection, selected) {
+                (
+                    ValueProjection::Field(name),
+                    Value::Object(fields) | Value::Struct { fields, .. },
+                ) => {
+                    let Some(value) = fields.get_mut(name) else {
+                        return Ok(None);
+                    };
+                    value
+                }
+                (ValueProjection::Index(index), Value::Array(values)) => {
+                    let Some(value) = values.get_mut(*index) else {
+                        return Ok(None);
+                    };
+                    value
+                }
+                (ValueProjection::EnumField(index), Value::Enum { fields, .. }) => {
+                    let Some(value) = fields.get_mut(*index) else {
+                        return Ok(None);
+                    };
+                    value
+                }
+                _ => return Ok(None),
+            };
+        }
+        if selected.contains_owned_task(span)? {
+            Ok(Some(std::mem::replace(selected, Value::Null)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) fn copy_value(&self) -> Option<Value> {
         match self {
             Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Some(self.clone()),
@@ -195,22 +375,12 @@ impl Value {
         }
     }
 
-    pub(crate) fn contains_borrowed(&self) -> bool {
-        match self {
-            Value::Borrowed(_) => true,
-            Value::Array(values) | Value::Enum { fields: values, .. } => {
-                values.iter().any(Value::contains_borrowed)
-            }
-            Value::Object(fields) | Value::Struct { fields, .. } => {
-                fields.values().any(Value::contains_borrowed)
-            }
-            Value::Result { value, .. } => value.contains_borrowed(),
-            _ => false,
-        }
+    pub(crate) fn contains_borrowed(&self, span: Span) -> KuResult<bool> {
+        self.visit_owned_values(span, |value| Ok(matches!(value, Value::Borrowed(_))))
     }
 
     pub(crate) fn require_owned(&self, span: Span) -> KuResult<()> {
-        if self.contains_borrowed() {
+        if self.contains_borrowed(span)? {
             return Err(KuError::runtime("borrowed value cannot escape, be stored, or be passed to an owning parameter; use clone to create an owned value", span));
         }
         Ok(())
@@ -219,7 +389,7 @@ impl Value {
     /// Interpreter container construction and insertion validate every child
     /// before storing it. Such containers cannot contain borrowed descendants;
     /// checking their root avoids rescanning an entire growing tree each time.
-    /// Public Env admission still uses the full recursive require_owned check.
+    /// Public Env admission still checks the full tree through require_owned.
     pub(crate) fn require_owned_root(&self, span: Span) -> KuResult<()> {
         if matches!(self, Value::Borrowed(_)) {
             return Err(KuError::runtime("borrowed value cannot escape, be stored, or be passed to an owning parameter; use clone to create an owned value", span));
@@ -261,6 +431,74 @@ impl Value {
                 .with_read(Span::default(), |value| Ok(value.type_name()))
                 .unwrap_or("expired borrowed value"),
             Value::Null => "null",
+        }
+    }
+}
+
+enum OwnedValueChildren<'a> {
+    Sequence(std::slice::Iter<'a, Value>),
+    Fields(std::collections::hash_map::Values<'a, String, Value>),
+    Result(Option<&'a Value>),
+}
+
+fn reserve_value_ancestor<'a>(
+    ancestors: &mut Vec<OwnedValueChildren<'a>>,
+    scratch_bytes: usize,
+    span: Span,
+) -> KuResult<()> {
+    let frame_bytes = std::mem::size_of::<OwnedValueChildren<'_>>();
+    let frame_limit = scratch_bytes / frame_bytes;
+    let limit_error = || KuError::runtime("value traversal scratch budget exhausted", span);
+    let required = ancestors.len().checked_add(1).ok_or_else(limit_error)?;
+    if required > frame_limit || ancestors.capacity() > frame_limit {
+        return Err(limit_error());
+    }
+    if required <= ancestors.capacity() {
+        return Ok(());
+    }
+
+    // Growing keeps both iterator buffers alive until their contents move.
+    // Charge that transient peak and the allocator's actual visible capacity.
+    let available = frame_limit - ancestors.capacity();
+    if required > available {
+        return Err(limit_error());
+    }
+    let target = ancestors
+        .capacity()
+        .saturating_mul(2)
+        .max(required)
+        .min(available);
+    let mut replacement = Vec::new();
+    replacement
+        .try_reserve_exact(target)
+        .map_err(|_| KuError::runtime("value traversal scratch out of memory", span))?;
+    if replacement.capacity() > available {
+        return Err(limit_error());
+    }
+    replacement.append(ancestors);
+    *ancestors = replacement;
+    Ok(())
+}
+
+impl<'a> OwnedValueChildren<'a> {
+    fn of(value: &'a Value) -> Option<Self> {
+        match value {
+            Value::Array(values) | Value::Enum { fields: values, .. } => {
+                Some(Self::Sequence(values.iter()))
+            }
+            Value::Object(fields) | Value::Struct { fields, .. } => {
+                Some(Self::Fields(fields.values()))
+            }
+            Value::Result { value, .. } => Some(Self::Result(Some(value))),
+            _ => None,
+        }
+    }
+
+    fn next(&mut self) -> Option<&'a Value> {
+        match self {
+            Self::Sequence(values) => values.next(),
+            Self::Fields(fields) => fields.next(),
+            Self::Result(value) => value.take(),
         }
     }
 }
@@ -401,6 +639,206 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod task_ownership_tests {
+    use super::*;
+    use crate::runtime::task::TaskRuntime;
+
+    #[test]
+    fn task_walk_covers_owned_wrappers_and_leaves_enum_siblings() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let task = runtime.spawn(|| Ok(Value::Int(1))).unwrap();
+        let id = task.id();
+        let mut value = Value::Struct {
+            name: "Holder".into(),
+            fields: HashMap::from([(
+                "payload".into(),
+                Value::Result {
+                    ok: true,
+                    value: Box::new(Value::Enum {
+                        name: "Choice".into(),
+                        variant: "Pair".into(),
+                        fields: vec![Value::Task(task), Value::String("sibling".into())],
+                    }),
+                },
+            )]),
+        };
+        let mut tasks = Vec::new();
+        value.collect_owned_tasks(&mut tasks, span).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id(), id);
+        let wrapped = value
+            .take_task_projection(&[ValueProjection::Field("payload".into())], span)
+            .unwrap()
+            .unwrap();
+        // Result is consumed/unwrapped as a value, just as the interpreter's `?`
+        // path does; field/index projections do not invent a Result member.
+        let Value::Result {
+            value: mut payload, ..
+        } = wrapped
+        else {
+            unreachable!()
+        };
+        let taken = payload
+            .take_task_projection(&[ValueProjection::EnumField(0)], span)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(taken, Value::Task(task) if task.id() == id));
+        assert!(!value.contains_owned_task(span).unwrap());
+        let Value::Struct { fields, .. } = &value else {
+            unreachable!()
+        };
+        assert_eq!(fields["payload"], Value::Null);
+        let Value::Enum { fields, .. } = payload.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(fields, &[Value::Null, Value::String("sibling".into())]);
+    }
+
+    #[test]
+    fn task_walk_is_iterative_and_does_not_follow_closure_captures() {
+        const CHILD: &str = "KU_OWNED_VALUE_WALK_CHILD";
+        const COMPLETED: &str = "owned value walk regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::value::task_ownership_tests::task_walk_is_iterative_and_does_not_follow_closure_captures",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("owned value walk has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "owned value walk child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut captures = Env::new();
+        captures
+            .define(
+                "task".into(),
+                Value::Task(runtime.spawn(|| Ok(Value::Int(1))).unwrap()),
+                false,
+                span,
+            )
+            .unwrap();
+        let function = Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: Vec::new(),
+            captures,
+            self_name: None,
+            is_async: false,
+        };
+        assert!(!function.contains_owned_task(span).unwrap());
+        assert!(!function.contains_borrowed(span).unwrap());
+        function.require_owned(span).unwrap();
+        let mut value = Value::Int(1);
+        for _ in 0..10_000 {
+            value = Value::Result {
+                ok: true,
+                value: Box::new(value),
+            };
+        }
+        assert!(!value.contains_owned_task(span).unwrap());
+        assert!(!value.contains_borrowed(span).unwrap());
+        value.require_owned(span).unwrap();
+        let error = value
+            .visit_owned_values_with_budget(span, 0, |_| Ok(false))
+            .unwrap_err();
+        assert!(error.message.contains("scratch budget exhausted"));
+        assert!(!value.contains_owned_task(span).unwrap());
+        // This test exercises the iterative visitor, not the existing recursive
+        // destructor for arbitrary deeply nested Value trees.
+        while let Value::Result { value: child, .. } = value {
+            value = *child;
+        }
+        let wide = Value::Array(vec![Value::Int(0); 65_536]);
+        assert!(!wide.contains_owned_task(span).unwrap());
+        assert!(!wide.contains_borrowed(span).unwrap());
+        let frame_bytes = std::mem::size_of::<OwnedValueChildren<'_>>();
+        let mut visited = 0;
+        assert!(!wide
+            .visit_owned_values_with_budget(span, frame_bytes, |_| {
+                visited += 1;
+                Ok(false)
+            })
+            .unwrap());
+        assert_eq!(visited, 65_537);
+        let error = wide
+            .visit_owned_values_with_budget(span, frame_bytes - 1, |_| Ok(false))
+            .unwrap_err();
+        assert!(error.message.contains("scratch budget exhausted"));
+
+        let nested = Value::Result {
+            ok: true,
+            value: Box::new(Value::Result {
+                ok: true,
+                value: Box::new(Value::Int(1)),
+            }),
+        };
+        assert!(!nested
+            .visit_owned_values_with_budget(span, 3 * frame_bytes, |_| Ok(false))
+            .unwrap());
+        let error = nested
+            .visit_owned_values_with_budget(span, 3 * frame_bytes - 1, |_| Ok(false))
+            .unwrap_err();
+        assert!(error.message.contains("scratch budget exhausted"));
+        assert!(!nested.contains_owned_task(span).unwrap());
+
+        // Weak views are leaves, including an expired source: traversal must
+        // neither upgrade them nor inspect Task ownership behind the view.
+        let root = Arc::new(Value::Task(runtime.spawn(|| Ok(Value::Int(2))).unwrap()));
+        let view = Value::Borrowed(BorrowedValue::new(&root));
+        assert!(!view.contains_owned_task(span).unwrap());
+        assert!(view.contains_borrowed(span).unwrap());
+        assert_eq!(Arc::strong_count(&root), 1);
+        drop(root);
+        let wrapped = Value::Array(vec![Value::Struct {
+            name: "Holder".into(),
+            fields: HashMap::from([(
+                "payload".into(),
+                Value::Object(HashMap::from([(
+                    "choice".into(),
+                    Value::Enum {
+                        name: "Choice".into(),
+                        variant: "Some".into(),
+                        fields: vec![Value::Result {
+                            ok: true,
+                            value: Box::new(view),
+                        }],
+                    },
+                )])),
+            )]),
+        }]);
+        assert!(!wrapped.contains_owned_task(span).unwrap());
+        assert!(wrapped.contains_borrowed(span).unwrap());
+        assert!(wrapped
+            .require_owned(span)
+            .unwrap_err()
+            .message
+            .contains("borrowed value cannot escape"));
+        eprintln!("{COMPLETED}");
     }
 }
 

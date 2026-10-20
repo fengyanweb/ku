@@ -5,10 +5,8 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex,
+        Arc,
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -18,32 +16,262 @@ use crate::{
         Item, Literal, MatchPattern, ParamMode, Program, Stmt, UnaryOp,
     },
     env::{BorrowLease, Env},
-    error::{KuError, KuResult},
+    error::{KuError, KuResult, RuntimeTermination, TerminationReason},
     lexer::Lexer,
     parser::Parser,
     runtime::{
         http_listener_registry,
-        task::{current_task_cancelled, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport},
+        task::{
+            current_cleanup_context, current_task_cancellation, set_execution_termination,
+            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskRuntime,
+            TaskRuntimeSnapshot, TaskStressReport,
+        },
     },
     span::{Position, Span},
     stdlib,
-    value::{BorrowProjection, HttpListenerLease, Value},
+    value::{BorrowProjection, BorrowedValue, HttpListenerLease, Value, ValueProjection},
 };
 
 const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
+const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
 const HTTP_MAX_METHOD_BYTES: usize = 32;
 
+// Existing nested regression modules share these parent test imports. The
+// production I/O owner keeps its channels and lock imports in http_io.rs.
+#[cfg(test)]
+use std::sync::{
+    mpsc::{self, Receiver, SyncSender},
+    Mutex,
+};
+
 const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
+
+mod cancellation;
+mod http_flight;
+mod http_io;
+mod netpoll;
+
+#[cfg(test)]
+use std::thread;
+
+// The flat core handles statically closed scalar call trees. Other calling,
+// waiting and cleanup paths still require migration; P0 is not yet complete.
+mod execution;
+
+#[cfg(test)]
+mod task_cleanup_tests;
+
+#[cfg(test)]
+mod stack_safety_tests;
+
+#[cfg(test)]
+mod match_task_tests;
+
+#[cfg(test)]
+mod caller_owner_tests;
 
 enum Flow {
     Continue,
-    Break,
-    LoopContinue,
-    Return(Value),
-    Fail(Value),
+    Break(Option<RuntimeTermination>),
+    LoopContinue(Option<RuntimeTermination>),
+    Return {
+        value: Value,
+        cleanup: Option<RuntimeTermination>,
+    },
+    Fail {
+        value: Value,
+        cleanup: Option<RuntimeTermination>,
+    },
+}
+
+impl Flow {
+    fn into_call_value(self, span: Span, kind: &str) -> KuResult<Value> {
+        match self {
+            Self::Continue => Ok(Value::Null),
+            Self::Return { value, .. } => Ok(value),
+            Self::Fail { value, .. } => Ok(Value::Result {
+                ok: false,
+                value: Box::new(value),
+            }),
+            Self::Break(_) | Self::LoopContinue(_) => Err(KuError::runtime(
+                format!("loop control escaped {kind}"),
+                span,
+            )),
+        }
+    }
+
+    fn into_call_flow(self, span: Span, kind: &str) -> KuResult<Self> {
+        let cleanup = cancellation::ScopeExit::cleanup_context(&self);
+        self.into_call_value(span, kind)
+            .map(|value| Self::Return { value, cleanup })
+    }
+
+    fn fail(value: Value) -> Self {
+        Self::Fail {
+            value,
+            cleanup: None,
+        }
+    }
+
+    fn returned(value: Value) -> Self {
+        Self::Return {
+            value,
+            cleanup: None,
+        }
+    }
+}
+
+struct HttpHandlerDeadline {
+    deadline: Instant,
+    timed_out: bool,
+    cleanup_deadline: Option<Instant>,
+    flight: Option<Arc<http_flight::FlightRecord>>,
+}
+
+impl HttpHandlerDeadline {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            timed_out: false,
+            cleanup_deadline: None,
+            flight: http_flight::current(),
+        }
+    }
+
+    fn poll(&mut self, now: Instant) -> bool {
+        if let Some(flight) = &self.flight {
+            flight.progress(now);
+            if now >= self.deadline {
+                flight.expire_at(http_flight::Stage::InterpreterExpired, now);
+            }
+        }
+        self.timed_out |= now >= self.deadline;
+        self.timed_out
+    }
+}
+
+// Opt-in, bounded timing only. Request fields never enter this diagnostic.
+struct HttpSlowTrace {
+    threshold: Duration,
+    emitted: usize,
+}
+
+struct HttpSlowTraceStart {
+    start: Instant,
+    queued: Duration,
+    cpu_start: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+struct HttpSlowTraceSample {
+    queued: Duration,
+    handler_wall: Duration,
+    handler_cpu: Option<Duration>,
+}
+
+impl HttpSlowTrace {
+    const MAX_LINES: usize = 128;
+
+    fn from_threshold_ms(value: Option<&str>) -> Option<Self> {
+        let millis = value?.parse::<u64>().ok().filter(|millis| *millis > 0)?;
+        Some(Self {
+            threshold: Duration::from_millis(millis),
+            emitted: 0,
+        })
+    }
+
+    fn from_env() -> Option<Self> {
+        Self::from_threshold_ms(std::env::var("KU_HTTP_TRACE_SLOW_MS").ok().as_deref())
+    }
+
+    fn begin(&self, deadline: Instant, handler_timeout: Duration) -> Option<HttpSlowTraceStart> {
+        if self.emitted >= Self::MAX_LINES {
+            return None;
+        }
+        let start = Instant::now();
+        let queued = deadline
+            .checked_sub(handler_timeout)
+            .map(|created| start.saturating_duration_since(created))
+            .unwrap_or_default();
+        Some(HttpSlowTraceStart {
+            start,
+            queued,
+            cpu_start: http_handler_thread_cpu_time(),
+        })
+    }
+
+    fn should_record(&self, sample: &HttpSlowTraceSample, status: i64) -> bool {
+        self.emitted < Self::MAX_LINES
+            && (status == 504
+                || sample.queued >= self.threshold
+                || sample.handler_wall >= self.threshold)
+    }
+
+    #[cfg(test)]
+    fn record(
+        &mut self,
+        token: &impl std::fmt::Debug,
+        sample: HttpSlowTraceSample,
+        status: i64,
+        output: &mut impl Write,
+    ) -> std::io::Result<()> {
+        if !self.should_record(&sample, status) {
+            return Ok(());
+        }
+        // Limit attempts too: a broken stderr must not cause unbounded retries.
+        self.emitted += 1;
+        let cpu_us = sample
+            .handler_cpu
+            .map(|cpu| cpu.as_micros().to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        writeln!(
+            output,
+            "ku_http_slow token={token:?} queue_us={} handler_wall_us={} handler_cpu_us={} status={status}",
+            sample.queued.as_micros(),
+            sample.handler_wall.as_micros(),
+            cpu_us,
+        )
+    }
+}
+
+impl HttpSlowTraceStart {
+    fn finish(self) -> HttpSlowTraceSample {
+        let handler_wall = self.start.elapsed();
+        let handler_cpu = self.cpu_start.and_then(|start| {
+            http_handler_thread_cpu_time().and_then(|end| end.checked_sub(start))
+        });
+        HttpSlowTraceSample {
+            queued: self.queued,
+            handler_wall,
+            handler_cpu,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn http_handler_thread_cpu_time() -> Option<Duration> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // The OS writes only the initialized local timespec. This clock measures
+    // the handler's current thread, independently of socket-owner CPU time.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) };
+    if result != 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(value.tv_sec).ok()?,
+        u32::try_from(value.tv_nsec).ok()?,
+    ))
+}
+
+#[cfg(not(unix))]
+fn http_handler_thread_cpu_time() -> Option<Duration> {
+    None
 }
 
 struct FunctionValueCall<'a> {
@@ -58,8 +286,28 @@ struct FunctionValueCall<'a> {
     depth: usize,
 }
 
+// Code is immutable during execution. Sharing this internal source table lets
+// a continuation retain stable AST references while polling the interpreter,
+// without cloning user values or copying every function body at each call.
+#[derive(Clone, Default)]
+struct FunctionTable(Arc<HashMap<String, FnDecl>>);
+
+impl std::ops::Deref for FunctionTable {
+    type Target = HashMap<String, FnDecl>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FunctionTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Interpreter {
-    functions: HashMap<String, FnDecl>,
+    functions: FunctionTable,
     structs: HashMap<String, HashSet<String>>,
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
@@ -67,14 +315,17 @@ pub struct Interpreter {
     call_depth: usize,
     pending_fail: Option<Value>,
     std_modules: HashSet<String>,
-    execution_deadline: Option<Instant>,
+    execution_deadline: Option<HttpHandlerDeadline>,
     task_runtime: Option<TaskRuntime>,
     async_execution: bool,
+    termination: Option<RuntimeTermination>,
+    cleanup_timeout_recorded: bool,
+    caller_owners: Vec<crate::env::OwnedBindingObserver>,
 }
 
 #[derive(Clone)]
 struct InterpreterTemplate {
-    functions: HashMap<String, FnDecl>,
+    functions: FunctionTable,
     structs: HashMap<String, HashSet<String>>,
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
@@ -84,7 +335,7 @@ struct InterpreterTemplate {
 impl Interpreter {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
+            functions: FunctionTable::default(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -95,6 +346,9 @@ impl Interpreter {
             execution_deadline: None,
             task_runtime: None,
             async_execution: false,
+            termination: None,
+            cleanup_timeout_recorded: false,
+            caller_owners: Vec::new(),
         }
     }
 
@@ -106,6 +360,7 @@ impl Interpreter {
     }
 
     pub fn run(&mut self, program: Program) -> KuResult<()> {
+        let _execution = ExecutionTerminationGuard::enter();
         for item in program.items {
             match item {
                 Item::Function(function) => {
@@ -144,10 +399,20 @@ impl Interpreter {
         let result = (|| -> KuResult<Value> {
             let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
             match result {
-                Value::Task(task) => task.await_result(),
+                Value::Task(task) => {
+                    let mut ticket = crate::runtime::task::AwaitTicket::begin(task);
+                    ticket.drive_sync();
+                    ticket.finish_with(|result| self.observe_termination(result))
+                }
                 value => Ok(value),
             }
         })();
+        self.observe_termination(&result);
+        let _shutdown_cleanup = result
+            .as_ref()
+            .err()
+            .and_then(KuError::scope_cleanup)
+            .map(CleanupGuard::enter);
         let shutdown = self
             .task_runtime
             .as_ref()
@@ -171,6 +436,17 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Value> {
+        self.call_function_flow(name, args, span, depth)?
+            .into_call_value(span, "function")
+    }
+
+    fn call_function_flow(
+        &mut self,
+        name: &str,
+        mut args: Vec<Value>,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<Flow> {
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::structured(
                 crate::error::KuErrorKind::Runtime,
@@ -180,26 +456,55 @@ impl Interpreter {
                 span,
             ));
         }
-        let function = self
-            .functions
+        // A private immutable table snapshot keeps selection independent of
+        // &mut self without recursively cloning the entry's AST first.
+        let source = self.functions.clone();
+        let function = source
             .get(name)
-            .cloned()
             .ok_or_else(|| KuError::runtime(format!("undefined function '{name}'"), span))?;
         if function.is_async {
-            return self.spawn_async_function(function, args, span);
+            return self
+                .spawn_async_function(function.clone(), args, span)
+                .map(Flow::returned);
         }
-        self.call_function_direct(function, args, span, depth)
+        if let Some(result) =
+            execution::try_execute_borrowed_string(self, function, &mut args, depth)
+        {
+            return result;
+        }
+        if let Some(result) = execution::try_execute_owned(self, function, &mut args, depth) {
+            // Unsupported selection leaves the original argument Vec intact.
+            // A selected owner or rejection returns directly without replay.
+            return result;
+        }
+        if let Some(result) = execution::try_execute(self, function, &args, depth) {
+            // The driver has completed the real scope/call epilogues and kept
+            // their carried cleanup context in this Flow.
+            return result;
+        }
+        self.call_function_direct_flow(function.clone(), args, span, depth)
     }
 
     fn call_function_direct(
         &mut self,
         function: FnDecl,
         args: Vec<Value>,
-        _span: Span,
+        span: Span,
         depth: usize,
     ) -> KuResult<Value> {
+        self.call_function_direct_flow(function, args, span, depth)?
+            .into_call_value(span, "function")
+    }
+
+    fn call_function_direct_flow(
+        &mut self,
+        function: FnDecl,
+        args: Vec<Value>,
+        _span: Span,
+        depth: usize,
+    ) -> KuResult<Flow> {
         self.call_depth += 1;
-        let result = (|| -> KuResult<Value> {
+        let result = (|| -> KuResult<Flow> {
             if function.params.len() != args.len() {
                 return Err(KuError::runtime(
                     format!(
@@ -228,18 +533,14 @@ impl Interpreter {
                 env.define_parameter(param.name.clone(), value, false, param.span)?;
             }
 
-            match self.exec_block(&function.body, &mut env, depth)? {
-                Flow::Continue => Ok(Value::Null),
-                Flow::Return(value) => Ok(value),
-                Flow::Fail(value) => Ok(Value::Result {
-                    ok: false,
-                    value: Box::new(value),
-                }),
-                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
-                    "loop control escaped function",
-                    function.span,
-                )),
-            }
+            let result = self.exec_block_with_fallthrough(
+                &function.body,
+                &mut env,
+                depth,
+                Flow::returned(Value::Null),
+            );
+            self.finish_call_scope(env, leases, result, function.span)?
+                .into_call_flow(function.span, "function")
         })();
         self.call_depth -= 1;
         result
@@ -251,6 +552,7 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> KuResult<Value> {
+        self.reject_cleanup_submission(span)?;
         if function
             .params
             .iter()
@@ -269,14 +571,14 @@ impl Interpreter {
             .clone()
             .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
         let child_runtime = runtime.clone();
-        let task = runtime.spawn_deferred(|| {
+        let task = runtime.spawn_runner_deferred(|| {
             let template = self.template();
             move || {
                 let mut interpreter = Interpreter::from_template(template, child_runtime);
                 interpreter.async_execution = true;
-                interpreter.call_function_direct(function, args, span, 0)
+                execution::ClaimedNamedTask::new(interpreter, function, args, span)
             }
-        });
+        })?;
         Ok(Value::Task(task))
     }
 
@@ -303,52 +605,47 @@ impl Interpreter {
             execution_deadline: None,
             task_runtime: Some(runtime),
             async_execution: true,
+            termination: None,
+            cleanup_timeout_recorded: false,
+            caller_owners: Vec::new(),
         }
     }
 
     fn call_function_value(&mut self, call: FunctionValueCall<'_>) -> KuResult<Value> {
+        let span = call.span;
+        self.call_function_value_flow(call)?
+            .into_call_value(span, "function value")
+    }
+
+    fn call_function_value_flow(&mut self, call: FunctionValueCall<'_>) -> KuResult<Flow> {
         if call.is_async {
+            let span = call.span;
+            self.reject_cleanup_submission(span)?;
             if call.param_modes.contains(&ParamMode::View) {
                 return Err(KuError::runtime(
                     "async functions cannot declare borrowed parameters",
-                    call.span,
+                    span,
                 ));
             }
             for value in &call.args {
-                value.require_owned_root(call.span)?;
+                value.require_owned_root(span)?;
             }
-            let runtime = self.task_runtime.clone().ok_or_else(|| {
-                KuError::runtime("async task runtime is not initialized", call.span)
-            })?;
+            let runtime = self
+                .task_runtime
+                .clone()
+                .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
             let template = self.template();
             let child_runtime = runtime.clone();
-            let params = call.params.to_vec();
-            let param_modes = call.param_modes.to_vec();
-            let body = call.body.to_vec();
-            let captures = call.captures.clone();
-            let self_name = call.self_name.clone();
-            let args = call.args;
-            let span = call.span;
-            let task = runtime.spawn(move || {
-                let mut interpreter = Interpreter::from_template(template, child_runtime);
-                interpreter.call_function_value_direct(
-                    FunctionValueCall {
-                        params: &params,
-                        param_modes: &param_modes,
-                        body: &body,
-                        captures: &captures,
-                        self_name: &self_name,
-                        is_async: true,
-                        args,
-                        span,
-                        depth: 0,
-                    },
-                    true,
-                )
-            });
-            return Ok(Value::Task(task));
+            let prepared = execution::prepare_async_function_value(self, call);
+            let task = runtime.spawn_runner_deferred(|| {
+                move || {
+                    let interpreter = Interpreter::from_template(template, child_runtime);
+                    execution::ClaimedFunctionValueTask::new(interpreter, prepared)
+                }
+            })?;
+            return Ok(Flow::returned(Value::Task(task)));
         }
-        self.call_function_value_direct(call, false)
+        self.call_function_value_direct_flow(call, false)
     }
 
     fn call_function_value_direct(
@@ -356,6 +653,30 @@ impl Interpreter {
         call: FunctionValueCall<'_>,
         declared_async: bool,
     ) -> KuResult<Value> {
+        let span = call.span;
+        self.call_function_value_direct_flow(call, declared_async)?
+            .into_call_value(span, "function value")
+    }
+
+    fn call_function_value_direct_flow(
+        &mut self,
+        call: FunctionValueCall<'_>,
+        declared_async: bool,
+    ) -> KuResult<Flow> {
+        if call.depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "runtime",
+                "call_depth_exceeded",
+                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
+                call.span,
+            ));
+        }
+        if !declared_async {
+            if let Some(result) = execution::try_execute_function_value(self, &call) {
+                return result;
+            }
+        }
         let FunctionValueCall {
             params,
             param_modes,
@@ -367,17 +688,8 @@ impl Interpreter {
             span,
             depth,
         } = call;
-        if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
-            return Err(KuError::structured(
-                crate::error::KuErrorKind::Runtime,
-                "runtime",
-                "call_depth_exceeded",
-                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
-                span,
-            ));
-        }
         self.call_depth += 1;
-        let result = (|| -> KuResult<Value> {
+        let result = (|| -> KuResult<Flow> {
             if params.len() != args.len() || params.len() != param_modes.len() {
                 return Err(KuError::runtime(
                     format!(
@@ -421,36 +733,46 @@ impl Interpreter {
                 env.define_parameter(param.clone(), value, false, span)?;
             }
 
-            let result = match self.exec_block(body, &mut env, depth)? {
-                Flow::Continue => Ok(Value::Null),
-                Flow::Return(value) => Ok(value),
-                Flow::Fail(value) => Ok(Value::Result {
-                    ok: false,
-                    value: Box::new(value),
-                }),
-                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
-                    "loop control escaped function value",
-                    span,
-                )),
-            };
-            env.pop_scope();
-            result
+            let result = self.exec_block_with_fallthrough(
+                body,
+                &mut env,
+                depth,
+                Flow::returned(Value::Null),
+            );
+            self.finish_call_scope(env, leases, result, span)?
+                .into_call_flow(span, "function value")
         })();
         self.call_depth -= 1;
         result
     }
 
     fn exec_block(&mut self, body: &[Stmt], env: &mut Env, depth: usize) -> KuResult<Flow> {
+        self.exec_block_with_fallthrough(body, env, depth, Flow::Continue)
+    }
+
+    fn exec_block_with_fallthrough(
+        &mut self,
+        body: &[Stmt],
+        env: &mut Env,
+        depth: usize,
+        fallthrough: Flow,
+    ) -> KuResult<Flow> {
         env.push_scope();
-        for stmt in body {
-            let flow = self.exec_stmt(stmt, env, depth)?;
-            if !matches!(flow, Flow::Continue) {
-                env.pop_scope();
-                return Ok(flow);
+        let result = (|| {
+            for stmt in body {
+                let flow = self.exec_stmt(stmt, env, depth)?;
+                if !matches!(flow, Flow::Continue) {
+                    return Ok(flow);
+                }
             }
-        }
-        env.pop_scope();
-        Ok(Flow::Continue)
+            Ok(fallthrough)
+        })();
+        self.finish_owned_scope(
+            env,
+            result,
+            body.first().map(stmt_span).unwrap_or_default(),
+            true,
+        )
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &mut Env, depth: usize) -> KuResult<Flow> {
@@ -465,7 +787,7 @@ impl Interpreter {
             } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 env.define_owned(
                     name.clone(),
@@ -477,11 +799,11 @@ impl Interpreter {
             }
             Stmt::Assign { name, value, span } => {
                 if self.try_self_array_push(name, value, env, depth, *span)? {
-                    return Ok(self.take_pending_fail().map_or(Flow::Continue, Flow::Fail));
+                    return Ok(self.take_pending_fail().map_or(Flow::Continue, Flow::fail));
                 }
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 if env.contains(name) {
                     env.assign_owned(name, value, *span)?;
@@ -497,11 +819,11 @@ impl Interpreter {
             } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.assign_target(target, value, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -513,11 +835,11 @@ impl Interpreter {
             } => {
                 let right = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.compound_assign_target(target, *op, right, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -540,7 +862,7 @@ impl Interpreter {
                 for value in values {
                     evaluated.push(self.eval(value, env, depth)?);
                     if let Some(value) = self.take_pending_fail() {
-                        return Ok(Flow::Fail(value));
+                        return Ok(Flow::fail(value));
                     }
                 }
                 for (name, value) in names.iter().zip(evaluated) {
@@ -563,11 +885,11 @@ impl Interpreter {
             } => {
                 let source = self.eval_object_destructure_source(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.object_destructure_assign(bindings, rest.as_ref(), source, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -579,7 +901,7 @@ impl Interpreter {
             } => {
                 let condition = self.eval(condition, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 if expect_bool_condition(condition, *span)? {
                     self.exec_block(then_branch, env, depth)
@@ -595,7 +917,7 @@ impl Interpreter {
                 loop {
                     let condition = self.eval(condition, env, depth)?;
                     if let Some(value) = self.take_pending_fail() {
-                        return Ok(Flow::Fail(value));
+                        return Ok(Flow::fail(value));
                     }
                     if !expect_bool_condition(condition, *span)? {
                         break;
@@ -603,9 +925,9 @@ impl Interpreter {
                     self.tick(*span)?;
                     match self.exec_block(body, env, depth)? {
                         Flow::Continue => {}
-                        Flow::LoopContinue => continue,
-                        Flow::Break => break,
-                        flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                        Flow::LoopContinue(_) => continue,
+                        Flow::Break(_) => break,
+                        flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                     }
                 }
                 Ok(Flow::Continue)
@@ -618,7 +940,7 @@ impl Interpreter {
             } => {
                 let iterable = self.eval(iterable, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 match iterable {
                     Value::Borrowed(_) => return Err(KuError::runtime("for over a borrowed value is not supported; clone to create an owned iterable", *span)),
@@ -626,9 +948,9 @@ impl Interpreter {
                         for value in values {
                             self.tick(*span)?;
                             match self.exec_for_iteration(name, value, body, env, depth, *span)? {
-                                Flow::Continue | Flow::LoopContinue => {}
-                                Flow::Break => return Ok(Flow::Continue),
-                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                                Flow::Continue | Flow::LoopContinue(_) => {}
+                                Flow::Break(_) => return Ok(Flow::Continue),
+                                flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                             }
                         }
                     }
@@ -650,9 +972,9 @@ impl Interpreter {
                                 depth,
                                 *span,
                             )? {
-                                Flow::Continue | Flow::LoopContinue => {}
-                                Flow::Break => return Ok(Flow::Continue),
-                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                                Flow::Continue | Flow::LoopContinue(_) => {}
+                                Flow::Break(_) => return Ok(Flow::Continue),
+                                flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                             }
                             current += 1;
                         }
@@ -669,8 +991,8 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
-            Stmt::Break { .. } => Ok(Flow::Break),
-            Stmt::Continue { .. } => Ok(Flow::LoopContinue),
+            Stmt::Break { .. } => Ok(Flow::Break(None)),
+            Stmt::Continue { .. } => Ok(Flow::LoopContinue(None)),
             Stmt::Function(function) => {
                 let params = function
                     .params
@@ -678,7 +1000,7 @@ impl Interpreter {
                     .map(|param| param.name.clone())
                     .collect::<Vec<_>>();
                 let body = function.body.clone();
-                let capture_names = function_capture_names(function);
+                let capture_names = function_capture_names(function)?;
                 env.check_capture(&capture_names, function.span)?;
                 let captures = env.capture(&capture_names);
                 env.define_owned(
@@ -703,41 +1025,51 @@ impl Interpreter {
                 finally_body,
                 span,
             } => {
-                let mut flow = self.exec_block(body, env, depth)?;
-                if let Flow::Fail(value) = flow {
-                    if let Some(name) = catch_name {
+                let mut result = self.exec_block(body, env, depth);
+                if let (Ok(Flow::Fail { value, .. }), Some(name)) = (&mut result, catch_name) {
+                    let value = std::mem::replace(value, Value::Null);
+                    result = {
                         env.push_scope();
-                        env.define_owned(name.clone(), value, false, *span)?;
-                        flow = Flow::Continue;
-                        for stmt in catch_body {
-                            flow = self.exec_stmt(stmt, env, depth)?;
-                            if !matches!(flow, Flow::Continue) {
-                                break;
+                        let caught = (|| {
+                            env.define_owned(name.clone(), value, false, *span)?;
+                            for stmt in catch_body {
+                                let flow = self.exec_stmt(stmt, env, depth)?;
+                                if !matches!(flow, Flow::Continue) {
+                                    return Ok(flow);
+                                }
                             }
-                        }
-                        env.pop_scope();
-                    } else {
-                        flow = Flow::Fail(value);
+                            Ok(Flow::Continue)
+                        })();
+                        self.finish_owned_scope(env, caught, *span, true)
+                    };
+                }
+                let mode = self.prepare_finally(env, &result, *span);
+                if matches!(mode, cancellation::FinallyMode::Skip) {
+                    return result;
+                }
+                let guard = match mode {
+                    cancellation::FinallyMode::Protected(context) => {
+                        Some(CleanupGuard::enter(context))
                     }
-                }
-                let finally_flow = self.exec_block(finally_body, env, depth)?;
-                if !matches!(finally_flow, Flow::Continue) {
-                    return Ok(finally_flow);
-                }
-                Ok(flow)
+                    _ => None,
+                };
+                let finally_result = self.exec_block(finally_body, env, depth);
+                let result = self.finish_finally(result, finally_result, mode, *span);
+                drop(guard);
+                result
             }
             Stmt::Fail { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 value.require_owned_root(*span)?;
-                Ok(Flow::Fail(normalize_error_value(value)))
+                Ok(Flow::fail(normalize_error_value(value)))
             }
             Stmt::Panic { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Err(KuError::runtime(format!("panic: {value}"), *span))
             }
@@ -747,16 +1079,16 @@ impl Interpreter {
                     None => Value::Null,
                 };
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 value.require_owned_root(*span)?;
-                Ok(Flow::Return(value))
+                Ok(Flow::returned(value))
             }
             Stmt::Print { value, span } => {
                 let mut leases = Vec::new();
                 let value = self.eval_read_argument(value, env, depth, &mut leases)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 print!("{value}");
                 std::io::stdout().flush().map_err(|err| {
@@ -767,7 +1099,7 @@ impl Interpreter {
             Stmt::Expr { expr, .. } => {
                 self.eval(expr, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -905,7 +1237,8 @@ impl Interpreter {
         env: &mut Env,
         depth: usize,
         leases: &mut Vec<BorrowLease>,
-    ) -> KuResult<Vec<Value>> {
+        values: &mut Vec<Value>,
+    ) -> KuResult<()> {
         // Reject either argument order before evaluating effects. Paths are
         // deliberately conservative at the root, matching the checker contract.
         if modes.contains(&ParamMode::View) && modes.contains(&ParamMode::Owned) {
@@ -932,7 +1265,6 @@ impl Interpreter {
                 }
             }
         }
-        let mut values = Vec::with_capacity(args.len());
         for (index, arg) in args.iter().enumerate() {
             let value = if modes.get(index) == Some(&ParamMode::View) {
                 self.eval_borrow_argument(arg, env, depth, leases)?
@@ -946,7 +1278,19 @@ impl Interpreter {
                 break;
             }
         }
-        Ok(values)
+        Ok(())
+    }
+
+    fn call_argument_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Value> {
+        match result? {
+            // Only argument evaluation leaves Fail here. A callee's own Fail
+            // was already wrapped as a returned Result at its call boundary.
+            Flow::Fail { value, .. } => {
+                self.pending_fail = Some(value);
+                Ok(Value::Null)
+            }
+            flow => flow.into_call_value(span, "function"),
+        }
     }
 
     fn eval_readonly_call(
@@ -1131,13 +1475,13 @@ impl Interpreter {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
             if matches!(target_value, Value::Borrowed(_)) {
                 return target_value.with_read(span, |value| {
-                    if value_contains_task(value) {
+                    if value_contains_task(value, span)? {
                         return Err(KuError::runtime("task values cannot be cloned", span));
                     }
                     Ok(Some(value.clone()))
                 });
             }
-            if value_contains_task(&target_value) {
+            if value_contains_task(&target_value, span)? {
                 return Err(KuError::runtime("task values cannot be cloned", span));
             }
             return Ok(Some(target_value));
@@ -1243,6 +1587,9 @@ impl Interpreter {
                 };
             }
         }
+        if is_blocking_dotted_builtin(callee) {
+            self.reject_cleanup_submission(span)?;
+        }
         if !self.async_execution || !is_blocking_dotted_builtin(callee) {
             return stdlib::eval_dotted_builtin(callee, args, span, &self.base_dir);
         }
@@ -1281,6 +1628,7 @@ impl Interpreter {
             ExprKind::Literal(Literal::Null) => Ok(Value::Null),
             ExprKind::Variable(name) => self.eval_variable(name, env, expr.span),
             ExprKind::Await(task) => {
+                self.reject_cleanup_submission(expr.span)?;
                 let value = self.eval(task, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
@@ -1291,7 +1639,9 @@ impl Interpreter {
                         expr.span,
                     ));
                 };
-                task.await_result()
+                let mut ticket = crate::runtime::task::AwaitTicket::begin(task);
+                ticket.drive_sync();
+                ticket.finish_with(|result| self.observe_termination(result))
             }
             ExprKind::Unary { op, expr: right } => {
                 let value = self.eval(right, env, depth)?;
@@ -1351,148 +1701,204 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
-                if let Some(value) = self.eval_readonly_call(callee, args, env, depth, expr.span)? {
-                    return Ok(value);
+                // Register before even the first argument is evaluated: a later
+                // nested call can observe cancellation before this callee starts.
+                let previous_observers = self.caller_owners.len();
+                if self
+                    .task_runtime
+                    .as_ref()
+                    .is_some_and(TaskRuntime::has_task_submissions)
+                {
+                    let observer = env.observe_owned_bindings(expr.span)?;
+                    if !observer.is_empty() {
+                        self.caller_owners.try_reserve(1).map_err(|_| {
+                            KuError::runtime(
+                                "caller task ownership observation out of memory",
+                                expr.span,
+                            )
+                        })?;
+                        self.caller_owners.push(observer);
+                    }
                 }
-                if let ExprKind::Variable(name) = &callee.kind {
-                    if let Some(function) = self.functions.get(name) {
-                        let modes = explicit_borrow_modes(function);
-                        let mut leases = Vec::new();
-                        let values =
-                            self.eval_call_arguments(args, &modes, env, depth, &mut leases)?;
+                // All existing early returns/? leave this closure first, so an
+                // ordinary error cannot retain an observer past the expression.
+                let result = (|| {
+                    if let Some(value) =
+                        self.eval_readonly_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    if let ExprKind::Variable(name) = &callee.kind {
+                        if let Some(function) = self.functions.get(name) {
+                            let modes = explicit_borrow_modes(function);
+                            let mut leases = Vec::new();
+                            let mut values = Vec::with_capacity(args.len());
+                            let result = (|| {
+                                self.eval_call_arguments(
+                                    args,
+                                    &modes,
+                                    env,
+                                    depth,
+                                    &mut leases,
+                                    &mut values,
+                                )?;
+                                if let Some(value) = self.take_pending_fail() {
+                                    return Ok(Flow::fail(value));
+                                }
+                                self.call_function_flow(
+                                    name,
+                                    std::mem::take(&mut values),
+                                    expr.span,
+                                    depth + 1,
+                                )
+                            })();
+                            let result =
+                                self.finish_call_arguments(env, leases, values, result, expr.span);
+                            return self.call_argument_value(result, expr.span);
+                        }
+                    }
+                    if let ExprKind::Field { target, name } = &callee.kind {
+                        if name == "map" {
+                            return self.eval_array_map(target, args, env, depth, expr.span);
+                        }
+                    }
+                    if let Some(value) =
+                        self.eval_std_method_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    if let Some(value) =
+                        self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    // Resolve a first-class callable before its arguments so the
+                    // declared modes, including imported/local closures, drive reads.
+                    if !matches!(&callee.kind, ExprKind::Variable(name) if !env.contains(name))
+                        && (dotted_builtin_is_shadowed(callee, env)
+                            || dotted_builtin_module(callee).is_none())
+                    {
+                        let callable = self.eval(callee, env, depth)?;
+                        return callable.with_read(expr.span, |callable| {
+                            let Value::Function {
+                                params,
+                                param_modes,
+                                body,
+                                captures,
+                                self_name,
+                                is_async,
+                            } = callable
+                            else {
+                                return Err(KuError::runtime(
+                                    format!("cannot call {}", callable.type_name()),
+                                    callee.span,
+                                ));
+                            };
+                            let mut leases = Vec::new();
+                            let mut values = Vec::with_capacity(args.len());
+                            let result = (|| {
+                                self.eval_call_arguments(
+                                    args,
+                                    param_modes,
+                                    env,
+                                    depth,
+                                    &mut leases,
+                                    &mut values,
+                                )?;
+                                if let Some(value) = self.take_pending_fail() {
+                                    return Ok(Flow::fail(value));
+                                }
+                                self.call_function_value_flow(FunctionValueCall {
+                                    params,
+                                    param_modes,
+                                    body,
+                                    captures,
+                                    self_name,
+                                    is_async: *is_async,
+                                    args: std::mem::take(&mut values),
+                                    span: expr.span,
+                                    depth: depth + 1,
+                                })
+                            })();
+                            let result =
+                                self.finish_call_arguments(env, leases, values, result, expr.span);
+                            self.call_argument_value(result, expr.span)
+                        });
+                    }
+                    let mut values = Vec::with_capacity(args.len());
+                    for arg in args {
+                        let value = self.eval(arg, env, depth)?;
+                        value.require_owned_root(arg.span)?;
+                        values.push(value);
                         if self.pending_fail.is_some() {
                             return Ok(Value::Null);
                         }
-                        return self.call_function(name, values, expr.span, depth + 1);
                     }
-                }
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    if name == "map" {
-                        return self.eval_array_map(target, args, env, depth, expr.span);
+                    let args = values;
+                    if !dotted_builtin_is_shadowed(callee, env) {
+                        if let Some(module) = dotted_builtin_module(callee) {
+                            if stdlib::metadata::module_requires_import(module)
+                                && !self.std_modules.contains(module)
+                            {
+                                return Err(KuError::runtime(
+                                    format!("std module '{module}' must be imported before use"),
+                                    expr.span,
+                                ));
+                            }
+                        }
+                        if let Some(value) = self.eval_dotted_builtin(callee, &args, expr.span)? {
+                            return Ok(value);
+                        }
                     }
-                }
-                if let Some(value) =
-                    self.eval_std_method_call(callee, args, env, depth, expr.span)?
-                {
-                    return Ok(value);
-                }
-                if let Some(value) =
-                    self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
-                {
-                    return Ok(value);
-                }
-                // Resolve a first-class callable before its arguments so the
-                // declared modes, including imported/local closures, drive reads.
-                if !matches!(&callee.kind, ExprKind::Variable(name) if !env.contains(name))
-                    && (dotted_builtin_is_shadowed(callee, env)
-                        || dotted_builtin_module(callee).is_none())
-                {
-                    let callable = self.eval(callee, env, depth)?;
-                    return callable.with_read(expr.span, |callable| {
-                        let Value::Function {
+                    if let Some((enum_name, variant)) = enum_variant_path(callee) {
+                        if self.enums.contains_key(&enum_name) {
+                            return self.construct_enum(&enum_name, &variant, args, expr.span);
+                        }
+                    }
+                    if let ExprKind::Variable(name) = &callee.kind {
+                        if self.functions.contains_key(name) {
+                            return self.call_function(name, args, expr.span, depth + 1);
+                        }
+                        if !env.contains(name) {
+                            if let Some(value) = stdlib::eval_builtin(name, &args, expr.span)? {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                    let callee_value = self.eval(callee, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    match callee_value {
+                        Value::Function {
                             params,
                             param_modes,
                             body,
                             captures,
                             self_name,
                             is_async,
-                        } = callable
-                        else {
-                            return Err(KuError::runtime(
-                                format!("cannot call {}", callable.type_name()),
-                                callee.span,
-                            ));
-                        };
-                        let mut leases = Vec::new();
-                        let values =
-                            self.eval_call_arguments(args, param_modes, env, depth, &mut leases)?;
-                        if self.pending_fail.is_some() {
-                            return Ok(Value::Null);
-                        }
-                        self.call_function_value(FunctionValueCall {
-                            params,
-                            param_modes,
-                            body,
-                            captures,
-                            self_name,
-                            is_async: *is_async,
-                            args: values,
+                        } => self.call_function_value(FunctionValueCall {
+                            params: &params,
+                            param_modes: &param_modes,
+                            body: &body,
+                            captures: &captures,
+                            self_name: &self_name,
+                            is_async,
+                            args,
                             span: expr.span,
                             depth: depth + 1,
-                        })
-                    });
-                }
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    let value = self.eval(arg, env, depth)?;
-                    value.require_owned_root(arg.span)?;
-                    values.push(value);
-                    if self.pending_fail.is_some() {
-                        return Ok(Value::Null);
+                        }),
+                        other => Err(KuError::runtime(
+                            format!("cannot call {}", other.type_name()),
+                            callee.span,
+                        )),
                     }
-                }
-                let args = values;
-                if !dotted_builtin_is_shadowed(callee, env) {
-                    if let Some(module) = dotted_builtin_module(callee) {
-                        if stdlib::metadata::module_requires_import(module)
-                            && !self.std_modules.contains(module)
-                        {
-                            return Err(KuError::runtime(
-                                format!("std module '{module}' must be imported before use"),
-                                expr.span,
-                            ));
-                        }
-                    }
-                    if let Some(value) = self.eval_dotted_builtin(callee, &args, expr.span)? {
-                        return Ok(value);
-                    }
-                }
-                if let Some((enum_name, variant)) = enum_variant_path(callee) {
-                    if self.enums.contains_key(&enum_name) {
-                        return self.construct_enum(&enum_name, &variant, args, expr.span);
-                    }
-                }
-                if let ExprKind::Variable(name) = &callee.kind {
-                    if self.functions.contains_key(name) {
-                        return self.call_function(name, args, expr.span, depth + 1);
-                    }
-                    if !env.contains(name) {
-                        if let Some(value) = stdlib::eval_builtin(name, &args, expr.span)? {
-                            return Ok(value);
-                        }
-                    }
-                }
-                let callee_value = self.eval(callee, env, depth)?;
-                if self.pending_fail.is_some() {
-                    return Ok(Value::Null);
-                }
-                match callee_value {
-                    Value::Function {
-                        params,
-                        param_modes,
-                        body,
-                        captures,
-                        self_name,
-                        is_async,
-                    } => self.call_function_value(FunctionValueCall {
-                        params: &params,
-                        param_modes: &param_modes,
-                        body: &body,
-                        captures: &captures,
-                        self_name: &self_name,
-                        is_async,
-                        args,
-                        span: expr.span,
-                        depth: depth + 1,
-                    }),
-                    other => Err(KuError::runtime(
-                        format!("cannot call {}", other.type_name()),
-                        callee.span,
-                    )),
-                }
+                })();
+                self.caller_owners.truncate(previous_observers);
+                result
             }
             ExprKind::Function { params, body, .. } => {
-                let names = closure_capture_names(params, body);
+                let names = closure_capture_names(params, body)?;
                 env.check_capture(&names, expr.span)?;
                 Ok(Value::Function {
                     params: params.iter().map(|param| param.name.clone()).collect(),
@@ -1517,6 +1923,9 @@ impl Interpreter {
             }
             ExprKind::Index { .. } => self.eval_index_expr(expr, env, depth, false),
             ExprKind::Field { target, name } => {
+                if let Some(value) = self.take_task_field(expr, env)? {
+                    return Ok(value);
+                }
                 if let ExprKind::Variable(enum_name) = &target.kind {
                     if enum_name == "http"
                         && !env.contains("http")
@@ -1621,35 +2030,63 @@ impl Interpreter {
                 Ok(Value::Object(values))
             }
             ExprKind::Match { value, arms } => {
-                let value = self.eval(value, env, depth)?;
+                let mut value = self.eval(value, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
                 }
-                for arm in arms {
-                    env.push_scope();
-                    let matched = match_pattern(&arm.pattern, &value, env, arm.span)?;
-                    if matched {
-                        if let Some(guard) = &arm.guard {
-                            let guard = self.eval(guard, env, depth)?;
-                            if self.pending_fail.is_some() {
-                                env.pop_scope();
-                                return Ok(Value::Null);
+                let result = (|| {
+                    for arm in arms {
+                        env.push_scope();
+                        let result = (|| {
+                            let Some(task_bindings) =
+                                match_pattern(&arm.pattern, &value, env, arm.span)?
+                            else {
+                                return Ok(Flow::Continue);
+                            };
+                            if let Some(guard) = &arm.guard {
+                                let guard = self.eval(guard, env, depth)?;
+                                if self.pending_fail.is_some() {
+                                    return Ok(Flow::returned(Value::Null));
+                                }
+                                if !expect_bool_condition(guard, arm.span)? {
+                                    return Ok(Flow::Continue);
+                                }
                             }
-                            if !expect_bool_condition(guard, arm.span)? {
-                                env.pop_scope();
-                                continue;
+                            for (name, path) in task_bindings {
+                                let selected = value.take_task_projection(&path, arm.span)?
+                                    .ok_or_else(|| KuError::runtime("tentative Task match payload was lost before arm selection", arm.span))?;
+                                env.commit_task_match_probe(&name, selected, arm.span)?;
                             }
+                            self.eval(&arm.value, env, depth).map(Flow::returned)
+                        })();
+                        let result = self.finish_owned_scope(env, result, arm.span, true);
+                        let flow = result?;
+                        if !matches!(flow, Flow::Continue) {
+                            return Ok(flow);
                         }
-                        let result = self.eval(&arm.value, env, depth);
-                        env.pop_scope();
-                        return result;
                     }
-                    env.pop_scope();
+                    Err(KuError::runtime(
+                        "match expression did not match any arm",
+                        expr.span,
+                    ))
+                })();
+                // Selected Task payloads have moved out of `value`. Wildcard
+                // and unselected payloads still belong to this expression and
+                // must finish bounded cleanup before its result can escape.
+                let result = if value.contains_owned_task(expr.span)? {
+                    let mut residual = Env::new();
+                    residual.define_owned("\0match.scrutinee".into(), value, false, expr.span)?;
+                    self.finish_owned_scope(&mut residual, result, expr.span, false)
+                } else {
+                    result
+                };
+                match result? {
+                    Flow::Return { value, .. } => Ok(value),
+                    _ => Err(KuError::runtime(
+                        "match expression lost its selected value",
+                        expr.span,
+                    )),
                 }
-                Err(KuError::runtime(
-                    "match expression did not match any arm",
-                    expr.span,
-                ))
             }
             ExprKind::TryUnwrap { expr: inner } => {
                 let value = if matches!(&inner.kind, ExprKind::Index { .. }) {
@@ -1896,8 +2333,7 @@ impl Interpreter {
             }
             Ok(loop_flow)
         })();
-        env.pop_scope();
-        result
+        self.finish_owned_scope(env, result, span, true)
     }
 
     fn assign_target(
@@ -2068,7 +2504,7 @@ impl Interpreter {
 
     fn eval_variable(&self, name: &str, env: &Env, span: Span) -> KuResult<Value> {
         if env.contains(name) {
-            return env.get(name, span);
+            return env.get_owning(name, span);
         }
         if let Some(function) = self.functions.get(name) {
             return Ok(Value::Function {
@@ -2115,6 +2551,9 @@ impl Interpreter {
             return Ok(Some(Value::Null));
         }
         if (name == "run" || name == "close") && is_http_listener_object(&target_value) {
+            if name == "run" {
+                self.reject_cleanup_submission(span)?;
+            }
             if !args.is_empty() {
                 return Err(KuError::runtime(
                     format!(
@@ -2128,12 +2567,12 @@ impl Interpreter {
                 result_from_listener_operation(
                     self.run_http_listener(target_value, span),
                     "run_failed",
-                )
+                )?
             } else {
                 result_from_listener_operation(
                     close_http_listener_value(target_value, span),
                     "close_failed",
-                )
+                )?
             }));
         }
         if !is_http_service_object(&target_value) {
@@ -2159,6 +2598,7 @@ impl Interpreter {
                     args[0].span,
                 ));
             };
+            self.reject_cleanup_submission(span)?;
             let compiled_router = compile_http_routes(&target_value, span)?;
             // Validate field assignments before opening a socket. Otherwise an
             // invalid post-construction limit would fail inside listener.run and
@@ -2186,6 +2626,7 @@ impl Interpreter {
                     span,
                 ) {
                     Ok(()) => "http service listen returned unexpectedly".to_string(),
+                    Err(err) if err.runtime_termination().is_some() => return Err(err),
                     Err(err) => err.message,
                 },
             )));
@@ -2236,6 +2677,7 @@ impl Interpreter {
     }
 
     fn run_http_listener(&mut self, listener: Value, span: Span) -> KuResult<()> {
+        self.reject_cleanup_submission(span)?;
         let Value::Object(mut fields) = listener else {
             return Err(KuError::runtime("http listener must be an object", span));
         };
@@ -2251,119 +2693,49 @@ impl Interpreter {
             .ok_or_else(|| KuError::runtime("http listener missing compiled_router", span))?;
         let limits = HttpServerRuntimeLimits::from_service(&service, span)?;
         let tcp = take_http_listener(listener_id, span)?;
-        tcp.set_nonblocking(true).map_err(|err| {
-            KuError::runtime(
-                format!("http listener nonblocking setup failed: {err}"),
-                span,
-            )
+        let mut slow_trace = HttpSlowTrace::from_env();
+        let mut io = http_io::HttpIo::start(tcp, limits).map_err(|err| {
+            KuError::runtime(format!("http I/O reactor setup failed: {err}"), span)
         })?;
-
-        let connection_count = Arc::new(AtomicUsize::new(0));
-        let (connection_tx, connection_rx) =
-            mpsc::sync_channel::<PendingHttpConnection>(limits.max_pending_requests);
-        let shared_connection_rx = Arc::new(Mutex::new(connection_rx));
-        let (handler_tx, handler_rx) =
-            mpsc::sync_channel::<HttpHandlerJob>(limits.max_active_requests);
-        let worker_count = Arc::new(AtomicUsize::new(0));
-
         loop {
-            let mut made_progress = false;
-            for _ in 0..HTTP_ACCEPT_BATCH {
-                match tcp.accept() {
-                    Ok((stream, _)) => {
-                        made_progress = true;
-                        Self::enqueue_http_connection(
-                            stream,
-                            &connection_tx,
-                            &shared_connection_rx,
-                            &handler_tx,
-                            &connection_count,
-                            &worker_count,
-                            limits,
-                        )?;
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => {
-                        return Err(KuError::runtime(
-                            format!("http listener accept failed: {err}"),
-                            span,
-                        ));
-                    }
+            self.poll_termination(span)?;
+            // Preserve the original termination observation interval. Socket
+            // readiness and every connection deadline progress independently on
+            // the single I/O thread, including while this handler is running.
+            let Some(mut job) = io
+                .next_job(HTTP_EVENT_LOOP_SLEEP)
+                .map_err(|err| KuError::runtime(format!("http I/O reactor failed: {err}"), span))?
+            else {
+                continue;
+            };
+            job.reply.handler_started();
+            let _flight = http_flight::FlightGuard::enter(job.flight.clone());
+            let trace_start = slow_trace
+                .as_ref()
+                .and_then(|trace| trace.begin(job.deadline, limits.handler_timeout));
+            let (response, origin) = self.execute_http_handler_job_traced(
+                job.request,
+                &compiled_router,
+                span,
+                job.deadline,
+            );
+            let trace_sample = trace_start.map(HttpSlowTraceStart::finish);
+            let status = response.status;
+            job.reply
+                .handler_finished(trace_sample.as_ref(), status, origin);
+            if let (Some(trace), Some(sample)) = (&mut slow_trace, trace_sample) {
+                if trace.should_record(&sample, status) {
+                    trace.emitted += 1;
+                    job.reply.slow_sample(sample, status);
                 }
             }
-
-            loop {
-                match handler_rx.try_recv() {
-                    Ok(job) => {
-                        made_progress = true;
-                        let response = self.execute_http_handler_job(
-                            job.request,
-                            &compiled_router,
-                            span,
-                            job.deadline,
-                        );
-                        let _ = job.response_tx.send(response);
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        return Err(KuError::runtime(
-                            "http handler worker channel disconnected",
-                            span,
-                        ));
-                    }
-                }
-            }
-
-            if !made_progress {
-                thread::sleep(HTTP_EVENT_LOOP_SLEEP);
-            }
+            job.reply.respond(job.token, response).map_err(|err| {
+                KuError::runtime(format!("http handler reply failed: {err}"), span)
+            })?;
         }
     }
 
-    fn enqueue_http_connection(
-        mut stream: TcpStream,
-        connection_tx: &SyncSender<PendingHttpConnection>,
-        connection_rx: &Arc<Mutex<Receiver<PendingHttpConnection>>>,
-        handler_tx: &SyncSender<HttpHandlerJob>,
-        connection_count: &Arc<AtomicUsize>,
-        worker_count: &Arc<AtomicUsize>,
-        limits: HttpServerRuntimeLimits,
-    ) -> KuResult<()> {
-        stream.set_nonblocking(false).map_err(|err| {
-            KuError::runtime(
-                format!("http connection blocking setup failed: {err}"),
-                entry_span(),
-            )
-        })?;
-        let Some(permit) =
-            HttpConnectionPermit::try_acquire(Arc::clone(connection_count), limits.max_connections)
-        else {
-            reject_http_connection(&mut stream, limits);
-            return Ok(());
-        };
-        match connection_tx.try_send(PendingHttpConnection {
-            stream,
-            _permit: permit,
-        }) {
-            Ok(()) => ensure_http_workers(
-                connection_rx,
-                handler_tx,
-                connection_count,
-                worker_count,
-                limits,
-            ),
-            Err(TrySendError::Full(mut pending)) => {
-                reject_http_connection(&mut pending.stream, limits);
-                Ok(())
-            }
-            Err(TrySendError::Disconnected(_)) => Err(KuError::runtime(
-                "http connection worker channel disconnected",
-                entry_span(),
-            )),
-        }
-    }
-
+    #[cfg(test)]
     fn execute_http_handler_job(
         &mut self,
         request: ParsedHttpRequest,
@@ -2371,26 +2743,59 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> HttpWireResponse {
+        self.execute_http_handler_job_traced(request, compiled_router, span, deadline)
+            .0
+    }
+
+    fn execute_http_handler_job_traced(
+        &mut self,
+        request: ParsedHttpRequest,
+        compiled_router: &Value,
+        span: Span,
+        deadline: Instant,
+    ) -> (HttpWireResponse, http_io::HttpTraceOrigin) {
+        use http_io::HttpTraceOrigin;
+        // Queueing spends the same handler deadline. Do not prepare an expired
+        // job or enter its handler/cleanup state after the original deadline.
+        let now = Instant::now();
+        if now >= deadline {
+            if let Some(flight) = http_flight::current() {
+                flight.expire_at(http_flight::Stage::QueueExpired, now);
+            }
+            return (
+                status_response(504, "Gateway Timeout"),
+                HttpTraceOrigin::QueueExpired,
+            );
+        }
         let route = match find_http_route(compiled_router, &request, span) {
             Ok(route) => route,
-            Err(_) => return status_response(500, "Internal Server Error"),
+            Err(_) => {
+                return (
+                    status_response(500, "Internal Server Error"),
+                    HttpTraceOrigin::Response,
+                )
+            }
         };
-        match route {
+        let response = match route {
             RouteLookup::Found(handler, params) => {
-                let req = http_request_value(&request, params);
+                let req = http_request_value(request, params);
                 match self.call_http_handler(handler, req, span, deadline) {
                     Ok(value) => value_to_http_response(value).unwrap_or_else(|| {
                         status_response(500, "handler did not return HttpResponse")
                     }),
                     Err(err) if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE => {
-                        status_response(504, "Gateway Timeout")
+                        return (
+                            status_response(504, "Gateway Timeout"),
+                            HttpTraceOrigin::HandlerExpired,
+                        );
                     }
                     Err(_) => status_response(500, "Internal Server Error"),
                 }
             }
             RouteLookup::MethodNotAllowed => status_response(405, "Method Not Allowed"),
             RouteLookup::NotFound => status_response(404, "Not Found"),
-        }
+        };
+        (response, HttpTraceOrigin::Response)
     }
 
     fn call_http_handler(
@@ -2400,6 +2805,7 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> KuResult<Value> {
+        let _execution = ExecutionTerminationGuard::enter();
         let Value::Function {
             params,
             param_modes,
@@ -2426,7 +2832,20 @@ impl Interpreter {
             )),
         };
         self.steps = 0;
-        let previous_deadline = self.execution_deadline.replace(deadline);
+        let previous_caller_owners = std::mem::take(&mut self.caller_owners);
+        let previous_termination = self.termination.take();
+        let previous_cleanup_recorded =
+            std::mem::replace(&mut self.cleanup_timeout_recorded, false);
+        let previous_deadline = self
+            .execution_deadline
+            .replace(HttpHandlerDeadline::new(deadline));
+        if let Some(flight) = self
+            .execution_deadline
+            .as_ref()
+            .and_then(|state| state.flight.as_ref())
+        {
+            flight.mark(http_flight::Stage::ActualHandlerStart);
+        }
         let result = self.call_function_value(FunctionValueCall {
             params: &params,
             param_modes: &param_modes,
@@ -2438,8 +2857,19 @@ impl Interpreter {
             span,
             depth: 0,
         });
+        let timed_out = self.execution_deadline.as_mut().is_some_and(|state| {
+            state.poll(Instant::now());
+            state.timed_out
+        });
         self.execution_deadline = previous_deadline;
-        result
+        self.caller_owners = previous_caller_owners;
+        self.termination = previous_termination;
+        self.cleanup_timeout_recorded = previous_cleanup_recorded;
+        if timed_out && result.is_ok() {
+            Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span))
+        } else {
+            result
+        }
     }
 
     fn eval_template(
@@ -2510,6 +2940,23 @@ impl Interpreter {
 
     fn eval_template_expr(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
         match &expr.kind {
+            ExprKind::Binary { left, op, right } if *op == BinaryOp::And || *op == BinaryOp::Or => {
+                // Keep template-specific arithmetic/concatenation in operands,
+                // but share ordinary expressions' lazy bool-only semantics.
+                let left = self.eval_template_expr(left, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                let left = expect_bool_condition(left, expr.span)?;
+                if (*op == BinaryOp::And && !left) || (*op == BinaryOp::Or && left) {
+                    return Ok(Value::Bool(left));
+                }
+                let right = self.eval_template_expr(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Bool(expect_bool_condition(right, expr.span)?))
+            }
             ExprKind::Binary { left, op, right } if *op == BinaryOp::Add => {
                 let left = self.eval_template_expr(left, env, depth)?;
                 if self.pending_fail.is_some() {
@@ -2561,23 +3008,1535 @@ impl Interpreter {
     }
 
     fn tick(&mut self, span: Span) -> KuResult<()> {
-        if current_task_cancelled() {
-            return Err(KuError::structured(
-                crate::error::KuErrorKind::Runtime,
-                "task",
-                "cancelled",
-                "async task was cancelled",
-                span,
-            ));
-        }
-        if self
-            .execution_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span));
-        }
+        self.poll_termination(span)?;
         self.steps = self.steps.saturating_add(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+use crate::registry_server::native_test_harness as finally_bounded_process;
+
+#[cfg(test)]
+mod finally_tests {
+    use super::*;
+
+    pub(super) fn body(source: &str) -> Vec<Stmt> {
+        let source = format!("fn test() {{\n{source}\n}}");
+        let program = Parser::new(Lexer::new(&source).tokenize().expect("lex fixture"))
+            .parse_program()
+            .expect("parse fixture");
+        let Item::Function(function) = program.items.into_iter().next().expect("fixture function")
+        else {
+            panic!("expected fixture function")
+        };
+        function.body
+    }
+
+    pub(super) fn marker_env() -> Env {
+        let mut env = Env::new();
+        env.define_owned("marker".into(), Value::Int(0), true, Span::default())
+            .unwrap();
+        env
+    }
+
+    pub(super) fn marker(env: &Env) -> i64 {
+        env.with_value("marker", Span::default(), |value| match value {
+            Value::Int(value) => Ok(*value),
+            _ => panic!("marker must stay int"),
+        })
+        .unwrap()
+    }
+
+    fn handler(source: &str, captures: &Env) -> Value {
+        Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: body(source),
+            captures: captures.clone(),
+            self_name: None,
+            is_async: false,
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_normal_control_flow_and_owned_payloads() {
+        for (source, expected) in [
+            ("try { marker = 1 } finally { marker += 10 }", "continue"),
+            (
+                "try { return [\"saved\"] } finally { marker = 11 }",
+                "return",
+            ),
+            ("try { fail \"saved\" } finally { marker = 11 }", "fail"),
+            ("try { break } finally { marker = 11 }", "break"),
+            ("try { continue } finally { marker = 11 }", "loop"),
+        ] {
+            let mut interpreter = Interpreter::new();
+            let mut env = marker_env();
+            let flow = interpreter.exec_block(&body(source), &mut env, 0).unwrap();
+            let actual = match flow {
+                Flow::Continue => "continue",
+                Flow::Break(_) => "break",
+                Flow::LoopContinue(_) => "loop",
+                Flow::Return { value, .. } => {
+                    assert_eq!(value, Value::Array(vec![Value::String("saved".into())]));
+                    "return"
+                }
+                Flow::Fail { value, .. } => {
+                    assert_eq!(value, normalize_error_value(Value::String("saved".into())));
+                    "fail"
+                }
+            };
+            assert_eq!(actual, expected, "{source}");
+            assert_eq!(marker(&env), 11, "{source}");
+            assert!(interpreter.pending_fail.is_none());
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_catch_fields_and_finally_override() {
+        let mut interpreter = Interpreter::new();
+        let mut env = marker_env();
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { fail { domain: "sample", code: "failed", message: "saved" } }
+            catch (err) {
+                marker = 1
+                return [err.domain, err.code, err.message]
+            } finally { marker += 10 }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        let Flow::Return { value, .. } = flow else {
+            panic!("expected saved return")
+        };
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                Value::String("sample".into()),
+                Value::String("failed".into()),
+                Value::String("saved".into()),
+            ])
+        );
+        assert_eq!(marker(&env), 11);
+        assert!(!env.contains("err"));
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { return "discarded" } finally { return "replacement" }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        assert!(
+            matches!(flow, Flow::Return { value: Value::String(value), .. } if value == "replacement")
+        );
+    }
+
+    #[test]
+    fn interpreter_finally_fatal_paths_pop_block_catch_and_match_scopes() {
+        for source in [
+            "local = probe\npanic(\"fatal\")",
+            "try { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "try { fail \"caught\" } catch (err) { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "local = probe\nselected = match 1 { bound if (missing == true) => 0\n_ => 1 }",
+        ] {
+            let mut env = marker_env();
+            let probe = HttpListenerLease::new(-1);
+            env.define_owned("probe".into(), Value::HttpListenerLease(probe.clone()), false, Span::default()).unwrap();
+            let error = Interpreter::new().exec_block(&body(source), &mut env, 0).err().expect("fatal error");
+            assert!(error.message.contains("panic:") || error.message.contains("undefined variable"));
+            assert_eq!(marker(&env), 0, "fatal panic keeps its existing semantics");
+            for name in ["local", "err", "selected", "bound"] {
+                assert!(!env.contains(name), "{name} leaked in {source}");
+            }
+            assert_eq!(Arc::strong_count(&probe), 2, "block-owned references must drop on error");
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_http_cleanup_budget_is_shared_and_never_restarted() {
+        let start = Instant::now();
+        let end = start + HTTP_HANDLER_CLEANUP_GRACE;
+        let context = CancellationContext::with_deadline(TerminationReason::TimedOut, end);
+        let outer = CleanupGuard::enter(context);
+        let nested = CleanupGuard::enter(RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: end + Duration::from_secs(1),
+        });
+        assert_eq!(current_cleanup_context(), Some(context));
+        drop(nested);
+        assert_eq!(current_cleanup_context(), Some(context));
+        let nested = CleanupGuard::enter(RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: end - Duration::from_millis(1),
+        });
+        drop(nested);
+        assert_eq!(
+            current_cleanup_context().unwrap().cleanup_deadline,
+            end - Duration::from_millis(1)
+        );
+        drop(outer);
+        assert!(current_cleanup_context().is_none());
+    }
+
+    #[test]
+    fn interpreter_finally_http_deadline_is_inactive_outside_handlers() {
+        let mut interpreter = Interpreter::new();
+        interpreter.tick(Span::default()).unwrap();
+        let mut state = HttpHandlerDeadline::new(Instant::now() + Duration::from_secs(10));
+        assert!(!state.poll(Instant::now()));
+        assert!(!state.timed_out);
+    }
+
+    #[test]
+    fn interpreter_http_expired_job_stops_before_routing_and_preserves_state() {
+        let mut interpreter = Interpreter::new();
+        let span = Span::default();
+        let expired = Instant::now() - Duration::from_millis(1);
+        let request = |method: &str, path: &str| ParsedHttpRequest {
+            keep_alive: false,
+            method: method.into(),
+            path: path.into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        // An invalid router proves the expired path does not even inspect it.
+        assert_eq!(
+            interpreter
+                .execute_http_handler_job(request("GET", "/"), &Value::Null, span, expired)
+                .status,
+            504
+        );
+        assert_eq!(
+            interpreter
+                .execute_http_handler_job(
+                    request("GET", "/"),
+                    &Value::Null,
+                    span,
+                    http_deadline(Duration::from_secs(10)),
+                )
+                .status,
+            500
+        );
+        let captures = marker_env();
+        let route = Value::Object(HashMap::from([
+            ("path".into(), Value::String("/".into())),
+            (
+                "handler".into(),
+                handler(
+                    "try { marker = 1 } finally { marker += 10 }\nreturn {status: 200, headers: {}, body: \"ok\"}",
+                    &captures,
+                ),
+            ),
+        ]));
+        let router = Value::Object(HashMap::from([(
+            "GET".into(),
+            Value::Object(HashMap::from([("/".into(), route)])),
+        )]));
+        for (method, path) in [("GET", "/"), ("GET", "/missing"), ("POST", "/")] {
+            assert_eq!(
+                interpreter
+                    .execute_http_handler_job(request(method, path), &router, span, expired)
+                    .status,
+                504
+            );
+            assert_eq!(marker(&captures), 0);
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.termination.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+            assert!(current_cleanup_context().is_none());
+        }
+        for (method, path, status) in [
+            ("GET", "/missing", 404),
+            ("POST", "/", 405),
+            ("GET", "/", 200),
+        ] {
+            let response = interpreter.execute_http_handler_job(
+                request(method, path),
+                &router,
+                span,
+                http_deadline(Duration::from_secs(10)),
+            );
+            assert_eq!(response.status, status);
+            if status == 200 {
+                assert_eq!(response.body, "ok");
+                assert_eq!(marker(&captures), 11);
+            } else {
+                assert_eq!(marker(&captures), 0);
+            }
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.termination.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+        }
+    }
+
+    #[test]
+    fn interpreter_http_request_transfer_preserves_owned_buffers() {
+        fn owned(text: &str) -> String {
+            let mut value = String::with_capacity(text.len() + 64);
+            value.push_str(text);
+            value
+        }
+
+        fn identity(value: &String) -> (usize, usize) {
+            (value.as_ptr() as usize, value.capacity())
+        }
+
+        fn assert_buffer(value: &String, expected: &str, original: (usize, usize)) {
+            assert_eq!(value, expected);
+            assert_eq!(
+                identity(value),
+                original,
+                "request buffer was copied: {expected:?}"
+            );
+        }
+
+        fn assert_field(
+            fields: &HashMap<String, Value>,
+            name: &str,
+            expected: &str,
+            original: (usize, usize),
+        ) {
+            let Some(Value::String(value)) = fields.get(name) else {
+                panic!("missing request string field {name}");
+            };
+            assert_buffer(value, expected, original);
+        }
+
+        fn assert_map_entry(
+            fields: &HashMap<String, Value>,
+            name: &str,
+            key: &str,
+            expected: &str,
+            original: ((usize, usize), (usize, usize)),
+        ) {
+            let Some(Value::Object(values)) = fields.get(name) else {
+                panic!("missing request object field {name}");
+            };
+            let Some((actual_key, Value::String(value))) = values.get_key_value(key) else {
+                panic!("missing request map entry {name}.{key}");
+            };
+            assert_buffer(actual_key, key, original.0);
+            assert_buffer(value, expected, original.1);
+        }
+
+        let request = ParsedHttpRequest {
+            keep_alive: false,
+            method: owned("POST"),
+            path: owned("/echo"),
+            query: HashMap::from([(owned("term"), owned("中文🙂\0查询"))]),
+            headers: HashMap::from([(owned("x-title"), owned("中文🙂"))]),
+            body: owned("中文🙂\0正文"),
+        };
+        let params = HashMap::from([(owned("id"), owned("参数🙂"))]);
+        let method_buffer = identity(&request.method);
+        let path_buffer = identity(&request.path);
+        let body_buffer = identity(&request.body);
+        let (query_key, query_value) = request.query.iter().next().unwrap();
+        let query_buffers = (identity(query_key), identity(query_value));
+        let (header_key, header_value) = request.headers.iter().next().unwrap();
+        let header_buffers = (identity(header_key), identity(header_value));
+        let (param_key, param_value) = params.iter().next().unwrap();
+        let param_buffers = (identity(param_key), identity(param_value));
+
+        let value = http_request_value(request, params);
+        let Value::Object(fields) = &value else {
+            panic!("request must become a Ku object");
+        };
+        // Read through the final owner after the parsed-request owner is gone.
+        assert_field(fields, "body", "中文🙂\0正文", body_buffer);
+        assert_field(fields, "method", "POST", method_buffer);
+        assert_field(fields, "path", "/echo", path_buffer);
+        assert_map_entry(fields, "query", "term", "中文🙂\0查询", query_buffers);
+        assert_map_entry(fields, "headers", "x-title", "中文🙂", header_buffers);
+        assert_map_entry(fields, "params", "id", "参数🙂", param_buffers);
+        drop(value);
+    }
+
+    #[test]
+    fn interpreter_http_slow_trace_is_opt_in_and_checks_thresholds() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("abc"),
+            Some("1.5"),
+        ] {
+            assert!(HttpSlowTrace::from_threshold_ms(value).is_none());
+        }
+        let mut trace = HttpSlowTrace::from_threshold_ms(Some("5")).unwrap();
+        let sample = |queued, handler_wall| HttpSlowTraceSample {
+            queued: Duration::from_micros(queued),
+            handler_wall: Duration::from_micros(handler_wall),
+            handler_cpu: Some(Duration::from_micros(21)),
+        };
+        let mut output = Vec::new();
+        trace
+            .record(&(7usize, 42u64), sample(4_999, 4_999), 200, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+        trace
+            .record(&(7usize, 42u64), sample(0, 5_000), 200, &mut output)
+            .unwrap();
+        trace
+            .record(&(7usize, 42u64), sample(5_000, 0), 200, &mut output)
+            .unwrap();
+        trace
+            .record(&(7usize, 42u64), sample(0, 1), 504, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 3);
+        assert!(output.contains("queue_us=0 handler_wall_us=5000 handler_cpu_us=21 status=200"));
+        assert!(output.contains("queue_us=5000 handler_wall_us=0 handler_cpu_us=21 status=200"));
+        assert!(output.contains("queue_us=0 handler_wall_us=1 handler_cpu_us=21 status=504"));
+    }
+
+    #[test]
+    fn interpreter_http_slow_trace_is_bounded_and_only_formats_numeric_metadata() {
+        let mut trace = HttpSlowTrace::from_threshold_ms(Some("1")).unwrap();
+        let mut output = Vec::new();
+        for _ in 0..=HttpSlowTrace::MAX_LINES {
+            trace
+                .record(
+                    &(7usize, 42u64),
+                    HttpSlowTraceSample {
+                        queued: Duration::from_micros(2),
+                        handler_wall: Duration::from_micros(3),
+                        handler_cpu: None,
+                    },
+                    504,
+                    &mut output,
+                )
+                .unwrap();
+        }
+        assert_eq!(trace.emitted, HttpSlowTrace::MAX_LINES);
+        assert!(trace
+            .begin(Instant::now(), Duration::from_secs(1))
+            .is_none());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), HttpSlowTrace::MAX_LINES);
+        for line in output.lines() {
+            assert_eq!(line, "ku_http_slow token=(7, 42) queue_us=2 handler_wall_us=3 handler_cpu_us=unavailable status=504");
+            for payload_field in ["path", "url", "body", "header", "credential"] {
+                assert!(!line.contains(payload_field));
+            }
+        }
+    }
+
+    fn http_test_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    pub(super) fn http_test_limits() -> HttpServerRuntimeLimits {
+        HttpServerRuntimeLimits {
+            read_header_timeout: Duration::from_secs(1),
+            read_body_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_secs(1),
+            handler_timeout: Duration::from_millis(100),
+            max_header_bytes: 1024,
+            max_body_bytes: 1024,
+            max_connections: 1,
+            max_active_requests: 1,
+            max_pending_requests: 1,
+            max_buffer_bytes: stdlib::http::DEFAULT_MAX_BUFFER_BYTES,
+        }
+    }
+
+    fn http_bounded_test_child(test: &str, variable: &str) -> bool {
+        if std::env::var_os(variable).is_some() {
+            return true;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env(variable, "1");
+        let output = finally_bounded_process::run_bounded(
+            &mut command,
+            Duration::from_secs(15),
+            finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+        )
+        .expect("HTTP transport test must terminate, including join failures");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn http_reactor_client(address: std::net::SocketAddr, request: &[u8]) -> TcpStream {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(request).unwrap();
+        client
+    }
+
+    fn http_assert_closed(client: &mut TcpStream) {
+        match client.read(&mut [0; 1]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("reactor socket did not close: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpreter_http_reactor_reuses_slots_and_retires_all_socket_owners() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_reactor_reuses_slots_and_retires_all_socket_owners",
+            "KU_HTTP_REACTOR_OWNER_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut first = http_reactor_client(
+            address,
+            b"GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let first_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(first_job.request.path, "/a");
+        let mut expired = Vec::new();
+        first.read_to_end(&mut expired).unwrap();
+        assert!(expired.starts_with(b"HTTP/1.1 504 "), "{expired:?}");
+
+        let mut second = http_reactor_client(
+            address,
+            b"GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let second_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        // There is exactly one active slot. Its distinct token therefore proves
+        // a new generation, rather than accidentally selecting another slot.
+        assert_ne!(first_job.token, second_job.token);
+        first_job
+            .reply
+            .respond(first_job.token, status_response(200, "stale界🙂\0"))
+            .unwrap();
+        // Exceed several transport write chunks, preserving every UTF-8/NUL
+        // byte across the separate head and incremental body writes.
+        let body = "current界🙂\0".repeat(4096);
+        second_job
+            .reply
+            .respond(second_job.token, status_response(200, &body))
+            .unwrap();
+        let mut received = Vec::new();
+        second.read_to_end(&mut received).unwrap();
+        assert!(received.starts_with(b"HTTP/1.1 200 "), "{received:?}");
+        let body_start = received
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&received[body_start..], body.as_bytes());
+        assert!(!received
+            .windows(b"stale".len())
+            .any(|bytes| bytes == b"stale"));
+        drop(io);
+
+        // A real unanswered handler must not prevent other activity slots from
+        // reading, classifying malformed input, expiring a partial body or
+        // writing their responses. No Ku handler is run by this test thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        limits.max_active_requests = 3;
+        limits.max_pending_requests = 2;
+        limits.max_connections = 4;
+        limits.handler_timeout = Duration::from_secs(5);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut held = http_reactor_client(
+            address,
+            b"GET /held HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let held_job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        let mut malformed = http_reactor_client(address, b"GET / HTTP/1.1\n");
+        let mut response = Vec::new();
+        malformed.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400 "), "{response:?}");
+        let mut partial = http_reactor_client(
+            address,
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\na",
+        );
+        response.clear();
+        partial.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 408 "), "{response:?}");
+        assert!(io.next_job(Duration::from_millis(1)).unwrap().is_none());
+        drop(io);
+        http_assert_closed(&mut held);
+        held_job
+            .reply
+            .respond(held_job.token, status_response(200, "closed界🙂\0"))
+            .unwrap();
+
+        // No connection gives the poll no D. Dropping still has to wake and
+        // join it, and release the actual bound listener address.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(http_io::HttpIo::start(listener, limits).unwrap());
+        drop(TcpListener::bind(address).expect("idle reactor released its listener"));
+
+        // Establish active + pending admission with an observed 503, then
+        // shutdown with both real sockets held. Pending input is intentionally
+        // unread; platforms may close it with EOF or a connection reset.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        limits.max_active_requests = 1;
+        limits.max_pending_requests = 1;
+        limits.max_connections = 2;
+        limits.read_body_timeout = Duration::from_secs(5);
+        let io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut active = http_reactor_client(
+            address,
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\na",
+        );
+        let mut pending = http_reactor_client(
+            address,
+            b"GET /pending HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut excess = http_reactor_client(
+            address,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut response = Vec::new();
+        excess.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
+        drop(io);
+        http_assert_closed(&mut active);
+        http_assert_closed(&mut pending);
+    }
+
+    // Read exactly one framed response. Reading to EOF would turn a successful
+    // persistent reply into an idle-timeout test or consume the next response.
+    fn http_read_test_response(client: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 16 * 1024, "bounded response headers");
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(length <= 1024 * 1024, "bounded response body");
+        let mut body = vec![0; length];
+        client.read_exact(&mut body).unwrap();
+        (head, body)
+    }
+
+    #[test]
+    fn interpreter_http_buffer_budget_rejects_without_allocating_another_error() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_buffer_budget_rejects_without_allocating_another_error",
+            "KU_HTTP_BUFFER_REJECT_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.max_buffer_bytes = 1;
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert_eq!(body, b"Service Unavailable");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        let snapshot = io.buffer_snapshot();
+        assert_eq!(snapshot.current, 0);
+        assert!(snapshot.peak <= snapshot.limit);
+        assert!(snapshot.rejected >= 1);
+    }
+
+    #[test]
+    fn interpreter_http_buffer_budget_follows_late_handler_and_rejects_large_reply() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_buffer_budget_follows_late_handler_and_rejects_large_reply",
+            "KU_HTTP_BUFFER_RETIRE_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.max_connections = 2;
+        limits.max_active_requests = 2;
+        limits.max_body_bytes = 4096;
+        limits.max_buffer_bytes = 4096;
+        limits.handler_timeout = Duration::from_millis(250);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        // Send headers first: the owner must reserve Content-Length before
+        // reading the body, rather than relying on how TCP groups writes.
+        let mut first = http_reactor_client(address, b"POST /one HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current < 2048 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(io.buffer_snapshot().current >= 2048);
+        first.write_all(&[b'a'; 2048]).unwrap();
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(job.request.body.len(), 2048);
+        drop(job.request);
+        let held = io.buffer_snapshot().current;
+        assert!((2048..4096).contains(&held));
+        let mut second = http_reactor_client(address, b"POST /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2048\r\n\r\n");
+        let (head, _) = http_read_test_response(&mut second);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        http_assert_closed(&mut second);
+        let (head, _) = http_read_test_response(&mut first);
+        assert!(head.starts_with("HTTP/1.1 504 "));
+        http_assert_closed(&mut first);
+        // Logical timeout closed the socket, but the real handler reply owner
+        // still holds its input credit until it finishes or is dropped.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current != held && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(io.buffer_snapshot().current, held);
+        job.reply
+            .respond(job.token, status_response(200, "late"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while io.buffer_snapshot().current != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(io.buffer_snapshot().current, 0);
+        let mut third = http_reactor_client(
+            address,
+            b"GET /three HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        drop(job.request);
+        job.reply
+            .respond(job.token, status_response(200, &"x".repeat(5000)))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut third);
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert_eq!(body, b"Service Unavailable");
+        http_assert_closed(&mut third);
+        let snapshot = io.buffer_snapshot();
+        assert_eq!(snapshot.current, 0);
+        assert!(snapshot.peak <= snapshot.limit);
+        assert!(snapshot.rejected >= 2);
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_preserves_pipeline_order_body_bytes_and_close_tokens() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_preserves_pipeline_order_body_bytes_and_close_tokens",
+            "KU_HTTP_KEEP_ALIVE_PIPELINE_CHILD",
+        ) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.write_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(
+            address,
+            concat!(
+                "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\n界🙂",
+                "GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "GET /three HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, ClOsE\r\n\r\n",
+            )
+            .as_bytes(),
+        );
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(first.request.path, "/one");
+        assert_eq!(first.request.body, "界🙂");
+        assert!(
+            io.next_job(Duration::from_millis(10)).unwrap().is_none(),
+            "pipeline must not dispatch a second concurrent handler"
+        );
+        let first_token = first.token;
+        first
+            .reply
+            .respond(first.token, status_response(200, "first界🙂\0"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 200 "));
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert_eq!(body, "first界🙂\0".as_bytes());
+        let second = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(second.request.path, "/two");
+        assert_ne!(
+            first_token, second.token,
+            "each request has a distinct generation"
+        );
+        second
+            .reply
+            .respond(second.token, status_response(204, "discarded-body"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 204 "));
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert!(!head.contains("content-length:"));
+        assert!(body.is_empty());
+        let third = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(third.request.path, "/three");
+        third
+            .reply
+            .respond(third.token, status_response(200, "third"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"third");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        drop(io);
+
+        // Combining repeated fields must retain an earlier close token. The
+        // second pipelined request is never dispatched on this closed socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut client = http_reactor_client(address, concat!(
+            "GET /close HTTP/1.1\r\nHost: localhost\r\nConnection: ClOsE\r\nConnection: keep-alive\r\n\r\n",
+            "GET /unclaimed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ).as_bytes());
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(job.request.path, "/close");
+        assert_eq!(
+            job.request.headers["connection"], "keep-alive",
+            "transport decisions must preserve the existing handler-visible map"
+        );
+        job.reply
+            .respond(job.token, status_response(200, "close"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut client);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"close");
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_errors_and_idle_deadlines_close_without_extra_jobs() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_errors_and_idle_deadlines_close_without_extra_jobs",
+            "KU_HTTP_KEEP_ALIVE_ERRORS_CHILD",
+        ) {
+            return;
+        }
+        for (status, tail, next_status) in [
+            (500, "GET /unused HTTP/1.1\r\nHost: localhost\r\n\r\n", None),
+            (103, "GET /unused HTTP/1.1\r\nHost: localhost\r\n\r\n", None),
+            (200, "GET /malformed HTTP/1.1\n", Some(400)),
+            (200, "", Some(408)),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut limits = http_test_limits();
+            limits.idle_timeout = Duration::from_millis(30);
+            limits.handler_timeout = Duration::from_secs(1);
+            let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+            let request = format!("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n{tail}");
+            let mut client = http_reactor_client(address, request.as_bytes());
+            let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+            job.reply
+                .respond(job.token, status_response(status, "first"))
+                .unwrap();
+            let (head, _) = http_read_test_response(&mut client);
+            if let Some(next_status) = next_status {
+                assert!(head.contains("connection: keep-alive\r\n"));
+                let (head, _) = http_read_test_response(&mut client);
+                assert!(head.starts_with(&format!("HTTP/1.1 {next_status} ")));
+                assert!(head.contains("connection: close\r\n"));
+            } else {
+                assert!(head.contains("connection: close\r\n"));
+            }
+            http_assert_closed(&mut client);
+            assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let mut client =
+            http_reactor_client(address, b"GET /done HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let job = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        job.reply
+            .respond(job.token, status_response(200, "done"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut client).1, b"done");
+        client.shutdown(Shutdown::Write).unwrap();
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+        drop(io);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let mut client = http_reactor_client(
+            address,
+            b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+        );
+        let (head, _) = http_read_test_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 400 "));
+        assert!(head.contains("connection: close\r\n"));
+        http_assert_closed(&mut client);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn interpreter_http_keep_alive_idle_and_pipeline_yield_capacity_to_pending_connections() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_keep_alive_idle_and_pipeline_yield_capacity_to_pending_connections",
+            "KU_HTTP_KEEP_ALIVE_CAPACITY_CHILD",
+        ) {
+            return;
+        }
+        // An already-idle persistent socket releases its only activity slot
+        // when a fresh admitted connection arrives; idle D is not shortened.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut limits = http_test_limits();
+        limits.idle_timeout = Duration::from_secs(10);
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.max_connections = 2;
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut idle =
+            http_reactor_client(address, b"GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        first
+            .reply
+            .respond(first.token, status_response(200, "idle"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut idle);
+        assert!(head.contains("connection: keep-alive\r\n"));
+        assert_eq!(body, b"idle");
+        let mut fresh = http_reactor_client(
+            address,
+            b"GET /fresh HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let next = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(next.request.path, "/fresh");
+        http_assert_closed(&mut idle);
+        next.reply
+            .respond(next.token, status_response(200, "fresh"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut fresh).1, b"fresh");
+        http_assert_closed(&mut fresh);
+        drop(io);
+
+        // An existing pending connection also wins at the response boundary,
+        // even when another request was already sent in the pipeline.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut io = http_io::HttpIo::start(listener, limits).unwrap();
+        let mut pipeline = http_reactor_client(
+            address,
+            concat!(
+                "GET /active HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "GET /unclaimed HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .as_bytes(),
+        );
+        let first = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        let mut pending = http_reactor_client(
+            address,
+            b"GET /pending HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut excess = http_reactor_client(
+            address,
+            b"GET /excess HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(http_read_test_response(&mut excess)
+            .0
+            .starts_with("HTTP/1.1 503 "));
+        first
+            .reply
+            .respond(first.token, status_response(200, "active"))
+            .unwrap();
+        let (head, body) = http_read_test_response(&mut pipeline);
+        assert!(head.contains("connection: close\r\n"));
+        assert_eq!(body, b"active");
+        http_assert_closed(&mut pipeline);
+        let next = io.next_job(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(next.request.path, "/pending");
+        next.reply
+            .respond(next.token, status_response(200, "pending"))
+            .unwrap();
+        assert_eq!(http_read_test_response(&mut pending).1, b"pending");
+        http_assert_closed(&mut pending);
+        assert!(io.next_job(Duration::from_millis(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn interpreter_http_peer_accept_errors_preserve_real_queued_requests() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_peer_accept_errors_preserve_real_queued_requests",
+            "KU_HTTP_ACCEPT_PEER_CHILD",
+        ) {
+            return;
+        }
+        let mut errors = vec![
+            std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        ];
+        #[cfg(unix)]
+        errors.push(std::io::Error::from_raw_os_error(libc::ECONNABORTED));
+        #[cfg(target_os = "linux")]
+        errors.extend(
+            [
+                libc::ENETDOWN,
+                libc::EPROTO,
+                libc::ENOPROTOOPT,
+                libc::EHOSTDOWN,
+                libc::ENONET,
+                libc::EHOSTUNREACH,
+                libc::EOPNOTSUPP,
+                libc::ENETUNREACH,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        #[cfg(windows)]
+        errors.extend(
+            [
+                windows_sys::Win32::Networking::WinSock::WSAECONNABORTED,
+                windows_sys::Win32::Networking::WinSock::WSAECONNRESET,
+                windows_sys::Win32::Networking::WinSock::WSAEINTR,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        for error in errors {
+            let label = error.to_string();
+            let raw = error.raw_os_error();
+            let kind = error.kind();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut client = http_reactor_client(
+                address,
+                b"POST /recovered HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbody",
+            );
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let observed_attempts = Arc::clone(&attempts);
+            let mut remaining = 2;
+            let mut limits = http_test_limits();
+            limits.handler_timeout = Duration::from_secs(2);
+            limits.write_timeout = Duration::from_secs(1);
+            let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+                if remaining > 0 {
+                    observed_attempts.lock().unwrap().push(Instant::now());
+                    remaining -= 1;
+                    return Err(raw.map_or_else(|| kind.into(), std::io::Error::from_raw_os_error));
+                }
+                listener.accept()
+            })
+            .unwrap();
+            let job = io
+                .next_job(Duration::from_secs(2))
+                .unwrap_or_else(|failure| panic!("peer accept {label} stopped reactor: {failure}"))
+                .expect("healthy queued request after peer accept errors");
+            assert_eq!(job.request.path, "/recovered");
+            assert_eq!(job.request.body, "body");
+            let times = attempts.lock().unwrap();
+            assert_eq!(times.len(), 2);
+            assert!(
+                times[1].duration_since(times[0]) >= HTTP_EVENT_LOOP_SLEEP,
+                "peer accept retries must yield for the existing event-loop interval: {label}"
+            );
+            drop(times);
+            job.reply
+                .respond(job.token, status_response(200, "recovered界🙂\0"))
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            assert!(
+                response.starts_with(b"HTTP/1.1 200 "),
+                "{label}: {response:?}"
+            );
+            assert!(response.ends_with("recovered界🙂\0".as_bytes()));
+            drop(io);
+        }
+
+        // Keep a real listener backlog readable while every subsequent accept
+        // reports a peer abort. The previously admitted request must still read,
+        // dispatch and write its response while the listener is yielding.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = http_reactor_client(
+            address,
+            b"GET /active HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let mut backlog = http_reactor_client(
+            address,
+            b"GET /backlog HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let (retry_tx, retry_rx) = mpsc::sync_channel(1);
+        let mut admitted = false;
+        let mut limits = http_test_limits();
+        limits.handler_timeout = Duration::from_secs(2);
+        limits.write_timeout = Duration::from_secs(1);
+        let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+            if !admitted {
+                let accepted = listener.accept()?;
+                admitted = true;
+                return Ok(accepted);
+            }
+            let _ = retry_tx.try_send(());
+            Err(std::io::ErrorKind::ConnectionAborted.into())
+        })
+        .unwrap();
+        let job = io
+            .next_job(Duration::from_secs(2))
+            .unwrap()
+            .expect("active request progresses during continued peer accept errors");
+        assert_eq!(job.request.path, "/active");
+        job.reply
+            .respond(job.token, status_response(200, "active-during-retry界🙂\0"))
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 "), "{response:?}");
+        assert!(response.ends_with("active-during-retry界🙂\0".as_bytes()));
+        // Observe a new retry after the response, then stop with that path
+        // still live. Drop must wake/join rather than wait for more accepts.
+        let _ = retry_rx.try_recv();
+        retry_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stop_started = Instant::now();
+        drop(io);
+        assert!(stop_started.elapsed() < Duration::from_secs(2));
+        http_assert_closed(&mut backlog);
+    }
+
+    #[test]
+    fn interpreter_http_fatal_accept_errors_keep_the_original_failure() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_fatal_accept_errors_keep_the_original_failure",
+            "KU_HTTP_ACCEPT_FATAL_CHILD",
+        ) {
+            return;
+        }
+        let mut errors = vec![
+            std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            std::io::Error::from(std::io::ErrorKind::NetworkDown),
+            std::io::Error::from(std::io::ErrorKind::Unsupported),
+        ];
+        #[cfg(unix)]
+        errors.extend(
+            [
+                libc::EBADF,
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOBUFS,
+                libc::ENOMEM,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        #[cfg(windows)]
+        errors.extend(
+            [
+                windows_sys::Win32::Networking::WinSock::WSAENOTSOCK,
+                windows_sys::Win32::Networking::WinSock::WSAEMFILE,
+                windows_sys::Win32::Networking::WinSock::WSAENOBUFS,
+                windows_sys::Win32::Networking::WinSock::WSAENETDOWN,
+            ]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error),
+        );
+        for error in errors {
+            let raw = error.raw_os_error();
+            let kind = error.kind();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut client =
+                http_reactor_client(address, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut pending =
+                http_reactor_client(address, b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut backlog =
+                http_reactor_client(address, b"GET /backlog HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed_attempts = Arc::clone(&attempts);
+            let mut limits = http_test_limits();
+            limits.max_connections = 2;
+            let mut io = http_io::HttpIo::start_with_accept(listener, limits, move |listener| {
+                if observed_attempts.fetch_add(1, Ordering::AcqRel) < 2 {
+                    listener.accept()
+                } else {
+                    Err(raw.map_or_else(|| kind.into(), std::io::Error::from_raw_os_error))
+                }
+            })
+            .unwrap();
+            let failure = match io.next_job(Duration::from_secs(2)) {
+                Err(failure) => failure,
+                Ok(_) => panic!("fatal accept error must stop reactor"),
+            };
+            assert_eq!(failure.raw_os_error(), raw);
+            assert_eq!(failure.kind(), kind);
+            assert_eq!(attempts.load(Ordering::Acquire), 3);
+            http_assert_closed(&mut client);
+            http_assert_closed(&mut pending);
+            http_assert_closed(&mut backlog);
+            drop(io);
+        }
+    }
+
+    #[test]
+    fn interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes() {
+        if !http_bounded_test_child(
+            "runtime::interpreter::finally_tests::interpreter_http_netpoll_handles_batches_deadlines_and_shared_wakes",
+            "KU_HTTP_NETPOLL_CHILD",
+        ) {
+            return;
+        }
+        let (_first_peer, first) = http_test_pair();
+        let (mut second_peer, mut second) = http_test_pair();
+        first.set_nonblocking(true).unwrap();
+        second.set_nonblocking(true).unwrap();
+        let wake = netpoll::WakePair::new().unwrap();
+        let wake_sender = wake.sender.clone();
+        let body = "界🙂\0".as_bytes();
+        second_peer.write_all(body).unwrap();
+        second_peer.shutdown(Shutdown::Write).unwrap();
+        let interests = [
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&wake.reader),
+                read: true,
+                write: false,
+            },
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&first),
+                read: true,
+                write: false,
+            },
+            netpoll::Interest {
+                socket: netpoll::Socket::Stream(&second),
+                read: true,
+                write: false,
+            },
+        ];
+        let deadline = http_deadline(Duration::from_secs(2));
+        let ready = netpoll::wait(&interests, Some(deadline)).unwrap();
+        assert!(ready.iter().any(|event| event.index == 2 && event.readable));
+        assert!(ready.iter().all(|event| event.index == 2));
+        let mut bytes = Vec::new();
+        let mut eof = false;
+        for _ in 0..32 {
+            assert!(
+                Instant::now() < deadline,
+                "FIN drain retained its original D"
+            );
+            let mut buffer = [0; 64];
+            match second.read(&mut buffer) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let interests = [netpoll::Interest {
+                        socket: netpoll::Socket::Stream(&second),
+                        read: true,
+                        write: false,
+                    }];
+                    assert!(!netpoll::wait(&interests, Some(deadline))
+                        .unwrap()
+                        .is_empty());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("FIN drain failed: {error}"),
+            }
+        }
+        assert!(eof, "peer FIN must be observed after its data");
+        assert_eq!(bytes, body);
+
+        let idle = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&first),
+            read: true,
+            write: false,
+        }];
+        let deadline = http_deadline(Duration::from_millis(20));
+        assert!(netpoll::wait(&idle, Some(deadline)).unwrap().is_empty());
+        assert!(Instant::now() >= deadline);
+        assert!(netpoll::wait(&idle, Some(deadline)).unwrap().is_empty());
+
+        let wake_interest = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&wake.reader),
+            read: true,
+            write: false,
+        }];
+        wake_sender.notify().unwrap();
+        let ready =
+            netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2)))).unwrap();
+        assert!(ready.iter().any(|event| event.index == 0 && event.readable));
+        wake.drain().unwrap();
+        assert!(netpoll::wait(
+            &wake_interest,
+            Some(http_deadline(Duration::from_millis(20)))
+        )
+        .unwrap()
+        .is_empty());
+        wake_sender.notify().unwrap();
+        assert!(
+            !netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2))))
+                .unwrap()
+                .is_empty()
+        );
+        wake.drain().unwrap();
+        wake_sender.shutdown().unwrap();
+        let ready =
+            netpoll::wait(&wake_interest, Some(http_deadline(Duration::from_secs(2)))).unwrap();
+        assert!(ready.iter().any(|event| event.index == 0 && event.readable));
+        assert_eq!(
+            wake.drain().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+
+        assert!(netpoll::wait(&[], None).unwrap().is_empty());
+        let no_interest = [netpoll::Interest {
+            socket: netpoll::Socket::Stream(&first),
+            read: false,
+            write: false,
+        }];
+        assert_eq!(
+            netpoll::wait(&no_interest, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let too_many = (0..4099)
+            .map(|_| netpoll::Interest {
+                socket: netpoll::Socket::Stream(&first),
+                read: true,
+                write: false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            netpoll::wait(&too_many, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn interpreter_http_full_handler_queue_rejects_without_waiting_for_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _io = http_io::HttpIo::start(listener, http_test_limits()).unwrap();
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut first = TcpStream::connect(address).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        first.write_all(request).unwrap();
+        // Leave the real job queued. Its socket times out independently of the
+        // interpreter, releasing the sole activity/connection slot while the
+        // bounded job queue still contains the expired request.
+        let mut expired = Vec::new();
+        first.read_to_end(&mut expired).unwrap();
+        assert!(expired.starts_with(b"HTTP/1.1 504 "), "{expired:?}");
+        let mut second = TcpStream::connect(address).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        second.write_all(request).unwrap();
+        let mut response = Vec::new();
+        second.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
+    }
+
+    #[test]
+    fn interpreter_http_rejection_yields_for_fragments_and_returns_its_permit() {
+        let (mut client, server) = http_test_pair();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        let mut rejection = HttpRejection::new(server, Some(permit), http_test_limits()).unwrap();
+        rejection.drain_deadline = Instant::now() + Duration::from_secs(60);
+        assert!(!rejection.poll());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r";
+        client.write_all(prefix).unwrap();
+        let watchdog = Instant::now() + Duration::from_secs(2);
+        while rejection.seen < prefix.len() {
+            assert!(!rejection.poll());
+            assert!(Instant::now() < watchdog);
+            thread::yield_now();
+        }
+        assert!(rejection.write_deadline.is_none());
+        client.write_all(b"\n").unwrap();
+        while !rejection.poll() {
+            assert!(Instant::now() < watchdog);
+            thread::yield_now();
+        }
+        drop(rejection);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, HttpRejection::RESPONSE);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn interpreter_http_rejection_expired_write_budget_is_not_restarted() {
+        let (_client, server) = http_test_pair();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        let mut rejection = HttpRejection::new(server, Some(permit), http_test_limits()).unwrap();
+        rejection.drain_deadline = Instant::now() - Duration::from_secs(1);
+        let deadline = rejection.drain_deadline + rejection.write_timeout;
+        assert!(rejection.poll());
+        assert_eq!(rejection.write_deadline, Some(deadline));
+        assert!(rejection.poll());
+        assert_eq!(rejection.write_deadline, Some(deadline));
+        assert_eq!(rejection.sent, 0);
+        drop(rejection);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn interpreter_finally_http_timeout_cleanup_is_bounded() {
+        const CHILD: &str = "KU_INTERPRETER_FINALLY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "runtime::interpreter::finally_tests::interpreter_finally_http_timeout_cleanup_is_bounded", "--nocapture"])
+                .env(CHILD, "1");
+            let output = finally_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(15),
+                finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("infinite finally must not hang the test process");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for (source, expected) in [
+            (
+                r#"
+                fn helper(value: str): str { return value }
+                try { while (true) {} }
+                catch (err) { marker = 9 }
+                finally {
+                    try { text = helper("owned")\nmarker = 1 }
+                    finally { marker = marker * 10 + 2 }
+                }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { fail "caught" } catch (err) { while (true) {} }
+                finally { marker = 1 }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1 } }
+                finally { marker = marker * 10 + 2 }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nreturn "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nfail "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1\nwhile (true) {} } }
+                finally { marker = 9 }
+            "#,
+                1,
+            ),
+            // A timeout first encountered in an ordinary finally still exits
+            // that block; this patch does not resume its remaining statements.
+            (
+                r#"
+                try { marker = 1 }
+                finally { marker = 2\nwhile (true) {}\nmarker = 9 }
+            "#,
+                2,
+            ),
+        ] {
+            let source = source.replace("\\n", "\n");
+            let captures = marker_env();
+            let mut interpreter = Interpreter::new();
+            let value = handler(&source, &captures);
+            let error = interpreter
+                .call_http_handler(
+                    value,
+                    Value::Null,
+                    Span::default(),
+                    Instant::now() + Duration::from_millis(200),
+                )
+                .unwrap_err();
+            assert_eq!(error.message, HTTP_HANDLER_TIMEOUT_MESSAGE, "{source}");
+            assert_eq!(marker(&captures), expected, "{source}");
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+            let healthy = handler("return 42", &captures);
+            assert_eq!(
+                interpreter
+                    .call_http_handler(
+                        healthy,
+                        Value::Null,
+                        Span::default(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                    .unwrap(),
+                Value::Int(42)
+            );
+        }
     }
 }
 
@@ -2641,6 +4600,7 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
         ("json", "stringify") => "json.stringify",
+        ("json", "encode") => "json.encode",
         _ => return None,
     })
 }
@@ -2693,7 +4653,7 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
         if let Some(method) = name.strip_prefix("array.") {
             return stdlib::array::eval(method, std::slice::from_ref(first), span);
         }
-        if name == "json.stringify" {
+        if matches!(name, "json.stringify" | "json.encode") {
             return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
         }
         if name == "print" {
@@ -3318,6 +5278,7 @@ struct HttpServerRuntimeLimits {
     max_connections: usize,
     max_active_requests: usize,
     max_pending_requests: usize,
+    max_buffer_bytes: usize,
 }
 
 impl HttpServerRuntimeLimits {
@@ -3363,6 +5324,13 @@ impl HttpServerRuntimeLimits {
                 stdlib::http::MAX_PENDING_REQUESTS,
                 span,
             )?,
+            max_buffer_bytes: bounded_service_int(
+                service,
+                "max_buffer_bytes",
+                stdlib::http::DEFAULT_MAX_BUFFER_BYTES,
+                stdlib::http::MAX_BUFFER_BYTES,
+                span,
+            )?,
         })
     }
 }
@@ -3390,145 +5358,127 @@ impl Drop for HttpConnectionPermit {
 
 struct PendingHttpConnection {
     stream: TcpStream,
+    accepted_at: Instant,
     _permit: HttpConnectionPermit,
 }
 
-struct HttpHandlerJob {
-    request: ParsedHttpRequest,
-    deadline: Instant,
-    response_tx: SyncSender<HttpWireResponse>,
+// Exactly one over-limit socket may remain on the acceptor. Each poll performs
+// at most one bounded read and one write; it never parks the interpreter while
+// admitted requests are waiting to execute. Dropping this owner closes the
+// socket and returns a pending-queue permit, if it held one.
+struct HttpRejection {
+    stream: TcpStream,
+    _permit: Option<HttpConnectionPermit>,
+    drain_deadline: Instant,
+    write_deadline: Option<Instant>,
+    write_timeout: Duration,
+    remaining_header: usize,
+    tail: [u8; 4],
+    seen: usize,
+    sent: usize,
 }
 
-fn ensure_http_workers(
-    connection_rx: &Arc<Mutex<Receiver<PendingHttpConnection>>>,
-    handler_tx: &SyncSender<HttpHandlerJob>,
-    connection_count: &Arc<AtomicUsize>,
-    worker_count: &Arc<AtomicUsize>,
-    limits: HttpServerRuntimeLimits,
-) -> KuResult<()> {
-    let desired = connection_count
-        .load(Ordering::Acquire)
-        .min(limits.max_active_requests);
-    loop {
-        let current = worker_count.load(Ordering::Acquire);
-        if current >= desired {
-            return Ok(());
+impl HttpRejection {
+    const RESPONSE: &'static [u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 19\r\nconnection: close\r\n\r\nService Unavailable";
+
+    fn new(
+        stream: TcpStream,
+        permit: Option<HttpConnectionPermit>,
+        limits: HttpServerRuntimeLimits,
+    ) -> Option<Self> {
+        if stream.set_nonblocking(true).is_err() {
+            return None;
         }
-        if worker_count
-            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            continue;
-        }
-        let connection_rx = Arc::clone(connection_rx);
-        let handler_tx = handler_tx.clone();
-        if let Err(err) = thread::Builder::new()
-            .name(format!("ku-http-{current}"))
-            .spawn(move || http_worker_loop(connection_rx, handler_tx, limits))
-        {
-            worker_count.fetch_sub(1, Ordering::AcqRel);
-            return Err(KuError::runtime(
-                format!("http worker spawn failed: {err}"),
-                entry_span(),
-            ));
-        }
+        Some(Self {
+            stream,
+            _permit: permit,
+            drain_deadline: http_deadline(Duration::from_millis(50)),
+            write_deadline: None,
+            write_timeout: limits.write_timeout,
+            remaining_header: limits.max_header_bytes,
+            tail: [0; 4],
+            seen: 0,
+            sent: 0,
+        })
     }
-}
 
-fn http_worker_loop(
-    connection_rx: Arc<Mutex<Receiver<PendingHttpConnection>>>,
-    handler_tx: SyncSender<HttpHandlerJob>,
-    limits: HttpServerRuntimeLimits,
-) {
-    loop {
-        let pending = {
-            let Ok(receiver) = connection_rx.lock() else {
-                return;
-            };
-            match receiver.recv() {
-                Ok(pending) => pending,
-                Err(_) => return,
-            }
-        };
-        handle_http_connection(pending, &handler_tx, limits);
+    fn begin_write(&mut self, now: Instant) {
+        let start = now.min(self.drain_deadline);
+        self.write_deadline = Some(start.checked_add(self.write_timeout).unwrap_or(start));
     }
-}
 
-fn reject_http_connection(stream: &mut TcpStream, limits: HttpServerRuntimeLimits) {
-    let drain_deadline = http_deadline(Duration::from_millis(50));
-    let mut buffer = [0_u8; 1024];
-    let mut received = Vec::new();
-    while received.len() < limits.max_header_bytes {
-        if set_http_read_deadline(stream, drain_deadline).is_err() {
-            break;
-        }
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                received.extend_from_slice(&buffer[..read]);
-                if received.windows(4).any(|window| window == b"\r\n\r\n")
-                    || received.windows(2).any(|window| window == b"\n\n")
-                {
-                    break;
+    fn poll(&mut self) -> bool {
+        let now = Instant::now();
+        if self.write_deadline.is_none() {
+            if now >= self.drain_deadline || self.remaining_header == 0 {
+                self.begin_write(now);
+            } else {
+                let mut buffer = [0; 1024];
+                let count = buffer.len().min(self.remaining_header);
+                match self.stream.read(&mut buffer[..count]) {
+                    Ok(0) => self.begin_write(Instant::now()),
+                    Ok(read) => {
+                        self.remaining_header -= read;
+                        for byte in &buffer[..read] {
+                            self.tail.rotate_left(1);
+                            self.tail[3] = *byte;
+                            self.seen = self.seen.saturating_add(1);
+                            if (self.seen >= 4 && self.tail == *b"\r\n\r\n")
+                                || (self.seen >= 2 && self.tail[2..] == *b"\n\n")
+                            {
+                                self.begin_write(Instant::now());
+                                break;
+                            }
+                        }
+                        if self.remaining_header == 0 && self.write_deadline.is_none() {
+                            self.begin_write(Instant::now());
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        return false
+                    }
+                    Err(_) => return true,
                 }
             }
-            Err(_) => break,
+        }
+        let Some(deadline) = self.write_deadline else {
+            return false;
+        };
+        if Instant::now() >= deadline {
+            return true;
+        }
+        match self.stream.write(&Self::RESPONSE[self.sent..]) {
+            Ok(0) => true,
+            Ok(written) => {
+                self.sent += written;
+                if self.sent == Self::RESPONSE.len() {
+                    let _ = self.stream.shutdown(Shutdown::Write);
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                false
+            }
+            Err(_) => true,
         }
     }
-    let _ = write_http_response(
-        stream,
-        status_response(503, "Service Unavailable"),
-        limits.write_timeout,
-    );
-    let _ = stream.shutdown(Shutdown::Write);
-}
-
-fn handle_http_connection(
-    mut pending: PendingHttpConnection,
-    handler_tx: &SyncSender<HttpHandlerJob>,
-    limits: HttpServerRuntimeLimits,
-) {
-    let request = match read_http_request(&mut pending.stream, limits, entry_span()) {
-        Ok(request) => request,
-        Err(response) => {
-            let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-    };
-    let deadline = Instant::now() + limits.handler_timeout;
-    let (response_tx, response_rx) = mpsc::sync_channel(1);
-    if handler_tx
-        .send(HttpHandlerJob {
-            request,
-            deadline,
-            response_tx,
-        })
-        .is_err()
-    {
-        let _ = pending.stream.shutdown(Shutdown::Write);
-        return;
-    }
-
-    let response = match response_rx.recv_timeout(limits.handler_timeout) {
-        Ok(response) => response,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = write_http_response(
-                &mut pending.stream,
-                status_response(504, "Gateway Timeout"),
-                limits.write_timeout,
-            );
-            let _ = pending.stream.shutdown(Shutdown::Write);
-            return;
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => status_response(500, "Internal Server Error"),
-    };
-    let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
-    let _ = pending.stream.shutdown(Shutdown::Write);
 }
 
 #[derive(Debug)]
 struct ParsedHttpRequest {
+    keep_alive: bool,
     method: String,
     path: String,
     query: HashMap<String, String>,
@@ -3542,34 +5492,22 @@ enum RouteLookup {
     NotFound,
 }
 
-fn read_http_request(
-    stream: &mut TcpStream,
-    limits: HttpServerRuntimeLimits,
-    span: Span,
-) -> Result<ParsedHttpRequest, HttpWireResponse> {
-    stream
-        .set_nonblocking(true)
-        .map_err(|_| status_response(500, "Internal Server Error"))?;
-    let result = read_http_request_nonblocking(stream, limits, span);
-    let restored = stream.set_nonblocking(false);
-    match (result, restored) {
-        (Ok(request), Ok(())) => Ok(request),
-        (Err(response), _) => Err(response),
-        (Ok(_), Err(_)) => Err(status_response(500, "Internal Server Error")),
-    }
+// Shared by the real incremental I/O state machine: transport framing is
+// separate from the one HTTP grammar and request conversion implementation.
+struct ParsedHttpHead {
+    keep_alive: bool,
+    method: String,
+    path: String,
+    query: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    content_length: usize,
 }
 
-fn read_http_request_nonblocking(
-    stream: &mut TcpStream,
+fn parse_http_head(
+    header: Vec<u8>,
     limits: HttpServerRuntimeLimits,
     span: Span,
-) -> Result<ParsedHttpRequest, HttpWireResponse> {
-    let (header, body_prefix) = read_http_header(
-        stream,
-        limits.max_header_bytes,
-        limits.idle_timeout,
-        limits.read_header_timeout,
-    )?;
+) -> Result<ParsedHttpHead, HttpWireResponse> {
     if header.is_empty() {
         return Err(status_response(400, "Bad Request"));
     }
@@ -3608,6 +5546,7 @@ fn read_http_request_nonblocking(
     let mut headers = HashMap::new();
     let mut saw_host = false;
     let mut content_length = None;
+    let mut keep_alive = true;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -3635,6 +5574,14 @@ fn read_http_request_nonblocking(
                 }
                 saw_host = true;
             }
+            "connection" => {
+                if value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+                {
+                    keep_alive = false;
+                }
+            }
             "transfer-encoding" => return Err(status_response(400, "Bad Request")),
             "expect" => return Err(status_response(417, "Expectation Failed")),
             "content-length" => {
@@ -3652,6 +5599,8 @@ fn read_http_request_nonblocking(
             }
             _ => {}
         }
+        // Keep the existing last-field map value for handler compatibility;
+        // transport close decisions independently inspect every field above.
         headers.insert(name, value);
     }
     if !saw_host {
@@ -3671,126 +5620,34 @@ fn read_http_request_nonblocking(
     {
         return Err(status_response(414, "URI Too Long"));
     }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        let prefix_len = body_prefix.len().min(content_length);
-        body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
-        if prefix_len < content_length {
-            read_http_body(stream, &mut body[prefix_len..], limits.read_body_timeout)?;
-        }
-    }
-    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
-    Ok(ParsedHttpRequest {
+    Ok(ParsedHttpHead {
+        keep_alive,
         method,
         path,
         query,
         headers,
-        body,
+        content_length,
     })
 }
 
-fn read_http_header(
-    stream: &mut TcpStream,
-    max_header_bytes: usize,
-    idle_timeout: Duration,
-    read_header_timeout: Duration,
-) -> Result<(Vec<u8>, Vec<u8>), HttpWireResponse> {
-    const READ_CHUNK_BYTES: usize = 8192;
-    let mut bytes = Vec::new();
-    let mut incoming = [0u8; READ_CHUNK_BYTES];
-    let idle_deadline = http_deadline(idle_timeout);
-    let mut header_deadline = None;
-    loop {
-        let read = read_http_with_deadline(
-            stream,
-            &mut incoming,
-            header_deadline.unwrap_or(idle_deadline),
-        )?;
-        if read == 0 {
-            break;
-        }
-        let scan_from = bytes.len();
-        bytes.extend_from_slice(&incoming[..read]);
-        if scan_from == 0 {
-            header_deadline = Some(http_deadline(read_header_timeout));
-        }
-        for index in scan_from..bytes.len() {
-            if index + 1 > max_header_bytes {
-                return Err(status_response(431, "Request Header Fields Too Large"));
-            }
-            if bytes[index] == b'\n' && (index < 1 || bytes[index - 1] != b'\r') {
-                return Err(status_response(400, "Bad Request"));
-            }
-            if index >= 1 && bytes[index - 1] == b'\r' && bytes[index] != b'\n' {
-                return Err(status_response(400, "Bad Request"));
-            }
-            if index >= 3 && &bytes[index - 3..=index] == b"\r\n\r\n" {
-                let body_prefix = bytes.split_off(index + 1);
-                bytes.truncate(index - 3);
-                return Ok((bytes, body_prefix));
-            }
-        }
-    }
-    Err(status_response(400, "Bad Request"))
-}
-
-fn read_http_body(
-    stream: &mut TcpStream,
-    body: &mut [u8],
-    timeout: Duration,
-) -> Result<(), HttpWireResponse> {
-    let deadline = http_deadline(timeout);
-    let mut offset = 0usize;
-    while offset < body.len() {
-        match read_http_with_deadline(stream, &mut body[offset..], deadline)? {
-            0 => return Err(status_response(408, "Request Timeout")),
-            read => offset += read,
-        }
-    }
-    Ok(())
+fn finish_http_request(
+    head: ParsedHttpHead,
+    body: Vec<u8>,
+) -> Result<ParsedHttpRequest, HttpWireResponse> {
+    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
+    Ok(ParsedHttpRequest {
+        keep_alive: head.keep_alive,
+        method: head.method,
+        path: head.path,
+        query: head.query,
+        headers: head.headers,
+        body,
+    })
 }
 
 fn http_deadline(timeout: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(timeout).unwrap_or(now)
-}
-
-fn set_http_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), HttpWireResponse> {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return Err(status_response(408, "Request Timeout"));
-    };
-    if remaining.is_zero() {
-        return Err(status_response(408, "Request Timeout"));
-    }
-    stream
-        .set_read_timeout(Some(remaining))
-        .map_err(|_| status_response(408, "Request Timeout"))
-}
-
-fn read_http_with_deadline(
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-    deadline: Instant,
-) -> Result<usize, HttpWireResponse> {
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(status_response(408, "Request Timeout"));
-        };
-        if remaining.is_zero() {
-            return Err(status_response(408, "Request Timeout"));
-        }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| status_response(408, "Request Timeout"))?;
-        match stream.read(buffer) {
-            Ok(read) => return Ok(read),
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(remaining.min(Duration::from_millis(2)));
-            }
-            Err(_) => return Err(status_response(408, "Request Timeout")),
-        }
-    }
 }
 
 fn is_http_token_byte(byte: u8) -> bool {
@@ -4044,17 +5901,14 @@ fn match_http_path(
     Ok(Some(params))
 }
 
-fn http_request_value(request: &ParsedHttpRequest, params: HashMap<String, String>) -> Value {
+fn http_request_value(request: ParsedHttpRequest, params: HashMap<String, String>) -> Value {
     Value::Object(HashMap::from([
-        ("method".to_string(), Value::String(request.method.clone())),
-        ("path".to_string(), Value::String(request.path.clone())),
+        ("method".to_string(), Value::String(request.method)),
+        ("path".to_string(), Value::String(request.path)),
         ("params".to_string(), string_map_value(params)),
-        ("query".to_string(), string_map_value(request.query.clone())),
-        (
-            "headers".to_string(),
-            string_map_value(request.headers.clone()),
-        ),
-        ("body".to_string(), Value::String(request.body.clone())),
+        ("query".to_string(), string_map_value(request.query)),
+        ("headers".to_string(), string_map_value(request.headers)),
+        ("body".to_string(), Value::String(request.body)),
     ]))
 }
 
@@ -4080,26 +5934,24 @@ fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
         }
         return Some(status_response(500, "Internal Server Error"));
     }
-    let Value::Object(fields) = value else {
+    let Value::Object(mut fields) = value else {
         return None;
     };
-    let status = match fields.get("status") {
-        Some(Value::Int(status)) => *status,
-        _ => return None,
+    let Some(Value::Int(status)) = fields.remove("status") else {
+        return None;
     };
-    let headers = match fields.get("headers") {
-        Some(Value::Object(headers)) => headers
-            .iter()
-            .filter_map(|(name, value)| match value {
-                Value::String(value) => Some((name.clone(), value.clone())),
-                _ => None,
-            })
-            .collect(),
-        _ => return None,
+    let Some(Value::Object(headers)) = fields.remove("headers") else {
+        return None;
     };
-    let body = match fields.get("body") {
-        Some(Value::String(body)) => body.clone(),
-        _ => return None,
+    let headers = headers
+        .into_iter()
+        .filter_map(|(name, value)| match value {
+            Value::String(value) => Some((name, value)),
+            _ => None,
+        })
+        .collect();
+    let Some(Value::String(body)) = fields.remove("body") else {
+        return None;
     };
     Some(HttpWireResponse {
         status,
@@ -4119,12 +5971,14 @@ fn status_response(status: i64, message: &str) -> HttpWireResponse {
     }
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
-    response: HttpWireResponse,
-    timeout: Duration,
-) -> KuResult<()> {
+// Encode once before selecting the original total write deadline. Header and
+// body remain separate owners so a large body is not copied into a second wire
+// buffer; partial writes retain their offsets in the I/O connection state.
+fn encode_http_response(response: HttpWireResponse, keep_alive: bool) -> (String, String, bool) {
     let response = prepare_http_response(response);
+    // A final response must have unambiguous framing. Errors and interim-only
+    // handler replies retire the connection, including a sanitized 500 reply.
+    let keep_alive = keep_alive && (200..400).contains(&response.status);
     let reason = stdlib::http::status_text(response.status);
     let mut headers = response.headers;
     if !((100..200).contains(&response.status) || matches!(response.status, 204 | 304)) {
@@ -4133,56 +5987,27 @@ fn write_http_response(
             response.body.len().to_string(),
         );
     }
-    headers.insert("connection".to_string(), "close".to_string());
-    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    headers.insert(
+        "connection".to_string(),
+        if keep_alive { "keep-alive" } else { "close" }.to_string(),
+    );
+    let first = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
+    let capacity = first.len()
+        + 2
+        + headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + 4)
+            .sum::<usize>();
+    let mut head = String::with_capacity(capacity);
+    head.push_str(&first);
     for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        head.push_str(&name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    let deadline = http_deadline(timeout);
-    write_http_all(stream, head.as_bytes(), deadline)?;
-    write_http_all(stream, response.body.as_bytes(), deadline)
-}
-
-fn write_http_all(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> KuResult<()> {
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(KuError::runtime(
-                "http response write timed out",
-                Span::default(),
-            ));
-        };
-        if remaining.is_zero() {
-            return Err(KuError::runtime(
-                "http response write timed out",
-                Span::default(),
-            ));
-        }
-        stream.set_write_timeout(Some(remaining)).map_err(|err| {
-            KuError::runtime(
-                format!("http response write timeout setup failed: {err}"),
-                Span::default(),
-            )
-        })?;
-        match stream.write(&bytes[offset..]) {
-            Ok(0) => {
-                return Err(KuError::runtime(
-                    "http response connection closed during write",
-                    Span::default(),
-                ))
-            }
-            Ok(written) => offset += written,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                return Err(KuError::runtime(
-                    format!("http response write failed: {err}"),
-                    Span::default(),
-                ))
-            }
-        }
-    }
-    Ok(())
+    (head, response.body, keep_alive)
 }
 
 fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {
@@ -4222,13 +6047,14 @@ fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {
     response
 }
 
-fn result_from_listener_operation(result: KuResult<()>, code: &str) -> Value {
+fn result_from_listener_operation(result: KuResult<()>, code: &str) -> KuResult<Value> {
     match result {
-        Ok(()) => Value::Result {
+        Ok(()) => Ok(Value::Result {
             ok: true,
             value: Box::new(Value::Null),
-        },
-        Err(err) => http_error_result(code, err.message),
+        }),
+        Err(err) if err.runtime_termination().is_some() => Err(err),
+        Err(err) => Ok(http_error_result(code, err.message)),
     }
 }
 
@@ -4294,95 +6120,298 @@ fn http_error_result(code: &str, message: impl Into<String>) -> Value {
     }
 }
 
+struct MatchBinding {
+    name: String,
+    value: Value,
+    task_path: Option<Vec<ValueProjection>>,
+}
+
+type TaskMatchBindings = Vec<(String, Vec<ValueProjection>)>;
+
 fn match_pattern(
     pattern: &MatchPattern,
     value: &Value,
     env: &mut Env,
     span: Span,
-) -> KuResult<bool> {
+) -> KuResult<Option<TaskMatchBindings>> {
     let mut bindings = Vec::new();
-    if !collect_match_bindings(pattern, value, &mut bindings, span)? {
-        return Ok(false);
+    if !collect_match_bindings(pattern, value, &mut bindings, &mut Vec::new(), span)? {
+        return Ok(None);
     }
-    for (name, value) in bindings {
-        env.define_owned(name, value, false, span)?;
+    let mut task_bindings = Vec::new();
+    for binding in bindings {
+        if let Some(path) = binding.task_path {
+            env.define_task_match_probe(binding.name.clone(), binding.value, span)?;
+            task_bindings.push((binding.name, path));
+        } else {
+            env.define_owned(binding.name, binding.value, false, span)?;
+        }
     }
-    Ok(true)
+    Ok(Some(task_bindings))
+}
+
+const MATCH_SCRATCH_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum MatchInput<'a> {
+    Direct(&'a Value),
+    View {
+        root: &'a BorrowedValue,
+        path_base: usize,
+    },
+}
+
+enum MatchFields<'a> {
+    Direct(&'a [Value]),
+    View {
+        root: &'a BorrowedValue,
+        path_base: usize,
+    },
+}
+
+struct MatchFrame<'a> {
+    patterns: &'a [MatchPattern],
+    fields: MatchFields<'a>,
+    next: usize,
+    path_len: usize,
+}
+
+// The two scratch buffers coexist. A replacement also coexists with its old
+// backing until its iterators move; account for both visible capacities before
+// accepting it. Output bindings remain their existing separately owned output.
+fn reserve_match_scratch<T>(values: &mut Vec<T>, other_bytes: usize, span: Span) -> KuResult<()> {
+    let error = || KuError::runtime("match traversal scratch budget exhausted", span);
+    let bytes = std::mem::size_of::<T>();
+    let available_bytes = MATCH_SCRATCH_BYTES
+        .checked_sub(other_bytes)
+        .ok_or_else(error)?;
+    let limit = available_bytes / bytes;
+    let required = values.len().checked_add(1).ok_or_else(error)?;
+    if values.capacity() > limit || required > limit {
+        return Err(error());
+    }
+    if required <= values.capacity() {
+        return Ok(());
+    }
+    let available = limit - values.capacity();
+    if required > available {
+        return Err(error());
+    }
+    let target = values
+        .capacity()
+        .saturating_mul(2)
+        .max(required)
+        .min(available);
+    let mut replacement = Vec::new();
+    replacement
+        .try_reserve_exact(target)
+        .map_err(|_| KuError::runtime("match traversal scratch out of memory", span))?;
+    if replacement.capacity() > available {
+        return Err(error());
+    }
+    replacement.append(values);
+    *values = replacement;
+    Ok(())
+}
+
+fn match_scratch_bytes<T>(values: &Vec<T>, span: Span) -> KuResult<usize> {
+    values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| KuError::runtime("match traversal scratch budget exhausted", span))
 }
 
 fn collect_match_bindings(
     pattern: &MatchPattern,
     value: &Value,
-    bindings: &mut Vec<(String, Value)>,
+    bindings: &mut Vec<MatchBinding>,
+    path: &mut Vec<ValueProjection>,
     span: Span,
 ) -> KuResult<bool> {
-    if let Value::Borrowed(view) = value {
-        match pattern {
-            MatchPattern::Wildcard => return Ok(true),
-            MatchPattern::Literal(literal) => return Ok(value == &value_from_literal(literal)),
-            MatchPattern::Binding(_) => return Err(KuError::runtime("binding an owned borrowed match payload is not supported; clone to create an owned value", span)),
-            MatchPattern::EnumVariant { enum_name, variant, fields: patterns } => {
-                let matched = view.with_read(span, |value| match value {
-                    Value::Enum { name, variant: actual, fields } if name == enum_name && actual == variant => {
-                        if fields.len() != patterns.len() { return Err(KuError::runtime("match pattern field count mismatch", span)); }
-                        Ok(true)
-                    }
-                    _ => Ok(false),
-                })?;
-                if !matched { return Ok(false); }
-                let snapshot = bindings.len();
-                for (index, pattern) in patterns.iter().enumerate() {
-                    let value = view.project(BorrowProjection::EnumField(index), span)?;
-                    if !collect_match_bindings(pattern, &value, bindings, span)? {
-                        bindings.truncate(snapshot);
+    let path_base = path.len();
+    let snapshot = bindings.len();
+    let result = collect_match_bindings_inner(pattern, value, bindings, path, span);
+    // False rolls back this whole pattern; Err retains earlier bindings, just
+    // like the recursive calls did. Neither outcome may leak its path suffix.
+    path.truncate(path_base);
+    if matches!(result, Ok(false)) {
+        bindings.truncate(snapshot);
+    }
+    result
+}
+
+fn collect_match_bindings_inner<'a>(
+    pattern: &'a MatchPattern,
+    value: &'a Value,
+    bindings: &mut Vec<MatchBinding>,
+    path: &mut Vec<ValueProjection>,
+    span: Span,
+) -> KuResult<bool> {
+    let mut ancestors: Vec<MatchFrame<'a>> = Vec::new();
+    let mut next = Some((pattern, MatchInput::Direct(value)));
+    loop {
+        if let Some((pattern, input)) = next.take() {
+            let input = match input {
+                MatchInput::Direct(Value::Borrowed(root)) => MatchInput::View {
+                    root,
+                    path_base: path.len(),
+                },
+                input => input,
+            };
+            let frame = match (pattern, input) {
+                (MatchPattern::Wildcard, MatchInput::Direct(_)) => None,
+                (MatchPattern::Binding(name), MatchInput::Direct(value)) => {
+                    bindings.push(MatchBinding {
+                        name: name.clone(),
+                        value: value.clone(),
+                        task_path: value.contains_owned_task(span)?.then(|| path.clone()),
+                    });
+                    None
+                }
+                (MatchPattern::Literal(literal), MatchInput::Direct(value)) => {
+                    if value != &value_from_literal(literal) {
                         return Ok(false);
                     }
+                    None
                 }
-                return Ok(true);
-            }
-        }
-    }
-    match pattern {
-        MatchPattern::Wildcard => Ok(true),
-        MatchPattern::Binding(name) => {
-            bindings.push((name.clone(), value.clone()));
-            Ok(true)
-        }
-        MatchPattern::Literal(literal) => Ok(value == &value_from_literal(literal)),
-        MatchPattern::EnumVariant {
-            enum_name,
-            variant,
-            fields: patterns,
-        } => {
-            let Value::Enum {
-                name,
-                variant: actual_variant,
-                fields,
-            } = value
-            else {
-                return Ok(false);
+                (
+                    MatchPattern::EnumVariant {
+                        enum_name,
+                        variant,
+                        fields: patterns,
+                    },
+                    MatchInput::Direct(value),
+                ) => {
+                    let Value::Enum {
+                        name,
+                        variant: actual,
+                        fields,
+                    } = value
+                    else {
+                        return Ok(false);
+                    };
+                    if name != enum_name || actual != variant {
+                        return Ok(false);
+                    }
+                    if patterns.len() != fields.len() {
+                        return Err(KuError::runtime(
+                            format!("match pattern '{enum_name}.{variant}' expects {} fields but got {}", fields.len(), patterns.len()),
+                            span,
+                        ));
+                    }
+                    Some(MatchFrame {
+                        patterns,
+                        fields: MatchFields::Direct(fields),
+                        next: 0,
+                        path_len: path.len(),
+                    })
+                }
+                (pattern, MatchInput::View { root, path_base }) => {
+                    let projected = path.len() > path_base;
+                    match pattern {
+                        MatchPattern::Wildcard => {
+                            if projected {
+                                root.with_projection_read(&path[path_base..], span, |_| Ok(()))?;
+                            }
+                            None
+                        }
+                        MatchPattern::Binding(name) => {
+                            let copied = if projected {
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    Ok(value.copy_value())
+                                })?
+                            } else {
+                                None
+                            };
+                            let Some(value) = copied else {
+                                return Err(KuError::runtime("binding an owned borrowed match payload is not supported; clone to create an owned value", span));
+                            };
+                            bindings.push(MatchBinding {
+                                name: name.clone(),
+                                value,
+                                task_path: None,
+                            });
+                            None
+                        }
+                        MatchPattern::Literal(literal) => {
+                            let matched =
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    Ok(value == &value_from_literal(literal))
+                                });
+                            let matched = if projected {
+                                matched?
+                            } else {
+                                matched.unwrap_or(false)
+                            };
+                            if !matched {
+                                return Ok(false);
+                            }
+                            None
+                        }
+                        MatchPattern::EnumVariant {
+                            enum_name,
+                            variant,
+                            fields: patterns,
+                        } => {
+                            let matched =
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    match value {
+                                        Value::Enum {
+                                            name,
+                                            variant: actual,
+                                            fields,
+                                        } if name == enum_name && actual == variant => {
+                                            if fields.len() != patterns.len() {
+                                                return Err(KuError::runtime(
+                                                    "match pattern field count mismatch",
+                                                    span,
+                                                ));
+                                            }
+                                            Ok(true)
+                                        }
+                                        _ => Ok(false),
+                                    }
+                                })?;
+                            if !matched {
+                                return Ok(false);
+                            }
+                            Some(MatchFrame {
+                                patterns,
+                                fields: MatchFields::View { root, path_base },
+                                next: 0,
+                                path_len: path.len(),
+                            })
+                        }
+                    }
+                }
             };
-            if name != enum_name || actual_variant != variant {
-                return Ok(false);
-            }
-            if patterns.len() != fields.len() {
-                return Err(KuError::runtime(
-                    format!(
-                        "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
-                        fields.len(),
-                        patterns.len()
-                    ),
-                    span,
-                ));
-            }
-            let snapshot = bindings.len();
-            for (pattern, field) in patterns.iter().zip(fields.iter()) {
-                if !collect_match_bindings(pattern, field, bindings, span)? {
-                    bindings.truncate(snapshot);
-                    return Ok(false);
+            if let Some(frame) = frame {
+                if !frame.patterns.is_empty() {
+                    let path_bytes = match_scratch_bytes(path, span)?;
+                    reserve_match_scratch(&mut ancestors, path_bytes, span)?;
+                    ancestors.push(frame);
                 }
             }
-            Ok(true)
+        }
+        loop {
+            let Some(frame) = ancestors.last_mut() else {
+                return Ok(true);
+            };
+            path.truncate(frame.path_len);
+            let index = frame.next;
+            if let Some(pattern) = frame.patterns.get(index) {
+                frame.next += 1;
+                let input = match frame.fields {
+                    MatchFields::Direct(fields) => MatchInput::Direct(&fields[index]),
+                    MatchFields::View { root, path_base } => MatchInput::View { root, path_base },
+                };
+                let frame_bytes = match_scratch_bytes(&ancestors, span)?;
+                reserve_match_scratch(path, frame_bytes, span)?;
+                path.push(ValueProjection::EnumField(index));
+                next = Some((pattern, input));
+                break;
+            }
+            ancestors.pop();
         }
     }
 }
@@ -4397,18 +6426,8 @@ fn value_from_literal(literal: &Literal) -> Value {
     }
 }
 
-fn value_contains_task(value: &Value) -> bool {
-    match value {
-        Value::Task(_) => true,
-        Value::Array(values) | Value::Enum { fields: values, .. } => {
-            values.iter().any(value_contains_task)
-        }
-        Value::Object(fields) | Value::Struct { fields, .. } => {
-            fields.values().any(value_contains_task)
-        }
-        Value::Result { value, .. } => value_contains_task(value),
-        _ => false,
-    }
+fn value_contains_task(value: &Value, span: Span) -> KuResult<bool> {
+    value.contains_owned_task(span)
 }
 
 fn std_module_object_value(module: &str, span: Span) -> KuResult<Value> {
@@ -4678,6 +6697,38 @@ fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
             usize_value(snapshot.running_blocking_jobs),
         ),
         (
+            "resident_blocking_jobs".to_string(),
+            usize_value(snapshot.resident_blocking_jobs),
+        ),
+        (
+            "peak_resident_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_resident_blocking_jobs),
+        ),
+        (
+            "peak_queued_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_queued_blocking_jobs),
+        ),
+        (
+            "peak_running_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_running_blocking_jobs),
+        ),
+        (
+            "accepted_blocking_jobs".to_string(),
+            usize_value(snapshot.accepted_blocking_jobs),
+        ),
+        (
+            "rejected_blocking_jobs".to_string(),
+            usize_value(snapshot.rejected_blocking_jobs),
+        ),
+        (
+            "rejected_blocking_queue".to_string(),
+            usize_value(snapshot.rejected_blocking_queue),
+        ),
+        (
+            "finished_blocking_jobs".to_string(),
+            usize_value(snapshot.finished_blocking_jobs),
+        ),
+        (
             "task_workers".to_string(),
             usize_value(snapshot.task_workers),
         ),
@@ -4708,6 +6759,26 @@ fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
         (
             "finished_tasks".to_string(),
             usize_value(snapshot.finished_tasks),
+        ),
+        (
+            "finished_cancelled_tasks".to_string(),
+            usize_value(snapshot.finished_cancelled_tasks),
+        ),
+        (
+            "finished_timed_out_tasks".to_string(),
+            usize_value(snapshot.finished_timed_out_tasks),
+        ),
+        (
+            "suppressed_cleanup_outcomes".to_string(),
+            usize_value(snapshot.suppressed_cleanup_outcomes),
+        ),
+        (
+            "cleanup_timeouts".to_string(),
+            usize_value(snapshot.cleanup_timeouts),
+        ),
+        (
+            "cleanup_unfinished_tasks".to_string(),
+            usize_value(snapshot.cleanup_unfinished_tasks),
         ),
     ]))
 }
@@ -4801,57 +6872,142 @@ fn task_error_payload(value: &Value) -> Option<Value> {
     .then(|| value.as_ref().clone())
 }
 
-pub(crate) fn function_capture_names(function: &FnDecl) -> HashSet<String> {
+// Template interpolation is parsed independently of its enclosing function.
+// Keep one budget across that reparsing and the surrounding capture walk; the
+// parser's per-expression nesting guard alone cannot bound this traversal.
+const MAX_CAPTURE_SCAN_DEPTH: usize = 128;
+const MAX_CAPTURE_SCAN_WORK: usize = 262_144;
+const MAX_CAPTURE_TEMPLATE_BYTES: usize = 1_048_576;
+const MAX_CAPTURE_TEMPLATE_TOKENS: usize = 1_024;
+
+struct CaptureScanBudget {
+    remaining_work: usize,
+    remaining_template_bytes: usize,
+}
+
+impl CaptureScanBudget {
+    fn new() -> Self {
+        Self {
+            remaining_work: MAX_CAPTURE_SCAN_WORK,
+            remaining_template_bytes: MAX_CAPTURE_TEMPLATE_BYTES,
+        }
+    }
+
+    fn spend(&mut self, amount: usize, span: Span) -> KuResult<()> {
+        self.remaining_work = self.remaining_work.checked_sub(amount).ok_or_else(|| {
+            KuError::runtime("capture analysis limit: work budget exhausted", span)
+        })?;
+        Ok(())
+    }
+
+    fn enter(&mut self, depth: usize, span: Span) -> KuResult<()> {
+        if depth >= MAX_CAPTURE_SCAN_DEPTH {
+            return Err(KuError::runtime(
+                "capture analysis limit: nesting depth exceeded",
+                span,
+            ));
+        }
+        self.spend(1, span)
+    }
+
+    fn clone_scope(&mut self, bound: &HashSet<String>, span: Span) -> KuResult<HashSet<String>> {
+        self.spend(bound.len(), span)?;
+        Ok(bound.clone())
+    }
+
+    fn template(&mut self, raw: &str, span: Span) -> KuResult<()> {
+        self.remaining_template_bytes = self
+            .remaining_template_bytes
+            .checked_sub(raw.len())
+            .ok_or_else(|| {
+                KuError::runtime(
+                    "capture analysis limit: template byte budget exhausted",
+                    span,
+                )
+            })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn function_capture_names(function: &FnDecl) -> KuResult<HashSet<String>> {
+    let mut budget = CaptureScanBudget::new();
+    budget.spend(function.params.len(), function.span)?;
     let mut bound = HashSet::new();
     bound.insert(function.name.clone());
     for param in &function.params {
         bound.insert(param.name.clone());
     }
     let mut free = HashSet::new();
-    collect_free_block(&function.body, &mut bound, &mut free);
-    free
+    collect_free_block(&function.body, &mut bound, &mut free, &mut budget, 0)?;
+    Ok(free)
 }
 
-pub(crate) fn closure_capture_names(params: &[FunctionParam], body: &[Stmt]) -> HashSet<String> {
+pub(crate) fn closure_capture_names(
+    params: &[FunctionParam],
+    body: &[Stmt],
+) -> KuResult<HashSet<String>> {
+    let mut budget = CaptureScanBudget::new();
+    budget.spend(
+        params.len(),
+        params
+            .first()
+            .map_or_else(Span::default, |param| param.span),
+    )?;
     let mut bound = HashSet::new();
     for param in params {
         bound.insert(param.name.clone());
     }
     let mut free = HashSet::new();
-    collect_free_block(body, &mut bound, &mut free);
-    free
+    collect_free_block(body, &mut bound, &mut free, &mut budget, 0)?;
+    Ok(free)
 }
 
-fn collect_free_block(body: &[Stmt], bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_block(
+    body: &[Stmt],
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
     for stmt in body {
-        collect_free_stmt(stmt, bound, free);
+        collect_free_stmt(stmt, bound, free, budget, depth)?;
     }
+    Ok(())
 }
 
-fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_stmt(
+    stmt: &Stmt,
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    let span = stmt_span(stmt);
+    budget.enter(depth, span)?;
+    let depth = depth + 1;
     match stmt {
         Stmt::VarDecl { name, value, .. } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             bound.insert(name.clone());
         }
         Stmt::Assign { name, value, .. } => {
-            collect_free_expr(value, bound, free);
-            collect_free_assignment_name(name, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
+            collect_free_assignment_name(name, bound, free, budget, span)?;
         }
         Stmt::AssignTarget { target, value, .. } => {
-            collect_free_assign_target(target, bound, free);
-            collect_free_expr(value, bound, free);
+            collect_free_assign_target(target, bound, free, budget, depth, span)?;
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::CompoundAssign { target, value, .. } => {
-            collect_free_assign_target(target, bound, free);
-            collect_free_expr(value, bound, free);
+            collect_free_assign_target(target, bound, free, budget, depth, span)?;
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::DestructureAssign { names, values, .. } => {
             for value in values {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
             for name in names.iter().flatten() {
-                collect_free_assignment_name(name, bound, free);
+                collect_free_assignment_name(name, bound, free, budget, span)?;
             }
         }
         Stmt::ObjectDestructureAssign {
@@ -4860,17 +7016,18 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             value,
             ..
         } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             for binding in bindings {
+                budget.spend(1, span)?;
                 if let Some(default) = &binding.default {
-                    collect_free_expr(default, bound, free);
+                    collect_free_expr(default, bound, free, budget, depth)?;
                 }
                 if let Some(local) = &binding.local {
-                    collect_free_assignment_name(local, bound, free);
+                    collect_free_assignment_name(local, bound, free, budget, span)?;
                 }
             }
             if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                collect_free_assignment_name(local, bound, free);
+                collect_free_assignment_name(local, bound, free, budget, span)?;
             }
         }
         Stmt::If {
@@ -4879,15 +7036,18 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             else_branch,
             ..
         } => {
-            collect_free_expr(condition, bound, free);
-            collect_free_block(then_branch, &mut bound.clone(), free);
-            collect_free_block(else_branch, &mut bound.clone(), free);
+            collect_free_expr(condition, bound, free, budget, depth)?;
+            let mut then_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(then_branch, &mut then_bound, free, budget, depth)?;
+            let mut else_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(else_branch, &mut else_bound, free, budget, depth)?;
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_free_expr(condition, bound, free);
-            collect_free_block(body, &mut bound.clone(), free);
+            collect_free_expr(condition, bound, free, budget, depth)?;
+            let mut scoped = budget.clone_scope(bound, span)?;
+            collect_free_block(body, &mut scoped, free, budget, depth)?;
         }
         Stmt::For {
             name,
@@ -4895,16 +7055,17 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             body,
             ..
         } => {
-            collect_free_expr(iterable, bound, free);
-            let mut scoped = bound.clone();
+            collect_free_expr(iterable, bound, free, budget, depth)?;
+            let mut scoped = budget.clone_scope(bound, span)?;
             scoped.insert(name.clone());
-            collect_free_block(body, &mut scoped, free);
+            collect_free_block(body, &mut scoped, free, budget, depth)?;
         }
         Stmt::Function(function) => {
-            let mut nested = bound.clone();
+            let mut nested = budget.clone_scope(bound, span)?;
+            budget.spend(function.params.len(), span)?;
             nested.insert(function.name.clone());
             nested.extend(function.params.iter().map(|param| param.name.clone()));
-            collect_free_block(&function.body, &mut nested, free);
+            collect_free_block(&function.body, &mut nested, free, budget, depth)?;
             bound.insert(function.name.clone());
         }
         Stmt::Try {
@@ -4914,43 +7075,55 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             finally_body,
             ..
         } => {
-            collect_free_block(body, &mut bound.clone(), free);
-            let mut catch_bound = bound.clone();
+            let mut try_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(body, &mut try_bound, free, budget, depth)?;
+            let mut catch_bound = budget.clone_scope(bound, span)?;
             if let Some(name) = catch_name {
                 catch_bound.insert(name.clone());
             }
-            collect_free_block(catch_body, &mut catch_bound, free);
-            collect_free_block(finally_body, &mut bound.clone(), free);
+            collect_free_block(catch_body, &mut catch_bound, free, budget, depth)?;
+            let mut finally_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(finally_body, &mut finally_bound, free, budget, depth)?;
         }
         Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free),
+        Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free, budget, depth)?,
     }
+    Ok(())
 }
 
 fn collect_free_assignment_name(
     name: &str,
     bound: &mut HashSet<String>,
     free: &mut HashSet<String>,
-) {
+    budget: &mut CaptureScanBudget,
+    span: Span,
+) -> KuResult<()> {
+    budget.spend(1, span)?;
     if !bound.contains(name) {
         free.insert(name.to_string());
     }
     bound.insert(name.to_string());
+    Ok(())
 }
 
 fn collect_free_assign_target(
     target: &AssignTarget,
     bound: &HashSet<String>,
     free: &mut HashSet<String>,
-) {
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    span: Span,
+) -> KuResult<()> {
+    budget.enter(depth, span)?;
+    let depth = depth + 1;
     match target {
         AssignTarget::Variable(name) => {
             if !bound.contains(name) {
@@ -4958,11 +7131,14 @@ fn collect_free_assign_target(
             }
         }
         AssignTarget::Index { target, index } => {
-            collect_free_expr(target, bound, free);
-            collect_free_expr(index, bound, free);
+            collect_free_expr(target, bound, free, budget, depth)?;
+            collect_free_expr(index, bound, free, budget, depth)?;
         }
-        AssignTarget::Field { target, .. } => collect_free_expr(target, bound, free),
+        AssignTarget::Field { target, .. } => {
+            collect_free_expr(target, bound, free, budget, depth)?
+        }
     }
+    Ok(())
 }
 
 fn expect_bool_condition(value: Value, span: Span) -> KuResult<bool> {
@@ -4994,7 +7170,15 @@ fn expect_runtime_arg_count(
     }
 }
 
-fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_expr(
+    expr: &Expr,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    budget.enter(depth, expr.span)?;
+    let depth = depth + 1;
     match &expr.kind {
         ExprKind::Variable(name) => {
             if !bound.contains(name) {
@@ -5002,74 +7186,427 @@ fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<St
             }
         }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
-            collect_free_expr(expr, bound, free);
+            collect_free_expr(expr, bound, free, budget, depth)?;
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_free_expr(left, bound, free);
-            collect_free_expr(right, bound, free);
+            collect_free_expr(left, bound, free, budget, depth)?;
+            collect_free_expr(right, bound, free, budget, depth)?;
         }
         ExprKind::Call { callee, args } => {
-            collect_free_expr(callee, bound, free);
+            collect_free_expr(callee, bound, free, budget, depth)?;
             for arg in args {
-                collect_free_expr(arg, bound, free);
+                collect_free_expr(arg, bound, free, budget, depth)?;
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         ExprKind::Index { target, index } => {
-            collect_free_expr(target, bound, free);
-            collect_free_expr(index, bound, free);
+            collect_free_expr(target, bound, free, budget, depth)?;
+            collect_free_expr(index, bound, free, budget, depth)?;
         }
         ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            collect_free_expr(target, bound, free)
+            collect_free_expr(target, bound, free, budget, depth)?
         }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             for arm in arms {
-                let mut arm_bound = bound.clone();
-                bind_match_pattern_names(&arm.pattern, &mut arm_bound);
+                let mut arm_bound = budget.clone_scope(bound, expr.span)?;
+                bind_match_pattern_names(&arm.pattern, &mut arm_bound, budget, depth, expr.span)?;
                 if let Some(guard) = &arm.guard {
-                    collect_free_expr(guard, &arm_bound, free);
+                    collect_free_expr(guard, &arm_bound, free, budget, depth)?;
                 }
-                collect_free_expr(&arm.value, &arm_bound, free);
+                collect_free_expr(&arm.value, &arm_bound, free, budget, depth)?;
             }
         }
         ExprKind::Function { params, body, .. } => {
-            let mut nested = bound.clone();
+            let mut nested = budget.clone_scope(bound, expr.span)?;
+            budget.spend(params.len(), expr.span)?;
             for param in params {
                 nested.insert(param.name.clone());
             }
-            collect_free_block(body, &mut nested, free);
+            collect_free_block(body, &mut nested, free, budget, depth)?;
+        }
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            collect_free_template(raw, expr.span, bound, free, budget, depth)?;
         }
         ExprKind::Literal(_) => {}
     }
+    Ok(())
 }
 
-fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
-    match pattern {
-        MatchPattern::Binding(name) => {
-            bound.insert(name.clone());
+/// Visit actual interpolation expressions in source order, without retaining
+/// every parsed AST at once. Validate the complete generated expression before
+/// invoking the caller, including nested templates and their shared budget.
+/// An error must never be interpreted as an empty set of captures/effects.
+pub(crate) fn visit_template_capture_expressions(
+    raw: &str,
+    span: Span,
+    mut visitor: impl FnMut(&Expr) -> KuResult<()>,
+) -> KuResult<()> {
+    let bound = HashSet::new();
+    let mut validation_captures = HashSet::new();
+    visit_template_capture_expressions_with_budget(
+        raw,
+        span,
+        &mut CaptureScanBudget::new(),
+        0,
+        &mut |expression, budget, depth| {
+            collect_free_expr(expression, &bound, &mut validation_captures, budget, depth)?;
+            visitor(expression)
+        },
+    )
+}
+
+fn collect_free_template(
+    raw: &str,
+    span: Span,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    visit_template_capture_expressions_with_budget(
+        raw,
+        span,
+        budget,
+        depth,
+        &mut |expression, budget, depth| collect_free_expr(expression, bound, free, budget, depth),
+    )
+}
+
+fn visit_template_capture_expressions_with_budget(
+    raw: &str,
+    span: Span,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    visitor: &mut impl FnMut(&Expr, &mut CaptureScanBudget, usize) -> KuResult<()>,
+) -> KuResult<()> {
+    budget.enter(depth, span)?;
+    budget.template(raw, span)?;
+    // Match eval_template's streaming splitting and escaping exactly. In
+    // particular the first unescaped '}' ends an interpolation; this scan must
+    // not accept a different nested-brace grammar from actual evaluation.
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            chars.next();
+            continue;
         }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_names(field, bound);
+        if ch != '{' {
+            continue;
+        }
+        let mut source = String::new();
+        let mut found_end = false;
+        while let Some(inner) = chars.next() {
+            if inner == '\\' {
+                if let Some(next) = chars.next() {
+                    source.push('\\');
+                    source.push(next);
+                }
+                continue;
+            }
+            if inner == '}' {
+                found_end = true;
+                break;
+            }
+            source.push(inner);
+        }
+        if !found_end {
+            return Err(KuError::runtime(
+                "unterminated template interpolation",
+                span,
+            ));
+        }
+        if source.trim().is_empty() {
+            return Err(KuError::runtime("empty template interpolation", span));
+        }
+        let tokens = Lexer::new(&source).tokenize()?;
+        // Long flat binary expressions are constructed iteratively by Parser,
+        // but their AST drops recursively. Bound the newly owned AST before
+        // parsing, including the failure path after a capture-depth rejection.
+        if tokens.len() > MAX_CAPTURE_TEMPLATE_TOKENS {
+            return Err(KuError::parse(
+                "capture analysis limit: template token limit exceeded (too many tokens)",
+                span,
+            ));
+        }
+        budget.spend(tokens.len(), span)?;
+        let expression = Parser::new(tokens).parse_expression_only()?;
+        visitor(&expression, budget, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn bind_match_pattern_names(
+    pattern: &MatchPattern,
+    bound: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    span: Span,
+) -> KuResult<()> {
+    let mut ancestors: Vec<(std::slice::Iter<'_, MatchPattern>, usize)> = Vec::new();
+    let mut next = Some((pattern, depth));
+    loop {
+        if let Some((pattern, depth)) = next.take() {
+            // Preserve the old preorder work charge and exact semantic depth.
+            budget.enter(depth, span)?;
+            match pattern {
+                MatchPattern::Binding(name) => {
+                    bound.insert(name.clone());
+                }
+                MatchPattern::EnumVariant { fields, .. } if !fields.is_empty() => {
+                    reserve_match_scratch(&mut ancestors, 0, span)?;
+                    ancestors.push((fields.iter(), depth + 1));
+                }
+                _ => {}
             }
         }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+        loop {
+            let Some((children, depth)) = ancestors.last_mut() else {
+                return Ok(());
+            };
+            if let Some(child) = children.next() {
+                next = Some((child, *depth));
+                break;
+            }
+            ancestors.pop();
+        }
     }
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod template_capture_tests {
+    use super::*;
+
+    fn expression(source: &str) -> Expr {
+        Parser::new(Lexer::new(source).tokenize().expect("lex fixture"))
+            .parse_expression_only()
+            .expect("parse fixture")
+    }
+
+    fn function(source: &str) -> FnDecl {
+        let program = Parser::new(Lexer::new(source).tokenize().expect("lex fixture"))
+            .parse_program()
+            .expect("parse fixture");
+        let Item::Function(function) = program.items.into_iter().next().expect("one function")
+        else {
+            panic!("expected function fixture");
+        };
+        function
+    }
+
+    #[test]
+    fn named_function_template_capture_respects_self_parameters_and_locals() {
+        let function = function(
+            "fn Render(arg: int): str { local: int = 3; return `{helper(arg + local)} {outer} {Render(arg)}` }",
+        );
+        assert_eq!(
+            function_capture_names(&function).expect("capture analysis"),
+            HashSet::from(["helper".to_string(), "outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn closure_template_capture_uses_expressions_and_ignores_escaped_braces() {
+        let expression = expression(
+            r#"fn(value: int) { local: str = "owned"; return `\{escaped\} {helper(value)} {local.clone()} {outer}` }"#,
+        );
+        let ExprKind::Function { params, body, .. } = expression.kind else {
+            panic!("expected closure fixture");
+        };
+        assert_eq!(
+            closure_capture_names(&params, &body).expect("capture analysis"),
+            HashSet::from(["helper".to_string(), "outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn template_nested_arrow_capture_excludes_its_parameter() {
+        let expression = expression("fn() { return `{((local: int) => local + outer)(1)}` }");
+        let ExprKind::Function { params, body, .. } = expression.kind else {
+            panic!("expected closure fixture");
+        };
+        assert_eq!(
+            closure_capture_names(&params, &body).expect("capture analysis"),
+            HashSet::from(["outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn runtime_named_and_anonymous_functions_retain_template_only_capture() {
+        let span = Span::default();
+        for named in [false, true] {
+            let mut interpreter = Interpreter::new();
+            let mut env = Env::new();
+            env.define_owned("count".into(), Value::Int(42), true, span)
+                .expect("define capture");
+            if named {
+                interpreter
+                    .exec_stmt(
+                        &Stmt::Function(function("fn Render(): str { return `{count}` }")),
+                        &mut env,
+                        0,
+                    )
+                    .expect("create named function");
+            } else {
+                let closure = interpreter
+                    .eval(&expression("fn() { return `{count}` }"), &mut env, 0)
+                    .expect("create closure");
+                env.define_owned("Render".into(), closure, true, span)
+                    .expect("define closure");
+            }
+            let value = interpreter
+                .eval(&expression("Render()"), &mut env, 0)
+                .expect("invoke template closure");
+            assert!(matches!(value, Value::String(text) if text == "42"));
+        }
+    }
+
+    #[test]
+    fn malformed_templates_fail_capture_analysis_instead_of_returning_empty() {
+        for raw in ["{", "{}", "{name +}", "{name other}", "{@}"] {
+            let span = Span::default();
+            let body = [Stmt::Return {
+                value: Some(Expr::new(
+                    ExprKind::Literal(Literal::TemplateString(raw.into())),
+                    span,
+                )),
+                span,
+            }];
+            assert!(closure_capture_names(&[], &body).is_err(), "{raw}");
+            let mut calls = 0;
+            assert!(visit_template_capture_expressions(raw, span, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+            assert_eq!(calls, 0, "invalid interpolation must not reach visitor");
+        }
+    }
+
+    #[test]
+    fn template_capture_visitor_preserves_order_and_propagates_visitor_failure() {
+        let mut names = Vec::new();
+        visit_template_capture_expressions("{first}{second}", Span::default(), |expr| {
+            let ExprKind::Variable(name) = &expr.kind else {
+                panic!("expected variable interpolation");
+            };
+            names.push(name.clone());
+            Ok(())
+        })
+        .expect("visit both interpolations");
+        assert_eq!(names, ["first", "second"]);
+
+        let mut calls = 0;
+        let error = visit_template_capture_expressions("{first}{second}", Span::default(), |_| {
+            calls += 1;
+            Err(KuError::runtime("visitor failure", Span::default()))
+        })
+        .expect_err("visitor failure must propagate");
+        assert_eq!(calls, 1);
+        assert_eq!(error.message, "visitor failure");
+    }
+
+    #[test]
+    fn template_capture_visitor_rejects_deep_generated_ast_before_callback() {
+        // Flat sums now fail during construction, before capture validation.
+        // Keep that source and require the earlier, specific parse error.
+        let raw = format!("{{{}0}}", "0+".repeat(MAX_CAPTURE_SCAN_DEPTH + 1));
+        let mut calls = 0;
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("deep generated AST must be rejected");
+        assert_eq!(error.kind, crate::error::KuErrorKind::Parse);
+        assert_eq!(
+            error.message,
+            "maximum expression tree depth exceeded; expression is too deeply nested"
+        );
+        assert_eq!(calls, 0);
+
+        // Parentheses split local binary loops. Exactly 128 structural nodes
+        // fit Parser; interpolation's additional capture depth must still
+        // reject before the callback using the unchanged capture limit.
+        let mut expression = "0".to_owned();
+        for additions in [32, 32, 32, 31] {
+            expression = format!("({expression}){}", "+0".repeat(additions));
+        }
+        let raw = format!("{{{expression}}}");
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("capture depth remains bounded after parser admission");
+        assert_eq!(error.kind, crate::error::KuErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "capture analysis limit: nesting depth exceeded"
+        );
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn template_capture_token_limit_precedes_new_ast_construction() {
+        let raw = format!("{{{}0}}", "0+".repeat(MAX_CAPTURE_TEMPLATE_TOKENS));
+        let mut calls = 0;
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("oversized token stream must be rejected");
+        assert!(error.message.contains("template token limit exceeded"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn template_capture_work_is_shared_between_interpolations() {
+        let mut budget = CaptureScanBudget {
+            remaining_work: 5,
+            remaining_template_bytes: 64,
+        };
+        let error = collect_free_template(
+            "{first}{second}",
+            Span::default(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &mut budget,
+            0,
+        )
+        .expect_err("second interpolation must not reset work budget");
+        assert!(error.message.contains("work budget exhausted"));
+    }
+
+    #[test]
+    fn template_capture_byte_budget_is_checked_before_lexing() {
+        let mut budget = CaptureScanBudget {
+            remaining_work: MAX_CAPTURE_SCAN_WORK,
+            remaining_template_bytes: 5,
+        };
+        let error = collect_free_template(
+            "{name}",
+            Span::default(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &mut budget,
+            0,
+        )
+        .expect_err("template must fit cumulative byte budget");
+        assert!(error.message.contains("template byte budget exhausted"));
     }
 }
 
@@ -5263,6 +7800,7 @@ mod collection_tests {
                 "starts_with",
                 "ends_with",
                 "stringify",
+                "encode",
                 "push",
             ] {
                 assert_eq!(

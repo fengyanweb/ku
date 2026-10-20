@@ -1,0 +1,101 @@
+{
+  "siteTitle": "Ku — Eine Sprache im Entstehen",
+  "siteDescription": "Entdecken Sie Ku, eine experimentelle Programmiersprache. Erkunden Sie echte Beispiele, Installation, Sprachleitfäden und Backend-Unterstützung.",
+  "skip": "Zum Inhalt springen",
+  "home": "Ku-Startseite",
+  "documentation": "Dokumentation",
+  "languageGuide": "Sprachleitfaden",
+  "releases": "Versionshinweise",
+  "navigation": "Hauptnavigation",
+  "search": "Suche",
+  "searchDocs": "Dokumentation durchsuchen",
+  "searchTitle": "Ku-Dokumentation durchsuchen",
+  "searchPlaceholder": "Versuchen Sie JSON, json.encode, parse_error…",
+  "searchEmpty": "Zum Suchen tippen.",
+  "searching": "Suche läuft…",
+  "searchNoResults": "Keine Ergebnisse. Versuchen Sie ein anderes Stichwort.",
+  "searchUnavailable": "Die Suche ist in der gebauten Vorschau verfügbar. Verwenden Sie die Navigation zum Lesen der Dokumentation.",
+  "theme": "Darstellung",
+  "language": "Sprache",
+  "menu": "Menü",
+  "footer": "Fußzeile",
+  "tagline": "Eine Sprache im Entstehen.",
+  "project": "Projekt & Lizenz",
+  "support": "Unterstützungsmatrix",
+  "reportIssue": "Problem melden",
+  "experimental": "Experimentell. Nicht produktionsreif.",
+  "sourceAvailable": "Quelltext einsehbar",
+  "development": "Experimental prerelease",
+  "heroTitle": ["Eine Idee.", "Ein wenig", "Ku."],
+  "heroDescription": "Eine kleine Sprache mit Raum zum Wachsen. Lesbare Syntax, explizite Ownership und eine Toolchain, die Sie ab der ersten Zeile erkunden können.",
+  "start": "Mit Ku beginnen",
+  "explore": "Die Sprache entdecken",
+  "heroNote": "Bewusst am Anfang. Erkunden, experimentieren, Feedback geben.",
+  "interpreter": "Interpreter",
+  "viewSource": "Quelltext ansehen",
+  "principle": "Klein anfangen. Verstehen, was Sie bauen.",
+  "approachTitle": ["Weniger Oberfläche.", "Mehr Klarheit."],
+  "approachDescription": "Lernen Sie Ku anhand seines tatsächlichen Verhaltens kennen und behalten Sie die aktuellen Grenzen im Blick.",
+  "features": [
+    [
+      "Lesen. Verstehen.",
+      "Deklarieren Sie eine Bindung bei der ersten Zuweisung. Drücken Sie Ihre Idee mit Funktionen, strukturierten Werten und expliziter Fehlerbehandlung aus.",
+      "Sprachleitfaden",
+      "docs/guide/language"
+    ],
+    [
+      "Ownership sichtbar machen.",
+      "Standardmäßig verschieben, bewusst klonen und in synchronen Aufrufen schreibgeschützt ausleihen. Die aktuellen Regeln sind zusammen mit ihren Grenzen dokumentiert.",
+      "Ownership & Grenzen",
+      "docs/support"
+    ],
+    [
+      "Ausführungspfad wählen.",
+      "Mit dem Interpreter ausführen, einen ausführbaren Runner verpacken oder natives C erkunden. Prüfen Sie vor der Backend-Wahl die Unterstützungsmatrix.",
+      "Toolchain erkunden",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Vertraute Daten.", "Explizite Fehler."],
+  "practiceDescription": "Importieren Sie ein Modul, erstellen Sie einen Wert und kodieren Sie ihn als JSON. Der Operator ? reicht Fehler weiter, statt sie zu verbergen.",
+  "jsonReference": "JSON-Referenz lesen",
+  "exampleNote": "Synchrones Beispiel. Backend- und Versionsdetails stehen in der Referenz.",
+  "copy": "Code kopieren",
+  "copyExample": "JSON-Beispiel kopieren",
+  "copied": "Kopiert ✓",
+  "copyFallback": "Code zum Kopieren auswählen",
+  "learnTitle": "Ein guter Anfang.",
+  "install": "Installation & Downloads",
+  "resources": [
+    [
+      "Ihr erstes Ku-Programm",
+      "Installieren, ausführen und das Ergebnis sehen.",
+      "docs/getting-started"
+    ],
+    [
+      "Die Sprache lernen",
+      "Bindungen, Funktionen, Werte und Fehler.",
+      "docs/guide/language"
+    ],
+    ["Standardbibliothek", "Module finden und JSON erkunden.", "docs/stdlib"],
+    [
+      "Die Grenzen kennen",
+      "Plattformen, Backends und aktuelle Einschränkungen.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "Ein laufendes Projekt. Eine Geschichte zum Verfolgen.",
+  "projectDescription": "Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v{releasedVersion}. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases.",
+  "github": "Auf GitHub erkunden",
+  "license": "Der Quelltext ist einsehbar. Es wurde keine Open-Source-Lizenz erteilt.",
+  "verified": "Geprüft",
+  "limitations": "Unterstützung & Grenzen",
+  "version": "Dokumentationsversion",
+  "next": "v0.0.18",
+  "snapshot": "Snapshot {version}",
+  "snapshotNotice": "Archivierter Dokumentationsstand. Er wird unabhängig von der aktuellen Entwicklungsdokumentation aufbewahrt und kündigt keine Binärveröffentlichung an.",
+  "nextNotice": "Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v{currentVersion}. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases.",
+  "startGroup": "Hier beginnen",
+  "toolsGroup": "Sprache & Werkzeuge",
+  "projectGroup": "Projekt"
+}

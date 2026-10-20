@@ -192,6 +192,42 @@ fn std_string_byte_len_rejects_wrong_types_and_arity() {
 }
 
 #[test]
+fn std_json_encode_decode_example_and_numeric_limits() {
+    let example = include_str!("../examples/json.ku");
+    check_source("json.ku", example).expect("JSON encode/decode example should check");
+    run_source("json.ku", example).expect("JSON encode/decode example should run");
+    let source = r#"
+fn ExpectReject(text: str): null! {
+    rejected = false
+    try {
+        json.decode(text)?
+    } catch (error) {
+        rejected = error.domain == "json" && error.code == "parse_error"
+    }
+    if (!rejected) { panic("out-of-range integer was accepted") }
+    return ok(null)
+}
+fn main(): null! {
+    maximum = json.decode("9223372036854775807")?
+    minimum = json.decode("-9223372036854775808")?
+    if (json.encode(maximum)? != "9223372036854775807" || json.encode(minimum)? != "-9223372036854775808") {
+        panic("JSON integer boundary changed during encoding")
+    }
+    if (maximum.as_int()? != 9223372036854775807 || minimum.as_int()? != -9223372036854775807 - 1) {
+        panic("JSON integer boundary lost precision")
+    }
+    duplicate = json.decode("{\"value\":1,\"value\":2}")?
+    if (duplicate["value"]?.as_int()? + 1 != 3) { panic("duplicate key did not keep the last value") }
+    ExpectReject("9223372036854775808")?
+    ExpectReject("-9223372036854775809")?
+    return ok(null)
+}
+"#;
+    check_source("json-boundaries.ku", source).expect("JSON alias numeric limits should check");
+    run_source("json-boundaries.ku", source).expect("JSON alias numeric limits should run");
+}
+
+#[test]
 fn std_json_try_parse_integrates_with_question_and_try_catch() {
     let source = r#"
 fn parse_value(): str! {
@@ -679,18 +715,29 @@ fn main() {
     if (server.max_pending_requests <= 0) {
         panic("bad pending limit")
     }
+    if (server.max_buffer_bytes != 67108864) {
+        panic("bad buffer budget default")
+    }
     tuned = http.server({
         max_body_bytes: 4,
         read_header_timeout_ms: 500,
         max_connections: 2,
         max_active_requests: 1,
-        max_pending_requests: 1
+        max_pending_requests: 1,
+        max_buffer_bytes: 4096
     })
     if (tuned.max_body_bytes != 4) {
         panic("bad configured server")
     }
     if (tuned.max_connections != 2 || tuned.max_active_requests != 1 || tuned.max_pending_requests != 1) {
         panic("bad configured backpressure")
+    }
+    if (tuned.max_buffer_bytes != 4096) {
+        panic("bad configured buffer budget")
+    }
+    tuned.max_buffer_bytes = 8192
+    if (tuned.max_buffer_bytes != 8192) {
+        panic("bad assigned buffer budget")
     }
     client2 = http.client({ timeout_ms: 1000 })
     if (client2.timeout_ms != 1000) {
@@ -749,6 +796,12 @@ fn main() {
 #[test]
 fn std_http_config_limits_must_be_positive() {
     for source in [
+        r#"
+import "std.http"
+fn main() {
+    http.server({ max_buffer_bytes: 0 })
+}
+"#,
         r#"
 import "std.http"
 
@@ -1864,4 +1917,45 @@ fn http_pg_example_serializes_database_text_and_avoids_dom_html_sinks() {
     );
     assert!(frontend.contains("replaceChildren"));
     assert!(frontend.contains("textContent"));
+}
+
+#[test]
+fn std_json_large_float_roundtrip_preserves_integer_range() {
+    let source = r#"
+import json from "std.json"
+fn ExpectFloat(text: str, expected: str): null! {
+    value = json.decode(text)?
+    encoded = json.encode(value)?
+    if (encoded != expected || json.stringify(value)? != expected) {
+        panic("large float JSON spelling changed")
+    }
+    decoded = json.decode(encoded)?
+    if (decoded != value || json.encode(decoded)? != encoded) {
+        panic("large float JSON roundtrip changed its value")
+    }
+    if (json.stringify(json.parse(encoded)?)? != encoded) {
+        panic("legacy JSON aliases disagree")
+    }
+    return ok(null)
+}
+fn main(): null! {
+    ExpectFloat("1e20", "100000000000000000000.0")?
+    ExpectFloat("-1e20", "-100000000000000000000.0")?
+    ExpectFloat("9.223372036854776e18", "9223372036854776000.0")?
+    ExpectFloat("-9.223372036854776e18", "-9223372036854776000.0")?
+    nested = json.decode("{\"values\":[1e20,-1e20]}")?
+    decoded = json.decode(json.encode(nested)?)?
+    values = decoded["values"]?
+    original = nested["values"]?
+    if (values[0]? != original[0]? || values[1]? != original[1]?) {
+        panic("nested large float roundtrip changed its value")
+    }
+    if (json.encode(json.decode("1.0")?)? != "1" || json.encode(json.decode("-0.0")?)? != "-0") {
+        panic("existing small integral float spelling changed")
+    }
+    return ok(null)
+}
+"#;
+    check_source("json-large-float.ku", source).expect("large float JSON program should check");
+    run_source("json-large-float.ku", source).expect("large float JSON program should roundtrip");
 }

@@ -1,0 +1,9 @@
+---
+import { localeFromPath, translate } from '../i18n/locales';
+const locale = localeFromPath(Astro.url.pathname);
+const t = translate(locale);
+---
+
+<a class="ku-doc-title" href={`/${locale}/`}>
+  ku.<span>{t.documentation}</span>
+</a>

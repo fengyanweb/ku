@@ -1,0 +1,43 @@
+---
+import { localeDefinitions } from '../i18n/locales';
+import { translationsForPath } from '../i18n/routes';
+import { archiveFromPath, versions } from '../data/versions';
+const archive = archiveFromPath(Astro.url.pathname);
+const versionLabel = archive?.label ?? versions.current;
+const head = Astro.locals.starlightRoute.head.filter(
+  ({ tag, attrs }) =>
+    !(
+      tag === 'link' &&
+      (attrs?.rel === 'canonical' || attrs?.rel === 'alternate')
+    ) && !(tag === 'meta' && attrs?.name === 'robots'),
+);
+const path = Astro.url.pathname;
+const indexable =
+  import.meta.env.INDEXABLE === 'true' &&
+  !!Astro.site &&
+  !Astro.locals.starlightRoute.isFallback;
+---
+
+{head.map(({ tag: Tag, attrs, content }) => (
+  <Tag
+    {...attrs}
+    set:html={Tag === 'title' ? `${content} · ${versionLabel}` : content}
+  />
+))}
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<meta
+  name="robots"
+  content={indexable ? 'index, follow' : 'noindex, nofollow'}
+/>
+{Astro.site && (
+  <>
+    <link rel="canonical" href={new URL(path, Astro.site)} />
+    {translationsForPath(path).map(({ locale: key, path: translatedPath }) => (
+      <link
+        rel="alternate"
+        hreflang={localeDefinitions[key].lang}
+        href={new URL(translatedPath, Astro.site)}
+      />
+    ))}
+  </>
+)}

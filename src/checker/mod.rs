@@ -2,12 +2,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     ast::*,
-    error::{KuError, KuResult},
+    error::{DiagnosticId, KuError, KuResult},
     span::Span,
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
 
+mod generic;
+#[cfg(test)]
+mod loop_analysis_tests;
+mod statement_depth;
+pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
+
 const MAX_CHECK_DEPTH: usize = 32;
+// Shared by nested speculative loop passes, never replenished per loop.
+const MAX_LOOP_ANALYSIS_WORK: usize = 100_000;
 /// Prefix owned by the compiler's generated C identifiers; see `reject_reserved_name`.
 const RESERVED_NAME_PREFIX: &str = "__ku_";
 /// Sub-namespaces the import expander synthesizes inside the reserved prefix. These
@@ -50,7 +58,7 @@ enum Type {
     },
     /// A tagged dynamic value read out of a dynamic object (`obj[key]?`,
     /// `get_or`). A first-class type, NOT `Unknown`: only println /
-    /// json.stringify / object-array nesting / `==` `!=` / explicit
+    /// json.stringify/encode / object-array nesting / `==` `!=` / explicit
     /// `.as_int()` / `.as_str()` accept it; arithmetic is rejected.
     KuValue,
     Unknown,
@@ -135,6 +143,9 @@ fn move_of_moved_error(root: &str, path: &[String], span: Span) -> KuError {
 
 type BindingId = u64;
 
+mod http_shared;
+use http_shared::HttpSharedCallable;
+
 /// The binding cells reachable from closures contained in a value. `complete`
 /// distinguishes a proven empty dependency set (for example a top-level
 /// function) from a value whose provenance the checker could not recover.
@@ -142,6 +153,12 @@ type BindingId = u64;
 struct ClosureProvenance {
     dependencies: HashSet<BindingId>,
     complete: bool,
+    /// An indirect write may have changed the body. This follows values through
+    /// clone/move/return; a fresh alias cannot validate a stale callable Type.
+    http_callable_body_uncertain: bool,
+    /// Flow-local evidence travels with aliases and escaping environments.
+    /// These are not ownership edges: copying a value does not capture its cell.
+    http_shared: BTreeMap<BindingId, HttpSharedCallable>,
 }
 
 impl ClosureProvenance {
@@ -149,6 +166,8 @@ impl ClosureProvenance {
         Self {
             dependencies: HashSet::new(),
             complete: true,
+            http_callable_body_uncertain: false,
+            http_shared: BTreeMap::new(),
         }
     }
 
@@ -156,12 +175,20 @@ impl ClosureProvenance {
         Self {
             dependencies: HashSet::new(),
             complete: false,
+            http_callable_body_uncertain: false,
+            http_shared: BTreeMap::new(),
         }
     }
 
     fn merge(&mut self, other: &Self) {
         self.dependencies.extend(other.dependencies.iter().copied());
         self.complete &= other.complete;
+        self.http_callable_body_uncertain |= other.http_callable_body_uncertain;
+        for (binding, origin) in &other.http_shared {
+            self.http_shared
+                .entry(*binding)
+                .or_insert_with(|| origin.clone());
+        }
     }
 }
 
@@ -176,6 +203,8 @@ struct ClosureReturnFlow {
 struct ClosureWriteEffect {
     target: BindingId,
     provenance: ClosureProvenance,
+    /// A recovered assignment site; opaque may-writes use the calling site.
+    assignment_span: Option<Span>,
 }
 
 #[derive(Clone)]
@@ -213,6 +242,8 @@ struct ClosureBodyView<'a> {
 struct ClosureProvenanceKey {
     dependencies: Vec<BindingId>,
     complete: bool,
+    http_callable_body_uncertain: bool,
+    http_shared: Vec<BindingId>,
 }
 
 impl From<&ClosureProvenance> for ClosureProvenanceKey {
@@ -222,6 +253,8 @@ impl From<&ClosureProvenance> for ClosureProvenanceKey {
         Self {
             dependencies,
             complete: provenance.complete,
+            http_callable_body_uncertain: provenance.http_callable_body_uncertain,
+            http_shared: provenance.http_shared.keys().copied().collect(),
         }
     }
 }
@@ -434,6 +467,10 @@ pub struct Checker {
     scopes: Vec<HashMap<String, VarType>>,
     current_return: Type,
     check_depth: usize,
+    /// Only the just-completed expression's value evidence, not a scope/span
+    /// cache. Call results retain the arguments as they were evaluated. The
+    /// address is compared for identity only, never dereferenced or persisted.
+    completed_expression_provenance: Option<(usize, Span, ClosureProvenance)>,
     recoverable_depth: usize,
     loop_depth: usize,
     /// One collector per enclosing loop; each holds the move state captured at
@@ -468,6 +505,10 @@ pub struct Checker {
     /// exit; after its finally is checked, still-pending exits are forwarded to
     /// the parent so nested try/finally chains preserve execution order.
     try_exit_collectors: Vec<TryExitCollector>,
+    generic_state: generic::GenericState,
+    loop_analysis_remaining: usize,
+    loop_analysis_depth: usize,
+    loop_analysis_exhausted: Option<Span>,
 }
 
 impl Checker {
@@ -479,6 +520,7 @@ impl Checker {
             scopes: vec![HashMap::new()],
             current_return: Type::Void,
             check_depth: 0,
+            completed_expression_provenance: None,
             recoverable_depth: 0,
             loop_depth: 0,
             loop_break_states: Vec::new(),
@@ -494,6 +536,10 @@ impl Checker {
             function_body_outer_bindings: HashMap::new(),
             closure_capture_boundaries: Vec::new(),
             try_exit_collectors: Vec::new(),
+            generic_state: generic::GenericState::default(),
+            loop_analysis_remaining: MAX_LOOP_ANALYSIS_WORK,
+            loop_analysis_depth: 0,
+            loop_analysis_exhausted: None,
         }
     }
 
@@ -539,6 +585,12 @@ impl Checker {
     }
 
     pub fn check(mut self, program: &Program) -> KuResult<()> {
+        self.check_program(program)?;
+        self.check_generic_instances()
+    }
+
+    fn check_program(&mut self, program: &Program) -> KuResult<()> {
+        statement_depth::check(program)?;
         let mut top_level_names = HashMap::new();
         for item in &program.items {
             match item {
@@ -699,9 +751,27 @@ impl Checker {
             }
         }
 
+        let has_generic_functions = self
+            .functions
+            .values()
+            .any(|function| !function.type_params.is_empty());
         for item in &program.items {
             if let Item::Function(function) = item {
-                self.check_function(function)?;
+                if has_generic_functions {
+                    self.generic_state.context.clone_from(&function.name);
+                }
+                // Template variables remain in scope throughout the body, not
+                // only in its signature. Concrete rechecks install actual types.
+                self.generic_state.bindings.extend(
+                    function
+                        .type_params
+                        .iter()
+                        .map(|name| (name.clone(), Type::Generic(name.clone()))),
+                );
+                let checked = self.check_function(function);
+                self.generic_state.bindings.clear();
+                self.check_loop_analysis_budget()?;
+                checked?;
             }
         }
         Ok(())
@@ -905,6 +975,9 @@ impl Checker {
                 }
                 Ok(Type::Union(resolved))
             }
+            TypeName::Custom(name) if self.generic_state.bindings.contains_key(name) => {
+                Ok(self.generic_state.bindings[name].clone())
+            }
             TypeName::Custom(name) if generics.contains(name) => Ok(Type::Generic(name.clone())),
             TypeName::Custom(name) if self.structs.contains_key(name) => {
                 Ok(Type::Struct(name.clone()))
@@ -986,6 +1059,11 @@ impl Checker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        self.completed_expression_provenance = None;
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::VarDecl {
                 name,
@@ -1025,6 +1103,10 @@ impl Checker {
             }
             Stmt::Assign { name, value, span } => {
                 if self.contains(name) {
+                    self.reject_http_shared_write(
+                        self.get_allow_moved(name, *span)?.binding_id,
+                        *span,
+                    )?;
                     reject_direct_closure_cycle(name, value, *span)?;
                 }
                 // A closure assigned to an already-declared function-typed
@@ -1078,12 +1160,16 @@ impl Checker {
                 // `obj["self"] = obj` and `obj[key] = key` must not read a moved
                 // receiver/key in native code.
                 let actual = self.consume_expr(value)?;
+                let closure_provenance = if self.type_may_contain_function_value(&actual) {
+                    Some(self.expression_closure_provenance(value))
+                } else {
+                    None
+                };
                 let expected = self.check_assign_target(target, *span)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
-                if self.type_may_contain_function_value(&actual) {
-                    let closure_provenance = self.expression_closure_provenance(value);
+                if let Some(closure_provenance) = closure_provenance {
                     if let Some(name) = assign_target_root_name(target) {
                         self.reject_closure_reference_cycle(name, &closure_provenance, *span)?;
                         // Field/index writes update only one unknown slot. Without a
@@ -1152,15 +1238,17 @@ impl Checker {
                         }
                     }
                 }
-                let provenances = values
+                let evaluated = values
                     .iter()
-                    .map(|value| self.expression_closure_provenance(value))
-                    .collect::<Vec<_>>();
-                let actuals = values
-                    .iter()
-                    .map(|value| self.consume_expr(value))
+                    .map(|value| {
+                        let actual = self.consume_expr(value)?;
+                        // Preserve each evaluated value before the next RHS
+                        // can replace a callable, but defer all destination stores.
+                        let provenance = self.expression_closure_provenance(value);
+                        Ok((actual, provenance))
+                    })
                     .collect::<KuResult<Vec<_>>>()?;
-                for ((name, actual), provenance) in names.iter().zip(actuals).zip(provenances) {
+                for (name, (actual, provenance)) in names.iter().zip(evaluated) {
                     let Some(name) = name else {
                         continue;
                     };
@@ -1198,10 +1286,14 @@ impl Checker {
                 body,
                 span,
             } => {
-                self.expect_condition(condition, *span)?;
+                // A backedge reaches the condition, not the already-consumed
+                // state after its first evaluation.
                 let before = self.scopes.clone();
-                let top = self.compute_loop_top(&before, body, None);
+                let top = self.compute_loop_top(&before, Some(condition), body, None, *span);
                 self.scopes = top;
+                self.check_loop_analysis_budget()?;
+                self.expect_condition(condition, *span)?;
+                let condition_exit = self.scopes.clone();
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
                 self.loop_continue_states.push(Vec::new());
@@ -1210,7 +1302,12 @@ impl Checker {
                 self.loop_continue_states.pop();
                 self.loop_depth -= 1;
                 result?;
-                self.scopes = self.after_loop_state(before, self.scopes.clone(), breaks);
+                // Body fallthrough/continue first evaluates the condition again.
+                // Its post-condition state covers the false edge; a body re-init
+                // cannot make a value consumed by that last condition live.
+                let mut exits = vec![condition_exit.clone()];
+                exits.extend(breaks);
+                self.scopes = merge_moved_scope_paths(condition_exit, &exits);
                 Ok(())
             }
             Stmt::For {
@@ -1225,9 +1322,9 @@ impl Checker {
                         iterable.span,
                     ));
                 }
+                let iterable_type = self.check_expr(iterable)?;
                 let iterable_provenance = self.expression_closure_provenance(iterable);
-                let iterable = self.check_expr(iterable)?;
-                let element = match iterable {
+                let element = match iterable_type {
                     Type::Array(element) => *element,
                     Type::Int => Type::Int,
                     Type::Unknown => Type::Unknown,
@@ -1249,8 +1346,10 @@ impl Checker {
                 let before = self.scopes.clone();
                 let top = self.compute_loop_top(
                     &before,
+                    None,
                     body,
                     Some((name, &element, &element_provenance)),
+                    *span,
                 );
                 self.scopes = top;
                 self.push_scope();
@@ -1525,8 +1624,8 @@ impl Checker {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
-        let source_provenance = self.expression_closure_provenance(value);
         let source_type = self.check_object_destructure_source(value)?;
+        let source_provenance = self.expression_closure_provenance(value);
         let mut consumed = HashSet::new();
         match source_type {
             Type::Object(fields) => {
@@ -1664,6 +1763,8 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
+        self.completed_expression_provenance = None;
+        let mut evaluated_provenance = None;
         self.check_depth += 1;
         if self.check_depth > MAX_CHECK_DEPTH {
             self.check_depth = self.check_depth.saturating_sub(1);
@@ -1725,10 +1826,17 @@ impl Checker {
                         }
                     }
                     if let Some(ty) = self.check_std_method_call(callee, args, expr.span)? {
+                        if self.type_may_contain_function_value(&ty) {
+                            if let ExprKind::Field { target, name } = &callee.kind {
+                                if name == "clone" && args.is_empty() {
+                                    evaluated_provenance = Some(self.expression_closure_provenance(target));
+                                }
+                            }
+                        }
                         return Ok(ty);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name).cloned() {
+                        if let Some(function) = (!self.contains(name)).then(|| self.functions.get(name).cloned()).flatten() {
                             if function.params.len() != args.len() {
                                 return Err(KuError::runtime(
                                     format!(
@@ -1739,10 +1847,7 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
-                            let argument_provenance = args
-                                .iter()
-                                .map(|arg| self.expression_closure_provenance(arg))
-                                .collect::<Vec<_>>();
+                            let mut argument_provenance = Vec::with_capacity(args.len());
                             let mut generic_bindings = HashMap::new();
                             self.check_call_borrow_conflicts(args, &function.value_params, expr.span, None)?;
                             let mut actual_arg_types = Vec::with_capacity(args.len());
@@ -1755,6 +1860,7 @@ impl Checker {
                                     return Err(type_error(arg.span, expected, &actual));
                                 }
                                 actual_arg_types.push(actual);
+                                argument_provenance.push(self.expression_closure_provenance(arg));
                             }
                             if !function
                                 .type_params
@@ -1767,6 +1873,9 @@ impl Checker {
                                 ));
                             }
                             let returns = substitute_generics(&function.returns, &generic_bindings);
+                            if !function.type_params.is_empty() {
+                                self.record_generic_call(name, &function, &generic_bindings, &actual_arg_types, expr.span)?;
+                            }
                             let effect_params = function
                                 .value_params
                                 .iter()
@@ -1800,6 +1909,13 @@ impl Checker {
                                 &argument_provenance,
                                 expr.span,
                             )?;
+                            if self.type_may_contain_function_value(&returns) {
+                                evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                    &effect_params, &function.body, Some(function.body_id),
+                                    &actual_arg_types, &argument_provenance,
+                                    &ClosureProvenance::empty(),
+                                ));
+                            }
                             return Ok(if function.is_async {
                                 Type::Task(Box::new(returns))
                             } else {
@@ -1807,11 +1923,11 @@ impl Checker {
                             });
                         }
                         if self.contains(name) {
-                            let argument_provenance = args
-                                .iter()
-                                .map(|arg| self.expression_closure_provenance(arg))
-                                .collect::<Vec<_>>();
-                            let callee_type = self.get(name, callee.span)?.ty;
+                            // Like evaluation, retain the callable value before
+                            // checking arguments that may replace its binding.
+                            let callee_binding = self.get(name, callee.span)?;
+                            let captured = callee_binding.closure_provenance;
+                            let callee_type = callee_binding.ty;
                             if let Type::FunctionValue {
                                 params,
                                 return_type,
@@ -1820,7 +1936,7 @@ impl Checker {
                                 is_async,
                             } = callee_type
                             {
-                                let (returns, actual_arg_types) = self.check_function_value_call(
+                                let (returns, actual_arg_types, argument_provenance) = self.check_function_value_call(
                                     FunctionValueBodyRef {
                                         params: &params,
                                         return_type: return_type.as_deref(),
@@ -1834,7 +1950,8 @@ impl Checker {
                                 )?;
                                 if let Some(body_id) = body_id {
                                     self.apply_known_function_closure_effects(
-                                        name,
+                                        Some(name),
+                                        &captured,
                                         ClosureBodyView {
                                             params: &params,
                                             body: &body,
@@ -1851,6 +1968,12 @@ impl Checker {
                                         &argument_provenance,
                                         expr.span,
                                     )?;
+                                }
+                                if self.type_may_contain_function_value(&returns) {
+                                    evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                        &params, &body, body_id, &actual_arg_types,
+                                        &argument_provenance, &captured,
+                                    ));
                                 }
                                 return Ok(if is_async {
                                     Type::Task(Box::new(returns))
@@ -1881,12 +2004,9 @@ impl Checker {
                         {
                             return Ok(ty);
                         }
-                        let argument_provenance = args
-                            .iter()
-                            .map(|arg| self.expression_closure_provenance(arg))
-                            .collect::<Vec<_>>();
                         let callee_root = expr_root_name(callee).map(str::to_string);
                         let callee_type = self.check_expr(callee)?;
+                        let captured = self.expression_closure_provenance(callee);
                         if let Type::FunctionValue {
                             params,
                             return_type,
@@ -1895,7 +2015,7 @@ impl Checker {
                             is_async,
                         } = callee_type
                         {
-                            let (returns, actual_arg_types) = self.check_function_value_call(
+                            let (returns, actual_arg_types, argument_provenance) = self.check_function_value_call(
                                 FunctionValueBodyRef {
                                     params: &params,
                                     return_type: return_type.as_deref(),
@@ -1907,10 +2027,10 @@ impl Checker {
                                 None,
                                 Some(callee),
                             )?;
-                            if let Some(callee_root) = callee_root {
-                                if let Some(body_id) = body_id {
+                            if let Some(body_id) = body_id {
                                     self.apply_known_function_closure_effects(
-                                        &callee_root,
+                                        callee_root.as_deref(),
+                                        &captured,
                                         ClosureBodyView {
                                             params: &params,
                                             body: &body,
@@ -1920,7 +2040,14 @@ impl Checker {
                                         &actual_arg_types,
                                         expr.span,
                                     )?;
-                                } else {
+                            } else {
+                                self.reject_http_shared_unknown_call(&captured, expr.span)?;
+                                for (param, argument) in params.iter().zip(&argument_provenance) {
+                                    if param.ty.as_ref().is_none_or(|ty| self.type_may_contain_function_value(ty)) {
+                                        self.reject_http_shared_unknown_call(argument, expr.span)?;
+                                    }
+                                }
+                                if let Some(callee_root) = callee_root {
                                     self.reject_erased_function_value_call_cycle(
                                         &callee_root,
                                         &params,
@@ -1928,6 +2055,12 @@ impl Checker {
                                         expr.span,
                                     )?;
                                 }
+                            }
+                            if self.type_may_contain_function_value(&returns) {
+                                evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                    &params, &body, body_id, &actual_arg_types,
+                                    &argument_provenance, &captured,
+                                ));
                             }
                             Ok(if is_async {
                                 Type::Task(Box::new(returns))
@@ -1944,13 +2077,20 @@ impl Checker {
                 }
                 ExprKind::Array(values) => {
                     let mut element_type = Type::Unknown;
+                    let mut elements_provenance = ClosureProvenance::empty();
                     for value in values {
                         let actual = self.consume_expr(value)?;
+                        if self.type_may_contain_function_value(&actual) {
+                            elements_provenance.merge(&self.expression_closure_provenance(value));
+                        }
                         if element_type == Type::Unknown {
                             element_type = actual;
                         } else if !type_matches(&element_type, &actual) {
                             return Err(type_error(value.span, &element_type, &actual));
                         }
+                    }
+                    if self.type_may_contain_function_value(&element_type) {
+                        evaluated_provenance = Some(elements_provenance);
                     }
                     Ok(Type::Array(Box::new(element_type)))
                 }
@@ -2123,6 +2263,7 @@ impl Checker {
                         ));
                     };
                     let mut seen = HashSet::new();
+                    let mut fields_provenance = ClosureProvenance::empty();
                     for (field_name, value) in fields {
                         if !seen.insert(field_name) {
                             return Err(KuError::runtime(
@@ -2137,6 +2278,9 @@ impl Checker {
                             ));
                         };
                         let actual = self.consume_expr_expecting(value, Some(expected))?;
+                        if self.type_may_contain_function_value(&actual) {
+                            fields_provenance.merge(&self.expression_closure_provenance(value));
+                        }
                         if !type_matches(expected, &actual) {
                             return Err(type_error(value.span, expected, &actual));
                         }
@@ -2149,11 +2293,15 @@ impl Checker {
                             ));
                         }
                     }
+                    if self.type_may_contain_function_value(&Type::Struct(name.clone())) {
+                        evaluated_provenance = Some(fields_provenance);
+                    }
                     Ok(Type::Struct(name.clone()))
                 }
                 ExprKind::ObjectLiteral { fields } => {
                     let mut seen = HashSet::new();
                     let mut object_fields = HashMap::new();
+                    let mut fields_provenance = ClosureProvenance::empty();
                     for (field_name, value) in fields {
                         if !seen.insert(field_name) {
                             return Err(KuError::runtime(
@@ -2161,7 +2309,14 @@ impl Checker {
                                 value.span,
                             ));
                         }
-                        object_fields.insert(field_name.clone(), self.consume_expr(value)?);
+                        let actual = self.consume_expr(value)?;
+                        if self.type_may_contain_function_value(&actual) {
+                            fields_provenance.merge(&self.expression_closure_provenance(value));
+                        }
+                        object_fields.insert(field_name.clone(), actual);
+                    }
+                    if object_fields.values().any(|ty| self.type_may_contain_function_value(ty)) {
+                        evaluated_provenance = Some(fields_provenance);
                     }
                     Ok(Type::Object(object_fields))
                 }
@@ -2174,7 +2329,12 @@ impl Checker {
                         ));
                     }
                     match self.consume_await_task_expr(task, expr.span)? {
-                        Type::Task(value) => Ok(*value),
+                        Type::Task(value) => {
+                            if self.type_may_contain_function_value(&value) {
+                                evaluated_provenance = Some(self.expression_closure_provenance(task));
+                            }
+                            Ok(*value)
+                        }
                         Type::Unknown => Ok(Type::Unknown),
                         other => Err(KuError::runtime(
                             format!("await expects task but got {}", type_name(&other)),
@@ -2228,6 +2388,9 @@ impl Checker {
                     }
                     match self.consume_expr(inner)? {
                         Type::Result(value) => {
+                            if self.type_may_contain_function_value(&value) {
+                                evaluated_provenance = Some(self.expression_closure_provenance(inner));
+                            }
                             if !matches!(self.current_return, Type::Result(_))
                                 && self.recoverable_depth == 0
                             {
@@ -2261,6 +2424,15 @@ impl Checker {
             self.reject_readonly_http_native_capture_read(expr, &ty)?;
             Ok(ty)
         });
+        // Publish only this successful expression. Nested body checking and
+        // argument evaluation may have overwritten the slot; none is this
+        // expression's result. A later check/statement clears it before reuse.
+        self.completed_expression_provenance = match (&result, evaluated_provenance) {
+            (Ok(_), Some(provenance)) => {
+                Some((expr as *const Expr as usize, expr.span, provenance))
+            }
+            _ => None,
+        };
         self.check_depth = self.check_depth.saturating_sub(1);
         result
     }
@@ -2412,6 +2584,7 @@ impl Checker {
             body,
         } = &expr.kind
         {
+            self.completed_expression_provenance = None;
             return self.check_closure_literal(
                 params,
                 return_type.as_ref(),
@@ -2493,18 +2666,46 @@ impl Checker {
     }
 
     fn check_template_string(&mut self, raw: &str, span: Span) -> KuResult<()> {
-        for interpolation in template_interpolations(raw, span)? {
-            let tokens = crate::lexer::Lexer::new(&interpolation.source)
+        // Validate the separately parsed AST before the regular type-checking
+        // pass. Capture analysis and checking must share the same resource bound.
+        let interpolations = template_interpolations(raw, span)?;
+        let mut validated = 0;
+        crate::runtime::interpreter::visit_template_capture_expressions(raw, span, |_| {
+            validated += 1;
+            Ok(())
+        })
+        .map_err(|mut error| {
+            if matches!(
+                error.kind,
+                crate::error::KuErrorKind::Lex | crate::error::KuErrorKind::Parse
+            ) && !error.message.starts_with("capture analysis limit:")
+            {
+                if let Some(interpolation) = interpolations.get(validated) {
+                    return map_template_error(error, interpolation);
+                }
+            }
+            // Capture-budget errors (including the parser token budget) already
+            // carry the enclosing template span, unlike snippet parse errors.
+            // Do not rebase them as if those positions were snippet-relative.
+            error.span = span;
+            error
+        })?;
+        for interpolation in interpolations {
+            let mut tokens = crate::lexer::Lexer::new(&interpolation.source)
                 .tokenize()
                 .map_err(|err| map_template_error(err, &interpolation))?;
-            let expr = crate::parser::Parser::new(tokens)
-                .parse_expression_only()
-                .map_err(|err| map_template_error(err, &interpolation))?;
+            for token in &mut tokens {
+                token.span = Span::new(
+                    template_position(interpolation.span.start, token.span.start),
+                    template_position(interpolation.span.start, token.span.end),
+                );
+            }
+            let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
             let saved = self.template_mode;
             self.template_mode = true;
             let result = self.check_expr(&expr);
             self.template_mode = saved;
-            result.map_err(|err| map_template_error(err, &interpolation))?;
+            result?;
         }
         Ok(())
     }
@@ -2673,6 +2874,29 @@ impl Checker {
             return Err(type_error(args[0].span, &Type::String, &path_type));
         }
         let handler_arg = &args[1];
+        // A factory call may replace a callable while evaluating its arguments.
+        // Audit/freeze the value actually returned, not pre-evaluation evidence.
+        // Inline handlers retain their HTTP-specific parameter inference below.
+        let handler_type = if matches!(handler_arg.kind, ExprKind::Function { .. }) {
+            None
+        } else {
+            Some(self.check_expr(handler_arg)?)
+        };
+        let handler_provenance = self.expression_closure_provenance(handler_arg);
+        if handler_provenance.http_callable_body_uncertain {
+            return Err(KuError::runtime(
+                "cannot prove HTTP-shared function binding safety after an indirect replacement with an unproven body",
+                handler_arg.span,
+            ).with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
+        }
+        if !self.closure_capture_boundaries.is_empty()
+            && !handler_provenance.dependencies.is_empty()
+        {
+            return Err(KuError::runtime(
+                "cannot prove HTTP-shared function binding registration order inside a deferred closure; register the capturing route directly in its owning scope",
+                span,
+            ).with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
+        }
         if let ExprKind::Function {
             params,
             return_type,
@@ -2680,6 +2904,11 @@ impl Checker {
         } = &handler_arg.kind
         {
             reject_duplicate_function_value_params(params)?;
+            let captures = checker_closure_capture_names(
+                params,
+                body,
+                &self.visible_binding_ids().into_keys().collect(),
+            );
             let params = params
                 .iter()
                 .map(|param| {
@@ -2699,6 +2928,7 @@ impl Checker {
                 .map(|ty| self.resolve_type_name(ty, handler_arg.span).map(Box::new))
                 .transpose()?;
             let body_id = self.fresh_function_body_id();
+            self.record_function_body_outer_bindings(body_id, &captures);
             self.check_http_handler(
                 name,
                 &params,
@@ -2708,8 +2938,7 @@ impl Checker {
                 handler_arg.span,
             )?;
         } else {
-            let handler_type = self.check_expr(handler_arg)?;
-            match handler_type {
+            match handler_type.expect("non-inline HTTP handler was checked above") {
                 Type::FunctionValue {
                     params,
                     return_type,
@@ -2742,6 +2971,7 @@ impl Checker {
         }
         // Route registration mutates the named service in place. Returning the
         // service would create an untracked second owner of native's raw pointer.
+        self.freeze_http_shared_callables(&handler_provenance, span)?;
         Ok(Some(Type::Null))
     }
 
@@ -3131,7 +3361,11 @@ impl Checker {
         // Record that move after the arms are checked, so later uses (a second
         // match, a clone, passing it on) are rejected instead of silently reading
         // an emptied payload.
-        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
+        // Task-containing match input is itself an owning read. Otherwise a
+        // binding arm could transfer its handle while the original name remained
+        // available for a second await (including through a container wrapper).
+        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms)
+            || self.match_guard_type_contains_task(&value_type);
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
@@ -3186,10 +3420,39 @@ impl Checker {
                 covered_patterns.insert(key);
             }
             if let Some(guard) = &arm.guard {
+                // A guard probes this arm; failure must leave its Task payloads
+                // available to later arms. Track only the newly bound pattern
+                // variables, so creating/awaiting an unrelated Task stays legal.
+                let tentative_tasks = self
+                    .scopes
+                    .last()
+                    .expect("match arm scope")
+                    .iter()
+                    .filter(|(_, binding)| self.match_guard_type_contains_task(&binding.ty))
+                    .map(|(name, binding)| {
+                        (name.clone(), binding.binding_id, binding.moves.clone())
+                    })
+                    .collect::<Vec<_>>();
                 let guard_type = self.check_expr(guard)?;
                 if guard_type != Type::Bool {
                     self.pop_scope();
                     return Err(type_error(guard.span, &Type::Bool, &guard_type));
+                }
+                for (name, id, previous_moves) in tentative_tasks {
+                    let changed = self
+                        .scopes
+                        .last()
+                        .and_then(|scope| scope.get(&name))
+                        .is_some_and(|binding| {
+                            binding.binding_id == id && binding.moves != previous_moves
+                        });
+                    if changed {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("cannot consume tentative Task binding '{name}' in a match guard; await or move it only in the selected arm"),
+                            guard.span,
+                        ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
+                    }
                 }
             }
             let actual = self.consume_expr(&arm.value);
@@ -3234,6 +3497,34 @@ impl Checker {
         Ok(result_type)
     }
 
+    fn match_guard_type_contains_task(&self, root: &Type) -> bool {
+        let mut pending = vec![root];
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Type::Task(_) => return true,
+                Type::Array(inner) | Type::Result(inner) => pending.push(inner),
+                Type::Union(types) => pending.extend(types),
+                Type::Object(fields) => pending.extend(fields.values()),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        pending.extend(layout.fields.values());
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        pending.extend(layout.variants.values().flatten());
+                    }
+                }
+                // Function signatures do not own their parameter/return types;
+                // captures have their own existing move checks.
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// True when matching `value` binds an owned enum payload — the backend moves
     /// that payload out of the scrutinee, so the match consumes it.
     fn match_consumes_scrutinee(&self, value_type: &Type, arms: &[MatchArm]) -> bool {
@@ -3266,54 +3557,73 @@ impl Checker {
         expected: &Type,
         span: Span,
     ) -> KuResult<()> {
-        match pattern {
-            MatchPattern::Wildcard => Ok(()),
-            MatchPattern::Binding(name) => self.define(name.clone(), expected.clone(), false, span),
-            MatchPattern::Literal(literal) => {
-                let actual = type_of_literal(literal);
-                if type_matches(expected, &actual) {
-                    Ok(())
-                } else {
-                    Err(type_error(span, expected, &actual))
+        // Each ancestor retains a cursor over siblings, rather than a Rust call
+        // frame or one pending entry per field. Keep the original preorder so
+        // definitions and the first diagnostic still follow source order.
+        let mut ancestors: Vec<
+            std::iter::Zip<std::slice::Iter<'_, MatchPattern>, std::vec::IntoIter<Type>>,
+        > = Vec::new();
+        let mut current = Some((pattern, std::borrow::Cow::Borrowed(expected)));
+        while let Some((pattern, expected)) = current.take() {
+            match pattern {
+                MatchPattern::Wildcard => {}
+                MatchPattern::Binding(name) => {
+                    self.define(name.clone(), expected.as_ref().clone(), false, span)?;
+                }
+                MatchPattern::Literal(literal) => {
+                    let actual = type_of_literal(literal);
+                    if !type_matches(expected.as_ref(), &actual) {
+                        return Err(type_error(span, expected.as_ref(), &actual));
+                    }
+                }
+                MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    fields,
+                } => {
+                    let expected_enum = Type::Enum(enum_name.clone());
+                    if !type_matches(expected.as_ref(), &expected_enum) {
+                        return Err(type_error(span, expected.as_ref(), &expected_enum));
+                    }
+                    let Some(enum_type) = self.enums.get(enum_name) else {
+                        return Err(KuError::runtime(
+                            format!("undefined enum '{enum_name}'"),
+                            span,
+                        ));
+                    };
+                    let Some(payload) = enum_type.variants.get(variant).cloned() else {
+                        return Err(KuError::runtime(
+                            format!("enum '{enum_name}' has no variant '{variant}'"),
+                            span,
+                        ));
+                    };
+                    if payload.len() != fields.len() {
+                        return Err(KuError::runtime(
+                            format!(
+                                "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
+                                payload.len(),
+                                fields.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    let mut children = fields.iter().zip(payload);
+                    if let Some((field, ty)) = children.next() {
+                        ancestors.push(children);
+                        current = Some((field, std::borrow::Cow::Owned(ty)));
+                        continue;
+                    }
                 }
             }
-            MatchPattern::EnumVariant {
-                enum_name,
-                variant,
-                fields,
-            } => {
-                let expected_enum = Type::Enum(enum_name.clone());
-                if !type_matches(expected, &expected_enum) {
-                    return Err(type_error(span, expected, &expected_enum));
+            while let Some(children) = ancestors.last_mut() {
+                if let Some((field, ty)) = children.next() {
+                    current = Some((field, std::borrow::Cow::Owned(ty)));
+                    break;
                 }
-                let Some(enum_type) = self.enums.get(enum_name) else {
-                    return Err(KuError::runtime(
-                        format!("undefined enum '{enum_name}'"),
-                        span,
-                    ));
-                };
-                let Some(payload) = enum_type.variants.get(variant).cloned() else {
-                    return Err(KuError::runtime(
-                        format!("enum '{enum_name}' has no variant '{variant}'"),
-                        span,
-                    ));
-                };
-                if payload.len() != fields.len() {
-                    return Err(KuError::runtime(
-                        format!(
-                            "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
-                            payload.len(),
-                            fields.len()
-                        ),
-                        span,
-                    ));
-                }
-                for (field, ty) in fields.iter().zip(payload.iter()) {
-                    self.check_match_pattern(field, ty, span)?;
-                }
-                Ok(())
+                ancestors.pop();
             }
         }
+        Ok(())
     }
 
     fn check_dotted_builtin_call(
@@ -3614,7 +3924,7 @@ impl Checker {
                     span,
                 ));
             }
-            if self.is_owned_type(&target_type) {
+            if self.is_owned_type(&target_type) || matches!(target_type, Type::Generic(_)) {
                 // Cloning reads the WHOLE value, so it must be fully live: a
                 // partially-moved struct would clone an already-emptied field.
                 if let PlaceClass::Movable(place) = self.classify_place(target) {
@@ -4292,7 +4602,7 @@ impl Checker {
         span: Span,
         name: Option<&str>,
         callee: Option<&Expr>,
-    ) -> KuResult<(Type, Vec<Type>)> {
+    ) -> KuResult<(Type, Vec<Type>, Vec<ClosureProvenance>)> {
         if function.params.len() != args.len() {
             let subject = name
                 .map(|name| format!("function value '{name}'"))
@@ -4307,11 +4617,14 @@ impl Checker {
             ));
         }
         self.check_call_borrow_conflicts(args, function.params, span, callee)?;
-        let actual_arg_types = args
-            .iter()
-            .zip(function.params.iter())
-            .map(|(arg, param)| self.check_arg_mode(arg, param.ty.as_ref(), param.mode))
-            .collect::<KuResult<Vec<_>>>()?;
+        let mut actual_arg_types = Vec::with_capacity(args.len());
+        let mut argument_provenance = Vec::with_capacity(args.len());
+        for (arg, param) in args.iter().zip(function.params) {
+            actual_arg_types.push(self.check_arg_mode(arg, param.ty.as_ref(), param.mode)?);
+            // Snapshot each evaluated value in order, not all bindings before
+            // the first argument or after the last one's possible writes.
+            argument_provenance.push(self.expression_closure_provenance(arg));
+        }
         let mut arg_types = Vec::new();
         for ((param, actual), arg) in function
             .params
@@ -4336,7 +4649,7 @@ impl Checker {
             }
         }
         let returns = self.check_function_value_call_with_types(function, &arg_types, span)?;
-        Ok((returns, actual_arg_types))
+        Ok((returns, actual_arg_types, argument_provenance))
     }
 
     fn check_function_value_call_with_types(
@@ -4438,7 +4751,6 @@ impl Checker {
                 if self.readonly_function_body_stack.contains(&body_id) {
                     return Ok(return_type.cloned().unwrap_or(Type::Unknown));
                 }
-                self.readonly_function_body_stack.push(body_id);
                 Some(body_id)
             } else {
                 None
@@ -4446,6 +4758,19 @@ impl Checker {
         } else {
             None
         };
+        // Re-auditing a captured helper must not resolve its lexical captures
+        // through same-named locals introduced by the HTTP caller.
+        let replay_scope = if self
+            .readonly_capture
+            .is_some_and(|capture| capture.owner == "http handler")
+        {
+            self.http_capture_replay_scope(body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = readonly_body_key {
+            self.readonly_function_body_stack.push(body_id);
+        }
         let inference_body_key = guard_inference.then_some(body_id).flatten();
         if let Some(body_id) = inference_body_key {
             self.function_value_inference_stack.push(body_id);
@@ -4459,6 +4784,10 @@ impl Checker {
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
+        }
         self.push_scope();
         // Stage 6c-str: everything defined at or above this scope index is local to
         // the closure body; anything below it is captured from an enclosing scope
@@ -4496,21 +4825,51 @@ impl Checker {
         // outer scope empties the cell (the backend moves out of `(cell)->value`),
         // so mark them and let `record_move` require an explicit clone instead.
         if let Some(&boundary) = self.closure_capture_boundaries.last() {
-            let captured: Vec<String> = self.scopes[..boundary]
-                .iter()
-                .flat_map(|scope| scope.keys().cloned())
-                .filter(|name| function_body_uses_name(body, name))
-                .collect();
-            for scope in self.scopes[..boundary].iter_mut() {
-                for name in &captured {
-                    if let Some(var) = scope.get_mut(name) {
-                        var.captured = true;
+            let lexical_capture_ids = self
+                .readonly_capture
+                .filter(|capture| capture.owner == "http handler")
+                .and(body_id)
+                .and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+                .map(|bindings| bindings.values().copied().collect::<HashSet<_>>());
+            if let Some(captured_ids) = lexical_capture_ids {
+                // Mark both a replay copy and its original binding, but not a
+                // caller-local homonym or a same-named function parameter.
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for var in scope.values_mut() {
+                        if captured_ids.contains(&var.binding_id) {
+                            var.captured = true;
+                        }
+                    }
+                }
+            } else {
+                // A missing lexical map is not proof of an empty capture set.
+                // Preserve the existing conservative path outside known HTTP
+                // replay bodies, including functions without a capture map.
+                let http_audit = self
+                    .readonly_capture
+                    .is_some_and(|capture| capture.owner == "http handler");
+                let captured: Vec<String> = self.scopes[..boundary]
+                    .iter()
+                    .flat_map(|scope| scope.keys().cloned())
+                    // A top-level parameter is local to that call, even when
+                    // its spelling matches an owned value in the HTTP caller.
+                    .filter(|name| !http_audit || params.iter().all(|param| &param.name != name))
+                    .filter(|name| function_body_uses_name(body, name))
+                    .collect();
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for name in &captured {
+                        if let Some(var) = scope.get_mut(name) {
+                            var.captured = true;
+                        }
                     }
                 }
             }
         }
         self.closure_capture_boundaries.pop();
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
@@ -4523,6 +4882,42 @@ impl Checker {
             debug_assert_eq!(popped, Some(expected_key));
         }
         result
+    }
+
+    /// Reuse the creation-time capture identities used by effect summaries.
+    /// Only shadowed captures need an overlay; parameters and body locals are
+    /// defined in the function scope above it and retain ordinary shadowing.
+    /// A stale/missing lexical identity is not permission to use a homonym.
+    fn http_capture_replay_scope(
+        &self,
+        body_id: Option<FunctionBodyId>,
+        span: Span,
+    ) -> KuResult<Option<HashMap<String, VarType>>> {
+        let Some(captures) =
+            body_id.and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+        else {
+            return Ok(None);
+        };
+        let mut names = captures.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut replay = HashMap::new();
+        for name in names {
+            let binding_id = captures[name];
+            let visible = self.scopes.iter().rev().find_map(|scope| scope.get(name));
+            if visible.is_some_and(|binding| binding.binding_id == binding_id) {
+                continue;
+            }
+            let binding = self.binding_by_id(binding_id).ok_or_else(|| {
+                KuError::runtime(
+                    format!(
+                        "http handler cannot prove captured variable '{name}' is read-only because its lexical binding is unavailable"
+                    ),
+                    span,
+                )
+            })?;
+            replay.insert(name.clone(), binding.clone());
+        }
+        Ok((!replay.is_empty()).then_some(replay))
     }
 
     fn check_function_value_body_readonly_captures(
@@ -4552,7 +4947,18 @@ impl Checker {
             if self.readonly_function_body_stack.contains(&body_id) {
                 return Ok(function.return_type.cloned().unwrap_or(Type::Unknown));
             }
+        }
+        let replay_scope = if effective_capture.owner == "http handler" {
+            self.http_capture_replay_scope(function.body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = function.body_id {
             self.readonly_function_body_stack.push(body_id);
+        }
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
         }
         self.push_scope();
         self.readonly_capture = Some(effective_capture);
@@ -4609,6 +5015,9 @@ impl Checker {
         self.try_exit_collectors = saved_try_exit_collectors;
         self.readonly_capture = saved_capture;
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         if let Some(expected_body_id) = function.body_id {
             let popped = self.readonly_function_body_stack.pop();
             debug_assert_eq!(popped, Some(expected_body_id));
@@ -4679,6 +5088,11 @@ impl Checker {
             .flat_map(|bindings| bindings.values())
         {
             closure_provenance.dependencies.insert(*binding_id);
+            if let Some(binding) = self.binding_by_id(*binding_id) {
+                closure_provenance
+                    .http_shared
+                    .extend(binding.closure_provenance.http_shared.clone());
+            }
         }
         self.set_closure_provenance(&function.name, closure_provenance, function.span)?;
         let arg_types = params
@@ -4742,6 +5156,10 @@ impl Checker {
     }
 
     fn check_stmt_and_infer_return(&mut self, stmt: &Stmt) -> KuResult<Option<Type>> {
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::Return { value, span } => {
                 let expected = self.current_return.clone();
@@ -4993,6 +5411,88 @@ impl Checker {
             .find(|var| var.binding_id == binding_id)
     }
 
+    fn mark_http_callable_body_uncertain(&mut self, target: BindingId) {
+        for binding in self.scopes.iter_mut().flat_map(|scope| scope.values_mut()) {
+            if binding.binding_id == target && matches!(binding.ty, Type::FunctionValue { .. }) {
+                binding.closure_provenance.http_callable_body_uncertain = true;
+            }
+        }
+    }
+
+    /// This deliberately small exact transfer is ordered and unconditional.
+    /// An unordered may-write summary cannot prove the last assigned body on
+    /// branches/loops. Only one assignment of a non-shadowed top-level function
+    /// or a proven captured function's explicit clone, followed by a literal
+    /// null return, can recover a concrete identity here.
+    fn straight_line_callable_replacement(
+        &self,
+        params: &[FunctionValueParam],
+        body: &[Stmt],
+        body_id: FunctionBodyId,
+    ) -> Option<(BindingId, Type)> {
+        let [Stmt::Assign { name, value, .. }, Stmt::Return {
+            value: Some(returned),
+            ..
+        }] = body
+        else {
+            return None;
+        };
+        if !matches!(returned.kind, ExprKind::Literal(Literal::Null)) {
+            return None;
+        }
+        let bindings = self.function_body_outer_bindings.get(&body_id)?;
+        if params.iter().any(|param| &param.name == name) {
+            return None;
+        }
+        let target = *bindings.get(name)?;
+        if let ExprKind::Call { callee, args } = &value.kind {
+            let ExprKind::Field {
+                target: source,
+                name: method,
+            } = &callee.kind
+            else {
+                return None;
+            };
+            let ExprKind::Variable(source) = &source.kind else {
+                return None;
+            };
+            if method != "clone"
+                || !args.is_empty()
+                || params.iter().any(|param| &param.name == source)
+            {
+                return None;
+            }
+            let binding = self.binding_by_id(*bindings.get(source)?)?;
+            if binding.closure_provenance.complete
+                && !binding.closure_provenance.http_callable_body_uncertain
+                && matches!(
+                    binding.ty,
+                    Type::FunctionValue {
+                        body_id: Some(_),
+                        ..
+                    }
+                )
+            {
+                return Some((target, binding.ty.clone()));
+            }
+            return None;
+        }
+        let ExprKind::Variable(replacement) = &value.kind else {
+            return None;
+        };
+        if params
+            .iter()
+            .any(|param| &param.name == replacement || &param.name == name)
+            || bindings.contains_key(replacement)
+        {
+            return None;
+        }
+        Some((
+            target,
+            function_value_type(replacement, self.functions.get(replacement)?, value.span).ok()?,
+        ))
+    }
+
     fn reject_closure_reference_cycle(
         &self,
         target: &str,
@@ -5038,12 +5538,49 @@ impl Checker {
     }
 
     fn expression_closure_provenance(&self, expr: &Expr) -> ClosureProvenance {
+        if let Some((identity, span, provenance)) = &self.completed_expression_provenance {
+            if *identity == expr as *const Expr as usize && *span == expr.span {
+                return provenance.clone();
+            }
+        }
         self.expression_closure_provenance_inner(
             expr,
             &HashMap::new(),
             &mut ClosureSummaryContext::new(),
             true,
         )
+    }
+
+    fn evaluated_call_return_provenance(
+        &self,
+        params: &[FunctionValueParam],
+        body: &[Stmt],
+        body_id: Option<FunctionBodyId>,
+        argument_types: &[Type],
+        arguments: &[ClosureProvenance],
+        captured: &ClosureProvenance,
+    ) -> ClosureProvenance {
+        if let Some(body_id) = body_id.filter(|_| !captured.http_callable_body_uncertain) {
+            return self.known_function_body_return_provenance(
+                ClosureBodyView {
+                    params,
+                    body,
+                    body_id,
+                },
+                argument_types,
+                arguments,
+                captured,
+                &mut ClosureSummaryContext::new(),
+            );
+        }
+        let mut result = captured.clone();
+        for (ty, argument) in argument_types.iter().zip(arguments) {
+            if self.type_may_contain_function_value(ty) {
+                result.merge(argument);
+            }
+        }
+        result.complete = false;
+        result
     }
 
     fn expression_closure_provenance_inner(
@@ -5083,6 +5620,9 @@ impl Checker {
                     } else if allow_checker_bindings {
                         if let Ok(binding) = self.get_allow_moved(&name, expr.span) {
                             provenance.dependencies.insert(binding.binding_id);
+                            provenance
+                                .http_shared
+                                .extend(binding.closure_provenance.http_shared);
                         } else if !self.functions.contains_key(&name) {
                             provenance.complete = false;
                         }
@@ -5170,7 +5710,10 @@ impl Checker {
                     })
                     .collect::<Vec<_>>();
                 if let ExprKind::Variable(name) = &callee.kind {
-                    if let Some(function) = self.functions.get(name) {
+                    if let Some(function) = self.functions.get(name).filter(|_| {
+                        !symbolic.contains_key(name)
+                            && (!allow_checker_bindings || !self.contains(name))
+                    }) {
                         return self.known_function_body_return_provenance(
                             ClosureBodyView {
                                 params: &function.value_params,
@@ -5183,7 +5726,7 @@ impl Checker {
                             summaries,
                         );
                     }
-                    if allow_checker_bindings {
+                    if allow_checker_bindings && !symbolic.contains_key(name) {
                         if let Ok(binding) = self.get_allow_moved(name, callee.span) {
                             if let Type::FunctionValue {
                                 params,
@@ -5192,7 +5735,9 @@ impl Checker {
                                 ..
                             } = &binding.ty
                             {
-                                if !body.is_empty() {
+                                if !body.is_empty()
+                                    && !binding.closure_provenance.http_callable_body_uncertain
+                                {
                                     let parameter_types = params
                                         .iter()
                                         .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
@@ -5439,7 +5984,8 @@ impl Checker {
 
     fn apply_known_function_closure_effects(
         &mut self,
-        callee_name: &str,
+        callee_name: Option<&str>,
+        captured: &ClosureProvenance,
         function: ClosureBodyView<'_>,
         arguments: &[ClosureProvenance],
         argument_types: &[Type],
@@ -5450,13 +5996,16 @@ impl Checker {
             body,
             body_id,
         } = function;
+        if captured.http_callable_body_uncertain {
+            self.reject_http_shared_unknown_call(captured, span)?;
+        }
         if params.len() != arguments.len()
             || params.len() != argument_types.len()
             || body.is_empty()
         {
             return Ok(());
         }
-        let callee = self.get_allow_moved(callee_name, span)?;
+        let replacement = self.straight_line_callable_replacement(params, body, body_id);
         let mut summaries = ClosureSummaryContext::new();
         let mut summary = self.known_function_body_effect_summary(
             ClosureBodyView {
@@ -5466,14 +6015,21 @@ impl Checker {
             },
             arguments,
             argument_types,
-            &callee.closure_provenance,
+            captured,
             &mut summaries,
         );
+        summary.complete &= !captured.http_callable_body_uncertain;
         if !summary.complete {
+            self.reject_http_shared_unknown_call(captured, span)?;
+            for (ty, argument) in argument_types.iter().zip(arguments) {
+                if self.type_may_contain_function_value(ty) {
+                    self.reject_http_shared_unknown_call(argument, span)?;
+                }
+            }
             // Unsupported calls/loops must never erase known ownership. Retain
             // the callee environment and every function-capable argument as a
             // possible write to each captured function-capable cell.
-            let mut conservative = callee.closure_provenance.clone();
+            let mut conservative = captured.clone();
             for (param, argument) in params.iter().zip(arguments) {
                 if param
                     .ty
@@ -5490,6 +6046,7 @@ impl Checker {
                 .into_iter()
                 .flat_map(|bindings| bindings.values().copied())
             {
+                self.reject_http_shared_write(target, span)?;
                 if self
                     .binding_by_id(target)
                     .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
@@ -5499,15 +6056,19 @@ impl Checker {
                     // remove that tautological edge so an opaque but harmless
                     // call does not immediately self-cycle its callee capture.
                     provenance.dependencies.remove(&target);
-                    summary
-                        .effects
-                        .push(ClosureWriteEffect { target, provenance });
+                    summary.effects.push(ClosureWriteEffect {
+                        target,
+                        provenance,
+                        assignment_span: None,
+                    });
                 }
             }
         }
 
         let mut environment_effect = ClosureProvenance::empty();
         for effect in summary.effects {
+            self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
+            self.mark_http_callable_body_uncertain(effect.target);
             environment_effect.merge(&effect.provenance);
             let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
             else {
@@ -5519,13 +6080,24 @@ impl Checker {
             self.reject_closure_reference_cycle(&target_name, &effect.provenance, span)?;
             self.merge_closure_provenance(&target_name, &effect.provenance, span)?;
         }
-        if !environment_effect.dependencies.is_empty() || !environment_effect.complete {
+        if let Some(callee_name) = callee_name
+            .filter(|_| !environment_effect.dependencies.is_empty() || !environment_effect.complete)
+        {
             // A FunctionValue owns every cell in its environment. A write through
             // any captured cell therefore updates what aliases of this callee can
             // reach; retaining the aggregate edge also catches hidden cells whose
             // lexical binding has left the checker scope.
             self.reject_closure_reference_cycle(callee_name, &environment_effect, span)?;
             self.merge_closure_provenance(callee_name, &environment_effect, span)?;
+        }
+        if let Some((target, ty)) = replacement {
+            for binding in self.scopes.iter_mut().flat_map(|scope| scope.values_mut()) {
+                if binding.binding_id == target && matches!(binding.ty, Type::FunctionValue { .. })
+                {
+                    binding.ty = ty.clone();
+                    binding.closure_provenance.http_callable_body_uncertain = false;
+                }
+            }
         }
         Ok(())
     }
@@ -5542,6 +6114,23 @@ impl Checker {
         if params.len() != arguments.len()
             || params.len() != argument_types.len()
             || body.is_empty()
+        {
+            return Ok(());
+        }
+        // This entry point is only for a resolved top-level function, not a
+        // same-named local FunctionValue. With no lexical captures and no
+        // function-capable actual arguments, it cannot reach a caller's
+        // callable cell. Avoid walking its entire transitive call graph merely
+        // to prove that absence (notably for the self-hosted parser). Argument
+        // checking and any active HTTP read-only body replay already ran at
+        // the call site; neither is bypassed by this write-effect fast path.
+        if self
+            .function_body_outer_bindings
+            .get(&body_id)
+            .is_none_or(HashMap::is_empty)
+            && argument_types
+                .iter()
+                .all(|ty| !self.type_may_contain_function_value(ty))
         {
             return Ok(());
         }
@@ -5566,6 +6155,7 @@ impl Checker {
             let mut conservative = ClosureProvenance::empty();
             for (ty, argument) in argument_types.iter().zip(arguments) {
                 if self.type_may_contain_function_value(ty) {
+                    self.reject_http_shared_unknown_call(argument, span)?;
                     conservative.merge(argument);
                 }
             }
@@ -5577,6 +6167,7 @@ impl Checker {
                 .flat_map(|(_, argument)| argument.dependencies.iter().copied())
                 .collect::<HashSet<_>>();
             for target in possible_targets {
+                self.reject_http_shared_write(target, span)?;
                 if self
                     .binding_by_id(target)
                     .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
@@ -5584,12 +6175,15 @@ impl Checker {
                     summary.effects.push(ClosureWriteEffect {
                         target,
                         provenance: conservative.clone(),
+                        assignment_span: None,
                     });
                 }
             }
         }
 
         for effect in summary.effects {
+            self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
+            self.mark_http_callable_body_uncertain(effect.target);
             let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
             else {
                 continue;
@@ -5611,6 +6205,7 @@ impl Checker {
         span: Span,
     ) -> KuResult<()> {
         let callee = self.get_allow_moved(callee_name, span)?;
+        self.reject_http_shared_unknown_call(&callee.closure_provenance, span)?;
         let captured_targets = callee
             .closure_provenance
             .dependencies
@@ -5625,6 +6220,7 @@ impl Checker {
             {
                 continue;
             }
+            self.reject_http_shared_unknown_call(argument, span)?;
             let mut visited = HashSet::new();
             let reaches_callee = argument.dependencies.iter().copied().any(|dependency| {
                 self.closure_dependency_reaches(dependency, callee.binding_id, &mut visited)
@@ -5744,7 +6340,27 @@ impl Checker {
         let ExprKind::Call { callee, args } = &expr.kind else {
             return None;
         };
-        let ExprKind::Variable(name) = &callee.kind else {
+        if self.closure_effect_noninvoking_call(callee, args, outer_bindings, environment) {
+            return Some(ClosureEffectSummary {
+                effects: Vec::new(),
+                complete: true,
+            });
+        }
+        // clone() copies a function value without invoking its environment.
+        // An immediately following call still executes the original body.
+        let mut callable = callee.as_ref();
+        let mut clone_depth = 0;
+        while let ExprKind::Call { callee, args } = &callable.kind {
+            let ExprKind::Field { target, name } = &callee.kind else {
+                return None;
+            };
+            if name != "clone" || !args.is_empty() || clone_depth >= MAX_CHECK_DEPTH {
+                return None;
+            }
+            clone_depth += 1;
+            callable = target;
+        }
+        let ExprKind::Variable(name) = &callable.kind else {
             return None;
         };
         let (params, body, body_id, captured_environment) =
@@ -5768,6 +6384,9 @@ impl Checker {
                         .cloned()
                         .unwrap_or_else(ClosureProvenance::unknown),
                 )
+            } else if environment.locals.contains(name) {
+                // An untyped local still shadows captured/global callables.
+                return None;
             } else if let Some(binding_id) = outer_bindings.get(name) {
                 let binding = self.binding_by_id(*binding_id)?;
                 let Type::FunctionValue {
@@ -5779,16 +6398,14 @@ impl Checker {
                 else {
                     return None;
                 };
-                (
-                    params.clone(),
-                    body.clone(),
-                    *body_id,
-                    environment
-                        .symbolic
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| binding.closure_provenance.clone()),
-                )
+                let mut captured = environment
+                    .symbolic
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| binding.closure_provenance.clone());
+                captured.http_callable_body_uncertain |=
+                    binding.closure_provenance.http_callable_body_uncertain;
+                (params.clone(), body.clone(), *body_id, captured)
             } else if let Some(function) = self.functions.get(name) {
                 (
                     function.value_params.clone(),
@@ -5817,7 +6434,7 @@ impl Checker {
             .iter()
             .map(|arg| self.effect_expression_type(arg, outer_bindings, environment))
             .collect::<Vec<_>>();
-        Some(self.known_function_body_effect_summary(
+        let mut summary = self.known_function_body_effect_summary(
             ClosureBodyView {
                 params: &params,
                 body: &body,
@@ -5827,7 +6444,130 @@ impl Checker {
             &argument_types,
             &captured_environment,
             summaries,
-        ))
+        );
+        // Keep known may-writes, but never prove safety from a body whose
+        // identity an indirect replacement may already have changed.
+        summary.complete &= !captured_environment.http_callable_body_uncertain;
+        Some(summary)
+    }
+
+    /// Only operations whose dispatch cannot invoke a user callback belong
+    /// here. Metadata validates the spelling/arity; argument ownership alone
+    /// is not evidence of no callbacks (in particular array.map is excluded).
+    fn closure_effect_noninvoking_call(
+        &self,
+        callee: &Expr,
+        args: &[Expr],
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+    ) -> bool {
+        let unshadowed = |name: &str| {
+            !environment.locals.contains(name)
+                && !environment.types.contains_key(name)
+                && !outer_bindings.contains_key(name)
+                && !self.functions.contains_key(name)
+        };
+        if let ExprKind::Variable(name) = &callee.kind {
+            return unshadowed(name)
+                && matches!(name.as_str(), "len" | "str" | "ok" | "err" | "println")
+                && metadata::builtin_signature(name)
+                    .is_some_and(|signature| signature.args.len() == args.len());
+        }
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return false;
+        };
+        // check_std_method_call gives the intrinsic clone method precedence;
+        // it cannot be replaced by an object field named clone. Receiver
+        // evaluation is collected separately, even for clone().
+        if name == "clone" && args.is_empty() {
+            return true;
+        }
+        if let ExprKind::Variable(module) = &target.kind {
+            if unshadowed(module)
+                && (!metadata::module_requires_import(module) || self.std_modules.contains(module))
+                && Self::closure_effect_noninvoking_dotted(module, name)
+            {
+                if let Some(signature) = metadata::dotted_signature(module, name) {
+                    return if module == "http" {
+                        match name.as_str() {
+                            "text" | "html" | "json" | "redirect" => {
+                                matches!(args.len(), 1 | 2)
+                            }
+                            "empty" => args.len() <= 1,
+                            _ => signature.args.len() == args.len(),
+                        }
+                    } else {
+                        signature.args.len() == args.len()
+                    };
+                }
+            }
+        }
+        let receiver = match &target.kind {
+            ExprKind::Literal(Literal::String(_) | Literal::TemplateString(_)) => Type::String,
+            ExprKind::Array(_) => Type::Array(Box::new(Type::Unknown)),
+            _ => self.effect_expression_type(target, outer_bindings, environment),
+        };
+        let module = match receiver {
+            Type::String => "string",
+            Type::Array(_) => "array",
+            Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
+            Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
+            _ => return false,
+        };
+        Self::closure_effect_noninvoking_dotted(module, name)
+            && metadata::dotted_signature(module, name)
+                .is_some_and(|signature| signature.args.len() == args.len() + 1)
+    }
+
+    fn closure_effect_noninvoking_dotted(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            (
+                "fs",
+                "read" | "try_read" | "write" | "try_write" | "exists" | "read_dir"
+            ) | ("lexer", "scan")
+                | ("parser", "parse")
+                | (
+                    "string",
+                    "len"
+                        | "byte_len"
+                        | "chars"
+                        | "trim"
+                        | "lower"
+                        | "upper"
+                        | "contains"
+                        | "starts_with"
+                        | "ends_with"
+                        | "replace"
+                        | "slice"
+                )
+                | (
+                    "array",
+                    "len" | "is_empty" | "first" | "last" | "try_get" | "push" | "concat"
+                )
+                | ("object", "get_or")
+                | ("kuvalue", "as_int" | "as_str")
+                | ("json", "parse" | "try_parse" | "stringify")
+                | (
+                    "time",
+                    "now"
+                        | "instant"
+                        | "unix"
+                        | "millis"
+                        | "steady_millis"
+                        | "date"
+                        | "elapsed"
+                        | "from_unix"
+                        | "from_millis"
+                        | "is_leap"
+                        | "days_in_month"
+                        | "sleep"
+                )
+                | (
+                    "http",
+                    "text" | "html" | "json" | "empty" | "redirect" | "statusText"
+                )
+        )
     }
 
     fn effect_expression_type(
@@ -5840,6 +6580,9 @@ impl Checker {
             ExprKind::Variable(name) => {
                 if let Some(ty) = environment.types.get(name) {
                     return ty.clone();
+                }
+                if environment.locals.contains(name) {
+                    return Type::Unknown;
                 }
                 if let Some(binding_id) = outer_bindings.get(name) {
                     if let Some(binding) = self.binding_by_id(*binding_id) {
@@ -6020,18 +6763,148 @@ impl Checker {
         complete: &mut bool,
         summaries: &mut ClosureSummaryContext,
     ) {
-        if !expr_may_call_function(expr) {
+        self.extend_expression_closure_effects_inner(
+            expr,
+            outer_bindings,
+            environment,
+            effects,
+            complete,
+            summaries,
+            0,
+        );
+    }
+
+    // Carry depth separately from the existing function-summary state budget:
+    // forward function bodies may not have reached ordinary expression checking.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_expression_closure_effects_inner(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+        effects: &mut Vec<ClosureWriteEffect>,
+        complete: &mut bool,
+        summaries: &mut ClosureSummaryContext,
+        depth: usize,
+    ) {
+        if depth >= MAX_CHECK_DEPTH {
+            *complete = false;
             return;
         }
-        if let Some(summary) =
-            self.expression_call_effect_summary(expr, outer_bindings, environment, summaries)
-        {
-            effects.extend(summary.effects);
-            *complete &= summary.complete;
-        } else {
-            // A nested or dynamically selected call is not proven effect-free.
-            // The bounded caller fallback will retain its callable arguments.
-            *complete = false;
+        let initial_effects = effects.len();
+        // Child calls are collected in evaluation order, but this is still a
+        // may-write summary, not an ordered environment transfer. If an earlier
+        // child writes, later call targets may no longer have their old bodies.
+        let mut visit = |child: &Expr, child_environment: &ClosureEffectEnvironment| {
+            if effects.len() != initial_effects {
+                *complete = false;
+            }
+            self.extend_expression_closure_effects_inner(
+                child,
+                outer_bindings,
+                child_environment,
+                effects,
+                complete,
+                summaries,
+                depth + 1,
+            );
+        };
+        match &expr.kind {
+            ExprKind::Literal(Literal::TemplateString(raw)) => {
+                if crate::runtime::interpreter::visit_template_capture_expressions(
+                    raw,
+                    expr.span,
+                    |interpolation| {
+                        visit(interpolation, environment);
+                        Ok(())
+                    },
+                )
+                .is_err()
+                {
+                    *complete = false;
+                }
+            }
+            // Closure creation captures cells; it does not execute its body.
+            ExprKind::Function { .. } | ExprKind::Literal(_) | ExprKind::Variable(_) => {}
+            ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => {
+                visit(expr, environment);
+            }
+            ExprKind::Await(expr) => {
+                visit(expr, environment);
+                // Task execution requires its own effect proof, not just the
+                // effects of producing a task handle.
+                *complete = false;
+            }
+            ExprKind::Binary { left, op, right } => {
+                visit(left, environment);
+                let skipped = matches!(
+                    (&left.kind, op),
+                    (ExprKind::Literal(Literal::Bool(false)), BinaryOp::And)
+                        | (ExprKind::Literal(Literal::Bool(true)), BinaryOp::Or)
+                );
+                if !skipped {
+                    visit(right, environment);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                visit(callee, environment);
+                for argument in args {
+                    visit(argument, environment);
+                }
+                if effects.len() != initial_effects {
+                    *complete = false;
+                }
+                if let Some(summary) = self.expression_call_effect_summary(
+                    expr,
+                    outer_bindings,
+                    environment,
+                    summaries,
+                ) {
+                    effects.extend(summary.effects);
+                    *complete &= summary.complete;
+                } else {
+                    *complete = false;
+                }
+            }
+            ExprKind::Array(values) => {
+                for value in values {
+                    visit(value, environment);
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                for (_, value) in fields {
+                    visit(value, environment);
+                }
+            }
+            ExprKind::Index { target, index } => {
+                visit(target, environment);
+                visit(index, environment);
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                visit(target, environment);
+            }
+            ExprKind::Match { value, arms } => {
+                visit(value, environment);
+                // Pattern bindings shadow functions/modules even when their
+                // concrete selected type cannot be recovered. Keep all arms as
+                // possible executions; never evaluate a nested closure body.
+                for arm in arms {
+                    let mut arm_environment = environment.clone();
+                    let mut names = HashSet::new();
+                    bind_match_pattern_names(&arm.pattern, &mut names);
+                    for name in names {
+                        arm_environment.locals.insert(name.clone());
+                        arm_environment.types.insert(name.clone(), Type::Unknown);
+                        arm_environment
+                            .symbolic
+                            .insert(name, ClosureProvenance::unknown());
+                    }
+                    if let Some(guard) = &arm.guard {
+                        visit(guard, &arm_environment);
+                    }
+                    visit(&arm.value, &arm_environment);
+                }
+            }
         }
     }
 
@@ -6095,6 +6968,7 @@ impl Checker {
                         effects.push(ClosureWriteEffect {
                             target: *target,
                             provenance: provenance.clone(),
+                            assignment_span: Some(stmt_span(stmt)),
                         });
                         environment.symbolic.insert(name.clone(), provenance);
                         environment.types.insert(name.clone(), actual_type);
@@ -6125,6 +6999,7 @@ impl Checker {
                                 effects.push(ClosureWriteEffect {
                                     target: *target,
                                     provenance,
+                                    assignment_span: Some(stmt_span(stmt)),
                                 });
                             }
                         }
@@ -6158,6 +7033,7 @@ impl Checker {
                             effects.push(ClosureWriteEffect {
                                 target: *target,
                                 provenance: provenance.clone(),
+                                assignment_span: Some(stmt_span(stmt)),
                             });
                             environment.symbolic.insert(name.clone(), provenance);
                             environment.types.insert(name.clone(), actual_type);
@@ -6202,6 +7078,7 @@ impl Checker {
                             effects.push(ClosureWriteEffect {
                                 target: *target,
                                 provenance: provenance.clone(),
+                                assignment_span: Some(stmt_span(stmt)),
                             });
                             environment
                                 .symbolic
@@ -6319,9 +7196,17 @@ impl Checker {
                 }
                 Stmt::Function(function) => {
                     let mut provenance = ClosureProvenance::empty();
-                    for name in crate::runtime::interpreter::function_capture_names(function) {
-                        if let Some(captured) = environment.symbolic.get(&name) {
-                            provenance.merge(captured);
+                    match crate::runtime::interpreter::function_capture_names(function) {
+                        Ok(names) => {
+                            for name in names {
+                                if let Some(captured) = environment.symbolic.get(&name) {
+                                    provenance.merge(captured);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            complete = false;
+                            provenance.complete = false;
                         }
                     }
                     environment.locals.insert(function.name.clone());
@@ -6393,71 +7278,76 @@ impl Checker {
     }
 
     fn type_may_contain_function_value(&self, ty: &Type) -> bool {
-        self.type_may_contain_function_value_inner(ty, &mut HashSet::new(), &mut HashSet::new())
+        self.type_graph_any(ty, |ty| {
+            matches!(
+                ty,
+                Type::FunctionValue { .. }
+                    | Type::DynamicObject
+                    | Type::KuValue
+                    | Type::Generic(_)
+                    | Type::Unknown
+            )
+        })
     }
 
-    fn type_may_contain_function_value_inner(
-        &self,
-        ty: &Type,
-        visiting_structs: &mut HashSet<String>,
-        visiting_enums: &mut HashSet<String>,
-    ) -> bool {
-        match ty {
-            Type::FunctionValue { .. }
-            | Type::DynamicObject
-            | Type::KuValue
-            | Type::Generic(_)
-            | Type::Unknown => true,
-            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
-                self.type_may_contain_function_value_inner(inner, visiting_structs, visiting_enums)
-            }
-            Type::Union(types) => types.iter().any(|ty| {
-                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Object(fields) => fields.values().any(|ty| {
-                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Struct(name) => {
-                if !visiting_structs.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.structs.get(name).is_some_and(|layout| {
-                    layout.fields.values().any(|field| {
-                        self.type_may_contain_function_value_inner(
-                            field,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_structs.remove(name);
-                contains
-            }
-            Type::Enum(name) => {
-                if !visiting_enums.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.enums.get(name).is_some_and(|layout| {
-                    layout.variants.values().flatten().any(|field| {
-                        self.type_may_contain_function_value_inner(
-                            field,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_enums.remove(name);
-                contains
-            }
-            Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Null
-            | Type::StringMap
-            | Type::Native(_)
-            | Type::Void => false,
+    /// Query owned payload types without following Rust call frames. Named
+    /// layouts form a graph, so visit each struct/enum once per query; their
+    /// namespaces stay separate even when the names happen to be identical.
+    /// Function signatures are not payload edges and remain leaves.
+    fn type_graph_any<'a>(&'a self, root: &'a Type, matches_leaf: impl Fn(&Type) -> bool) -> bool {
+        enum Children<'a> {
+            Sequence(std::slice::Iter<'a, Type>),
+            Fields(std::collections::hash_map::Values<'a, String, Type>),
+            Variants(std::iter::Flatten<std::collections::hash_map::Values<'a, String, Vec<Type>>>),
         }
+        impl<'a> Iterator for Children<'a> {
+            type Item = &'a Type;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self {
+                    Self::Sequence(types) => types.next(),
+                    Self::Fields(types) => types.next(),
+                    Self::Variants(types) => types.next(),
+                }
+            }
+        }
+
+        let mut ancestors = Vec::new();
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        let mut current = Some(root);
+        while let Some(ty) = current.take() {
+            if matches_leaf(ty) {
+                return true;
+            }
+            match ty {
+                Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
+                    current = Some(inner.as_ref());
+                    continue;
+                }
+                Type::Union(types) => ancestors.push(Children::Sequence(types.iter())),
+                Type::Object(fields) => ancestors.push(Children::Fields(fields.values())),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        ancestors.push(Children::Fields(layout.fields.values()));
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        ancestors.push(Children::Variants(layout.variants.values().flatten()));
+                    }
+                }
+                _ => {}
+            }
+            while let Some(children) = ancestors.last_mut() {
+                if let Some(ty) = children.next() {
+                    current = Some(ty);
+                    break;
+                }
+                ancestors.pop();
+            }
+        }
+        false
     }
 
     fn mark_initialized(&mut self, name: &str) {
@@ -7076,112 +7966,50 @@ impl Checker {
     }
 
     fn is_owned_type(&self, ty: &Type) -> bool {
-        match ty {
-            Type::String
-            | Type::Array(_)
-            | Type::Object(_)
-            | Type::StringMap
-            | Type::DynamicObject
-            | Type::KuValue
-            // A native handle owns a C resource; it must be move-tracked and dropped.
-            | Type::Native(_) => true,
-            Type::Struct(name) => {
-                self.structs.get(name).is_some_and(|layout| {
-                    layout
-                        .fields
-                        .values()
-                        .any(|field| self.is_owned_type(field))
-                }) || self.structs.contains_key(name)
+        let mut ancestors: Vec<std::slice::Iter<'_, Type>> = Vec::new();
+        let mut current = Some(ty);
+        while let Some(ty) = current.take() {
+            match ty {
+                Type::String
+                | Type::Array(_)
+                | Type::Object(_)
+                | Type::StringMap
+                | Type::DynamicObject
+                | Type::KuValue
+                // A native handle owns a C resource; it must be move-tracked and dropped.
+                | Type::Native(_)
+                | Type::Result(_)
+                | Type::Task(_)
+                // Calling a function value reads it; passing it follows its parameter mode.
+                | Type::FunctionValue { .. } => return true,
+                // A defined aggregate already owns storage regardless of its
+                // payload types. Walking those types first cannot alter the
+                // answer and used to recurse through long named enum chains.
+                Type::Struct(name) if self.structs.contains_key(name) => return true,
+                Type::Enum(name) if self.enums.contains_key(name) => return true,
+                Type::Union(types) if !types.is_empty() => ancestors.push(types.iter()),
+                _ => {}
             }
-            Type::Enum(name) => {
-                self.enums.get(name).is_some_and(|layout| {
-                    layout
-                        .variants
-                        .values()
-                        .flatten()
-                        .any(|field| self.is_owned_type(field))
-                }) || self.enums.contains_key(name)
+            while let Some(types) = ancestors.last_mut() {
+                if let Some(ty) = types.next() {
+                    current = Some(ty);
+                    break;
+                }
+                ancestors.pop();
             }
-            Type::Result(_) | Type::Task(_) => true,
-            // Calling a function value reads it; passing it follows its parameter mode.
-            Type::FunctionValue { .. } => true,
-            Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
-            _ => false,
         }
+        false
     }
 
     /// Native handles are move-only even when nested inside another owned value.
-    /// Walk named layouts recursively, but break cycles so an invalid/self-recursive
-    /// user type cannot overflow the checker while clone eligibility is decided.
     fn type_contains_native_resource(&self, ty: &Type) -> bool {
-        self.type_contains_native_resource_inner(ty, &mut HashSet::new(), &mut HashSet::new())
-    }
-
-    fn type_contains_native_resource_inner(
-        &self,
-        ty: &Type,
-        visiting_structs: &mut HashSet<String>,
-        visiting_enums: &mut HashSet<String>,
-    ) -> bool {
-        match ty {
-            // `bytes` is an ordinary cloneable owned value. Other native types
-            // carry external resource identity and remain move-only, including
-            // when nested inside arrays/results/user aggregates.
-            Type::Native(name) => name != metadata::BYTES,
-            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
-                self.type_contains_native_resource_inner(inner, visiting_structs, visiting_enums)
-            }
-            Type::Union(types) => types.iter().any(|ty| {
-                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Object(fields) => fields.values().any(|ty| {
-                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Struct(name) => {
-                if !visiting_structs.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.structs.get(name).is_some_and(|layout| {
-                    layout.fields.values().any(|ty| {
-                        self.type_contains_native_resource_inner(
-                            ty,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_structs.remove(name);
-                contains
-            }
-            Type::Enum(name) => {
-                if !visiting_enums.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.enums.get(name).is_some_and(|layout| {
-                    layout.variants.values().flatten().any(|ty| {
-                        self.type_contains_native_resource_inner(
-                            ty,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_enums.remove(name);
-                contains
-            }
-            Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Null
-            | Type::StringMap
-            | Type::DynamicObject
-            | Type::Generic(_)
-            | Type::Void
-            | Type::FunctionValue { .. }
-            | Type::KuValue
-            | Type::Unknown => false,
-        }
+        // `bytes` is an ordinary cloneable owned value. Other native types
+        // carry external resource identity and remain move-only, including
+        // when nested inside arrays/results/user aggregates.
+        self.type_graph_any(
+            ty,
+            |ty| matches!(ty, Type::Native(name) if name != metadata::BYTES),
+        )
     }
 
     /// The move state after a loop, joining every way it can exit: running zero
@@ -7206,16 +8034,26 @@ impl Checker {
     /// the body re-initializes at the top before using it. A loop that cannot
     /// iterate (no back-edge) keeps the pre-loop state.
     ///
-    /// This runs a throwaway pass over the body to discover its moves; its scope
+    /// For while, the header is before the condition, which is included in every
+    /// speculative transfer. For for, there is no repeated condition expression.
+    /// This runs a throwaway condition/body pass to discover its moves; its scope
     /// mutations are rolled back and its errors ignored (the authoritative pass
     /// re-checks the body and surfaces any real error).
     fn compute_loop_top(
         &mut self,
         before: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
+        span: Span,
     ) -> Vec<HashMap<String, VarType>> {
-        if !loop_body_has_backedge(body) {
+        // With no outer bindings there is no loop-carried owner/provenance to
+        // discover. The authoritative pass still checks the entire body. This
+        // avoids doubling the work at every level of a pure nested loop.
+        if self.loop_analysis_exhausted.is_some()
+            || before.iter().all(HashMap::is_empty)
+            || !loop_body_has_backedge(body)
+        {
             return before.to_vec();
         }
         let saved_scopes = self.scopes.clone();
@@ -7233,12 +8071,18 @@ impl Checker {
         let mut top = before.to_vec();
         let mut converged = false;
         for _ in 0..max_iterations {
+            if self.charge_loop_analysis(span).is_err() {
+                break;
+            }
             // Speculative locals and closure bodies must receive the same ids on
             // every pass; otherwise Type/body-id churn would prevent convergence.
             self.next_binding_id = saved_next_binding_id;
             self.next_function_body_id = saved_next_function_body_id;
             self.function_body_outer_bindings = saved_body_bindings.clone();
-            let candidate = self.speculative_loop_transfer(before, &top, body, loop_var);
+            let candidate = self.speculative_loop_transfer(before, &top, condition, body, loop_var);
+            if self.loop_analysis_exhausted.is_some() {
+                break;
+            }
             if candidate == top {
                 top = candidate;
                 converged = true;
@@ -7246,7 +8090,7 @@ impl Checker {
             }
             top = candidate;
         }
-        if !converged {
+        if !converged && self.loop_analysis_exhausted.is_none() {
             // Fail closed after the explicit budget: every function-capable loop
             // binding may reach every other one. The authoritative pass then
             // reports E0904 at the first write that could close such a cycle.
@@ -7275,10 +8119,20 @@ impl Checker {
         &mut self,
         before: &[HashMap<String, VarType>],
         iteration_top: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
     ) -> Vec<HashMap<String, VarType>> {
         self.scopes = iteration_top.to_vec();
+        self.loop_analysis_depth += 1;
+        // Evaluate in the outer scope: a typed body-local shadow must not stand
+        // in for the original binding consumed by the next condition. The
+        // surrounding compute_loop_top already isolated try-exit collectors.
+        if let Some(condition) = condition {
+            if self.charge_loop_analysis(condition.span).is_ok() {
+                let _ = self.expect_condition(condition, condition.span);
+            }
+        }
         self.push_scope();
         if let Some((name, ty, provenance)) = loop_var {
             let _ = self.define(name.to_string(), ty.clone(), true, Span::default());
@@ -7293,20 +8147,48 @@ impl Checker {
             // Errors are surfaced by the authoritative pass. Continue scanning so
             // an earlier speculative error cannot hide later graph edges.
             let _ = self.check_stmt(stmt);
-            if stmt_stops_fallthrough(stmt) {
+            if self.loop_analysis_exhausted.is_some() || stmt_stops_fallthrough(stmt) {
                 break;
             }
         }
+        self.loop_analysis_depth -= 1;
         self.loop_break_states.pop();
         let continues = self.loop_continue_states.pop().unwrap_or_default();
         self.loop_depth -= 1;
         self.pop_scope();
-        let end_of_body = self.scopes.clone();
-        let mut top = merge_moved_scopes(before.to_vec(), before.to_vec(), end_of_body);
+        let mut top = before.to_vec();
+        // In particular, an if whose arms both break/return/continue has no
+        // fallthrough. Its restored pre-if scopes are not a real backedge.
+        if loop_block_flow(body).fallthrough {
+            top = merge_moved_scopes(before.to_vec(), top, self.scopes.clone());
+        }
         for state in continues {
             top = merge_moved_scopes(before.to_vec(), top, state);
         }
         top
+    }
+
+    fn check_loop_analysis_budget(&self) -> KuResult<()> {
+        match self.loop_analysis_exhausted {
+            Some(span) => Err(KuError::runtime(
+                "maximum check work exceeded; loop ownership analysis budget exhausted",
+                span,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn charge_loop_analysis(&mut self, span: Span) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
+        if let Some(remaining) = self.loop_analysis_remaining.checked_sub(1) {
+            self.loop_analysis_remaining = remaining;
+            Ok(())
+        } else {
+            // Sticky: an ignored speculative diagnostic cannot admit a partial
+            // ownership result, and unwinding nested loops never refills it.
+            self.loop_analysis_exhausted = Some(span);
+            self.check_loop_analysis_budget()
+        }
     }
 
     #[allow(dead_code)]
@@ -7338,16 +8220,38 @@ impl Checker {
 
     fn readonly_capture_for_outer_binding(&self, name: &str) -> Option<ReadonlyCapture> {
         let capture = self.readonly_capture?;
-        self.scopes
+        if capture.owner != "http handler" {
+            return self
+                .scopes
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
+                .filter(|index| *index < capture.boundary)
+                .map(|_| capture);
+        }
+        let binding_id = self
+            .scopes
             .iter()
-            .enumerate()
             .rev()
-            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
-            .filter(|index| *index < capture.boundary)
-            .map(|_| capture)
+            .find_map(|scope| scope.get(name))?
+            .binding_id;
+        // A replay scope is physically inside the handler but contains the
+        // original binding identity. Local homonyms have fresh identities.
+        self.scopes[..capture.boundary]
+            .iter()
+            .any(|scope| {
+                scope
+                    .get(name)
+                    .is_some_and(|binding| binding.binding_id == binding_id)
+            })
+            .then_some(capture)
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
+        if let Ok(binding) = self.get_allow_moved(name, span) {
+            self.reject_http_shared_write(binding.binding_id, span)?;
+        }
         if self
             .get_allow_moved(name, span)
             .is_ok_and(|binding| binding.borrowed)
@@ -7752,9 +8656,53 @@ fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<Stri
             Type::Result(actual) => bind_generic_type(expected, actual, bindings),
             _ => false,
         },
-        Type::Union(options) => options
-            .iter()
-            .any(|option| bind_generic_type(option, actual, bindings)),
+        Type::Union(options) => options.iter().any(|option| {
+            let mut candidate = bindings.clone();
+            if bind_generic_type(option, actual, &mut candidate) && type_matches(option, actual) {
+                *bindings = candidate;
+                true
+            } else {
+                false
+            }
+        }),
+        Type::FunctionValue {
+            params,
+            return_type,
+            is_async,
+            ..
+        } => {
+            let Type::FunctionValue {
+                params: actual_params,
+                return_type: actual_return,
+                is_async: actual_async,
+                ..
+            } = actual
+            else {
+                return false;
+            };
+            if is_async != actual_async || params.len() != actual_params.len() {
+                return false;
+            }
+            for (expected, actual) in params.iter().zip(actual_params) {
+                if expected.mode != actual.mode {
+                    return false;
+                }
+                if let (Some(expected), Some(actual)) = (&expected.ty, &actual.ty) {
+                    if !bind_generic_type(expected, actual, bindings)
+                        || !type_matches(expected, actual)
+                    {
+                        return false;
+                    }
+                }
+            }
+            match (return_type, actual_return) {
+                (Some(expected), Some(actual)) => {
+                    bind_generic_type(expected, actual, bindings) && type_matches(expected, actual)
+                }
+                (None, None) | (None, Some(_)) => true,
+                (Some(_), None) => false,
+            }
+        }
         _ => true,
     }
 }
@@ -7770,6 +8718,31 @@ fn substitute_generics(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
                 .map(|ty| substitute_generics(ty, bindings))
                 .collect(),
         ),
+        Type::FunctionValue {
+            params,
+            return_type,
+            body,
+            body_id,
+            is_async,
+        } => Type::FunctionValue {
+            params: params
+                .iter()
+                .map(|param| FunctionValueParam {
+                    name: param.name.clone(),
+                    mode: param.mode,
+                    ty: param
+                        .ty
+                        .as_ref()
+                        .map(|ty| substitute_generics(ty, bindings)),
+                })
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|ty| Box::new(substitute_generics(ty, bindings))),
+            body: body.clone(),
+            body_id: *body_id,
+            is_async: *is_async,
+        },
         other => other.clone(),
     }
 }
@@ -7806,19 +8779,44 @@ fn enum_pattern_covers_all_payload(pattern: &MatchPattern) -> bool {
 }
 
 fn pattern_key(pattern: &MatchPattern) -> String {
-    match pattern {
-        MatchPattern::Wildcard => "_".to_string(),
-        MatchPattern::Binding(_) => "$binding".to_string(),
-        MatchPattern::Literal(literal) => literal_key(literal),
-        MatchPattern::EnumVariant {
-            enum_name,
-            variant,
-            fields,
-        } => {
-            let fields = fields.iter().map(pattern_key).collect::<Vec<_>>().join(",");
-            format!("enum:{enum_name}.{variant}({fields})")
+    let mut key = String::new();
+    let mut ancestors: Vec<std::slice::Iter<'_, MatchPattern>> = Vec::new();
+    let mut current = Some(pattern);
+    while let Some(pattern) = current.take() {
+        match pattern {
+            MatchPattern::Wildcard => key.push('_'),
+            MatchPattern::Binding(_) => key.push_str("$binding"),
+            MatchPattern::Literal(literal) => key.push_str(&literal_key(literal)),
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                key.push_str("enum:");
+                key.push_str(enum_name);
+                key.push('.');
+                key.push_str(variant);
+                key.push('(');
+                let mut children = fields.iter();
+                if let Some(field) = children.next() {
+                    ancestors.push(children);
+                    current = Some(field);
+                    continue;
+                }
+                key.push(')');
+            }
+        }
+        while let Some(children) = ancestors.last_mut() {
+            if let Some(field) = children.next() {
+                key.push(',');
+                current = Some(field);
+                break;
+            }
+            key.push(')');
+            ancestors.pop();
         }
     }
+    key
 }
 
 fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
@@ -7938,6 +8936,18 @@ fn assign_target_uses_name(target: &AssignTarget, name: &str, shadowed: bool) ->
 
 fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            let mut used = false;
+            let result = crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    used |= expr_uses_name(inner, name, shadowed);
+                    Ok(())
+                },
+            );
+            used || (result.is_err() && !shadowed)
+        }
         ExprKind::Variable(variable) => !shadowed && variable == name,
         ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
             expr_uses_name(expr, name, shadowed)
@@ -7980,13 +8990,9 @@ fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
 }
 
 fn pattern_binds_name(pattern: &MatchPattern, name: &str) -> bool {
-    match pattern {
-        MatchPattern::Binding(binding) => binding == name,
-        MatchPattern::EnumVariant { fields, .. } => {
-            fields.iter().any(|field| pattern_binds_name(field, name))
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => false,
-    }
+    pattern
+        .preorder()
+        .any(|node| matches!(node, MatchPattern::Binding(binding) if binding == name))
 }
 
 fn reject_http_side_effect_response_calls(body: &[Stmt], span: Span) -> KuResult<()> {
@@ -8602,6 +9608,22 @@ fn collect_checker_capture_expr(
     captures: &mut HashSet<String>,
 ) {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            if crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    collect_checker_capture_expr(inner, bound, visible_names, captures);
+                    Ok(())
+                },
+            )
+            .is_err()
+            {
+                // A failed scan is never evidence of an empty environment.
+                // check_template_string reports the actual validation error.
+                captures.extend(visible_names.difference(bound).cloned());
+            }
+        }
         ExprKind::Variable(name) => {
             capture_checker_name(name, bound, visible_names, captures);
         }
@@ -8656,16 +9678,10 @@ fn collect_checker_capture_expr(
 }
 
 fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
-    match pattern {
-        MatchPattern::Binding(name) => {
+    for node in pattern.preorder() {
+        if let MatchPattern::Binding(name) = node {
             bound.insert(name.clone());
         }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_names(field, bound);
-            }
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
 }
 
@@ -8724,21 +9740,27 @@ fn bind_match_pattern_closure_provenance(
     selected: &ClosureProvenance,
     symbolic: &mut HashMap<String, ClosureProvenance>,
 ) {
-    match pattern {
-        MatchPattern::Binding(name) => {
+    for node in pattern.preorder() {
+        if let MatchPattern::Binding(name) = node {
             symbolic.insert(name.clone(), selected.clone());
         }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_closure_provenance(field, selected, symbolic);
-            }
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
 }
 
 fn expr_may_call_function(expr: &Expr) -> bool {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            let mut calls = false;
+            let result = crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    calls |= expr_may_call_function(inner);
+                    Ok(())
+                },
+            );
+            calls || result.is_err()
+        }
         ExprKind::Call { .. } | ExprKind::Await(_) => true,
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => expr_may_call_function(expr),
         ExprKind::Binary { left, right, .. } => {
@@ -9143,7 +10165,14 @@ fn loop_stmt_flow(stmt: &Stmt) -> LoopBodyFlow {
                 continues: then_flow.continues || else_flow.continues,
             }
         }
-        Stmt::While { .. } | Stmt::For { .. } => LoopBodyFlow {
+        // Nested loops capture their own continue. Reuse the existing precise
+        // literal-true/no-own-break rule: a nonreturning inner while cannot
+        // manufacture a backedge to this outer condition.
+        Stmt::While { .. } => LoopBodyFlow {
+            fallthrough: !stmt_stops_fallthrough(stmt),
+            continues: false,
+        },
+        Stmt::For { .. } => LoopBodyFlow {
             fallthrough: true,
             continues: false,
         },
@@ -9471,7 +10500,7 @@ const HTTP_REQUEST_CONFIG_FIELDS: [&str; 6] = [
     "timeout_ms",
     "max_body_bytes",
 ];
-const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
+const HTTP_SERVICE_CONFIG_FIELDS: [&str; 11] = [
     "read_header_timeout_ms",
     "read_body_timeout_ms",
     "write_timeout_ms",
@@ -9482,6 +10511,7 @@ const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
     "max_connections",
     "max_active_requests",
     "max_pending_requests",
+    "max_buffer_bytes",
 ];
 
 /// Reject a statically-known HTTP config field that the selected API does not
@@ -9518,6 +10548,7 @@ fn http_service_type() -> Type {
         ("max_connections".to_string(), Type::Int),
         ("max_active_requests".to_string(), Type::Int),
         ("max_pending_requests".to_string(), Type::Int),
+        ("max_buffer_bytes".to_string(), Type::Int),
         (
             "routes".to_string(),
             Type::Array(Box::new(http_route_type())),
@@ -9690,7 +10721,8 @@ fn reject_direct_closure_cycle(target: &str, value: &Expr, span: Span) -> KuResu
 fn expression_contains_closure_capturing(expr: &Expr, target: &str) -> bool {
     match &expr.kind {
         ExprKind::Function { params, body, .. } => {
-            crate::runtime::interpreter::closure_capture_names(params, body).contains(target)
+            crate::runtime::interpreter::closure_capture_names(params, body)
+                .map_or(true, |names| names.contains(target))
         }
         ExprKind::TryUnwrap { expr } => expression_contains_closure_capturing(expr, target),
         ExprKind::Array(values) => values
@@ -9781,6 +10813,7 @@ fn map_template_error(err: KuError, interpolation: &TemplateInterpolation) -> Ku
     if err.span == Span::default() {
         return err;
     }
+    let diagnostic = err.diagnostic_id();
     KuError::new(
         err.kind,
         err.message,
@@ -9794,6 +10827,22 @@ fn map_template_error(err: KuError, interpolation: &TemplateInterpolation) -> Ku
                 prefix_by_offset(&interpolation.source, err.span.end.offset),
             ),
         ),
+    )
+    .with_diagnostic_id(diagnostic)
+}
+
+fn template_position(
+    base: crate::span::Position,
+    inner: crate::span::Position,
+) -> crate::span::Position {
+    crate::span::Position::new(
+        base.line + inner.line.saturating_sub(1),
+        if inner.line <= 1 {
+            base.column + inner.column.saturating_sub(1)
+        } else {
+            inner.column
+        },
+        base.offset + inner.offset,
     )
 }
 
@@ -9829,7 +10878,218 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deep_match_patterns_keep_type_binding_capture_and_key_behavior() {
+        const CHILD: &str = "KU_CHECKER_DEEP_MATCH_PATTERN_CHILD";
+        const COMPLETED: &str = "checker deep match pattern completed";
+        if std::env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "checker::tests::deep_match_patterns_keep_type_binding_capture_and_key_behavior",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("deep pattern check has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "deep pattern child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+
+        const DEPTH: usize = 16_384;
+        let mut pattern = MatchPattern::EnumVariant {
+            enum_name: "Node".into(),
+            variant: "End".into(),
+            fields: vec![MatchPattern::Binding("leaf".into())],
+        };
+        for _ in 0..DEPTH {
+            pattern = MatchPattern::EnumVariant {
+                enum_name: "Node".into(),
+                variant: "Next".into(),
+                fields: vec![pattern],
+            };
+        }
+        let pattern = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![pattern, MatchPattern::Binding("tail".into())],
+        };
+        let mut checker = Checker::new();
+        checker.enums.insert(
+            "Node".into(),
+            EnumType {
+                variants: HashMap::from([
+                    ("Next".into(), vec![Type::Enum("Node".into())]),
+                    ("End".into(), vec![Type::Int]),
+                ]),
+            },
+        );
+        checker.enums.insert(
+            "Pair".into(),
+            EnumType {
+                variants: HashMap::from([(
+                    "Both".into(),
+                    vec![Type::Enum("Node".into()), Type::Bool],
+                )]),
+            },
+        );
+        checker
+            .check_match_pattern(&pattern, &Type::Enum("Pair".into()), Span::default())
+            .expect("deep match remains valid without a new pattern depth limit");
+        assert_eq!(checker.get("leaf", Span::default()).unwrap().ty, Type::Int);
+        assert_eq!(checker.get("tail", Span::default()).unwrap().ty, Type::Bool);
+        assert!(pattern_binds_name(&pattern, "leaf"));
+        assert!(pattern_binds_name(&pattern, "tail"));
+        assert!(!pattern_binds_name(&pattern, "missing"));
+        let mut bound = HashSet::from(["outer".into()]);
+        bind_match_pattern_names(&pattern, &mut bound);
+        assert_eq!(
+            bound,
+            HashSet::from(["outer".into(), "leaf".into(), "tail".into()])
+        );
+        let mut selected = ClosureProvenance::empty();
+        selected.dependencies.extend([7, 11]);
+        let mut symbolic = HashMap::from([("outer".into(), ClosureProvenance::unknown())]);
+        bind_match_pattern_closure_provenance(&pattern, &selected, &mut symbolic);
+        assert_eq!(symbolic.get("leaf"), Some(&selected));
+        assert_eq!(symbolic.get("tail"), Some(&selected));
+        assert!(!symbolic.get("outer").unwrap().complete);
+        let expected_key = format!(
+            "enum:Pair.Both({}enum:Node.End($binding){},$binding)",
+            "enum:Node.Next(".repeat(DEPTH),
+            ")".repeat(DEPTH)
+        );
+        assert_eq!(pattern_key(&pattern), expected_key);
+        drop(pattern);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn match_pattern_keys_and_first_error_still_follow_field_order() {
+        let pattern = MatchPattern::EnumVariant {
+            enum_name: "Mod.Tree".into(),
+            variant: "Branch".into(),
+            fields: vec![
+                MatchPattern::Wildcard,
+                MatchPattern::Binding("ignored_name".into()),
+                MatchPattern::Literal(Literal::Int(-3)),
+                MatchPattern::Literal(Literal::Float(0.5)),
+                MatchPattern::Literal(Literal::Bool(true)),
+                MatchPattern::Literal(Literal::String("中,(文)".into())),
+                MatchPattern::Literal(Literal::TemplateString("模板".into())),
+                MatchPattern::Literal(Literal::Null),
+                MatchPattern::EnumVariant {
+                    enum_name: "Empty".into(),
+                    variant: "Unit".into(),
+                    fields: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            pattern_key(&pattern),
+            "enum:Mod.Tree.Branch(_,$binding,int:-3,float:0.5,bool:true,str:中,(文),str:模板,null,enum:Empty.Unit())"
+        );
+
+        let mut checker = Checker::new();
+        checker.enums.insert(
+            "Pair".into(),
+            EnumType {
+                variants: HashMap::from([("Both".into(), vec![Type::Int, Type::Bool])]),
+            },
+        );
+        let mismatch_before_binding = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![
+                MatchPattern::Literal(Literal::Bool(true)),
+                MatchPattern::Binding("later".into()),
+            ],
+        };
+        let error = checker
+            .check_match_pattern(
+                &mismatch_before_binding,
+                &Type::Enum("Pair".into()),
+                Span::default(),
+            )
+            .expect_err("first payload has the wrong type");
+        assert_eq!(
+            error.message,
+            type_error(Span::default(), &Type::Int, &Type::Bool).message
+        );
+        assert!(!checker.contains("later"));
+
+        let binding_before_mismatch = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![
+                MatchPattern::Binding("earlier".into()),
+                MatchPattern::Literal(Literal::Int(1)),
+            ],
+        };
+        let error = checker
+            .check_match_pattern(
+                &binding_before_mismatch,
+                &Type::Enum("Pair".into()),
+                Span::default(),
+            )
+            .expect_err("second payload has the wrong type");
+        assert_eq!(
+            error.message,
+            type_error(Span::default(), &Type::Bool, &Type::Int).message
+        );
+        assert_eq!(
+            checker.get("earlier", Span::default()).unwrap().ty,
+            Type::Int
+        );
+    }
+
+    #[test]
     fn native_resource_detection_is_recursive_and_cycle_safe() {
+        const CHILD: &str = "KU_CHECKER_NAMED_TYPE_GRAPH_CHILD";
+        const COMPLETED: &str = "checker named type graph completed";
+        if std::env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "checker::tests::native_resource_detection_is_recursive_and_cycle_safe",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("named type graph check has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "named type graph child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+
         let mut checker = Checker::new();
         checker.structs.insert(
             "Recursive".to_string(),
@@ -9877,5 +11137,94 @@ mod tests {
             ))))),
         ]);
         assert!(checker.type_contains_native_resource(&nested));
+
+        // The struct and enum intentionally share a name. A single visited
+        // namespace would incorrectly suppress the enum payload below it.
+        checker.structs.insert(
+            "Shared".into(),
+            StructType {
+                fields: HashMap::from([("child".into(), Type::Enum("Shared".into()))]),
+            },
+        );
+        checker.enums.insert(
+            "Shared".into(),
+            EnumType {
+                variants: HashMap::from([
+                    ("Cycle".into(), vec![Type::Struct("Shared".into())]),
+                    ("End".into(), vec![Type::Int]),
+                ]),
+            },
+        );
+        const DEPTH: usize = 4_000;
+        for index in 0..DEPTH {
+            let previous = if index == 0 {
+                Type::Struct("Shared".into())
+            } else {
+                Type::Enum(format!("Deep{}", index - 1))
+            };
+            checker.enums.insert(
+                format!("Deep{index}"),
+                EnumType {
+                    variants: HashMap::from([("Next".into(), vec![previous.clone(), previous])]),
+                },
+            );
+        }
+        let root = Type::Enum(format!("Deep{}", DEPTH - 1));
+        let function = Type::FunctionValue {
+            params: vec![FunctionValueParam {
+                name: "handle".into(),
+                mode: ParamMode::Owned,
+                ty: Some(Type::Native(metadata::PG_RESULT.into())),
+            }],
+            return_type: Some(Box::new(Type::Native(metadata::MYSQL_CLIENT.into()))),
+            body: vec![],
+            body_id: None,
+            is_async: false,
+        };
+        for (leaf, contains_function, contains_native) in [
+            (Type::Int, false, false),
+            (function, true, false),
+            (Type::Unknown, true, false),
+            (Type::Generic("T".into()), true, false),
+            (Type::DynamicObject, true, false),
+            (Type::KuValue, true, false),
+            (Type::Native(metadata::BYTES.into()), false, false),
+            (Type::Native(metadata::PG_RESULT.into()), false, true),
+        ] {
+            let payload = Type::Result(Box::new(Type::Task(Box::new(Type::Array(Box::new(
+                Type::Object(HashMap::from([(
+                    "payload".into(),
+                    Type::Union(vec![Type::Bool, leaf]),
+                )])),
+            ))))));
+            checker
+                .enums
+                .get_mut("Shared")
+                .unwrap()
+                .variants
+                .insert("End".into(), vec![payload]);
+            assert_eq!(
+                checker.type_may_contain_function_value(&root),
+                contains_function
+            );
+            assert_eq!(
+                checker.type_contains_native_resource(&root),
+                contains_native
+            );
+        }
+
+        // A deep diamond DAG has exponentially many paths but only linearly
+        // many nodes/edges. Each named layout is expanded once per query.
+        let visited = std::cell::Cell::new(0usize);
+        assert!(!checker.type_graph_any(&root, |_| {
+            visited.set(visited.get() + 1);
+            false
+        }));
+        assert!(visited.get() <= DEPTH * 3 + 32);
+        for absent in [Type::Struct("Missing".into()), Type::Enum("Missing".into())] {
+            assert!(!checker.type_may_contain_function_value(&absent));
+            assert!(!checker.type_contains_native_resource(&absent));
+        }
+        eprintln!("{COMPLETED}");
     }
 }

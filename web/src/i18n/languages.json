@@ -1,0 +1,82 @@
+{
+  "de": {
+    "label": "Deutsch",
+    "lang": "de",
+    "dir": "ltr"
+  },
+  "el": {
+    "label": "Ελληνικά",
+    "lang": "el",
+    "dir": "ltr"
+  },
+  "en": {
+    "label": "English",
+    "lang": "en",
+    "dir": "ltr"
+  },
+  "es": {
+    "label": "Español",
+    "lang": "es",
+    "dir": "ltr"
+  },
+  "fa": {
+    "label": "فارسی",
+    "lang": "fa",
+    "dir": "rtl"
+  },
+  "fr": {
+    "label": "Français",
+    "lang": "fr",
+    "dir": "ltr"
+  },
+  "it": {
+    "label": "Italiano",
+    "lang": "it",
+    "dir": "ltr"
+  },
+  "ja": {
+    "label": "日本語",
+    "lang": "ja",
+    "dir": "ltr"
+  },
+  "ko": {
+    "label": "한국어",
+    "lang": "ko",
+    "dir": "ltr"
+  },
+  "pl": {
+    "label": "Polski",
+    "lang": "pl",
+    "dir": "ltr"
+  },
+  "pt": {
+    "label": "Português (Brasil)",
+    "lang": "pt-BR",
+    "dir": "ltr"
+  },
+  "ro": {
+    "label": "Română",
+    "lang": "ro",
+    "dir": "ltr"
+  },
+  "ru": {
+    "label": "Русский",
+    "lang": "ru",
+    "dir": "ltr"
+  },
+  "tr": {
+    "label": "Türkçe",
+    "lang": "tr",
+    "dir": "ltr"
+  },
+  "zh-cn": {
+    "label": "简体中文",
+    "lang": "zh-CN",
+    "dir": "ltr"
+  },
+  "zh-tw": {
+    "label": "繁體中文",
+    "lang": "zh-TW",
+    "dir": "ltr"
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "siteTitle": "Ku — Język w trakcie tworzenia",
+  "siteDescription": "Poznaj Ku, eksperymentalny język programowania. Prawdziwe przykłady, instalacja, przewodniki po języku i obsługa zapleczy.",
+  "skip": "Przejdź do treści",
+  "home": "Strona główna Ku",
+  "documentation": "Dokumentacja",
+  "languageGuide": "Przewodnik po języku",
+  "releases": "Informacje o wydaniach",
+  "navigation": "Nawigacja główna",
+  "search": "Szukaj",
+  "searchDocs": "Szukaj w dokumentacji",
+  "searchTitle": "Przeszukaj dokumentację Ku",
+  "searchPlaceholder": "Spróbuj JSON, json.encode, parse_error…",
+  "searchEmpty": "Wpisz, aby wyszukać.",
+  "searching": "Wyszukiwanie…",
+  "searchNoResults": "Brak wyników. Spróbuj innego słowa.",
+  "searchUnavailable": "Wyszukiwanie jest dostępne w zbudowanym podglądzie. Przeglądaj dokumentację przez nawigację.",
+  "theme": "Motyw",
+  "language": "Język",
+  "menu": "Menu",
+  "footer": "Stopka",
+  "tagline": "Język w trakcie tworzenia.",
+  "project": "O projekcie i licencji",
+  "support": "Macierz obsługi",
+  "reportIssue": "Zgłoś problem",
+  "experimental": "Eksperymentalny. Nie do produkcji.",
+  "sourceAvailable": "Źródła dostępne do przeglądania",
+  "development": "Experimental prerelease",
+  "heroTitle": ["Pomysł.", "Odrobina", "Ku."],
+  "heroDescription": "Mały język z miejscem na rozwój. Czytelna składnia, jawna własność i narzędzia, które poznasz od pierwszej linijki.",
+  "start": "Zacznij pisać w Ku",
+  "explore": "Poznaj język",
+  "heroNote": "Wczesny etap jest zamierzony. Odkrywaj, eksperymentuj, dziel się opinią.",
+  "interpreter": "Interpreter",
+  "viewSource": "Zobacz źródło",
+  "principle": "Zacznij od małego. Zrozum, co budujesz.",
+  "approachTitle": ["Mniejsza złożoność.", "Jaśniejszy obraz."],
+  "approachDescription": "Poznaj Ku przez rzeczywiste zachowanie, stale pamiętając o bieżących granicach.",
+  "features": [
+    [
+      "Przeczytaj. Zrozum.",
+      "Deklaruj wiązanie przy pierwszym przypisaniu. Wyrażaj pomysł funkcjami, wartościami strukturalnymi i jawną obsługą błędów.",
+      "Przewodnik po języku",
+      "docs/guide/language"
+    ],
+    [
+      "Ujawnij własność.",
+      "Domyślnie przenoś, klonuj świadomie i pożyczaj tylko do odczytu w wywołaniach synchronicznych. Bieżące reguły opisano razem z ograniczeniami.",
+      "Własność i granice",
+      "docs/support"
+    ],
+    [
+      "Wybierz ścieżkę wykonania.",
+      "Uruchamiaj interpreterem, pakuj wykonywalny program uruchamiający lub poznaj natywne C. Przed wyborem zaplecza sprawdź macierz obsługi.",
+      "Poznaj narzędzia",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Znajome dane.", "Jawne błędy."],
+  "practiceDescription": "Zaimportuj moduł, zbuduj wartość i zakoduj ją jako JSON. Operator ? propaguje błędy zamiast je ukrywać.",
+  "jsonReference": "Czytaj dokumentację JSON",
+  "exampleNote": "Przykład synchroniczny. Szczegóły zaplecza i wersji opisano w dokumentacji.",
+  "copy": "Kopiuj kod",
+  "copyExample": "Kopiuj przykład JSON",
+  "copied": "Skopiowano ✓",
+  "copyFallback": "Zaznacz kod do skopiowania",
+  "learnTitle": "Dobre miejsce na początek.",
+  "install": "Instalacja i pobieranie",
+  "resources": [
+    [
+      "Pierwszy program Ku",
+      "Zainstaluj, uruchom i zobacz wynik.",
+      "docs/getting-started"
+    ],
+    [
+      "Nauka języka",
+      "Wiązania, funkcje, wartości i błędy.",
+      "docs/guide/language"
+    ],
+    ["Biblioteka standardowa", "Znajdź moduły i poznaj JSON.", "docs/stdlib"],
+    [
+      "Poznaj granice",
+      "Platformy, zaplecza i obecne ograniczenia.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "Prace trwają. Historia się rozwija.",
+  "projectDescription": "Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v{releasedVersion}. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases.",
+  "github": "Zobacz na GitHub",
+  "license": "Źródła można przeglądać. Nie udzielono licencji open source.",
+  "verified": "Zweryfikowano",
+  "limitations": "Obsługa i ograniczenia",
+  "version": "Wersja dokumentacji",
+  "next": "v0.0.18",
+  "snapshot": "Migawka {version}",
+  "snapshotNotice": "Archiwalna migawka dokumentacji. Jest zachowywana niezależnie od bieżącej dokumentacji rozwojowej; nie ogłasza wydania binarnego.",
+  "nextNotice": "Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v{currentVersion}. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases.",
+  "startGroup": "Zacznij tutaj",
+  "toolsGroup": "Język i narzędzia",
+  "projectGroup": "Projekt"
+}

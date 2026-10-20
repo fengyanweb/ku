@@ -1,0 +1,101 @@
+{
+  "siteTitle": "Ku — A language in the making",
+  "siteDescription": "Meet Ku, an experimental programming language. Explore real examples, installation, language guides and backend support.",
+  "skip": "Skip to content",
+  "home": "Ku home",
+  "documentation": "Documentation",
+  "languageGuide": "Language guide",
+  "releases": "Release notes",
+  "navigation": "Main navigation",
+  "search": "Search",
+  "searchDocs": "Search documentation",
+  "searchTitle": "Search Ku documentation",
+  "searchPlaceholder": "Try JSON, json.encode, parse_error…",
+  "searchEmpty": "Type to search.",
+  "searching": "Searching…",
+  "searchNoResults": "No results. Try another keyword.",
+  "searchUnavailable": "Search is available in the built preview. Browse documentation using the navigation.",
+  "theme": "Theme",
+  "language": "Language",
+  "menu": "Menu",
+  "footer": "Footer",
+  "tagline": "A language in the making.",
+  "project": "About & license",
+  "support": "Support matrix",
+  "reportIssue": "Report an issue",
+  "experimental": "Experimental. Not for production.",
+  "sourceAvailable": "Source available to view",
+  "development": "Experimental prerelease",
+  "heroTitle": ["An idea.", "A little", "Ku."],
+  "heroDescription": "A small language with room to grow. Readable syntax, explicit ownership, and a toolchain you can explore from the first line.",
+  "start": "Start writing Ku",
+  "explore": "Explore the language",
+  "heroNote": "Early by design. Explore, experiment, share feedback.",
+  "interpreter": "Interpreter",
+  "viewSource": "View source",
+  "principle": "Start small. Understand what you build.",
+  "approachTitle": ["A smaller surface.", "A clearer picture."],
+  "approachDescription": "Get to know Ku through its actual behavior, with the current boundaries always in view.",
+  "features": [
+    [
+      "Read it. Understand it.",
+      "Declare a binding on first assignment. Use functions, structured values and explicit error handling to express your idea.",
+      "Language guide",
+      "docs/guide/language"
+    ],
+    [
+      "Make ownership explicit.",
+      "Move by default, clone intentionally, and borrow read-only in synchronous calls. The current rules are documented alongside their limits.",
+      "Ownership & boundaries",
+      "docs/support"
+    ],
+    [
+      "Choose your execution path.",
+      "Run with the interpreter, package an executable runner, or explore native C. Check the support matrix before choosing a backend.",
+      "Explore the toolchain",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Familiar data.", "Explicit errors."],
+  "practiceDescription": "Import a module, build a value, and encode it as JSON. The ? operator propagates errors instead of hiding them.",
+  "jsonReference": "Read the JSON reference",
+  "exampleNote": "Synchronous example. Backend and version details are documented in the reference.",
+  "copy": "Copy code",
+  "copyExample": "Copy JSON example",
+  "copied": "Copied ✓",
+  "copyFallback": "Select code to copy",
+  "learnTitle": "A good place to begin.",
+  "install": "Installation & downloads",
+  "resources": [
+    [
+      "Your first Ku program",
+      "Install, run, and see the result.",
+      "docs/getting-started"
+    ],
+    [
+      "Learn the language",
+      "Bindings, functions, values and errors.",
+      "docs/guide/language"
+    ],
+    ["Standard library", "Find modules and explore JSON.", "docs/stdlib"],
+    [
+      "Know the boundaries",
+      "Platforms, backends and current limits.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "A work in progress. A story to follow.",
+  "projectDescription": "This documentation describes the frozen scope of the v{releasedVersion} experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases.",
+  "github": "Explore on GitHub",
+  "license": "Source is available to view. No open-source license has been granted.",
+  "verified": "Verified",
+  "limitations": "Support & limitations",
+  "version": "Documentation version",
+  "next": "Current documentation",
+  "snapshot": "{version} snapshot",
+  "snapshotNotice": "Independent version documentation. The corresponding GitHub Release records actual publication, assets and checksums.",
+  "nextNotice": "Documentation for Ku {currentVersion}. Use its snapshot for a fixed reference; GitHub Release records actual publication and assets.",
+  "startGroup": "Start here",
+  "toolsGroup": "Language & tools",
+  "projectGroup": "Project"
+}

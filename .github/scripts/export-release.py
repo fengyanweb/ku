@@ -2,7 +2,8 @@
 """Export a checked Ku bundle without publishing or obtaining credentials.
 
 Only Python's standard library is used. Cargo metadata is supplied by the
-caller so this program never downloads a dependency or executes package code.
+caller so this program never downloads a dependency. The command-line release
+path runs only the freshly verified host Ku binary and repository examples.
 """
 
 from __future__ import annotations
@@ -13,12 +14,15 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import platform
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 MAX_FILES = 1000
 MAX_BYTES = 1024 * 1024 * 1024
@@ -40,6 +44,86 @@ RLIB_NAME = re.compile(r"deps/lib[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\.rlib\Z")
 
 class ExportError(ValueError):
     pass
+
+
+def canonical_example(source: bytes) -> bytes:
+    """Hash and execute the same UTF-8/LF text on every checkout platform."""
+    return source.decode("utf-8").replace("\r\n", "\n").encode("utf-8")
+
+
+def install_command(executable: Path, arguments: list[str], working: Path) -> tuple[dict, str]:
+    """Run an installed CLI command with bounded time/output and reap it."""
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen([str(executable), *arguments], cwd=working,
+                                   stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        deadline = time.monotonic() + 30
+        try:
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise ExportError("installed Ku command exceeded 30 seconds")
+                if any(os.fstat(stream.fileno()).st_size > 65536 for stream in (stdout, stderr)):
+                    raise ExportError("installed Ku command exceeded its output limit")
+                time.sleep(0.02)
+            output = []
+            for stream in (stdout, stderr):
+                stream.seek(0)
+                value = stream.read(65537)
+                if len(value) > 65536:
+                    raise ExportError("installed Ku command exceeded its output limit")
+                output.append(value)
+            if process.returncode != 0 or output[1]:
+                raise ExportError(f"installed Ku command failed (exit {process.returncode}): "
+                                  + output[1].decode("utf-8", errors="replace")[:2048])
+            receipt = {"exit_code": process.returncode, "stdout_bytes": len(output[0]),
+                       "stdout_sha256": hashlib.sha256(output[0]).hexdigest(),
+                       "stderr_bytes": len(output[1])}
+            return receipt, output[0].decode("utf-8").replace("\r\n", "\n")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=10)
+
+
+def verify_installation(installed: Path, repo: Path, version: str, target: str) -> dict:
+    """Use the files extracted from the final archive, outside the checkout."""
+    hosts = {("Windows", "amd64"): "x86_64-pc-windows-msvc",
+             ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+             ("Darwin", "arm64"): "aarch64-apple-darwin"}
+    if hosts.get((platform.system(), platform.machine().lower())) != target:
+        raise ExportError("installation check requires the release target's native host")
+    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    receipt = {"format": "ku-install-check-v1", "version": version, "target": target,
+               "executable_sha256": file_hash(executable), "checks": [], "examples": {}}
+    with tempfile.TemporaryDirectory(prefix="ku-install-check-") as temporary:
+        working = Path(temporary).resolve()
+        for name in ("hello.ku", "json.ku"):
+            source = canonical_example(read_bounded(repo / "examples" / name, 65536))
+            (working / name).write_bytes(source)
+            receipt["examples"][name] = hashlib.sha256(source).hexdigest()
+        for name, arguments in (("version", ["--version"]),
+                                ("check-hello", ["check", "hello.ku"]),
+                                ("run-hello", ["run", "hello.ku"]),
+                                ("run-json", ["run", "json.ku"])):
+            record, output = install_command(executable, arguments, working)
+            if name == "version" and output != f"ku {version}\n":
+                raise ExportError("installed Ku version does not match the release")
+            if name == "check-hello" and output != "check ok: hello.ku\n":
+                raise ExportError("installed Ku did not check the representative program")
+            if name == "run-hello" and output != "Hello Ku\n":
+                raise ExportError("installed Ku representative program returned unexpected output")
+            if name == "run-json":
+                lines = output.splitlines()
+                if (len(lines) != 4 or lines[1:3] != ["roundtrip ok", "json/parse_error"]
+                        or "byte 7" not in lines[3]):
+                    raise ExportError("installed Ku JSON example did not complete its checks")
+                value = json.loads(lines[0])
+                if (value.get("name") != "中文😀" or value.get("count") != 7
+                        or value.get("active") is not True or value.get("absent", True) is not None
+                        or value.get("embedded_nul") != "left\0right"
+                        or value.get("nested") != {"numbers": [[1, 2], [3]]}):
+                    raise ExportError("installed Ku JSON result differs from the example")
+            receipt["checks"].append({"name": name, **record})
+    return receipt
 
 
 class PlainTarInfo(tarfile.TarInfo):
@@ -417,7 +501,8 @@ def verify_archive(archive: Path, expected: dict, destination: Path):
 
 
 def export_release(bundle: Path, output: Path, repo: Path, version: str,
-                   target: str, commit: str, metadata: Path, rust_sysroot: Path) -> dict:
+                   target: str, commit: str, metadata: Path, rust_sysroot: Path,
+                   verify_install: bool = False) -> dict:
     if not VERSION.fullmatch(version):
         raise ExportError("version must be a canonical 0.x.y version without v")
     if target not in TARGETS:
@@ -505,6 +590,8 @@ components. No additional license grant for Ku is implied by this archive.
         verify_archive(compressed, stage.files, verified)
         manifest = {**release, "asset": asset_name, "sha256": file_hash(compressed),
                     "size": compressed.stat().st_size, "files": stage.files}
+        if verify_install:
+            manifest["installation_check"] = verify_installation(verified, repo, version, target)
         # Exclusive creation also closes the race with another publisher.
         with asset_path.open("xb") as destination, compressed.open("rb") as source:
             shutil.copyfileobj(source, destination, length=1024 * 1024)
@@ -522,7 +609,7 @@ def main() -> int:
         parser.add_argument(f"--{argument}", required=True)
     arguments = parser.parse_args()
     try:
-        result = export_release(**vars(arguments))
+        result = export_release(**vars(arguments), verify_install=True)
     except (ExportError, OSError, ValueError, KeyError, TypeError, AttributeError,
             RecursionError, tarfile.TarError, EOFError) as error:
         print(f"release export failed: {error}", file=sys.stderr)

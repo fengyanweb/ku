@@ -1,0 +1,37 @@
+---
+import messages from '../i18n/language-preferences.json';
+import type { Locale } from '../i18n/locales';
+interface Props {
+  locale: Locale;
+  fallback?: boolean;
+}
+const { locale, fallback = false } = Astro.props;
+---
+
+{fallback ? (
+  <p id="ku-language-fallback" class="fallback" role="status">
+    {messages[locale].fallback}
+  </p>
+) : (
+  <p class="notice">{messages[locale].notice}</p>
+)}
+<style>
+  .notice {
+    color: var(--ku-muted);
+    font-size: 0.75rem;
+    line-height: 1.7;
+    margin-block: 1rem;
+    max-width: 55rem;
+  }
+  .fallback {
+    display: none;
+    border: 1px solid var(--ku-line);
+    padding: 1rem;
+    margin-block: 1rem;
+    color: var(--ku-ink);
+    font-size: 0.9rem;
+  }
+  .fallback:target {
+    display: block;
+  }
+</style>

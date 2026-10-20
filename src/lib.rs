@@ -9,6 +9,7 @@ pub mod lexer;
 mod native_tls_archive;
 pub mod package;
 pub mod parser;
+pub mod process_execution;
 pub mod registry_admin;
 pub mod registry_server;
 pub mod runtime;

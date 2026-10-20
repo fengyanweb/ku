@@ -291,7 +291,7 @@ fn main(): null! {{
 "#
         ),
     );
-    let allocation = "result.ptr = (uint8_t*)malloc(result.capacity);";
+    let allocation = "result.ptr = (uint8_t*)ku_net_allocate(allocator, result.capacity);";
     assert_eq!(
         generated.matches(allocation).count(),
         1,
@@ -481,14 +481,14 @@ fn main(): null! {
         1,
     );
     let read_start = harness
-        .find("static KuResult_bytes ku_net_read(")
+        .find("static KuResult_bytes ku_net_read_with_allocator(")
         .expect("net read helper");
     harness.insert_str(
         read_start,
         "static KuNetAtomicFlag ku_test_read_gate_acquired;\n",
     );
     let read_start = harness
-        .find("static KuResult_bytes ku_net_read(")
+        .find("static KuResult_bytes ku_net_read_with_allocator(")
         .expect("net read helper after declaration");
     let acquire_marker = "int acquired = ku_net_gate_acquire(&client->gate, deadline);";
     let acquire = read_start

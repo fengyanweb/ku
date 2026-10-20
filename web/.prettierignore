@@ -1,0 +1,9 @@
+node_modules
+.astro
+dist
+package-lock.json
+src/data/ku.tmLanguage.json
+
+# Preserve historical document snapshots exactly as archived.
+src/content/docs/*/v*/
+src/content/versions/

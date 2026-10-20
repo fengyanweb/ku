@@ -1,0 +1,68 @@
+:root {
+  --sl-font: var(--ku-font);
+  --sl-font-mono: var(--ku-mono);
+  --sl-color-accent-low: #e6efda;
+  --sl-color-accent: #4e6d2b;
+  --sl-color-accent-high: #253c13;
+  --sl-color-bg: var(--ku-paper);
+}
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #2b3a20;
+  --sl-color-accent: #a5d46d;
+  --sl-color-accent-high: #d9f2b8;
+  --sl-color-bg: var(--ku-paper);
+}
+.ku-doc-title {
+  color: var(--ku-ink);
+  font-size: 1.6rem;
+  font-weight: 800;
+  text-decoration: none;
+  letter-spacing: -0.06em;
+}
+.ku-doc-title span {
+  color: var(--ku-muted);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  margin-inline-start: 0.75rem;
+}
+.ku-page-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  margin-top: 1rem;
+  color: var(--ku-muted);
+  font-size: 0.75rem;
+}
+.ku-page-meta span:first-child {
+  background: var(--sl-color-accent-low);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+}
+.sl-markdown-content a {
+  text-underline-offset: 3px;
+}
+.ku-doc-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  white-space: nowrap;
+}
+.ku-doc-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ku-version-notice {
+  color: var(--ku-muted);
+  font-size: 0.8rem;
+  line-height: 1.8;
+  margin-top: 1rem;
+}
+.sl-markdown-content pre,
+.sl-markdown-content code {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.sl-markdown-content pre {
+  text-align: left;
+}

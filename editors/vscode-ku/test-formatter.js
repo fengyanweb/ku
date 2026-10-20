@@ -130,6 +130,7 @@ assert.strictEqual(formatKu(expected), expected);
 const document = {
   fileName: "sample.ku",
   uri: { fsPath: "sample.ku", toString: () => "file://sample.ku" },
+  getText: () => "first line\n    if(42) {}\n let value = 1\n",
 };
 const jsonDiagnostics = parseDiagnostics(
   [
@@ -172,3 +173,4 @@ assert.strictEqual(textDiagnostics[0].range.start.line, 2);
 assert(textDiagnostics[0].message.includes("'let' is not supported"));
 
 console.log("ku formatter ok");
+require("./test-diagnostic-model");

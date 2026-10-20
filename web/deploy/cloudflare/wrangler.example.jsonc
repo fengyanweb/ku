@@ -1,0 +1,15 @@
+// Connection example only. No account, hostname, route or DNS change is set.
+// Build web/dist first with the confirmed production SITE_URL and INDEXABLE.
+{
+  "name": "ku-website-language-entry",
+  "main": "./worker.mjs",
+  "compatibility_date": "2026-10-19",
+  "workers_dev": false,
+  "assets": {
+    "directory": "../../dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/"],
+    "html_handling": "force-trailing-slash",
+    "not_found_handling": "404-page",
+  },
+}

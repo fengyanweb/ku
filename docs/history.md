@@ -40,7 +40,8 @@ history/
 | 0.0.14 | 已归档 | create/init/template 项目模板、HTTP status helper、匿名 fn handler、VS Code/release 同步 |
 | 0.0.15 | 已归档 | 对象解构、HTTP service 调用严格化、示例重写、clone/IR/native 路线同步 |
 | 0.0.16 | 历史版本 | native 标准库、统一数据库 client、package/registry 与 target-scoped 发布合同 |
-| 0.0.17 | 当前实验版本 | 同步 `&` 只读借用、Stage3 braced `while` 与跨平台测试工具修复；验收状态见 [版本记录](v0.0.17.md) |
+| 0.0.17 | 历史实验版本 | 同步 `&` 只读借用、Stage3 braced `while` 与跨平台测试工具修复；验收状态见 [版本记录](v0.0.17.md) |
+| 0.0.18 | 当前实验版本 | 有限 Task/阻塞调用与关闭修复、HTTP 复用、有界缓冲、JSON 大浮点往返及显式进程限制；冻结范围与已知问题见 [版本记录](v0.0.18.md) |
 
 ## 自动化
 

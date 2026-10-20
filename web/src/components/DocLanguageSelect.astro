@@ -1,0 +1,6 @@
+---
+import LanguageSwitch from './LanguageSwitch.astro';
+import { localeFromPath } from '../i18n/locales';
+---
+
+<LanguageSwitch locale={localeFromPath(Astro.url.pathname)} variant="docs" />

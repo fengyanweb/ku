@@ -102,6 +102,10 @@ fn assert_ir_cfg_acyclic(program: &ir::IrProgram) {
                     continue_block,
                     timeout_block,
                 } => vec![*continue_block, *timeout_block],
+                ir::IrTerminator::SyncGuard {
+                    continue_block,
+                    cleanup_block,
+                } => vec![*continue_block, *cleanup_block],
                 ir::IrTerminator::JumpErr { target, .. } => vec![*target],
                 ir::IrTerminator::Next
                 | ir::IrTerminator::PropagateErr(_)
@@ -338,7 +342,7 @@ fn main() {
 }
 
 #[test]
-fn native_build_rejects_async_syntax_with_clear_error() {
+fn native_build_rejects_async_main_without_result_before_artifacts() {
     let dir = unique_temp_path("native-async");
     fs::create_dir_all(&dir).expect("create temp dir");
     let file = dir.join("main.ku");
@@ -358,13 +362,51 @@ async fn main() {
         "--native".to_string(),
         file.display().to_string(),
     ])
-    .expect_err("native async should be rejected")
-    .to_string();
-    assert!(
-        err.contains("native C prototype does not support async/await yet"),
-        "unexpected error: {err}"
+    .expect_err("async main without a Result declaration must be rejected");
+    assert_eq!(
+        err.message,
+        "async fn 'main' must explicitly declare a Result return type such as T!"
     );
+    assert!(!file.with_extension("c").exists());
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_build_rejects_unsupported_async_control_before_artifacts() {
+    for (index, source) in [
+        "async fn main(): null! { try { println(1) } finally { while (false) { println(0) } } return ok(null) }",
+        "async fn main(): null! { try { println(1) } finally { for item in 0 { println(item) } } return ok(null) }",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        check_source("inline.ku", source).expect("fixture is valid interpreted async source");
+        let dir = unique_temp_path(&format!("native-async-control-{index}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("main.ku");
+        let binary = dir.join(if cfg!(windows) { "app.exe" } else { "app" });
+        fs::write(&file, source).expect("write source");
+        for link in [false, true] {
+            let mut args = vec![
+                "ku".to_string(),
+                "build".to_string(),
+                "--native".to_string(),
+                file.display().to_string(),
+            ];
+            if link {
+                args.extend(["-o".to_string(), binary.display().to_string()]);
+            }
+            let error = run_cli(args).expect_err("unsupported control must not emit or link C");
+            assert_eq!(
+                error.message,
+                "native async subset does not support loops inside a native Task finally body"
+            );
+            assert!(!file.with_extension("c").exists());
+            assert!(!binary.exists());
+            assert!(!dir.join(".ku/build/debug/c").exists());
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[test]
@@ -414,7 +456,7 @@ fn main(): null! {
         "imported Add missing:\n{c}"
     );
     assert!(
-        c.contains("KuResult_null ku_main()"),
+        c.contains("KuResult_null ku_main(void)"),
         "entry main missing:\n{c}"
     );
     assert!(
@@ -1557,11 +1599,54 @@ fn main() {
     print(report.peak_active)
     print(report.accepted + report.rejected_limit + report.rejected_queue + report.rejected_internal)
     print(after.finished_tasks - before.finished_tasks)
+    if (after.finished_cancelled_tasks < before.finished_cancelled_tasks || after.finished_timed_out_tasks < before.finished_timed_out_tasks) {
+        panic("retired cancellation and timeout counters must be monotonic")
+    }
+    if (after.suppressed_cleanup_outcomes < 0 || after.cleanup_timeouts < 0 || after.cleanup_unfinished_tasks < 0) {
+        panic("cleanup statistics must be nonnegative")
+    }
     print(time.millis() - started)
 }
 "#;
     check_source("inline.ku", source).expect("task stress API should check");
     run_source("inline.ku", source).expect("task stress API should run and drain");
+
+    let blocking_source = r#"
+import "std.task"
+import "std.time"
+
+async fn main(): null! {
+    before = task.stats()
+    time.sleep(1)
+    after = task.stats()
+    if (after.accepted_blocking_jobs != before.accepted_blocking_jobs + 1) {
+        panic("sleep must be charged as an accepted blocking job")
+    }
+    if (after.rejected_blocking_jobs != before.rejected_blocking_jobs || after.rejected_blocking_queue != before.rejected_blocking_queue) {
+        panic("one admitted sleep must not be counted as rejected")
+    }
+    if (after.peak_resident_blocking_jobs < 1 || after.peak_queued_blocking_jobs < 1 || after.peak_running_blocking_jobs < 1) {
+        panic("blocking peaks must retain the real sleep after response delivery")
+    }
+    if (after.resident_blocking_jobs < 0 || after.resident_blocking_jobs > 1 || after.finished_blocking_jobs < before.finished_blocking_jobs || after.finished_blocking_jobs > after.accepted_blocking_jobs) {
+        panic("blocking retirement observation must remain within the admitted job")
+    }
+    deadline = time.millis() + 3000
+    attempts = 0
+    drained = false
+    while (!drained && attempts < 10000 && time.millis() < deadline) {
+        retired = task.stats()
+        drained = retired.resident_blocking_jobs == 0 && retired.queued_blocking_jobs == 0 && retired.running_blocking_jobs == 0 && retired.accepted_blocking_jobs == retired.finished_blocking_jobs
+        attempts = attempts + 1
+    }
+    if (!drained) panic("actual blocking job must retire within the bounded observation")
+    return ok(null)
+}
+"#;
+    check_source("blocking-stats.ku", blocking_source)
+        .expect("blocking retirement fields should check");
+    run_source("blocking-stats.ku", blocking_source)
+        .expect("blocking statistics should observe the actual sleep job");
 
     let err = check_source(
         "inline.ku",
@@ -1578,6 +1663,29 @@ fn main() {
         err.contains("expected int"),
         "task.stress argument types must be checked: {err}"
     );
+}
+
+#[test]
+fn async_task_field_moves_and_handled_sibling_failure_preserve_other_owners() {
+    let source = r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn Broken(): int! { fail "expected child failure" }
+async fn main(): null! {
+    pair = { first: Child(3), second: Child(4) }
+    moved = pair.first
+    sibling = pair.second
+    try { failed = (await Broken())? } catch (err) {
+        if (err.message != "expected child failure") panic("wrong child error")
+    }
+    if (true) { discarded = Child(5) }
+    first = (await moved)?
+    second = (await sibling)?
+    if (first != 3 || second != 4) panic("Task ownership moved or cancelled the wrong child")
+    return ok(null)
+}
+"#;
+    check_source("task-owner.ku", source).expect("Task ownership should check");
+    run_source("task-owner.ku", source).expect("handled child failure must not cancel siblings");
 }
 
 #[test]

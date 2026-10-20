@@ -72,7 +72,7 @@ fn native_pg_handle_comparison_snapshots_do_not_clone_opaque_owners() {
     let directory = TempDir::new("handle-comparison-source");
     let generated = emit_c(directory.path(), fixture());
     let body = generated
-        .split_once(" HandleComparisons() {\n")
+        .split_once(" HandleComparisons(void) {\n")
         .expect("native handle comparison function")
         .1
         .split_once("\n}\n")

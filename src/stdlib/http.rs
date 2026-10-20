@@ -27,6 +27,8 @@ const DEFAULT_MAX_ACTIVE_REQUESTS: i64 = 256;
 pub const MAX_ACTIVE_REQUESTS: usize = 1024;
 const DEFAULT_MAX_PENDING_REQUESTS: i64 = 1024;
 pub const MAX_PENDING_REQUESTS: usize = 8192;
+pub const DEFAULT_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_CLIENT_IDLE_CONNECTIONS: usize = 1024;
 const CLIENT_CONFIG_FIELDS: [&str; 3] = ["timeout_ms", "max_body_bytes", "max_idle_connections"];
 const REQUEST_CONFIG_FIELDS: [&str; 6] = [
@@ -37,7 +39,7 @@ const REQUEST_CONFIG_FIELDS: [&str; 6] = [
     "timeout_ms",
     "max_body_bytes",
 ];
-const SERVER_CONFIG_FIELDS: [&str; 10] = [
+const SERVER_CONFIG_FIELDS: [&str; 11] = [
     "read_header_timeout_ms",
     "read_body_timeout_ms",
     "write_timeout_ms",
@@ -48,6 +50,7 @@ const SERVER_CONFIG_FIELDS: [&str; 10] = [
     "max_connections",
     "max_active_requests",
     "max_pending_requests",
+    "max_buffer_bytes",
 ];
 /// Longest accepted request target (the `/path?query` token of the request line).
 /// A target over this is answered with 414 before it is copied or routed -- it is
@@ -779,6 +782,7 @@ fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut max_active_requests = DEFAULT_MAX_ACTIVE_REQUESTS;
     let mut max_pending_requests = DEFAULT_MAX_PENDING_REQUESTS;
+    let mut max_buffer_bytes = DEFAULT_MAX_BUFFER_BYTES as i64;
     if let Some(config) = config {
         let Value::Object(fields) = config else {
             return Err(expected_type("object", config, span));
@@ -854,6 +858,13 @@ fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
             MAX_PENDING_REQUESTS as i64,
             span,
         )?;
+        max_buffer_bytes = optional_bounded_int(
+            fields,
+            "max_buffer_bytes",
+            max_buffer_bytes,
+            MAX_BUFFER_BYTES as i64,
+            span,
+        )?;
     }
     Ok(Value::Object(HashMap::from([
         (
@@ -885,6 +896,7 @@ fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
             "max_pending_requests".to_string(),
             Value::Int(max_pending_requests),
         ),
+        ("max_buffer_bytes".to_string(), Value::Int(max_buffer_bytes)),
         ("routes".to_string(), Value::Array(Vec::new())),
     ])))
 }

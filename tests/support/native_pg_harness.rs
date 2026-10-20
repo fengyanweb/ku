@@ -17,9 +17,9 @@ use bounded_process::FailureKind;
 pub use bounded_process::{run_bounded, OutputLimits};
 pub type BoundedOutput = bounded_process::BoundedOutput;
 
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(20);
-const BUILD_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 * 1024);
+pub const BUILD_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 * 1024);
 pub const RUN_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -313,8 +313,31 @@ fn compile_harness_linked(
     libpq_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     let output = directory.join(executable_name(stem));
+    let require_tsan = match env::var("KU_NATIVE_REQUIRE_TSAN") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => panic!("KU_NATIVE_REQUIRE_TSAN must be exactly 1 when set"),
+    };
     let mut candidates: Vec<(PathBuf, Vec<String>)> = Vec::new();
-    if let Ok(spec) = env::var("KU_CC") {
+    if require_tsan {
+        assert!(
+            cfg!(target_os = "linux"),
+            "required Task TSan gate is Linux-only"
+        );
+        assert!(
+            libpq_dir.is_none(),
+            "required Task TSan gate excludes external libpq"
+        );
+        let spec = env::var("KU_CC").expect("required Task TSan gate requires KU_CC");
+        let configured = PathBuf::from(&spec);
+        assert!(
+            !spec.is_empty()
+                && (configured.is_file()
+                    || (spec.split_whitespace().count() == 1 && !spec.starts_with('-'))),
+            "required Task TSan KU_CC must be one executable, without extra flags or inputs"
+        );
+        candidates.push((configured, Vec::new()));
+    } else if let Ok(spec) = env::var("KU_CC") {
         let configured = PathBuf::from(&spec);
         if configured.exists() {
             candidates.push((configured, Vec::new()));
@@ -325,16 +348,27 @@ fn compile_harness_linked(
             }
         }
     }
-    candidates.extend([
-        (PathBuf::from("clang"), Vec::new()),
-        (PathBuf::from("gcc"), Vec::new()),
-        (PathBuf::from("cc"), Vec::new()),
-        (PathBuf::from("zig"), vec!["cc".to_string()]),
-    ]);
+    if !require_tsan {
+        candidates.extend([
+            (PathBuf::from("clang"), Vec::new()),
+            (PathBuf::from("gcc"), Vec::new()),
+            (PathBuf::from("cc"), Vec::new()),
+            (PathBuf::from("zig"), vec!["cc".to_string()]),
+        ]);
+    }
 
     for (program, prefix) in candidates {
         let mut command = Command::new(&program);
-        command.args(prefix).arg(source).arg("-std=c11");
+        command.args(prefix);
+        if require_tsan {
+            // KU_CC contributes no flags, extra TU, response file or linker input.
+            // Compile and link the actual fixture with the same instrumentation.
+            command
+                .args(["-fsanitize=thread", "-O1", "-fno-omit-frame-pointer", "-g"])
+                .arg("-include")
+                .arg(repo_root().join("tests/support/native_tsan_required.h"));
+        }
+        command.arg(source).arg("-std=c11");
         if cfg!(windows) {
             command.arg("-lws2_32");
         } else {
@@ -344,6 +378,9 @@ fn compile_harness_linked(
             command.arg("-L").arg(libdir).arg("-lpq");
         }
         command.arg("-o").arg(&output);
+        if require_tsan {
+            eprintln!("required Task TSan compile and link: {command:?}");
+        }
         match run_bounded(&mut command, BUILD_TIMEOUT, BUILD_LIMITS) {
             Ok(done) if done.status.success() => return Some(output),
             Ok(done) => panic!(
@@ -353,7 +390,8 @@ fn compile_harness_linked(
                 String::from_utf8_lossy(&done.stderr)
             ),
             Err(error)
-                if error.kind() == FailureKind::Spawn
+                if !require_tsan
+                    && error.kind() == FailureKind::Spawn
                     && error.io_error_kind() == Some(std::io::ErrorKind::NotFound) => {}
             Err(error) => panic!("PG poll harness compiler was not bounded: {error}"),
         }

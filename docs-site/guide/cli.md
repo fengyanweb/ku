@@ -9,6 +9,7 @@ ku init
 ku init --template <template>
 ku template list
 ku run [--locked|--offline] [file.ku]
+ku supervise [limits] -- <entry>...
 ku check [--locked|--offline] [file.ku]
 ku check --json
 ku check --json <file.ku>

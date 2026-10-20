@@ -725,6 +725,153 @@ fn main() {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn http_server_thread_count(pid: u32) -> usize {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("read actual HTTP process status")
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .expect("process status includes a thread count")
+        .trim()
+        .parse()
+        .expect("actual thread count is an integer")
+}
+
+#[cfg(target_os = "macos")]
+fn http_server_thread_count(pid: u32) -> usize {
+    // macOS -M ignores custom -o formatting. The main row has USER/PID and
+    // continuation rows begin with PID; count both forms, excluding headings.
+    let mut command = Command::new("/bin/ps");
+    command.args(["-M", "-p", &pid.to_string()]);
+    let output = run_bounded(
+        &mut command,
+        Duration::from_secs(5),
+        OutputLimits::new(1024 * 1024, 16 * 1024),
+    )
+    .expect("bounded actual HTTP process thread enumeration");
+    assert!(output.status.success());
+    let pid = pid.to_string();
+    let count = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(pid.as_str()) || fields.next() == Some(pid.as_str())
+        })
+        .count();
+    assert!(count > 0, "HTTP process must still have a thread");
+    count
+}
+
+#[cfg(windows)]
+fn http_server_thread_count(pid: u32) -> usize {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            // This guard exclusively owns the successfully created snapshot.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    assert_ne!(raw, INVALID_HANDLE_VALUE, "thread snapshot creation failed");
+    let snapshot = Snapshot(raw);
+    assert!(Instant::now() < deadline);
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<THREADENTRY32>() as u32;
+    entry.dwSize = size;
+    assert_ne!(unsafe { Thread32First(snapshot.0, &mut entry) }, 0);
+    let mut count = 0;
+    let mut scanned = 0;
+    loop {
+        scanned += 1;
+        assert!(scanned <= 65536 && Instant::now() < deadline);
+        count += usize::from(entry.th32OwnerProcessID == pid);
+        entry.dwSize = size;
+        let next = unsafe { Thread32Next(snapshot.0, &mut entry) };
+        assert!(Instant::now() < deadline);
+        if next == 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(ERROR_NO_MORE_FILES as i32)
+            );
+            break;
+        }
+    }
+    assert!(count > 0, "HTTP process must still have a thread");
+    count
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn run_http_waiting_connections_keep_thread_count_bounded() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import "std.http"
+fn main(): null! {
+    app = http.server({
+        max_connections: 96, max_active_requests: 64, max_pending_requests: 32,
+        read_header_timeout_ms: 10000, read_body_timeout_ms: 10000,
+        idle_timeout_ms: 5000, handler_timeout_ms: 1000, write_timeout_ms: 500
+    })
+    app.get("/health", fn(req) { return http.text(req.query.id) })
+    app.post("/echo", fn(req) { return http.text(req.body) })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    let mut server = Some(KuServerProcess::spawn(source));
+    let health = |server: &mut Option<KuServerProcess>, label: &str| {
+        let response = http_response_or_stop(
+            server,
+            &address,
+            &format!(
+                "GET /health?id={label} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert_http_status(&response, "HTTP/1.1 200 OK");
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1, label);
+    };
+    health(&mut server, "startup");
+    let pid = server.as_ref().unwrap().child.as_ref().unwrap().id();
+    let baseline = http_server_thread_count(pid);
+    let mut held = Vec::new();
+    let mut observations = Vec::new();
+    for target in [8, 48] {
+        while held.len() < target {
+            let mut stream =
+                connect_with_read_timeout(&address, Duration::from_secs(3), Duration::from_secs(3));
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+                .unwrap();
+            held.push(stream);
+        }
+        health(&mut server, &format!("held-{target}"));
+        observations.push((target, http_server_thread_count(pid)));
+    }
+    drop(held);
+    health(&mut server, "recovered");
+    let output = server.take().unwrap().stop();
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    // Allow two incidental runtime threads, but waiting sockets must not
+    // allocate one OS thread each. Clean the server before reporting failure.
+    assert!(
+        observations.iter().all(|(_, count)| *count <= baseline + 2),
+        "waiting connections grew actual process threads: baseline={baseline}, observations={observations:?}"
+    );
+}
+
 #[test]
 fn run_http_service_handles_local_request() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1001,6 +1148,92 @@ fn main(): null! {
     let _ = server.take().expect("server should exist").stop();
 }
 
+#[cfg(unix)]
+#[test]
+fn run_http_slow_trace_does_not_block_on_a_full_stderr_pipe() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import { http, time } from "std"
+fn main(): null! {
+    app = http.server({handler_timeout_ms: 2000, write_timeout_ms: 2000})
+    app.get("/trace", fn() { time.sleep(120); return http.text("trace") })
+    app.get("/health", fn() { return http.text("healthy") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    let path = unique_temp_path("http-blocked-trace");
+    fs::write(&path, source).expect("write bounded trace service");
+    let mut server = Some(KuServerProcess {
+        child: None,
+        stdout: None,
+        stderr: None,
+        source_path: path.clone(),
+    });
+    let mut descriptors = [-1; 2];
+    // A successful pipe transfers two distinct live descriptors to these Files.
+    assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+    let reader = unsafe { fs::File::from_raw_fd(descriptors[0]) };
+    let mut writer = unsafe { fs::File::from_raw_fd(descriptors[1]) };
+    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+        // Neither the intentionally unread parent endpoint nor the original
+        // write endpoint may leak across exec; Stdio duplicates the latter.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let mut filled = 0usize;
+    let fill_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(Instant::now() < fill_deadline, "stderr prefill deadline");
+        match writer.write(&[b'x'; 4096]) {
+            Ok(0) => panic!("pipe stopped making progress without WouldBlock"),
+            Ok(bytes) => {
+                filled += bytes;
+                assert!(filled <= 16 * 1024 * 1024, "pipe prefill is bounded");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("fill actual stderr pipe: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+    let child = Command::new(ku_binary())
+        .args(["run", &path_arg(&path)])
+        .env("KU_HTTP_TRACE_SLOW_MS", "50")
+        .current_dir(repo_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .expect("spawn service with blocked stderr");
+    server.as_mut().unwrap().child = Some(child);
+    let request =
+        |path| format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let response = http_response_or_stop(&mut server, &address, &request("/trace"));
+    assert_http_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("trace"));
+    // Receiving the slow reply is the publication barrier. The pipe remains
+    // full: a synchronous logger would now strand the next handler until 504.
+    let response = http_response_or_stop(&mut server, &address, &request("/health"));
+    assert_http_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("healthy"));
+    let _ = server.take().unwrap().stop();
+    drop(reader);
+}
+
 #[test]
 fn run_http_service_enforces_idle_and_handler_timeouts() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1147,6 +1380,139 @@ fn main(): null! {
         "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert_http_status(&recovered, "HTTP/1.1 200 OK");
+    let _ = server.take().expect("server should exist").stop();
+}
+
+#[test]
+fn run_http_service_executes_admitted_requests_while_rejecting_silent_peers() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.server({
+        idle_timeout_ms: 5000,
+        handler_timeout_ms: 1000,
+        read_header_timeout_ms: 10000,
+        read_body_timeout_ms: 10000,
+        write_timeout_ms: 500,
+        max_connections: 2,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.get("/ok", fn() {
+        return http.text("ok")
+    })
+    app.post("/ok", fn() {
+        return http.text("ok")
+    })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    let mut server = Some(KuServerProcess::spawn(source));
+
+    // The first connection is also the startup probe: an extra readiness
+    // request must not briefly consume one of the two permits under test.
+    let mut active =
+        connect_with_read_timeout(&address, Duration::from_secs(5), Duration::from_secs(3));
+    active
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound admitted request writes");
+    active
+        .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .expect("hold the active worker until its final body byte");
+    let mut pending =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(3));
+    pending
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound pending request writes");
+    pending
+        .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .expect("hold the second admitted connection");
+
+    // Receiving this complete rejection establishes admission of both earlier
+    // connections without guessing how long it takes a worker to start.
+    let mut probe =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(3));
+    probe
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound admission probe write");
+    probe
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write full admission probe");
+    assert_http_status(
+        &read_http_stream(probe, Duration::from_secs(3)),
+        "HTTP/1.1 503 Service Unavailable",
+    );
+    pending
+        .write_all(b"b")
+        .expect("complete the queued request before excess connections arrive");
+
+    let mut silent = Vec::with_capacity(32);
+    for _ in 0..32 {
+        silent.push(connect_with_read_timeout(
+            &address,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        ));
+    }
+    // Observe the first silent peer's 50ms rejection before releasing A. The
+    // remaining 31 peers stay open. The former synchronous acceptor drains all
+    // of them (about 1.55s), expiring A's unchanged 1000ms handler deadline.
+    assert_http_status(
+        &read_http_stream(silent.remove(0), Duration::from_secs(3)),
+        "HTTP/1.1 503 Service Unavailable",
+    );
+    active
+        .write_all(b"a")
+        .expect("release the active request while silent rejections remain");
+
+    let active_response = read_http_stream(active, Duration::from_secs(3));
+    let pending_response = read_http_stream(pending, Duration::from_secs(3));
+    assert!(
+        active_response.starts_with("HTTP/1.1 200 OK"),
+        "active admitted request: {active_response}"
+    );
+    assert!(active_response.ends_with("\r\n\r\nok"), "{active_response}");
+    assert!(
+        pending_response.starts_with("HTTP/1.1 200 OK"),
+        "pending admitted request: {pending_response}"
+    );
+    assert!(
+        pending_response.ends_with("\r\n\r\nok"),
+        "{pending_response}"
+    );
+    drop(silent);
+
+    // Closing client handles does not acknowledge server-side permit release.
+    // Only the recovery phase may observe transient overload while the already
+    // closed peers retire; both admitted requests above must still be 200.
+    let recovery_deadline = Instant::now() + Duration::from_secs(3);
+    let mut recovered = None;
+    for _ in 0..150 {
+        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let response = wait_for_http_response(
+            &address,
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            remaining,
+        )
+        .expect("HTTP recovery probe must finish within its original deadline");
+        if response.starts_with("HTTP/1.1 200 OK") {
+            recovered = Some(response);
+            break;
+        }
+        assert_http_status(&response, "HTTP/1.1 503 Service Unavailable");
+        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+    let recovered = recovered.expect("HTTP did not recover within the original three seconds");
+    assert!(recovered.ends_with("\r\n\r\nok"), "{recovered}");
     let _ = server.take().expect("server should exist").stop();
 }
 

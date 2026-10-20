@@ -5,6 +5,8 @@
 
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
+#[path = "support/native_allocation_harness.rs"]
+mod native_allocation_harness;
 
 use std::env;
 use std::fs;
@@ -429,6 +431,15 @@ fn native_emit_c(dir: &Path, entry_rel: &str) -> String {
 /// library pragmas and provide local stubs, so they exercise generated runtime
 /// guards without requiring a live service or its development library.
 fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBuf> {
+    compile_c_harness_with_libraries(dir, source, out_stem, &[])
+}
+
+fn compile_c_harness_with_libraries(
+    dir: &Path,
+    source: &Path,
+    out_stem: &str,
+    libraries: &[&str],
+) -> Option<PathBuf> {
     let output = dir.join(exe_name(out_stem));
     let mut candidates: Vec<(PathBuf, Vec<String>)> = Vec::new();
     if let Ok(spec) = env::var("KU_CC") {
@@ -456,6 +467,9 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
             command.arg("-pthread");
         }
         command.arg("-o").arg(&output);
+        for library in libraries {
+            command.arg(format!("-l{library}"));
+        }
         match run_bounded(&mut command, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS) {
             Ok(done) if done.status.success() => return Some(output),
             Ok(done) => panic!(
@@ -515,14 +529,27 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
         }
         let script = dir.join("compile-harness.bat");
         let object = dir.join(format!("{out_stem}.obj"));
+        let link_libraries = if libraries.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " /link {}",
+                libraries
+                    .iter()
+                    .map(|library| format!("{library}.lib"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
         fs::write(
             &script,
             format!(
-                "@echo off\r\ncall \"{}\" >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\ncl.exe /nologo /std:c11 /utf-8 \"{}\" /Fe:\"{}\" /Fo:\"{}\"\r\n",
+                "@echo off\r\ncall \"{}\" >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\ncl.exe /nologo /std:c11 /utf-8 \"{}\" /Fe:\"{}\" /Fo:\"{}\"{}\r\n",
                 vcvars.display(),
                 source.display(),
                 output.display(),
-                object.display()
+                object.display(),
+                link_libraries
             ),
         )
         .expect("write MSVC harness script");
@@ -546,6 +573,43 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
         eprintln!("skip: no C compiler available for generated C harness");
         None
     }
+}
+
+fn run_array_capacity_c_harness(dir: &Path, generated: &str, stem: &str, checks: &str) {
+    let declaration = "typedef struct KuString {";
+    assert!(generated.contains(declaration));
+    let generated = generated.replacen(
+        declaration,
+        &format!(
+            "{}{declaration}",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    let assertions = r#"
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "array capacity check failed at line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
+#define VECTOR_MATCHES(value) ((value).data ? ((value).capacity >= (value).len && (((KuPerfAllocation*)(value).data) - 1)->record.size == (value).capacity * sizeof(*(value).data)) : (!(value).len && !(value).capacity))
+#define NO_LIVE_ALLOCATIONS() (!ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes)
+"#;
+    let harness = dir.join(format!("{stem}-harness.c"));
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{assertions}\n{checks}"),
+    )
+    .expect("write array capacity C harness");
+    let Some(exe) = compile_c_harness(dir, &harness, stem) else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("{stem} C harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "{stem} C harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run_binary(exe: &Path) -> (String, Option<i32>) {
@@ -644,6 +708,434 @@ int main(void) {{
         String::from_utf8_lossy(&output.stderr)
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_pending_connection_keeps_unread_next_request_bytes() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("http-pending-ready-reuse"));
+    let dir = &cleanup.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    app = http.server({ max_active_requests: 1 })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write pending ready HTTP source");
+    let generated = native_emit_c(dir, "main.ku");
+    let start = "/* Under pressure a genuinely idle persistent socket yields its slot.";
+    let end = "if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)";
+    assert_eq!(generated.matches(start).count(), 1);
+    // Execute the actual emitted promotion branch, rather than reimplementing
+    // its idle predicate in the fixture. Only its surrounding loop is removed.
+    let branch = generated
+        .split_once(start)
+        .expect("native pending promotion marker")
+        .1
+        .split_once(end)
+        .expect("native promotion ends before deadline processing")
+        .0;
+    let checks = r#"
+static int ku_http_fixture_ready(KuHttpSocket socket_value) {
+  KuHttpPollFd item = {0};
+  int count = 0;
+  ku_http_poll_add(&item, &count, socket_value, KU_HTTP_POLL_READ);
+  return ku_http_poll(&item, 1, 1000) == 1 && (item.revents & KU_HTTP_POLL_READ);
+}
+static int ku_http_fixture_tcp_pair(KuHttpSocket* peer, KuHttpSocket* accepted) {
+  KuHttpSocket listener = KU_HTTP_INVALID_SOCKET;
+  *peer = *accepted = KU_HTTP_INVALID_SOCKET;
+  listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listener == KU_HTTP_INVALID_SOCKET) goto failed;
+  struct sockaddr_in address;
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(listener, (struct sockaddr*)&address, sizeof(address)) != 0
+      || listen(listener, 1) != 0 || !ku_http_socket_nonblocking(listener)) goto failed;
+#if defined(_WIN32)
+  int address_length = (int)sizeof(address);
+#else
+  socklen_t address_length = (socklen_t)sizeof(address);
+#endif
+  if (getsockname(listener, (struct sockaddr*)&address, &address_length) != 0) goto failed;
+  *peer = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (*peer == KU_HTTP_INVALID_SOCKET) goto failed;
+  /* This is a fresh private loopback listener with an empty backlog. The
+     existing process watchdog also bounds connect and every fixture exit. */
+  if (connect(*peer, (struct sockaddr*)&address, sizeof(address)) != 0
+      || !ku_http_fixture_ready(listener)) goto failed;
+  *accepted = accept(listener, NULL, NULL);
+  if (*accepted == KU_HTTP_INVALID_SOCKET || !ku_http_socket_nonblocking(*accepted)
+      || !ku_http_socket_nonblocking(*peer)
+      || ku_http_socket_suppress_sigpipe(*peer) != 0) goto failed;
+  ku_http_socket_close(listener);
+  return 1;
+failed:
+  ku_http_socket_close(listener);
+  ku_http_socket_close(*peer);
+  ku_http_socket_close(*accepted);
+  *peer = *accepted = KU_HTTP_INVALID_SOCKET;
+  return 0;
+}
+static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte) {
+  KuHttpSocket peer, accepted;
+  if (!ku_http_fixture_tcp_pair(&peer, &accepted)) return 0;
+  if (with_byte) {
+    char byte = 0;
+    /* A partial next request is enough: prove its first byte is already in
+       the TCP receive queue before promotion, without scheduling sleeps. */
+    if (ku_http_socket_send(peer, "G", 1) != 1 || !ku_http_fixture_ready(accepted)
+        || recv(accepted, &byte, 1, MSG_PEEK) != 1 || byte != 'G') {
+      ku_http_socket_close(peer);
+      ku_http_socket_close(accepted);
+      return 0;
+    }
+  }
+  KuHttpServer server = {0};
+  server.buffer_budget = budget;
+  server.idle_timeout_ms = 1000;
+  KuHttpConnection connection = {0};
+  ku_http_atomic_store(&ku_http_active_conns, 1);
+  ku_http_connection_start(&connection, accepted, &server);
+  connection.reused = 1;
+  char* original_header = connection.header;
+  const size_t original_capacity = connection.capacity;
+  const unsigned long long original_deadline = connection.deadline;
+  int passed = connection.phase == KU_HTTP_IO_HEADER && original_header
+      && original_capacity == 1024 && budget->current == original_capacity;
+  if (passed) ku_http_fixture_promote(&connection);
+  const int observed_phase = connection.phase;
+  const int same_socket = connection.socket_value == accepted;
+  if (with_byte) {
+    char byte = 0;
+    passed = passed && same_socket && connection.phase == KU_HTTP_IO_HEADER
+        && connection.header == original_header && connection.capacity == original_capacity
+        && connection.deadline == original_deadline && !connection.buffered
+        && budget->current == original_capacity
+        && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+  } else {
+    passed = passed && connection.socket_value == KU_HTTP_INVALID_SOCKET
+        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current;
+  }
+  /* Retire the actual connection owner before reporting an intentional red
+     result; the failing old branch has already retired this owner itself. */
+  ku_http_connection_close(&connection);
+  ku_http_socket_close(peer);
+  const int retired = budget->current == 0 && ku_http_active_conns == 0;
+  if (!passed || !retired) {
+    fprintf(stderr,
+      "HTTP pending reuse failed after cleanup: with_byte=%d phase=%d same_socket=%d retired=%d\n",
+      with_byte, observed_phase, same_socket, retired);
+    return 0;
+  }
+  return 1;
+}
+int main(void) {
+  if (ku_http_net_init() != 0) return 20;
+  KuHttpBufferBudget budget = {0};
+  budget.limit = 65536;
+  if (!ku_http_mutex_init(&budget.lock)) { ku_http_net_cleanup(); return 21; }
+  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1);
+  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0);
+  const int budget_zero = budget.current == 0;
+  ku_http_mutex_destroy(&budget.lock);
+  ku_http_net_cleanup();
+  if (!ready_passed || !idle_passed || !budget_zero) return 1;
+  puts("http-pending-ready-reuse-ok");
+  return 0;
+}
+"#;
+    let harness = dir.join("http-pending-ready-reuse-harness.c");
+    fs::write(
+        &harness,
+        format!(
+            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  {start}{branch}\n}}\n{checks}"
+        ),
+    )
+    .expect("write pending ready HTTP C harness");
+    let libraries: &[&str] = if cfg!(windows) { &["ws2_32"] } else { &[] };
+    let Some(exe) =
+        compile_c_harness_with_libraries(dir, &harness, "http-pending-ready-reuse", libraries)
+    else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("pending ready HTTP harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "pending ready HTTP harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "http-pending-ready-reuse-ok\n"
+    );
+}
+
+#[test]
+fn native_http_read_callbacks_recheck_original_deadlines() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("http-original-read-deadlines"));
+    let dir = &cleanup.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    app = http.server({ max_active_requests: 1 })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write original HTTP read deadline source");
+
+    let generated = native_emit_c(dir, "main.ku");
+    let clock = "static unsigned long long ku_http_now_ms(void) {";
+    let recv =
+        "static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    assert_eq!(generated.matches(recv).count(), 1);
+    // Replace only the platform-function definitions. Every real generated
+    // callback continues to call the original typed names supplied below.
+    let generated = generated.replacen(
+        clock,
+        "static unsigned long long ku_http_now_ms(void);\nstatic unsigned long long ku_http_fixture_real_now_ms(void) {",
+        1,
+    );
+    let generated = generated.replacen(
+        recv,
+        "static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len);\nstatic int ku_http_fixture_real_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {",
+        1,
+    );
+    let declaration = "typedef struct KuString {";
+    assert!(generated.contains(declaration));
+    let generated = generated.replacen(
+        declaration,
+        &format!(
+            "{}{declaration}",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    let checks = r#"
+static unsigned long long ku_http_fixture_now;
+static size_t ku_http_fixture_recv_calls;
+static const char* ku_http_fixture_received;
+static size_t ku_http_fixture_received_length;
+static int ku_http_fixture_would_block;
+static unsigned long long ku_http_now_ms(void) { return ku_http_fixture_now; }
+static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {
+  (void)socket_value;
+  ku_http_fixture_recv_calls++;
+  if (ku_http_fixture_would_block) {
+#if defined(_WIN32)
+    WSASetLastError(WSAEWOULDBLOCK);
+#else
+    errno = EAGAIN;
+#endif
+    return -1;
+  }
+  size_t count = ku_http_fixture_received_length < len ? ku_http_fixture_received_length : len;
+  if (count) memcpy(data, ku_http_fixture_received, count);
+  return (int)count;
+}
+static int ku_http_fixture_zero(void) {
+  return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
+}
+static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budget, int kind, unsigned long long now) {
+  KuHttpQueue queue;
+  if (!ku_http_queue_init(&queue, 1, wake)) return 0;
+  KuHttpServer server = {0};
+  server.buffer_budget = budget;
+  server.max_header_bytes = 1024;
+  server.max_body_bytes = 1024;
+  server.idle_timeout_ms = 333;
+  server.read_header_timeout_ms = 111;
+  server.read_body_timeout_ms = 222;
+  server.write_timeout_ms = 77;
+  server.handler_timeout_ms = 100;
+  KuHttpConnection connection = {0};
+  connection.socket_value = KU_HTTP_INVALID_SOCKET;
+  ku_http_fixture_now = now;
+  ku_http_fixture_recv_calls = 0;
+  ku_http_fixture_would_block = now < 100;
+  if (kind < 2) {
+    ku_http_connection_start(&connection, KU_HTTP_INVALID_SOCKET, &server);
+    if (!connection.header) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    if (kind == 1) {
+      static const char prefix[] = "POST /ok HTTP/1.1\r\nHost: localhost\r\n";
+      memcpy(connection.header, prefix, sizeof(prefix) - 1);
+      connection.buffered = sizeof(prefix) - 1;
+      ku_http_fixture_received = "Content-Length: 1\r\n\r\nx";
+    } else {
+      ku_http_fixture_received = "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
+    }
+    ku_http_fixture_received_length = strlen(ku_http_fixture_received);
+  } else {
+    connection.budget = budget;
+    connection.input.budget = budget;
+    /* Match the real parser's retained body and target backing owners. */
+    if (!ku_http_buffer_reserve(budget, 6)) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    connection.input.body_charge = 2;
+    connection.input.metadata_charge = 4;
+    connection.phase = KU_HTTP_IO_BODY;
+    memcpy(connection.input.method, "POST", 5);
+    connection.input.target = ku_string_to_cstr(ku_string_static((const uint8_t*)"/ok", 3));
+    connection.input.path_len = 3;
+    connection.input.headers = ku_object_new(0);
+    connection.input.body_len = 2;
+    connection.input.body = (char*)malloc(2);
+    if (!connection.input.body) {
+      ku_http_queue_close(&queue, 0);
+      ku_http_connection_close(&connection);
+      ku_http_queue_free(&queue);
+      return 0;
+    }
+    connection.input.body[0] = 'x';
+    connection.body_received = 1;
+    ku_http_fixture_received = "y";
+    ku_http_fixture_received_length = 1;
+  }
+  connection.deadline = 100; /* The already-created idle/header/body D. */
+  const int original_phase = connection.phase;
+  char* original_header = connection.header;
+  const size_t original_capacity = connection.capacity;
+  const size_t original_buffered = connection.buffered;
+  char* original_body = connection.input.body;
+  const size_t original_body_received = connection.body_received;
+  if (kind < 2) ku_http_connection_read_header(&connection, &server, &queue, 1);
+  else ku_http_connection_read_body(&connection, &server, &queue, 1);
+
+  const int observed_phase = connection.phase;
+  const int64_t observed_status = connection.output.response.status;
+  const size_t observed_calls = ku_http_fixture_recv_calls;
+  int passed;
+  if (now >= 100) {
+    passed = connection.phase == KU_HTTP_IO_WRITE
+      && connection.output.response.status == 408
+      && ku_http_fixture_recv_calls == 0
+      && connection.deadline == now + 77
+      && !connection.header && !connection.input.body
+      && !connection.input.target && !connection.input.headers && !connection.job;
+  } else {
+    passed = connection.phase == original_phase && connection.deadline == 100
+      && ku_http_fixture_recv_calls == 1
+      && connection.header == original_header
+      && connection.capacity == original_capacity
+      && connection.buffered == original_buffered
+      && connection.input.body == original_body
+      && connection.body_received == original_body_received
+      && !connection.job;
+  }
+  /* Old callbacks can wrongly queue the completed legal input. Abort that
+     actual queued owner first, then release the connection's remaining owner,
+     so the intentional red assertion never skips input/job/response cleanup. */
+  ku_http_queue_close(&queue, 0);
+  ku_http_connection_close(&connection);
+  const int retired = queue.count == 0 && ku_http_queue_resident(&queue) == 0;
+  ku_http_queue_free(&queue);
+  const int zero = ku_http_fixture_zero();
+  const int budget_zero = budget->current == 0;
+  if (!passed || !retired || !zero || !budget_zero) {
+    fprintf(stderr,
+      "HTTP original read deadline failed after cleanup: kind=%d now=%llu phase=%d status=%lld recv_calls=%zu retired=%d allocations_zero=%d budget_zero=%d\n",
+      kind, now, observed_phase, (long long)observed_status, observed_calls, retired, zero, budget_zero);
+    return 0;
+  }
+  return 1;
+}
+int main(void) {
+  if (ku_http_net_init() != 0) return 20;
+  KuHttpWake wake;
+  if (!ku_http_wake_init(&wake)) { ku_http_net_cleanup(); return 21; }
+  KuHttpBufferBudget budget = {0};
+  budget.limit = 65536;
+  if (!ku_http_mutex_init(&budget.lock)) {
+    ku_http_wake_close(&wake);
+    ku_http_net_cleanup();
+    return 23;
+  }
+  int passed = 1;
+  for (int kind = 0; kind < 3; kind++) {
+    for (unsigned long long now = 99; now <= 101; now++) {
+      if (!ku_http_fixture_read_case(&wake, &budget, kind, now)) passed = 0;
+    }
+  }
+  const int budget_zero = budget.current == 0;
+  ku_http_mutex_destroy(&budget.lock);
+  ku_http_wake_close(&wake);
+  ku_http_net_cleanup();
+  if (!budget_zero) {
+    fputs("HTTP original read deadline fixture retained buffer credits\n", stderr);
+    return 24;
+  }
+  if (!ku_http_fixture_zero()) {
+    fputs("HTTP original read deadline fixture retained allocations\n", stderr);
+    return 22;
+  }
+  if (!passed) return 1;
+  puts("http-read-original-deadlines-ok");
+  return 0;
+}
+"#;
+    let harness = dir.join("http-original-read-deadlines-harness.c");
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{checks}"),
+    )
+    .expect("write original HTTP read deadline C harness");
+    // Keep generated ws2_32 pragmas for MSVC and supply the same library
+    // explicitly for Windows clang/gcc. Existing harness calls keep no extras.
+    let libraries: &[&str] = if cfg!(windows) { &["ws2_32"] } else { &[] };
+    let Some(exe) =
+        compile_c_harness_with_libraries(dir, &harness, "http-original-read-deadlines", libraries)
+    else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output =
+        run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap_or_else(|error| {
+            panic!("original HTTP read deadline harness was not bounded: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "original HTTP read deadline harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        "http-read-original-deadlines-ok\n"
+    );
 }
 
 #[test]
@@ -2909,6 +3401,871 @@ fn native_fs_write_read_roundtrip() {
 }
 
 #[test]
+fn native_async_fs_write_preserves_views_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).expect("create async fs test directory");
+    }
+    let text = "中文🙂\0tail";
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Content(): str! { println("content") return ok("中文🙂@NUL@tail") }
+async fn Roundtrip(): null! {
+    path = (await Pathname())?
+    content = (await Content())?
+    fs.write(path, content)?
+    println(path)
+    println(content)
+    fs.try_write((await Pathname())?, (await Content())?)?
+    println(path)
+    println(content)
+    fs.write("empty.bin", "")?
+    return ok(null)
+}
+async fn MissingParent(): null! {
+    try {
+        fs.write("missing-parent/file.bin", "unchanged")?
+        fail "missing parent write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn NulPath(): null! {
+    try {
+        fs.try_write("keep.txt@NUL@ignored", "unchanged")?
+        fail "NUL path write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Roundtrip())?;
+    (await MissingParent())?;
+    (await NulPath())?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    fs::write(source.join("main.ku"), program).expect("write async fs program");
+    fs::write(source.join("keep.txt"), "keep").expect("write truncation sentinel");
+    let expected = format!(
+        "path\ncontent\n数据.bin\n{text}\npath\ncontent\n数据.bin\n{text}\nfs\nwrite_failed\ncleaned\nfs\nwrite_failed\n"
+    );
+    let entry = source.join("main.ku");
+    let mut interpreted = Command::new(ku_binary());
+    interpreted.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreted, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty(), "{:?}", interpreted.stderr);
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(source.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(source.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(source.join("keep.txt")).unwrap(), b"keep");
+    fs::remove_file(source.join("数据.bin")).unwrap();
+    fs::remove_file(source.join("empty.bin")).unwrap();
+
+    let executable = bin.join(exe_name("asyncfs"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        eprintln!("skip native async fs execution: no C compiler");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfs")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfs")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(fs::read(data.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(data.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("数据.bin").exists());
+        assert!(!directory.join("empty.bin").exists());
+        assert!(!directory.join("keep.txt").exists());
+    }
+}
+
+#[test]
+fn native_async_fs_read_preserves_owned_results_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-read-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let text = "中文🙂\0tail";
+    let medium = "多段🙂\0".repeat(4096);
+    fs::write(source.join("数据.bin"), text.as_bytes()).unwrap();
+    fs::write(source.join("medium.bin"), medium.as_bytes()).unwrap();
+    fs::write(source.join("empty.bin"), b"").unwrap();
+    fs::write(source.join("invalid.bin"), [0xff, 0xfe]).unwrap();
+    fs::write(source.join("keep.txt"), b"keep").unwrap();
+    fs::write(source.join("pathname.txt"), "数据.bin").unwrap();
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Echo(text: str): str! { return ok(text) }
+async fn Small(): null! {
+    path = (await Pathname())?
+    text = fs.read(path)?
+    fs.write("roundtrip.bin", text)?
+    println(path)
+    println(text)
+    println(text)
+    echoed = (await Echo(fs.try_read((await Pathname())?)?))?
+    println(echoed)
+    println(fs.read("empty.bin")?)
+    return ok(null)
+}
+async fn Medium(): null! {
+    text = fs.try_read("medium.bin")?
+    fs.try_write("medium-copy.bin", text)?
+    return ok(null)
+}
+async fn ExistsChecks(): null! {
+    path = fs.read("pathname.txt")?
+    println(fs.exists(path))
+    println(path)
+    println(fs.exists("."))
+    println(fs.exists("missing.bin"))
+    println(fs.exists(""))
+    println(fs.exists("keep.txt@NUL@ignored"))
+    println(fs.exists((await Pathname())?))
+    return ok(null)
+}
+async fn ReadFailure(path: str): null! {
+    try {
+        fs.read(path)?
+        fail "read should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Small())?;
+    (await Medium())?;
+    (await ExistsChecks())?;
+    (await ReadFailure("missing.bin"))?;
+    (await ReadFailure("invalid.bin"))?;
+    (await ReadFailure("keep.txt@NUL@ignored"))?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    let entry = source.join("main.ku");
+    fs::write(&entry, program).unwrap();
+    let expected = format!(
+        "path\n数据.bin\n{text}\n{text}\npath\n{text}\n\ntrue\n数据.bin\ntrue\nfalse\ntrue\nfalse\npath\ntrue\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\n"
+    );
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs read interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(
+        fs::read(source.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(source.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    for file in ["roundtrip.bin", "medium-copy.bin"] {
+        fs::remove_file(source.join(file)).unwrap();
+    }
+    let executable = bin.join(exe_name("asyncfsread"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs read build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfsread")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfsread")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs read");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(
+        fs::read(data.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(data.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("roundtrip.bin").exists());
+        assert!(!directory.join("medium-copy.bin").exists());
+    }
+}
+#[test]
+fn native_async_flat_array_for_preserves_sources_and_owned_iteration_across_await() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-flat-array-for"));
+    let dir = &cleanup.0;
+    let first = "数组🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    fs::write(dir.join("third.txt"), "未遍历").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn Next(value: int): int! { println(value) return ok(value) }
+async fn Show(text: str): null! { time.sleep(0)? println(text) return ok(null) }
+async fn Numbers(): null! {
+    values = [(await Next(1))?, (await Next(2))?, (await Next(3))?]
+    total = 0
+    for value in values {
+        if (value == 2) { continue }
+        total = total + value
+        if (value == 3) { break }
+    }
+    println(total)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn Strings(): null! {
+    rows = [fs.read("first.txt")?, fs.try_read("second.txt")?, fs.read("third.txt")?]
+    values = rows
+    seen = 0
+    for text in values {
+        (await Show(text))?
+        seen = seen + 1
+        if (seen == 1) { continue }
+        break
+    }
+    for text in values { println(text) }
+    println(values.len())
+    return ok(null)
+}
+async fn EmptyAndBool(): null! {
+    empty: [str] = []
+    for text in empty { println(text) }
+    println(empty.is_empty())
+    flags = [true, false]
+    for flag in flags { time.sleep(0)? println(flag) }
+    return ok(null)
+}
+async fn Nested(): null! {
+    values = [1, 2]
+    total = 0
+    for outer in values {
+        for inner in values {
+            time.sleep(0)?
+            if (inner == 1) { continue }
+            total = total + outer
+            break
+        }
+    }
+    println(total)
+    return ok(null)
+}
+async fn Early(): str! {
+    values = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try {
+        for text in values { return ok(text) }
+    } finally { println("early-finally") }
+    fail "empty"
+}
+async fn SumValues(values: [int], offset: int): int! {
+    total = offset
+    for value in values { time.sleep(0)? total = total + value }
+    return ok(total)
+}
+async fn ForwardValues(values: [int], offset: int): int! {
+    return (await SumValues(values, offset))
+}
+async fn EchoTexts(values: [str]): null! {
+    for text in values { (await Show(text))? }
+    return ok(null)
+}
+async fn ForwardTexts(values: [str]): null! { return (await EchoTexts(values)) }
+async fn CountFlags(values: [bool]): int! {
+    count = 0
+    for flag in values { if (flag) { count = count + 1 } }
+    return ok(count)
+}
+async fn ParameterNumbers(): null! {
+    values = [10, 20]
+    println((await ForwardValues(values.clone(), (await Next(5))?))?)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn ParameterTexts(): null! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?];
+    (await ForwardTexts(words))?;
+    return ok(null)
+}
+async fn ParameterEmptyAndBool(): null! {
+    flags = [false, true, true]
+    println((await CountFlags(flags))?)
+    empty: [int] = []
+    println((await SumValues(empty, 0))?)
+    println((await SumValues([], 0))?)
+    return ok(null)
+}
+async fn Recover(): null! {
+    values = [1, 2]
+    try {
+        for value in values {
+            if (value == 2) { fail "row" }
+            println(value)
+        }
+    } catch (err) { println(err.message) }
+      finally { println("error-finally") }
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Numbers())?;
+    (await Strings())?;
+    (await EmptyAndBool())?;
+    (await Nested())?;
+    println((await Early())?);
+    (await ParameterNumbers())?;
+    (await ParameterTexts())?;
+    (await ParameterEmptyAndBool())?;
+    (await Recover())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("1\n2\n3\n4\n1\n2\n3\n{first}\n乙\n{first}\n乙\n未遍历\n3\ntrue\ntrue\nfalse\n3\nearly-finally\n{first}\n5\n35\n10\n20\n{first}\n乙\n2\n0\n0\n1\nrow\nerror-finally\n1\n2\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter flat array comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "flatarrayfor") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "flatarrayfor")).unwrap();
+    assert!(generated.contains("KuArray_int"));
+    assert!(generated.contains("KuArray_bool"));
+    assert!(generated.contains("KuArray_str"));
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native flat array execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
+fn native_async_array_results_cross_await_and_callable_boundaries() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-array-results"));
+    let dir = &cleanup.0;
+    let first = "返回🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn ArrayNumbers(values: [int]): [int]! {
+    try { if (!values.is_empty()) { return ok(values) } }
+    finally { println("numbers-finally") }
+    empty: [int] = []
+    return ok(empty)
+}
+async fn ForwardNumbers(): [int]! { return (await ArrayNumbers([1, 2, 3])) }
+async fn ArrayFlags(): [bool]! { flags = [true, false] return ok(flags) }
+async fn UseNumbers(): null! {
+    values = (await ForwardNumbers())?
+    for value in values { println(value) }
+    empty: [int] = []
+    nothing = (await ArrayNumbers(empty))?
+    println(nothing.is_empty())
+    flags = (await ArrayFlags())?
+    for flag in flags { println(flag) }
+    return ok(null)
+}
+async fn TextRows(): [str]! {
+    words = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try { if (!words.is_empty()) { return ok(words) } }
+    finally { println("texts-finally") }
+    fail "empty-texts"
+}
+async fn ForwardRows(): [str]! { return (await TextRows()) }
+async fn UseRows(): null! {
+    saved: [str]! = await ForwardRows()
+    time.sleep(0)?
+    rows = saved?
+    for row in rows { println(row) }
+    fetch: async fn(): [str]! = TextRows
+    again = (await fetch())?
+    for row in again { println(row) }
+    return ok(null)
+}
+async fn MissingRows(): [str]! { fail "array-failed" }
+async fn ReplacedRows(replace: bool): [str]! {
+    rows = [fs.read("first.txt")?]
+    try { if (!rows.is_empty()) { return ok(rows) } }
+    finally { if (replace) { fail "replaced-array" } }
+    empty: [str] = []
+    return ok(empty)
+}
+async fn PartialRows(): [str]! {
+    rows = [fs.read("first.txt")?, fs.read("missing.txt")?]
+    return ok(rows)
+}
+async fn ReassignText(): null! {
+    text = fs.read("first.txt")?
+    text = text
+    println(text)
+    try { text = fs.read("missing.txt")? }
+    catch (err) { println(err.code) }
+    println(text)
+    text = fs.read("second.txt")?
+    println(text)
+    if (true) { text = fs.read("first.txt")? }
+    println(text)
+    return ok(null)
+}
+async fn ReassignArrays(): null! {
+    rows = (await TextRows())?
+    rows = rows
+    rows = []
+    println(rows.len())
+    rows = (await TextRows())?
+    moved = rows
+    rows = []
+    println(moved.len())
+    println(rows.is_empty())
+    for row in moved { println(row) }
+    return ok(null)
+}
+async fn ReassignResults(): null! {
+    result: [str]! = await MissingRows()
+    result = await TextRows()
+    result = result
+    rows = result?
+    for row in rows { println(row) }
+    number: int! = ok(1)
+    number = ok(2)
+    println(number?)
+    try { fail "old-error" } catch (err) {
+        held = err
+        try { fail "new-error" } catch (next) { held = next }
+        println(held.message)
+    }
+    return ok(null)
+}
+async fn RelayRowsResult(values: [str]!): [str]! { time.sleep(0)? return values }
+async fn UseArrayResultParameters(): null! {
+    relay: async fn([str]!): [str]! = RelayRowsResult
+    saved: [str]! = await TextRows()
+    rows = (await relay(saved))?
+    for row in rows { println(row) }
+    try {
+        failed: [str]! = await MissingRows()
+        unused = (await relay(failed))?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    return ok(null)
+}
+async fn RelayFlagResult(values: [bool]!): [bool]! { return values }
+async fn UseArrayCallableParameters(): null! {
+    selected: async fn([int]): [int]! = ArrayNumbers
+    empty = (await selected([]))?
+    println(empty.is_empty())
+    input = [8, 9]
+    copied = (await selected(input.clone()))?
+    println(input.len())
+    for number in copied { println(number) }
+    stored: [bool]! = await ArrayFlags()
+    flags = (await RelayFlagResult(stored))?
+    for flag in flags { println(flag) }
+    return ok(null)
+}
+async fn EchoText(value: str): str! { time.sleep(0)? return ok(value) }
+async fn StringBasics(): null! {
+    text = fs.read("first.txt")?
+    println(text.len())
+    println(text.byte_len())
+    duplicate = text.clone()
+    println(text)
+    println(duplicate)
+    blank = ""
+    println(blank.len())
+    println(blank.byte_len())
+    println(blank.clone())
+    return ok(null)
+}
+async fn StringJoins(): null! {
+    text = fs.read("first.txt")?
+    joined = text + (await EchoText("乙"))?
+    println(text)
+    println(joined)
+    moved = text + (await EchoText(text))?
+    println(moved)
+    try { unused = "prefix" + fs.read("missing.txt")? }
+    catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn GetterNumbers(): null! {
+    values = [7, 9]
+    println(values.try_get(values.len()-1)?)
+    println(values.try_get(0)?)
+    flags = [true, false]
+    println(flags.try_get(1)?)
+    println(values.len())
+    try { missing = values.try_get(-1)? println(missing) }
+    catch (err) { println(err.domain) println(err.code) }
+    try { missing = values.try_get(values.len())? println(missing) }
+    catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn GetterTexts(): null! {
+    rows = [fs.read("first.txt")?, fs.read("second.txt")?]
+    selected = rows.try_get(0)?
+    println(rows.len())
+    rows = []
+    println(selected)
+    println(selected.len())
+    println(selected.byte_len())
+    return ok(null)
+}
+async fn GetterIndex(rows: [str]): int! { time.sleep(0)? return ok(rows.len()-1) }
+async fn GetterSnapshots(): null! {
+    rows = [fs.read("first.txt")?, fs.read("second.txt")?]
+    println(rows.try_get((await GetterIndex(rows))?)?)
+    index = 0
+    while (index < 2 && (["循环"].try_get(0)?).len() > 0) { index = index + 1 }
+    println(index)
+    return ok(null)
+}
+async fn UseGetters(): null! {
+    (await GetterNumbers())?;
+    (await GetterTexts())?;
+    (await GetterSnapshots())?;
+    return ok(null)
+}
+async fn CheckErrors(): null! {
+    try {
+        unexpected = (await MissingRows())?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await ReplacedRows(true))?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    try {
+        unexpected = (await PartialRows())?
+        println("unexpected")
+    } catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await UseNumbers())?;
+    (await UseRows())?;
+    (await CheckErrors())?;
+    (await ReassignText())?;
+    (await ReassignArrays())?;
+    (await ReassignResults())?;
+    (await StringBasics())?;
+    (await StringJoins())?;
+    (await UseArrayResultParameters())?;
+    (await UseArrayCallableParameters())?;
+    (await UseGetters())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\ntexts-finally\n{first}\n乙\narray-failed\nnumbers-finally\ntrue\nnumbers-finally\n2\n8\n9\ntrue\nfalse\n9\n7\nfalse\n2\narray\nindex_out_of_bounds\nindex_out_of_bounds\n2\n{first}\n5\n12\n乙\n2\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter array Result comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "arrayresults") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "arrayresults")).unwrap();
+    for field in ["integer_array", "boolean_array", "string_array"] {
+        assert!(generated.contains(field));
+    }
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native array Result execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
+fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-callable-parameters"));
+    let dir = &cleanup.0;
+    let program = r#"async fn First(value: int): int! { println("first") return ok(value + 1) }
+async fn Second(value: int): int! { println("second") return ok(value + 2) }
+async fn Apply(action: async fn(int): int!, value: int): int! {
+    once = action.clone()
+    first = (await once(value))?
+    second = (await action(value))?
+    return ok(first + second)
+}
+async fn Forward(action: async fn(int): int!, value: int): int! {
+    return await Apply(action, value)
+}
+async fn UnusedSameSignature(value: int): int! {
+    return await Forward(First, value)
+}
+async fn Argument(): int! { println("arg") return ok(4) }
+async fn main(): null! {
+    action = First
+    println((await Forward(action.clone(), (await Argument())?))?)
+    println((await action(2))?)
+    println((await Apply(Second, 3))?)
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).expect("write callable parameter program");
+    let expected = "arg\nfirst\nfirst\n10\nfirst\n3\nsecond\nsecond\n10\n";
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded callable parameter interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "callableparameters") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "callableparameters")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut command = Command::new(executable);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native callable parameter execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
 fn native_fs_intrinsic_gates_emit_complete_cross_platform_helpers() {
     let dir = unique_temp_dir("fs-gates-c");
     let cases = [
@@ -3027,7 +4384,14 @@ fn native_fs_result_intrinsics_compile_and_run_independently() {
 
 #[test]
 fn native_fs_unicode_paths_nul_content_exists_and_sorted_read_dir() {
-    let dir = unique_temp_dir("fs-unicode");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("fs-unicode"));
+    let dir = &cleanup.0;
     let listing = dir.join("目录");
     fs::create_dir_all(&listing).expect("create unicode directory");
     let first = listing.join("a.txt");
@@ -3059,15 +4423,158 @@ fn main(): null! {{
     );
     fs::write(dir.join("main.ku"), source).expect("write unicode fs source");
 
-    let Some(exe) = native_build(&dir, "main.ku", "fsunicode") else {
-        fs::remove_dir_all(&dir).ok();
+    let Some(exe) = native_build(dir, "main.ku", "fsunicode") else {
         return;
     };
     let (stdout, code) = run_binary_bytes(&exe);
     let normalized: Vec<u8> = stdout.into_iter().filter(|byte| *byte != b'\r').collect();
     assert_eq!(normalized, b"sorted\na\0b");
     assert_eq!(code, Some(0));
-    fs::remove_dir_all(&dir).ok();
+
+    let empty = dir.join("capacity-empty");
+    let one = dir.join("capacity-one");
+    let many = dir.join("capacity-many");
+    for directory in [&empty, &one, &many] {
+        fs::create_dir(directory).expect("create directory capacity fixture");
+    }
+    fs::write(one.join("entry-00.txt"), b"").expect("write single directory entry");
+    for index in (0..17).rev() {
+        fs::write(many.join(format!("entry-{index:02}.txt")), b"")
+            .expect("write directory growth entry");
+    }
+    let generated = native_emit_c(dir, "main.ku");
+    let allocation_hook = format!(
+        r#"{}
+static size_t ku_fs_fixture_realloc_calls, ku_fs_fixture_fail_realloc_at;
+static void* ku_fs_fixture_realloc(void* value, size_t bytes) {{
+  ku_fs_fixture_realloc_calls++;
+  if (ku_fs_fixture_fail_realloc_at == ku_fs_fixture_realloc_calls) return NULL;
+  return ku_perf_realloc(value, bytes);
+}}
+typedef struct KuString {{"#,
+        native_allocation_harness::ALLOCATION_HOOK
+    );
+    assert!(generated.contains("typedef struct KuString {"));
+    let generated = generated.replacen("typedef struct KuString {", &allocation_hook, 1);
+    let vector_allocation =
+        "KuString* grown = (KuString*)realloc(builder->values.data, next * sizeof(KuString));";
+    assert!(generated.contains(vector_allocation));
+    let generated = generated.replacen(
+        vector_allocation,
+        "KuString* grown = (KuString*)ku_fs_fixture_realloc(builder->values.data, next * sizeof(KuString));",
+        1,
+    );
+    let c_path = |path: &Path| {
+        let path = path.to_str().expect("UTF-8 fixture path");
+        let escaped = path
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect::<String>();
+        format!(
+            "ku_string_static((const uint8_t*)\"{escaped}\", {}u)",
+            path.len()
+        )
+    };
+    let checks = r#"
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "directory capacity check failed at line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
+static int ku_fs_fixture_empty(void) {
+  CHECK(!ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes);
+  return 0;
+}
+static int ku_fs_fixture_listing(KuString path, size_t count, size_t capacity) {
+  KuResult_array_str result = ku_fs_read_dir(path);
+  CHECK(result.ok && result.value.len == count && result.value.capacity == capacity);
+  size_t bytes = capacity * sizeof(KuString);
+  if (!count) CHECK(!result.value.data && !capacity);
+  else {
+    CHECK(result.value.data && (((KuPerfAllocation*)result.value.data) - 1)->record.size == bytes);
+    for (size_t i = 0; i < count; i++) {
+      KuString value = result.value.data[i];
+      char name[32];
+      int length = snprintf(name, sizeof(name), "entry-%02u.txt", (unsigned)i);
+      CHECK(length > 0 && value.len >= (size_t)length && value.storage == KU_STRING_OWNED);
+      CHECK(memcmp(value.ptr + value.len - (size_t)length, name, (size_t)length) == 0);
+      CHECK((((KuPerfAllocation*)value.ptr) - 1)->record.size == value.capacity);
+      bytes += value.capacity;
+      if (i) CHECK(ku_fs_path_compare(&result.value.data[i - 1], &value) < 0);
+    }
+  }
+  CHECK(ku_perf_live_allocations == count + (count ? 1u : 0u) && ku_perf_live_bytes == bytes);
+  ku_result_drop_array_str(&result);
+  CHECK(!result.value.data && !result.value.len && !result.value.capacity);
+  return ku_fs_fixture_empty();
+}
+static int ku_fs_fixture_failure(KuString path, size_t fail_at) {
+  ku_fs_fixture_realloc_calls = 0;
+  ku_fs_fixture_fail_realloc_at = fail_at;
+  KuResult_array_str result = ku_fs_read_dir(path);
+  CHECK(!result.ok && ku_fs_fixture_realloc_calls == fail_at);
+  CHECK(!result.value.data && !result.value.len && !result.value.capacity);
+  const char* message = "failed to read directory: out of memory";
+  CHECK(result.error.message.len == strlen(message) && !memcmp(result.error.message.ptr, message, strlen(message)));
+  ku_result_drop_array_str(&result);
+  ku_fs_fixture_fail_realloc_at = 0;
+  return ku_fs_fixture_empty();
+}
+static int ku_fs_fixture_growth_failure(void) {
+  KuFsDirBuilder builder = {0};
+  KuError error = {0};
+  KuString leaf = ku_string_static((const uint8_t*)"x", 1);
+  CHECK(ku_fs_dir_builder_push(&builder, leaf, &error));
+  size_t capacity = builder.values.capacity;
+  CHECK(capacity == 16u && (((KuPerfAllocation*)builder.values.data) - 1)->record.size == capacity * sizeof(KuString));
+  for (size_t i = builder.values.len; i < capacity; i++) CHECK(ku_fs_dir_builder_push(&builder, leaf, &error));
+  KuString* original = builder.values.data;
+  size_t bytes = ku_perf_live_bytes, output_bytes = builder.output_bytes;
+  uint8_t* input = (uint8_t*)malloc(7u);
+  CHECK(input);
+  memcpy(input, "pending", 7u);
+  ku_fs_fixture_fail_realloc_at = ku_fs_fixture_realloc_calls + 1u;
+  CHECK(!ku_fs_dir_builder_push(&builder, (KuString){input, 7u, 7u, KU_STRING_OWNED}, &error));
+  CHECK(ku_fs_fixture_realloc_calls == ku_fs_fixture_fail_realloc_at);
+  CHECK(builder.values.data == original && builder.values.len == capacity && builder.values.capacity == capacity);
+  CHECK(builder.output_bytes == output_bytes && ku_perf_live_allocations == 1u && ku_perf_live_bytes == bytes);
+  CHECK((((KuPerfAllocation*)original) - 1)->record.size == capacity * sizeof(KuString));
+  ku_fs_fixture_fail_realloc_at = 0;
+  ku_error_drop(&error);
+  ku_fs_dir_builder_drop(&builder);
+  CHECK(!builder.values.data && !builder.values.len && !builder.values.capacity && !builder.output_bytes);
+  return ku_fs_fixture_empty();
+}
+int main(void) {
+  CHECK(!ku_fs_fixture_listing(@EMPTY@, 0u, 0u));
+  CHECK(!ku_fs_fixture_listing(@ONE@, 1u, 16u));
+  CHECK(!ku_fs_fixture_listing(@MANY@, 17u, 32u));
+  CHECK(!ku_fs_fixture_failure(@ONE@, 1u));
+  CHECK(!ku_fs_fixture_failure(@MANY@, 2u));
+  CHECK(!ku_fs_fixture_growth_failure());
+  CHECK(!ku_fs_fixture_listing(@MANY@, 17u, 32u));
+  return 0;
+}
+"#
+    .replace("@EMPTY@", &c_path(&empty))
+    .replace("@ONE@", &c_path(&one))
+    .replace("@MANY@", &c_path(&many));
+    let harness = dir.join("fs-directory-capacity-harness.c");
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{checks}"),
+    )
+    .expect("write directory capacity C harness");
+    let Some(exe) = compile_c_harness(dir, &harness, "fs-directory-capacity") else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("directory capacity C harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "directory capacity C harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -3250,6 +4757,36 @@ fn native_json_parse_read_and_convert() {
     assert_eq!(stdout.replace('\r', ""), "Ku\n18\n");
     assert_eq!(code, Some(0));
 
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_json_encode_decode_example_keeps_values_usable() {
+    let dir = unique_temp_dir("json-encode-decode");
+    fs::write(dir.join("main.ku"), include_str!("../examples/json.ku"))
+        .expect("write JSON encode/decode example");
+    let c = native_emit_c(&dir, "main.ku");
+    assert!(c.contains("static KuResult_kuvalue ku_json_parse(KuString text)"));
+    assert!(c.contains("static KuResult_str ku_json_stringify(KuValue value)"));
+    assert!(c.contains("ku_json_parse_error_at("));
+    assert!(c.contains("ku_json_write_value("));
+    let Some(exe) = native_build(&dir, "main.ku", "jsonencodedecode") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    let stdout = stdout.replace('\r', "");
+    assert!(stdout.contains("\"name\":\"中文😀\""), "{stdout}");
+    assert!(
+        stdout.contains("\"embedded_nul\":\"left\\u0000right\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nroundtrip ok\njson/parse_error\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("byte 7"), "{stdout}");
+    assert_eq!(code, Some(0));
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -3468,6 +5005,7 @@ fn main(): null! {
     ExpectReject("1e")?
     ExpectReject("1e+")?
     ExpectReject("9223372036854775808")?
+    ExpectReject("-9223372036854775809")?
     ExpectReject("1e400")?
     println("done")
     return ok(null)
@@ -3502,10 +5040,65 @@ fn native_json_float_roundtrip_typed_array_and_non_finite_rejection() {
         dir.join("main.ku"),
         r#"import json from "std.json"
 
+struct LargeFloat {
+    value: float
+}
+
+fn ExpectIntegerReject(text: str): null! {
+    rejected = false
+    try {
+        json.decode(text)?
+    } catch (err) {
+        rejected = err.domain == "json" && err.code == "parse_error"
+    }
+    if (!rejected) { panic("bare out-of-range integer was accepted") }
+    return ok(null)
+}
+
 fn main(): null! {
     println(json.parse("1.5")?)
     println(json.stringify(json.parse("-0.25")?)?)
     println(json.stringify([1.5, 2.25])?)
+    println(json.encode(json.decode("9223372036854775807")?)?)
+    println(json.encode(json.decode("-9223372036854775808")?)?)
+    duplicate = json.decode("{\"value\":1,\"value\":2}")?
+    println(duplicate["value"]?.as_int()? + 1)
+
+    scale = 10000000000.0
+    positive = scale * scale
+    negative = -positive
+    if (json.encode(positive)? != "100000000000000000000.0" || json.stringify(negative)? != "-100000000000000000000.0") {
+        panic("large float must keep a decimal marker")
+    }
+    if (json.encode(json.decode(json.encode(positive)?)?)? != "100000000000000000000.0" || json.stringify(json.try_parse(json.stringify(negative)?)?)? != "-100000000000000000000.0") {
+        panic("large scalar float failed to roundtrip")
+    }
+    values = [positive, negative]
+    if (json.encode(values)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("typed float array used a different JSON formatter")
+    }
+    if (json.encode(json.decode(json.stringify(values)?)?)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("typed float array failed to roundtrip")
+    }
+    if (json.encode(values)? != "[100000000000000000000.0,-100000000000000000000.0]") {
+        panic("encoding consumed the float array")
+    }
+    record = LargeFloat { value: positive }
+    if (json.encode(json.decode(json.stringify(record)?)?)? != "{\"value\":100000000000000000000.0}") {
+        panic("typed float field failed to roundtrip")
+    }
+    nested = json.parse("{\"nested\":[1e20,-1e20]}")?
+    if (json.stringify(json.decode(json.encode(nested)?)?)? != "{\"nested\":[100000000000000000000.0,-100000000000000000000.0]}") {
+        panic("nested dynamic float failed to roundtrip")
+    }
+    if (json.encode(nested)? != "{\"nested\":[100000000000000000000.0,-100000000000000000000.0]}") {
+        panic("encoding consumed the dynamic object")
+    }
+    if (json.encode(json.decode("1.0")?)? != "1" || json.encode(json.decode("0.0")?)? != "0" || json.encode(json.decode("-0.0")?)? != "-0") {
+        panic("existing small float spelling changed")
+    }
+    ExpectIntegerReject("9223372036854775808")?
+    ExpectIntegerReject("-9223372036854775809")?
     return ok(null)
 }
 "#,
@@ -3517,7 +5110,10 @@ fn main(): null! {
         return;
     };
     let (stdout, code) = run_binary(&exe);
-    assert_eq!(stdout.replace('\r', ""), "1.5\n-0.25\n[1.5,2.25]\n");
+    assert_eq!(
+        stdout.replace('\r', ""),
+        "1.5\n-0.25\n[1.5,2.25]\n9223372036854775807\n-9223372036854775808\n3\n"
+    );
     assert_eq!(code, Some(0));
 
     fs::write(
@@ -3562,11 +5158,18 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
     let mut bits = vec![
         0.1f64.to_bits(),
         1e20f64.to_bits(),
+        (-1e20f64).to_bits(),
         1e-20f64.to_bits(),
         (-0.0f64).to_bits(),
         0x3fefffffffffffff, // predecessor of 1.0
         0x3ff0000000000000, // 1.0
         0x3ff0000000000001, // successor of 1.0
+        0x43dfffffffffffff, // predecessor of 2^63
+        0x43e0000000000000, // 2^63
+        0x43e0000000000001, // successor of 2^63
+        0xc3dfffffffffffff, // successor of -2^63
+        0xc3e0000000000000, // -2^63: shortest decimal is outside int64
+        0xc3e0000000000001, // predecessor of -2^63
         f64::MIN_POSITIVE.to_bits(),
         f64::MAX.to_bits(),
         0x0000000000000001, // minimum subnormal
@@ -3595,7 +5198,13 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
         .join(",");
     let expected = values
         .iter()
-        .map(f64::to_string)
+        .map(|value| {
+            ku::stdlib::json::stringify_value(
+                &ku::runtime::value::Value::Float(*value),
+                ku::span::Span::default(),
+            )
+            .expect("finite float JSON encoding")
+        })
         .collect::<Vec<_>>()
         .join(",");
     let source = format!(
@@ -3603,7 +5212,9 @@ fn native_json_float_stringify_matches_rust_shortest_fixed_decimal() {
 
 fn main(): null! {{
     value = json.parse("[{input}]")?
-    print(json.stringify(value)?)
+    encoded = json.stringify(value)?
+    json.decode(encoded.clone())?
+    print(encoded)
     return ok(null)
 }}
 "#,
@@ -3793,6 +5404,11 @@ fn native_json_input_and_output_limits_are_hard_boundaries() {
     let dir = unique_temp_dir("json-limits");
     fs::write(dir.join("ok.txt"), vec![b'a'; 999_998]).expect("write boundary payload");
     fs::write(dir.join("too-large.txt"), vec![b'a'; 999_999]).expect("write oversized payload");
+    // This object has 47 bytes of JSON syntax/number text, including the new
+    // decimal marker on 1e20; the marker must count towards the same hard limit.
+    fs::write(dir.join("float-ok.txt"), vec![b'a'; 999_953]).expect("write float boundary payload");
+    fs::write(dir.join("float-too-large.txt"), vec![b'a'; 999_954])
+        .expect("write oversized float boundary payload");
     fs::write(
         dir.join("main.ku"),
         r#"import fs from "std.fs"
@@ -3801,6 +5417,13 @@ import json from "std.json"
 fn ParseTooLarge(): null! {
     text = "\"" + fs.read("too-large.txt")? + "\""
     json.try_parse(text)?
+    return ok(null)
+}
+
+fn FloatOutputTooLarge(): null! {
+    scale = 10000000000.0
+    number = scale * scale
+    json.encode({ number: number, padding: fs.read("float-too-large.txt")? })?
     return ok(null)
 }
 
@@ -3816,6 +5439,22 @@ fn main(): null! {
     }
     if (!caught) {
         panic("oversized json input should fail")
+    }
+    scale = 10000000000.0
+    number = scale * scale
+    float_text = json.encode({ number: number, padding: fs.read("float-ok.txt")? })?
+    if (float_text.byte_len() != 1000000) {
+        panic("float decimal marker was not included in output accounting")
+    }
+    json.decode(float_text)?
+    caught_float = false
+    try {
+        FloatOutputTooLarge()?
+    } catch (err) {
+        caught_float = err.domain == "json" && err.code == "stringify_error"
+    }
+    if (!caught_float) {
+        panic("float decimal marker exceeded the output limit")
     }
     return ok(null)
 }
@@ -4910,7 +6549,14 @@ fn native_string_methods_match_interpreter() {
     // non-overlapping all-occurrences swap, and slice is char-indexed and returns
     // a Result. byte_len counts UTF-8 bytes without changing len or consuming its
     // input; its edge cases share this executable to avoid another C build.
-    let dir = unique_temp_dir("string-methods");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("string-methods"));
+    let dir = &cleanup.0;
     fs::write(
         dir.join("main.ku"),
         concat!(
@@ -4968,11 +6614,11 @@ fn native_string_methods_match_interpreter() {
     )
     .expect("write main.ku");
 
-    let c = native_emit_c(&dir, "main.ku");
+    let c = native_emit_c(dir, "main.ku");
     assert!(c.contains("static KuArray_str ku_string_chars(KuString s)"));
     assert!(c.contains("result.data[index] = ku_string_alloc(len)"));
 
-    let Some(exe) = native_build(&dir, "main.ku", "strmethods") else {
+    let Some(exe) = native_build(dir, "main.ku", "strmethods") else {
         return;
     };
 
@@ -4983,7 +6629,55 @@ fn native_string_methods_match_interpreter() {
     );
     assert_eq!(code, Some(0));
 
-    fs::remove_dir_all(&dir).ok();
+    run_array_capacity_c_harness(
+        dir,
+        &c,
+        "string-chars-capacity",
+        r#"
+int main(void) {
+  KuArray_str empty = ku_string_chars(ku_string_static((const uint8_t*)"", 0u));
+  CHECK(!empty.len && !empty.capacity && VECTOR_MATCHES(empty));
+  KuArray_str empty_clone = ku_array_clone_str(empty);
+  CHECK(VECTOR_MATCHES(empty_clone) && NO_LIVE_ALLOCATIONS());
+  ku_array_drop_str(&empty);
+  ku_array_drop_str(&empty_clone);
+
+  const uint8_t sample[] = {0x41, 0x00, 0xe7, 0x95, 0x8c, 0xf0, 0x9f, 0x98, 0x80};
+  const size_t lengths[] = {1u, 1u, 3u, 4u};
+  uint8_t* bytes = (uint8_t*)malloc(13u);
+  CHECK(bytes);
+  memcpy(bytes, sample, sizeof(sample));
+  KuString input = {bytes, sizeof(sample), 13u, KU_STRING_OWNED};
+  KuArray_str chars = ku_string_chars(input);
+  CHECK(chars.len == 4u && chars.capacity == 4u && VECTOR_MATCHES(chars));
+  CHECK(input.ptr == bytes && input.len == sizeof(sample) && !memcmp(input.ptr, sample, sizeof(sample)));
+  ku_string_drop(&input);
+  size_t offset = 0;
+  for (size_t i = 0; i < chars.len; i++) {
+    KuString value = chars.data[i];
+    CHECK(value.len == lengths[i] && !memcmp(value.ptr, sample + offset, value.len));
+    if (i < 2u) CHECK(value.storage == KU_STRING_STATIC);
+    else CHECK(value.storage == KU_STRING_OWNED && (((KuPerfAllocation*)value.ptr) - 1)->record.size == value.capacity);
+    offset += value.len;
+  }
+  CHECK(offset == sizeof(sample) && ku_perf_live_allocations == 3u);
+  KuArray_str clone = ku_array_clone_str(chars);
+  CHECK(clone.len == 4u && clone.capacity == 4u && VECTOR_MATCHES(clone) && clone.data != chars.data);
+  CHECK(clone.data[2].ptr != chars.data[2].ptr && clone.data[3].ptr != chars.data[3].ptr);
+  CHECK(ku_perf_live_allocations == 6u && ku_perf_live_bytes == 2u * (4u * sizeof(KuString) + 7u));
+  ku_array_drop_str(&chars);
+  offset = 0;
+  for (size_t i = 0; i < clone.len; i++) {
+    CHECK(clone.data[i].len == lengths[i] && !memcmp(clone.data[i].ptr, sample + offset, lengths[i]));
+    offset += lengths[i];
+  }
+  ku_array_drop_str(&clone);
+  CHECK(!chars.data && !chars.len && !chars.capacity && !clone.data && !clone.len && !clone.capacity);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+"#,
+    );
 }
 
 #[test]
@@ -6344,14 +8038,33 @@ fn native_array_map_matches_interpreter() {
     // annotation, so its type is propagated from the array's element type (the
     // checker infers it, so the interpreter accepts `map(x => x*2)`; native must
     // too — rule 8). The result array is built by invoking the mapper per element.
-    let dir = unique_temp_dir("array-map-basic");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("array-map-basic"));
+    let dir = &cleanup.0;
     fs::write(
         dir.join("main.ku"),
-        "fn main(): null! {\n    r = [1, 2, 3].map(x => x * 2)\n    println(r[0])\n    println(r[1])\n    println(r[2])\n    return ok(null)\n}\n",
+        concat!(
+            "fn main(): null! {\n",
+            "    r = [1, 2, 3].map(x => x * 2)\n",
+            "    println(r[0])\n",
+            "    println(r[1])\n",
+            "    println(r[2])\n",
+            "    flags = [1, 2, 3].map(x => x > 1)\n",
+            "    labels = [1, 2, 3].map(x => str(x))\n",
+            "    if (flags[0] || !flags[1] || !flags[2]) panic(\"bool map output changed\")\n",
+            "    if (labels[0] != \"1\" || labels[1] != \"2\" || labels[2] != \"3\") panic(\"string map output changed\")\n",
+            "    return ok(null)\n",
+            "}\n",
+        ),
     )
     .expect("write main.ku");
 
-    let Some(exe) = native_build(&dir, "main.ku", "mapbasic") else {
+    let Some(exe) = native_build(dir, "main.ku", "mapbasic") else {
         return;
     };
 
@@ -6359,7 +8072,69 @@ fn native_array_map_matches_interpreter() {
     assert_eq!(stdout.replace('\r', ""), "2\n4\n6\n");
     assert_eq!(code, Some(0));
 
-    fs::remove_dir_all(&dir).ok();
+    let generated = native_emit_c(dir, "main.ku");
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "array-map-capacity",
+        r#"
+static size_t fixture_calls;
+static int64_t fixture_int(void* env, int64_t value) { (void)env; fixture_calls++; return value * 2; }
+static bool fixture_bool(void* env, int64_t value) { (void)env; fixture_calls++; return value > 1; }
+static KuString fixture_string(void* env, int64_t value) { (void)env; fixture_calls++; return ku_string_from_int(value); }
+int main(void) {
+  KuArray_int empty = {0};
+  KuArray_int empty_int = ku_array_map_fn_int__to_int(empty, (KuClosure_fn_int__to_int){fixture_int, NULL});
+  KuArray_bool empty_bool = ku_array_map_fn_int__to_bool(empty, (KuClosure_fn_int__to_bool){fixture_bool, NULL});
+  KuArray_str empty_str = ku_array_map_fn_int__to_str(empty, (KuClosure_fn_int__to_str){fixture_string, NULL});
+  CHECK(!fixture_calls && VECTOR_MATCHES(empty_int) && VECTOR_MATCHES(empty_bool) && VECTOR_MATCHES(empty_str));
+  ku_array_drop_int(&empty_int);
+  ku_array_drop_bool(&empty_bool);
+  ku_array_drop_str(&empty_str);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  int64_t values[] = {1, 2, 3};
+  KuArray_int input = {3u, values, 3u};
+  KuArray_int ints = ku_array_map_fn_int__to_int(input, (KuClosure_fn_int__to_int){fixture_int, NULL});
+  CHECK(fixture_calls == 3u && ints.len == 3u && ints.capacity == 3u && VECTOR_MATCHES(ints));
+  KuArray_int ints_clone = ku_array_clone_int(ints);
+  CHECK(ints_clone.data != ints.data && ints_clone.capacity == 3u && VECTOR_MATCHES(ints_clone));
+  for (size_t i = 0; i < 3u; i++) CHECK(ints.data[i] == values[i] * 2 && ints_clone.data[i] == ints.data[i]);
+  CHECK(ku_perf_live_allocations == 2u && ku_perf_live_bytes == 6u * sizeof(int64_t));
+  ku_array_drop_int(&ints);
+  CHECK(ints_clone.data[0] == 2 && ints_clone.data[2] == 6);
+  ku_array_drop_int(&ints_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  KuArray_bool bools = ku_array_map_fn_int__to_bool(input, (KuClosure_fn_int__to_bool){fixture_bool, NULL});
+  CHECK(fixture_calls == 6u && bools.len == 3u && bools.capacity == 3u && VECTOR_MATCHES(bools));
+  KuArray_bool bools_clone = ku_array_clone_bool(bools);
+  CHECK(bools_clone.data != bools.data && bools_clone.capacity == 3u && VECTOR_MATCHES(bools_clone));
+  for (size_t i = 0; i < 3u; i++) CHECK(bools.data[i] == (values[i] > 1) && bools_clone.data[i] == bools.data[i]);
+  CHECK(ku_perf_live_allocations == 2u && ku_perf_live_bytes == 6u * sizeof(bool));
+  ku_array_drop_bool(&bools);
+  CHECK(!bools_clone.data[0] && bools_clone.data[1] && bools_clone.data[2]);
+  ku_array_drop_bool(&bools_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  KuArray_str strings = ku_array_map_fn_int__to_str(input, (KuClosure_fn_int__to_str){fixture_string, NULL});
+  CHECK(fixture_calls == 9u && strings.len == 3u && strings.capacity == 3u && VECTOR_MATCHES(strings));
+  KuArray_str strings_clone = ku_array_clone_str(strings);
+  CHECK(strings_clone.data != strings.data && strings_clone.capacity == 3u && VECTOR_MATCHES(strings_clone));
+  for (size_t i = 0; i < 3u; i++) {
+    CHECK(strings.data[i].len == 1u && strings.data[i].ptr[0] == (uint8_t)('1' + i));
+    CHECK(strings.data[i].storage == KU_STRING_OWNED && strings_clone.data[i].storage == KU_STRING_OWNED);
+    CHECK(strings_clone.data[i].ptr != strings.data[i].ptr && strings_clone.data[i].len == 1u);
+  }
+  CHECK(ku_perf_live_allocations == 8u && ku_perf_live_bytes == 2u * (3u * sizeof(KuString) + 3u));
+  ku_array_drop_str(&strings);
+  for (size_t i = 0; i < 3u; i++) CHECK(strings_clone.data[i].ptr[0] == (uint8_t)('1' + i) && values[i] == (int64_t)i + 1);
+  ku_array_drop_str(&strings_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+"#,
+    );
 }
 
 #[test]

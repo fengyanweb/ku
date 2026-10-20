@@ -1,0 +1,32 @@
+---
+// The request entry handles / before this static fallback is served. A purely
+// static host has no trusted country metadata; its fallback is English.
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Ku</title>
+    <noscript>
+      <meta http-equiv="refresh" content="0;url=/en/" />
+    </noscript>
+    <script>
+      import { readPreferenceCookie } from '../entry/language.mjs';
+      let locale = 'en';
+      try {
+        locale = readPreferenceCookie(document.cookie) ?? 'en';
+      } catch {
+        /* Unavailable cookies use English. */
+      }
+      location.replace(`/${locale}/${location.search}${location.hash}`);
+    </script>
+  </head>
+  <body data-pagefind-ignore="all">
+    <noscript>
+      <a href="/en/">Ku — English</a>
+    </noscript>
+  </body>
+</html>

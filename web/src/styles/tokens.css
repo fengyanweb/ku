@@ -1,0 +1,22 @@
+:root {
+  --ku-ink: #242720;
+  --ku-paper: #f7f8f2;
+  --ku-muted: #666d5e;
+  --ku-line: #dce0d2;
+  --ku-accent: #c6ee80;
+  --ku-accent-ink: #375321;
+  --ku-font:
+    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  --ku-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --ku-radius: 12px;
+}
+:root[data-theme='dark'] {
+  --ku-ink: #e8ecdf;
+  --ku-paper: #191c17;
+  --ku-muted: #b0b8a4;
+  --ku-line: #383e30;
+  --ku-accent: #c6ee80;
+  --ku-accent-ink: #c6ee80;
+  color-scheme: dark;
+}

@@ -1,0 +1,197 @@
+---
+import {
+  localeDefinitions,
+  locales,
+  translate,
+  type Locale,
+} from '../i18n/locales';
+import { languageDestination } from '../i18n/routes';
+interface Props {
+  locale: Locale;
+  variant?: 'website' | 'docs';
+}
+const { locale, variant = 'website' } = Astro.props;
+const t = translate(locale);
+---
+
+<details
+  class="ku-language-switch"
+  data-ku-language-switch
+  data-variant={variant}
+>
+  <summary aria-label={t.language}>
+    <svg
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.5"
+    >
+      <path d="M3 5h12M9 2v3M5 5c1 6 4 9 9 11M13 5c-1 6-4 9-9 11M14 21l4-10 4 10M16 17h4" />
+    </svg>
+    <span>{localeDefinitions[locale].label}</span>
+    <svg
+      class="caret"
+      viewBox="0 0 12 12"
+      width="10"
+      height="10"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+    >
+      <path d="m2 4 4 4 4-4" />
+    </svg>
+  </summary>
+  <ul aria-label={t.language}>
+    {locales.map((key) => {
+      const destination = languageDestination(Astro.url.pathname, key);
+      return (
+        <li>
+          <a
+            href={destination.path}
+            lang={localeDefinitions[key].lang}
+            hreflang={localeDefinitions[key].lang}
+            aria-current={key === locale ? 'true' : undefined}
+            data-ku-language={key}
+            data-ku-anchors={JSON.stringify(destination.anchors)}
+            data-ku-fallback={destination.fallback ? 'true' : undefined}
+          >
+            {localeDefinitions[key].label}
+          </a>
+        </li>
+      );
+    })}
+  </ul>
+</details>
+
+<script>
+  import {
+    rememberLanguageChoice,
+    updateLanguageLinks,
+  } from '../i18n/preference-client';
+  updateLanguageLinks();
+  window.addEventListener('pageshow', updateLanguageLinks);
+  window.addEventListener('hashchange', updateLanguageLinks);
+  document.addEventListener('click', (event) => {
+    document
+      .querySelectorAll<HTMLDetailsElement>('[data-ku-language-switch][open]')
+      .forEach((menu) => {
+        if (event.target instanceof Node && !menu.contains(event.target))
+          menu.open = false;
+      });
+    if (
+      !event.isTrusted ||
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    )
+      return;
+    const link =
+      event.target instanceof Element
+        ? event.target.closest<HTMLAnchorElement>('a[data-ku-language]')
+        : null;
+    if (!link || (link.target && link.target !== '_self')) return;
+    rememberLanguageChoice(link.dataset.kuLanguage!);
+    // Normal anchors retain native navigation, keyboard activation, and context
+    // menu behavior. Only explicit unmodified activation writes a preference.
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    document
+      .querySelectorAll<HTMLDetailsElement>('[data-ku-language-switch][open]')
+      .forEach((menu) => {
+        menu.open = false;
+        menu.querySelector<HTMLElement>('summary')?.focus();
+      });
+  });
+</script>
+
+<style>
+  .ku-language-switch {
+    position: relative;
+    color: inherit;
+    font: inherit;
+  }
+  summary {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    cursor: pointer;
+    list-style: none;
+    padding-block: 0.55rem;
+    font-size: 0.8rem;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+  summary span {
+    max-width: 6.5rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  summary svg {
+    flex-shrink: 0;
+  }
+  summary:focus-visible,
+  a:focus-visible {
+    outline: 2px solid var(--ku-accent, #4e6d2b);
+    outline-offset: 3px;
+  }
+  ul {
+    position: absolute;
+    z-index: 60;
+    inset-inline-end: 0;
+    top: 100%;
+    margin: 0.25rem 0 0;
+    padding: 0.35rem;
+    list-style: none;
+    min-width: 12rem;
+    max-height: min(70vh, 32rem);
+    overflow: auto;
+    background: var(--ku-paper);
+    border: 1px solid var(--ku-line);
+    border-radius: 0.35rem;
+    box-shadow: 0 8px 24px #0001;
+  }
+  li {
+    margin: 0;
+  }
+  a {
+    display: block;
+    padding: 0.4rem 0.6rem;
+    color: inherit;
+    text-decoration: none;
+    white-space: nowrap;
+    font-size: 0.85rem;
+  }
+  a:hover,
+  a[aria-current] {
+    background: var(--sl-color-accent-low, #e6efda);
+  }
+  @media (max-width: 480px) {
+    summary {
+      font-size: 0.7rem;
+    }
+    summary span {
+      max-width: 5rem;
+    }
+  }
+  @media (max-width: 49.999rem) {
+    /* Starlight's mobile controls sit below the sidebar. Keep the linked menu
+       inside the viewport even without JavaScript or with collapsed groups. */
+    [data-variant='docs'] ul {
+      position: fixed;
+      top: calc(var(--sl-nav-height, 3.5rem) + 0.75rem);
+      inset-inline-end: 1rem;
+      width: 12rem;
+      max-height: calc(100dvh - var(--sl-nav-height, 3.5rem) - 2rem);
+      margin-top: 0;
+    }
+  }
+</style>

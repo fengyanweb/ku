@@ -241,7 +241,7 @@ fn main() {
     let generated = c::generate_c_source(&ir::optimize_program(&checked_ir(source)))
         .expect("emit boxed Copy return");
     let body = generated
-        .split_once(" ReturnBoxedCopy() {\n")
+        .split_once(" ReturnBoxedCopy(void) {\n")
         .expect("boxed Copy return function")
         .1
         .split_once("\n}\n")

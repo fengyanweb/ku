@@ -1,0 +1,28 @@
+---
+import Default from '@astrojs/starlight/components/PageTitle.astro';
+import VersionNotice from 'starlight-versions/components/VersionNotice.astro';
+import { localeFromPath, translate } from '../i18n/locales';
+import { archiveFromPath } from '../data/versions';
+const data = Astro.locals.starlightRoute.entry.data;
+const locale = localeFromPath(Astro.url.pathname);
+const t = translate(locale);
+const archive = archiveFromPath(Astro.url.pathname);
+---
+
+<Default />
+<div class="ku-page-meta">
+  <span>
+    {archive ? t.snapshot.replace('{version}', archive.label) : t.next}
+  </span>
+  <span>
+    {t.verified} ·{' '}
+    <time datetime={data.verifiedAt} dir="ltr">
+      {data.verifiedAt}
+    </time>
+  </span>
+  <a href={`/${locale}/${archive ? `${archive.slug}/` : ''}docs/support/`}>
+    {t.limitations} ↗
+  </a>
+</div>
+<VersionNotice />
+{!archive && <p class="ku-version-notice">{t.nextNotice}</p>}

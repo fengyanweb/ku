@@ -171,6 +171,8 @@ namespace Ku.Release {
         public bool TimedOut { get; internal set; }
         public bool OutputLimitExceeded { get; internal set; }
         public bool DescendantHeldOutputPipe { get; internal set; }
+        public string SelfTestReadinessError { get; internal set; }
+        public string SelfTestCleanupError { get; internal set; }
     }
     public static class BoundedProcess {
         private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
@@ -266,6 +268,86 @@ namespace Ku.Release {
             }
         }
         public static BoundedProcessResult Run(string fileName, string[] arguments, string workingDirectory, string stdoutPath, string stderrPath, string startGatePath, string groupReadyPath, int timeoutMilliseconds, long maximumOutputBytes) {
+            return RunCore(fileName, arguments, workingDirectory, stdoutPath, stderrPath, startGatePath, groupReadyPath, timeoutMilliseconds, maximumOutputBytes, null, null);
+        }
+
+        // Only self-tests wait for a real fixture before the same execution deadline.
+        public static BoundedProcessResult RunSelfTest(string fileName, string[] arguments, string workingDirectory, string stdoutPath, string stderrPath, string startGatePath, string groupReadyPath, int timeoutMilliseconds, long maximumOutputBytes, string readinessPidPath, string delayStartGatePath) {
+            // PowerShell can bind $null to an empty CLR string.
+            readinessPidPath = string.IsNullOrEmpty(readinessPidPath) ? null : readinessPidPath;
+            delayStartGatePath = string.IsNullOrEmpty(delayStartGatePath) ? null : delayStartGatePath;
+            return RunCore(fileName, arguments, workingDirectory, stdoutPath, stderrPath, startGatePath, groupReadyPath, timeoutMilliseconds, maximumOutputBytes, readinessPidPath, delayStartGatePath);
+        }
+
+        private static string WaitForSelfTestReadiness(Process process, string pidPath) {
+            var clock = Stopwatch.StartNew();
+            const int preparationMilliseconds = 10000;
+            while (true) {
+                if (clock.ElapsedMilliseconds >= preparationMilliseconds) {
+                    return "fixture did not become ready within the 10000-ms preparation bound";
+                }
+                if (File.Exists(pidPath) || Directory.Exists(pidPath)) {
+                    var attributes = File.GetAttributes(pidPath);
+                    if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0) {
+                        return "readiness PID must be a plain file";
+                    }
+                    var info = new FileInfo(pidPath);
+                    if (info.Length < 1 || info.Length > 10) return "readiness PID has an invalid size";
+                    byte[] bytes = File.ReadAllBytes(pidPath);
+                    if (bytes.Length < 1 || bytes.Length > 10) return "readiness PID has an invalid size";
+                    foreach (byte digit in bytes) {
+                        if (digit < 0x30 || digit > 0x39) return "readiness PID is not a positive integer";
+                    }
+                    string text = System.Text.Encoding.ASCII.GetString(bytes);
+                    if (!int.TryParse(text, System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out int childPid) || childPid <= 0) {
+                        return "readiness PID is not a positive integer";
+                    }
+                    try {
+                        using (var child = Process.GetProcessById(childPid)) {
+                            if (child.HasExited) return "readiness child already exited";
+                        }
+                    } catch (ArgumentException) { return "readiness child already exited"; }
+                    if (process.HasExited) return "fixture exited before the timeout phase";
+                    if (clock.ElapsedMilliseconds >= preparationMilliseconds) {
+                        return "fixture did not become ready within the 10000-ms preparation bound";
+                    }
+                    return null;
+                }
+                if (process.HasExited) return "fixture exited before publishing readiness";
+                long remaining = preparationMilliseconds - clock.ElapsedMilliseconds;
+                if (remaining <= 0) return "fixture did not become ready within the 10000-ms preparation bound";
+                process.WaitForExit((int)Math.Min(10, remaining));
+            }
+        }
+
+        private static void SignalSelfTestDelayStart(string path, long deadlineTimestamp) {
+            byte[] bytes = System.Text.Encoding.ASCII.GetBytes(deadlineTimestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            string temporaryPath = path + ".tmp";
+            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read)) {
+                stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+            }
+            File.Move(temporaryPath, path);
+        }
+
+        private static void AddSelfTestCleanupError(ref string errors, string message) {
+            errors = errors == null ? message : errors + "; " + message;
+        }
+
+        private static void KillSelfTestLeader(Process process, ref string errors) {
+            try { KillLeader(process); }
+            catch (Exception error) { AddSelfTestCleanupError(ref errors, "leader termination failed: " + error.Message); }
+        }
+
+        private static bool WaitSelfTestOutput(Task output, ref string errors) {
+            try { return output.Wait(10000); }
+            catch (AggregateException error) {
+                AddSelfTestCleanupError(ref errors, "output capture failed: " + error.GetBaseException().Message);
+                return output.IsCompleted;
+            }
+        }
+
+        private static BoundedProcessResult RunCore(string fileName, string[] arguments, string workingDirectory, string stdoutPath, string stderrPath, string startGatePath, string groupReadyPath, int timeoutMilliseconds, long maximumOutputBytes, string readinessPidPath, string delayStartGatePath) {
             var start = new ProcessStartInfo { FileName = fileName, WorkingDirectory = workingDirectory, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
             foreach (string argument in arguments) start.ArgumentList.Add(argument);
             using (var process = new Process { StartInfo = start }) {
@@ -275,18 +357,99 @@ namespace Ku.Release {
                     if (OperatingSystem.IsWindows()) { job = AssignKillOnCloseJob(process); SignalStart(startGatePath); }
                     var budget = new Budget(process, maximumOutputBytes, groupReadyPath);
                     Task stdout = Pump(process.StandardOutput.BaseStream, stdoutPath, budget); Task stderr = Pump(process.StandardError.BaseStream, stderrPath, budget);
-                    bool timedOut = !process.WaitForExit(timeoutMilliseconds);
-                    if (OperatingSystem.IsWindows()) { if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; } }
-                    else { KillUnixProcessGroup(process.Id, groupReadyPath); }
-                    if (timedOut) KillLeader(process);
-                    if (!process.WaitForExit(10000)) { KillLeader(process); throw new TimeoutException("release subprocess tree cleanup was not confirmed"); }
-                    Task allOutput = Task.WhenAll(stdout, stderr); bool heldPipe = !allOutput.Wait(10000);
-                    if (heldPipe) {
-                        Interlocked.Exchange(ref budget.StopPumps, 1); KillLeader(process); process.StandardOutput.Close(); process.StandardError.Close();
-                        if (!allOutput.Wait(10000)) throw new TimeoutException("release subprocess output cleanup was not confirmed");
+                    bool isSelfTest = delayStartGatePath != null || readinessPidPath != null;
+                    bool startupDeadlineMode = delayStartGatePath != null && readinessPidPath == null;
+                    long startupStartTimestamp = 0;
+                    string readinessError = null;
+                    string cleanupError = null;
+                    if (isSelfTest) {
+                        try {
+                            if (delayStartGatePath != null) {
+                                // Only the controlled startup fixture measures from gate release.
+                                // A delayed parent must never grant it another execution window.
+                                startupStartTimestamp = Stopwatch.GetTimestamp();
+                                long deadline = startupDeadlineMode
+                                    ? checked(startupStartTimestamp + (long)(timeoutMilliseconds * (double)Stopwatch.Frequency / 1000))
+                                    : 0;
+                                SignalSelfTestDelayStart(delayStartGatePath, deadline);
+                            }
+                            if (readinessPidPath != null) readinessError = WaitForSelfTestReadiness(process, readinessPidPath);
+                        } catch (Exception error) {
+                            readinessError = "fixture preparation failed: " + error.Message;
+                        }
                     }
-                    if (allOutput.IsFaulted) throw new IOException("release subprocess output capture failed", allOutput.Exception);
-                    return new BoundedProcessResult { ExitCode = process.ExitCode, TimedOut = timedOut, OutputLimitExceeded = Volatile.Read(ref budget.Exceeded) != 0, DescendantHeldOutputPipe = heldPipe };
+                    int executionTimeoutMilliseconds = timeoutMilliseconds;
+                    if (startupDeadlineMode) {
+                        double elapsed = (Stopwatch.GetTimestamp() - startupStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+                        executionTimeoutMilliseconds = (int)Math.Max(0, Math.Floor(timeoutMilliseconds - elapsed));
+                    }
+                    bool timedOut;
+                    if (isSelfTest) {
+                        timedOut = false;
+                        try {
+                            timedOut = readinessError == null &&
+                                ((startupDeadlineMode && executionTimeoutMilliseconds <= 0) || !process.WaitForExit(executionTimeoutMilliseconds));
+                        }
+                        catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "execution wait failed: " + error.Message); }
+                    }
+                    else { timedOut = !process.WaitForExit(timeoutMilliseconds); }
+                    if (OperatingSystem.IsWindows()) { if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; } }
+                    else if (isSelfTest) {
+                        try { KillUnixProcessGroup(process.Id, groupReadyPath); }
+                        catch (Exception error) {
+                            AddSelfTestCleanupError(ref cleanupError, "group termination failed: " + error.Message);
+                            // Still retire a live test fixture if group signalling fails.
+                            // The test's actual-child assertion remains authoritative.
+                            try { if (!process.HasExited) process.Kill(true); }
+                            catch (Exception fallbackError) { AddSelfTestCleanupError(ref cleanupError, "tree termination failed: " + fallbackError.Message); }
+                        }
+                    }
+                    else { KillUnixProcessGroup(process.Id, groupReadyPath); }
+                    if (timedOut || readinessError != null || cleanupError != null) {
+                        if (isSelfTest) KillSelfTestLeader(process, ref cleanupError);
+                        else KillLeader(process);
+                    }
+                    bool leaderRetired;
+                    if (isSelfTest) {
+                        leaderRetired = false;
+                        try { leaderRetired = process.WaitForExit(10000); }
+                        catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "leader wait failed: " + error.Message); }
+                    }
+                    else { leaderRetired = process.WaitForExit(10000); }
+                    if (!leaderRetired) {
+                        if (isSelfTest) {
+                            AddSelfTestCleanupError(ref cleanupError, "subprocess tree cleanup was not confirmed");
+                            KillSelfTestLeader(process, ref cleanupError);
+                        }
+                        else {
+                            KillLeader(process);
+                            throw new TimeoutException("release subprocess tree cleanup was not confirmed");
+                        }
+                    }
+                    Task allOutput = Task.WhenAll(stdout, stderr);
+                    bool heldPipe = !(isSelfTest ? WaitSelfTestOutput(allOutput, ref cleanupError) : allOutput.Wait(10000));
+                    if (heldPipe) {
+                        Interlocked.Exchange(ref budget.StopPumps, 1);
+                        if (isSelfTest) {
+                            KillSelfTestLeader(process, ref cleanupError);
+                            try { process.StandardOutput.Close(); }
+                            catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "stdout close failed: " + error.Message); }
+                            try { process.StandardError.Close(); }
+                            catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "stderr close failed: " + error.Message); }
+                            if (!WaitSelfTestOutput(allOutput, ref cleanupError)) AddSelfTestCleanupError(ref cleanupError, "subprocess output cleanup was not confirmed");
+                        }
+                        else {
+                            KillLeader(process);
+                            process.StandardOutput.Close();
+                            process.StandardError.Close();
+                            if (!allOutput.Wait(10000)) throw new TimeoutException("release subprocess output cleanup was not confirmed");
+                        }
+                    }
+                    if (allOutput.IsFaulted) {
+                        if (isSelfTest) AddSelfTestCleanupError(ref cleanupError, "subprocess output capture failed: " + allOutput.Exception.GetBaseException().Message);
+                        else throw new IOException("release subprocess output capture failed", allOutput.Exception);
+                    }
+                    return new BoundedProcessResult { ExitCode = isSelfTest && !leaderRetired ? -1 : process.ExitCode, TimedOut = timedOut, OutputLimitExceeded = Volatile.Read(ref budget.Exceeded) != 0, DescendantHeldOutputPipe = heldPipe, SelfTestReadinessError = readinessError, SelfTestCleanupError = cleanupError };
                 } finally {
                     if (job != IntPtr.Zero) CloseHandle(job);
                 }
@@ -317,6 +480,18 @@ try {
         $ready = [IO.FileStream]::new([string]$item.groupReady, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $ready.WriteByte(1); $ready.Flush($true) } finally { $ready.Dispose() }
     }
+    if ($item.PSObject.Properties.Name -contains "selfTestDelayStartGate") {
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath ([string]$item.selfTestDelayStartGate) -PathType Leaf)) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw "release self-test delay gate timed out" }
+            Start-Sleep -Milliseconds 10
+        }
+        $startupDeadline = [long]([IO.File]::ReadAllText([string]$item.selfTestDelayStartGate, [Text.Encoding]::ASCII))
+        Start-Sleep -Milliseconds ([int]$item.selfTestStartupDelayMilliseconds)
+        if ($startupDeadline -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $startupDeadline) {
+            throw "self-test startup fixture reached its original execution deadline"
+        }
+    }
     & ([string]$item.tool) @([string[]]$item.arguments)
     if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }
     exit 0
@@ -326,21 +501,55 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
     [IO.File]::WriteAllText($path, $source, [Text.UTF8Encoding]::new($false)); return $path
 }
 
-function Invoke-BoundedTool([string]$Name, [string[]]$Arguments, [string]$WorkingDirectory, [string]$WorkRoot, [string]$LogName, [int]$TimeoutMilliseconds, [string]$Wrapper) {
+function Invoke-BoundedTool([string]$Name, [string[]]$Arguments, [string]$WorkingDirectory, [string]$WorkRoot, [string]$LogName, [int]$TimeoutMilliseconds, [string]$Wrapper, [string]$SelfTestReadinessPidPath = $null, [int]$SelfTestStartupDelayMilliseconds = 0, [switch]$SelfTestStderrDirectoryFault) {
+    if (($SelfTestReadinessPidPath -or $SelfTestStartupDelayMilliseconds -ne 0 -or $SelfTestStderrDirectoryFault) -and -not $SelfTest) { throw "release fixture gates are restricted to -SelfTest" }
+    if ($SelfTestStartupDelayMilliseconds -notin @(0, 2500)) { throw "invalid release self-test startup delay" }
+    if ($SelfTestStderrDirectoryFault -and -not $SelfTestReadinessPidPath) { throw "release log-fault self-test requires real fixture readiness" }
     $command = Get-Command $Name -ErrorAction Stop | Select-Object -First 1
     if ($command.CommandType -ne [Management.Automation.CommandTypes]::Application -and $command.CommandType -ne [Management.Automation.CommandTypes]::ExternalScript) { throw "release tool '$Name' must resolve to an application or external script" }
     $pwsh = Get-Command "pwsh" -CommandType Application -ErrorAction Stop | Select-Object -First 1
     $specPath = Join-Path $WorkRoot ("$LogName-$([Guid]::NewGuid().ToString('N')).json")
     $runId = [Guid]::NewGuid().ToString('N'); $startGatePath = Join-Path $WorkRoot "$runId.start"; $groupReadyPath = Join-Path $WorkRoot "$runId.group"
-    $spec = [ordered]@{ tool = [string]$command.Source; arguments = @($Arguments); startGate = $startGatePath; groupReady = $groupReadyPath } | ConvertTo-Json -Compress
+    $delayStartGatePath = if ($SelfTestStartupDelayMilliseconds -ne 0) { Join-Path $WorkRoot "$runId.delay-start" } else { $null }
+    $specItem = [ordered]@{ tool = [string]$command.Source; arguments = @($Arguments); startGate = $startGatePath; groupReady = $groupReadyPath }
+    if ($null -ne $delayStartGatePath) {
+        $specItem.selfTestDelayStartGate = $delayStartGatePath
+        $specItem.selfTestStartupDelayMilliseconds = $SelfTestStartupDelayMilliseconds
+    }
+    $spec = $specItem | ConvertTo-Json -Compress
     [IO.File]::WriteAllText($specPath, $spec, [Text.UTF8Encoding]::new($false))
     $stdoutPath = Join-Path $WorkRoot "$LogName-$runId.stdout"; $stderrPath = Join-Path $WorkRoot "$LogName-$runId.stderr"
-    $result = [Ku.Release.BoundedProcess]::Run([string]$pwsh.Source, @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $Wrapper, "-Spec", $specPath), $WorkingDirectory, $stdoutPath, $stderrPath, $startGatePath, $groupReadyPath, $TimeoutMilliseconds, $processOutputLimit)
-    $stdout = [IO.File]::ReadAllText($stdoutPath, $outputUtf8); $stderr = [IO.File]::ReadAllText($stderrPath, $outputUtf8)
+    if ($SelfTestStderrDirectoryFault) { [IO.Directory]::CreateDirectory($stderrPath) | Out-Null }
+    if ($SelfTestReadinessPidPath -or $null -ne $delayStartGatePath) {
+        $readyPath = if ($SelfTestReadinessPidPath) { $SelfTestReadinessPidPath } else { $null }
+        $result = [Ku.Release.BoundedProcess]::RunSelfTest([string]$pwsh.Source, @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $Wrapper, "-Spec", $specPath), $WorkingDirectory, $stdoutPath, $stderrPath, $startGatePath, $groupReadyPath, $TimeoutMilliseconds, $processOutputLimit, $readyPath, $delayStartGatePath)
+    }
+    else {
+        $result = [Ku.Release.BoundedProcess]::Run([string]$pwsh.Source, @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $Wrapper, "-Spec", $specPath), $WorkingDirectory, $stdoutPath, $stderrPath, $startGatePath, $groupReadyPath, $TimeoutMilliseconds, $processOutputLimit)
+    }
+    $cleanupDetails = $result.SelfTestCleanupError
+    if ($SelfTest) {
+        $logProblems = [Collections.Generic.List[string]]::new()
+        if ($cleanupDetails) { $logProblems.Add($cleanupDetails) }
+        $stdout = ""
+        $stderr = ""
+        try { $stdout = [IO.File]::ReadAllText($stdoutPath, $outputUtf8) }
+        catch { $logProblems.Add("stdout log read failed: $($_.Exception.Message)") }
+        try { $stderr = [IO.File]::ReadAllText($stderrPath, $outputUtf8) }
+        catch { $logProblems.Add("stderr log read failed: $($_.Exception.Message)") }
+        $cleanupDetails = $logProblems -join "; "
+    }
+    else {
+        $stdout = [IO.File]::ReadAllText($stdoutPath, $outputUtf8); $stderr = [IO.File]::ReadAllText($stderrPath, $outputUtf8)
+    }
     $output = if ($stdout.Length -eq 0) { $stderr } elseif ($stderr.Length -eq 0) { $stdout } else { "$stdout`n$stderr" }
-    if ($result.OutputLimitExceeded) { throw "$Name output exceeded $processOutputLimit bytes; its process tree was terminated" }
-    if ($result.TimedOut) { throw "$Name exceeded its $TimeoutMilliseconds-ms deadline; its process tree was terminated" }
-    if ($result.DescendantHeldOutputPipe) { throw "$Name left an inherited output pipe open after exit; the release command was rejected" }
+    $cleanupSuffix = if ($cleanupDetails) { "; self-test cleanup failed: $cleanupDetails" } else { "" }
+    $terminationSuffix = if ($cleanupDetails) { "; process-tree cleanup could not be confirmed" } else { "; its process tree was terminated" }
+    if ($result.OutputLimitExceeded) { throw "$Name output exceeded $processOutputLimit bytes$terminationSuffix$cleanupSuffix" }
+    if ($result.SelfTestReadinessError) { throw "$Name self-test readiness failed: $($result.SelfTestReadinessError)$terminationSuffix$cleanupSuffix" }
+    if ($result.TimedOut) { throw "$Name exceeded its $TimeoutMilliseconds-ms deadline$terminationSuffix$cleanupSuffix" }
+    if ($result.DescendantHeldOutputPipe) { throw "$Name left an inherited output pipe open after exit; the release command was rejected$cleanupSuffix" }
+    if ($cleanupDetails) { throw "self-test cleanup failed: $cleanupDetails" }
     return [pscustomobject]@{ ExitCode = $result.ExitCode; Output = $output; Stdout = $stdout; Stderr = $stderr }
 }
 
@@ -1140,6 +1349,9 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
     if ($null -eq $python) { throw "release self-test requires Python to exercise orphan process-tree cleanup" }
 
     $processOwner = [Guid]::NewGuid().ToString('N'); $processRoot = New-OwnedDirectory $temporaryRoot '.ku-release-process-selftest-' $processOwner
+    $recordedChildren = [Collections.Generic.List[string]]::new()
+    $confirmedChildren = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $primaryFailure = $null
     try {
         function Assert-SelfTestChildGone([string]$PidPath, [string]$Case) {
             if (-not (Test-PlainFile $PidPath)) { throw "$Case self-test did not record its child" }
@@ -1149,15 +1361,19 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
                 if ($alive) { Start-Sleep -Milliseconds 20 }
             } while ($alive -and [DateTime]::UtcNow -lt $deadline)
             if ($alive) { throw "$Case self-test left child PID $childPid alive" }
+            # A confirmed exit is final; the OS may later reuse this numeric PID.
+            [void]$confirmedChildren.Add($PidPath)
         }
 
         $wrapper = New-ToolWrapper $processRoot; $pidFile = Join-Path $processRoot 'child.pid'
+        $recordedChildren.Add($pidFile)
         $program = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid))'
         $clock = [Diagnostics.Stopwatch]::StartNew(); [void](Invoke-CheckedTool ([string]$python.Source) @('-c', $program, $pidFile) $processRoot $processRoot 'orphan-tree' 10000 $wrapper); $clock.Stop()
         Assert-SelfTestChildGone $pidFile 'orphan process'
         if ($clock.ElapsedMilliseconds -gt 15000) { throw "orphan process self-test exceeded its fixed cleanup bound" }
 
         $outputPidFile = Join-Path $processRoot 'output-child.pid'
+        $recordedChildren.Add($outputPidFile)
         $outputProgram = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); sys.stdout.buffer.write((b"x"*8191+b"\n")*640); sys.stdout.flush()'
         $outputRejected = $false
         $outputFailure = $null
@@ -1170,14 +1386,126 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
         $captured = 0L; foreach ($log in Get-ChildItem -LiteralPath $processRoot -File | Where-Object Name -Like 'output-budget-*.std*') { $captured += $log.Length }
         if ($captured -gt $processOutputLimit) { throw "release output-budget self-test captured more than its configured limit" }
 
-        $timeoutPidFile = Join-Path $processRoot 'timeout-child.pid'
-        $timeoutProgram = 'import subprocess,sys,time; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); time.sleep(60)'
+        # Every timeout fixture is a real child in the already isolated tree.
+        # Publish its own PID only after a flushed, atomic rename, never a fake PID.
+        $timeoutProgram = @'
+import subprocess, sys, time
+child = """
+import os, sys, time
+def publish(path, data):
+    with open(path + '.tmp', 'xb') as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(path + '.tmp', path)
+pid = str(os.getpid()).encode('ascii')
+publish(sys.argv[1], pid)
+if sys.argv[3] == 'bad':
+    publish(sys.argv[2], b'not-a-pid')
+elif sys.argv[3] == 'bom':
+    publish(sys.argv[2], bytes((239, 187, 191)) + pid)
+time.sleep(60)
+"""
+subprocess.Popen([sys.executable, '-c', child, sys.argv[1], sys.argv[2], sys.argv[3]])
+time.sleep(60)
+'@
+
+        # The gate starts this 2500-ms delay after the parent's pumps are ready.
+        # The ordinary 2000-ms execution window must stop the wrapper before it
+        # may launch Python. This does not stand in for the child-cleanup case.
+        $startupPid = Join-Path $processRoot "startup-child.pid"
+        $recordedChildren.Add($startupPid)
+        $startupRejected = $false
+        $startupFailure = "no rejection"
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", $timeoutProgram, $startupPid, $startupPid, "plain") $processRoot $processRoot "startup-deadline" 2000 $wrapper -SelfTestStartupDelayMilliseconds 2500) }
+        catch {
+            $startupFailure = $_.Exception.Message
+            $startupRejected = $startupFailure -like "*exceeded its 2000-ms deadline*" -and $startupFailure -notlike "*self-test cleanup failed*"
+        }
+        if (-not $startupRejected -or (Test-Path -LiteralPath $startupPid)) {
+            throw "release startup self-test did not enforce its original 2000-ms window before fixture readiness ($startupFailure)"
+        }
+
+        $timeoutPid = Join-Path $processRoot "timeout-child.pid"
+        $recordedChildren.Add($timeoutPid)
         $timeoutRejected = $false
-        try { [void](Invoke-BoundedTool ([string]$python.Source) @('-c', $timeoutProgram, $timeoutPidFile) $processRoot $processRoot 'direct-timeout' 2000 $wrapper) } catch { $timeoutRejected = $_.Exception.Message -like '*exceeded its 2000-ms deadline*' }
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", $timeoutProgram, $timeoutPid, $timeoutPid, "plain") $processRoot $processRoot "direct-timeout" 2000 $wrapper -SelfTestReadinessPidPath $timeoutPid -SelfTestStartupDelayMilliseconds 2500) }
+        catch { $timeoutRejected = $_.Exception.Message -like "*exceeded its 2000-ms deadline*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
         if (-not $timeoutRejected) { throw "release direct-timeout self-test was not rejected" }
-        Assert-SelfTestChildGone $timeoutPidFile 'timeout process'
+        Assert-SelfTestChildGone $timeoutPid "release timeout"
+
+        # A real Pump open failure leaves stderr as a directory. Preserve the
+        # original timeout together with capture/read errors, then verify the child.
+        $logFaultPid = Join-Path $processRoot "log-fault-child.pid"
+        $recordedChildren.Add($logFaultPid)
+        $logFaultRejected = $false
+        $logFaultFailure = "no rejection"
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", $timeoutProgram, $logFaultPid, $logFaultPid, "plain") $processRoot $processRoot "log-fault" 2000 $wrapper -SelfTestReadinessPidPath $logFaultPid -SelfTestStderrDirectoryFault) }
+        catch {
+            $logFaultFailure = $_.Exception.Message
+            $logFaultRejected = $logFaultFailure -like "*exceeded its 2000-ms deadline*" -and
+                $logFaultFailure -like "*self-test cleanup failed:*output*capture*failed*" -and
+                $logFaultFailure -like "*stderr log read failed:*"
+        }
+        if (-not $logFaultRejected) { throw "release log-fault self-test masked its primary timeout ($logFaultFailure)" }
+        Assert-SelfTestChildGone $logFaultPid "release log-fault"
+
+        # A missing/invalid readiness signal is a preparation failure, never a
+        # successful 2000-ms timeout. Both cases still own a genuine live child.
+        $noReadyPid = Join-Path $processRoot "no-ready-child.pid"
+        $noReadySignal = Join-Path $processRoot "never-published.pid"
+        $recordedChildren.Add($noReadyPid)
+        $noReadyRejected = $false
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", $timeoutProgram, $noReadyPid, $noReadySignal, "plain") $processRoot $processRoot "no-ready" 2000 $wrapper -SelfTestReadinessPidPath $noReadySignal) }
+        catch { $noReadyRejected = $_.Exception.Message -like "*self-test readiness failed:*10000-ms preparation bound*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
+        if (-not $noReadyRejected) { throw "release no-readiness self-test did not report its preparation bound" }
+        Assert-SelfTestChildGone $noReadyPid "release no-readiness"
+
+        foreach ($badMode in @("bad", "bom")) {
+            $badReadyPid = Join-Path $processRoot "$badMode-ready-child.pid"
+            $badReadySignal = Join-Path $processRoot "$badMode-invalid-ready.pid"
+            $recordedChildren.Add($badReadyPid)
+            $badReadyRejected = $false
+            $badReadyFailure = "no rejection"
+            try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", $timeoutProgram, $badReadyPid, $badReadySignal, $badMode) $processRoot $processRoot "$badMode-ready" 2000 $wrapper -SelfTestReadinessPidPath $badReadySignal) }
+            catch {
+                $badReadyFailure = $_.Exception.Message
+                $badReadyRejected = $badReadyFailure -like "*self-test readiness failed:*readiness PID*" -and $badReadyFailure -notlike "*self-test cleanup failed*"
+            }
+            if (-not $badReadyRejected) { throw "release invalid-readiness self-test did not reject $badMode PID ($badReadyFailure)" }
+            Assert-SelfTestChildGone $badReadyPid "release invalid-readiness $badMode"
+        }
+
+        $earlyExitSignal = Join-Path $processRoot "early-exit.pid"
+        $earlyExitRejected = $false
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @("-c", "import sys; sys.exit(0)") $processRoot $processRoot "early-exit" 2000 $wrapper -SelfTestReadinessPidPath $earlyExitSignal) }
+        catch { $earlyExitRejected = $_.Exception.Message -like "*self-test readiness failed:*fixture exited before publishing readiness*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
+        if (-not $earlyExitRejected -or (Test-Path -LiteralPath $earlyExitSignal)) {
+            throw "release early-exit self-test did not report the missing fixture"
+        }
     }
-    finally { Remove-OwnedDirectory $processRoot $temporaryRoot '.ku-release-process-selftest-' $processOwner }
+    catch { $primaryFailure = $_; throw }
+    finally {
+        $cleanupProblems = [Collections.Generic.List[string]]::new()
+        foreach ($recordedPid in $recordedChildren) {
+            if ($confirmedChildren.Contains($recordedPid)) { continue }
+            try {
+                if (Test-Path -LiteralPath $recordedPid) { Assert-SelfTestChildGone $recordedPid "release final cleanup" }
+            }
+            catch { $cleanupProblems.Add("${recordedPid}: $($_.Exception.Message)") }
+        }
+        if ($cleanupProblems.Count -eq 0) {
+            try { Remove-OwnedDirectory $processRoot $temporaryRoot '.ku-release-process-selftest-' $processOwner }
+            catch { $cleanupProblems.Add("private-root cleanup: $($_.Exception.Message)") }
+        }
+        if ($cleanupProblems.Count -ne 0) {
+            $cleanupMessage = "release self-test cleanup failed: " + ($cleanupProblems -join "; ")
+            if ($null -ne $primaryFailure) {
+                throw [InvalidOperationException]::new($primaryFailure.Exception.Message + "; " + $cleanupMessage, $primaryFailure.Exception)
+            }
+            throw $cleanupMessage
+        }
+    }
     if (Test-Path -LiteralPath $processRoot) { throw "orphan process self-test work root could not be removed immediately" }
 
     if ($IsWindows) {
@@ -1318,7 +1646,7 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
             $expectedOk = if ($null -eq $case.Expected) { -not (Test-Path -LiteralPath $destination) } else { Test-PlainFile (Join-Path $destination ([string]$case.Expected)) }
             if (-not $expectedOk -or (Test-Path -LiteralPath $journal) -or (Test-Path -LiteralPath $stage) -or ($null -ne $backup -and (Test-Path -LiteralPath $backup))) { throw "release transaction recovery failed case '$($case.Name)'" }
         }
-        Write-Output "release self-test ok: SemVer, orphan/timeout/output/retry cleanup, strict TLS ABI archive validation, single-writer locking, and crash recovery"
+        Write-Output "release self-test ok: SemVer, orphan/fixed-2000-ms-timeout/output/retry cleanup, bounded fixture readiness/invalid/early-exit cleanup, strict TLS ABI archive validation, single-writer locking, and crash recovery"
     }
     finally { Remove-OwnedDirectory $workRoot $temporaryRoot '.ku-release-selftest-' $owner }
 }

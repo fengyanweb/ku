@@ -16,22 +16,15 @@ const MAX_JSON_OUTPUT_BYTES: usize = 1_000_000;
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
     match function {
-        "parse" => {
-            expect_arg_count("json.parse", args.len(), 1, span)?;
+        "parse" | "try_parse" | "decode" => {
+            expect_arg_count(&format!("json.{function}"), args.len(), 1, span)?;
             let Value::String(text) = &args[0] else {
                 return Err(expected_type("str", &args[0], span));
             };
             Ok(Some(parse_result(text, span)))
         }
-        "try_parse" => {
-            expect_arg_count("json.try_parse", args.len(), 1, span)?;
-            let Value::String(text) = &args[0] else {
-                return Err(expected_type("str", &args[0], span));
-            };
-            Ok(Some(parse_result(text, span)))
-        }
-        "stringify" => {
-            expect_arg_count("json.stringify", args.len(), 1, span)?;
+        "stringify" | "encode" => {
+            expect_arg_count(&format!("json.{function}"), args.len(), 1, span)?;
             let result = match stringify_value(&args[0], span) {
                 Ok(text) => errors::ok(Value::String(text)),
                 Err(err) => errors::err(
@@ -260,7 +253,7 @@ impl<'a> JsonParser<'a> {
         } else {
             text.parse::<i64>()
                 .map(Value::Int)
-                .map_err(|_| self.error("invalid json number"))
+                .map_err(|_| self.error("invalid json number: integer is outside int64 range"))
         }
     }
 
@@ -330,8 +323,17 @@ impl<'a> JsonParser<'a> {
     }
 
     fn error(&self, message: impl Into<String>) -> KuError {
-        let position = Position::new(self.span.start.line, self.span.start.column, self.current);
-        KuError::runtime(message, Span::point(position))
+        // The parser walks Unicode scalars; diagnostics report UTF-8 bytes.
+        // Only failure needs this conversion, so the normal parse stays unchanged.
+        let byte = self.chars[..self.current]
+            .iter()
+            .map(|ch| ch.len_utf8())
+            .sum();
+        let position = Position::new(self.span.start.line, self.span.start.column, byte);
+        KuError::runtime(
+            format!("json parse failed: {} at byte {byte}", message.into()),
+            Span::point(position),
+        )
     }
 }
 
@@ -353,9 +355,15 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
                     span,
                 ));
             }
-            output.push_str(&value.to_string());
+            let text = value.to_string();
+            output.push_str(&text);
+            // Keep the existing spelling unless an integer-looking float would
+            // be rejected by the strict int64 decoder on the next roundtrip.
+            if !text.contains(['.', 'e', 'E']) && text.parse::<i64>().is_err() {
+                output.push_str(".0");
+            }
         }
-        Value::String(value) => write_json_string(value, output),
+        Value::String(value) => write_json_string(value, output, span)?,
         Value::Array(values) => {
             output.push('[');
             for (index, value) in values.iter().enumerate() {
@@ -368,13 +376,17 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
         }
         Value::Object(fields) | Value::Struct { fields, .. } => {
             output.push('{');
+            // Reject plainly oversized objects before allocating sort storage.
+            if fields.len() > MAX_JSON_OUTPUT_BYTES / 4 {
+                return Err(KuError::runtime("json.stringify output is too large", span));
+            }
             let mut fields = fields.iter().collect::<Vec<_>>();
             fields.sort_by(|left, right| left.0.cmp(right.0));
             for (index, (key, value)) in fields.iter().enumerate() {
                 if index > 0 {
                     output.push(',');
                 }
-                write_json_string(key, output);
+                write_json_string(key, output, span)?;
                 output.push(':');
                 write_json(value, output, depth + 1, span)?;
             }
@@ -397,7 +409,11 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
     Ok(())
 }
 
-fn write_json_string(value: &str, output: &mut String) {
+fn write_json_string(value: &str, output: &mut String, span: Span) -> KuResult<()> {
+    // Keep the bound without copying a huge value or building a second tree.
+    if value.len().saturating_add(2) > MAX_JSON_OUTPUT_BYTES.saturating_sub(output.len()) {
+        return Err(KuError::runtime("json.stringify output is too large", span));
+    }
     output.push('"');
     for ch in value.chars() {
         match ch {
@@ -409,13 +425,109 @@ fn write_json_string(value: &str, output: &mut String) {
             ch if (ch as u32) < 0x20 => output.push_str(&format!("\\u{:04x}", ch as u32)),
             _ => output.push(ch),
         }
+        if output.len() >= MAX_JSON_OUTPUT_BYTES {
+            return Err(KuError::runtime("json.stringify output is too large", span));
+        }
     }
     output.push('"');
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_floats_roundtrip_without_relaxing_integer_limits() {
+        for (number, expected) in [
+            (1e20, "100000000000000000000.0"),
+            (-1e20, "-100000000000000000000.0"),
+            (f64::from_bits(0x43e0000000000000), "9223372036854776000.0"),
+            (f64::from_bits(0xc3e0000000000000), "-9223372036854776000.0"),
+            (1.0, "1"),
+            (-0.0, "-0"),
+            (1.25, "1.25"),
+        ] {
+            assert_eq!(
+                stringify_value(&Value::Float(number), Span::default()).unwrap(),
+                expected
+            );
+        }
+        for bits in [
+            1e20f64.to_bits(),
+            (-1e20f64).to_bits(),
+            0x43dfffffffffffff, // Immediately below 2^63.
+            0x43e0000000000000,
+            0x43e0000000000001,
+            0xc3dfffffffffffff, // Immediately above -2^63.
+            0xc3e0000000000000,
+            0xc3e0000000000001,
+            f64::MAX.to_bits(),
+            (-f64::MAX).to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+            1, // Minimum subnormal.
+        ] {
+            let original = f64::from_bits(bits);
+            let text = stringify_value(&Value::Float(original), Span::default()).unwrap();
+            let decoded = parse_json(&text, Span::default()).expect("encoded float must decode");
+            let number = match decoded {
+                Value::Float(number) => number,
+                Value::Int(number) => number as f64,
+                _ => panic!("encoded float decoded as a non-number"),
+            };
+            assert_eq!(number.to_bits(), bits, "roundtrip changed {text}");
+            if text.ends_with(".0") {
+                assert!(matches!(
+                    parse_json(&text, Span::default()),
+                    Ok(Value::Float(_))
+                ));
+            }
+        }
+        for text in ["9223372036854775808", "-9223372036854775809"] {
+            assert!(parse_json(text, Span::default()).is_err());
+        }
+        for number in [i64::MIN, i64::MAX] {
+            let text = stringify_value(&Value::Int(number), Span::default()).unwrap();
+            assert_eq!(text, number.to_string());
+            assert_eq!(
+                parse_json(&text, Span::default()).unwrap(),
+                Value::Int(number)
+            );
+        }
+    }
+
+    #[test]
+    fn large_float_suffix_obeys_json_output_limit() {
+        let mut value = Value::Array(vec![Value::String("x".repeat(999_972)), Value::Float(1e20)]);
+        let text = stringify_value(&value, Span::default()).unwrap();
+        assert_eq!(text.len(), MAX_JSON_OUTPUT_BYTES);
+        assert!(text.ends_with(",100000000000000000000.0]"));
+        let Value::Array(values) = &mut value else {
+            unreachable!()
+        };
+        let Value::String(text) = &mut values[0] else {
+            unreachable!()
+        };
+        text.push('x');
+        let error = stringify_value(&value, Span::default()).expect_err("suffix counts toward cap");
+        assert!(error.message.contains("output is too large"));
+    }
+
+    #[test]
+    fn json_deep_input_is_bounded_and_decoded_values_are_owned() {
+        let text = format!("{}0{}", "[".repeat(4096), "]".repeat(4096));
+        let error = parse_json(&text, Span::default()).expect_err("bounded parser depth");
+        assert!(error.message.contains("json nesting is too deep"));
+        let input = String::from("{\"after\":[\"中\\u0000😀\",7]}");
+        let value = parse_json(&input, Span::default()).unwrap();
+        drop(input);
+        // Input is gone; retained Ku data stays usable after another failure.
+        assert!(parse_json("[false,}", Span::default()).is_err());
+        assert_eq!(
+            stringify_value(&value, Span::default()).unwrap(),
+            "{\"after\":[\"中\\u0000😀\",7]}"
+        );
+    }
 
     #[test]
     fn stringify_rejects_every_non_finite_float() {
