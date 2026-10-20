@@ -83,7 +83,7 @@ class PrepareReleaseTests(unittest.TestCase):
                                       "installation_check": {
                                           "format": "ku-install-check-v1", "version": VERSION,
                                           "target": target, "executable_sha256": specs[executable]["sha256"],
-                                          "examples": {name: hashlib.sha256((self.repo / "examples" / name).read_bytes()).hexdigest()
+                                          "examples": {name: hashlib.sha256(PREPARE.EXPORTER.canonical_example((self.repo / "examples" / name).read_bytes())).hexdigest()
                                                        for name in ("hello.ku", "json.ku")},
                                           "checks": [{"name": name, "exit_code": 0, "stdout_bytes": 1,
                                                       "stdout_sha256": "f" * 64, "stderr_bytes": 0}
@@ -168,6 +168,19 @@ class PrepareReleaseTests(unittest.TestCase):
                 self.change_manifest(update)
                 self.rejected()
                 self.archive(PREPARE.TARGETS[0])
+
+    def test_windows_crlf_installation_receipt_matches_linux_lf_checkout(self):
+        for name in ("hello.ku", "json.ku"):
+            (self.repo / "examples" / name).write_bytes(f"fixture {name}\r\n".encode())
+        self.archive("x86_64-pc-windows-msvc")
+        for name in ("hello.ku", "json.ku"):
+            (self.repo / "examples" / name).write_bytes(f"fixture {name}\n".encode())
+        self.assertEqual(self.prepare()["targets"], list(PREPARE.TARGETS))
+
+    def test_lf_installation_receipts_match_crlf_verification_checkout(self):
+        for name in ("hello.ku", "json.ku"):
+            (self.repo / "examples" / name).write_bytes(f"fixture {name}\r\n".encode())
+        self.assertEqual(self.prepare()["targets"], list(PREPARE.TARGETS))
 
     def test_tag_commit_and_all_repository_versions_must_match(self):
         for value in ("0.0.17", "v0.00.17", "v0.0.17/../x", "v0.0.18", "v0.0.17\n"):

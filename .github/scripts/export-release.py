@@ -46,6 +46,11 @@ class ExportError(ValueError):
     pass
 
 
+def canonical_example(source: bytes) -> bytes:
+    """Hash and execute the same UTF-8/LF text on every checkout platform."""
+    return source.decode("utf-8").replace("\r\n", "\n").encode("utf-8")
+
+
 def install_command(executable: Path, arguments: list[str], working: Path) -> tuple[dict, str]:
     """Run an installed CLI command with bounded time/output and reap it."""
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -92,7 +97,7 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
     with tempfile.TemporaryDirectory(prefix="ku-install-check-") as temporary:
         working = Path(temporary).resolve()
         for name in ("hello.ku", "json.ku"):
-            source = read_bounded(repo / "examples" / name, 65536)
+            source = canonical_example(read_bounded(repo / "examples" / name, 65536))
             (working / name).write_bytes(source)
             receipt["examples"][name] = hashlib.sha256(source).hexdigest()
         for name, arguments in (("version", ["--version"]),

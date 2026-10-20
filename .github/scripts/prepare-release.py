@@ -263,7 +263,8 @@ def prepare_release(assets: Path, tag: str, commit: str, repo: Path) -> dict:
         manifest = json_object(data)
         validate_manifest(manifest, version, target, commit, name)
         for example, digest in manifest["installation_check"]["examples"].items():
-            if hashlib.sha256(read_file(repo / "examples" / example, 65536)).hexdigest() != digest:
+            source = EXPORTER.canonical_example(read_file(repo / "examples" / example, 65536))
+            if hashlib.sha256(source).hexdigest() != digest:
                 raise PrepareError("installation check examples differ from the release commit")
         checksums[manifest_name] = hashlib.sha256(data).hexdigest()
         with tempfile.TemporaryDirectory(prefix="ku-release-verify-") as temporary:

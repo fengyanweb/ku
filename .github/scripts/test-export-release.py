@@ -142,7 +142,7 @@ class ReleaseExportTests(unittest.TestCase):
 
     def test_installed_commands_validate_version_examples_and_normal_exit(self):
         for name in ("hello.ku", "json.ku"):
-            self.put(self.repo / "examples" / name, f"fixture {name}\n".encode())
+            self.put(self.repo / "examples" / name, f"fixture {name}\r\n".encode())
         value = {"name": "中文😀", "count": 7, "active": True, "absent": None,
                  "embedded_nul": "left\0right", "nested": {"numbers": [[1, 2], [3]]}}
         outputs = ["ku 0.0.17\n", "check ok: hello.ku\n", "Hello Ku\n",
@@ -150,8 +150,8 @@ class ReleaseExportTests(unittest.TestCase):
 
         def command(executable, arguments, working):
             self.assertEqual(executable, self.bundle / "ku")
-            self.assertTrue((working / "hello.ku").is_file())
-            self.assertTrue((working / "json.ku").is_file())
+            for name in ("hello.ku", "json.ku"):
+                self.assertEqual((working / name).read_bytes(), f"fixture {name}\n".encode())
             output = outputs.pop(0)
             return {"exit_code": 0, "stdout_bytes": len(output.encode()),
                     "stdout_sha256": hashlib.sha256(output.encode()).hexdigest(), "stderr_bytes": 0}, output
@@ -163,12 +163,21 @@ class ReleaseExportTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in receipt["checks"]],
                          ["version", "check-hello", "run-hello", "run-json"])
         self.assertEqual(run.call_count, 4)
+        self.assertEqual(receipt["examples"], {
+            name: hashlib.sha256(f"fixture {name}\n".encode()).hexdigest()
+            for name in ("hello.ku", "json.ku")})
         self.assertEqual(receipt["executable_sha256"], hashlib.sha256((self.bundle / "ku").read_bytes()).hexdigest())
         with mock.patch.object(EXPORT.platform, "system", return_value="Linux"), mock.patch.object(
                 EXPORT.platform, "machine", return_value="x86_64"), mock.patch.object(
                 EXPORT, "install_command", return_value=({}, "ku 0.0.16\n")):
             with self.assertRaisesRegex(EXPORT.ExportError, "version does not match"):
                 EXPORT.verify_installation(self.bundle, self.repo, "0.0.17", self.target)
+
+    def test_example_canonicalization_changes_only_crlf_and_requires_utf8(self):
+        source = "\ufeff中文😀\r\nkeep\rcontent  \n".encode("utf-8")
+        self.assertEqual(EXPORT.canonical_example(source), "\ufeff中文😀\nkeep\rcontent  \n".encode("utf-8"))
+        with self.assertRaises(UnicodeDecodeError):
+            EXPORT.canonical_example(b"invalid\xff\r\n")
 
     def test_install_command_reaps_normal_and_expired_processes(self):
         receipt, output = EXPORT.install_command(Path(sys.executable), ["-c", "print('installed')"], self.root)
