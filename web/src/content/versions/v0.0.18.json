@@ -1,0 +1,101 @@
+{
+  "sidebar": [
+    {
+      "label": "开始使用",
+      "translations": {
+        "de": "Hier beginnen",
+        "el": "Ξεκινήστε εδώ",
+        "en": "Start here",
+        "es": "Empieza aquí",
+        "fa": "شروع کار",
+        "fr": "Commencer ici",
+        "it": "Inizia qui",
+        "ja": "はじめに",
+        "ko": "시작하기",
+        "pl": "Zacznij tutaj",
+        "pt": "Comece aqui",
+        "ro": "Începe aici",
+        "ru": "Начните здесь",
+        "tr": "Buradan başlayın",
+        "zh-cn": "开始使用",
+        "zh-tw": "開始使用"
+      },
+      "items": [
+        {
+          "slug": "docs/install"
+        },
+        {
+          "slug": "docs/getting-started"
+        }
+      ]
+    },
+    {
+      "label": "语言与工具",
+      "translations": {
+        "de": "Sprache & Werkzeuge",
+        "el": "Γλώσσα και εργαλεία",
+        "en": "Language & tools",
+        "es": "Lenguaje y herramientas",
+        "fa": "زبان و ابزارها",
+        "fr": "Langage et outils",
+        "it": "Linguaggio e strumenti",
+        "ja": "言語とツール",
+        "ko": "언어 및 도구",
+        "pl": "Język i narzędzia",
+        "pt": "Linguagem e ferramentas",
+        "ro": "Limbaj și instrumente",
+        "ru": "Язык и инструменты",
+        "tr": "Dil ve araçlar",
+        "zh-cn": "语言与工具",
+        "zh-tw": "語言與工具"
+      },
+      "items": [
+        {
+          "slug": "docs/guide/language"
+        },
+        {
+          "slug": "docs/stdlib"
+        },
+        {
+          "slug": "docs/stdlib/json"
+        },
+        {
+          "slug": "docs/guide/errors"
+        }
+      ]
+    },
+    {
+      "label": "项目",
+      "translations": {
+        "de": "Projekt",
+        "el": "Έργο",
+        "en": "Project",
+        "es": "Proyecto",
+        "fa": "پروژه",
+        "fr": "Projet",
+        "it": "Progetto",
+        "ja": "プロジェクト",
+        "ko": "프로젝트",
+        "pl": "Projekt",
+        "pt": "Projeto",
+        "ro": "Proiect",
+        "ru": "Проект",
+        "tr": "Proje",
+        "zh-cn": "项目",
+        "zh-tw": "專案"
+      },
+      "items": [
+        {
+          "slug": "docs/support"
+        },
+        {
+          "slug": "releases"
+        },
+        {
+          "slug": "docs/project"
+        }
+      ]
+    }
+  ],
+  "excluded": []
+}

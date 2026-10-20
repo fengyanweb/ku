@@ -1,0 +1,101 @@
+{
+  "siteTitle": "Ku — Oluşmakta olan bir dil",
+  "siteDescription": "Deneysel programlama dili Ku ile tanışın. Gerçek örnekleri, kurulumu, dil kılavuzlarını ve arka uç desteğini keşfedin.",
+  "skip": "İçeriğe geç",
+  "home": "Ku ana sayfa",
+  "documentation": "Belgeler",
+  "languageGuide": "Dil kılavuzu",
+  "releases": "Sürüm notları",
+  "navigation": "Ana gezinme",
+  "search": "Ara",
+  "searchDocs": "Belgelerde ara",
+  "searchTitle": "Ku belgelerinde ara",
+  "searchPlaceholder": "JSON, json.encode, parse_error deneyin…",
+  "searchEmpty": "Aramak için yazın.",
+  "searching": "Aranıyor…",
+  "searchNoResults": "Sonuç yok. Başka bir sözcük deneyin.",
+  "searchUnavailable": "Arama derlenmiş önizlemede kullanılabilir. Belgeleri gezinme menüsüyle inceleyin.",
+  "theme": "Tema",
+  "language": "Dil",
+  "menu": "Menü",
+  "footer": "Alt bilgi",
+  "tagline": "Oluşmakta olan bir dil.",
+  "project": "Hakkında ve lisans",
+  "support": "Destek matrisi",
+  "reportIssue": "Sorun bildir",
+  "experimental": "Deneysel. Üretim için değil.",
+  "sourceAvailable": "Kaynak görüntülenebilir",
+  "development": "Experimental prerelease",
+  "heroTitle": ["Bir fikir.", "Biraz", "Ku."],
+  "heroDescription": "Büyüme alanı olan küçük bir dil. Okunabilir sözdizimi, açık sahiplik ve ilk satırdan keşfedebileceğiniz araçlar.",
+  "start": "Ku yazmaya başlayın",
+  "explore": "Dili keşfedin",
+  "heroNote": "Erken aşamada olması tasarımın bir parçası. Keşfedin, deneyin, geri bildirim paylaşın.",
+  "interpreter": "Yorumlayıcı",
+  "viewSource": "Kaynağı görüntüle",
+  "principle": "Küçük başlayın. Yaptığınızı anlayın.",
+  "approachTitle": ["Daha az karmaşıklık.", "Daha net bir görünüm."],
+  "approachDescription": "Güncel sınırları göz önünde tutarak Ku dilini gerçek davranışı üzerinden tanıyın.",
+  "features": [
+    [
+      "Okuyun. Anlayın.",
+      "İlk atamada bağ bildirin. Fikrinizi işlevler, yapılandırılmış değerler ve açık hata yönetimiyle ifade edin.",
+      "Dil kılavuzu",
+      "docs/guide/language"
+    ],
+    [
+      "Sahipliği açık kılın.",
+      "Varsayılan olarak taşıyın, bilinçli klonlayın ve eşzamanlı çağrılarda salt okunur ödünç alın. Güncel kurallar sınırlarıyla birlikte belgelenir.",
+      "Sahiplik ve sınırlar",
+      "docs/support"
+    ],
+    [
+      "Yürütme yolunuzu seçin.",
+      "Yorumlayıcıyla çalıştırın, yürütülebilir çalıştırıcı paketleyin veya yerel C yolunu keşfedin. Arka uç seçmeden önce destek matrisini inceleyin.",
+      "Araçları keşfedin",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Tanıdık veriler.", "Açık hatalar."],
+  "practiceDescription": "Bir modül içe aktarın, değer oluşturun ve JSON olarak kodlayın. ? işleci hataları gizlemek yerine iletir.",
+  "jsonReference": "JSON başvurusunu okuyun",
+  "exampleNote": "Eşzamanlı örnek. Arka uç ve sürüm ayrıntıları başvuruda belgelenir.",
+  "copy": "Kodu kopyala",
+  "copyExample": "JSON örneğini kopyala",
+  "copied": "Kopyalandı ✓",
+  "copyFallback": "Kopyalamak için kodu seçin",
+  "learnTitle": "Başlamak için iyi bir yer.",
+  "install": "Kurulum ve indirmeler",
+  "resources": [
+    [
+      "İlk Ku programınız",
+      "Kurun, çalıştırın ve sonucu görün.",
+      "docs/getting-started"
+    ],
+    [
+      "Dili öğrenin",
+      "Bağlar, işlevler, değerler ve hatalar.",
+      "docs/guide/language"
+    ],
+    ["Standart kütüphane", "Modülleri bulun ve JSON keşfedin.", "docs/stdlib"],
+    [
+      "Sınırları bilin",
+      "Platformlar, arka uçlar ve güncel sınırlar.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "Süren bir çalışma. İzlenecek bir hikâye.",
+  "projectDescription": "Bu belgeler v{releasedVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",
+  "github": "GitHub üzerinde keşfedin",
+  "license": "Kaynak görüntülenebilir. Açık kaynak lisansı verilmemiştir.",
+  "verified": "Doğrulandı",
+  "limitations": "Destek ve sınırlamalar",
+  "version": "Belge sürümü",
+  "next": "v0.0.18",
+  "snapshot": "{version} anlık görüntüsü",
+  "snapshotNotice": "Arşivlenmiş belge anlık görüntüsü. Güncel geliştirme belgelerinden bağımsız korunur; ikili sürüm duyurusu değildir.",
+  "nextNotice": "Bu belgeler v{currentVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",
+  "startGroup": "Buradan başlayın",
+  "toolsGroup": "Dil ve araçlar",
+  "projectGroup": "Proje"
+}

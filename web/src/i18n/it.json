@@ -1,0 +1,101 @@
+{
+  "siteTitle": "Ku — Un linguaggio in divenire",
+  "siteDescription": "Scopri Ku, un linguaggio di programmazione sperimentale. Esplora esempi reali, installazione, guide al linguaggio e supporto dei backend.",
+  "skip": "Vai al contenuto",
+  "home": "Pagina iniziale Ku",
+  "documentation": "Documentazione",
+  "languageGuide": "Guida al linguaggio",
+  "releases": "Note di versione",
+  "navigation": "Navigazione principale",
+  "search": "Cerca",
+  "searchDocs": "Cerca nella documentazione",
+  "searchTitle": "Cerca nella documentazione Ku",
+  "searchPlaceholder": "Prova JSON, json.encode, parse_error…",
+  "searchEmpty": "Scrivi per cercare.",
+  "searching": "Ricerca…",
+  "searchNoResults": "Nessun risultato. Prova un'altra parola chiave.",
+  "searchUnavailable": "La ricerca è disponibile nell'anteprima compilata. Usa la navigazione per consultare la documentazione.",
+  "theme": "Tema",
+  "language": "Lingua",
+  "menu": "Menu",
+  "footer": "Piè di pagina",
+  "tagline": "Un linguaggio in divenire.",
+  "project": "Progetto e licenza",
+  "support": "Matrice di supporto",
+  "reportIssue": "Segnala un problema",
+  "experimental": "Sperimentale. Non per la produzione.",
+  "sourceAvailable": "Sorgenti consultabili",
+  "development": "Experimental prerelease",
+  "heroTitle": ["Un'idea.", "Un po' di", "Ku."],
+  "heroDescription": "Un piccolo linguaggio con spazio per crescere. Sintassi leggibile, proprietà esplicita e una toolchain da esplorare fin dalla prima riga.",
+  "start": "Inizia a scrivere Ku",
+  "explore": "Esplora il linguaggio",
+  "heroNote": "Alle prime fasi, per scelta. Esplora, sperimenta, condividi il tuo riscontro.",
+  "interpreter": "Interprete",
+  "viewSource": "Vedi il sorgente",
+  "principle": "Inizia in piccolo. Comprendi ciò che costruisci.",
+  "approachTitle": ["Meno superficie.", "Più chiarezza."],
+  "approachDescription": "Conosci Ku attraverso il suo comportamento reale, tenendo sempre presenti i limiti attuali.",
+  "features": [
+    [
+      "Leggilo. Comprendilo.",
+      "Dichiara un binding alla prima assegnazione. Usa funzioni, valori strutturati e gestione esplicita degli errori per esprimere la tua idea.",
+      "Guida al linguaggio",
+      "docs/guide/language"
+    ],
+    [
+      "Rendi esplicita la proprietà.",
+      "Sposta per impostazione predefinita, clona con intenzione e prendi in prestito in sola lettura nelle chiamate sincrone. Le regole attuali sono documentate insieme ai loro limiti.",
+      "Proprietà e limiti",
+      "docs/support"
+    ],
+    [
+      "Scegli il percorso di esecuzione.",
+      "Esegui con l'interprete, impacchetta un runner eseguibile o esplora C nativo. Controlla la matrice di supporto prima di scegliere un backend.",
+      "Esplora gli strumenti",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Dati familiari.", "Errori espliciti."],
+  "practiceDescription": "Importa un modulo, crea un valore e codificalo come JSON. L'operatore ? propaga gli errori invece di nasconderli.",
+  "jsonReference": "Leggi il riferimento JSON",
+  "exampleNote": "Esempio sincrono. I dettagli di backend e versione sono nella documentazione.",
+  "copy": "Copia codice",
+  "copyExample": "Copia esempio JSON",
+  "copied": "Copiato ✓",
+  "copyFallback": "Seleziona il codice da copiare",
+  "learnTitle": "Un buon punto di partenza.",
+  "install": "Installazione e download",
+  "resources": [
+    [
+      "Il tuo primo programma Ku",
+      "Installa, esegui e osserva il risultato.",
+      "docs/getting-started"
+    ],
+    [
+      "Impara il linguaggio",
+      "Binding, funzioni, valori ed errori.",
+      "docs/guide/language"
+    ],
+    ["Libreria standard", "Trova moduli ed esplora JSON.", "docs/stdlib"],
+    [
+      "Conosci i limiti",
+      "Piattaforme, backend e limiti attuali.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "Un lavoro in corso. Una storia da seguire.",
+  "projectDescription": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{releasedVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",
+  "github": "Esplora su GitHub",
+  "license": "Il codice sorgente è consultabile. Non è stata concessa una licenza open source.",
+  "verified": "Verificato",
+  "limitations": "Supporto e limiti",
+  "version": "Versione della documentazione",
+  "next": "v0.0.18",
+  "snapshot": "Istantanea {version}",
+  "snapshotNotice": "Istantanea archiviata della documentazione. È conservata indipendentemente dalla documentazione di sviluppo attuale; non annuncia un rilascio di binari.",
+  "nextNotice": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{currentVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",
+  "startGroup": "Inizia qui",
+  "toolsGroup": "Linguaggio e strumenti",
+  "projectGroup": "Progetto"
+}

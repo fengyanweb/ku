@@ -1,0 +1,105 @@
+{
+  "siteTitle": "Ku — Un limbaj în devenire",
+  "siteDescription": "Descoperă Ku, un limbaj de programare experimental. Exemple reale, instalare, ghiduri de limbaj și suportul backendurilor.",
+  "skip": "Sari la conținut",
+  "home": "Acasă Ku",
+  "documentation": "Documentație",
+  "languageGuide": "Ghidul limbajului",
+  "releases": "Notele versiunilor",
+  "navigation": "Navigație principală",
+  "search": "Caută",
+  "searchDocs": "Caută în documentație",
+  "searchTitle": "Caută în documentația Ku",
+  "searchPlaceholder": "Încearcă JSON, json.encode, parse_error…",
+  "searchEmpty": "Tastează pentru a căuta.",
+  "searching": "Se caută…",
+  "searchNoResults": "Niciun rezultat. Încearcă alt cuvânt.",
+  "searchUnavailable": "Căutarea este disponibilă în previzualizarea compilată. Răsfoiește documentația folosind navigația.",
+  "theme": "Temă",
+  "language": "Limbă",
+  "menu": "Meniu",
+  "footer": "Subsol",
+  "tagline": "Un limbaj în devenire.",
+  "project": "Despre proiect și licență",
+  "support": "Matrice de suport",
+  "reportIssue": "Raportează o problemă",
+  "experimental": "Experimental. Nu pentru producție.",
+  "sourceAvailable": "Sursa poate fi consultată",
+  "development": "Experimental prerelease",
+  "heroTitle": ["O idee.", "Puțin", "Ku."],
+  "heroDescription": "Un limbaj mic cu loc pentru creștere. Sintaxă lizibilă, proprietate explicită și instrumente pe care le poți explora de la prima linie.",
+  "start": "Începe să scrii Ku",
+  "explore": "Explorează limbajul",
+  "heroNote": "O etapă timpurie, în mod intenționat. Explorează, experimentează, oferă feedback.",
+  "interpreter": "Interpretor",
+  "viewSource": "Vezi sursa",
+  "principle": "Începe simplu. Înțelege ce construiești.",
+  "approachTitle": ["Mai puțină complexitate.", "O imagine mai clară."],
+  "approachDescription": "Cunoaște Ku prin comportamentul real, având permanent în vedere limitele curente.",
+  "features": [
+    [
+      "Citește. Înțelege.",
+      "Declară o legare la prima atribuire. Folosește funcții, valori structurate și gestionarea explicită a erorilor pentru a-ți exprima ideea.",
+      "Ghidul limbajului",
+      "docs/guide/language"
+    ],
+    [
+      "Fă proprietatea explicită.",
+      "Mută implicit, clonează intenționat și împrumută doar pentru citire în apeluri sincrone. Regulile curente sunt documentate alături de limitele lor.",
+      "Proprietate și limite",
+      "docs/support"
+    ],
+    [
+      "Alege calea de execuție.",
+      "Rulează cu interpretorul, împachetează un lansator executabil sau explorează C nativ. Verifică matricea de suport înainte de a alege un backend.",
+      "Explorează instrumentele",
+      "docs/support"
+    ]
+  ],
+  "practiceTitle": ["Date familiare.", "Erori explicite."],
+  "practiceDescription": "Importă un modul, construiește o valoare și codific-o în JSON. Operatorul ? propagă erorile în loc să le ascundă.",
+  "jsonReference": "Citește referința JSON",
+  "exampleNote": "Exemplu sincron. Detaliile de backend și versiune sunt documentate în referință.",
+  "copy": "Copiază codul",
+  "copyExample": "Copiază exemplul JSON",
+  "copied": "Copiat ✓",
+  "copyFallback": "Selectează codul pentru copiere",
+  "learnTitle": "Un loc bun de început.",
+  "install": "Instalare și descărcări",
+  "resources": [
+    [
+      "Primul tău program Ku",
+      "Instalează, rulează și vezi rezultatul.",
+      "docs/getting-started"
+    ],
+    [
+      "Învață limbajul",
+      "Legări, funcții, valori și erori.",
+      "docs/guide/language"
+    ],
+    [
+      "Biblioteca standard",
+      "Găsește module și explorează JSON.",
+      "docs/stdlib"
+    ],
+    [
+      "Cunoaște limitele",
+      "Platforme, backenduri și limite curente.",
+      "docs/support"
+    ]
+  ],
+  "projectTitle": "O lucrare în curs. O poveste de urmărit.",
+  "projectDescription": "Documentația descrie domeniul fixat al prelansării experimentale v{releasedVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",
+  "github": "Explorează pe GitHub",
+  "license": "Sursa poate fi consultată. Nu a fost acordată o licență open source.",
+  "verified": "Verificat",
+  "limitations": "Suport și limite",
+  "version": "Versiunea documentației",
+  "next": "v0.0.18",
+  "snapshot": "Instantaneu {version}",
+  "snapshotNotice": "Instantaneu arhivat al documentației. Este păstrat independent de documentația curentă de dezvoltare; nu anunță o lansare binară.",
+  "nextNotice": "Documentația descrie domeniul fixat al prelansării experimentale v{currentVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",
+  "startGroup": "Începe aici",
+  "toolsGroup": "Limbaj și instrumente",
+  "projectGroup": "Proiect"
+}

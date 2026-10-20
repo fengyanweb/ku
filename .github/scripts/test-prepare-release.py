@@ -41,6 +41,9 @@ class PrepareReleaseTests(unittest.TestCase):
         self.repo.mkdir()
         self.assets.mkdir()
         (self.repo / "docs").mkdir()
+        (self.repo / "examples").mkdir()
+        for name in ("hello.ku", "json.ku"):
+            (self.repo / "examples" / name).write_bytes(f"fixture {name}\n".encode())
         (self.repo / "docs" / f"v{VERSION}.md").write_text("# Ku 0.0.17\n\n实验版本。\n", encoding="utf-8")
         (self.repo / "Cargo.toml").write_text(f'[package]\nname = "ku"\nversion = "{VERSION}"\n', encoding="utf-8")
         (self.repo / "Cargo.lock").write_text(f'[[package]]\nname = "ku"\nversion = "{VERSION}"\n', encoding="utf-8")
@@ -61,8 +64,9 @@ class PrepareReleaseTests(unittest.TestCase):
 
     def archive(self, target, release=None, extra=None):
         asset, manifest = self.paths(target)
+        executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
         payloads = {"RELEASE.json": encoded(release or {"version": VERSION, "target": target, "commit": COMMIT}),
-                    "ku": b"fake target data, not executed\n", "deps/libprobe.rlib": b"fake library"}
+                    executable: b"fake target data, not executed\n", "deps/libprobe.rlib": b"fake library"}
         if extra:
             payloads.update(extra)
         specs = {}
@@ -75,7 +79,15 @@ class PrepareReleaseTests(unittest.TestCase):
                                "sha256": hashlib.sha256(content).hexdigest()}
         manifest.write_bytes(encoded({"version": VERSION, "target": target, "commit": COMMIT,
                                       "asset": asset.name, "sha256": hashlib.sha256(asset.read_bytes()).hexdigest(),
-                                      "size": asset.stat().st_size, "files": specs}))
+                                      "size": asset.stat().st_size, "files": specs,
+                                      "installation_check": {
+                                          "format": "ku-install-check-v1", "version": VERSION,
+                                          "target": target, "executable_sha256": specs[executable]["sha256"],
+                                          "examples": {name: hashlib.sha256((self.repo / "examples" / name).read_bytes()).hexdigest()
+                                                       for name in ("hello.ku", "json.ku")},
+                                          "checks": [{"name": name, "exit_code": 0, "stdout_bytes": 1,
+                                                      "stdout_sha256": "f" * 64, "stderr_bytes": 0}
+                                                     for name in ("version", "check-hello", "run-hello", "run-json")]}}))
 
     def change_manifest(self, update):
         _, path = self.paths()
@@ -139,6 +151,21 @@ class PrepareReleaseTests(unittest.TestCase):
                            ("asset", "../other.tar.gz"), ("sha256", "0" * 64), ("size", 1)):
             with self.subTest(key=key):
                 self.change_manifest(lambda item: item.update({key: value}))
+                self.rejected()
+                self.archive(PREPARE.TARGETS[0])
+
+    def test_missing_failed_or_substituted_installation_check_is_rejected(self):
+        cases = (
+            lambda item: item.pop("installation_check"),
+            lambda item: item["installation_check"].update({"target": "wrong"}),
+            lambda item: item["installation_check"].update({"executable_sha256": "b" * 64}),
+            lambda item: item["installation_check"]["checks"].pop(),
+            lambda item: item["installation_check"]["checks"][0].update({"exit_code": 1}),
+            lambda item: item["installation_check"]["examples"].update({"json.ku": "a" * 64}),
+        )
+        for index, update in enumerate(cases):
+            with self.subTest(index=index):
+                self.change_manifest(update)
                 self.rejected()
                 self.archive(PREPARE.TARGETS[0])
 

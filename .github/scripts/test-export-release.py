@@ -118,6 +118,71 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertEqual(digest, hashlib.sha256((extracted / name).read_bytes()).hexdigest())
         self.assertIn("UNLICENSED", (extracted / "README-INSTALL.md").read_text(encoding="utf-8"))
 
+    def test_release_cli_requires_actual_archive_installation_check(self):
+        arguments = ["export-release.py", "--bundle", str(self.bundle), "--output", str(self.output),
+                     "--repo", str(self.repo), "--metadata", str(self.metadata),
+                     "--rust-sysroot", str(self.sysroot), "--version", "0.0.17",
+                     "--target", self.target, "--commit", "a" * 40]
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(
+                EXPORT, "export_release", return_value={}) as export, mock.patch("builtins.print"):
+            self.assertEqual(EXPORT.main(), 0)
+        self.assertIs(export.call_args.kwargs["verify_install"], True)
+
+    def test_installation_uses_verified_extracted_archive_and_records_receipt(self):
+        def verify(installed, repo, version, target):
+            self.assertNotEqual(installed, self.bundle)
+            self.assertEqual((installed / "ku").read_bytes(), (self.bundle / "ku").read_bytes())
+            self.assertTrue((installed / "SHA256SUMS").is_file())
+            return {"format": "test-receipt", "target": target}
+        with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check:
+            result = self.run_export(verify_install=True)
+        self.assertEqual(check.call_count, 1)
+        manifest = json.loads(Path(result["manifest_path"]).read_bytes())
+        self.assertEqual(manifest["installation_check"], {"format": "test-receipt", "target": self.target})
+
+    def test_installed_commands_validate_version_examples_and_normal_exit(self):
+        for name in ("hello.ku", "json.ku"):
+            self.put(self.repo / "examples" / name, f"fixture {name}\n".encode())
+        value = {"name": "中文😀", "count": 7, "active": True, "absent": None,
+                 "embedded_nul": "left\0right", "nested": {"numbers": [[1, 2], [3]]}}
+        outputs = ["ku 0.0.17\n", "check ok: hello.ku\n", "Hello Ku\n",
+                   json.dumps(value) + "\nroundtrip ok\njson/parse_error\nerror at byte 7\n"]
+
+        def command(executable, arguments, working):
+            self.assertEqual(executable, self.bundle / "ku")
+            self.assertTrue((working / "hello.ku").is_file())
+            self.assertTrue((working / "json.ku").is_file())
+            output = outputs.pop(0)
+            return {"exit_code": 0, "stdout_bytes": len(output.encode()),
+                    "stdout_sha256": hashlib.sha256(output.encode()).hexdigest(), "stderr_bytes": 0}, output
+
+        with mock.patch.object(EXPORT.platform, "system", return_value="Linux"), mock.patch.object(
+                EXPORT.platform, "machine", return_value="x86_64"), mock.patch.object(
+                EXPORT, "install_command", side_effect=command) as run:
+            receipt = EXPORT.verify_installation(self.bundle, self.repo, "0.0.17", self.target)
+        self.assertEqual([row["name"] for row in receipt["checks"]],
+                         ["version", "check-hello", "run-hello", "run-json"])
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(receipt["executable_sha256"], hashlib.sha256((self.bundle / "ku").read_bytes()).hexdigest())
+        with mock.patch.object(EXPORT.platform, "system", return_value="Linux"), mock.patch.object(
+                EXPORT.platform, "machine", return_value="x86_64"), mock.patch.object(
+                EXPORT, "install_command", return_value=({}, "ku 0.0.16\n")):
+            with self.assertRaisesRegex(EXPORT.ExportError, "version does not match"):
+                EXPORT.verify_installation(self.bundle, self.repo, "0.0.17", self.target)
+
+    def test_install_command_reaps_normal_and_expired_processes(self):
+        receipt, output = EXPORT.install_command(Path(sys.executable), ["-c", "print('installed')"], self.root)
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual(output, "installed\n")
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(EXPORT.subprocess, "Popen", return_value=process), mock.patch.object(
+                EXPORT.time, "monotonic", side_effect=(0, 31)):
+            with self.assertRaisesRegex(EXPORT.ExportError, "exceeded 30 seconds"):
+                EXPORT.install_command(self.bundle / "ku", ["run", "hello.ku"], self.root)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10)
+
     def test_windows_bundle_and_asset_names(self):
         (self.bundle / "ku").rename(self.bundle / "ku.exe")
         previous = self.bundle / f"native-tls/v1/{self.target}"

@@ -1,0 +1,35 @@
+{
+  "name": "ku-website",
+  "version": "0.0.18",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "scripts": {
+    "postinstall": "node scripts/patch-versioning.mjs",
+    "dev": "astro dev --host 127.0.0.1",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "check": "astro check",
+    "build": "astro build",
+    "build:production": "node scripts/require-production.mjs && astro build",
+    "preview": "node scripts/preview.mjs"
+  },
+  "dependencies": {
+    "@astrojs/markdown-remark": "7.3.3",
+    "@astrojs/sitemap": "3.7.4",
+    "@astrojs/starlight": "0.42.6",
+    "astro": "7.4.0",
+    "starlight-versions": "0.10.1"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.10",
+    "prettier": "3.9.10",
+    "prettier-plugin-astro": "1.1.1",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "postcss-selector-parser": "7.1.6"
+  }
+}

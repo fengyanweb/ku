@@ -1,0 +1,84 @@
+---
+title: 'Başlangıç'
+description: 'Hello Ku yazın, kaynak kodunuzu denetleyin ve yorumlama ile derlemeyi ayırt edin.'
+kuVersion: '0.0.18 / experimental prerelease'
+verifiedAt: '2026-10-20'
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+---
+
+Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu sayfa v0.0.17 içinde zaten bulunan temel sözdizimini ve CLI komutlarını kullanır. Önce [Ku kurulumunu](/tr/docs/install/) yapın ve `ku --version` komutunun çalıştığını doğrulayın.
+
+## İlk programınızı yazın
+
+Depodaki `examples/hello.ku` ile aynı içeriğe sahip `hello.ku` dosyasını oluşturun:
+
+```ku
+fn main() {
+    println("Hello Ku")
+}
+```
+
+`fn main()` giriş noktasıdır. `println` bir satır metin yazar. Ku, `let` veya `let mut` kullanmaz.
+
+## Denetleyin ve çalıştırın
+
+Dosyanın bulunduğu dizinde:
+
+```sh
+ku check hello.ku
+ku run hello.ku
+```
+
+`check`, programı çalıştırmadan sözcüksel, sözdizimsel ve temel anlamsal hataları denetler. Çalıştırıldığında beklenen standart çıktı:
+
+```text
+Hello Ku
+```
+
+Ku `PATH` içinde değilse yürütülebilir dosyayı tam kurulum yoluyla çağırın. Windows yürütülebilir dosyası `ku.exe` adındadır.
+
+## Değişkenler ve işlevler
+
+Bu temel sözdizimi parçası `main` içine yerleştirilebilir:
+
+```ku
+name = "Ku"
+count:int = 3
+println(name)
+println(count)
+```
+
+İlk atama değişkeni bildirir. Açık tür belirtimi `name:type = value` biçimindedir. `print` otomatik satır sonu olmadan yazar; `println` satır sonu ekler.
+
+## Yürütülebilir dosya oluşturun
+
+Kurulum sayfası gerekli derleme araçlarını listeler. Varsayılan arka uç için:
+
+```sh
+ku build hello.ku
+```
+
+Varsayılan arka uç bir yorumlayıcı çalıştırıcısını paketler. C üzerinden yerel derleme ayrı bir C derleyicisi gerektirir:
+
+```sh
+ku build --backend c hello.ku
+```
+
+Varsayılan çıktı `.ku/build/<profile>/` altındadır; CLI tarafından bildirilen tam yolu kullanın. İki arka uç farklı özellikleri kapsar. `ku check` başarısı yerel derlemenin başarılı olacağını kanıtlamaz.
+
+Not: `ku build --native hello.ku` komutu **`-o` olmadan yalnızca C kaynak kodu üretir**, bağlama yapmaz. İlk derlenmiş programınız için yukarıdaki `--backend c` komutunu kullanın.
+
+## Proje oluşturun
+
+Paket dizini gerektiğinde yerleşik bir şablon kullanın:
+
+```sh
+ku create HelloWorld --template basic
+cd HelloWorld
+ku check
+ku run
+```
+
+Paketin giriş noktası `ku.mod` içinde yapılandırılır. `ku create --list` kullanılabilir şablonları listeler. Şu anda `ku test` veya `ku fmt` komutları yoktur.
+
+[Dil kılavuzu](/tr/docs/guide/language/), [sorun giderme](/tr/docs/guide/errors/) ve [arka uç desteği](/tr/docs/support/) ile devam edin. Buradaki çıktılar beklenen örneklerdir ve platformunuzdaki kurulum doğrulamasının yerini tutmaz.

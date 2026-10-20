@@ -1,0 +1,66 @@
+{
+  "de": {
+    "notice": "Beim ersten Besuch wird anhand der IP-Region vereinfachtes Chinesisch oder Englisch ausgewählt. Die manuelle Auswahl einer dieser beiden Sprachen wird in diesem Browser gespeichert.",
+    "fallback": "Diese Seite ist noch nicht in der ausgewählten Sprache verfügbar. Sie wurden zur Startseite dieser Sprache weitergeleitet."
+  },
+  "el": {
+    "notice": "Στην πρώτη επίσκεψη επιλέγονται απλοποιημένα κινεζικά ή αγγλικά βάσει της περιοχής της διεύθυνσης IP. Η χειροκίνητη επιλογή μίας από αυτές τις δύο γλώσσες αποθηκεύεται σε αυτόν τον φυλλομετρητή.",
+    "fallback": "Αυτή η σελίδα δεν έχει ακόμη μετάφραση στην επιλεγμένη γλώσσα. Έγινε επιστροφή στην αρχική σελίδα αυτής της γλώσσας."
+  },
+  "en": {
+    "notice": "Your first visit uses your IP region to choose Simplified Chinese or English. Manual choices of these two languages are saved in this browser.",
+    "fallback": "This page is not yet translated into your selected language. You have been returned to that language’s home page."
+  },
+  "es": {
+    "notice": "En la primera visita se elige chino simplificado o inglés según la región de la IP. La elección manual de uno de estos dos idiomas se guarda en este navegador.",
+    "fallback": "Esta página aún no está traducida al idioma seleccionado. Se ha vuelto a la página de inicio de ese idioma."
+  },
+  "fa": {
+    "notice": "در نخستین بازدید، بر اساس منطقهٔ نشانی IP، چینی ساده‌شده یا انگلیسی انتخاب می‌شود. انتخاب دستی یکی از این دو زبان در همین مرورگر ذخیره می‌شود.",
+    "fallback": "این صفحه هنوز به زبان انتخاب‌شده ترجمه نشده است. به صفحهٔ اصلی آن زبان بازگشته‌اید."
+  },
+  "fr": {
+    "notice": "Lors de la première visite, le chinois simplifié ou l’anglais est choisi selon la région de l’adresse IP. Le choix manuel de l’une de ces deux langues est enregistré dans ce navigateur.",
+    "fallback": "Cette page n’est pas encore traduite dans la langue sélectionnée. Vous avez été redirigé vers la page d’accueil de cette langue."
+  },
+  "it": {
+    "notice": "Alla prima visita viene scelto il cinese semplificato o l’inglese in base alla regione dell’indirizzo IP. La scelta manuale di una di queste due lingue viene salvata in questo browser.",
+    "fallback": "Questa pagina non è ancora tradotta nella lingua selezionata. Sei stato reindirizzato alla pagina iniziale di quella lingua."
+  },
+  "ja": {
+    "notice": "初回アクセスでは IP アドレスの地域に応じて簡体字中国語または英語を表示します。この 2 言語を手動で選択した場合は、その設定をこのブラウザーに保存します。",
+    "fallback": "このページには、選択した言語の翻訳がまだありません。その言語のホームページに戻りました。"
+  },
+  "ko": {
+    "notice": "첫 방문 시 IP 주소의 지역에 따라 중국어 간체 또는 영어를 선택합니다. 이 두 언어 중 하나를 직접 선택하면 해당 선택을 이 브라우저에 저장합니다.",
+    "fallback": "이 페이지에는 아직 선택한 언어의 번역이 없습니다. 해당 언어의 홈페이지로 돌아왔습니다."
+  },
+  "pl": {
+    "notice": "Podczas pierwszej wizyty region adresu IP decyduje o wyborze chińskiego uproszczonego lub angielskiego. Ręczny wybór jednego z tych dwóch języków jest zapisywany w tej przeglądarce.",
+    "fallback": "Ta strona nie została jeszcze przetłumaczona na wybrany język. Nastąpił powrót na stronę główną w tym języku."
+  },
+  "pt": {
+    "notice": "Na primeira visita, o idioma é definido como chinês simplificado ou inglês conforme a região do IP. A escolha manual de um desses dois idiomas é salva neste navegador.",
+    "fallback": "Esta página ainda não foi traduzida para o idioma selecionado. Você voltou à página inicial desse idioma."
+  },
+  "ro": {
+    "notice": "La prima vizită se alege chineza simplificată sau engleza în funcție de regiunea adresei IP. Alegerea manuală a uneia dintre aceste două limbi este salvată în acest browser.",
+    "fallback": "Această pagină nu este încă tradusă în limba selectată. Ai revenit la pagina principală în acea limbă."
+  },
+  "ru": {
+    "notice": "При первом посещении упрощённый китайский или английский выбирается по региону IP-адреса. Ручной выбор одного из этих двух языков сохраняется в этом браузере.",
+    "fallback": "Эта страница ещё не переведена на выбранный язык. Выполнен переход на главную страницу на этом языке."
+  },
+  "tr": {
+    "notice": "İlk ziyarette IP adresinin bölgesine göre Basitleştirilmiş Çince veya İngilizce seçilir. Bu iki dilden birini elle seçtiğinizde tercihiniz bu tarayıcıya kaydedilir.",
+    "fallback": "Bu sayfa henüz seçtiğiniz dile çevrilmemiş. O dilin ana sayfasına döndünüz."
+  },
+  "zh-cn": {
+    "notice": "首次访问按 IP 所属地区选择简体中文或英文；手动选择这两种语言的偏好保存在本浏览器中。",
+    "fallback": "此页面尚无所选语言译文，已返回该语言首页。"
+  },
+  "zh-tw": {
+    "notice": "首次造訪時依 IP 所屬地區選擇簡體中文或英文；手動選擇這兩種語言的偏好會儲存在此瀏覽器中。",
+    "fallback": "此頁面尚無所選語言的譯文，已返回該語言的首頁。"
+  }
+}

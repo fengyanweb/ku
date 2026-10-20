@@ -1,0 +1,77 @@
+---
+title: 'نصب و دریافت'
+description: 'دریافت پیش‌انتشار آزمایشی Ku 0.0.18 و آشنایی با نیازمندی‌های پلتفرم و ساخت.'
+kuVersion: '0.0.18 / experimental prerelease'
+verifiedAt: '2026-10-20'
+sources:
+  [
+    'Cargo.toml',
+    'docs/v0.0.18.md',
+    'docs/history.md',
+    '.github/scripts/export-release.py',
+  ]
+---
+
+> اطلاعات تازهٔ v0.0.18 در ادامه فعلاً به انگلیسی آمده است؛ بقیهٔ ترجمه حفظ می‌شود. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+
+This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+
+## انتخاب پلتفرم
+
+Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+
+| سیستم   | معماری                | بایگانی                                      |
+| ------- | --------------------- | -------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
+| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
+| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+
+بایگانی پلتفرم‌های دیگر بررسی نشده است. پشتیبانی از کامپایل متقابل به معنای انتشار بسته برای تمام سیستم‌عامل‌ها و معماری‌ها نیست.
+
+## استخراج و بررسی
+
+1. بایگانی را با `SHA256SUMS` انتشار تطبیق دهید. فایل جداگانهٔ `.manifest.json` یکپارچگی بایگانی و فایل‌ها را توصیف می‌کند. چک‌سام‌ها برای بررسی یکپارچگی‌اند و امضای ناشر نیستند.
+2. **تمام بایگانی** را در پوشه‌ای خالی استخراج کرده و `README-INSTALL.md` را بخوانید. چیدمان نسبی `ku`، ‏`libku.rlib`، ‏`deps/` و `native-tls/` را حفظ کنید.
+3. نسخه را از همان پوشه بررسی کنید. در macOS / Linux:
+
+```sh
+./ku --version
+```
+
+در Windows PowerShell:
+
+```powershell
+.\ku.exe --version
+```
+
+نسخهٔ گزارش‌شده باید `0.0.18` باشد. در صورت نیاز پوشه را به `PATH` اضافه کنید و سپس `ku --version` را اجرا کنید. برای یکپارچگی با VS Code، فایل همراه `ku-language-0.0.18.vsix` را نصب کنید.
+
+## نیازمندی‌های اجرا و ساخت
+
+| عملیات                                  | نیازمندی‌های اضافی                                                                     |
+| --------------------------------------- | -------------------------------------------------------------------------------------- |
+| `ku run hello.ku` / `ku check hello.ku` | Ku CLI متناسب با پلتفرم                                                                |
+| دستور پیش‌فرض `ku build hello.ku`       | Rust **1.89.0** برای مقصد و پیونددهندهٔ سیستم؛ وابستگی‌های Rust همراه بسته را حفظ کنید |
+| `ku build --backend c hello.ku`         | کامپایلر C و پیونددهندهٔ سالم برای مقصد                                                |
+| برنامهٔ بومی پایگاه داده                | کتابخانه‌های پویای خارجیِ سازگارِ کارخواه پایگاه داده؛ در بسته نیستند                  |
+
+اجراکنندهٔ پیش‌فرض فقط کد ورودی را در خود جای می‌دهد. ماژول‌های واردشده همچنان از محل اصلی بارگذاری می‌شوند. استقرار کل گراف واردسازی محلی بدون وابستگی به کد منبع، به کامپایل C بومی نیاز دارد و همچنان تابع [محدودیت‌های پشتیبانی از مسیرهای اجرا](/fa/docs/support/) است.
+
+## آزمایش کد توسعه
+
+در نسخهٔ محلی دریافت‌شده از مخزن:
+
+```sh
+cargo +1.89.0 run --locked --release -- --version
+cargo +1.89.0 run --locked --release -- run examples/hello.ku
+```
+
+The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+
+## حذف نصب
+
+برای نصب از بایگانی، پوشهٔ استخراج‌شده را حذف کنید، ورودی اضافه‌شده به `PATH` را برگردانید و افزونهٔ VS Code را حذف کنید. ابتدا کدها و تنظیماتی را که در آن پوشه ساخته‌اید نگه دارید. نصب‌کنندهٔ جداگانهٔ یک‌کلیکی، نصب از مدیر بسته یا فرمان `ku uninstall` بررسی نشده‌اند.
+
+گام بعدی: [اجرای اولین برنامه](/fa/docs/getting-started/). منبع قرارداد نصب: [بایگانی‌های انتشار](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+
+`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/fa/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.

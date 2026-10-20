@@ -1,14 +1,14 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.17`，新增同步 `&` 只读借用参数，并推进 Ku 自举 Parser 的有界 `while` 切片。Ku 仍处于实验阶段，0.0.x 会主动删除重复 API，目前不可用于生产。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.18`，交付已验证的解释器修复、有限 native Task、HTTP 连接复用、JSON 浮点往返修复和显式 `ku supervise` 进程资源限制。Ku 仍处于实验阶段，0.0.x 会主动删除重复 API，目前不可用于生产。
 
-源码公开可查看，但目前未授予开源许可证；编辑器扩展也保持 `UNLICENSED`。本次发布不新增或变更许可。0.0.17 的实际验证状态和未完成边界见 [版本记录](docs/v0.0.17.md)。
+源码公开可查看，但目前未授予开源许可证；编辑器扩展也保持 `UNLICENSED`。本次发布不新增或变更许可。0.0.18 的冻结范围、安装方式和未完成边界见 [版本记录](docs/v0.0.18.md) 及 [已知问题](docs/v0.0.18-known-issues.md)。
 
 > **0.0.16 数据库驱动均为 native-only（`ku build --native`），解释器 `ku run` 暂不支持连库。** 旧驱动底层曾分别通过 PostgreSQL / Redis / MySQL 实库验证；本次统一 client 与 MySQL `MYSQL_STMT` 路径必须以新的自动化和实库验收结果为准，不能沿用旧结果冒充新 API 已验证。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
 
 第一层协议的真实完成度、生产部署边界和通用 TLS 落地顺序见 [协议地基状态](docs/protocol-foundation.md)。
 
-规范性规则从 [语义合同](docs/semantics.md) 和 [语法合同](docs/syntax.md) 进入；后端覆盖和测试证据不等于语言规则。[v0.0.18 实施记录](docs/v0.0.18-worklog.md) 是未完成工作，不是已发布能力。
+规范性规则从 [语义合同](docs/semantics.md) 和 [语法合同](docs/syntax.md) 进入；后端覆盖和测试证据不等于语言规则。[v0.0.18 实施记录](docs/v0.0.18-worklog.md) 保留历史过程；本版交付范围以 [冻结清单](docs/v0.0.18.md#冻结范围与原任务清单) 为准，未完成项没有被改写为完成。
 
 ## 快速开始
 
@@ -165,7 +165,15 @@ null
 
 Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `name:type = value`。
 
-## 0.0.17 新增
+## 0.0.18 新增与发布边界
+
+- 保留 JSON 旧实现，提供 `json.encode` / `json.decode` 兼容入口；修复大浮点 JSON 编码后无法再解码的问题。
+- 交付已验证的有限 native Task、timer、blocking 文件/目录与局部 TCP 路径，以及关闭并发修复；完整 M:N 和通用网络调度移至后续版本。
+- HTTP 支持连接复用及有界缓冲，修复诊断输出阻塞处理线程的问题。历史存在 504；本轮短测未复现，根因未确认，正式 30 分钟验收尚未通过，作为本版已知问题保留。
+- `ku supervise` 在 Linux 的已委托 cgroup v2（memory、pids、cgroup.kill 等条件）或 Windows Job Object 中运行完整程序 worker；Windows 限制提交内存，macOS 原生明确拒绝该模式。协调器自身无 OS 内存硬限制，单 Task 堆未精确计量，不宣称整个系统内存绝对封顶。
+- 三平台安装包、校验、安装步骤和后移任务见 [0.0.18 版本记录](docs/v0.0.18.md)。Ku 仍为实验版本；不把未通过的长期负载验收写成通过。
+
+## 0.0.17 历史记录
 
 - 同步函数用 `&name: T` 声明只读借用，调用仍写 `inspect(value)`；普通 owned 参数继续默认 move，需要独立值时显式 `.clone()`。函数类型用 `fn(&T): R`，不引入普通 `&T` 引用类型或调用处 `&`。
 - 借用模式贯穿 Rust 前端、checker、解释器、IR verifier 和 C ABI；新增临时释放、同调用冲突、源码删除后运行及分配账本测试。首版不支持 async borrowed 参数、borrowed `for` 或带 owned payload binding 的 borrowed match。
@@ -327,6 +335,7 @@ http_pg_frontend.html # http_pg 的前端页面
 - [语法文档](docs/syntax.md)
 - [自举状态与 bootstrap 路线](docs/self-hosting.md)
 - [并发模型与 HTTP 千万请求压测 demo](docs/concurrency.md)
+- [0.0.18 版本记录](docs/v0.0.18.md)
 - [0.0.17 版本记录](docs/v0.0.17.md)
 - [0.0.16 版本记录](docs/v0.0.16.md)
 - [0.0.15 版本记录](docs/v0.0.15.md)
@@ -459,17 +468,17 @@ Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
 Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`；成员补全会识别 `http.` / `fs.` / `json.` 等上下文，只插入成员名，避免 `http.http.server`。
 ```
 
-安装包以 [GitHub Releases](https://github.com/fengyanweb/ku/releases) 中实际发布的 `ku-v0.0.17-<Rust triple>.tar.gz` 为准；选择匹配操作系统/CPU 的 bundle，解压后使用其中的 `ku-language-0.0.17.vsix`。安装说明、`RELEASE.json`、逐文件 hash 与第三方 notices 随资产提供；bundle 不包含 `ku-registry` 服务端。不要把 CI 的 `native_ci-*` 验收样例当作 Ku CLI。尚未列出的 target 不表示已经发布或通过验收。
+安装包以 [GitHub Releases](https://github.com/fengyanweb/ku/releases) 中实际发布的 `ku-v0.0.18-<Rust triple>.tar.gz` 为准；选择匹配操作系统/CPU 的 bundle，解压后使用其中的 `ku-language-0.0.18.vsix`。安装说明、`RELEASE.json`、逐文件 hash 与第三方 notices 随资产提供；bundle 不包含 `ku-registry` 服务端。不要把 CI 的 `native_ci-*` 验收样例当作 Ku CLI。尚未列出的 target 不表示已经发布或通过验收。
 
-图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择解压后的 `ku-language-0.0.17.vsix`。
+图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择解压后的 `ku-language-0.0.18.vsix`。
 
 在 bundle 解压目录中安装：
 
 ```powershell
-code --install-extension .\ku-language-0.0.17.vsix --force
+code --install-extension .\ku-language-0.0.18.vsix --force
 ```
 
-从源码重打 VSIX 时，在 `editors/vscode-ku` 执行 `npm ci --ignore-scripts`、`npm test`，再执行 `npx --no-install vsce package --out ku-language-0.0.17.vsix`；只使用 lockfile 中固定的 vsce，不从网络临时解析浮动版本。生成的二进制和 VSIX 是发布资产，不是版本号已更新就自动完成的产物。
+从源码重打 VSIX 时，在 `editors/vscode-ku` 执行 `npm ci --ignore-scripts`、`npm test`，再执行 `npx --no-install vsce package --out ku-language-0.0.18.vsix`；只使用 lockfile 中固定的 vsce，不从网络临时解析浮动版本。生成的二进制和 VSIX 是发布资产，不是版本号已更新就自动完成的产物。
 
 ## 开发验证
 

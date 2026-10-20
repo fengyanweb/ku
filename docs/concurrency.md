@@ -1,5 +1,8 @@
 # Ku 并发与 HTTP 压测
 
+> v0.0.18 按 [冻结清单](v0.0.18.md#冻结范围与原任务清单) 交付已实现子集；完整 M:N、通用网络调度和未接入组合仍未完成。历史 HTTP 504 和正式 30 分钟未通过状态见 [已知问题](v0.0.18-known-issues.md)。
+
+
 Ku 的用户级并发模型保持简单：业务代码通过 `async fn` 启动一次性 task，然后用 `await task` 或 `await task?` 等待结果。用户不能手动 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`。
 
 ## task 规则

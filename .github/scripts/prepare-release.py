@@ -145,7 +145,7 @@ def inventory(assets: Path, expected: set[str]) -> dict:
 
 
 def validate_manifest(manifest: dict, version: str, target: str, commit: str, asset: str):
-    required = {"version", "target", "commit", "asset", "sha256", "size", "files"}
+    required = {"version", "target", "commit", "asset", "sha256", "size", "files", "installation_check"}
     optional = {"format", "rust_toolchain", "status", "ku_license"}
     if not required.issubset(manifest) or set(manifest) - required - optional:
         raise PrepareError("manifest field set is invalid")
@@ -173,6 +173,33 @@ def validate_manifest(manifest: dict, version: str, target: str, commit: str, as
         total += spec["size"]
         if total > MAX_BYTES:
             raise PrepareError("manifest expanded size exceeds 1 GiB")
+    check = manifest["installation_check"]
+    if (not isinstance(check, dict) or set(check) != {
+            "format", "version", "target", "executable_sha256", "checks", "examples"}
+            or check["format"] != "ku-install-check-v1" or check["version"] != version
+            or check["target"] != target):
+        raise PrepareError("manifest installation check identity is invalid")
+    executable = "ku.exe" if target.endswith("windows-msvc") else "ku"
+    if (executable not in files
+            or check["executable_sha256"] != files[executable]["sha256"]):
+        raise PrepareError("manifest installation check does not match its Ku executable")
+    examples = check["examples"]
+    if (not isinstance(examples, dict) or set(examples) != {"hello.ku", "json.ku"}
+            or any(not isinstance(value, str) or not SHA256.fullmatch(value)
+                   for value in examples.values())):
+        raise PrepareError("manifest installation example checksums are invalid")
+    checks = check["checks"]
+    names = ["version", "check-hello", "run-hello", "run-json"]
+    if not isinstance(checks, list) or len(checks) != len(names):
+        raise PrepareError("manifest installation checks are incomplete")
+    for row, name in zip(checks, names):
+        if (not isinstance(row, dict) or set(row) != {
+                "name", "exit_code", "stdout_bytes", "stdout_sha256", "stderr_bytes"}
+                or row["name"] != name or type(row["exit_code"]) is not int or row["exit_code"] != 0
+                or type(row["stderr_bytes"]) is not int or row["stderr_bytes"] != 0
+                or type(row["stdout_bytes"]) is not int or not 0 < row["stdout_bytes"] <= 65536
+                or not isinstance(row["stdout_sha256"], str) or not SHA256.fullmatch(row["stdout_sha256"])):
+            raise PrepareError("manifest installation command did not pass")
 
 
 def copy_verified(archive: Path, snapshot: Path, expected: dict, original: tuple):
@@ -235,6 +262,9 @@ def prepare_release(assets: Path, tag: str, commit: str, repo: Path) -> dict:
         data = read_file(assets / manifest_name, MAX_JSON)
         manifest = json_object(data)
         validate_manifest(manifest, version, target, commit, name)
+        for example, digest in manifest["installation_check"]["examples"].items():
+            if hashlib.sha256(read_file(repo / "examples" / example, 65536)).hexdigest() != digest:
+                raise PrepareError("installation check examples differ from the release commit")
         checksums[manifest_name] = hashlib.sha256(data).hexdigest()
         with tempfile.TemporaryDirectory(prefix="ku-release-verify-") as temporary:
             # macOS's system temp root may itself be reached via /var -> /private/var.
