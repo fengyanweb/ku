@@ -500,6 +500,7 @@ jobs:
                         and os.access(path, os.X_OK)]
           if len(candidates) != 1:
               raise SystemExit(f'Expected one current native_task_adapter_test executable, got {candidates}')
+          subprocess.run([sys.executable, '-B', 'tests/acceptance/test_runtime_matrix.py'], check=True)
           subprocess.run([sys.executable, '-B', 'tests/acceptance/runtime_matrix.py',
                           '--ku', str(Path('target/release/ku'+suffix).resolve()),
                           '--profile', 'release', '--loops', '1', '2', '4', '--blocking-regression', str(candidates[0].resolve()),
