@@ -119,13 +119,13 @@ int main(void) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            if value == "2048" {
-                "database process budget closed loop\n"
-            } else {
-                "invalid database budget rejected\n"
-            }
-        );
+        let message = if value == "2048" {
+            "database process budget closed loop"
+        } else {
+            "invalid database budget rejected"
+        };
+        // The C harness retains the platform's default stdout text mode.
+        let ending = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert_eq!(output.stdout, format!("{message}{ending}").as_bytes());
     }
 }

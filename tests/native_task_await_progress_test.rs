@@ -222,7 +222,7 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
             false,
         ),
         (
-            "async fn main(): null! { index = 0 while (index < 4) { index = index + 1 } return ok(null) }",
+            "async fn main(): null! { index = 0 while (index < 100000) { index = index + 1 } return ok(null) }",
             "native-source-while-copy-cancel",
             true,
         ),
@@ -248,7 +248,7 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
                     .all(|op| !matches!(op, TaskOp::Start { .. }))
         }));
         let plan = verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
-        let counter_check = if has_counter {
+        let (counter_progress, counter_check) = if has_counter {
             let index = task.states[task.entry.0]
                 .operations
                 .iter()
@@ -258,10 +258,21 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
                 })
                 .expect("source counter binding");
             assert!(plan.functions[0].slots.contains(&index));
-            // A body scope drain and its Suspend latch have both returned.
-            format!("CHECK(fixture_parent->frame.s_{} == 1);", index.0)
+            // Source loops now share a finite state-dispatch quantum. Observe
+            // progress at actual poll returns without requiring every loop
+            // latch or empty scope to yield a separate poll.
+            (
+                format!(
+                    "CHECK(fixture_parent->frame.s_{0} > fixture_last_counter && fixture_parent->frame.s_{0} < 100000); fixture_last_counter=fixture_parent->frame.s_{0};",
+                    index.0
+                ),
+                format!(
+                    "CHECK(fixture_parent->frame.s_{} == fixture_last_counter);",
+                    index.0
+                ),
+            )
         } else {
-            String::new()
+            (String::new(), String::new())
         };
         let mut generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
         let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{}\n{}\nstatic void fixture_source_resume(void*);\nstatic void fixture_source_poll_returned(void*,uint32_t);\n",
@@ -293,7 +304,11 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
             "static int fixture_original_main(void) {",
         );
         assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
-        generated.push_str(&SOURCE_WHILE_MAIN.replace("@COUNTER_CHECK@", &counter_check));
+        generated.push_str(
+            &SOURCE_WHILE_MAIN
+                .replace("@COUNTER_PROGRESS@", &counter_progress)
+                .replace("@COUNTER_CHECK@", &counter_check),
+        );
         run_generated(
             generated,
             label,
@@ -305,6 +320,7 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
 const SOURCE_WHILE_MAIN: &str = r#"
 static KuTestEvent fixture_two_polls,fixture_release;
 static unsigned fixture_resumes,fixture_returned_polls;
+static int64_t fixture_last_counter;
 static KuTaskInstance_0* fixture_parent;
 static void fixture_source_resume(void* raw) {
   if (!fixture_parent) fixture_parent=(KuTaskInstance_0*)raw;
@@ -313,6 +329,7 @@ static void fixture_source_resume(void* raw) {
 static void fixture_source_poll_returned(void* raw,uint32_t outcome) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)raw;
   fixture_returned_polls++;
+  if (fixture_returned_polls<=2u) { @COUNTER_PROGRESS@ }
   if (fixture_returned_polls==2u) {
     CHECK(outcome==KU_TASK_CONTROL_PENDING && fixture_resumes==2u);
     KuTaskDriverSnapshotV1 snapshot={0};

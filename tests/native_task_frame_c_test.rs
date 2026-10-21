@@ -297,6 +297,7 @@ fn native_task_frame_emission_preserves_sync_output_and_fail_closed_cli_boundary
         "ku_task_driver_",
         "ku_task_control_",
         "ku_task_frame_",
+        "ku_runtime_loop_count",
     ] {
         assert!(!synchronous.contains(internal), "unexpected {internal}");
     }

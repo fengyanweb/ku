@@ -175,7 +175,10 @@ def request(service, path, expected, results, persistence):
                     None if category == "success" else {"path": path, "status": response.status, "body": repr(body[:160])})
         persistence["last_completed"] = time.monotonic()
     except (OSError, http.client.HTTPException) as error:
-        category = "client_timeout" if isinstance(error, TimeoutError) else "connection_error"
+        if isinstance(error, (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)):
+            category = "server_transport_close"
+        else:
+            category = "client_timeout" if isinstance(error, TimeoutError) else "connection_error"
         results.add(category, time.monotonic()-started,
                     {"path": path, "error": type(error).__name__, "errno": getattr(error, "errno", None),
                      "detail": str(error)[:160]})
@@ -202,11 +205,18 @@ class PartialBodyFlood:
 
     def run(self):
         held = {}
+        # Bound replenishment as well as simultaneous sockets. Immediate 503
+        # responses must not turn this into an unbounded reconnect loop.
+        next_attempt = time.monotonic()
         try:
             while not self.stopping.is_set():
                 for _ in range(min(32, 280-len(held))):
                     if self.stopping.is_set():
                         break
+                    now = time.monotonic()
+                    if now < next_attempt:
+                        break
+                    next_attempt = now+1/280
                     peer = None
                     try:
                         peer = socket.create_connection(("127.0.0.1", self.service.port), timeout=.02)
@@ -219,10 +229,11 @@ class PartialBodyFlood:
                         if peer is not None and peer not in held:
                             peer.close()
                         self.count("connect_"+type(error).__name__)
+                wait = max(0, min(.02, next_attempt-time.monotonic())) if len(held) < 280 else .02
                 if not held:
-                    self.stopping.wait(.02)
+                    self.stopping.wait(wait)
                     continue
-                readable, _, _ = select.select(list(held), [], [], .02)
+                readable, _, _ = select.select(list(held), [], [], wait)
                 for peer in readable:
                     try:
                         chunk = peer.recv(1024)
@@ -254,10 +265,11 @@ class PartialBodyFlood:
         if self.thread.is_alive():
             raise RuntimeError("bounded partial-body generator did not stop")
         return {"counts": self.counts, "peak_connections": self.peak, "connection_limit": 280,
+                "maximum_connection_attempts_per_second": 280,
                 "classification": "408 body deadline and 503 admission are expected; statusless transport failures remain ambiguous"}
 
 
-def phase(service, seconds, rps, overload=False):
+def phase(service, seconds, rps, overload=False, progress=None):
     results = Results()
     work = queue.Queue(maxsize=64)
     stopping = threading.Event()
@@ -291,6 +303,9 @@ def phase(service, seconds, rps, overload=False):
             except (OSError, ValueError, http.client.HTTPException) as error:
                 sample["metrics_error"] = type(error).__name__
             samples.append(sample)  # At most 361 samples for allowed duration.
+            if progress:
+                progress({"elapsed_seconds": time.monotonic()-began, "requests": results.value(),
+                          "resource_samples": list(samples)})
             sample_stop.wait(10)
     sampler = threading.Thread(target=sample_resources)
     sampler.start()
@@ -373,17 +388,24 @@ def main():
     parser.add_argument("--rps", type=float, default=100)
     parser.add_argument("--loops", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--profile", choices=["debug", "release"], default="release")
+    parser.add_argument("--overload-only", action="store_true", help="Bounded 3..30s overload and recovery preflight, not sustained acceptance")
     args = parser.parse_args()
     if args.duration < 3 or args.duration > 3600 or not 1 <= args.rps <= 5000 or any(n not in [1, 2, 4] for n in args.loops):
         parser.error("duration 3..3600, rps 1..5000, loops 1/2/4 required")
+    if args.overload_only and args.duration > 30:
+        parser.error("overload preflight duration must be 3..30 seconds")
     repository = Path(__file__).resolve().parents[2]
     report = {"status": "running", "platform": platform.platform(), "cpu_count": os.cpu_count(),
+        "cli_sha256": hashlib.sha256(args.ku.resolve().read_bytes()).hexdigest(),
+        "fixture_sha256": hashlib.sha256((repository/"tests/fixtures/multiloop_service.ku").read_bytes()).hexdigest(),
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
         "source_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repository, text=True)),
         "tls": "none; direct loopback HTTP", "load_generator": "same host, fixed32threads, max64inflight",
         "parameters": {"duration_seconds": args.duration, "arrival_rps": args.rps, "loops": args.loops,
             "native_c_profile": args.profile, "blocking_threads_total": 5, "thread_budget": 16,
             "normal_unexpected_errors": 0, "normal_p99_ms": 250, "pre_overload_peak_loop_delay_ms": 100,
+            "overload_http_statuses": [200, 408, 503, 504], "overload_unclassified_measured_errors": 0,
+            "overload_slow_peer_attempts_per_second": 280, "overload_slow_peer_connections": 280,
             "recovery_seconds": 5, "formal_phases_seconds": {"warm": 60, "steady": 1470, "overload": 30,
                 "recovery": args.duration-1560} if args.duration >= 1800 else None,
             "overload_duration_reason": "280 slow peers over 30s fits the same-host 16384 ephemeral-port budget; service deadlines unchanged",
@@ -405,16 +427,34 @@ def main():
             try:
                 item = {"loops": loops, "baseline": process_sample(service.child.pid), "phases": []}
                 report["runs"].append(item)
-                if args.duration >= 1800:
+                if args.overload_only:
+                    phases = [("overload", args.duration, args.rps*3, True)]
+                elif args.duration >= 1800:
                     phases = [("warm", 60, args.rps, False), ("steady", 1470, args.rps, False),
                               ("overload", 30, args.rps*3, True), ("recovery", args.duration-1560, args.rps, False)]
                 else:
                     phases = [("short", args.duration, args.rps, False)]
                 for name, seconds, rate, overload in phases:
-                    result = phase(service, seconds, rate, overload)
+                    def checkpoint(value):
+                        report["live"] = {"loops": loops, "phase": name, **value}
+                        atomic_json(args.output, report)
+                    result = phase(service, seconds, rate, overload, progress=checkpoint)
+                    report.pop("live", None)
                     result["name"] = name
                     result["end_metrics"] = service.metrics()
                     result["end_resources"] = process_sample(service.child.pid)
+                    if overload:
+                        allowed = {"success", "http_408", "http_503", "http_504", "server_transport_close"}
+                        result["overload_classification"] = {
+                            "correct": result["counts"].get("success", 0),
+                            "explicit_admission_rejection": result["counts"].get("http_503", 0),
+                            "explicit_deadline": sum(result["counts"].get(key, 0) for key in ["http_408", "http_504"]),
+                            "server_transport_close": result["counts"].get("server_transport_close", 0),
+                            "load_client_budget_refusal": result["client_shed"],
+                            "unclassified_or_unexpected": {key: count for key, count in result["counts"].items() if key not in allowed},
+                            "meaning": "Direct-peer EOF/reset/broken-pipe is server transport termination, not an HTTP 503 or a uniquely identified close reason. Local queue refusals are load-client limits and remain in total arrivals. Other transport/client/protocol errors fail. Deliberate slow peers remain separate."}
+                        result["overload_classification"]["pressure_observed"] = (
+                            sum(row["rejected_responses"] for row in result["end_metrics"]["outcomes"]) > 0)
                     item["phases"].append(result)
                     if overload:
                         result["recovery_probe"] = recovery_probe(service, result["overload_removed_monotonic"])
@@ -430,6 +470,9 @@ def main():
                             raise RuntimeError(f"{name} loop delay exceeded frozen 100ms threshold: {peak}")
                     if overload and (not result["recovery_probe"]["passed"] or result["counts"].get("wrong_body", 0)):
                         raise RuntimeError("overload response correctness or five-second recovery failed")
+                    if overload and (result["overload_classification"]["unclassified_or_unexpected"]
+                                     or not result["overload_classification"]["pressure_observed"]):
+                        raise RuntimeError("overload has unexpected errors or did not reach actual admission pressure")
                 item["final_metrics"] = service.metrics()
                 item["exit_code"] = service.stop()
                 if item["exit_code"] != 0:

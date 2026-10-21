@@ -1538,6 +1538,13 @@ typedef struct {
   KuHttpOutput output;
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
+enum {
+  KU_HTTP_CLOSE_IDLE_PRESSURE, KU_HTTP_CLOSE_RESPONSE_POLICY,
+  KU_HTTP_CLOSE_WRITE_DEADLINE, KU_HTTP_CLOSE_PEER_WRITE,
+  KU_HTTP_CLOSE_QUEUE_NOT_ADMITTED, KU_HTTP_CLOSE_DRAIN_IDLE,
+  KU_HTTP_CLOSE_REASON_COUNT
+};
+static void ku_http_count_transport_close(KuHttpConnection*,int);
 static void ku_http_output_part(KuHttpOutput* output, const char* bytes, size_t length) {
   if (!length) return;
   if (output->count >= 9) { fputs("http response segment bound exceeded\n", stderr); exit(1); }
@@ -1644,7 +1651,10 @@ static void ku_http_connection_start(KuHttpConnection* connection, KuHttpSocket 
 /* A response may be published before the worker releases its real reference.
    Reuse the physical slot only after that owner retires, exactly as close does. */
 static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttpServer* server) {
-  if (!connection->keep_alive) { ku_http_connection_close(connection); return; }
+  if (!connection->keep_alive) {
+    ku_http_count_transport_close(connection,KU_HTTP_CLOSE_RESPONSE_POLICY);
+    ku_http_connection_close(connection); return;
+  }
   if (connection->job && !ku_http_job_only_owner(connection->job)) {
     connection->phase = KU_HTTP_IO_REUSE_WAIT; connection->deadline = 0; return;
   }
@@ -1684,6 +1694,7 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   connection->phase = KU_HTTP_IO_JOB;
   connection->deadline = 0;
   if (!workers || !ku_http_queue_push(queue, job)) {
+    ku_http_count_transport_close(connection,KU_HTTP_CLOSE_QUEUE_NOT_ADMITTED);
     ku_http_connection_close(connection);
   } else ku_http_count_admitted();
 }
@@ -1796,7 +1807,10 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
   /* Each readiness turn is finite even for a peer that remains writable and a
      very large Ku response. Neither partial sends nor EINTR refresh write D. */
   for (int turn = 0; turn < 32 && bytes < (size_t)262144; turn++) {
-    if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_close(connection); return; }
+    if (ku_http_now_ms() >= connection->deadline) {
+      ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
+      ku_http_connection_close(connection); return;
+    }
     if (output->part >= output->count) { ku_http_connection_next_request(connection, server); return; }
     KuHttpPart* part = &output->parts[output->part];
     size_t remaining = part->length - output->offset;
@@ -1806,9 +1820,13 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
       int error = ku_http_socket_last_error();
       if (ku_http_socket_error_interrupted(error)) continue;
       if (ku_http_socket_would_block(error)) return;
+      ku_http_count_transport_close(connection,KU_HTTP_CLOSE_PEER_WRITE);
       ku_http_connection_close(connection); return;
     }
-    if (!sent) { ku_http_connection_close(connection); return; }
+    if (!sent) {
+      ku_http_count_transport_close(connection,KU_HTTP_CLOSE_PEER_WRITE);
+      ku_http_connection_close(connection); return;
+    }
     output->offset += (size_t)sent;
     bytes += (size_t)sent;
     if (output->offset == part->length) { output->part++; output->offset = 0; }
@@ -1947,6 +1965,7 @@ typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, pending, workers, ready, exited, drained;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
+  unsigned long long transport_closes[KU_HTTP_CLOSE_REASON_COUNT];
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   KuHttpWake* wake;
 #if defined(_WIN32)
@@ -1968,6 +1987,18 @@ struct KuHttpLoopGroup {
 };
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
+/* Branch witnesses, not request IDs or proof that a client observed this close.
+   Counts are fixed storage and publication never performs diagnostic I/O.
+   response_policy includes explicit Connection:close, error responses and
+   pressure's response-boundary reuse decision; it is not synonymous with 503. */
+static void ku_http_count_transport_close(KuHttpConnection* connection,int reason) {
+  KuHttpLoopOwner* owner=ku_http_current_loop;
+  if (!owner || connection->socket_value==KU_HTTP_INVALID_SOCKET
+      || reason<0 || reason>=KU_HTTP_CLOSE_REASON_COUNT) return;
+  ku_http_mutex_lock(&owner->group->lock);
+  if (owner->transport_closes[reason]!=~0ULL) owner->transport_closes[reason]++;
+  ku_http_mutex_unlock(&owner->group->lock);
+}
 static int ku_http_reused_request_admit(void) {
   KuHttpLoopOwner* owner=ku_http_current_loop;
   if (!owner) return 1;
@@ -2169,7 +2200,9 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
   int live = !strcmp(input->method,"GET") && input->path_len == 17 && !memcmp(input->target,"/__ku/health/live",17);
   if (!drain && !startup && !ready && !live && !metrics) { ku_http_connection_status(connection,server,404); return 1; }
   if (metrics) {
-    char text[32768]; size_t used = 0;
+    /* Fixed bound includes 32 owners and every counter at full uint64 width;
+       it remains inside the reserved management channel's 64 KiB quota. */
+    char text[49152]; size_t used = 0;
     ku_http_mutex_lock(&group->lock);
     int n = snprintf(text,sizeof(text),"{\"loops\":[");
     if (n < 0) _Exit(79);
@@ -2191,6 +2224,17 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
       KuHttpLoopOwner* owner=&group->loops[i];
       n=snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
         owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes);
+      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    }
+    ku_http_mutex_unlock(&group->lock);
+    text[used++]=']';
+    n=snprintf(text+used,sizeof(text)-used,",\"transport_closes\":[");
+    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    ku_http_mutex_lock(&group->lock);
+    for (int i=0;i<group->created;i++) {
+      unsigned long long* counts=group->loops[i].transport_closes;
+      n=snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"idle_pressure\":%llu,\"response_policy\":%llu,\"write_deadline\":%llu,\"peer_write_error\":%llu,\"queue_not_admitted\":%llu,\"drain_idle\":%llu}",
+          i?",":"",i,counts[0],counts[1],counts[2],counts[3],counts[4],counts[5]);
       if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
     }
     ku_http_mutex_unlock(&group->lock);
@@ -2388,8 +2432,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     unsigned long long now = ku_http_now_ms();
     for (int index = 0; index < slot_count; index++) {
       KuHttpConnection* connection = &connections[index];
+      /* This is reuse admission at the response boundary. A keep-alive header
+         already sent is a snapshot, not a promise to retain a pressured idle
+         connection. Preserve pending FIFO priority, including pipeline bytes. */
       if (!listening || listen_failure || pending.count) connection->keep_alive = 0;
       if (!listening && connection->phase == KU_HTTP_IO_HEADER && connection->reused && !connection->buffered && !connection->carry_length) {
+        ku_http_count_transport_close(connection,KU_HTTP_CLOSE_DRAIN_IDLE);
         ku_http_connection_close(connection); continue;
       }
       ku_http_connection_observe_job(connection, server);
@@ -2415,18 +2463,24 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         char next_byte;
         int ready = recv(connection->socket_value, &next_byte, 1, MSG_PEEK);
         if (ready == 0 || (ready < 0 &&
-            !ku_http_socket_error_interrupted(ku_http_socket_last_error())))
+            !ku_http_socket_error_interrupted(ku_http_socket_last_error()))) {
+          ku_http_count_transport_close(connection,KU_HTTP_CLOSE_IDLE_PRESSURE);
           ku_http_connection_close(connection);
+        }
       }
       if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)
         ku_http_connection_status(connection, server, 408);
-      else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline)
+      else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline) {
+        ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
         ku_http_connection_close(connection);
+      }
     }
     if (rejection.phase == KU_HTTP_IO_REJECT && now >= rejection.deadline)
       ku_http_connection_status(&rejection, server, 503);
-    else if (rejection.phase == KU_HTTP_IO_WRITE && now >= rejection.deadline)
+    else if (rejection.phase == KU_HTTP_IO_WRITE && now >= rejection.deadline) {
+      ku_http_count_transport_close(&rejection,KU_HTTP_CLOSE_WRITE_DEADLINE);
       ku_http_connection_close(&rejection);
+    }
     if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
     int occupied = rejection.phase != KU_HTTP_IO_FREE;
     for (int index = 0; index < slot_count; index++) occupied |= connections[index].phase != KU_HTTP_IO_FREE;

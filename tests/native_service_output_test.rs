@@ -142,7 +142,14 @@ fn service_output_flush_preserves_unicode_nul_and_normal_program_format() {
         let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
             .expect("bounded normal-output regression");
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"42:Ku:\xe4\xb8\xad\0\xe6\x96\x87\n");
+        // Both bounded and synchronous output retain the C stdout text mode.
+        // Compare the full payload, including NUL, without stripping any CR.
+        let expected: &[u8] = if cfg!(windows) {
+            b"42:Ku:\xe4\xb8\xad\0\xe6\x96\x87\r\n"
+        } else {
+            b"42:Ku:\xe4\xb8\xad\0\xe6\x96\x87\n"
+        };
+        assert_eq!(output.stdout, expected);
         assert!(output.stderr.is_empty());
     }
 }
@@ -303,5 +310,10 @@ fn service_output_closed_collector_records_failure_without_terminating_service()
         .take(4096)
         .read_to_string(&mut evidence)
         .expect("read closed-output evidence");
-    assert_eq!(evidence, "closed collector recorded failure\n");
+    let expected = if cfg!(windows) {
+        "closed collector recorded failure\r\n"
+    } else {
+        "closed collector recorded failure\n"
+    };
+    assert_eq!(evidence, expected);
 }

@@ -3090,7 +3090,19 @@ fn main(): null! {
     return ok(null)
 }
 "#;
-    let Some(mut server) = spawn_native_server("keep-alive", source, &address) else {
+    let management_address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "keep-alive",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "1"),
+            ("KU_SERVICE_CONTROL_TOKEN", "keepalive-regression"),
+            ("KU_SERVICE_PROBE_ADDR", &management_address),
+        ],
+    ) else {
         assert!(
             env::var_os("GITHUB_ACTIONS").is_none(),
             "CI requires a real native compiler"
@@ -3206,6 +3218,34 @@ fn main(): null! {
     for mut peer in pending {
         assert_status(&read_frame(&mut peer), "HTTP/1.1 200 OK");
     }
+    // The controlled sequence witnessed a real idle-pressure close, while
+    // every pending peer received a complete response. Queue admission was
+    // not the cause: capacity pressure does not close the worker queue.
+    let metrics = http_response(&management_address,
+        "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: keepalive-regression\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3));
+    assert_status(&metrics, "HTTP/1.1 200 OK");
+    let closes = metrics
+        .split_once("\"transport_closes\":[")
+        .unwrap()
+        .1
+        .split_once(']')
+        .unwrap()
+        .0;
+    let count = |name: &str| -> u64 {
+        closes
+            .split_once(&format!("\"{name}\":"))
+            .unwrap()
+            .1
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert!(count("idle_pressure") >= 1);
+    assert!(count("response_policy") >= 1);
+    assert_eq!(count("queue_not_admitted"), 0);
 
     let mut partial = connect_with_retry(&address, Duration::from_secs(3));
     partial
@@ -3424,6 +3464,7 @@ fn main(): null! {
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
                         | std::io::ErrorKind::BrokenPipe
                         | std::io::ErrorKind::NotConnected
                 ) => {}

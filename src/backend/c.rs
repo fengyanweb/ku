@@ -247,6 +247,9 @@ pub fn generate_task_frame_c_source(
     program: &IrProgram,
     frames: &crate::ir::task::TaskProgram,
 ) -> KuResult<String> {
+    if frames.functions.is_empty() {
+        return generate_c_source(program);
+    }
     let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
     if !frames.functions.is_empty()
         && program.functions.iter().any(|function| {

@@ -1738,10 +1738,13 @@ fn native_task_driver_empty_workers_keep_state_and_work_notifications_separate()
     let mut driver = generated[driver_start..driver_end].to_owned();
     // Intercept only this emitted driver's native calls. The test-event
     // implementation and every forwarded OS call remain unmodified.
+    // signal_owner adds a second work-channel call for its native-condition
+    // fallback. The execution assertions below still distinguish work wakes
+    // from observer-only parking announcements.
     for (from, to, count) in [
-        ("WakeAllConditionVariable(", "fixture_idle_os_signal(", 2),
+        ("WakeAllConditionVariable(", "fixture_idle_os_signal(", 3),
         ("SleepConditionVariableSRW(", "fixture_idle_os_wait(", 2),
-        ("pthread_cond_broadcast(", "fixture_idle_os_signal(", 2),
+        ("pthread_cond_broadcast(", "fixture_idle_os_signal(", 3),
         ("pthread_cond_wait(", "fixture_idle_os_wait(", 2),
         (
             "pthread_cond_timedwait_relative_np(",
@@ -2913,9 +2916,13 @@ int main(void) {
 fn native_task_driver_shutdown_numeric_range_keeps_a_finite_original_budget() {
     let generated = fixture_source();
     let shutdown_start = generated
-        .find("static uint32_t ku_task_driver_shutdown(")
-        .expect("actual generated shutdown");
-    let root_lines = generated[shutdown_start..]
+        .find("static uint32_t ku_task_driver_shutdown_impl(")
+        .expect("actual generated shared shutdown implementation");
+    let shutdown_end = shutdown_start
+        + generated[shutdown_start..]
+            .find("\nstatic uint32_t ku_task_driver_shutdown(")
+            .expect("public shutdown wrapper follows implementation");
+    let root_lines = generated[shutdown_start..shutdown_end]
         .lines()
         .filter(|line| line.trim_start().starts_with("uint64_t root = "))
         .collect::<Vec<_>>();

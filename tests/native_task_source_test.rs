@@ -1185,18 +1185,25 @@ async fn main(): null! {
         r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"late TCP readiness line %d: %s\n",__LINE__,#c);return 1;}}while(0)
 int main(void) {
-  KuTaskBlockingPoolV1 pool={0};uint64_t deadline=ku_task_driver_now_ms()+1000u;
-  CHECK(ku_task_blocking_init(&pool,1u,1u,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(!ku_task_blocking_lock(&pool));
-  KuTaskBlockingJobV1* job=&pool.jobs[0];job->generation=2u;job->state=KU_TASK_BLOCKING_NET_WAIT;
+  /* The fixed 1024-job table alone exceeds a Windows default 1MiB main
+     stack. Production roots use static/heap storage; mirror that here. */
+  KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*pool));
+  CHECK(pool);uint64_t deadline=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_blocking_init(pool,1u,1u,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(pool));
+  KuTaskBlockingJobV1* job=&pool->jobs[0];job->generation=2u;job->state=KU_TASK_BLOCKING_NET_WAIT;
   job->net_owner=1u;job->kind=6u;job->net_requested=17;job->net_deadline=deadline;
-  ku_task_blocking_unlock(&pool);
-  CHECK(ku_task_net_dispatch(&pool,0u,0u,1u,KU_TASK_NET_READ|KU_TASK_NET_ERROR)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_net_dispatch(&pool,1u,0u,2u,KU_TASK_NET_READ)==KU_TASK_DRIVER_OK);
-  CHECK(!ku_task_blocking_lock(&pool));
-  CHECK(job->generation==2u && job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_requested==17 && !job->cancelled && !pool.fault);
-  memset(job,0,sizeof(*job));ku_task_blocking_unlock(&pool);
-  CHECK(ku_task_blocking_finish(&pool,deadline)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(pool);
+  CHECK(ku_task_net_dispatch(pool,0u,0u,1u,KU_TASK_NET_READ|KU_TASK_NET_ERROR)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_net_dispatch(pool,1u,0u,2u,KU_TASK_NET_READ)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(pool));
+  CHECK(job->generation==2u && job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_requested==17 && !job->cancelled && !pool->fault);
+  memset(job,0,sizeof(*job));ku_task_blocking_unlock(pool);
+  CHECK(ku_task_blocking_finish(pool,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(pool->initialized==KU_TASK_DRIVER_STORAGE_ZERO && !pool->resources
+      && !pool->resident && !pool->queued && !pool->running
+      && pool->workers_joined==pool->workers_created);
+  free(pool);
   puts("late-tcp-generation-ok");return 0;
 }
 "#
@@ -1210,9 +1217,17 @@ int main(void) {
     let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
     assert!(
         output.status.success(),
-        "{}{}",
+        "late TCP readiness process failed: {} ({:?}, code {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.status,
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.ends_with(b"late-tcp-generation-ok\n"));
+    let expected: &[u8] = if cfg!(windows) {
+        b"late-tcp-generation-ok\r\n"
+    } else {
+        b"late-tcp-generation-ok\n"
+    };
+    assert!(output.stdout.ends_with(expected));
 }

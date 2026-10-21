@@ -195,11 +195,9 @@ fn run_repeated_pending_expression(source: &str) {
         "typedef struct KuString {",
         &format!("{instrumentation}typedef struct KuString {{"),
     );
-    let source_place = if plan.functions[0].slots.contains(&frozen_source) {
-        format!("frame->s_{}", frozen_source.0)
-    } else {
-        format!("slot_{}", frozen_source.0)
-    };
+    // Native source emission also persists Copy temporaries because its finite
+    // dispatch quantum can return before an IR liveness boundary.
+    let source_place = format!("frame->s_{}", frozen_source.0);
     let lhs_assignment = if concat {
         format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source_place},&frame->s_{});\n",lhs.0)
     } else if owned {
@@ -636,7 +634,7 @@ async fn main(): null! { return ok(null) }
         &format!("{continued}\n  fixture_if_continued(instance,descriptor->scope_id);"),
     );
     let joined = joined[0].0;
-    let joined_print = format!("  if ((frame->s_{joined}.len && fwrite(frame->s_{joined}.ptr,1,frame->s_{joined}.len,stdout)!=frame->s_{joined}.len) || fputc('\\n',stdout)==EOF || fflush(stdout)==EOF) {{");
+    let joined_print = format!("  if (ku_output_write(frame->s_{joined}.ptr,frame->s_{joined}.len) < 0 || ku_output_printf(\"\\n\")<0 || ku_output_flush()<0) {{");
     generated = replace_once(
         generated,
         &joined_print,

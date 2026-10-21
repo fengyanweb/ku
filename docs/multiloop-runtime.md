@@ -100,7 +100,9 @@ python3 -B deploy/service/verify.py --ku /absolute/path/ku --haproxy /absolute/p
 python3 -B deploy/service/verify.py --blocking-only --ku /absolute/path/ku --output /absolute/path/retirement.json
 ```
 
-计划与门槛在发流量前落盘。客户端固定线程/在途/队列/直方图，采样线程不占到达率时钟，不重放失败请求；已超过 fixture 的 1 秒空闲期限的客户端连接在发送下一请求前主动回收。过载的慢体连接持续补充且上限 280，其拒绝、读取期限和不确定的传输关闭单独报告；撤除负载后五秒内必须恢复。临时源码、native 产物、数据库和子进程由驱动清理，仅保留精简结果与必要失败证据。
+独立 CI 正式入口及门槛见[正式计划](multiloop-formal-plan.md)，只用指定 PR 标签启动，不随普通提交反复长测。
+
+计划与门槛在发流量前落盘。客户端固定线程/在途/队列/直方图，采样线程不占到达率时钟，不重放失败请求；已超过 fixture 的 1 秒空闲期限的客户端连接在发送下一请求前主动回收。过载的慢体连接上限 280，补连也不超过每秒 280 次，其拒绝、期限和传输关闭单独报告；撤除负载后五秒内必须恢复。临时源码、native 产物、数据库和子进程由驱动清理，仅保留精简结果与必要失败证据。
 
 正式窗口参数为：release native、N=4、总后台 5、总线程配置 16、Task 16 MiB、连接 256/活动 128/排队 128/HTTP 缓冲 8 MiB；warm 60 秒、steady 1470 秒、overload 30 秒、recovery 240 秒，共 1800 秒。普通阶段 50 到达/秒，过载 150 到达/秒并叠加 280 条慢体连接；固定 32 个客户端工作线程、64 个在途/队列上界。handler/header/body/write/idle 均 1000ms，`/timer` 等待 25ms。普通阶段必须无非预期错误、无压测端主动丢弃且 p99≤250ms，过载前累计 loop delay 峰值≤100ms；过载必须无错 body，撤载后五秒内正确响应并恢复逻辑队列。错误、拒绝、超时、连接关闭和压测端错误保留各自分母。
 
