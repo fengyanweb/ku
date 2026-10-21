@@ -452,7 +452,9 @@ jobs:
             test -z "$(cat "$delegated/cgroup.procs")"
             printf '+memory +pids\n' | sudo tee "$delegated/cgroup.subtree_control" >/dev/null
             sudo chown -R "$(id -u):$(id -g)" "$delegated"
-            python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
+            # This one isolated provider test needs administrator migration
+            # rights from the runner's existing cgroup into its private domain.
+            sudo env "PATH=$PATH" python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
               --cgroup-root "$delegated" --output "$RUNNER_TEMP/ku-service-memory-provider.json"
           else
             python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
