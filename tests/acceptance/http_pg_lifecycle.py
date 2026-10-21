@@ -40,6 +40,69 @@ def run(args, **kwargs):
     return result.stdout.strip()
 
 
+def prepare_windows_pg_directory(root, report):
+    """Give only this user's restricted PostgreSQL token the fixture's access.
+
+    PostgreSQL 17 reexecutes initdb with Administrators and Power Users marked
+    deny-only (src/common/restricted_token.c). Python's Windows mkdir(0700)
+    grants SYSTEM, Administrators and OWNER RIGHTS; the owner can itself be
+    Administrators. Add the actual user SID on this newly created private root,
+    keeping the protected ACL and all parent directories unchanged. Do not set
+    PG_RESTRICT_EXEC, which would bypass PostgreSQL's normal token transition.
+    """
+    if sys.platform != "win32":
+        return
+    root = Path(root)
+    if (root.is_symlink() or not root.is_dir()
+            or not root.name.startswith("ku-http-pg-acceptance-")
+            or root.resolve().parent != Path(tempfile.gettempdir()).resolve()):
+        raise ValueError("PostgreSQL ACL setup requires this fixture's private temporary root")
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$root = $env:KU_PG_FIXTURE_ROOT
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$before = Get-Acl -LiteralPath $root
+$beforeSddl = $before.Sddl
+$beforeOwner = $before.Owner
+$parent = [System.IO.Directory]::GetParent($root).FullName
+$parentSddl = (Get-Acl -LiteralPath $parent).Sddl
+$evidence = @{user_sid=$sid.Value; owner_before=$beforeOwner; sddl_before=$beforeSddl;
+  parent_sddl_before=$parentSddl; rights='Modify'; inheritance='ContainerInherit,ObjectInherit';
+  scope='private fixture root and inherited children only'}
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $sid, [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow)
+try {
+    $before.AddAccessRule($rule)
+    Set-Acl -LiteralPath $root -AclObject $before
+} catch {
+    $evidence.error = $_.Exception.Message
+    $evidence | ConvertTo-Json -Compress
+    exit 1
+}
+$after = Get-Acl -LiteralPath $root
+$evidence.owner_after = $after.Owner
+$evidence.sddl_after = $after.Sddl
+$evidence.parent_sddl_after = (Get-Acl -LiteralPath $parent).Sddl
+$evidence | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+                            env=os.environ | {"KU_PG_FIXTURE_ROOT": str(root.resolve())})
+    evidence = {"exit_code": result.returncode, "python_version": sys.version,
+                "stdout_tail": result.stdout[-12000:], "stderr_tail": result.stderr[-2000:]}
+    report["windows_pg_directory_acl"] = evidence
+    if result.returncode or len(result.stdout) > 12000:
+        raise RuntimeError(f"private PostgreSQL directory ACL setup failed: {evidence}")
+    evidence["acl"] = json.loads(result.stdout)
+    del evidence["stdout_tail"]
+    if evidence["acl"]["parent_sddl_before"] != evidence["acl"]["parent_sddl_after"]:
+        raise RuntimeError("PostgreSQL fixture parent ACL changed during private root setup")
+
+
 class DatabaseProxy:
     """Bounded test proxy; lose one confirmed INSERT acknowledgement."""
 
@@ -173,6 +236,7 @@ def main():
         started = False
         logs = root / "http.log"
         try:
+            prepare_windows_pg_directory(root, report)
             environment = os.environ | {"KU_EVENT_LOOPS": str(args.loops), "KU_BLOCKING_THREADS": "8",
                                         "KU_DB_MAX_CONNECTIONS": "4", "KU_DB_MAX_WAITERS": "8",
                                         "KU_DB_MAX_PENDING_BYTES": "1048576"}
