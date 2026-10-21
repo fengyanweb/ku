@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'full runs all gates; windows-service reuses an already passed full suite'
+        type: choice
+        default: full
+        options: [full, windows-service]
 
 permissions:
   contents: read
@@ -14,6 +20,7 @@ concurrency:
 
 jobs:
   quality:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
     name: Rust format, check and clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -66,6 +73,7 @@ jobs:
           python3 -B .github/scripts/test-prepare-release.py
 
   borrow-sanitizers:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
     name: Native borrow and Task ASan, UBSan and leak checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -109,6 +117,7 @@ jobs:
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
   task-tsan:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
     name: Linux native Task selected-path ThreadSanitizer gate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -145,19 +154,13 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    name: ${{ matrix.os }} unfiltered workspace test suite
+    name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-service' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            tls_target: x86_64-pc-windows-msvc
-          - os: ubuntu-24.04
-            tls_target: x86_64-unknown-linux-gnu
-          - os: macos-15
-            tls_target: aarch64-apple-darwin
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-service' && '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"}]' || '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"},{"os":"ubuntu-24.04","tls_target":"x86_64-unknown-linux-gnu"},{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]') }}
     env:
       CARGO_INCREMENTAL: "0"
       KU_NATIVE_TLS_LINK_REQUIRED: "1"
@@ -428,8 +431,16 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run every default test target without stopping at the first failure
+        if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
         run: >-
           cargo test --locked --release --workspace --no-fail-fast
+          -- --nocapture --test-threads=2
+
+      - name: Verify focused service and blocking lifecycle regressions
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-service'
+        run: >-
+          cargo test --locked --release
+          --test service_supervision_test --test native_task_adapter_test
           -- --nocapture --test-threads=2
 
       - name: Verify native scheduler probe correctness, not performance
@@ -552,6 +563,7 @@ jobs:
           if-no-files-found: error
 
   release-contract:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
     name: ${{ matrix.os }} release scripts and clean CheckOnly
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -631,6 +643,7 @@ jobs:
           fi
 
   native:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-service'
     name: ${{ matrix.target }} native build and run
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
