@@ -1069,6 +1069,9 @@ async fn main(): null! {{
                 Err(error) => panic!("bounded Task transport accept: {error}"),
             }
         };
+        // Accepted sockets may inherit the listener's nonblocking mode. This peer
+        // uses bounded blocking I/O; a read timeout does not change that mode.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();

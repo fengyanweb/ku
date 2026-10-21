@@ -173,6 +173,23 @@ fn main(): null! {
                     raise RuntimeError("provider metrics, uncertainty, surviving instance or replacement response mismatch")
                 if platform.system() == "Linux" and not current.get("memory_limit_observed"):
                     raise RuntimeError("Linux pressure did not record actual cgroup limit/OOM evidence")
+                if platform.system() == "Linux":
+                    evidence = current.get("memory_limit_evidence") or {}
+                    worker = evidence.get("worker", {})
+                    before = evidence.get("private_domain_before", {})
+                    after = evidence.get("private_domain_after", {})
+                    for counters in (worker, before, after):
+                        if not (set(counters) == {"max", "oom", "oom_kill"}
+                                and all(type(value) is int and value >= 0 for value in counters.values())):
+                            raise RuntimeError("Linux provider omitted bounded raw worker/private-domain event evidence")
+                    if any(after[key] < before[key] for key in before):
+                        raise RuntimeError("Linux private-domain event counter decreased")
+                    leaf_oom = worker["oom"] > 0
+                    domain_oom = after["oom"] > before["oom"]
+                    if not (worker["oom_kill"] > 0 and (leaf_oom or domain_oom)
+                            and current.get("last_reason") == "os_memory_limit"):
+                        raise RuntimeError("Linux pressure termination lacks correlated configured-domain OOM and worker victim evidence")
+                    report["limit_event_scope"] = "worker_and_private_domain" if leaf_oom and domain_oom else "worker" if leaf_oom else "private_domain"
                 report["guarantee"] = ("Linux cgroup v2 actual memory/oom evidence" if platform.system() == "Linux"
                     else "Windows configured Job commit limit, pressure process failure and replacement; no OS-kill or OOM inference from exit code")
             report["status"] = "passed"

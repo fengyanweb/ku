@@ -140,6 +140,7 @@ fn exited_status() -> Status {
         limit_metric: None,
         memory_peak_bytes: None,
         memory_limit_observed: None,
+        memory_limit_evidence: None,
         last_exit_generation: Some(1),
         last_exit_code: Some(1),
         last_launcher_signal: None,
@@ -158,6 +159,7 @@ fn oom_metrics(local_limit: bool) -> platform::Metrics {
         oom_kill_count: Some(1),
         memory_limit_event: Some(local_limit),
         memory_limit_termination: Some(local_limit),
+        memory_limit_evidence: None,
         process_count: Some(0),
         resource_group: "test-only-provider-snapshot".into(),
     }
@@ -185,7 +187,9 @@ fn host_oom_count_does_not_claim_the_configured_service_limit_caused_exit() {
 #[test]
 fn confirmed_leaf_memory_limit_termination_records_the_provider_reason() {
     let mut state = exited_status();
-    let metrics = oom_metrics(true);
+    let mut metrics = oom_metrics(true);
+    metrics.memory_limit_evidence =
+        Some("{\"worker\":{\"max\":1,\"oom\":1,\"oom_kill\":1}}".into());
     record_provider_metrics(&mut state, &metrics);
     assert_eq!(state.last_reason, "os_memory_limit");
     assert_eq!(state.memory_limit_observed, Some(true));
@@ -193,4 +197,8 @@ fn confirmed_leaf_memory_limit_termination_records_the_provider_reason() {
     assert_eq!(state.limit_metric, Some(metrics.limit_metric));
     assert!(state.unfinished_work_possible);
     assert_eq!(state.database_outcome, "unknown");
+    assert_eq!(state.memory_limit_evidence, metrics.memory_limit_evidence);
+    assert!(state
+        .json()
+        .contains("\"memory_limit_evidence\":{\"worker\":"));
 }

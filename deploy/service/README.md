@@ -59,7 +59,7 @@ ku service --probe-addr 127.0.0.1:18181 \
 
 ## 两个活动实例与一个滚动备用位
 
-复制并填写 `cluster.example.json`，使用真实 Ku、二进制、token 和代理 socket 路径。每个 slot 的 `listen_addr` 是业务端口、`probe_addr` 是 runtime 管理端口、`control_addr` 是 supervisor 控制端口，所有端口互不冲突。正常运行 a/b，spare 留空。`http_service.ku` 是实际可编译示例：每个 slot 目录有二进制及 `http.addr`（无换行，内容为该 slot 的 `listen_addr`）；使用 `ku build --native service.ku -o service`，从源/输出同目录构建，移动时保留已有 fs 相对路径约定。
+复制并填写 `cluster.example.json`，使用真实 Ku、二进制、token 和代理 socket 路径。每个 slot 的 `listen_addr` 是业务端口、`probe_addr` 是 runtime 管理端口、`control_addr` 是 supervisor 控制端口，所有端口互不冲突。正常运行 a/b，spare 留空。将 `http_service.ku` 复制为各 slot 的 `service.ku`；各 slot 使用独立目录，例如 `/opt/ku/releases/current/a/` 和 `/opt/ku/releases/current/b/`，目录内准备 `http.addr`（无换行，内容为该 slot 的 `listen_addr`）。在各自目录使用 `ku build --native service.ku -o service` 构建，二进制与地址文件放在一起；移动时保留已有 fs 相对路径约定。不能把读取同名 `http.addr` 的不同 slot 放在同一目录。
 
 部署总预算包含新旧共存的三个实例，不按平时两个实例虚报：示例最多 12 事件线程、12 阻塞线程、53 个已列明线程份额（含一个代理线程与一次管理操作余量）、24 个数据库连接；数据库等待数和字节也按三个实例合计。每个实例声明 512MiB 预留，其中 supervisor 控制余量 32MiB。该预留是部署配置的准入账本，不是 coordinator 全堆精确计量或 macOS 硬上限。
 
@@ -74,7 +74,13 @@ python3 manage.py check /etc/ku/cluster.json
 python3 manage.py render /etc/ku/cluster.json > /etc/ku/haproxy.cfg
 chmod 600 /etc/ku/haproxy.cfg
 haproxy -c -f /etc/ku/haproxy.cfg
+# 终端 A：代理在前台持续运行。
 haproxy -db -f /etc/ku/haproxy.cfg
+```
+
+保持代理运行，在另一个终端执行管理命令：
+
+```sh
 python3 manage.py start /etc/ku/cluster.json a
 python3 manage.py start /etc/ku/cluster.json b
 python3 manage.py status /etc/ku/cluster.json

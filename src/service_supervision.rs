@@ -101,6 +101,7 @@ struct Status {
     limit_metric: Option<&'static str>,
     memory_peak_bytes: Option<u64>,
     memory_limit_observed: Option<bool>,
+    memory_limit_evidence: Option<String>,
     last_exit_generation: Option<u64>,
     last_exit_code: Option<i32>,
     last_launcher_signal: Option<i32>,
@@ -113,7 +114,7 @@ struct Status {
 impl Status {
     fn json(&self) -> String {
         format!(
-            "{{\"phase\":\"{}\",\"generation\":{},\"pid\":{},\"restarts\":{},\"probe_failures\":{},\"last_reason\":\"{}\",\"elapsed_ms\":{},\"ready_after_ms\":{},\"retired_after_ms\":{},\"limit_metric\":{},\"memory_peak_bytes\":{},\"memory_limit_observed\":{},\"last_exit_generation\":{},\"last_exit_code\":{},\"last_launcher_signal\":{},\"launcher_status\":{},\"termination_requested\":{},\"unfinished_work_possible\":{},\"database_outcome\":\"{}\",\"database_retry\":false}}\n",
+            "{{\"phase\":\"{}\",\"generation\":{},\"pid\":{},\"restarts\":{},\"probe_failures\":{},\"last_reason\":\"{}\",\"elapsed_ms\":{},\"ready_after_ms\":{},\"retired_after_ms\":{},\"limit_metric\":{},\"memory_peak_bytes\":{},\"memory_limit_observed\":{},\"memory_limit_evidence\":{},\"last_exit_generation\":{},\"last_exit_code\":{},\"last_launcher_signal\":{},\"launcher_status\":{},\"termination_requested\":{},\"unfinished_work_possible\":{},\"database_outcome\":\"{}\",\"database_retry\":false}}\n",
             self.phase.name(), self.generation, self.pid, self.restarts, self.failures,
             self.last_reason, self.started.elapsed().as_millis(),
             self.ready_after_ms.map_or_else(|| "null".into(), |value| value.to_string()),
@@ -121,6 +122,7 @@ impl Status {
             self.limit_metric.map_or_else(|| "null".into(), |value| format!("\"{value}\"")),
             self.memory_peak_bytes.map_or_else(|| "null".into(), |value| value.to_string()),
             self.memory_limit_observed.map_or_else(|| "null".into(), |value| value.to_string()),
+            self.memory_limit_evidence.as_deref().unwrap_or("null"),
             self.last_exit_generation.map_or_else(|| "null".into(), |value| value.to_string()),
             self.last_exit_code.map_or_else(|| "null".into(), |value| value.to_string()),
             self.last_launcher_signal.map_or_else(|| "null".into(), |value| value.to_string()),
@@ -183,6 +185,7 @@ pub fn run_service_command(args: &[String]) -> Result<(), KuError> {
         limit_metric: None,
         memory_peak_bytes: None,
         memory_limit_observed: None,
+        memory_limit_evidence: None,
         last_exit_generation: None,
         last_exit_code: None,
         last_launcher_signal: None,
@@ -476,6 +479,9 @@ fn record_provider_metrics(state: &mut Status, metrics: &platform::Metrics) {
     state.limit_metric = Some(metrics.limit_metric);
     state.memory_peak_bytes = metrics.memory_peak_bytes;
     state.memory_limit_observed = metrics.memory_limit_event;
+    state
+        .memory_limit_evidence
+        .clone_from(&metrics.memory_limit_evidence);
     // A cgroup's oom_kill counter can include a victim of global host OOM.
     // Only the provider's combined evidence identifies its configured limit
     // as the reason for termination; the raw count alone cannot establish it.

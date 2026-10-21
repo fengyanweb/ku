@@ -45,7 +45,7 @@
       "listen_addr": "127.0.0.1:18081",
       "probe_addr": "127.0.0.1:18181",
       "control_addr": "127.0.0.1:19081",
-      "program": "/opt/ku/releases/current/service-a",
+      "program": "/opt/ku/releases/current/a/service",
       "env": {},
       "manager_start": ["systemctl", "start", "ku-service@a"],
       "manager_stop": ["systemctl", "stop", "ku-service@a"]
@@ -55,7 +55,7 @@
       "listen_addr": "127.0.0.1:18082",
       "probe_addr": "127.0.0.1:18182",
       "control_addr": "127.0.0.1:19082",
-      "program": "/opt/ku/releases/current/service-b",
+      "program": "/opt/ku/releases/current/b/service",
       "env": {},
       "manager_start": ["systemctl", "start", "ku-service@b"],
       "manager_stop": ["systemctl", "stop", "ku-service@b"]
@@ -65,7 +65,7 @@
       "listen_addr": "127.0.0.1:18083",
       "probe_addr": "127.0.0.1:18183",
       "control_addr": "127.0.0.1:19083",
-      "program": "/opt/ku/releases/previous/service-spare",
+      "program": "/opt/ku/releases/previous/spare/service",
       "env": {},
       "manager_start": ["systemctl", "start", "ku-service@spare"],
       "manager_stop": ["systemctl", "stop", "ku-service@spare"]

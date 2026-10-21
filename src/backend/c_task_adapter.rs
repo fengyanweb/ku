@@ -1286,10 +1286,12 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   KuTaskAdapterTakeRequestV1* request=(KuTaskAdapterTakeRequestV1*)destination;
   if (!ku_task_driver_external_storage(instance->ticket.driver,request,sizeof(*request),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterTakeRequestV1))
       || ku_task_frame_ranges_overlap(instance,sizeof(*instance),request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
-  if(request->retained_bytes || request->retain_payload_charge>1u
-      || (request->parent && request->retain_payload_charge)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
   if (!instance->payload_initialized) return KU_TASK_CONTROL_RESULT_TAKEN;
 @REQUEST_ALIASES@
+  /* The request may alias a smaller payload allocation. Reject that address
+   * before reading even its private HTTP receipt fields. */
+  if(request->retained_bytes || request->retain_payload_charge>1u
+      || (request->parent && request->retain_payload_charge)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
   KuTaskAdapterOutcomeV1* outcome=request->outcome;
   if (!ku_task_driver_external_storage(instance->ticket.driver,outcome,sizeof(*outcome),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1))
       || ku_task_frame_ranges_overlap(instance,sizeof(*instance),outcome,sizeof(*outcome))

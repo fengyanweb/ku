@@ -1,3 +1,4 @@
+use super::memory_events::MemoryEvents;
 use super::{GroupConfig, Metrics, ProviderError};
 use std::{
     fs::{self, File, OpenOptions},
@@ -38,6 +39,7 @@ pub(crate) struct Worker {
     group: PathBuf,
     domain: Arc<DomainState>,
     retired: Option<Metrics>,
+    domain_events_before: MemoryEvents,
 }
 
 impl Domain {
@@ -196,14 +198,23 @@ impl Domain {
                     Ok(())
                 });
             }
-            command.spawn().map_err(ProviderError::from)
+            // This is Ku's fresh private aggregate domain, never a shared
+            // delegation/host ancestor. Capture before admitting this worker
+            // so an earlier generation's OOM cannot relabel its replacement.
+            let domain_events_before =
+                read_memory_events(&self.inner.path.join("memory.events.local"))?;
+            command
+                .spawn()
+                .map(|child| (child, domain_events_before))
+                .map_err(ProviderError::from)
         })();
         match launch {
-            Ok(child) => Ok(Worker {
+            Ok((child, domain_events_before)) => Ok(Worker {
                 child,
                 group,
                 domain: Arc::clone(&self.inner),
                 retired: None,
+                domain_events_before,
             }),
             Err(error) => {
                 // std::process reaps a child whose pre_exec/exec fails. An
@@ -235,7 +246,7 @@ impl Worker {
         if let Some(metrics) = &self.retired {
             return Ok(metrics.clone());
         }
-        snapshot(&self.group)
+        snapshot(&self.group, &self.domain.path, self.domain_events_before)
     }
 
     pub(crate) fn cleanup(&mut self, deadline: Instant) -> Result<Metrics, ProviderError> {
@@ -414,38 +425,32 @@ fn kill_group(path: &Path) -> Result<(), ProviderError> {
     write_control(&path.join("cgroup.kill"), 1)
 }
 
-fn snapshot(path: &Path) -> Result<Metrics, ProviderError> {
+fn read_memory_events(path: &Path) -> Result<MemoryEvents, ProviderError> {
+    MemoryEvents::parse(&read_control(path)?).map_err(ProviderError::new)
+}
+
+fn snapshot(
+    path: &Path,
+    domain: &Path,
+    domain_before: MemoryEvents,
+) -> Result<Metrics, ProviderError> {
     let memory_current_bytes = Some(read_number(&path.join("memory.current"))?);
     let memory_peak_bytes = match fs::metadata(path.join("memory.peak")) {
         Ok(_) => Some(read_number(&path.join("memory.peak"))?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let events = read_control(&path.join("memory.events"))?;
-    let mut oom_kill_count = None;
-    let mut memory_limit_event = false;
-    let mut local_oom = false;
-    for line in events.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let key = fields.next().unwrap_or_default();
-        let Some(raw_value) = fields.next() else {
-            return Err(ProviderError::new("invalid cgroup memory event counter"));
-        };
-        let value = raw_value
-            .parse::<u64>()
-            .map_err(|_| ProviderError::new("invalid cgroup memory event counter"))?;
-        if key == "oom_kill" {
-            oom_kill_count = Some(value);
-        }
-        if key == "oom" && value != 0 {
-            local_oom = true;
-        }
-        // oom_kill also includes a global host OOM victim. Preserve that count
-        // without claiming it proves this leaf's configured limit was reached.
-        if matches!(key, "max" | "oom") && value != 0 {
-            memory_limit_event = true;
-        }
-    }
+    let worker_events = read_memory_events(&path.join("memory.events"))?;
+    let domain_after = read_memory_events(&domain.join("memory.events.local"))?;
+    let (memory_limit_event, memory_limit_termination) = worker_events
+        .classify(domain_before, domain_after)
+        .map_err(ProviderError::new)?;
+    let evidence = format!(
+        "{{\"worker\":{},\"private_domain_before\":{},\"private_domain_after\":{}}}",
+        worker_events.json(),
+        domain_before.json(),
+        domain_after.json()
+    );
     // This is the leaf's process count, unlike pids.current which also counts
     // individual kernel threads. populated additionally covers descendants.
     let process_count = Some(
@@ -458,9 +463,10 @@ fn snapshot(path: &Path) -> Result<Metrics, ProviderError> {
         limit_metric: "linux_cgroup_v2_charged_memory_bytes",
         memory_peak_bytes,
         memory_current_bytes,
-        oom_kill_count,
+        oom_kill_count: Some(worker_events.oom_kill),
         memory_limit_event: Some(memory_limit_event),
-        memory_limit_termination: Some(local_oom && oom_kill_count.is_some_and(|count| count != 0)),
+        memory_limit_termination: Some(memory_limit_termination),
+        memory_limit_evidence: Some(evidence),
         process_count,
         resource_group: path.display().to_string(),
     })
