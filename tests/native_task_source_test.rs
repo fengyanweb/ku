@@ -58,9 +58,13 @@ int main(void) {
   CHECK(driver.workers[0].local_queued==2u && driver.workers[1].local_queued==2u);
   CHECK(notifications[0] && notifications[1]);
   uint64_t next=UINT64_MAX;
+  size_t before_first_pump[2]={notifications[0],notifications[1]};
   CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
   CHECK(driver.workers[0].polls==1u && !driver.workers[1].polls);
   CHECK(next==0u && driver.queued==3u);
+  /* Remaining ready work is already represented by next==0. The owner must
+   * turn again without a socket self-notification under the driver mutex. */
+  CHECK(notifications[0]==before_first_pump[0] && notifications[1]==before_first_pump[1]);
   CHECK(ku_task_driver_pump(&driver,1u,2u,&next)==KU_TASK_DRIVER_OK);
   CHECK(driver.workers[1].polls==2u && driver.workers[0].polls==1u);
   CHECK(ku_task_driver_pump(&driver,0u,2u,&next)==KU_TASK_DRIVER_OK);
@@ -90,7 +94,7 @@ int main(void) {
   }
   CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_COMPLETED);
   uint64_t used_polls=driver.workers[work_owner].polls-before_polls;
-  CHECK(used_polls>100u && (notifications[work_owner]-before_notifications)*8u<used_polls);
+  CHECK(used_polls>100u && notifications[work_owner]==before_notifications);
   KuTaskAdapterOutcomeV1 work_result={0};
   CHECK(ku_task_value_take(&work,NULL,&work_result)==KU_TASK_CONTROL_OK);
   CHECK(work_result.value.integer.ok && work_result.value.integer.value==5000);
@@ -100,10 +104,18 @@ int main(void) {
     CHECK(ku_task_driver_pump(&driver,work_owner,4u,&next)==KU_TASK_DRIVER_OK);
   CHECK(!driver.resident && !driver.reserved_bytes);
   KuTaskValueV1 replacement={0}; int64_t value=9;
+  size_t before_new_publication[2]={notifications[0],notifications[1]};
   CHECK(ku_task_0_start_value(&driver,&value,&replacement)==KU_TASK_DRIVER_OK);
+  size_t replacement_owner=slots[replacement.ticket.slot].owner_worker-1u;
+  /* Publication after the final pump lock observes pumping==0 and retains its
+   * actual directed wake, even before the embedding loop reaches OS poll. */
+  CHECK(notifications[replacement_owner]>before_new_publication[replacement_owner]);
+  CHECK(notifications[1u-replacement_owner]==before_new_publication[1u-replacement_owner]);
   CHECK(ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
   CHECK(ku_task_value_drop(&replacement,deadline)==KU_TASK_DRIVER_OK);
+  size_t before_close[2]={notifications[0],notifications[1]};
   CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(notifications[0]>before_close[0] && notifications[1]>before_close[1]);
   for(size_t n=0;n<16u && driver.workers_exited<2u;n++)
     for(size_t owner=0;owner<2u;owner++) if(driver.workers[owner].state!=KU_TASK_DRIVER_WORKER_EXITED) {
       uint32_t result=ku_task_driver_pump(&driver,owner,4u,&next);

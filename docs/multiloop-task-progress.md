@@ -130,3 +130,17 @@ Linux 新结果补齐了内存归因证据：64 MiB 私有域 memory.events.loca
 现改为直接 Win32 进程计数与 Toolhelp 线程快照，所有诊断句柄均显式关闭；采样错误、缺失或非有限字段明确失败。新入口保留 cold、首次各阶段、同进程三轮重复及全矩阵最终状态，不逐轮重置基线；重复与最终回收仍沿用原 +2 阈值，冷态 RSS 仍沿用 16 MiB 门槛。冷态新增句柄完整保留，不能写成冷态句柄全部归零或未经证明的系统缓存。6 项本机回归通过，2 项真实 Win32 采样检查等待 Windows 实际执行。
 
 Windows CI 分成资源/退役与 PG/Task Scheduler 两个定向组，以免不相关失败挡住各自执行；未运行的全量步骤明确跳过，不计通过。`src/` 与 Cargo 均未变化，Linux 正式驱动的负载逻辑、阶段及判定也未变化；资源采样只改 Windows 分支。
+
+## macOS 新热点路径的有界关联诊断与最小修复
+
+旧本机2/250预检缺少内部请求映射，原记录不覆盖、不补写唯一原因。本轮对同一新路径使用私有诊断产物及定长整数环，捕获一个新的完整504后停止采集：request1400的 `/hot`，submit入口至选择504为1000.259ms，所在owner实际CPU约20.846ms。绝对handler截止点至选择超时约0.083ms，不能将客户端1376.648ms全部算成handler执行；请求准入、响应交付和压测端调度分别保留。
+
+确认的可修改路径是driver mutex内的多余自唤醒：pump已把剩余ready表达为 `next_deadline=0`，尾部仍调用HTTP socket notifier。两段锁内通知调用区间墙钟69.973/80.264ms、线程CPU0.026/0.124ms；另一owner的driver取锁区间120.623ms并与之重叠。样本还包含poll(0)、poll后到下轮pump等显著off-CPU区间；不能将整次504唯一归因于通知，也不能将所有off-CPU时间写成持续可运行但没拿到CPU。
+
+最小修复只删除pump尾部通知，不改变请求期限、32量子批次、64dispatch预算或线程模型。最后检查与pumping标志在同一driver锁下：此前发布已体现在ready/deadline0；此后发布看到pumping=0仍通知目标owner。关闭/故障广播保留。既有external-owner永久回归新增无自通知、5000轮持续正确推进、外部新发布定向通知和关闭广播断言；旧代码在新断言失败，修后整个source目标16/16通过。
+
+私有候选仍观察到116ms请求总耗时，窗口在首个诊断触发后停止，不能拿其280/280与修前1403次作错误率对照。真正的修后短预检使用重建CLI生成的普通release产物、原N4/50RPS/32客户端/5秒完整窗口，没有诊断环、libproc或sample：250/250正确，错误/主动拒绝0，p99=28.5ms，loop delay峰3ms，退出0。它满足原短门槛，不代表每次超过100ms的墙钟空窗都已解释，也不替代最终三平台/正式窗口。
+
+精简时间线、身份/patch摘要与竞争说明见[诊断记录](evidence/mac-tail-notify-diagnostic.json)，有界原始窗口及5秒报告保留在本机证据目录。修后本机fmt、workspace/all-targets clippy拒绝warnings、15项辅助回归（12过、3Windows专用跳过）通过。因为这次确实修改运行时，新冻结提交必须重新执行对应三平台检查和同参数正式30分钟，原d173的通过不能冒充修后通过。
+
+Windows PG辅助复验另修两处明确失败：SDDL把当前SID合法缩写为LA，不能全文字符串判断，改用SecurityIdentifier和Modify/OI/CI位；从pwsh父进程调用Windows PowerShell时，只在子环境移除PSModulePath，让引擎建立匹配的默认模块路径，父环境及PATH/libpq保留。真正PG检查仍由新Windows实跑结果确认，不把ACL脚本通过当数据库通过。

@@ -418,9 +418,9 @@ static void ku_task_driver_signal_work(KuTaskDriverV1* driver) {
  * broadcast for startup/close/fault and legacy shared-condition workers. */
 static void ku_task_driver_signal_owner(KuTaskDriverV1* driver,size_t owner) {
   if(driver->fixed_owner && driver->event_wake && owner && owner<=driver->workers_created) {
-    /* The active external pump rechecks ready work and the cached deadline
-     * under this same mutex before parking. Its final ready publication sends
-     * one durable wake; per-quantum self-notifications only contend on send. */
+    /* The active external pump rechecks ready work and reports deadline zero
+     * under this same mutex before returning. Later publication observes
+     * pumping==0 and keeps its directed wake; self-notification adds no work. */
     if(driver->external_loops && driver->workers[owner-1u].pumping)return;
     driver->event_wake(driver->event_context,owner-1u);
     if(driver->external_loops || driver->io_wait)return;
@@ -2907,7 +2907,10 @@ static uint32_t ku_task_driver_pump(KuTaskDriverV1* driver, size_t owner,
     worker->state=KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
   } else {
     worker->state=KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
-    if (worker->local_queued) driver->event_wake(driver->event_context,owner);
+    /* Remaining ready work already requires the caller's immediate next turn.
+     * Do not call its socket notifier under this lock for our own continuation.
+     * A later publisher takes the same lock, sees pumping==0, and still wakes
+     * the owner if it arrives between this return and the caller's OS wait. */
   }
   checked=driver->fault ? driver->fault : count ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
   ku_task_driver_signal(driver);

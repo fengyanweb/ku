@@ -62,37 +62,61 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $root = $env:KU_PG_FIXTURE_ROOT
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$before = Get-Acl -LiteralPath $root
-$beforeSddl = $before.Sddl
-$beforeOwner = $before.Owner
-$parent = [System.IO.Directory]::GetParent($root).FullName
-$parentSddl = (Get-Acl -LiteralPath $parent).Sddl
-$evidence = @{user_sid=$sid.Value; owner_before=$beforeOwner; sddl_before=$beforeSddl;
-  parent_sddl_before=$parentSddl; rights='Modify'; inheritance='ContainerInherit,ObjectInherit';
+$evidence = @{user_sid=$sid.Value; engine_version=$PSVersionTable.PSVersion.ToString();
+  engine_edition=$PSVersionTable.PSEdition; engine_home=$PSHOME; module_path=$env:PSModulePath;
+  rights='Modify'; inheritance='ContainerInherit,ObjectInherit';
   scope='private fixture root and inherited children only'}
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $sid, [System.Security.AccessControl.FileSystemRights]::Modify,
-    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow)
 try {
+    $before = Get-Acl -LiteralPath $root
+    $evidence.sddl_before = $before.Sddl
+    $evidence.owner_before = $before.Owner
+    $parent = [System.IO.Directory]::GetParent($root).FullName
+    $evidence.parent_sddl_before = (Get-Acl -LiteralPath $parent).Sddl
+    $requiredRights = [System.Security.AccessControl.FileSystemRights]::Modify
+    $requiredInheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid, $requiredRights, $requiredInheritance,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow)
     $before.AddAccessRule($rule)
     Set-Acl -LiteralPath $root -AclObject $before
+    $after = Get-Acl -LiteralPath $root
+    $evidence.owner_after = $after.Owner
+    $evidence.sddl_after = $after.Sddl
+    $evidence.parent_sddl_after = (Get-Acl -LiteralPath $parent).Sddl
+    $matchingRules = @()
+    foreach ($entry in $after.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        $entrySid = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($entrySid -eq $sid.Value) {
+            $matchingRules += @{sid=$entrySid;
+              allow=($entry.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow);
+              modify=(($entry.FileSystemRights -band $requiredRights) -eq $requiredRights);
+              object_and_container_inherit=(($entry.InheritanceFlags -band $requiredInheritance) -eq $requiredInheritance);
+              applies_to_root=($entry.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None)}
+        }
+    }
+    $evidence.current_user_access_rules = $matchingRules
+    $evidence.current_user_modify_inheritable = @($matchingRules | Where-Object {
+        $_.allow -and $_.modify -and $_.object_and_container_inherit -and $_.applies_to_root
+    }).Count -gt 0
 } catch {
     $evidence.error = $_.Exception.Message
     $evidence | ConvertTo-Json -Compress
     exit 1
 }
-$after = Get-Acl -LiteralPath $root
-$evidence.owner_after = $after.Owner
-$evidence.sddl_after = $after.Sddl
-$evidence.parent_sddl_after = (Get-Acl -LiteralPath $parent).Sddl
-$evidence | ConvertTo-Json -Compress
+$evidence | ConvertTo-Json -Compress -Depth 4
 """
+    # A pwsh parent exports its Core-only module search path. Windows PowerShell
+    # must build its own defaults to load Microsoft.PowerShell.Security/Get-Acl.
+    # Change only this child's copy; PATH/libpq and the caller stay untouched.
+    environment = {name: value for name, value in os.environ.items() if name.upper() != "PSMODULEPATH"}
+    environment["KU_PG_FIXTURE_ROOT"] = str(root.resolve())
     result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
-                            env=os.environ | {"KU_PG_FIXTURE_ROOT": str(root.resolve())})
+                            env=environment)
     evidence = {"exit_code": result.returncode, "python_version": sys.version,
+                "child_psmodulepath_removed": True,
+                "parent_psmodulepath_present": any(name.upper() == "PSMODULEPATH" for name in os.environ),
                 "stdout_tail": result.stdout[-12000:], "stderr_tail": result.stderr[-2000:]}
     report["windows_pg_directory_acl"] = evidence
     if result.returncode or len(result.stdout) > 12000:
@@ -101,6 +125,8 @@ $evidence | ConvertTo-Json -Compress
     del evidence["stdout_tail"]
     if evidence["acl"]["parent_sddl_before"] != evidence["acl"]["parent_sddl_after"]:
         raise RuntimeError("PostgreSQL fixture parent ACL changed during private root setup")
+    if evidence["acl"].get("current_user_modify_inheritable") is not True:
+        raise RuntimeError("PostgreSQL fixture user SID lacks the required inherited Modify rule")
 
 
 class DatabaseProxy:

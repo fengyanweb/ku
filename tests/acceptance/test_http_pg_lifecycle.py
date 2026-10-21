@@ -44,7 +44,8 @@ class WindowsPostgresDirectoryContracts(unittest.TestCase):
             with self.subTest(parent_changed=changed), \
                     tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary:
                 report = {}
-                acl = {"parent_sddl_before": "parent", "parent_sddl_after": "changed" if changed else "parent"}
+                acl = {"parent_sddl_before": "parent", "parent_sddl_after": "changed" if changed else "parent",
+                       "current_user_modify_inheritable": True}
                 success = SimpleNamespace(returncode=0, stdout=json.dumps(acl), stderr="")
                 with patch.object(fixture.sys, "platform", "win32"), \
                         patch.object(fixture.subprocess, "run", return_value=success) as runner:
@@ -58,6 +59,35 @@ class WindowsPostgresDirectoryContracts(unittest.TestCase):
                 self.assertEqual(runner.call_args.kwargs["env"]["KU_PG_FIXTURE_ROOT"], str(Path(temporary).resolve()))
                 self.assertEqual(report["windows_pg_directory_acl"]["acl"], acl)
 
+    def test_only_child_module_path_is_reset_and_other_environment_is_preserved(self):
+        acl = {"parent_sddl_before": "parent", "parent_sddl_after": "parent",
+               "current_user_modify_inheritable": True}
+        success = SimpleNamespace(returncode=0, stdout=json.dumps(acl), stderr="")
+        inherited = {"PSModulePath": "Core-only-module-path", "KU_PG_LIB": "private-libpq", "PATH": "unchanged-path"}
+        with tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary, \
+                patch.dict(fixture.os.environ, inherited), \
+                patch.object(fixture.sys, "platform", "win32"), \
+                patch.object(fixture.subprocess, "run", return_value=success) as runner:
+            before = dict(os.environ)
+            fixture.prepare_windows_pg_directory(Path(temporary), {})
+            child = runner.call_args.kwargs["env"]
+            self.assertFalse(any(name.upper() == "PSMODULEPATH" for name in child))
+            self.assertEqual(child["KU_PG_LIB"], inherited["KU_PG_LIB"])
+            self.assertEqual(child["PATH"], inherited["PATH"])
+            self.assertEqual(dict(os.environ), before)
+
+    def test_missing_current_user_modify_inheritance_fails(self):
+        for accepted in (None, False):
+            with self.subTest(accepted=accepted), \
+                    tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary:
+                acl = {"parent_sddl_before": "parent", "parent_sddl_after": "parent",
+                       "current_user_modify_inheritable": accepted}
+                success = SimpleNamespace(returncode=0, stdout=json.dumps(acl), stderr="")
+                with patch.object(fixture.sys, "platform", "win32"), \
+                        patch.object(fixture.subprocess, "run", return_value=success):
+                    with self.assertRaises(RuntimeError):
+                        fixture.prepare_windows_pg_directory(Path(temporary), {})
+
     @unittest.skipUnless(os.name == "nt", "actual directory ACL requires Windows")
     def test_real_windows_acl_grants_current_user_without_touching_parent(self):
         report = {}
@@ -66,7 +96,10 @@ class WindowsPostgresDirectoryContracts(unittest.TestCase):
             acl = report["windows_pg_directory_acl"]["acl"]
             self.assertEqual(acl["parent_sddl_before"], acl["parent_sddl_after"])
             self.assertEqual(acl["owner_before"], acl["owner_after"])
-            self.assertIn(acl["user_sid"], acl["sddl_after"])
+            self.assertTrue(acl["current_user_modify_inheritable"])
+            self.assertTrue(any(rule["sid"] == acl["user_sid"] and rule["allow"] and rule["modify"]
+                                and rule["object_and_container_inherit"] and rule["applies_to_root"]
+                                for rule in acl["current_user_access_rules"]))
             self.assertEqual(acl["rights"], "Modify")
             self.assertEqual(acl["inheritance"], "ContainerInherit,ObjectInherit")
             child = Path(temporary) / "test-data"
