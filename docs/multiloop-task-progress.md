@@ -104,3 +104,11 @@ TCP 迟到事件夹具原先把 1024 个 1064 字节 job 放在局部栈上，�
 同轮普通套件在 macOS/Windows 各有一个相同 TCP 对端夹具失败，Linux 默认套件全部通过。对端从非阻塞 listener 接受 socket 后直接执行带超时的 `read_exact`，并未显式恢复阻塞模式；在本机最小复现中，旧模式在约 2µs 返回 WouldBlock，恢复阻塞后等待约 82ms 取得完整 `A\0B`。现只为夹具 peer 设置阻塞模式，保持 3 秒读写期限、部分响应、二进制字节和单执行器 timer 先行断言。普通 Task source 16/16、ASan/UBSan 对应 TCP 1/1 本机通过，Windows 修后结果仍由最终 CI 确认。此处没有证据要求修改生产 TCP reactor。
 
 Linux 服务内存验收的旧样本确实达到 64 MiB 并终止第一代，301ms 后替代可用、另一实例 10/10，清理后域为空；失败是 `memory_limit_observed=false`。原提供器仅读叶层，而私有总域也设置上限，遗漏了父层触发可能性。现记录本代开始前和退休后的私有域 `memory.events.local` 与叶层计数；配置域的新 oom 与该叶实际 oom_kill 同时成立才报告限制终止，单独主机 OOM 或历史事件不归因。纯计数 3 项与状态 7 项本机通过；旧记录没有父层事件，不能补写唯一原因，实际归因和恢复仍等新 CI 原始计数确认，见 [Linux 门禁记录](evidence/linux-memory-provider-gate.json)。
+
+## Windows 服务存在性检查的定向收尾
+
+提交 `d1738ef` 的三平台默认套件、工具检测、原生构建和安装检查通过；Linux/macOS 的真实 PG、服务替换、更新/回滚也通过。Windows 后续第一项在压力请求前报 `slot a already has a supervisor`，三个新 slot 最后均不可达。原报告未保留连接阶段和 errno，不能推断已有进程、端口冲突或超时中的唯一原因；后续 Windows 验收当时被跳过。
+
+管理端现保留分段错误和最后状态。仅 Windows 的连接异常可再使用 `SO_EXCLUSIVEADDRUSE` 绑定证明确切 loopback 端口空闲；不 listen、不复用地址，任何绑定失败（包括残留连接）保持不可达和预算。自有存活 supervisor 即使暂未监听也禁止重复启动。期限没有增加，业务 HTTP/SQL 没有重发。本机管理回归 10 项通过，1 项真实 Winsock 检查等待 Windows；真实无响应监听者仍为不可达。
+
+工作流新增显式 `workflow_dispatch` 的 `scope=windows-service`，只用于复验受影响的部署辅助代码，实际运行 Windows 限额、阻塞退役、短矩阵、PG 与 Task Scheduler。普通 push/PR 仍完整运行；已通过的 `d1738ef` 全量结果保留，不能把定向模式冒充新的全量测试。本轮 `src/`、Cargo 和原生生成链路没有变化，独立 Linux 正式窗口继续对应自己的冻结提交。

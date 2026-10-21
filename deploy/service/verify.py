@@ -126,6 +126,10 @@ fn main(): null! {
             path.write_text(json.dumps(data), encoding="utf-8")
             config = M.load(path)
             a, b, _ = config["slots"]
+            report["slot_preflight"] = {
+                slot["name"]: M.status(config, slot) for slot in config["slots"]
+            }
+            save()
             if platform.system() == "Darwin":
                 rejected = subprocess.run(M.command(config, a), env=M.environment(config, a),
                                           capture_output=True, text=True, timeout=5)

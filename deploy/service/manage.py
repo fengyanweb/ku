@@ -68,18 +68,78 @@ def slot_named(config, name):
 def call(address, method, route, token=None, timeout=1):
     host, port = address.rsplit(":", 1)
     connection = http.client.HTTPConnection(host, int(port), timeout=timeout)
+    started = time.monotonic()
+    stage = "connect"
     try:
+        connection.connect()
+        stage = "request"
         headers = {"Connection": "close"}
         if token:
             headers["X-Ku-Control-Token"] = token
         connection.request(method, route, headers=headers)
+        stage = "response_headers"
         response = connection.getresponse()
+        stage = "response_body"
         data = response.read(8193)
         if len(data) > 8192:
             raise ValueError("bounded control response exceeded")
         return response.status, data.decode("utf-8")
+    except (OSError, http.client.HTTPException) as error:
+        error.ku_control_context = {
+            "stage": stage, "elapsed_ms": round((time.monotonic()-started)*1000, 3),
+            "error_type": type(error).__name__, "errno": getattr(error, "errno", None),
+            "winerror": getattr(error, "winerror", None), "detail": str(error)[:256],
+        }
+        raise
     finally:
         connection.close()
+
+
+def windows_control_port_absent(address):
+    """Prove vacancy without connecting, listening or reusing another socket.
+
+    Windows may still be resolving a refused loopback connect when its socket
+    deadline expires. An exclusive bind succeeds only if the exact endpoint
+    is free. Any failure, including lingering connections, stays inconclusive;
+    it must never release a deployment reservation.
+    """
+    host, port = address.rsplit(":", 1)
+    if host != "127.0.0.1" or not hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        return False, {"method": "windows_exclusive_bind", "result": "unavailable"}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            probe.bind((host, int(port)))
+        return True, {"method": "windows_exclusive_bind", "result": "vacant"}
+    except OSError as error:
+        return False, {"method": "windows_exclusive_bind", "result": "inconclusive",
+                       "errno": error.errno, "winerror": getattr(error, "winerror", None),
+                       "detail": str(error)[:256]}
+
+
+def control_failure(slot, error):
+    context = getattr(error, "ku_control_context", {
+        "stage": "unknown", "error_type": type(error).__name__,
+        "errno": getattr(error, "errno", None), "winerror": getattr(error, "winerror", None),
+        "detail": str(error)[:256],
+    })
+    state = {"phase": "unreachable", "pid": None,
+             "control_error": f"{type(error).__name__}: {error}"[:256],
+             "control_failure": context}
+    process = OWNED_SUPERVISORS.get(slot["name"])
+    if process is not None and process.poll() is None:
+        # A live owned child may not have bound yet. Preserve its reservation
+        # even when the endpoint is not listening, and refuse duplicate start.
+        state.update(pid=process.pid, owned_supervisor_alive=True)
+        return state
+    if isinstance(error, ConnectionRefusedError):
+        state.update(phase="absent", pid=0)
+    elif sys.platform == "win32":
+        absent, proof = windows_control_port_absent(slot["control_addr"])
+        state["control_presence"] = proof
+        if absent:
+            state.update(phase="absent", pid=0)
+    return state
 
 
 def status(config, slot):
@@ -91,13 +151,10 @@ def status(config, slot):
         if code != 200:
             raise RuntimeError(f"control {slot['name']} at {slot['control_addr']} response {code}: {body[:256]}")
         return json.loads(body)
-    except ConnectionRefusedError:
-        return {"phase": "absent", "pid": 0}
     except (OSError, http.client.HTTPException) as error:
         # A failed read is not a process-exit receipt. Keep its deployment
         # reservation and refuse duplicate startup until the listener is gone.
-        return {"phase": "unreachable", "pid": None,
-                "control_error": f"{type(error).__name__}: {error}"[:256]}
+        return control_failure(slot, error)
 
 
 def command(config, slot):
@@ -147,26 +204,30 @@ def write_config(config):
 
 def wait_ready(config, slot, timeout):
     deadline = time.monotonic() + timeout
+    state = None
     while time.monotonic() < deadline:
         state = status(config, slot)
         if state["phase"] == "ready":
             return state
         time.sleep(0.05)
-    raise TimeoutError(f"slot {slot['name']} not ready before fixed deadline")
+    raise TimeoutError(f"slot {slot['name']} not ready before fixed deadline; last status: {json.dumps(state)}")
 
 
 def wait_absent(config, slot, timeout):
     deadline = time.monotonic() + timeout
+    state = None
     while time.monotonic() < deadline:
-        if status(config, slot)["phase"] == "absent":
+        state = status(config, slot)
+        if state["phase"] == "absent":
             return
         time.sleep(0.05)
-    raise TimeoutError(f"slot {slot['name']} has not retired")
+    raise TimeoutError(f"slot {slot['name']} has not retired; last status: {json.dumps(state)}")
 
 
 def start(config, slot):
-    if status(config, slot)["phase"] != "absent":
-        raise RuntimeError(f"slot {slot['name']} already has a supervisor")
+    state = status(config, slot)
+    if state["phase"] != "absent":
+        raise RuntimeError(f"slot {slot['name']} already has a supervisor or cannot prove absence; status: {json.dumps(state)}")
     active = sum(status(config, candidate)["phase"] != "absent" for candidate in config["slots"])
     if active >= config["deployment_budget"]["max_parallel_instances"]:
         raise RuntimeError("deployment coexistence limit reached")
@@ -190,9 +251,12 @@ def start(config, slot):
 
 def stop(config, slot):
     deadline = time.monotonic() + config["operation_timeout_seconds"]
-    while status(config, slot)["phase"] != "absent":
+    while True:
+        state = status(config, slot)
+        if state["phase"] == "absent":
+            break
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"slot {slot['name']} has not retired")
+            raise TimeoutError(f"slot {slot['name']} has not retired; last status: {json.dumps(state)}")
         try:
             code, _ = call(slot["control_addr"], "POST", "/stop", config["_token"],
                            timeout=min(1, max(.01, deadline-time.monotonic())))
