@@ -1,0 +1,260 @@
+name: Multiloop sustained acceptance
+run-name: Multiloop 30m PR ${{ github.event.pull_request.number }} at ${{ github.event.pull_request.head.sha }}
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multiloop-sustained-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  sustained:
+    if: github.event.label.name == 'run-multiloop-sustained'
+    name: Four-loop frozen 30-minute acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_EVENT_LOOPS: "4"
+      KU_BLOCKING_THREADS: "5"
+      KU_THREAD_BUDGET: "16"
+      KU_SUSTAINED_EVIDENCE: ${{ runner.temp }}/ku-multiloop-sustained
+      KU_EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - name: Freeze requested plan before checkout or load
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["KU_SUSTAINED_EVIDENCE"])
+          root.mkdir(parents=True, exist_ok=True)
+          plan = {
+              "status": "prepared_not_executed", "source_sha": os.environ["KU_EXPECTED_SOURCE_SHA"],
+              "runner": "ubuntu-24.04", "required_effective_cpus": 4,
+              "event": "pull_request:labeled:run-multiloop-sustained",
+              "event_payload": {key: os.environ.get(key) for key in ["GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA"]},
+              "loops": 4, "blocking_threads_total": 5, "thread_budget": 16,
+              "duration_seconds": 1800, "normal_arrival_rps": 50, "overload_arrival_rps": 150,
+              "overload_slow_peer_attempts_per_second": 280, "overload_slow_peer_connections": 280,
+              "phases_seconds": {"warm": 60, "steady": 1470, "overload": 30, "recovery": 240},
+              "thresholds": {"normal_unexpected_errors": 0, "normal_client_shed": 0,
+                  "normal_p99_ms": 250, "pre_overload_peak_loop_delay_ms": 100,
+                  "overload_wrong_body": 0, "recovery_seconds": 5, "native_drain_exit": 0},
+              "overload_policy": "Require actual admission pressure. Count HTTP responses, direct-peer EOF/reset and load-client budget refusals separately; do not label transport closes as HTTP 503 or uniquely attribute each close. Other errors fail.",
+              "command": "python3 -u -B tests/acceptance/multiloop_load.py --ku target/release/ku --loops 4 --duration 1800 --rps 50 --profile release --output report.json",
+              "scope": "direct loopback HTTP; same-host bounded load client; no database, service-supervisor or historical-504 rerun",
+          }
+          (root/"plan.json").write_text(json.dumps(plan, indent=2)+"\n")
+          PY
+
+      - name: Check out the exact labeled PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Record runner and reject less than four available CPUs
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json, os, platform, subprocess
+          from pathlib import Path, PurePosixPath
+          root = Path(os.environ["KU_SUSTAINED_EVIDENCE"])
+          def command(argv):
+              result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+              return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+          machine = {
+              "uname": command(["uname", "-a"]), "lscpu": command(["lscpu"]),
+              "nproc": command(["nproc"]), "python": platform.python_version(),
+              "cc": command(["cc", "--version"]), "affinity": sorted(os.sched_getaffinity(0)),
+              "logical_cpu_count": os.cpu_count(), "cpu_quotas": [], "errors": [],
+              "source_sha": command(["git", "rev-parse", "HEAD"])["stdout"].strip(),
+              "source_status": command(["git", "status", "--porcelain"])["stdout"],
+          }
+          for name in ["/proc/self/cgroup", "/proc/self/mountinfo", "/proc/stat", "/proc/pressure/cpu"]:
+              path = Path(name)
+              if path.is_file():
+                  (root/(name.strip("/").replace("/", "-")+"-before.txt")).write_text(path.read_text())
+          try:
+              nproc = int(machine["nproc"]["stdout"].strip())
+              limits = [len(machine["affinity"]), nproc]
+              memberships = Path("/proc/self/cgroup").read_text().splitlines()
+              membership = next(line.split(":", 2)[2] for line in memberships if line.startswith("0::"))
+              mount = next(line.split(" - ", 1)[0].split() for line in Path("/proc/self/mountinfo").read_text().splitlines()
+                           if line.split(" - ", 1)[1].split()[0] == "cgroup2")
+              mount_root, mount_point = PurePosixPath(mount[3]), Path(mount[4])
+              current = mount_point/str(PurePosixPath(membership).relative_to(mount_root))
+              current = current.resolve()
+              mount_point = mount_point.resolve()
+              current.relative_to(mount_point)
+              while True:
+                  quota_file = current/"cpu.max"
+                  if quota_file.is_file():
+                      text = quota_file.read_text().strip()
+                      quota, period = text.split()
+                      limit = None if quota == "max" else int(quota)/int(period)
+                      machine["cpu_quotas"].append({"path": str(quota_file), "value": text, "cpus": limit})
+                      if limit is not None:
+                          limits.append(limit)
+                  if current == mount_point:
+                      break
+                  current = current.parent
+              machine["effective_cpu_capacity"] = min(limits)
+              if machine["effective_cpu_capacity"] < 4:
+                  machine["errors"].append("affinity, nproc or visible ancestor cgroup quota provides fewer than 4 CPUs")
+          except (OSError, ValueError, StopIteration, ZeroDivisionError) as error:
+              machine["errors"].append("cannot establish Ubuntu cgroup-v2 CPU capacity: "+repr(error))
+          if machine["source_sha"] != os.environ["KU_EXPECTED_SOURCE_SHA"] or machine["source_status"]:
+              machine["errors"].append("checkout is not the clean exact labeled PR head")
+          (root/"machine.json").write_text(json.dumps(machine, indent=2)+"\n")
+          if machine["errors"]:
+              raise SystemExit("; ".join(machine["errors"]))
+          print("effective CPU capacity:", machine["effective_cpu_capacity"])
+          PY
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustc --version --verbose > "$KU_SUSTAINED_EVIDENCE/rustc.txt"
+          cargo --version > "$KU_SUSTAINED_EVIDENCE/cargo.txt"
+          cc --version > "$KU_SUSTAINED_EVIDENCE/cc.txt"
+          python3 --version > "$KU_SUSTAINED_EVIDENCE/python.txt"
+
+      - name: Build the exact release CLI before the timed window
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin ku 2>&1 | tee "$KU_SUSTAINED_EVIDENCE/build.log"
+          sha256sum target/release/ku tests/acceptance/multiloop_load.py tests/fixtures/multiloop_service.ku > "$KU_SUSTAINED_EVIDENCE/inputs.sha256"
+
+      - name: Run the frozen 30-minute plan once with bounded cleanup
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json, os, signal, subprocess, time
+          from pathlib import Path
+          root = Path(os.environ["KU_SUSTAINED_EVIDENCE"])
+          argv = ["/usr/bin/time", "-v", "-o", str(root/"invocation-cost.txt"),
+                  "python3", "-u", "-B", "tests/acceptance/multiloop_load.py",
+                  "--ku", "target/release/ku", "--loops", "4", "--duration", "1800",
+                  "--rps", "50", "--profile", "release", "--output", str(root/"report.json")]
+          result = {"status": "starting", "command": argv}
+          child = None
+          began = time.monotonic()
+          def interrupted(signum, frame):
+              raise InterruptedError("runner interrupted with signal "+str(signum))
+          def send(signum):
+              try:
+                  os.killpg(child.pid, signum)
+              except ProcessLookupError:
+                  pass
+          def group_alive():
+              if child is None:
+                  return False
+              child.poll()
+              try:
+                  os.killpg(child.pid, 0)
+                  return True
+              except ProcessLookupError:
+                  return False
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+          try:
+              with (root/"driver.log").open("wb") as log:
+                  child = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                  result["exit_code"] = child.wait(timeout=35*60)
+                  result["status"] = "finished" if result["exit_code"] == 0 else "failed"
+          except (subprocess.TimeoutExpired, InterruptedError) as error:
+              result.update(status="interrupted", error=str(error), exit_code=124)
+          finally:
+              # SIGINT lets Python unwind the driver's existing finally blocks.
+              # The process group also covers its compiler/native descendants.
+              signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              signal.signal(signal.SIGINT, signal.SIG_IGN)
+              if group_alive():
+                  result["cleanup_required"] = True
+                  if result.get("exit_code") == 0:
+                      result.update(status="failed", error="driver returned with live descendants", exit_code=1)
+                  for sig, grace in [(signal.SIGINT, 15), (signal.SIGTERM, 5), (signal.SIGKILL, 5)]:
+                      if not group_alive():
+                          break
+                      send(sig)
+                      deadline = time.monotonic()+grace
+                      while group_alive() and time.monotonic() < deadline:
+                          time.sleep(.1)
+                  result["process_group_still_visible"] = group_alive()
+              if child is not None:
+                  try:
+                      child.wait(timeout=1)
+                  except subprocess.TimeoutExpired:
+                      result.update(status="failed", error="owned process did not reap after bounded kill", exit_code=124)
+              result["elapsed_seconds"] = time.monotonic()-began
+              (root/"driver-exit.json").write_text(json.dumps(result, indent=2)+"\n")
+          raise SystemExit(result.get("exit_code", 1))
+          PY
+
+      - name: Retain resource peaks and outcome without converting failure to success
+        if: always()
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["KU_SUSTAINED_EVIDENCE"])
+          root.mkdir(parents=True, exist_ok=True)
+          for name in ["/proc/stat", "/proc/pressure/cpu"]:
+              path = Path(name)
+              if path.is_file():
+                  (root/(name.strip("/").replace("/", "-")+"-after.txt")).write_text(path.read_text())
+          report = json.loads((root/"report.json").read_text()) if (root/"report.json").is_file() else {}
+          exit_result = json.loads((root/"driver-exit.json").read_text()) if (root/"driver-exit.json").is_file() else {}
+          samples = []
+          for run in report.get("runs", []):
+              samples.append(run.get("baseline", {}))
+              for phase in run.get("phases", []):
+                  samples.extend(phase.get("resource_samples", []))
+                  samples.append(phase.get("end_resources", {}))
+          samples.extend(report.get("live", {}).get("resource_samples", []))
+          parameters = report.get("parameters", {})
+          matches_plan = (report.get("source_commit") == os.environ["KU_EXPECTED_SOURCE_SHA"]
+              and report.get("source_dirty") is False
+              and parameters.get("loops") == [4] and parameters.get("duration_seconds") == 1800
+              and parameters.get("arrival_rps") == 50 and parameters.get("native_c_profile") == "release"
+              and parameters.get("blocking_threads_total") == 5 and parameters.get("thread_budget") == 16
+              and parameters.get("overload_slow_peer_attempts_per_second") == 280
+              and parameters.get("overload_slow_peer_connections") == 280
+              and parameters.get("formal_phases_seconds") == {"warm": 60, "steady": 1470, "overload": 30, "recovery": 240})
+          summary = {"status": report.get("status", "not_executed"),
+              "source_sha": os.environ["KU_EXPECTED_SOURCE_SHA"], "driver_exit": exit_result,
+              "report_matches_frozen_plan": matches_plan,
+              "observed_native_peaks": {key: max((row[key] for row in samples if key in row), default=None)
+                  for key in ["rss_bytes", "threads", "fds"]},
+              "cost_scope": "native peaks are sampled, not continuous maxima; GNU time invocation-cost.txt covers cumulative CPU and maximum individual-process RSS, not aggregate process-tree memory",
+              "passed": report.get("status") == "passed" and exit_result.get("exit_code") == 0 and matches_plan}
+          (root/"summary.json").write_text(json.dumps(summary, indent=2)+"\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write("## Frozen multiloop acceptance\n\n```json\n"+json.dumps(summary, indent=2)+"\n```\n")
+          if not summary["passed"]:
+              raise SystemExit("formal acceptance has no complete passing result for the frozen source and plan")
+          PY
+
+      - name: Upload plan, report, logs and cost evidence on every outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: multiloop-sustained-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ku-multiloop-sustained
+          if-no-files-found: error
+          retention-days: 30
