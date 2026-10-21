@@ -1583,14 +1583,8 @@ impl Interpreter {
         }
         let module = target_value.with_read(span, |target| {
             Ok(match target {
-                // Preserve callable fields on typed objects/structs. Other tags
-                // still use the explicit KuValue conversion, without unwrapping.
-                Value::Struct { fields, .. } | Value::Object(fields)
-                    if (name == "as_int" || name == "as_str")
-                        && matches!(fields.get(name), Some(Value::Function { .. })) =>
-                {
-                    ""
-                }
+                // A KuValue can carry any runtime tag, including objects with
+                // callable fields. Converters retain their existing priority.
                 _ if name == "as_int" || name == "as_str" => "kuvalue",
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
@@ -1824,7 +1818,9 @@ impl Interpreter {
                         return Ok(value);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name) {
+                        if let Some(function) =
+                            self.functions.get(name).filter(|_| !env.contains(name))
+                        {
                             let modes = explicit_borrow_modes(function);
                             let mut leases = Vec::new();
                             let mut values = Vec::with_capacity(args.len());

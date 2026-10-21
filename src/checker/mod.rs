@@ -3893,6 +3893,14 @@ impl Checker {
             return Ok(None);
         };
         let target_type = self.check_expr(target)?;
+        if matches!(name.as_str(), "as_int" | "as_str") && target_type != Type::KuValue {
+            return Err(KuError::runtime(
+                format!(
+                    "{name}() is reserved for KuValue conversion; bind a callable field to a variable before calling it"
+                ),
+                span,
+            ));
+        }
         if name == "clone" {
             expect_arg_count("clone", args.len(), 0, span)?;
             if is_http_service_type(&target_type) {
