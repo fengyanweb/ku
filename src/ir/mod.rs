@@ -2326,69 +2326,6 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
-    /// Inspect a prospective method receiver without emitting its effects. This
-    /// intentionally does not turn arbitrary fields into callable values. The
-    /// caller only uses a proven Str to recognize temporary string receivers;
-    /// their real evaluation still goes through the ordinary owned-temp path.
-    fn static_receiver_type(&self, expr: &Expr, depth: usize) -> Option<IrType> {
-        if depth >= 64 {
-            return None;
-        }
-        if let Some(ty) = self.static_place_type(expr) {
-            return Some(ty);
-        }
-        match &expr.kind {
-            ExprKind::TryUnwrap { expr } => match self.static_receiver_type(expr, depth + 1)? {
-                IrType::Result(inner) => Some(*inner),
-                _ => None,
-            },
-            ExprKind::Call { callee, .. } => {
-                if let ExprKind::Variable(_) = &callee.kind {
-                    // A local function value shadows an identically named
-                    // top-level function or builtin, including its return type.
-                    if let Some(bound) = self.static_place_type(callee) {
-                        return match bound {
-                            IrType::Closure { ret, .. } => Some(*ret),
-                            _ => None,
-                        };
-                    }
-                }
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    if let Some(receiver) = self.static_receiver_type(target, depth + 1) {
-                        if name == "clone" {
-                            return Some(receiver);
-                        }
-                        let signature = match &receiver {
-                            IrType::Str => metadata::dotted_signature("string", name),
-                            IrType::Named(native)
-                                if native == metadata::MYSQL_CLIENT
-                                    || native == metadata::MYSQL_RESULT =>
-                            {
-                                metadata::mysql_method_signature(native, name)
-                            }
-                            IrType::Named(native) if native == "__ku_pg_result" => {
-                                metadata::dotted_signature("pg_result", name)
-                            }
-                            IrType::Named(native) if native == "__ku_value" => {
-                                metadata::dotted_signature("kuvalue", name)
-                            }
-                            _ => None,
-                        };
-                        return signature.map(|signature| signature_return_type(&signature, &[]));
-                    }
-                }
-                let (_, ty) = call_kind_and_type(callee, &[], self.signatures);
-                (ty != IrType::Unknown).then_some(ty)
-            }
-            ExprKind::Binary { left, op, right } if *op == BinaryOp::Add => {
-                let left = self.static_receiver_type(left, depth + 1)?;
-                let right = self.static_receiver_type(right, depth + 1)?;
-                (left == IrType::Str && right == IrType::Str).then_some(IrType::Str)
-            }
-            _ => None,
-        }
-    }
-
     fn lower_lvalue_target_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
         match &expr.kind {
             ExprKind::Variable(_) => self.lower_expr(expr),
@@ -2998,56 +2935,47 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
-    /// Recognize receiver-typed stdlib methods without executing a prospective
-    /// callee. User functions and module-qualified calls retain their old path.
+    /// Dispatch an already-evaluated receiver by its actual IR type. The caller
+    /// retains this value for callable-field fallback, so probing never emits
+    /// the receiver again and does not need a second static type inference.
     fn lower_builtin_method(
         &mut self,
         callee: &Expr,
         args: &[Expr],
+        receiver: &IrExpr,
         deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<Option<IrExpr>> {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
         };
-        let force_kuvalue = matches!(name.as_str(), "as_int" | "as_str");
-        let module = if force_kuvalue {
-            // The checker guarantees these converters have a KuValue receiver,
-            // including a fallible index expression whose static type is absent.
-            "kuvalue"
-        } else if is_pure_path(target) {
-            match self.static_place_type(target) {
-                Some(IrType::Array(_)) => "array",
-                Some(IrType::Str) => "string",
-                Some(IrType::Named(n)) if n == "__ku_object" => "object",
-                Some(IrType::Named(n)) if n == "__ku_value" => "kuvalue",
-                Some(IrType::Named(n)) if n == metadata::REDIS_CLIENT => "redis",
-                Some(IrType::Named(n)) if n == metadata::BYTES => "bytes",
-                Some(IrType::Named(n)) if n == metadata::NET_CLIENT => "net",
-                Some(IrType::Named(n))
-                    if n == "__ku_pg_client" && matches!(name.as_str(), "query" | "close") =>
-                {
-                    "pg_client"
-                }
-                Some(IrType::Named(n))
-                    if n == "__ku_pg_result"
-                        && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
-                {
-                    "pg_result"
-                }
-                Some(IrType::Named(n))
-                    if (n == metadata::MYSQL_CLIENT
-                        && matches!(name.as_str(), "query" | "execute" | "close"))
-                        || (n == metadata::MYSQL_RESULT
-                            && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null")) =>
-                {
-                    "mysql"
-                }
-                _ => return Ok(None),
+        let module = match &receiver.ty {
+            IrType::Array(_) => "array",
+            IrType::Str => "string",
+            IrType::Named(n) if n == "__ku_object" => "object",
+            IrType::Named(n) if n == "__ku_value" => "kuvalue",
+            IrType::Named(n) if n == metadata::REDIS_CLIENT => "redis",
+            IrType::Named(n) if n == metadata::BYTES => "bytes",
+            IrType::Named(n) if n == metadata::NET_CLIENT => "net",
+            IrType::Named(n)
+                if n == "__ku_pg_client" && matches!(name.as_str(), "query" | "close") =>
+            {
+                "pg_client"
             }
-        } else if self.static_receiver_type(target, 0) == Some(IrType::Str) {
-            "string"
-        } else {
-            return Ok(None);
+            IrType::Named(n)
+                if n == "__ku_pg_result"
+                    && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+            {
+                "pg_result"
+            }
+            IrType::Named(n)
+                if (n == metadata::MYSQL_CLIENT
+                    && matches!(name.as_str(), "query" | "execute" | "close"))
+                    || (n == metadata::MYSQL_RESULT
+                        && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null")) =>
+            {
+                "mysql"
+            }
+            _ => return Ok(None),
         };
         let signature = if module == "redis" {
             metadata::redis_client_method_signature(name)
@@ -3056,17 +2984,17 @@ impl<'a> FunctionLowerer<'a> {
         } else if module == "net" {
             metadata::net_client_method_signature(name)
         } else if module == "mysql" {
-            let Some(IrType::Named(native)) = self.static_place_type(target) else {
+            let IrType::Named(native) = &receiver.ty else {
                 return Ok(None);
             };
-            metadata::mysql_method_signature(&native, name)
+            metadata::mysql_method_signature(native, name)
         } else {
             metadata::dotted_signature(module, name)
         };
         let Some(signature) = signature else {
             return Ok(None);
         };
-        let receiver = self.lower_field_target(target)?;
+        let receiver = receiver.clone();
         let argument_effects = args
             .iter()
             .map(|arg| !is_pure_append_argument(arg, ""))
@@ -3082,7 +3010,13 @@ impl<'a> FunctionLowerer<'a> {
         ) {
             receiver
         } else {
-            self.snapshot_receiver_before_effects(receiver, remaining_effects != 0)?
+            // A computed receiver already has its own temporary owner. Only a
+            // source place can be replaced by an argument callback; preserving
+            // it keeps the existing snapshot rule without cloning call results.
+            self.snapshot_receiver_before_effects(
+                receiver,
+                remaining_effects != 0 && is_pure_path(target),
+            )?
         };
         let mut lowered_args = Vec::with_capacity(args.len());
         for (index, (arg, has_effects)) in args.iter().zip(argument_effects).enumerate() {
@@ -3287,105 +3221,145 @@ impl<'a> FunctionLowerer<'a> {
                         );
                     }
                 }
+                // Module functions and enum constructors have no runtime
+                // receiver. Every other dotted call evaluates its receiver once
+                // before arguments, then either dispatches a builtin or reuses
+                // that value as the owner of a callable field.
+                let mut prepared_callee = None;
                 if let ExprKind::Field { target, name } = &callee.kind {
-                    if name == "clone" && args.is_empty() {
-                        // Read the receiver in place: `u.name.clone()` must clone
-                        // the field without first moving (clearing) it. For a
-                        // non-field receiver this is identical to `lower_expr`.
-                        let target = self.lower_field_target(target)?;
-                        let ty = target.ty.clone();
-                        return self.emit_temp(IrExpr {
-                            kind: IrExprKind::Call {
-                                callee: Box::new(IrExpr {
-                                    kind: IrExprKind::Local("__ku_clone".to_string()),
-                                    ty: IrType::Function,
-                                }),
-                                args: vec![target],
-                                kind: IrCallKind::Intrinsic("__ku_clone".to_string()),
-                            },
-                            ty,
+                    let module_call = matches!(&target.kind, ExprKind::Variable(_))
+                        && self.static_place_type(target).is_none()
+                        && dotted_name(callee).is_some_and(|dotted| {
+                            dotted.split_once('.').is_some_and(|(module, function)| {
+                                metadata::dotted_signature(module, function).is_some()
+                            })
                         });
-                    }
-                }
-                // Stage 6f: `<array>.map(closure)`. Handled ahead of the generic
-                // argument lowering so the mapper closure's *unannotated* parameter
-                // is filled from the array's element type — the checker infers it
-                // (so the interpreter accepts `map(x => x*2)`), and native must too
-                // (rule 8). The whole call's IR type is `Array(<closure return
-                // type>)` rather than the unknown a fall-through would leave it. The
-                // checker guarantees any `.map(<1 arg>)` has an array receiver, so a
-                // non-array receiver here is unreachable for a checked program.
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    if name == "map" && args.len() == 1 {
-                        let receiver = self.lower_expr(target)?;
-                        // A mapper (or its factory) can replace a captured source
-                        // binding. Keep an owned snapshot until iteration and its
-                        // callbacks finish instead of borrowing a freed buffer.
-                        let receiver = self.snapshot_receiver_before_effects(receiver, true)?;
-                        let IrType::Array(element) = receiver.ty.clone() else {
-                            return Err(KuError::runtime(
-                                "array.map requires an array receiver",
-                                expr.span,
-                            ));
+                    if !module_call && self.enum_variant(callee).is_none() {
+                        let receiver = self.lower_field_target(target)?;
+                        let receiver = if !ir_expr_is_place(&receiver)
+                            && !ir_expr_is_borrowed(&receiver)
+                            && ir_type_is_owned(&receiver.ty)
+                        {
+                            self.emit_temp(receiver)?
+                        } else {
+                            receiver
                         };
-                        // Propagate the element type as the mapper's expected
-                        // parameter type; the return type is recovered from the
-                        // closure body (no body-driven inference of the parameter).
-                        let expected = IrType::Closure {
-                            params: vec![*element],
-                            param_modes: vec![ParamMode::Owned],
-                            ret: Box::new(IrType::Unknown),
-                        };
-                        let mapper = self.lower_expr_with_expected(&args[0], Some(&expected))?;
-                        let ret = match &mapper.ty {
-                            IrType::Closure { ret, .. } => (**ret).clone(),
-                            _ => IrType::Unknown,
-                        };
-                        return self.emit_temp(IrExpr {
-                            kind: IrExprKind::Call {
-                                callee: Box::new(IrExpr {
-                                    kind: IrExprKind::Local("array.map".to_string()),
-                                    ty: IrType::Function,
-                                }),
-                                args: vec![receiver, mapper],
-                                kind: IrCallKind::Intrinsic("array.map".to_string()),
-                            },
-                            ty: IrType::Array(Box::new(ret)),
-                        });
-                    }
-                }
-                // Stage 8a: native HTTP server lifecycle. `app.get/post/put/del`
-                // register a route; `app.listen` runs the accept loop. Detected by
-                // the receiver lowering to the synthetic `__ku_http_server` type
-                // (see `call_kind_and_type`), so a user object with a `.get` method
-                // is never mistaken for a server.
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    if matches!(
-                        name.as_str(),
-                        "get" | "post" | "put" | "del" | "listen" | "bind"
-                    ) && is_pure_path(target)
-                    {
-                        let receiver = self.lower_expr(target)?;
-                        if matches!(&receiver.ty, IrType::Named(n) if n == HTTP_SERVER_TYPE) {
+                        if name == "clone" && args.is_empty() {
+                            let ty = receiver.ty.clone();
+                            return self.emit_temp(IrExpr {
+                                kind: IrExprKind::Call {
+                                    callee: Box::new(IrExpr {
+                                        kind: IrExprKind::Local("__ku_clone".to_string()),
+                                        ty: IrType::Function,
+                                    }),
+                                    args: vec![receiver],
+                                    kind: IrCallKind::Intrinsic("__ku_clone".to_string()),
+                                },
+                                ty,
+                            });
+                        }
+                        if name == "map" && args.len() == 1 {
+                            if let IrType::Array(element) = receiver.ty.clone() {
+                                // Bound inputs still need the existing snapshot
+                                // if a mapper replaces them. A call/array result
+                                // already owns independent temporary storage.
+                                let receiver = self.snapshot_receiver_before_effects(
+                                    receiver,
+                                    is_pure_path(target),
+                                )?;
+                                let expected = IrType::Closure {
+                                    params: vec![*element],
+                                    param_modes: vec![ParamMode::Owned],
+                                    ret: Box::new(IrType::Unknown),
+                                };
+                                let mapper =
+                                    self.lower_expr_with_expected(&args[0], Some(&expected))?;
+                                let ret = match &mapper.ty {
+                                    IrType::Closure { ret, .. } => (**ret).clone(),
+                                    _ => IrType::Unknown,
+                                };
+                                return self.emit_temp(IrExpr {
+                                    kind: IrExprKind::Call {
+                                        callee: Box::new(IrExpr {
+                                            kind: IrExprKind::Local("array.map".to_string()),
+                                            ty: IrType::Function,
+                                        }),
+                                        args: vec![receiver, mapper],
+                                        kind: IrCallKind::Intrinsic("array.map".to_string()),
+                                    },
+                                    ty: IrType::Array(Box::new(ret)),
+                                });
+                            }
+                        }
+                        if matches!(
+                            name.as_str(),
+                            "get" | "post" | "put" | "del" | "listen" | "bind"
+                        ) && is_pure_path(target)
+                            && matches!(&receiver.ty, IrType::Named(n) if n == HTTP_SERVER_TYPE)
+                        {
                             return self.lower_http_server_method(receiver, name, args, expr.span);
                         }
+                        if let Some(value) = self.lower_builtin_method(
+                            callee,
+                            args,
+                            &receiver,
+                            deferred_safepoint.as_deref_mut(),
+                        )? {
+                            return Ok(value);
+                        }
+                        let ty = self.field_type(&receiver.ty, name);
+                        let field = IrExpr {
+                            kind: IrExprKind::Field {
+                                target: Box::new(receiver),
+                                name: name.clone(),
+                            },
+                            ty: ty.clone(),
+                        };
+                        // Reading a callable field retains its closure env,
+                        // following the existing field-read rule; it neither
+                        // consumes the field nor deep-copies its struct owner.
+                        prepared_callee = Some(if ir_expr_is_borrowed(&field) {
+                            field
+                        } else if ir_type_is_owned(&ty) {
+                            self.emit_temp(intrinsic_expr("__ku_clone", vec![field], ty))?
+                        } else {
+                            self.emit_temp(field)?
+                        });
                     }
-                }
-                if let Some(value) =
-                    self.lower_builtin_method(callee, args, deferred_safepoint.as_deref_mut())?
-                {
-                    return Ok(value);
                 }
                 // A lexical function binding takes precedence over a builtin
                 // or top-level function with the same name. Its parameters also
                 // provide context for closure/Result constructor arguments.
-                let bound_callee = match &callee.kind {
-                    ExprKind::Variable(_) => self.static_place_type(callee),
-                    ExprKind::Field { .. } | ExprKind::Index { .. } => self
-                        .static_place_type(callee)
-                        .filter(|ty| matches!(ty, IrType::Closure { .. })),
-                    _ => None,
+                let mut bound_callee = prepared_callee
+                    .as_ref()
+                    .map(|value| value.ty.clone())
+                    .or_else(|| match &callee.kind {
+                        ExprKind::Variable(_) => self.static_place_type(callee),
+                        ExprKind::Field { .. } | ExprKind::Index { .. } => self
+                            .static_place_type(callee)
+                            .filter(|ty| matches!(ty, IrType::Closure { .. })),
+                        _ => None,
+                    });
+                let (probe_kind, _) = if bound_callee.is_some() {
+                    (IrCallKind::Indirect, IrType::Unknown)
+                } else {
+                    call_kind_and_type(callee, &[], self.signatures)
                 };
+                if matches!(probe_kind, IrCallKind::Indirect) {
+                    let value = match prepared_callee.take() {
+                        Some(value) => value,
+                        None => self.lower_expr(callee)?,
+                    };
+                    // Arguments may replace a lexical closure binding. Retain
+                    // the selected closure before evaluating those arguments;
+                    // its env retain is shallow, never a receiver deep copy.
+                    let value = self.snapshot_receiver_before_effects(
+                        value,
+                        args.iter().any(|arg| !is_pure_append_argument(arg, "")),
+                    )?;
+                    bound_callee = Some(value.ty.clone());
+                    prepared_callee = Some(value);
+                }
                 let expected_param_types = match &bound_callee {
                     Some(IrType::Closure { params, .. }) => Some(params.clone()),
                     Some(_) => None,
@@ -3418,7 +3392,7 @@ impl<'a> FunctionLowerer<'a> {
                         },
                     }
                     .as_deref(),
-                    !is_pure_append_argument(callee, ""),
+                    false,
                 )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant
@@ -3483,7 +3457,9 @@ impl<'a> FunctionLowerer<'a> {
                         }
                     }
                     IrCallKind::Indirect => {
-                        let lowered = self.lower_expr(callee)?;
+                        let lowered = prepared_callee.ok_or_else(|| {
+                            KuError::runtime("missing evaluated indirect callee", expr.span)
+                        })?;
                         // Calling a closure value: the call yields the closure's
                         // return type (otherwise it stays Unknown).
                         if let IrType::Closure { ret, .. } = &lowered.ty {

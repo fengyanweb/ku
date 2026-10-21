@@ -2,7 +2,7 @@
 title: 安裝與下載
 description: 下載 Ku 0.0.18 實驗預發行包，瞭解平台、構建工具與安裝驗證。
 kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+verifiedAt: '2026-10-21'
 sources:
   [
     'Cargo.toml',
@@ -20,11 +20,13 @@ This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.
 
 Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
 
-| 系統    | 架構                  | 歸檔文件                                     |
-| ------- | --------------------- | -------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+| 系統    | 架構                  | 歸檔文件                                                                                                                                              |
+| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+
+[下載校驗檔案: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18/SHA256SUMS)
 
 沒有覈實的其他平台安裝包。跨平台編譯能力也不表示任意操作系統或架構已有發行包。
 
@@ -45,6 +47,18 @@ Windows PowerShell：
 ```
 
 應顯示版本 `0.0.18`。需要從任意目錄呼叫時，把該目錄加入 `PATH`，再執行 `ku --version`。VS Code 擴展通過歸檔內的 `ku-language-0.0.18.vsix` 安裝。
+
+## 直譯器與 VS Code 擴充功能
+
+上方平台包同時包含 Ku CLI（`ku run` 使用直譯器）和 `ku-language-0.0.18.vsix`。擴充功能目前隨平台包下載，沒有獨立的 VSIX 下載資產；這裡也沒有瀏覽器內執行直譯器。
+
+解壓後，在 VS Code 擴充功能面板選擇 **… → 從 VSIX 安裝…**，開啟 `ku-language-0.0.18.vsix`，再重新載入視窗。也可以在解壓目錄執行：
+
+```sh
+code --install-extension ./ku-language-0.0.18.vsix
+```
+
+擴充功能需要找到 Ku CLI。將解壓目錄加入 `PATH`，或在 VS Code 設定中將 `ku.executablePath` 指向 `ku`（Windows 為 `ku.exe`）的完整路徑。
 
 ## 執行與構建需要什麼
 

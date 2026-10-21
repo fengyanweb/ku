@@ -4,7 +4,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Features
 
-- Syntax highlighting for Ku 0.0.17 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
+- Syntax highlighting for Ku 0.0.18 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
 - `ku.mod` / `ku.lock` syntax highlighting.
 - Language configuration for comments, brackets, auto-closing pairs, and surrounding pairs.
 - Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, `std.task`, bounded task stress, HTTP response usage, array map, string methods, and `array.try_get`.
@@ -26,7 +26,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Install From VSIX
 
-Use `ku-language-0.0.17.vsix` from the matching target bundle actually listed in [GitHub Releases](https://github.com/fengyanweb/ku/releases). A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; this extension remains `UNLICENSED`.
+Use `ku-language-0.0.18.vsix` from the matching target bundle actually listed in [GitHub Releases](https://github.com/fengyanweb/ku/releases). A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; this extension remains `UNLICENSED`.
 
 To build the VSIX from the repository root instead:
 
@@ -34,8 +34,8 @@ To build the VSIX from the repository root instead:
 cd editors\vscode-ku
 npm ci --ignore-scripts
 npm test
-npx --no-install vsce package --out ku-language-0.0.17.vsix
-code --install-extension .\ku-language-0.0.17.vsix
+npx --no-install vsce package --out ku-language-0.0.18.vsix
+code --install-extension .\ku-language-0.0.18.vsix
 ```
 
 Then reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code, and open any `.ku` file.
@@ -46,7 +46,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 2. Open the Extensions view.
 3. Click `...`.
 4. Choose `Install from VSIX...`.
-5. Pick `ku-language-0.0.17.vsix` from the extracted bundle or your local build.
+5. Pick `ku-language-0.0.18.vsix` from the extracted bundle or your local build.
 6. Reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code.
 
 ## Install By Copying The Extension Folder
@@ -54,7 +54,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 If you do not want to use `vsce`, copy this folder into the VS Code extensions directory:
 
 ```powershell
-$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.17"
+$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.18"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Copy-Item -LiteralPath .\editors\vscode-ku\* -Destination $target -Recurse -Force
 ```

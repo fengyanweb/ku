@@ -4490,6 +4490,9 @@ impl Checker {
         if name != "map" {
             return Ok(None);
         }
+        let Type::Array(element) = self.check_expr(target)? else {
+            return Ok(None);
+        };
         if self.borrowed_expr_root(target).is_some() {
             return Err(KuError::runtime(
                 "borrowed operation is not supported: array.map; clone the array first",
@@ -4497,16 +4500,6 @@ impl Checker {
             ));
         }
         expect_arg_count("array.map", args.len(), 1, span)?;
-        let target_type = self.check_expr(target)?;
-        let Type::Array(element) = target_type else {
-            return Err(KuError::runtime(
-                format!(
-                    "type error: map expects array but got {}",
-                    type_name(&target_type)
-                ),
-                target.span,
-            ));
-        };
         if self.type_contains_native_resource(&element) {
             return Err(KuError::runtime(
                 "array.map cannot clone move-only native resource elements",

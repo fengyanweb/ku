@@ -2,7 +2,7 @@
 title: 'Instalação e downloads'
 description: 'Baixe a versão preliminar experimental Ku 0.0.18 e entenda os requisitos de plataforma e compilação.'
 kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+verifiedAt: '2026-10-21'
 sources:
   [
     'Cargo.toml',
@@ -20,11 +20,13 @@ This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.
 
 Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
 
-| Sistema | Arquitetura           | Arquivo                                      |
-| ------- | --------------------- | -------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+| Sistema | Arquitetura           | Arquivo                                                                                                                                               |
+| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+
+[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18/SHA256SUMS)
 
 Não foram verificados arquivos para outras plataformas. O suporte à compilação cruzada não significa que todo sistema operacional ou arquitetura tenha um pacote publicado.
 
@@ -45,6 +47,18 @@ No Windows PowerShell:
 ```
 
 A versão informada deve ser `0.0.18`. Opcionalmente, adicione este diretório a `PATH` e execute `ku --version`. Instale o arquivo incluído `ku-language-0.0.18.vsix` para integração com o VS Code.
+
+## Interpreter and VS Code extension
+
+Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.18.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
+
+After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.18.vsix`, and reload the window. Alternatively, run this from the extracted directory:
+
+```sh
+code --install-extension ./ku-language-0.0.18.vsix
+```
+
+The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
 
 ## Requisitos de execução e compilação
 
