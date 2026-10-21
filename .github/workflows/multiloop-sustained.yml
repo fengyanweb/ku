@@ -24,7 +24,6 @@ jobs:
       KU_EVENT_LOOPS: "4"
       KU_BLOCKING_THREADS: "5"
       KU_THREAD_BUDGET: "16"
-      KU_SUSTAINED_EVIDENCE: ${{ runner.temp }}/ku-multiloop-sustained
       KU_EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
 
     steps:
@@ -34,8 +33,10 @@ jobs:
           python3 -B - <<'PY'
           import json, os
           from pathlib import Path
-          root = Path(os.environ["KU_SUSTAINED_EVIDENCE"])
+          root = Path(os.environ["RUNNER_TEMP"])/"ku-multiloop-sustained"
           root.mkdir(parents=True, exist_ok=True)
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write("KU_SUSTAINED_EVIDENCE="+str(root)+"\n")
           plan = {
               "status": "prepared_not_executed", "source_sha": os.environ["KU_EXPECTED_SOURCE_SHA"],
               "runner": "ubuntu-24.04", "required_effective_cpus": 4,
