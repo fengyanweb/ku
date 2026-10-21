@@ -2,7 +2,7 @@ import { versions } from './versions';
 export const project = {
   name: 'Ku',
   repository: 'https://github.com/fengyanweb/ku',
-  release: `https://github.com/fengyanweb/ku/releases/tag/v${versions.released}`,
+  release: `https://github.com/fengyanweb/ku/releases/tag/${versions.releaseTag}`,
   version: versions.current,
   releasedVersion: versions.released,
   verifiedAt: '2026-10-20',

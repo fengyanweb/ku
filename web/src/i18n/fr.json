@@ -101,5 +101,7 @@
   "nextNotice": "Cette documentation décrit le périmètre figé de la préversion expérimentale v{currentVersion}. La publication effective et les téléchargements sont consignés dans GitHub Releases.",
   "startGroup": "Commencer ici",
   "toolsGroup": "Langage et outils",
-  "projectGroup": "Projet"
+  "projectGroup": "Projet",
+  "libraryGroup": "Bibliothèque standard",
+  "examplesGroup": "Exemples"
 }

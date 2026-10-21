@@ -1,10 +1,15 @@
 {
   "current": "0.0.18",
   "released": "0.0.18",
+  "releaseTag": "v0.0.18-r1",
   "archives": [
     {
       "slug": "v0.0.18",
       "label": "0.0.18"
+    },
+    {
+      "slug": "v0.0.17",
+      "label": "0.0.17"
     }
   ]
 }

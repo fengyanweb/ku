@@ -705,7 +705,7 @@ impl Interpreter {
             let mut env = captures.clone();
             env.push_scope();
             if let Some(name) = self_name {
-                env.define_owned(
+                env.define_function_self(
                     name.clone(),
                     Value::Function {
                         params: params.to_vec(),
@@ -715,7 +715,6 @@ impl Interpreter {
                         self_name: self_name.clone(),
                         is_async: declared_async,
                     },
-                    false,
                     span,
                 )?;
             }
@@ -1108,7 +1107,7 @@ impl Interpreter {
 
     fn eval_array_map(
         &mut self,
-        target: &Expr,
+        target: Value,
         args: &[Expr],
         env: &mut Env,
         depth: usize,
@@ -1119,10 +1118,6 @@ impl Interpreter {
                 format!("array.map expects 1 argument but got {}", args.len()),
                 span,
             ));
-        }
-        let target = self.eval(target, env, depth)?;
-        if self.pending_fail.is_some() {
-            return Ok(Value::Null);
         }
         let Value::Array(items) = target else {
             return Err(KuError::runtime(
@@ -1429,7 +1424,18 @@ impl Interpreter {
                         })
                     })?;
                     let Some(full_name) = full_name else {
-                        return Ok(None);
+                        // This receiver has already run. Resolve only its selected
+                        // field, as ordinary field access does, before releasing
+                        // any read leases and evaluating the call arguments.
+                        self.tick(callee.span)?;
+                        let callable = value.with_read(callee.span, |value| {
+                            field_value(value, name, callee.span)
+                        })?;
+                        drop(value);
+                        drop(leases);
+                        return self
+                            .eval_callable_arguments(callable, callee, args, env, depth, span)
+                            .map(Some);
                     };
                     values.push(value);
                     full_name
@@ -1444,6 +1450,57 @@ impl Interpreter {
             }
         }
         eval_readonly_builtin(name, &values, span)
+    }
+
+    fn eval_callable_arguments(
+        &mut self,
+        callable: Value,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        callable.with_read(span, |callable| {
+            let Value::Function {
+                params,
+                param_modes,
+                body,
+                captures,
+                self_name,
+                is_async,
+            } = callable
+            else {
+                return Err(KuError::runtime(
+                    format!("cannot call {}", callable.type_name()),
+                    callee.span,
+                ));
+            };
+            let mut leases = Vec::new();
+            let mut values = Vec::with_capacity(args.len());
+            let result = (|| {
+                self.eval_call_arguments(args, param_modes, env, depth, &mut leases, &mut values)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::fail(value));
+                }
+                self.call_function_value_flow(FunctionValueCall {
+                    params,
+                    param_modes,
+                    body,
+                    captures,
+                    self_name,
+                    is_async: *is_async,
+                    args: std::mem::take(&mut values),
+                    span,
+                    depth: depth + 1,
+                })
+            })();
+            let result = self.finish_call_arguments(env, leases, values, result, span);
+            self.call_argument_value(result, span)
+        })
     }
 
     fn eval_std_method_call(
@@ -1470,6 +1527,11 @@ impl Interpreter {
         let target_value = self.eval(target, env, depth)?;
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
+        }
+        if name == "map" && matches!(target_value, Value::Array(_)) {
+            return self
+                .eval_array_map(target_value, args, env, depth, span)
+                .map(Some);
         }
         if name == "clone" {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
@@ -1520,9 +1582,8 @@ impl Interpreter {
         }
         let module = target_value.with_read(span, |target| {
             Ok(match target {
-                // KuValue converters win over the concrete-type modules: a value read
-                // from an object may carry any tag, so `.as_int()`/`.as_str()` must
-                // dispatch to the kuvalue path regardless of the runtime tag.
+                // A KuValue can carry any runtime tag, including objects with
+                // callable fields. Converters retain their existing priority.
                 _ if name == "as_int" || name == "as_str" => "kuvalue",
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
@@ -1531,7 +1592,31 @@ impl Interpreter {
             })
         })?;
         if module.is_empty() {
-            return Ok(None);
+            if (matches!(
+                name.as_str(),
+                "get" | "post" | "put" | "del" | "listen" | "bind"
+            ) && is_http_service_object(&target_value))
+                || (matches!(name.as_str(), "run" | "close")
+                    && is_http_listener_object(&target_value))
+            {
+                return self
+                    .eval_http_service_method_call(callee, target_value, args, env, depth, span)?
+                    .map(Some)
+                    .ok_or_else(|| KuError::runtime("unresolved HTTP method", span));
+            }
+            self.tick(callee.span)?;
+            let callable = target_value
+                .with_read(callee.span, |value| field_value(value, name, callee.span))?;
+            drop(target_value);
+            return self
+                .eval_callable_arguments(callable, callee, args, env, depth, span)
+                .map(Some);
+        }
+        if module != "kuvalue" && stdlib::metadata::dotted_signature(module, name).is_none() {
+            return Err(KuError::runtime(
+                format!("unknown {module} method '{name}'"),
+                span,
+            ));
         }
         target_value.require_owned_root(span)?;
         let mut values = Vec::with_capacity(args.len() + 1);
@@ -1544,13 +1629,16 @@ impl Interpreter {
                 return Ok(Some(Value::Null));
             }
         }
-        match module {
+        let value = match module {
             "string" => stdlib::string::eval(name, &values, span),
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
             "kuvalue" => Ok(eval_kuvalue_method(name, &values)),
             _ => Ok(None),
-        }
+        }?;
+        value
+            .map(Some)
+            .ok_or_else(|| KuError::runtime(format!("unknown {module} method '{name}'"), span))
     }
 
     fn eval_dotted_builtin(
@@ -1729,7 +1817,11 @@ impl Interpreter {
                         return Ok(value);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name) {
+                        let global_is_visible = self.functions.contains_key(name)
+                            && !env.shadows_global_function(name, expr.span)?;
+                        if let Some(function) =
+                            self.functions.get(name).filter(|_| global_is_visible)
+                        {
                             let modes = explicit_borrow_modes(function);
                             let mut leases = Vec::new();
                             let mut values = Vec::with_capacity(args.len());
@@ -1757,18 +1849,8 @@ impl Interpreter {
                             return self.call_argument_value(result, expr.span);
                         }
                     }
-                    if let ExprKind::Field { target, name } = &callee.kind {
-                        if name == "map" {
-                            return self.eval_array_map(target, args, env, depth, expr.span);
-                        }
-                    }
                     if let Some(value) =
                         self.eval_std_method_call(callee, args, env, depth, expr.span)?
-                    {
-                        return Ok(value);
-                    }
-                    if let Some(value) =
-                        self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
                     {
                         return Ok(value);
                     }
@@ -1779,51 +1861,9 @@ impl Interpreter {
                             || dotted_builtin_module(callee).is_none())
                     {
                         let callable = self.eval(callee, env, depth)?;
-                        return callable.with_read(expr.span, |callable| {
-                            let Value::Function {
-                                params,
-                                param_modes,
-                                body,
-                                captures,
-                                self_name,
-                                is_async,
-                            } = callable
-                            else {
-                                return Err(KuError::runtime(
-                                    format!("cannot call {}", callable.type_name()),
-                                    callee.span,
-                                ));
-                            };
-                            let mut leases = Vec::new();
-                            let mut values = Vec::with_capacity(args.len());
-                            let result = (|| {
-                                self.eval_call_arguments(
-                                    args,
-                                    param_modes,
-                                    env,
-                                    depth,
-                                    &mut leases,
-                                    &mut values,
-                                )?;
-                                if let Some(value) = self.take_pending_fail() {
-                                    return Ok(Flow::fail(value));
-                                }
-                                self.call_function_value_flow(FunctionValueCall {
-                                    params,
-                                    param_modes,
-                                    body,
-                                    captures,
-                                    self_name,
-                                    is_async: *is_async,
-                                    args: std::mem::take(&mut values),
-                                    span: expr.span,
-                                    depth: depth + 1,
-                                })
-                            })();
-                            let result =
-                                self.finish_call_arguments(env, leases, values, result, expr.span);
-                            self.call_argument_value(result, expr.span)
-                        });
+                        return self.eval_callable_arguments(
+                            callable, callee, args, env, depth, expr.span,
+                        );
                     }
                     let mut values = Vec::with_capacity(args.len());
                     for arg in args {
@@ -2529,6 +2569,7 @@ impl Interpreter {
     fn eval_http_service_method_call(
         &mut self,
         callee: &Expr,
+        target_value: Value,
         args: &[Expr],
         env: &mut Env,
         depth: usize,
@@ -2542,13 +2583,6 @@ impl Interpreter {
             "get" | "post" | "put" | "del" | "listen" | "bind" | "run" | "close"
         ) {
             return Ok(None);
-        }
-        if matches!(&target.kind, ExprKind::Variable(module) if module == "http") {
-            return Ok(None);
-        }
-        let target_value = self.eval(target, env, depth)?;
-        if self.pending_fail.is_some() {
-            return Ok(Some(Value::Null));
         }
         if (name == "run" || name == "close") && is_http_listener_object(&target_value) {
             if name == "run" {

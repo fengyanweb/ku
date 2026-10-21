@@ -97,5 +97,7 @@
   "nextNotice": "Esta documentação descreve o escopo congelado da pré-versão experimental v{currentVersion}. A publicação efetiva e os downloads estão registrados no GitHub Releases.",
   "startGroup": "Comece aqui",
   "toolsGroup": "Linguagem e ferramentas",
-  "projectGroup": "Projeto"
+  "projectGroup": "Projeto",
+  "libraryGroup": "Biblioteca padrão",
+  "examplesGroup": "Exemplos"
 }

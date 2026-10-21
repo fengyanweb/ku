@@ -11,9 +11,11 @@ sources:
     'examples/control_flow.ku',
     'examples/result.ku',
   ]
+sidebar:
+  order: 0
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. This guide introduces core syntax. The repository's [syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
+This guide introduces core syntax. The repository's [syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
 
 ## Variables and types
 

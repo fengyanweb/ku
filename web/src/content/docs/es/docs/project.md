@@ -17,7 +17,7 @@ Esta documentación describe el alcance fijado de la versión preliminar experim
 
 ## Código fuente y licencia
 
-Consulta el [código en GitHub](https://github.com/fengyanweb/ku) y la [página de la versión](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). El código es visible públicamente, pero el código propio de Ku **no tiene una concesión de licencia de código abierto**. La extensión del editor está marcada como `UNLICENSED`. Publicar código o binarios no concede automáticamente una licencia de código abierto.
+Consulta el [código en GitHub](https://github.com/fengyanweb/ku) y la [página de la versión](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). El código es visible públicamente, pero el código propio de Ku **no tiene una concesión de licencia de código abierto**. La extensión del editor está marcada como `UNLICENSED`. Publicar código o binarios no concede automáticamente una licencia de código abierto.
 
 Los avisos de terceros incluidos en los archivos de versiones solo se aplican a sus respectivos componentes. No conceden permisos de uso, modificación ni redistribución de Ku. Cualquier autorización necesaria debe proceder expresamente del mantenedor; este sitio web no crea nuevos compromisos de licencia.
 

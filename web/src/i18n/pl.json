@@ -97,5 +97,7 @@
   "nextNotice": "Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v{currentVersion}. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases.",
   "startGroup": "Zacznij tutaj",
   "toolsGroup": "Język i narzędzia",
-  "projectGroup": "Projekt"
+  "projectGroup": "Projekt",
+  "libraryGroup": "Biblioteka standardowa",
+  "examplesGroup": "Przykłady"
 }

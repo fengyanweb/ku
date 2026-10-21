@@ -159,6 +159,7 @@ export default defineConfig({
         SiteTitle: './src/components/DocSiteTitle.astro',
         PageTitle: './src/components/DocPageTitle.astro',
         LanguageSelect: './src/components/DocLanguageSelect.astro',
+        ThemeSelect: './src/components/DocThemeSelect.astro',
         Footer: './src/components/DocFooter.astro',
       },
       expressiveCode: {
@@ -174,11 +175,19 @@ export default defineConfig({
           label: '语言与工具',
           translations: groupTranslations('toolsGroup'),
           items: [
-            { slug: 'docs/guide/language' },
-            { slug: 'docs/stdlib' },
-            { slug: 'docs/stdlib/json' },
-            { slug: 'docs/guide/errors' },
+            { autogenerate: { directory: 'docs/guide' } },
+            { autogenerate: { directory: 'docs/tools' } },
           ],
+        },
+        {
+          label: '标准库',
+          translations: groupTranslations('libraryGroup'),
+          items: [{ autogenerate: { directory: 'docs/stdlib' } }],
+        },
+        {
+          label: '示例',
+          translations: groupTranslations('examplesGroup'),
+          items: [{ slug: 'docs/examples' }],
         },
         {
           label: '项目',

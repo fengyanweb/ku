@@ -10,9 +10,11 @@ sources:
     'src/error.rs',
     'src/stdlib/json.rs',
   ]
+sidebar:
+  order: 2
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.
+Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.
 
 ## Identify the Ku executable
 
@@ -72,6 +74,6 @@ Passing `ku check` only establishes that frontend checking succeeded. Native C a
 
 `ku build --native file.ku` without `-o` only writes C. To compile and link an executable, use `ku build --backend c file.ku` and install the target C toolchain.
 
-Database errors `execution_unknown` and `execution_completed_without_result` must not trigger automatic replay. Retain request and business evidence and establish the actual execution state first. Verifying the local website does not require a production database connection.
+Database errors `execution_unknown` and `execution_completed_without_result` must not trigger automatic replay. Retain request and business evidence and establish the actual execution state first.
 
 For more detail, see the [repository diagnostic guide](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).

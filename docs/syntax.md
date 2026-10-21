@@ -1527,7 +1527,7 @@ time.millis(value: Time | Duration): int
 time.from_unix(seconds:int): Time
 time.from_millis(ms:int): Time
 time.date(): Date
-time.date(value: Time): Date
+time.date(value: Time): Date!
 time.date(value: Time, zone:str): Date!
 time.date(year:int, month:int, day:int): Date!
 time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int): Time!
@@ -1565,6 +1565,10 @@ print(now.millis) // Unix 毫秒时间戳
 `time.now()` 直接返回 Unix epoch 毫秒整数；`time.instant()` 返回可供日期、格式化和时间差 API 使用的 `Time` object。`time.elapsed(previous)` 返回从 `previous` 到当前墙上时间的毫秒差。`time.steady_millis()` 是进程内单调时钟，只用于计算时长。
 
 `Date` 形如 `{ kind:"time.date", year, month, day }`，`Duration` 形如 `{ kind:"time.duration", millis }`。
+
+`time.date()` 直接返回本地今天的日期；`time.date(value)?` 按本地时区提取日期，与 `time.date(value, "local")?` 等价。带参数的 `date` 重载均返回 Result，非法 Time、超出日历范围或非法时区不会被自动解包或替换为当前日期。
+
+单参数重载的 Result 检查规则在 `v0.0.18-r1` 修订版中修复；初版 v0.0.18 应使用 `time.date(value, "local")?`。
 
 默认格式为：
 

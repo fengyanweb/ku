@@ -17,7 +17,7 @@ Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0
 
 ## Źródła i licencjonowanie
 
-Zobacz [źródła GitHub](https://github.com/fengyanweb/ku) i [stronę wydania](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). Źródła można publicznie przeglądać, lecz własny kod Ku **nie został objęty udzieloną licencją open source**. Rozszerzenie edytora ma oznaczenie `UNLICENSED`. Publikacja kodu lub plików binarnych nie udziela takiej licencji automatycznie.
+Zobacz [źródła GitHub](https://github.com/fengyanweb/ku) i [stronę wydania](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Źródła można publicznie przeglądać, lecz własny kod Ku **nie został objęty udzieloną licencją open source**. Rozszerzenie edytora ma oznaczenie `UNLICENSED`. Publikacja kodu lub plików binarnych nie udziela takiej licencji automatycznie.
 
 Informacje o komponentach zewnętrznych w archiwach dotyczą tylko odpowiednich komponentów. Nie ustanawiają uprawnień do używania, modyfikowania ani rozpowszechniania samego Ku. Wymagane upoważnienia muszą pochodzić wyraźnie od opiekuna; witryna nie tworzy nowych zobowiązań licencyjnych.
 

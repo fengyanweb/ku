@@ -4,7 +4,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Features
 
-- Syntax highlighting for Ku 0.0.17 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
+- Syntax highlighting for Ku 0.0.18 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
 - `ku.mod` / `ku.lock` syntax highlighting.
 - Language configuration for comments, brackets, auto-closing pairs, and surrounding pairs.
 - Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, `std.task`, bounded task stress, HTTP response usage, array map, string methods, and `array.try_get`.
@@ -15,6 +15,8 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for async/await, Error, Result, std.fs, std.http, std.config, std.task, match, string and array helpers.
 - Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes. Member completion is context-aware: typing `http.se` offers `service` / `server`, and those constructors insert `service()` / `server()` so old property-style objects are not suggested; global completion no longer inserts bare `http.service` / `http.server`.
+- The 0.0.18 revision 1 extension also completes `std.bytes`, `std.net`, `std.lexer`, `std.parser`, directory operations, and the `time.instant` / `time.elapsed` / `time.steady_millis` clocks. These additions are included in the v0.0.18-r1 target bundles; the original v0.0.18 Release VSIX is unchanged. `time.now()` returns Unix milliseconds; `time.instant()` returns a Time object.
+- The revision 1 extension reads the status-bar comparison version from `package.json`; the original v0.0.18 VSIX retained a 0.0.17 comparison constant and can incorrectly report a mismatch with Ku 0.0.18.
 - HTTP handler completions understand `req` / `app` / `router` names, so `req.` offers request fields instead of falling back to global stdlib functions. Normal route templates use `fn()` when request data is not needed and `fn(req)` when it is.
 - Ordinary async task handles are one-use values returned by `async fn`; the extension does not suggest `status` / `cancel` / `await_timeout` lifecycle methods for them.
 - Typed arrow functions are first-class values. Object indexing is strict by default; `object[key]?` is the explicit nullable lookup form. Object destructuring snippets cover rename/default/rest.
@@ -26,7 +28,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Install From VSIX
 
-Use `ku-language-0.0.17.vsix` from the matching target bundle actually listed in [GitHub Releases](https://github.com/fengyanweb/ku/releases). A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; this extension remains `UNLICENSED`.
+Use `ku-language-0.0.18.vsix` from the matching target bundle in [0.0.18 revision 1](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). For an existing 0.0.18 installation, reinstall from VSIX or use `code --install-extension ./ku-language-0.0.18.vsix --force`; the extension version is still 0.0.18. A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; this extension remains `UNLICENSED`.
 
 To build the VSIX from the repository root instead:
 
@@ -34,8 +36,8 @@ To build the VSIX from the repository root instead:
 cd editors\vscode-ku
 npm ci --ignore-scripts
 npm test
-npx --no-install vsce package --out ku-language-0.0.17.vsix
-code --install-extension .\ku-language-0.0.17.vsix
+npx --no-install vsce package --out ku-language-0.0.18.vsix
+code --install-extension .\ku-language-0.0.18.vsix
 ```
 
 Then reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code, and open any `.ku` file.
@@ -46,7 +48,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 2. Open the Extensions view.
 3. Click `...`.
 4. Choose `Install from VSIX...`.
-5. Pick `ku-language-0.0.17.vsix` from the extracted bundle or your local build.
+5. Pick `ku-language-0.0.18.vsix` from the extracted bundle or your local build.
 6. Reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code.
 
 ## Install By Copying The Extension Folder
@@ -54,7 +56,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 If you do not want to use `vsce`, copy this folder into the VS Code extensions directory:
 
 ```powershell
-$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.17"
+$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.18"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Copy-Item -LiteralPath .\editors\vscode-ku\* -Destination $target -Recurse -Force
 ```
@@ -70,3 +72,7 @@ Open `editors/vscode-ku` in VS Code and press `F5` to launch an Extension Develo
 The extension uses `ku` from PATH first, then falls back to the matching workspace bundle under `release/<rust-target>/ku[.exe]`, followed by `target/release/ku[.exe]` and `target/debug/ku[.exe]`. Published target bundles currently map Windows x64 to `x86_64-pc-windows-msvc`, Linux x64 to `x86_64-unknown-linux-gnu`, and Apple Silicon macOS to `aarch64-apple-darwin`; unsupported host architectures must use `ku.executablePath` or PATH.
 
 If needed, set `ku.executablePath` in VS Code settings.
+
+## Scope
+
+Completion and hover text use the extension's built-in API model. They do not provide a full compiler language server or infer every receiver type and chained method. `ku check` supplies compiler diagnostics; commands still require an installed Ku executable. The extension does not install the CLI, database drivers, or native target packs. `std.bytes` / `std.net` need the native C execution path supported by the selected Ku package.

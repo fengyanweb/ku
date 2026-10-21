@@ -97,5 +97,7 @@
   "nextNotice": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{currentVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",
   "startGroup": "Inizia qui",
   "toolsGroup": "Linguaggio e strumenti",
-  "projectGroup": "Progetto"
+  "projectGroup": "Progetto",
+  "libraryGroup": "Libreria standard",
+  "examplesGroup": "Esempi"
 }

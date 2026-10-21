@@ -73,7 +73,11 @@
       "docs/getting-started"
     ],
     ["认识这门语言", "从变量、函数，到数据与错误处理。", "docs/guide/language"],
-    ["使用标准库", "查找模块，了解 JSON 接口。", "docs/stdlib"],
+    [
+      "使用标准库",
+      "查找 HTTP、JSON、文件、时间、数据库等官方模块。",
+      "docs/stdlib"
+    ],
     ["了解当前边界", "平台、执行路径与已知限制。", "docs/support"]
   ],
   "projectTitle": "认真构建，也坦诚记录。",
@@ -89,5 +93,7 @@
   "nextNotice": "Ku {currentVersion} 本版文档。固定版本参考请选择快照；安装包与公开状态以实际 GitHub Release 为准。",
   "startGroup": "开始使用",
   "toolsGroup": "语言与工具",
-  "projectGroup": "项目"
+  "projectGroup": "项目",
+  "libraryGroup": "标准库",
+  "examplesGroup": "示例"
 }

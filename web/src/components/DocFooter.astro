@@ -1,8 +1,5 @@
 ---
 import Default from '@astrojs/starlight/components/Footer.astro';
-import LanguageNotice from './LanguageNotice.astro';
-import { localeFromPath } from '../i18n/locales';
 ---
 
 <Default />
-<LanguageNotice locale={localeFromPath(Astro.url.pathname)} />

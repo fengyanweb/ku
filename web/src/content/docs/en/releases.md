@@ -1,63 +1,46 @@
 ---
-title: Release notes
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources:
-  [
-    'docs/v0.0.18.md',
-    'docs/v0.0.18-worklog.md',
-    'docs/history.md',
-    'Cargo.toml',
-  ]
+title: 'Versions and release notes'
+description: 'Versions and release notes'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-21'
+sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases.
+## 0.0.18 revision 1
 
-## v0.0.18 release scope and known limits
+Release tag `v0.0.18-r1` retains CLI and extension version `0.0.18`. It fixes chained calls, large float literals, `time.date(Time)` and extension metadata. The [original release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) remains available.
 
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
+The current experimental prerelease includes bounded Task/waiting and shutdown fixes, HTTP connection reuse and buffers, large-float JSON round trips and explicit `ku supervise` workers.
 
-- JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
-- Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
-- HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
-- `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
+[Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [Fixed docs](/en/v0.0.18/) · [Known limits](/en/docs/support/)
 
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. It is retained as a known issue for v0.0.18 and is not a separate release blocker. The earliest three historical 504s lack enough evidence for a unique reconstruction. Do not describe the issue as repaired or long-term stability as accepted.
+**Known HTTP issue: historical 504s, not reproduced by this round's short tests; root cause unconfirmed; formal 30-minute acceptance has not passed.** Complete M:N, general network scheduling and the complete database platform matrix remain incomplete.
 
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions. General value copy/release follow-up and AST analysis remain paused. No unrelated memory-limit validation is being repeated.
+## 0.0.17
 
-### Process memory boundary
+Synchronous borrowing, braced while in the self-hosted parser subset and cross-platform tooling corrections.
 
-| Host    | `ku supervise` guarantee and prerequisite                                                                                                                                                                                                                                                                   |
-| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux   | cgroup v2 kernel charged memory; a writable, delegated domain root with `memory` and `pids` enabled is required. Required interfaces include `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing controls or permissions cause refusal before application execution. |
-| Windows | Nested Job Object limits for individual workers and the worker group, measured as committed virtual memory, not RSS. Initial process commit is checked before its suspended application thread is released. Host policy can reject Job assignment.                                                          |
-| macOS   | This isolation mode is not supported natively and is explicitly rejected before starting the application. Use a suitably configured Linux host/VM when required; there is no automatic VM bridge.                                                                                                           |
+[Download and release notes](https://github.com/fengyanweb/ku/releases/tag/v0.0.17) · [Fixed docs](/en/v0.0.17/)
 
-Worker accounting covers applicable Ku and third-party library allocations in that worker's resource domain. Linux cgroup accounting and Windows commit are different metrics. Linux `memory.max` may permit transient overshoot; these mechanisms do not promise an absolute ceiling on all physical memory at every instant.
+## Early development records
 
-The coordinator itself has no OS memory hard limit. Its bounded admission/control reserve is an accounting policy, not a coordinator RSS limit. A single Task's entire heap is not precisely metered; shared connection pools, caches and library allocations cannot be exactly attributed to each Task. External databases, the host/VM and build compilers lie outside the worker domain.
+These 0.0.1–0.0.16 records predate the new website. Links are pinned to historical files preserved in the 0.0.17 tag. They are development records, not a claim of a GitHub Release or downloadable archive for each version. Old syntax may differ from the current version.
 
-When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
-
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
-
-## v0.0.17 · Experimental prerelease
-
-Published on **2026-10-18 (America/Los_Angeles)**, or `2026-10-19T03:51:10Z` in UTC. The release has `prerelease=true` and `draft=false`. No stable release has currently been verified.
-
-Main changes:
-
-- Synchronous read only borrowed parameters use `&name: T`, with ordinary call arguments. Normal owned parameters retain move semantics.
-- The self hosted parser subset adds braced `while`, with bounded nesting and statement counts.
-- Cross platform tests correct stdout disconnection checks. This does not add a business API.
-- Archives include matching Rust dependencies for the default runner and a target TLS pack. Appropriate external toolchains are still required.
-
-Downloads cover Windows x64, Linux x64, and macOS arm64. The seven Release assets are three platform archives, three manifests, and `SHA256SUMS`. See [installation](https://github.com/fengyanweb/ku/releases/tag/v0.0.17) and the [complete release notes](https://github.com/fengyanweb/ku/releases/tag/v0.0.17).
-
-### Compatibility and limits
-
-Ku remains experimental and is not ready for production. Version 0.0.x does not promise source or generated C/FFI ABI compatibility. Recompile the relevant native artifacts when updating. Borrowed async parameters, complete self hosting, and full native async are outside this release.
-
-The default runner embeds only the entry source; imported modules still require their original locations. Database clients are native only. Check each driver's real server, TLS, and session state limits. Ku's own code still has no open source license grant.
+| Version | Scope                                                                      | Original record                                                         |
+| ------- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 0.0.16  | Native libraries, database clients, registry and target-specific packaging | [0.0.16](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.16.md) |
+| 0.0.15  | Object destructuring, HTTP call rules and examples                         | [0.0.15](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.15.md) |
+| 0.0.14  | Project templates, HTTP status helpers and anonymous handlers              | [0.0.14](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.14.md) |
+| 0.0.13  | Unified build, project entries, time APIs and editor support               | [0.0.13](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.13.md) |
+| 0.0.12  | HTTP responses, connection reuse, file writes and strict bool              | [0.0.12](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.12.md) |
+| 0.0.11  | Result ABI, finally CFG and file-dependency cache                          | [0.0.11](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.11.md) |
+| 0.0.10  | Runtime captures, Result CFG and native control flow                       | [0.0.10](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.10.md) |
+| 0.0.9   | Typed temporary IR, lockfiles and native C prototype                       | [0.0.9](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.9.md)   |
+| 0.0.8   | Closure capture groundwork and typed CFG IR                                | [0.0.8](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.8.md)   |
+| 0.0.7   | Fallible collection access, package boundaries and IR                      | [0.0.7](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.7.md)   |
+| 0.0.6   | Standard library and compiler module organization                          | [0.0.6](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.6.md)   |
+| 0.0.5   | Result, try/catch/finally and ?                                            | [0.0.5](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.5.md)   |
+| 0.0.4   | Closures, match and compound-value updates                                 | [0.0.4](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.4.md)   |
+| 0.0.3   | Arrays, structs, enums, objects and module imports                         | [0.0.3](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.3.md)   |
+| 0.0.2   | Function values, arrow functions, templates and for                        | [0.0.2](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.2.md)   |
+| 0.0.1   | Initial interpreter, functions, conditions and loops                       | [0.0.1](https://github.com/fengyanweb/ku/blob/v0.0.17/docs/v0.0.1.md)   |

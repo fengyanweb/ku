@@ -97,5 +97,7 @@
   "nextNotice": "Esta documentación describe el alcance fijado de la versión preliminar experimental v{currentVersion}. La publicación real y las descargas constan en GitHub Releases.",
   "startGroup": "Empieza aquí",
   "toolsGroup": "Lenguaje y herramientas",
-  "projectGroup": "Proyecto"
+  "projectGroup": "Proyecto",
+  "libraryGroup": "Biblioteca estándar",
+  "examplesGroup": "Ejemplos"
 }

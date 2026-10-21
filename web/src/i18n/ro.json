@@ -101,5 +101,7 @@
   "nextNotice": "Documentația descrie domeniul fixat al prelansării experimentale v{currentVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",
   "startGroup": "Începe aici",
   "toolsGroup": "Limbaj și instrumente",
-  "projectGroup": "Proiect"
+  "projectGroup": "Proiect",
+  "libraryGroup": "Biblioteca standard",
+  "examplesGroup": "Exemple"
 }

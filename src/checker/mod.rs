@@ -3721,7 +3721,7 @@ impl Checker {
                 0 => Ok(Type::DynamicObject),
                 1 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
-                    Ok(Type::DynamicObject)
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
                 }
                 2 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
@@ -3893,6 +3893,14 @@ impl Checker {
             return Ok(None);
         };
         let target_type = self.check_expr(target)?;
+        if matches!(name.as_str(), "as_int" | "as_str") && target_type != Type::KuValue {
+            return Err(KuError::runtime(
+                format!(
+                    "{name}() is reserved for KuValue conversion; bind a callable field to a variable before calling it"
+                ),
+                span,
+            ));
+        }
         if name == "clone" {
             expect_arg_count("clone", args.len(), 0, span)?;
             if is_http_service_type(&target_type) {
@@ -4490,6 +4498,9 @@ impl Checker {
         if name != "map" {
             return Ok(None);
         }
+        let Type::Array(element) = self.check_expr(target)? else {
+            return Ok(None);
+        };
         if self.borrowed_expr_root(target).is_some() {
             return Err(KuError::runtime(
                 "borrowed operation is not supported: array.map; clone the array first",
@@ -4497,16 +4508,6 @@ impl Checker {
             ));
         }
         expect_arg_count("array.map", args.len(), 1, span)?;
-        let target_type = self.check_expr(target)?;
-        let Type::Array(element) = target_type else {
-            return Err(KuError::runtime(
-                format!(
-                    "type error: map expects array but got {}",
-                    type_name(&target_type)
-                ),
-                target.span,
-            ));
-        };
         if self.type_contains_native_resource(&element) {
             return Err(KuError::runtime(
                 "array.map cannot clone move-only native resource elements",

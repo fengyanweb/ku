@@ -17,7 +17,7 @@ Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vora
 
 ## Quelltext und Lizenzierung
 
-Sehen Sie sich den [Quelltext auf GitHub](https://github.com/fengyanweb/ku) und die [Veröffentlichungsseite](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) an. Der Quelltext ist öffentlich einsehbar, aber für Kus eigenen Code wurde **keine Open-Source-Lizenz erteilt**. Die Editor-Erweiterung ist als `UNLICENSED` gekennzeichnet. Die Veröffentlichung von Quelltext oder Binärdateien gewährt nicht automatisch eine Open-Source-Lizenz.
+Sehen Sie sich den [Quelltext auf GitHub](https://github.com/fengyanweb/ku) und die [Veröffentlichungsseite](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) an. Der Quelltext ist öffentlich einsehbar, aber für Kus eigenen Code wurde **keine Open-Source-Lizenz erteilt**. Die Editor-Erweiterung ist als `UNLICENSED` gekennzeichnet. Die Veröffentlichung von Quelltext oder Binärdateien gewährt nicht automatisch eine Open-Source-Lizenz.
 
 Drittanbieterhinweise in Veröffentlichungsarchiven gelten nur für die jeweiligen Komponenten. Sie gewähren keine Rechte zur Nutzung, Änderung oder Weitergabe von Ku selbst. Jede erforderliche Genehmigung muss ausdrücklich vom Maintainer kommen; diese Website begründet keine neue Lizenzzusage.
 

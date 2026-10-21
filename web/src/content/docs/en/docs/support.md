@@ -13,8 +13,6 @@ sources:
   ]
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases.
-
 ## Published CLI platforms
 
 The v0.0.18 experimental prerelease covers Windows x64 (MSVC), Linux x64 (GNU), and macOS arm64 (Apple Silicon). Each platform has its own archive. There is no single executable for all three systems. No other platform assets were verified; see [installation](/en/docs/install/).
@@ -27,6 +25,7 @@ The v0.0.18 experimental prerelease covers Windows x64 (MSVC), Linux x64 (GNU), 
 | JSON                                           | Supported                        | Supported                           | Supported                                           | Unsupported                            | Unsupported           |
 | Source independent complete local import graph | Loads source                     | Unsupported; only entry is embedded | Expanded during generation                          | Expanded within supported subset       | No deployment promise |
 | async / await                                  | Implemented with resource limits | Interpreter path                    | Dedicated subset or rejection                       | Partial, not full async                | No full support       |
+| HTTP                                           | Client and server                | Interpreter path                    | Server subset; see [HTTP](../stdlib/http/)          | No general HTTP support                | Unsupported           |
 | PostgreSQL / Redis / MySQL clients             | No database access               | No interpreted database access      | Native only                                         | Not general Task waiting               | Unsupported           |
 | TCP / TLS client                               | No corresponding native path     | No corresponding native path        | Generated C implementation; TLS needs matching pack | No complete generic network wait claim | Unsupported           |
 
@@ -34,7 +33,7 @@ Default builds require the matching Rust toolchain and linker. Native C requires
 
 ## The native Task subset
 
-The current development branch has a restricted `async fn main(): null!` source path. It covers explicitly listed primitives, strings, flat arrays, single layer Results, Task start/move/await, some control flow, and bounded file/directory background operations. It is not a complete async backend in the published v0.0.18 package.
+v0.0.18 includes a restricted `async fn main(): null!` source path. It covers explicitly listed primitives, strings, flat arrays, single layer Results, Task start/move/await, some control flow, and bounded file/directory background operations. This remains a subset, not a complete async backend.
 
 Generic Task network waiting, complete M:N execution, arbitrary dynamic heap combinations, all async capture/function combinations, and complete long duration soak remain unfinished. See the precise accepted and rejected subset in the [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md).
 
@@ -52,16 +51,16 @@ Work logs and previous CI results establish only their stated scope and commit. 
 
 ## v0.0.18 release scope and known limits
 
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
+This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums.
 
 - JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
 - Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
 - HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
 - `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
 
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. It is retained as a known issue for v0.0.18 and is not a separate release blocker. The earliest three historical 504s lack enough evidence for a unique reconstruction. Do not describe the issue as repaired or long-term stability as accepted.
+**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. The earliest three historical 504s lack enough evidence for a unique reconstruction.
 
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions. General value copy/release follow-up and AST analysis remain paused. No unrelated memory-limit validation is being repeated.
+**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions.
 
 ### Process memory boundary
 

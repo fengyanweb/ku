@@ -93,5 +93,7 @@
   "nextNotice": "本書は実験的プレリリース v{currentVersion} の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。",
   "startGroup": "はじめに",
   "toolsGroup": "言語とツール",
-  "projectGroup": "プロジェクト"
+  "projectGroup": "プロジェクト",
+  "libraryGroup": "標準ライブラリ",
+  "examplesGroup": "サンプル"
 }

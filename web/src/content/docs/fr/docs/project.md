@@ -17,7 +17,7 @@ Cette documentation décrit le périmètre figé de la préversion expérimental
 
 ## Sources et licence
 
-Consultez les [sources sur GitHub](https://github.com/fengyanweb/ku) et la [page de version](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). Les sources sont consultables publiquement, mais le code propre à Ku **ne bénéficie d'aucune concession de licence open source**. L'extension d'éditeur est marquée `UNLICENSED`. Publier des sources ou des binaires n'accorde pas automatiquement une licence open source.
+Consultez les [sources sur GitHub](https://github.com/fengyanweb/ku) et la [page de version](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Les sources sont consultables publiquement, mais le code propre à Ku **ne bénéficie d'aucune concession de licence open source**. L'extension d'éditeur est marquée `UNLICENSED`. Publier des sources ou des binaires n'accorde pas automatiquement une licence open source.
 
 Les mentions de tiers présentes dans les archives s'appliquent uniquement à leurs composants respectifs. Elles n'accordent pas de droits d'utilisation, de modification ou de redistribution de Ku lui-même. Toute autorisation nécessaire doit venir explicitement du mainteneur ; ce site ne crée aucun nouvel engagement de licence.
 

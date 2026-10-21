@@ -17,7 +17,7 @@ Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıkla
 
 ## Kaynak ve lisanslama
 
-[GitHub kaynağını](https://github.com/fengyanweb/ku) ve [sürüm sayfasını](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) inceleyin. Kaynak herkese açık görüntülenebilir, ancak Ku'nun kendi koduna **açık kaynak lisansı verilmemiştir**. Düzenleyici uzantısı `UNLICENSED` olarak işaretlidir. Kaynak veya ikili dosya yayımlamak otomatik olarak açık kaynak lisansı vermez.
+[GitHub kaynağını](https://github.com/fengyanweb/ku) ve [sürüm sayfasını](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) inceleyin. Kaynak herkese açık görüntülenebilir, ancak Ku'nun kendi koduna **açık kaynak lisansı verilmemiştir**. Düzenleyici uzantısı `UNLICENSED` olarak işaretlidir. Kaynak veya ikili dosya yayımlamak otomatik olarak açık kaynak lisansı vermez.
 
 Sürüm arşivlerindeki üçüncü taraf bildirimleri yalnızca ilgili bileşenlere uygulanır. Ku'nun kendisini kullanma, değiştirme veya yeniden dağıtma izni oluşturmaz. Gerekli yetki proje sorumlusundan açıkça gelmelidir; bu site yeni lisans taahhütleri oluşturmaz.
 

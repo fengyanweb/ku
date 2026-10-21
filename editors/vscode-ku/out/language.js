@@ -46,7 +46,7 @@ const completionModel_1 = require("./completionModel");
 const executableModel_1 = require("./executableModel");
 const imports_1 = require("./imports");
 const diagnosticModel_1 = require("./diagnosticModel");
-const KU_VERSION = "0.0.17";
+const KU_VERSION = require("../package.json").version;
 const KU_MODE = [{ language: "ku", scheme: "file" }];
 const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
@@ -760,17 +760,26 @@ class KuHoverProvider {
             "status": "`http.status` 是 HTTP 协议状态码常量对象，例如 `http.status.ok`、`http.status.created`、`http.status.notFound`。",
             "statusText": "`http.statusText(code)` 把 HTTP 状态码转成标准原因短语，例如 404 -> \"Not Found\"。",
             "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
-            "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
+            "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write/exists/read_dir`。",
+            "fs.exists": "`fs.exists(path)` 返回路径是否存在。",
+            "fs.read_dir": "`fs.read_dir(path)?` 返回排序后的目录条目路径数组。",
+            "bytes": "`import bytes from \"std.bytes\"` 后使用。`bytes.from_str(text)?` 和 `bytes.from_array(values)?` 创建拥有所有权的二进制数据；对象提供 len/get/to_str/clone。当前通过 native C 路径执行。",
+            "net": "`import net from \"std.net\"` 后使用。`net.client(config)?` 创建 TCP 客户端；对象提供 read/write/close，配置可启用 TLS。当前通过 native C 路径执行。",
+            "lexer": "`lexer.scan(text)` 返回词法单元字符串数组。",
+            "parser": "`parser.parse(textOrTokens)` 对源码返回解析调试文本；token 字符串数组只返回数量摘要。",
             "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
             "task": "`task` 不是关键字。业务 task 来自 async fn 调用并只能 await；`std.task` 只提供 stats/stress 诊断压测函数。",
             "object": "`object.get_or(obj, key, default)` 和 `obj.get_or(key, default)` 是显式宽松读取；普通对象缺键仍报错。",
             "object.get_or": "`object.get_or(obj, key, default)` 缺键返回 default，存在则返回字段值；default 参数会立即求值。",
             "get_or": "`obj.get_or(key, default)` 缺键返回 default；default 参数会立即求值，不是惰性计算。",
-            "time": "`time.now()` 返回 Time 对象；`time.millis()` 返回当前毫秒时间戳；支持 date/duration/format/parse/sleep。",
-            "time.now": "`time.now()` 返回 `{ kind: \"time.time\", millis }`；`time.now(t)` 返回 t 到当前时间的毫秒差。",
+            "time": "`time.now()` 返回 Unix 毫秒整数；`time.instant()` 返回 Time 对象。测量时长可使用进程内单调时钟 `time.steady_millis()`。",
+            "time.now": "`time.now()` 返回当前 Unix 毫秒整数，只接受零个参数。",
+            "time.instant": "`time.instant()` 返回 `{ kind: \"time.time\", millis }` Time 对象，供日期与格式化 API 使用。",
+            "time.elapsed": "`time.elapsed(previous)` 返回 Time 到当前墙上时间的毫秒差；测量耗时优先使用 `time.steady_millis()` 的差值。",
+            "time.steady_millis": "`time.steady_millis()` 返回进程内单调时钟的毫秒整数，不能作为 Unix 时间戳使用。",
             "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",
             "time.unix": "`time.unix()` 返回当前 Unix 秒；`time.unix(time)` 读取 Time 的 Unix 秒。",
-            "time.date": "`time.date()` 返回今天日期；`time.date(time, zone)?` 或 `time.date(year, month, day)?` 返回 Date。",
+            "time.date": "`time.date()` 直接返回今天日期；`time.date(time)?` 按本地时区提取日期，带参数的重载均返回 Result：`time.date(time[, zone])?`、`time.date(year, month, day)?`。",
             "time.datetime": "`time.datetime(year, month, day, hour, minute, second[, zone])?` 构造 Time。",
             "time.duration": "`time.duration(ms)?` 或 `time.duration(value, unit)?` 构造 Duration；unit 支持 ms/s/m/h/d。",
             "time.format": "`time.format(time, layout[, zone])?` 使用 yyyy/MM/dd/HH/mm/ss/SSS token 格式化。",

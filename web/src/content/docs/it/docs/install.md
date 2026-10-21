@@ -2,7 +2,7 @@
 title: 'Installazione e download'
 description: 'Scarica la versione preliminare sperimentale Ku 0.0.18 e comprendi i requisiti di piattaforma e compilazione.'
 kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+verifiedAt: '2026-10-21'
 sources:
   [
     'Cargo.toml',
@@ -14,17 +14,19 @@ sources:
 
 > Gli aggiornamenti v0.0.18 seguono per ora in inglese; il resto della traduzione è mantenuto. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) and its assets; documentation alone does not establish completed publication or production readiness.
 
 ## Scegli la piattaforma
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). `native_ci-*` artifacts are CI examples, not CLI installers.
 
-| Sistema | Architettura          | Archivio                                     |
-| ------- | --------------------- | -------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`     |
-| Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
-| Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
+| Sistema | Architettura          | Archivio                                                                                                                                                 |
+| ------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+
+[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/SHA256SUMS)
 
 Non sono stati verificati archivi per altre piattaforme. Il supporto alla compilazione incrociata non significa che ogni sistema operativo o architettura disponga di un pacchetto pubblicato.
 
@@ -45,6 +47,18 @@ Su Windows PowerShell:
 ```
 
 La versione riportata dovrebbe essere `0.0.18`. Se vuoi, aggiungi questa directory a `PATH`, quindi esegui `ku --version`. Installa il file incluso `ku-language-0.0.18.vsix` per l'integrazione con VS Code.
+
+## Interpreter and VS Code extension
+
+Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.18.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
+
+After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.18.vsix`, and reload the window. Alternatively, run this from the extracted directory:
+
+```sh
+code --install-extension ./ku-language-0.0.18.vsix
+```
+
+The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
 
 ## Requisiti di esecuzione e compilazione
 
