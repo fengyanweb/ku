@@ -78,3 +78,20 @@ fn main(): null! {
 ## 參考如何維護
 
 目前公開介面元資料位於 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs)，實作與規範一起用於核查。本網站暫時維護人工整理的核心參考；目前沒有已確認的 `ku doc` 命令。
+
+## API reference (English)
+
+Detailed module references and runnable examples are currently available in English:
+
+- [http](/en/docs/stdlib/http/)
+- [time](/en/docs/stdlib/time/)
+- [fs](/en/docs/stdlib/fs/)
+- [config](/en/docs/stdlib/config/)
+- [string](/en/docs/stdlib/string/)
+- [array](/en/docs/stdlib/array/)
+- [object](/en/docs/stdlib/object/)
+- [json](/en/docs/stdlib/json/)
+- [bytes](/en/docs/stdlib/bytes/)
+- [net](/en/docs/stdlib/net/)
+- [database](/en/docs/stdlib/database/)
+- [compiler](/en/docs/stdlib/compiler/)

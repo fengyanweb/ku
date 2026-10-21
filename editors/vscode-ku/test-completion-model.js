@@ -35,7 +35,19 @@ assert.deepStrictEqual(model.memberCompletionLabels("string", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("string", "by"), ["byte_len"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "by"), ["byte_len"]);
-assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql"]);
+assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser"]);
+assert.deepStrictEqual(model.memberCompletionLabels("bytes"), ["from_str", "from_array"]);
+assert.deepStrictEqual(model.memberCompletionLabels("net"), ["client"]);
+assert.deepStrictEqual(model.memberCompletionLabels("lexer"), ["scan"]);
+assert.deepStrictEqual(model.memberCompletionLabels("parser"), ["parse"]);
+for (const name of ["exists", "read_dir"]) {
+  assert(model.memberCompletionLabels("fs").includes(name));
+  assert(model.stdFunctions.includes(`fs.${name}`));
+}
+for (const name of ["instant", "elapsed", "steady_millis"]) {
+  assert(model.memberCompletionLabels("time").includes(name));
+  assert(model.stdFunctions.includes(`time.${name}`));
+}
 assert.deepStrictEqual(model.memberCompletionLabels("pg"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("redis"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("mysql"), ["client"]);
@@ -65,6 +77,10 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.pg",
   "std.redis",
   "std.mysql",
+  "std.bytes",
+  "std.net",
+  "std.lexer",
+  "std.parser",
 ]);
 
 assert(!model.globalCompletionLabels().includes("http.service"));

@@ -11,6 +11,8 @@ sources:
     'examples/json.ku',
     'docs/v0.0.18.md',
   ]
+sidebar:
+  order: 4
 ---
 
 `json.encode` / `json.decode` 是本版接口，分别复用 `stringify` / `parse`；兼容名继续保留。默认保持旧底层实现，不使用 yyjson。

@@ -6,7 +6,7 @@ verifiedAt: '2026-10-20'
 sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. This page uses basic syntax and CLI commands already present in v0.0.17. [Install Ku](/en/docs/install/) first and confirm that `ku --version` runs.
+[Install Ku](/en/docs/install/) first and confirm that `ku --version` runs.
 
 ## Write your first program
 

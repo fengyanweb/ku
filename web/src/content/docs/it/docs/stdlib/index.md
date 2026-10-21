@@ -78,3 +78,20 @@ Crea prima un file UTF-8 `message.txt` accanto al sorgente. Un file assente o un
 ## Manutenzione della documentazione
 
 I metadati delle interfacce pubbliche si trovano in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sono verificati insieme a implementazioni e contratti. Il sito mantiene attualmente una documentazione manuale selezionata; l'esistenza di un comando `ku doc` non è stata confermata.
+
+## API reference (English)
+
+Detailed module references and runnable examples are currently available in English:
+
+- [http](/en/docs/stdlib/http/)
+- [time](/en/docs/stdlib/time/)
+- [fs](/en/docs/stdlib/fs/)
+- [config](/en/docs/stdlib/config/)
+- [string](/en/docs/stdlib/string/)
+- [array](/en/docs/stdlib/array/)
+- [object](/en/docs/stdlib/object/)
+- [json](/en/docs/stdlib/json/)
+- [bytes](/en/docs/stdlib/bytes/)
+- [net](/en/docs/stdlib/net/)
+- [database](/en/docs/stdlib/database/)
+- [compiler](/en/docs/stdlib/compiler/)

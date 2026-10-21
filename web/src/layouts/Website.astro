@@ -23,7 +23,7 @@ const language = localeDefinitions[locale];
 const localized = locales.includes(Astro.url.pathname.split('/')[1] as Locale);
 const links = [
   [t.documentation, `/${locale}/docs/getting-started/`],
-  [t.languageGuide, `/${locale}/docs/guide/language/`],
+  [t.libraryGroup, `/${locale}/docs/stdlib/`],
   [t.releases, `/${locale}/releases/`],
 ];
 const messages = {
@@ -134,9 +134,6 @@ const messages = {
         </span>
       </div>
     </footer>
-    <div class="shell" data-pagefind-ignore>
-      <LanguageNotice locale={locale} />
-    </div>
     <dialog class="search-dialog" data-search-dialog aria-label={t.searchDocs}>
       <form method="dialog" class="search-top">
         <label for="ku-search">{t.searchTitle}</label>

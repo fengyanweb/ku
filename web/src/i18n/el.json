@@ -101,5 +101,7 @@
   "nextNotice": "Η τεκμηρίωση περιγράφει το οριστικοποιημένο εύρος της πειραματικής προέκδοσης v{currentVersion}. Η πραγματική δημοσίευση και οι λήψεις καταγράφονται στα GitHub Releases.",
   "startGroup": "Ξεκινήστε εδώ",
   "toolsGroup": "Γλώσσα και εργαλεία",
-  "projectGroup": "Έργο"
+  "projectGroup": "Έργο",
+  "libraryGroup": "Τυπική βιβλιοθήκη",
+  "examplesGroup": "Παραδείγματα"
 }

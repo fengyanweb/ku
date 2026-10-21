@@ -1,0 +1,68 @@
+---
+import Default from '@astrojs/starlight/components/ThemeSelect.astro';
+import { getCollection } from 'astro:content';
+import { archiveFromPath, unversionedPath, versions } from '../data/versions';
+import { localeFromPath, translate } from '../i18n/locales';
+
+const locale = localeFromPath(Astro.url.pathname);
+const t = translate(locale);
+const archive = archiveFromPath(Astro.url.pathname);
+const topic = unversionedPath(Astro.url.pathname).split('/').slice(2).join('/');
+const paths = new Set(
+  (await getCollection('docs')).map(
+    ({ id }) => `/${id.replace(/(^|\/)index$/, '').replace(/\/$/, '')}/`,
+  ),
+);
+const destination = (slug: string) => {
+  const prefix = `/${locale}/${slug ? `${slug}/` : ''}`;
+  const same = `${prefix}${topic}`;
+  if (paths.has(same)) return same;
+  const landing = slug ? prefix : `${prefix}docs/getting-started/`;
+  if (paths.has(landing)) return landing;
+  return `/en/${slug ? `${slug}/` : 'docs/getting-started/'}`;
+};
+---
+
+<label class="ku-version-select">
+  <span class="sr-only">{t.version}</span>
+  <select data-ku-doc-version aria-label={t.version}>
+    <option value={destination('')} selected={!archive}>
+      {versions.current} · {t.next}
+    </option>
+    {versions.archives.map((version) => (
+      <option
+        value={destination(version.slug)}
+        selected={archive?.slug === version.slug}
+      >
+        {t.snapshot.replace('{version}', version.label)}
+      </option>
+    ))}
+  </select>
+</label>
+<Default>
+  <slot />
+</Default>
+
+<script>
+  document
+    .querySelectorAll<HTMLSelectElement>('[data-ku-doc-version]')
+    .forEach((select) => {
+      select.addEventListener('change', () => {
+        const target = new URL(select.value, location.origin);
+        target.search = location.search;
+        location.assign(target.href);
+      });
+    });
+</script>
+
+<style>
+  .ku-version-select select {
+    max-width: 14rem;
+    padding: 0.5rem;
+    border: 0;
+    background: var(--sl-color-bg-nav);
+    color: var(--sl-color-white);
+    font: inherit;
+    font-size: var(--sl-text-sm);
+  }
+</style>

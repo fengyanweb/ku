@@ -15,6 +15,8 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for async/await, Error, Result, std.fs, std.http, std.config, std.task, match, string and array helpers.
 - Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes. Member completion is context-aware: typing `http.se` offers `service` / `server`, and those constructors insert `service()` / `server()` so old property-style objects are not suggested; global completion no longer inserts bare `http.service` / `http.server`.
+- The development source also completes `std.bytes`, `std.net`, `std.lexer`, `std.parser`, directory operations, and the `time.instant` / `time.elapsed` / `time.steady_millis` clocks. These additions require building the extension from this source; the existing v0.0.18 Release VSIX is unchanged. `time.now()` returns Unix milliseconds; `time.instant()` returns a Time object.
+- The development source reads the status-bar comparison version from `package.json`; the original v0.0.18 VSIX retained a 0.0.17 comparison constant and can incorrectly report a mismatch with Ku 0.0.18.
 - HTTP handler completions understand `req` / `app` / `router` names, so `req.` offers request fields instead of falling back to global stdlib functions. Normal route templates use `fn()` when request data is not needed and `fn(req)` when it is.
 - Ordinary async task handles are one-use values returned by `async fn`; the extension does not suggest `status` / `cancel` / `await_timeout` lifecycle methods for them.
 - Typed arrow functions are first-class values. Object indexing is strict by default; `object[key]?` is the explicit nullable lookup form. Object destructuring snippets cover rename/default/rest.
@@ -70,3 +72,7 @@ Open `editors/vscode-ku` in VS Code and press `F5` to launch an Extension Develo
 The extension uses `ku` from PATH first, then falls back to the matching workspace bundle under `release/<rust-target>/ku[.exe]`, followed by `target/release/ku[.exe]` and `target/debug/ku[.exe]`. Published target bundles currently map Windows x64 to `x86_64-pc-windows-msvc`, Linux x64 to `x86_64-unknown-linux-gnu`, and Apple Silicon macOS to `aarch64-apple-darwin`; unsupported host architectures must use `ku.executablePath` or PATH.
 
 If needed, set `ku.executablePath` in VS Code settings.
+
+## Scope
+
+Completion and hover text use the extension's built-in API model. They do not provide a full compiler language server or infer every receiver type and chained method. `ku check` supplies compiler diagnostics; commands still require an installed Ku executable. The extension does not install the CLI, database drivers, or native target packs. `std.bytes` / `std.net` need the native C execution path supported by the selected Ku package.

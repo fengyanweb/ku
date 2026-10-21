@@ -97,5 +97,7 @@
   "nextNotice": "Bu belgeler v{currentVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",
   "startGroup": "Buradan başlayın",
   "toolsGroup": "Dil ve araçlar",
-  "projectGroup": "Proje"
+  "projectGroup": "Proje",
+  "libraryGroup": "Standart kütüphane",
+  "examplesGroup": "Örnekler"
 }

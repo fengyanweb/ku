@@ -89,5 +89,7 @@
   "nextNotice": "本文檔對應 v{currentVersion} 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。",
   "startGroup": "開始使用",
   "toolsGroup": "語言與工具",
-  "projectGroup": "專案"
+  "projectGroup": "專案",
+  "libraryGroup": "標準函式庫",
+  "examplesGroup": "範例"
 }

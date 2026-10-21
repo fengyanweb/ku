@@ -77,7 +77,11 @@
       "Bindings, functions, values and errors.",
       "docs/guide/language"
     ],
-    ["Standard library", "Find modules and explore JSON.", "docs/stdlib"],
+    [
+      "Standard library",
+      "HTTP, JSON, files, time, databases and more.",
+      "docs/stdlib"
+    ],
     [
       "Know the boundaries",
       "Platforms, backends and current limits.",
@@ -97,5 +101,7 @@
   "nextNotice": "Documentation for Ku {currentVersion}. Use its snapshot for a fixed reference; GitHub Release records actual publication and assets.",
   "startGroup": "Start here",
   "toolsGroup": "Language & tools",
-  "projectGroup": "Project"
+  "projectGroup": "Project",
+  "libraryGroup": "Standard library",
+  "examplesGroup": "Examples"
 }

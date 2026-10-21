@@ -89,5 +89,7 @@
   "nextNotice": "이 문서는 실험적 사전 릴리스 v{currentVersion}의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요.",
   "startGroup": "시작하기",
   "toolsGroup": "언어 및 도구",
-  "projectGroup": "프로젝트"
+  "projectGroup": "프로젝트",
+  "libraryGroup": "표준 라이브러리",
+  "examplesGroup": "예제"
 }

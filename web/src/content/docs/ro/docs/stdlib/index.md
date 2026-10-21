@@ -78,3 +78,20 @@ Creează mai întâi un `message.txt` UTF-8 lângă sursă. Un fișier absent sa
 ## Întreținerea referinței
 
 Metadatele interfeței publice sunt în [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sunt verificate împreună cu implementările și contractele. Site-ul întreține momentan o referință selectată manual; nu a fost confirmată o comandă `ku doc` existentă.
+
+## API reference (English)
+
+Detailed module references and runnable examples are currently available in English:
+
+- [http](/en/docs/stdlib/http/)
+- [time](/en/docs/stdlib/time/)
+- [fs](/en/docs/stdlib/fs/)
+- [config](/en/docs/stdlib/config/)
+- [string](/en/docs/stdlib/string/)
+- [array](/en/docs/stdlib/array/)
+- [object](/en/docs/stdlib/object/)
+- [json](/en/docs/stdlib/json/)
+- [bytes](/en/docs/stdlib/bytes/)
+- [net](/en/docs/stdlib/net/)
+- [database](/en/docs/stdlib/database/)
+- [compiler](/en/docs/stdlib/compiler/)

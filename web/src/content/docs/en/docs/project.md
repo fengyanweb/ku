@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. The project is **Ku programming language / Ku 编程语言**, with the CLI named `ku`. Ku is a small programming language and interpreter under development. Its current public release is the v0.0.18 experimental prerelease.
+The project is **Ku programming language / Ku 编程语言**, with the CLI named `ku`. Ku is a small programming language and interpreter under development. Its current public release is the v0.0.18 experimental prerelease.
 
 ## Source and licensing
 
@@ -36,7 +36,7 @@ Do not submit tokens, passwords, real connection strings, or logs containing sen
 
 The [syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) define language behavior. Check CI, implementation, and contracts together. A work log target is not an implemented feature.
 
-Keep changes focused and explain reproduction, cause, scope, and validation. Review website content alongside the relevant source. Preserve existing tests, working tree changes, and unique evidence. The maintainer determines contribution acceptance and licensing arrangements; this website does not invent a contribution agreement.
+Keep changes focused and explain reproduction, cause, scope, and validation. Review website content alongside the relevant source. The maintainer determines contribution acceptance and licensing arrangements; this website does not invent a contribution agreement.
 
 This website is static. Its prose, navigation, and code do not require a business backend. Search loads a Pagefind index in the browser; the site does not provide remote Ku code execution.
 

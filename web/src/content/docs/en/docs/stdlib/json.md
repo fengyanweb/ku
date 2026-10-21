@@ -11,6 +11,8 @@ sources:
     'examples/json.ku',
     'docs/v0.0.18.md',
   ]
+sidebar:
+  order: 4
 ---
 
 `json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
@@ -26,14 +28,14 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | Read only encoding into new compact JSON text            |
 | `json.parse(text:str)`       | `KuValue!` | Strict parsing into an independently owned dynamic value |
 | `json.try_parse(text:str)`   | `KuValue!` | Compatibility alias for `parse`                          |
-| `json.encode(&value:any)`    | `str!`     | Development branch alias for `stringify`                 |
-| `json.decode(text:str)`      | `KuValue!` | Development branch alias for `parse`                     |
+| `json.encode(&value:any)`    | `str!`     | Alias for `stringify`                                    |
+| `json.decode(text:str)`      | `KuValue!` | Alias for `parse`                                        |
 
 `!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. Encoding does not consume or mutate the input.
 
 ## Encode and read values
 
-This is a complete basic example. The development branch has a broader regression example in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+This is a complete basic example. A more complete example is available in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -85,4 +87,4 @@ Recoverable errors use the `json` domain. Common codes are `parse_error`, `strin
 
 The interpreter, default packaged runner, and synchronous native C backend have JSON implementations. **The restricted native Task subset and LLVM do not support JSON.** Default runner imports still depend on their source locations; JSON support does not imply a fully independent package.
 
-Signatures and limits on this page were checked against source and contracts. Execution verification must name the version, commit, and backend. See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).

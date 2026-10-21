@@ -97,5 +97,7 @@
   "nextNotice": "Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v{currentVersion}. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases.",
   "startGroup": "Hier beginnen",
   "toolsGroup": "Sprache & Werkzeuge",
-  "projectGroup": "Projekt"
+  "projectGroup": "Projekt",
+  "libraryGroup": "Standardbibliothek",
+  "examplesGroup": "Beispiele"
 }

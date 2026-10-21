@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+Download the **Ku v0.0.18 experimental prerelease** for your operating system and CPU.
 
 ## Choose your platform
 

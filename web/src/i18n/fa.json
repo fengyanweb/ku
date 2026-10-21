@@ -97,5 +97,7 @@
   "nextNotice": "این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v{currentVersion} را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند.",
   "startGroup": "شروع کار",
   "toolsGroup": "زبان و ابزارها",
-  "projectGroup": "پروژه"
+  "projectGroup": "پروژه",
+  "libraryGroup": "کتابخانهٔ استاندارد",
+  "examplesGroup": "مثال‌ها"
 }

@@ -78,3 +78,20 @@ fn main(): null! {
 ## نگهداری مرجع
 
 فرادادهٔ رابط عمومی در [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs) قرار دارد. این داده‌ها همراه پیاده‌سازی‌ها و قراردادها بررسی می‌شوند. این وب‌سایت فعلاً مرجع دستی گزینش‌شده‌ای را نگه می‌دارد؛ وجود فرمان `ku doc` تأیید نشده است.
+
+## API reference (English)
+
+Detailed module references and runnable examples are currently available in English:
+
+- [http](/en/docs/stdlib/http/)
+- [time](/en/docs/stdlib/time/)
+- [fs](/en/docs/stdlib/fs/)
+- [config](/en/docs/stdlib/config/)
+- [string](/en/docs/stdlib/string/)
+- [array](/en/docs/stdlib/array/)
+- [object](/en/docs/stdlib/object/)
+- [json](/en/docs/stdlib/json/)
+- [bytes](/en/docs/stdlib/bytes/)
+- [net](/en/docs/stdlib/net/)
+- [database](/en/docs/stdlib/database/)
+- [compiler](/en/docs/stdlib/compiler/)

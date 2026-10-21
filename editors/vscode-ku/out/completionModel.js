@@ -34,13 +34,17 @@ exports.keywords = [
 ];
 exports.types = ["int", "float", "bool", "str", "null"];
 exports.builtins = ["len", "str", "ok", "err", "println"];
-exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task", "std.pg", "std.redis", "std.mysql"];
-exports.stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql"];
+exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task", "std.pg", "std.redis", "std.mysql", "std.bytes", "std.net", "std.lexer", "std.parser"];
+exports.stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser"];
 exports.stdFunctions = [
     "fs.read",
     "fs.try_read",
     "fs.write",
     "fs.try_write",
+    "fs.exists",
+    "fs.read_dir",
+    "lexer.scan",
+    "parser.parse",
     "http.get",
     "http.post",
     "http.request",
@@ -74,6 +78,9 @@ exports.stdFunctions = [
     "config.env_file",
     "config.yaml",
     "time.now",
+    "time.instant",
+    "time.elapsed",
+    "time.steady_millis",
     "time.unix",
     "time.millis",
     "time.from_unix",
@@ -105,9 +112,14 @@ exports.stdFunctions = [
     "pg.client",
     "redis.client",
     "mysql.client",
+    "bytes.from_str",
+    "bytes.from_array",
+    "net.client",
 ];
 exports.namespaceMembers = {
-    fs: ["read", "try_read", "write", "try_write"],
+    fs: ["read", "try_read", "write", "try_write", "exists", "read_dir"],
+    lexer: ["scan"],
+    parser: ["parse"],
     http: ["get", "post", "request", "client", "text", "html", "json", "empty", "redirect", "status", "statusText", "code", "service", "server"],
     status: [
         "ok",
@@ -144,12 +156,15 @@ exports.namespaceMembers = {
     ],
     code: ["SUCCESS", "CREATED", "ACCEPTED", "NO_CONTENT", "BAD_REQUEST", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION_FAILED", "INTERNAL_ERROR"],
     string: ["len", "byte_len", "chars", "contains", "starts_with", "ends_with", "trim", "lower", "upper", "replace", "slice"],
-    array: ["len", "try_get", "push", "concat"],
+    array: ["len", "try_get", "push", "concat", "first", "last", "is_empty"],
     object: ["get_or"],
     json: ["encode", "decode", "parse", "try_parse", "stringify"],
     config: ["env", "env_file", "yaml"],
     time: [
         "now",
+        "instant",
+        "elapsed",
+        "steady_millis",
         "unix",
         "millis",
         "from_unix",
@@ -173,6 +188,8 @@ exports.namespaceMembers = {
     pg: ["client"],
     redis: ["client"],
     mysql: ["client"],
+    bytes: ["from_str", "from_array"],
+    net: ["client"],
     err: ["domain", "code", "message"],
     text: ["len", "byte_len", "chars", "contains", "starts_with", "ends_with", "trim", "lower", "upper", "replace", "slice"],
     values: ["len", "try_get", "push", "concat", "map"],

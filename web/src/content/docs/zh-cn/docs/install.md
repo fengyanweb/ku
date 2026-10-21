@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-本页安装目标为 **v0.0.18 实验预发行版**，不是稳定版，也不代表生产就绪。请以实际 [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 及其资产为准，文档本身不能证明发布任务已执行。
+下载 **Ku v0.0.18 实验预发行版**，选择与你的系统和 CPU 匹配的安装包。
 
 ## 选择对应平台
 
@@ -78,7 +78,7 @@ cargo +1.89.0 run --locked --release -- --version
 cargo +1.89.0 run --locked --release -- run examples/hello.ku
 ```
 
-本版 CLI 与 Cargo 版本统一为 `0.0.18`。从源码复现时记录 Git commit、平台与工具链；源码构建成功不等于安装包已经发布。
+CLI 与 Cargo 版本为 `0.0.18`。从源码复现时记录 Git commit、平台与工具链；源码构建成功不等于安装包已经发布。
 
 ## 卸载
 

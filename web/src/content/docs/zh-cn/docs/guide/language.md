@@ -11,9 +11,11 @@ sources:
     'examples/control_flow.ku',
     'examples/result.ku',
   ]
+sidebar:
+  order: 0
 ---
 
-本文档对应 v0.0.18 实验预发行版的冻结范围；实际公开状态与下载资产以 GitHub Release 为准。这里介绍核心写法，完整规则以仓库[语法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)和[语义合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)为准。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
+本页介绍核心写法，详细规则见仓库[语法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)和[语义合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)为准。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
 
 ## 变量与类型
 
