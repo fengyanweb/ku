@@ -705,7 +705,7 @@ impl Interpreter {
             let mut env = captures.clone();
             env.push_scope();
             if let Some(name) = self_name {
-                env.define_owned(
+                env.define_function_self(
                     name.clone(),
                     Value::Function {
                         params: params.to_vec(),
@@ -715,7 +715,6 @@ impl Interpreter {
                         self_name: self_name.clone(),
                         is_async: declared_async,
                     },
-                    false,
                     span,
                 )?;
             }
@@ -1818,8 +1817,10 @@ impl Interpreter {
                         return Ok(value);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
+                        let global_is_visible = self.functions.contains_key(name)
+                            && !env.shadows_global_function(name, expr.span)?;
                         if let Some(function) =
-                            self.functions.get(name).filter(|_| !env.contains(name))
+                            self.functions.get(name).filter(|_| global_is_visible)
                         {
                             let modes = explicit_borrow_modes(function);
                             let mut leases = Vec::new();
