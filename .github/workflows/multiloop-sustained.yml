@@ -175,7 +175,24 @@ jobs:
           try:
               with (root/"driver.log").open("wb") as log:
                   child = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                  result["exit_code"] = child.wait(timeout=35*60)
+                  while child.poll() is None:
+                      remaining = 35*60-(time.monotonic()-began)
+                      if remaining <= 0:
+                          raise subprocess.TimeoutExpired(argv, 35*60)
+                      try:
+                          child.wait(timeout=min(30, remaining))
+                      except subprocess.TimeoutExpired:
+                          progress = {"elapsed_seconds": round(time.monotonic()-began, 1)}
+                          try:
+                              current = json.loads((root/"report.json").read_text())
+                              live = current.get("live", {})
+                              progress.update(status=current.get("status"), phase=live.get("phase"),
+                                  requests=live.get("requests"),
+                                  last_resource_sample=live.get("resource_samples", [{}])[-1:])
+                          except (OSError, ValueError):
+                              progress["status"] = "native_build_or_startup"
+                          print("bounded-checkpoint "+json.dumps(progress), flush=True)
+                  result["exit_code"] = child.returncode
                   result["status"] = "finished" if result["exit_code"] == 0 else "failed"
           except (subprocess.TimeoutExpired, InterruptedError) as error:
               result.update(status="interrupted", error=str(error), exit_code=124)
