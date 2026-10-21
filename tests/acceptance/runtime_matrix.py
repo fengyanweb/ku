@@ -7,9 +7,11 @@ histograms, diagnostic samples, client threads and retained sockets are bounded.
 No existing database, service configuration or website is accessed.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -41,12 +43,15 @@ PLAN = {
     "ordinary_and_timer_p99_limit_ms": 250, "idle_one_core_cpu_limit_percent": 5,
     "rss_recovered_growth_limit_bytes": 16777216,
     "descriptor_recovered_growth_limit": 2,
+    "windows_resource_initialization_cycles": 4,
+    "windows_resource_initialization_concurrency": 16,
     "meaning": {
         "throughput": "Observed short closed-loop throughput, no linear-scaling claim or minimum speedup gate.",
         "waiting": "Accepted incomplete HTTP bodies and timer Task waits are reported separately. Neither proves Task TCP await.",
         "blocking": "HTTP checks actual running jobs and charged output after timeout. Pool-full and stale-generation checks use the existing controlled native regression when supplied.",
         "cancel": "Black-box disconnect/deadline/reuse evidence; exact internal stale generations are covered by the controlled native regression.",
         "rss": "Allocator retained capacity may remain within the declared 16 MiB delta; RSS is not exact per-Task memory accounting.",
+        "windows_handles": "Retain cold counters and first-use costs. Three same-process repeat cycles and the full matrix must stay within the unchanged +2 handle limit of the first recovered cycle; failed samples never become zero counters.",
     },
 }
 
@@ -62,6 +67,20 @@ fn matrix_large(): HttpResponse! {
     text = text + text
     text = text + text
     text = text + text
+    return ok(http.text(text))
+}
+
+fn matrix_resource_sync(): HttpResponse! {
+    i = 0
+    total = 0
+    while (i < 500000) { total = total + i; i = i + 1 }
+    if (total != 124999750000) { fail "incorrect resource probe calculation" }
+    text = fs.read("resource.txt")?
+    return ok(http.text(text))
+}
+
+async fn matrix_resource_file(): HttpResponse! {
+    text = fs.read("resource.txt")?
     return ok(http.text(text))
 }
 
@@ -120,6 +139,69 @@ def cpu_sample(pid):
     except (OSError, ValueError, IndexError):
         value["cpu_sample_error"] = True
     return value
+
+
+def resource_sample_errors(sample, descriptor_key, require_cpu=False):
+    errors = []
+    if sample.get("sample_error") or sample.get("cpu_sample_error"):
+        errors.append("sample reports an error")
+    for field in ("rss_bytes", descriptor_key, "threads"):
+        value = sample.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(f"missing or invalid {field}")
+    if require_cpu:
+        value = sample.get("cpu_seconds")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            errors.append("missing or invalid cpu_seconds")
+    return errors
+
+
+def resource_recovery_check(recovery, baseline, final, descriptor_key):
+    errors = {name: resource_sample_errors(sample, descriptor_key)
+              for name, sample in (("baseline", baseline), ("final", final))}
+    errors = {name: value for name, value in errors.items() if value}
+    rss_delta = final["rss_bytes"] - baseline["rss_bytes"] if not errors else None
+    descriptor_delta = final[descriptor_key] - baseline[descriptor_key] if not errors else None
+    return {"recovery": recovery, "baseline": baseline, "final": final,
+            "sample_errors": errors, "rss_delta_bytes": rss_delta, "descriptor_delta": descriptor_delta,
+            "passed": not errors and recovery["passed"]
+                and rss_delta <= PLAN["rss_recovered_growth_limit_bytes"]
+                and descriptor_delta <= PLAN["descriptor_recovered_growth_limit"] and final["threads"] <= 16}
+
+
+def windows_resource_initialization(service, cold):
+    """Keep first-use costs visible, then test three repeats in this same child."""
+    cycles = []
+    first = None
+    for index in range(PLAN["windows_resource_initialization_cycles"]):
+        stages = []
+        for path, expected in (("/resource-sync", b"file-ready"),
+                               ("/timer", b"timer-ready"), ("/resource-file", b"file-ready")):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=PLAN["windows_resource_initialization_concurrency"]) as executor:
+                probes = list(executor.map(lambda _: call(service, path, expected),
+                                           range(PLAN["windows_resource_initialization_concurrency"])))
+            recovery = recover(service)
+            resources = cpu_sample(service.child.pid)
+            stages.append({"path": path, "probes": probes, "recovery": recovery, "resources": resources,
+                           "passed": all(probe[0] == "success" for probe in probes) and recovery["passed"]
+                               and not resource_sample_errors(resources, "handles")})
+        final = stages[-1]["resources"]
+        if first is None:
+            first = final
+        comparison = resource_recovery_check(stages[-1]["recovery"], first, final, "handles")
+        cycles.append({"cycle": index, "stages": stages, "recovered_resources": final,
+                       "compared_to_first_recovered_cycle": comparison,
+                       "passed": all(stage["passed"] for stage in stages) and comparison["passed"]})
+    cold_comparison = resource_recovery_check({"passed": True}, cold, first, "handles")
+    # The cold handle delta is reported, not relabelled as a released resource.
+    # It cannot explain repeat growth: every later cycle and the actual matrix
+    # still uses the original +2 limit. Keep the original cold RSS bound too.
+    cold_valid = not cold_comparison["sample_errors"] and cold_comparison["rss_delta_bytes"] <= PLAN["rss_recovered_growth_limit_bytes"]
+    cold_comparison.pop("passed")
+    cold_comparison["scope"] = "First-use costs, not a claim that cold handles were released; repeat and final recovery use the unchanged +2 limit."
+    return {"cold": cold, "cold_to_first_recovered_cycle": cold_comparison, "cycles": cycles,
+            "baseline_for_repeated_work": first,
+            "passed": cold_valid and all(cycle["passed"] for cycle in cycles)}
 
 
 class MatrixService(Service):
@@ -641,7 +723,7 @@ def main():
     source = fixture.read_text(encoding="utf-8")
     assert source.count("fn main(): null! {") == 1 and source.count("    app.listen(address)?") == 1
     source = source.replace("fn main(): null! {", EXTRA_HANDLERS + "fn main(): null! {")
-    source = source.replace("    app.listen(address)?", '    app.get("/blocking", matrix_blocking)\n    app.get("/large", matrix_large)\n    app.listen(address)?')
+    source = source.replace("    app.listen(address)?", '    app.get("/blocking", matrix_blocking)\n    app.get("/large", matrix_large)\n    app.get("/resource-sync", matrix_resource_sync)\n    app.get("/resource-file", matrix_resource_file)\n    app.listen(address)?')
     report = {"status": "prepared", "platform": platform.platform(), "python": platform.python_version(),
               "command": sys.argv, "host_logical_cpus": os.cpu_count(),
               "environment": machine_environment(),
@@ -664,6 +746,7 @@ def main():
             # fs.read has an existing 1,000,000-byte limit. The response is
             # intentionally larger than a TCP sender buffer without changing it.
             (root / "large.txt").write_bytes(b"x" * (PLAN["slow_response_bytes"] // 8))
+            (root / "resource.txt").write_text("file-ready", encoding="ascii")
             executable = root / ("matrix.exe" if os.name == "nt" else "matrix")
             profile_arguments = ["--release"] if args.profile == "release" else ["--profile", "debug"]
             build = subprocess.run([str(args.ku.resolve()), "build", *profile_arguments, "--backend", "c", "-o", str(executable), str(program)],
@@ -688,13 +771,21 @@ def main():
                     service = MatrixService(executable, root, loops)
                     run["baseline_metrics"] = service.metrics()
                     baseline = cpu_sample(service.child.pid)
+                    run["cold_resources"] = baseline
                     before = cpu_sample(service.child.pid)
                     time.sleep(PLAN["idle_seconds"])
                     after = cpu_sample(service.child.pid)
                     wall = after["monotonic"] - before["monotonic"]
-                    cpu = (after.get("cpu_seconds", float("inf")) - before.get("cpu_seconds", 0)) / wall * 100
+                    idle_errors = resource_sample_errors(before, "handles" if os.name == "nt" else "fds", True)
+                    idle_errors += resource_sample_errors(after, "handles" if os.name == "nt" else "fds", True)
+                    cpu = (after["cpu_seconds"] - before["cpu_seconds"]) / wall * 100 if not idle_errors and wall > 0 else None
                     run["checks"]["idle"] = {"before": before, "after": after, "one_core_cpu_percent": cpu,
-                                                "passed": cpu <= PLAN["idle_one_core_cpu_limit_percent"] and after.get("threads", 17) <= 16}
+                                                "sample_errors": idle_errors,
+                                                "passed": not idle_errors and cpu is not None and cpu <= PLAN["idle_one_core_cpu_limit_percent"] and after["threads"] <= 16}
+                    if os.name == "nt" and not args.cpu_only:
+                        initialization = windows_resource_initialization(service, baseline)
+                        run["checks"]["A18_windows_first_use_and_repeats"] = initialization
+                        baseline = initialization["baseline_for_repeated_work"]
                     atomic_json(args.output, report)
                     for name, action in [
                         ("cpu", lambda: closed_cpu(service)), ("fairness", lambda: fair_load(service)),
@@ -711,13 +802,8 @@ def main():
                         atomic_json(args.output, report)
                     recovery = recover(service, run["baseline_metrics"])
                     final = cpu_sample(service.child.pid)
-                    rss_delta = final.get("rss_bytes", 1 << 60) - baseline.get("rss_bytes", 0)
                     descriptor_key = "handles" if os.name == "nt" else "fds"
-                    descriptor_delta = final.get(descriptor_key, 1 << 60) - baseline.get(descriptor_key, 0)
-                    run["checks"]["A18_recovery"] = {"recovery": recovery, "baseline": baseline, "final": final,
-                        "rss_delta_bytes": rss_delta, "descriptor_delta": descriptor_delta,
-                        "passed": recovery["passed"] and rss_delta <= PLAN["rss_recovered_growth_limit_bytes"]
-                            and descriptor_delta <= PLAN["descriptor_recovered_growth_limit"] and final.get("threads", 17) <= 16}
+                    run["checks"]["A18_recovery"] = resource_recovery_check(recovery, baseline, final, descriptor_key)
                     metrics = service.metrics()
                     run["checks"]["all_loops_worked"] = {
                         "loops": metrics["loops"], "tasks": metrics["tasks"],

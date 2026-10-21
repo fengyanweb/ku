@@ -36,6 +36,87 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def windows_process_sample(pid):
+    """Read the child directly; every diagnostic handle belongs to this caller.
+
+    PowerShell startup used to exceed the first sample's timeout on CI. The
+    documented process counters and Toolhelp thread snapshot avoid subprocess
+    startup, and neither a missing counter nor a failed close is a zero sample.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ThreadID", wintypes.DWORD), ("th32OwnerProcessID", wintypes.DWORD),
+                    ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetProcessHandleCount.restype = wintypes.BOOL
+    kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+    kernel.K32GetProcessMemoryInfo.restype = wintypes.BOOL
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for function in (kernel.Thread32First, kernel.Thread32Next):
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+        function.restype = wintypes.BOOL
+
+    def check(ok, operation):
+        if not ok:
+            raise OSError(ctypes.get_last_error(), operation)
+
+    process = kernel.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    check(process, "OpenProcess")
+    try:
+        count = wintypes.DWORD()
+        check(kernel.GetProcessHandleCount(process, ctypes.byref(count)), "GetProcessHandleCount")
+        memory = MemoryCounters()
+        memory.cb = ctypes.sizeof(memory)
+        check(kernel.K32GetProcessMemoryInfo(process, ctypes.byref(memory), memory.cb), "K32GetProcessMemoryInfo")
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        check(kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(system), ctypes.byref(user)), "GetProcessTimes")
+        snapshot = kernel.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == wintypes.HANDLE(-1).value:
+            raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot")
+        try:
+            thread = ThreadEntry()
+            thread.dwSize = ctypes.sizeof(thread)
+            more = kernel.Thread32First(snapshot, ctypes.byref(thread))
+            threads = 0
+            while more:
+                threads += int(thread.th32OwnerProcessID == int(pid))
+                thread.dwSize = ctypes.sizeof(thread)
+                more = kernel.Thread32Next(snapshot, ctypes.byref(thread))
+            if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                raise OSError(ctypes.get_last_error(), "Thread32Next/First")
+            if not threads:
+                raise OSError("sampled process has no live threads")
+        finally:
+            check(kernel.CloseHandle(snapshot), "CloseHandle(thread snapshot)")
+        ticks = lambda value: (value.dwHighDateTime << 32) | value.dwLowDateTime
+        return {"handles": count.value, "threads": threads, "rss_bytes": memory.WorkingSetSize,
+                "cpu_seconds": (ticks(system) + ticks(user)) / 10000000,
+                "sampler": "Win32 process counters and Toolhelp thread snapshot"}
+    finally:
+        check(kernel.CloseHandle(process), "CloseHandle(process sample)")
+
+
 def process_sample(pid):
     sample = {"monotonic": time.monotonic()}
     try:
@@ -55,11 +136,12 @@ def process_sample(pid):
             descriptors = subprocess.run(["lsof", "-a", "-p", str(pid), "-Ff"], capture_output=True, text=True, timeout=3)
             sample["fds"] = sum(line.startswith("f") and line[1:].isdigit() for line in descriptors.stdout.splitlines())
         elif platform.system() == "Windows":
-            output = subprocess.check_output(["powershell", "-NoProfile", "-Command",
-                f"$p=Get-Process -Id {int(pid)}; @{{rss_bytes=$p.WorkingSet64;threads=$p.Threads.Count;handles=$p.HandleCount;cpu_seconds=$p.CPU}}|ConvertTo-Json -Compress"], text=True, timeout=5)
-            sample.update(json.loads(output))
+            sample.update(windows_process_sample(pid))
+            sample["sample_duration_ms"] = (time.monotonic() - sample["monotonic"]) * 1000
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         sample["sample_error"] = type(error).__name__
+        if platform.system() == "Windows":
+            sample["sample_error_detail"] = str(error)[:160]
     return sample
 
 
