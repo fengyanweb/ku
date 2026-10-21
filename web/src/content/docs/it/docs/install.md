@@ -14,19 +14,19 @@ sources:
 
 > Gli aggiornamenti v0.0.18 seguono per ora in inglese; il resto della traduzione è mantenuto. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
+This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) and its assets; documentation alone does not establish completed publication or production readiness.
 
 ## Scegli la piattaforma
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). `native_ci-*` artifacts are CI examples, not CLI installers.
 
-| Sistema | Architettura          | Archivio                                                                                                                                              |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+| Sistema | Architettura          | Archivio                                                                                                                                                 |
+| ------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18/SHA256SUMS)
+[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/SHA256SUMS)
 
 Non sono stati verificati archivi per altre piattaforme. Il supporto alla compilazione incrociata non significa che ogni sistema operativo o architettura disponga di un pacchetto pubblicato.
 

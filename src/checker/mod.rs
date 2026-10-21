@@ -3721,7 +3721,7 @@ impl Checker {
                 0 => Ok(Type::DynamicObject),
                 1 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
-                    Ok(Type::DynamicObject)
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
                 }
                 2 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;

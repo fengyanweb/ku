@@ -24,7 +24,10 @@ TARGETS = (
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
 )
-TAG = re.compile(r"v0\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\Z")
+TAG = re.compile(
+    r"v(?P<version>0\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8}))"
+    r"(?:-r[1-9][0-9]{0,8})?\Z"
+)
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}\Z")
@@ -247,13 +250,14 @@ def create_reports(assets: Path, checksums: bytes, notes: bytes):
 
 
 def prepare_release(assets: Path, tag: str, commit: str, repo: Path) -> dict:
-    if not TAG.fullmatch(tag) or not COMMIT.fullmatch(commit):
-        raise PrepareError("expected a canonical v0.x.y tag and lowercase 40-character commit")
-    version = tag[1:]
+    match = TAG.fullmatch(tag)
+    if match is None or not COMMIT.fullmatch(commit):
+        raise PrepareError("expected a canonical v0.x.y or v0.x.y-rN tag and lowercase 40-character commit")
+    version = match["version"]
     repository = repo_version(repo, version)
     run_url = ci_url(repository)
-    notes = read_file(repo / "docs" / f"v{version}.md", MAX_JSON).decode("utf-8")
-    archives = {target: f"ku-{tag}-{target}.tar.gz" for target in TARGETS}
+    notes = read_file(repo / "docs" / f"{tag}.md", MAX_JSON).decode("utf-8")
+    archives = {target: f"ku-v{version}-{target}.tar.gz" for target in TARGETS}
     expected = set(archives.values()) | {f"{name}.manifest.json" for name in archives.values()}
     original = inventory(assets, expected)
     checksums = {}

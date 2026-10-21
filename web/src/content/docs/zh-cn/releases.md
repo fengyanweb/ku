@@ -6,11 +6,13 @@ verifiedAt: '2026-10-21'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
-## 0.0.18
+## 0.0.18 修订版 1
+
+当前修订版保留 0.0.18 版本号，发布标识为 `v0.0.18-r1`。新增调用链、大浮点源码字面量、`time.date(Time)` 和插件修复；[初版 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 保留供追溯。
 
 当前实验预发行版。包含有限 Task/等待与关闭修复、HTTP 连接复用与缓冲限制、JSON 大浮点往返修复，以及显式 `ku supervise` 受控 worker。
 
-[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) · [固定文档](/zh-cn/v0.0.18/) · [已知限制](/zh-cn/docs/support/)
+[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [固定文档](/zh-cn/v0.0.18/) · [已知限制](/zh-cn/docs/support/)
 
 **HTTP 已知问题：历史出现过 504，本轮短测未复现，根因未确认，正式 30 分钟验收尚未通过。** 完整 M:N、通用网络调度和数据库完整平台矩阵尚未完成。
 

@@ -823,7 +823,7 @@ class KuHoverProvider implements vscode.HoverProvider {
       "time.steady_millis": "`time.steady_millis()` 返回进程内单调时钟的毫秒整数，不能作为 Unix 时间戳使用。",
       "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",
       "time.unix": "`time.unix()` 返回当前 Unix 秒；`time.unix(time)` 读取 Time 的 Unix 秒。",
-      "time.date": "`time.date()` 返回今天日期；`time.date(time, zone)?` 或 `time.date(year, month, day)?` 返回 Date。",
+      "time.date": "`time.date()` 直接返回今天日期；`time.date(time)?` 按本地时区提取日期，带参数的重载均返回 Result：`time.date(time[, zone])?`、`time.date(year, month, day)?`。",
       "time.datetime": "`time.datetime(year, month, day, hour, minute, second[, zone])?` 构造 Time。",
       "time.duration": "`time.duration(ms)?` 或 `time.duration(value, unit)?` 构造 Duration；unit 支持 ms/s/m/h/d。",
       "time.format": "`time.format(time, layout[, zone])?` 使用 yyyy/MM/dd/HH/mm/ss/SSS token 格式化。",

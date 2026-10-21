@@ -12,19 +12,19 @@ sources:
   ]
 ---
 
-下载 **Ku v0.0.18 实验预发行版**，选择与你的系统和 CPU 匹配的安装包。
+当前下载为 **Ku 0.0.18 修订版 1**（发布标识 `v0.0.18-r1`），CLI 和插件版本仍显示 `0.0.18`。选择与你的系统和 CPU 匹配的安装包。
 
 ## 选择对应平台
 
-从 [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 下载以下目标归档、并列 manifest 与 `SHA256SUMS`。`native_ci-*` 是 CI 样例，不是 CLI 安装包。
+从 [v0.0.18-r1 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) 下载以下目标归档、并列 manifest 与 `SHA256SUMS`。`native_ci-*` 是 CI 样例，不是 CLI 安装包。
 
-| 系统    | 架构                  | 归档文件                                                                                                                                              |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+| 系统    | 架构                  | 归档文件                                                                                                                                                 |
+| ------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
 
-[下载校验文件: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18/SHA256SUMS)
+[下载校验文件: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/SHA256SUMS)
 
 没有核实的其他平台安装包。跨平台编译能力也不表示任意操作系统或架构已有发行包。
 
@@ -53,7 +53,7 @@ Windows PowerShell：
 解压后，在 VS Code 的扩展面板选择 **… → 从 VSIX 安装…**，打开 `ku-language-0.0.18.vsix`，再重新加载窗口。也可以在解压目录运行：
 
 ```sh
-code --install-extension ./ku-language-0.0.18.vsix
+code --install-extension ./ku-language-0.0.18.vsix --force
 ```
 
 插件需要找到 Ku CLI。把解压目录加入 `PATH`，或在 VS Code 设置中把 `ku.executablePath` 指向 `ku`（Windows 为 `ku.exe`）的完整路径。

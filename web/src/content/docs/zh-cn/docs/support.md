@@ -51,7 +51,7 @@ Ku 自举 Lexer 和 Parser 已有有界子集及差分验证；完整 Parser、c
 
 ## v0.0.18 冻结范围与已知限制
 
-本版只交付已经实现并验证的功能与修复，仍为**实验预发行版**，不代表生产就绪。[v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 的实际记录决定公开状态、下载资产和校验信息。
+本版只交付已经实现并验证的功能与修复，仍为**实验预发行版**，不代表生产就绪。[v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) 的实际记录决定公开状态、下载资产和校验信息。
 
 - JSON 保留旧底层实现作为默认；`json.encode` / `json.decode` 复用 `stringify` / `parse` 入口，包含 `1e20` 浮点往返修复。yyjson 替换与性能探索已经结束。
 - Task/native async 保持合同列出的有界子集。关闭准入与回收修复不等于完整 M:N 或全部网络可挂起。

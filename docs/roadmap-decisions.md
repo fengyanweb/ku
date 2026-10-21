@@ -91,4 +91,4 @@ ku build --backend c --release --target <target> .
 - 正式长期服务验收及更广性能/Go 对照。HTTP 历史出现过 504，本轮短测未复现，根因未确认，正式 30 分钟验收尚未通过；作为 0.0.18 已知问题保留，不再追加盲测或单独阻塞该版。
 - 通用值复制/释放与 AST 后续分析保持暂停，恢复需另行决定；本次不重新开启。
 
-上述条目是明确的后续计划，不等于本轮新发现的阻塞缺陷。安装包、目标架构、校验和实际发布结果以 [Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 为准。
+上述条目是明确的后续计划，不等于本轮新发现的阻塞缺陷。安装包、目标架构、校验和实际发布结果以 [Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) 为准。

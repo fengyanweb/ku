@@ -6,11 +6,13 @@ verifiedAt: '2026-10-21'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
-## 0.0.18
+## 0.0.18 revision 1
+
+Release tag `v0.0.18-r1` retains CLI and extension version `0.0.18`. It fixes chained calls, large float literals, `time.date(Time)` and extension metadata. The [original release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) remains available.
 
 The current experimental prerelease includes bounded Task/waiting and shutdown fixes, HTTP connection reuse and buffers, large-float JSON round trips and explicit `ku supervise` workers.
 
-[Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) · [Fixed docs](/en/v0.0.18/) · [Known limits](/en/docs/support/)
+[Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [Fixed docs](/en/v0.0.18/) · [Known limits](/en/docs/support/)
 
 **Known HTTP issue: historical 504s, not reproduced by this round's short tests; root cause unconfirmed; formal 30-minute acceptance has not passed.** Complete M:N, general network scheduling and the complete database platform matrix remain incomplete.
 

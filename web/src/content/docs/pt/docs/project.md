@@ -17,7 +17,7 @@ Esta documentação descreve o escopo congelado da pré-versão experimental v0.
 
 ## Código-fonte e licença
 
-Consulte o [código no GitHub](https://github.com/fengyanweb/ku) e a [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). O código é visível publicamente, mas o código próprio do Ku **não tem concessão de licença de código aberto**. A extensão do editor está marcada como `UNLICENSED`. Publicar código ou binários não concede automaticamente uma licença de código aberto.
+Consulte o [código no GitHub](https://github.com/fengyanweb/ku) e a [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). O código é visível publicamente, mas o código próprio do Ku **não tem concessão de licença de código aberto**. A extensão do editor está marcada como `UNLICENSED`. Publicar código ou binários não concede automaticamente uma licença de código aberto.
 
 Os avisos de terceiros nos arquivos de versões aplicam-se somente aos respectivos componentes. Eles não estabelecem permissões para usar, modificar ou redistribuir o próprio Ku. Qualquer autorização necessária deve vir explicitamente do mantenedor; este site não cria novos compromissos de licença.
 

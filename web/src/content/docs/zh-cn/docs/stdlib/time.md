@@ -78,6 +78,7 @@ time.steady_millis(): int
 time.from_unix(seconds:int): Time
 time.from_millis(ms:int): Time
 time.date(): Date
+time.date(value:Time): Date!
 time.date(value:Time, zone:str): Date!
 time.date(year:int, month:int, day:int): Date!
 time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int): Time!
@@ -104,7 +105,9 @@ time.sleep(ms:int): null!
 time.sleep(duration:Duration): null!
 ```
 
-旧的单参数 `time.date(value)` 在 v0.0.18 中存在检查器与运行时对 Result 处理不一致的问题。请使用 `time.date(value, "local")?` 或显式指定其他时区。
+`time.date()` 直接返回本地今天的日期；`time.date(value)?` 按本地时区提取日期，与 `time.date(value, "local")?` 等价。带参数的 `date` 重载均返回 Result，非法 Time、超出日历范围或非法时区会返回错误。
+
+单参数重载的 Result 检查规则在 `v0.0.18-r1` 修订版中修复。使用初版 v0.0.18 时，请调用 `time.date(value, "local")?`。
 
 `time.add/sub` 按时长移动时间点，`diff(left, right)` 计算 `left - right`，`compare` 返回 -1、0 或 1。`weekday` 用 1 表示周一、7 表示周日。`parts` 返回 `kind`、`year`、`month`、`day`、`hour`、`minute`、`second`、`millis`（毫秒分量）、`weekday`、`zone`。
 

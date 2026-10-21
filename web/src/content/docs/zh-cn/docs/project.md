@@ -17,7 +17,7 @@ sources:
 
 ## 源码与许可
 
-[查看 GitHub 源码](https://github.com/fengyanweb/ku)与[发行页面](https://github.com/fengyanweb/ku/releases/tag/v0.0.18)。源码公开可查看，但 Ku 自身代码**未授予开源许可证**，编辑器扩展标记为 `UNLICENSED`。公开源码和二进制发布不自动授予开源许可。
+[查看 GitHub 源码](https://github.com/fengyanweb/ku)与[发行页面](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)。源码公开可查看，但 Ku 自身代码**未授予开源许可证**，编辑器扩展标记为 `UNLICENSED`。公开源码和二进制发布不自动授予开源许可。
 
 发行归档中的第三方许可只适用于相应第三方组件，不能据此推断 Ku 本身的使用、修改或再分发授权。需要相关授权时应由项目维护方明确说明；本站不添加新的许可承诺。
 

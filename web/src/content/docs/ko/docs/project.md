@@ -17,7 +17,7 @@ sources:
 
 ## 소스 및 라이선스
 
-[GitHub 소스](https://github.com/fengyanweb/ku)와 [릴리스 페이지](https://github.com/fengyanweb/ku/releases/tag/v0.0.18)를 확인하세요. 소스는 공개적으로 볼 수 있지만 Ku 자체 코드에는 **오픈 소스 라이선스가 부여되지 않았습니다**. 편집기 확장은 `UNLICENSED`로 표시됩니다. 소스나 바이너리를 공개해도 자동으로 오픈 소스 라이선스가 부여되지는 않습니다.
+[GitHub 소스](https://github.com/fengyanweb/ku)와 [릴리스 페이지](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)를 확인하세요. 소스는 공개적으로 볼 수 있지만 Ku 자체 코드에는 **오픈 소스 라이선스가 부여되지 않았습니다**. 편집기 확장은 `UNLICENSED`로 표시됩니다. 소스나 바이너리를 공개해도 자동으로 오픈 소스 라이선스가 부여되지는 않습니다.
 
 릴리스 압축 파일의 제삼자 고지는 해당 구성 요소에만 적용됩니다. Ku 자체의 사용, 수정, 재배포 권한을 부여하지 않습니다. 필요한 허가는 유지 관리자가 명시적으로 제공해야 합니다. 이 웹사이트는 새로운 라이선스 약속을 만들지 않습니다.
 

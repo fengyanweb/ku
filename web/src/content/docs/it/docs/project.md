@@ -17,7 +17,7 @@ Questa documentazione descrive l’ambito fissato della versione preliminare spe
 
 ## Sorgenti e licenza
 
-Consulta il [codice su GitHub](https://github.com/fengyanweb/ku) e la [pagina della versione](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). Il codice sorgente è visibile pubblicamente, ma al codice proprio di Ku **non è stata concessa una licenza open source**. L'estensione dell'editor è contrassegnata `UNLICENSED`. Pubblicare sorgenti o binari non concede automaticamente una licenza open source.
+Consulta il [codice su GitHub](https://github.com/fengyanweb/ku) e la [pagina della versione](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Il codice sorgente è visibile pubblicamente, ma al codice proprio di Ku **non è stata concessa una licenza open source**. L'estensione dell'editor è contrassegnata `UNLICENSED`. Pubblicare sorgenti o binari non concede automaticamente una licenza open source.
 
 Gli avvisi di terze parti negli archivi delle versioni si applicano soltanto ai rispettivi componenti. Non stabiliscono permessi di uso, modifica o ridistribuzione di Ku stesso. Ogni autorizzazione necessaria deve provenire esplicitamente dal manutentore; questo sito non crea nuovi impegni di licenza.
 

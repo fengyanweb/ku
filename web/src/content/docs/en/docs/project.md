@@ -17,7 +17,7 @@ The project is **Ku programming language / Ku 编程语言**, with the CLI named
 
 ## Source and licensing
 
-View the [GitHub source](https://github.com/fengyanweb/ku) and [release page](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). Source is publicly viewable, but Ku's own code has **no open source license grant**. The editor extension is marked `UNLICENSED`. Publishing source or binaries does not automatically grant an open source license.
+View the [GitHub source](https://github.com/fengyanweb/ku) and [release page](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Source is publicly viewable, but Ku's own code has **no open source license grant**. The editor extension is marked `UNLICENSED`. Publishing source or binaries does not automatically grant an open source license.
 
 Third party notices in release archives apply only to their respective components. They do not establish permissions to use, modify, or redistribute Ku itself. Any required authorization must come explicitly from the maintainer; this website creates no new licensing commitment.
 

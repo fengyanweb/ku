@@ -6,6 +6,8 @@ Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `
 
 源码公开可查看，但目前未授予开源许可证；编辑器扩展也保持 `UNLICENSED`。本次发布不新增或变更许可。0.0.18 的冻结范围、安装方式和未完成边界见 [版本记录](docs/v0.0.18.md) 及 [已知问题](docs/v0.0.18-known-issues.md)。
 
+当前修订为 [0.0.18-r1](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)，CLI 与插件仍显示 0.0.18。修复调用链、native C 浮点常量与时间接口，并更新插件和标准库文档；初版标签和下载保留。[修订说明](docs/v0.0.18-r1.md)。
+
 > **0.0.16 数据库驱动均为 native-only（`ku build --native`），解释器 `ku run` 暂不支持连库。** 旧驱动底层曾分别通过 PostgreSQL / Redis / MySQL 实库验证；本次统一 client 与 MySQL `MYSQL_STMT` 路径必须以新的自动化和实库验收结果为准，不能沿用旧结果冒充新 API 已验证。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
 
 第一层协议的真实完成度、生产部署边界和通用 TLS 落地顺序见 [协议地基状态](docs/protocol-foundation.md)。

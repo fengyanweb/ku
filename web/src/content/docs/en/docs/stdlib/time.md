@@ -78,6 +78,7 @@ time.steady_millis(): int
 time.from_unix(seconds:int): Time
 time.from_millis(ms:int): Time
 time.date(): Date
+time.date(value:Time): Date!
 time.date(value:Time, zone:str): Date!
 time.date(year:int, month:int, day:int): Date!
 time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int): Time!
@@ -104,7 +105,9 @@ time.sleep(ms:int): null!
 time.sleep(duration:Duration): null!
 ```
 
-`time.date(value)` is a legacy one-argument overload whose v0.0.18 checker and runtime disagree about Result handling. Use `time.date(value, "local")?` or an explicit zone instead.
+`time.date()` returns today's local date directly. `time.date(value)?` extracts a date in the local zone, equivalent to `time.date(value, "local")?`. All overloads with arguments return a Result; invalid Time objects, out-of-range timestamps, or invalid zones return errors.
+
+The one-argument overload's Result type checking is fixed in the `v0.0.18-r1` revision. With the original v0.0.18 release, use `time.date(value, "local")?`.
 
 `time.add` / `sub` shift an instant by a duration, `diff(left, right)` computes `left - right`, and `compare` returns -1, 0, or 1. `weekday` returns 1 for Monday through 7 for Sunday. `parts` returns `kind`, `year`, `month`, `day`, `hour`, `minute`, `second`, `millis` (the millisecond component), `weekday`, and `zone`.
 

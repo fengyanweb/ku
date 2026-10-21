@@ -2872,6 +2872,11 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 c_str_literal_static(value)
             } else if expr.ty == IrType::Int && value == "-9223372036854775808" {
                 Ok("INT64_MIN".to_string())
+            } else if expr.ty == IrType::Float && !value.contains(['.', 'e', 'E']) {
+                // IR keeps the shortest decimal spelling, which may omit the
+                // fraction. C must still see a double token, both for large
+                // values and for floating arithmetic such as 1.0 / 2.0.
+                Ok(format!("{value}.0"))
             } else {
                 Ok(value.clone())
             }
