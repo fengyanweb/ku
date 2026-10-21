@@ -99,6 +99,12 @@ jobs:
       - name: Verify HTTP lexical capture and owned response regression under sanitizers
         run: cargo test --locked --test native_http_test native_http_lexical_capture_replay_ -- --nocapture --test-threads=1
 
+      - name: Verify native HTTP async owner, timer and retirement under sanitizers
+        run: cargo test --locked --test native_http_test native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout -- --exact --nocapture --test-threads=1
+
+      - name: Verify native HTTP async TCP owner waits under sanitizers
+        run: cargo test --locked --test native_http_test native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker -- --exact --nocapture --test-threads=1
+
       - name: Verify scheduler probe rows and actual cancellation reclamation under sanitizers
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
@@ -179,7 +185,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            default-libmysqlclient-dev libpq-dev pkg-config
+            default-libmysqlclient-dev libpq-dev pkg-config postgresql haproxy
           source_lib="$(pg_config --libdir)/libpq.so"
           test -e "$source_lib"
           pg_config --version
@@ -218,7 +224,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
           set -euo pipefail
-          brew install libpq mysql-client
+          brew install libpq mysql-client postgresql@17 haproxy
           brew list --versions libpq mysql-client
           source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
           test -e "$source_lib"
@@ -326,6 +332,10 @@ jobs:
       - name: Build Ku CLI
         run: cargo build --locked --release --bin ku
 
+      - name: Verify resident deployment budget and rollback contracts
+        shell: bash
+        run: python3 -B deploy/service/test_manage.py
+
       - name: Build and verify the native TLS target pack
         shell: pwsh
         run: |
@@ -424,6 +434,120 @@ jobs:
 
       - name: Verify native scheduler probe correctness, not performance
         run: cargo test --locked --release --example native_task_scheduler_probe -- --nocapture --test-threads=1
+
+      - name: Verify resident hard memory provider recovery or explicit platform rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          ku="$PWD/target/release/ku${{ runner.os == 'Windows' && '.exe' || '' }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            delegated="/sys/fs/cgroup/ku-service-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            sudo mkdir "$delegated"
+            trap 'sudo rmdir "$delegated"' EXIT
+            if ! grep -qw memory "$delegated/cgroup.controllers" || ! grep -qw pids "$delegated/cgroup.controllers"; then
+              echo 'Dedicated cgroup v2 delegation lacks memory or pids controller; no weaker provider is substituted' >&2
+              cat "$delegated/cgroup.controllers"
+              exit 1
+            fi
+            test -z "$(cat "$delegated/cgroup.procs")"
+            printf '+memory +pids\n' | sudo tee "$delegated/cgroup.subtree_control" >/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$delegated"
+            python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
+              --cgroup-root "$delegated" --output "$RUNNER_TEMP/ku-service-memory-provider.json"
+          else
+            python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
+              --output "$RUNNER_TEMP/ku-service-memory-provider.json"
+          fi
+
+      - name: Verify native blocking retirement and resident replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B deploy/service/verify.py --blocking-only \
+            --ku "$PWD/target/release/ku${{ runner.os == 'Windows' && '.exe' || '' }}" \
+            --output "$RUNNER_TEMP/ku-native-blocking-retirement.json"
+
+      - name: Verify short native runtime matrix with actual bounded blocking regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          suffix = '.exe' if os.name == 'nt' else ''
+          candidates = [path for path in Path('target/release/deps').glob('native_task_adapter_test-*')
+                        if path.is_file() and (path.suffix == '.exe' if os.name == 'nt' else not path.suffix)
+                        and os.access(path, os.X_OK)]
+          if len(candidates) != 1:
+              raise SystemExit(f'Expected one current native_task_adapter_test executable, got {candidates}')
+          subprocess.run([sys.executable, '-B', 'tests/acceptance/runtime_matrix.py',
+                          '--ku', str(Path('target/release/ku'+suffix).resolve()),
+                          '--profile', 'release', '--loops', '1', '2', '4', '--blocking-regression', str(candidates[0].resolve()),
+                          '--output', str(Path(os.environ['RUNNER_TEMP'])/'ku-runtime-matrix.json')], check=True)
+          PYTHON
+
+      - name: Verify native resident recovery, rolling and rollback through HAProxy
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B deploy/service/verify.py \
+            --ku "$PWD/target/release/ku" \
+            --haproxy "$(command -v haproxy)" \
+            --output "$RUNNER_TEMP/ku-resident-service.json"
+
+      - name: Verify real HTTP to PostgreSQL lifecycle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then
+            export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          else
+            export PATH="$(pg_config --bindir):$PATH"
+          fi
+          python3 -B tests/acceptance/http_pg_lifecycle.py \
+            --ku "$PWD/target/release/ku" --loops 4 \
+            --output "$RUNNER_TEMP/ku-http-pg-lifecycle.json"
+
+      - name: Verify real HTTP to PostgreSQL lifecycle on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONUTF8 = '1'
+          $env:PATH = (Join-Path $env:PGROOT 'bin') + ';' + $env:PATH
+          & python -B tests/acceptance/http_pg_lifecycle.py `
+            --ku (Join-Path $PWD 'target/release/ku.exe') --loops 4 `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-http-pg-lifecycle.json')
+          if ($LASTEXITCODE -ne 0) { throw 'HTTP PostgreSQL lifecycle failed' }
+
+      - name: Verify actual isolated Windows host task registration, recovery and stop
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONUTF8 = '1'
+          & python -B deploy/service/verify.py --blocking-only --windows-host-task `
+            --ku (Join-Path $PWD 'target/release/ku.exe') `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-windows-host-task.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Actual Windows Task Scheduler service acceptance failed' }
+
+      - name: Retain resident service and PostgreSQL acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: service-lifecycle-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/ku-resident-service.json
+            ${{ runner.temp }}/ku-http-pg-lifecycle.json
+            ${{ runner.temp }}/ku-native-blocking-retirement.json
+            ${{ runner.temp }}/ku-runtime-matrix.json
+            ${{ runner.temp }}/ku-windows-host-task.json
+            ${{ runner.temp }}/ku-service-memory-provider.json
+          if-no-files-found: error
 
   release-contract:
     name: ${{ matrix.os }} release scripts and clean CheckOnly
