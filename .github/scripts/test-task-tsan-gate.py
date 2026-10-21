@@ -117,7 +117,7 @@ class TSanGateContracts(unittest.TestCase):
                 opening.assert_not_called()
                 run.assert_not_called()
 
-    def test_main_runs_ten_exact_tests_with_unique_logs_and_deduplicated_build(self) -> None:
+    def test_main_runs_thirteen_exact_tests_with_unique_logs_and_deduplicated_build(self) -> None:
         expected = (
             ("native_task_tsan_probe_test", "native_task_tsan_instrumentation_and_runtime_probe", True),
             ("native_task_driver_test", "native_task_driver_two_real_workers_overlap_without_same_task_overlap", False),
@@ -129,6 +129,9 @@ class TSanGateContracts(unittest.TestCase):
             ("native_task_adapter_test", "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline", False),
             ("native_task_adapter_test", "native_task_flat_array_snapshots_charge_partial_owners_and_release_each_failure", False),
             ("native_task_start_charge_test", "native_task_start_charge_multihop_active_results_and_late_observers_execute_in_c", False),
+            ("native_task_source_test", "native_task_external_owner_pump_preserves_affinity_wakes_and_retirement", False),
+            ("native_http_test", "native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout", False),
+            ("native_http_test", "native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker", False),
         )
         self.assertEqual(GATE.TARGETS, expected)
         calls = []
@@ -149,18 +152,18 @@ class TSanGateContracts(unittest.TestCase):
                 self.assertEqual(GATE.os.environ["TSAN_OPTIONS"], "halt_on_error=1:exitcode=66")
                 self.assertEqual(GATE.os.environ["KU_CC"], "/test/clang")
 
-        self.assertEqual(len(calls), 14)  # Three metadata calls, one build, ten exact tests.
+        self.assertEqual(len(calls), 17)  # Three metadata calls, one build, thirteen exact tests.
         self.assertEqual([label for _, label, _ in calls[:4]], [
             "commit", "rust-version", "clang-version", "build",
         ])
         unique_targets = list(dict.fromkeys(target for target, _, _ in expected))
-        self.assertEqual(len(unique_targets), 8)
+        self.assertEqual(len(unique_targets), 10)
         build = ["cargo", "test", "--locked", "--no-run"]
         for target in unique_targets:
             build += ["--test", target]
         self.assertEqual(calls[3], (build, "build", 300))
         invocations = calls[4:]
-        self.assertEqual(len(invocations), 10)
+        self.assertEqual(len(invocations), 13)
         labels = []
         for (command, label, timeout), (target, name, canary) in zip(invocations, expected):
             wanted = [
@@ -174,14 +177,14 @@ class TSanGateContracts(unittest.TestCase):
             self.assertRegex(label, r"^[a-z][a-z0-9_-]{0,199}$")
             self.assertEqual(timeout, 300)
             labels.append(label)
-        self.assertEqual(len(set(labels)), 10)
+        self.assertEqual(len(set(labels)), 13)
         self.assertEqual(sum("--ignored" in command for command, _, _ in invocations), 1)
 
     def test_only_detector_probe_is_explicitly_ignored(self) -> None:
-        self.assertEqual(len(GATE.TARGETS), 10)
+        self.assertEqual(len(GATE.TARGETS), 13)
         self.assertEqual(sum(canary for _, _, canary in GATE.TARGETS), 1)
-        self.assertEqual(len({target for target, _, _ in GATE.TARGETS}), 8)
-        self.assertEqual(len({(target, name) for target, name, _ in GATE.TARGETS}), 10)
+        self.assertEqual(len({target for target, _, _ in GATE.TARGETS}), 10)
+        self.assertEqual(len({(target, name) for target, name, _ in GATE.TARGETS}), 13)
         self.assertEqual(GATE.TSAN_OPTIONS, "halt_on_error=1:exitcode=66")
         self.assertNotIn("suppress", GATE.TSAN_OPTIONS)
         self.assertNotIn("ignore", GATE.TSAN_OPTIONS)

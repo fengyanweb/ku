@@ -983,6 +983,8 @@ impl Checker {
                 Ok(Type::Struct(name.clone()))
             }
             TypeName::Custom(name) if self.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
+            TypeName::Custom(name) if name == "HttpRequest" => Ok(http_request_type()),
+            TypeName::Custom(name) if name == "HttpResponse" => Ok(http_response_type()),
             TypeName::Custom(name) => {
                 Err(KuError::runtime(format!("undefined type '{name}'"), span))
             }
@@ -2944,16 +2946,20 @@ impl Checker {
                     return_type,
                     body,
                     body_id,
-                    ..
+                    is_async,
                 } => {
-                    self.check_http_handler(
+                    let saved_async_depth = self.async_depth;
+                    self.async_depth = usize::from(is_async);
+                    let checked = self.check_http_handler(
                         name,
                         &params,
                         return_type.as_deref(),
                         &body,
                         body_id,
                         handler_arg.span,
-                    )?;
+                    );
+                    self.async_depth = saved_async_depth;
+                    checked?;
                 }
                 Type::Unknown => {
                     return Err(KuError::runtime(

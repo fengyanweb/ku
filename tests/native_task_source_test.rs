@@ -26,6 +26,135 @@ fn native(source: &str) -> String {
     c::generate_native_task_c_source(&tasks, &Default::default()).expect("native Task C generation")
 }
 
+#[test]
+fn native_task_external_owner_pump_preserves_affinity_wakes_and_retirement() {
+    let generated=native("async fn Ready(value: int): int! { return ok(value) } async fn main(): null! { return ok(null) } async fn Work(): int! { index=0; while(index<5000) {index=index+1} return ok(index) }");
+    let generated = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    );
+    let source = format!(
+        "{generated}\n{}",
+        r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"external Task owner line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static size_t notifications[2];
+static void owner_wake(void* context,size_t owner) { (void)context; if(owner<2u) notifications[owner]++; }
+int main(void) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  uint64_t deadline=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,4u,ring,4u,fixed+4u*sizeof(KuTaskInstance_0),2u,deadline,NULL,owner_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 tasks[4]={0};
+  for(size_t i=0;i<4u;i++) {
+    int64_t value=(int64_t)i;
+    CHECK(ku_task_0_start_value(&driver,&value,&tasks[i])==KU_TASK_DRIVER_OK);
+    CHECK(slots[tasks[i].ticket.slot].owner_worker==i%2u+1u);
+    for(size_t n=0;n<1000u;n++) CHECK(ku_task_driver_wake(&tasks[i].ticket)==KU_TASK_DRIVER_OK);
+  }
+  CHECK(driver.queued==4u && !driver.global_queued);
+  CHECK(driver.workers[0].local_queued==2u && driver.workers[1].local_queued==2u);
+  CHECK(notifications[0] && notifications[1]);
+  uint64_t next=UINT64_MAX;
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.workers[0].polls==1u && !driver.workers[1].polls);
+  CHECK(next==0u && driver.queued==3u);
+  CHECK(ku_task_driver_pump(&driver,1u,2u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.workers[1].polls==2u && driver.workers[0].polls==1u);
+  CHECK(ku_task_driver_pump(&driver,0u,2u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(!driver.queued && driver.workers[0].polls==2u);
+  KuTaskDriverTicketV1 old=tasks[0].ticket;
+  for(size_t i=0;i<4u;i++) {
+    KuTaskAdapterOutcomeV1 outcome={0};
+    CHECK(ku_task_value_take(&tasks[i],NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==1u && outcome.value.integer.ok && outcome.value.integer.value==(int64_t)i);
+    ku_task_outcome_drop(&outcome);
+    CHECK(ku_task_value_drop(&tasks[i],deadline)==KU_TASK_DRIVER_OK);
+  }
+  for(size_t n=0;n<16u && driver.resident;n++)
+    for(size_t owner=0;owner<2u;owner++) {
+      uint32_t result=ku_task_driver_pump(&driver,owner,4u,&next);
+      CHECK(result==KU_TASK_DRIVER_OK || result==KU_TASK_DRIVER_PENDING);
+    }
+  CHECK(!driver.resident && !driver.reserved_bytes);
+  KuTaskValueV1 work={0};
+  CHECK(ku_task_2_start_value(&driver,&work)==KU_TASK_DRIVER_OK);
+  size_t work_owner=slots[work.ticket.slot].owner_worker-1u;
+  uint64_t before_polls=driver.workers[work_owner].polls;
+  size_t before_notifications=notifications[work_owner];
+  for(size_t turn=0;turn<16u && ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING;turn++) {
+    uint32_t result=ku_task_driver_pump(&driver,work_owner,64u,&next);
+    CHECK(result==KU_TASK_DRIVER_OK || result==KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_COMPLETED);
+  uint64_t used_polls=driver.workers[work_owner].polls-before_polls;
+  CHECK(used_polls>100u && (notifications[work_owner]-before_notifications)*8u<used_polls);
+  KuTaskAdapterOutcomeV1 work_result={0};
+  CHECK(ku_task_value_take(&work,NULL,&work_result)==KU_TASK_CONTROL_OK);
+  CHECK(work_result.value.integer.ok && work_result.value.integer.value==5000);
+  ku_task_outcome_drop(&work_result);
+  CHECK(ku_task_value_drop(&work,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.resident;turn++)
+    CHECK(ku_task_driver_pump(&driver,work_owner,4u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(!driver.resident && !driver.reserved_bytes);
+  KuTaskValueV1 replacement={0}; int64_t value=9;
+  CHECK(ku_task_0_start_value(&driver,&value,&replacement)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_value_drop(&replacement,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t n=0;n<16u && driver.workers_exited<2u;n++)
+    for(size_t owner=0;owner<2u;owner++) if(driver.workers[owner].state!=KU_TASK_DRIVER_WORKER_EXITED) {
+      uint32_t result=ku_task_driver_pump(&driver,owner,4u,&next);
+      CHECK(result==KU_TASK_DRIVER_OK || result==KU_TASK_DRIVER_PENDING);
+    }
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.queued && driver.workers_exited==2u);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  /* A partial HTTP thread start leaves never-bound logical owners. With no
+   * admitted work, the coordinator may bind/pump only these missing owners
+   * after close, then reclaim through the ordinary EXITED/join contract. */
+  memset(&driver,0,sizeof(driver));memset(slots,0,sizeof(slots));memset(ring,0,sizeof(ring));
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,4u,ring,4u,fixed+4u*sizeof(KuTaskInstance_0),2u,deadline,NULL,owner_wake)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t owner=0;owner<2u;owner++) {
+    CHECK(!driver.workers[owner].owner_bound);
+    uint32_t result=ku_task_driver_pump(&driver,owner,1u,&next);
+    CHECK(result==KU_TASK_DRIVER_OK || result==KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(driver.workers_exited==2u && !driver.resident);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  puts("external-task-owners-ok"); return 0;
+}
+"#
+    );
+    let directory = TempDir::new("task-external-owner");
+    let path = directory.path().join("external.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "external") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "external-task-owners-ok\n"
+    );
+}
+
 const MOVES_AND_AWAITS: &str = r#"
 async fn main(): null! {
     first = Child(3)
@@ -1032,4 +1161,58 @@ async fn main(): null! {
         "3\n0\n255\ninvalid_utf8\nindex_out_of_bounds\ninvalid_byte\n中文😀\0尾\ninvalid_config\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_tcp_late_readiness_cannot_mutate_a_reused_job_generation() {
+    let generated = native_task_transport_source(
+        r#"
+import net from "std.net"
+async fn main(): null! {
+    client=net.client({host:"127.0.0.1",port:9,tls:false})?
+    client.close()
+    return ok(null)
+}
+"#,
+    )
+    .replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    );
+    let source = format!(
+        "{generated}\n{}",
+        r#"
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"late TCP readiness line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+int main(void) {
+  KuTaskBlockingPoolV1 pool={0};uint64_t deadline=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_blocking_init(&pool,1u,1u,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(&pool));
+  KuTaskBlockingJobV1* job=&pool.jobs[0];job->generation=2u;job->state=KU_TASK_BLOCKING_NET_WAIT;
+  job->net_owner=1u;job->kind=6u;job->net_requested=17;job->net_deadline=deadline;
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_net_dispatch(&pool,0u,0u,1u,KU_TASK_NET_READ|KU_TASK_NET_ERROR)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_net_dispatch(&pool,1u,0u,2u,KU_TASK_NET_READ)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(job->generation==2u && job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_requested==17 && !job->cancelled && !pool.fault);
+  memset(job,0,sizeof(*job));ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_blocking_finish(&pool,deadline)==KU_TASK_DRIVER_OK);
+  puts("late-tcp-generation-ok");return 0;
+}
+"#
+    );
+    let directory = TempDir::new("tcp-late-generation");
+    let path = directory.path().join("generation.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "generation") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"late-tcp-generation-ok\n"));
 }

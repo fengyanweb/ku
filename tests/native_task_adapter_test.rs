@@ -1618,6 +1618,9 @@ async fn main(): null! { return ok(null) }
         native_task_ledger::LEDGER_LOCK,
         native_task_ledger::LOCKED_ALLOCATIONS
     );
+    // The cancellation witness must stay attached to the real worker's DONE
+    // publication, including when network jobs introduce a deferred state.
+    assert_eq!(generated.matches("    pool->running--;").count(), 1);
     let mut generated = generated
         .replacen("typedef struct KuString {", &format!("{instrumentation}typedef struct KuString {{"), 1)
         .replacen("int main(void) {", "static int ku_generated_main(void) {", 1)
@@ -1641,7 +1644,7 @@ async fn main(): null! { return ok(null) }
             "static KuResult_array_str ku_fs_read_dir_native_impl(const KuFsNativeChar* native, KuFsAllocatorV1* allocator) {\n  fixture_io_gate();",
         )
         .replacen("void* pointer=malloc(bytes);", "void* pointer=fixture_output_malloc(bytes);", 1)
-        .replacen("job->state=KU_TASK_BLOCKING_DONE; pool->running--;", "job->state=KU_TASK_BLOCKING_DONE; pool->running--; fixture_blocking_done(job->kind);", 1)
+        .replacen("    pool->running--;", "    pool->running--; fixture_blocking_done(job->kind);", 1)
         .replacen(
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {",
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n  if (fixture_pool_signal_failure()) { pool->fault=KU_TASK_DRIVER_INTERNAL; return; }",
@@ -1878,6 +1881,22 @@ static void blocking_queue_and_generation(void) {
   CHECK(!blocking_driver_snapshot().resident && !blocking_driver_snapshot().reserved_bytes);
   CHECK(remove("first.txt")==0); CHECK(remove("reused.txt")==0);
   blocking_finish(blocking_observation_deadline());
+}
+static void blocking_queued_cancel_retires_before_occupied_worker_is_released(void) {
+  blocking_setup(2u,4u*sizeof(KuTaskInstance_0)+1024u);fixture_gate_io=1;
+  KuTaskValueV1 first=blocking_start("occupied.txt");CHECK(ku_test_event_wait(&fixture_io_entered,2000));
+  KuTaskValueV1 queued=blocking_start("never-started.txt");blocking_idle();
+  CHECK(blocking_pool_snapshot().queued==1u);
+  CHECK(ku_task_driver_request_cancel(&queued.ticket,&queued.owner.lease,KU_TASK_CONTROL_CANCELLED,blocking_observation_deadline())==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_driver_wait_result(&queued.ticket,&queued.owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  CHECK(ku_task_control_status(&queued.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  KuTaskBlockingSnapshotV1 snapshot=blocking_pool_snapshot();
+  CHECK(snapshot.running==1u && snapshot.resident==1u && !snapshot.queued && snapshot.finished==1u);
+  CHECK(fixture_io_calls==1u);blocking_no_file("never-started.txt");
+  blocking_drop(&queued);blocking_idle();
+  CHECK(ku_test_event_set(&fixture_io_release));blocking_take(&first,NULL);blocking_drop(&first);blocking_idle();
+  CHECK(!blocking_pool_snapshot().resident && !blocking_driver_snapshot().reserved_bytes);
+  CHECK(remove("occupied.txt")==0);blocking_finish(blocking_observation_deadline());
 }
 static void blocking_late_retirement_keeps_original_deadline(void) {
   blocking_setup(1,2u*sizeof(KuTaskInstance_0)+1024u); fixture_gate_io=1;
@@ -2294,7 +2313,8 @@ static void blocking_directory_real_wait_and_cancel(void) {
 }
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
-  blocking_queue_and_generation(); blocking_late_retirement_keeps_original_deadline();
+  blocking_queue_and_generation(); blocking_queued_cancel_retires_before_occupied_worker_is_released();
+  blocking_late_retirement_keeps_original_deadline();
   blocking_rejections_have_no_file_effect(); blocking_close_skips_queued_files();
   blocking_fault_is_reported_after_real_resource_cleanup();
   blocking_read_boundaries_and_failures(); blocking_read_cancel_holds_real_output_until_done();

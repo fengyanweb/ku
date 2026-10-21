@@ -49,6 +49,12 @@ fn primitive(ty: &TypeName) -> Option<IrType> {
         TypeName::Bool => Some(IrType::Bool),
         TypeName::Null => Some(IrType::Null),
         TypeName::String => Some(IrType::Str),
+        TypeName::Custom(name) if name == "HttpRequest" => {
+            Some(IrType::Named("__ku_http_request".into()))
+        }
+        TypeName::Custom(name) if name == "HttpResponse" => {
+            Some(IrType::Named("__ku_http_response".into()))
+        }
         _ => None,
     }
 }
@@ -89,7 +95,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -186,6 +192,50 @@ impl Budget {
 /// here: malformed types, use-after-move or edge facts cannot bypass it through
 /// this internal API. No source runtime/runner is included in the result.
 pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
+    lower_program_impl(program, true)
+}
+
+/// Async bodies used by the native HTTP service's synchronous setup/main.
+/// The normal checker runs on the complete source before this bounded split.
+pub fn lower_service_handlers(program: &Program) -> KuResult<TaskProgram> {
+    let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http");
+    let filtered = Program {
+        items: program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Function(function) if function.is_async => Some(item.clone()),
+                Item::Module(module) if module.name.strip_prefix("std:").is_some_and(supported) => {
+                    Some(item.clone())
+                }
+                Item::Import(import) if import.path == "std" => {
+                    let ImportKind::Named(names) = &import.kind else {
+                        return None;
+                    };
+                    let names = names
+                        .iter()
+                        .filter(|name| supported(&name.source))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if names.is_empty() {
+                        None
+                    } else {
+                        let mut filtered = import.clone();
+                        filtered.kind = ImportKind::Named(names);
+                        Some(Item::Import(filtered))
+                    }
+                }
+                Item::Import(import) if import.path.strip_prefix("std.").is_some_and(supported) => {
+                    Some(item.clone())
+                }
+                _ => None,
+            })
+            .collect(),
+    };
+    lower_program_impl(&filtered, false).map(|native| native.tasks)
+}
+
+fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<NativeTaskProgram> {
     let limits = TaskLimits::default();
     if program
         .items
@@ -211,9 +261,41 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut std_fs = false;
     let mut std_net = false;
     let mut std_bytes = false;
+    let mut std_http = false;
     for item in &program.items {
         budget.analysis(1, Span::default())?;
         match item {
+            Item::Module(module) if module.name == "std:http" => {
+                std_http = true;
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std.http"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind,ImportKind::Namespace(name) if name=="http")) =>
+            {
+                std_http = true;
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std"
+                    && matches!(&import.kind,ImportKind::Named(names)
+                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"))) =>
+            {
+                if let ImportKind::Named(names) = &import.kind {
+                    for name in names {
+                        match name.source.as_str() {
+                            "time" => std_time = true,
+                            "fs" => std_fs = true,
+                            "net" => std_net = true,
+                            "bytes" => std_bytes = true,
+                            "http" => std_http = true,
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
             Item::Module(module) if matches!(module.name.as_str(), "std:net" | "std:bytes") => {
                 std_net |= module.name == "std:net";
                 std_bytes |= module.name == "std:bytes";
@@ -346,8 +428,13 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
         }
         declarations.push(function);
     }
-    let entry = entry
-        .ok_or_else(|| unsupported("a program without async fn main(): null!", Span::default()))?;
+    let entry = if require_entry {
+        entry.ok_or_else(|| {
+            unsupported("a program without async fn main(): null!", Span::default())
+        })?
+    } else {
+        entry.unwrap_or(TaskFunctionId(0))
+    };
     let mut functions = Vec::new();
     for declaration in declarations {
         functions.push(
@@ -359,6 +446,7 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                 std_fs,
                 std_net,
                 std_bytes,
+                std_http,
             )?
             .lower(declaration)?,
         );
@@ -374,6 +462,7 @@ struct FunctionLowerer<'a> {
     std_fs: bool,
     std_net: bool,
     std_bytes: bool,
+    std_http: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
@@ -435,6 +524,9 @@ enum FinallyExit {
 }
 
 impl<'a> FunctionLowerer<'a> {
+    // These standard-module capabilities belong to the one existing lowering
+    // context; keeping the constructor explicit avoids a second import policy.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
@@ -443,6 +535,7 @@ impl<'a> FunctionLowerer<'a> {
         std_fs: bool,
         std_net: bool,
         std_bytes: bool,
+        std_http: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
@@ -451,6 +544,7 @@ impl<'a> FunctionLowerer<'a> {
             std_fs,
             std_net,
             std_bytes,
+            std_http,
             budget,
             function: TaskFunction {
                 id: signature.id,
@@ -811,11 +905,66 @@ impl<'a> FunctionLowerer<'a> {
                 self.array_literal_expression(elements, expression.span, depth)
             }
             ExprKind::Variable(name) => self.variable_expression(name, expression.span),
+            ExprKind::Index { target, index } => {
+                let ExprKind::Field {
+                    target: request,
+                    name: map,
+                } = &target.kind
+                else {
+                    return Err(unsupported("this index projection", expression.span));
+                };
+                if !matches!(map.as_str(), "params" | "query" | "headers") {
+                    return Err(unsupported("this index projection", expression.span));
+                }
+                let request = self.expression(request, depth + 2)?;
+                let key = self.expression(index, depth + 1)?;
+                if !matches!(&self.function.slots[request.0].ty,TaskSlotType::Value {ty,..} if task::http_request_type(ty))
+                    || self.function.slots[key.0].ty != value_slot(IrType::Str)
+                {
+                    return Err(unsupported("this request map index", expression.span));
+                }
+                let dst = self.slot(value_slot(IrType::Str))?;
+                self.emit(TaskOp::HttpMapGet {
+                    dst,
+                    request,
+                    key,
+                    map: map.clone(),
+                })?;
+                if !matches!(&index.kind, ExprKind::Variable(_)) {
+                    self.emit(TaskOp::Drop { slot: key })?;
+                }
+                Ok(dst)
+            }
             ExprKind::Field { target, name } => {
+                if let ExprKind::Field {
+                    target: request,
+                    name: map,
+                } = &target.kind
+                {
+                    if matches!(map.as_str(), "params" | "query" | "headers") {
+                        let source = self.expression(request, depth + 2)?;
+                        if matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,..} if task::http_request_type(ty))
+                        {
+                            let destination = self.slot(value_slot(IrType::Str))?;
+                            let key =
+                                self.constant(TaskConstant::Str(name.clone()), IrType::Str)?;
+                            self.emit(TaskOp::HttpMapGet {
+                                dst: destination,
+                                request: source,
+                                key,
+                                map: map.clone(),
+                            })?;
+                            self.emit(TaskOp::Drop { slot: key })?;
+                            return Ok(destination);
+                        }
+                        return Err(unsupported("this request map projection", expression.span));
+                    }
+                }
                 let source = self.expression(target, depth + 1)?;
                 if !matches!(&self.function.slots[source.0].ty,
-                    TaskSlotType::Value { ty, .. } if task::error_type(ty))
-                    || !matches!(name.as_str(), "domain" | "code" | "message")
+                    TaskSlotType::Value { ty, .. }
+                    if task::error_type(ty) && matches!(name.as_str(), "domain" | "code" | "message")
+                    || task::http_request_type(ty) && matches!(name.as_str(),"method"|"path"|"body"))
                 {
                     return Err(unsupported("this field projection", expression.span));
                 }
@@ -1293,6 +1442,58 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if matches!(&object.kind,ExprKind::Variable(module) if module=="http")
+            && self.std_http
+            && self.local("http").is_none()
+            && !self.signatures.contains_key("http")
+        {
+            let kind = match name {
+                "text" => 0u32,
+                "html" => 1,
+                "empty" => 2,
+                "redirect" => 3,
+                _ => {
+                    return Err(unsupported(
+                        "this HTTP response constructor in a Task",
+                        span,
+                    ))
+                }
+            };
+            let has_body = kind != 2;
+            if (has_body && !(1..=2).contains(&args.len())) || (!has_body && args.len() > 1) {
+                return Err(unsupported(
+                    "HTTP response constructor argument count",
+                    span,
+                ));
+            }
+            let has_status = args.len() > usize::from(has_body);
+            let status = if has_status {
+                let slot = self.expression(&args[0], depth + 1)?;
+                if self.function.slots[slot.0].ty != value_slot(IrType::Int) {
+                    return Err(unsupported("HTTP response status type", span));
+                }
+                Some(slot)
+            } else {
+                None
+            };
+            let body = if has_body {
+                let slot = self.expression(&args[usize::from(has_status)], depth + 1)?;
+                if self.function.slots[slot.0].ty != value_slot(IrType::Str) {
+                    return Err(unsupported("HTTP response body type", span));
+                }
+                Some(self.copy_or_move(slot)?)
+            } else {
+                None
+            };
+            let dst = self.slot(value_slot(IrType::Named("__ku_http_response".into())))?;
+            self.emit(TaskOp::HttpResponse {
+                dst,
+                body,
+                status,
+                kind,
+            })?;
+            return Ok(dst);
+        }
         if matches!(&object.kind, ExprKind::Variable(module) if module == "net")
             && name == "client"
             && self.std_net
@@ -1558,6 +1759,7 @@ impl<'a> FunctionLowerer<'a> {
         };
         if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
             && !task::flat_array(ty)
+            && !task::http_response_type(ty)
         {
             return Err(unsupported("nested Result values", span));
         }

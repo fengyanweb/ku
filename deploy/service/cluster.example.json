@@ -1,0 +1,74 @@
+{
+  "ku": "/opt/ku/bin/ku",
+  "control_token_file": "/etc/ku/service.token",
+  "frontend_addr": "127.0.0.1:18080",
+  "haproxy_runtime_socket": "/var/run/ku-haproxy.sock",
+  "smoke_path": "/",
+  "smoke_expected": "Ku HTTP OK",
+  "operation_timeout_seconds": 20,
+  "service_options": {
+    "startup_timeout_ms": 5000,
+    "probe_timeout_ms": 250,
+    "probe_interval_ms": 1000,
+    "failure_threshold": 3,
+    "drain_timeout_ms": 10000,
+    "restart_limit": 5,
+    "restart_window_ms": 60000,
+    "backoff_ms": 100,
+    "max_backoff_ms": 5000
+  },
+  "deployment_budget": {
+    "max_parallel_instances": 3,
+    "reserved_memory_bytes": 1610612736,
+    "event_threads": 12,
+    "blocking_threads": 12,
+    "database_connections": 24,
+    "database_waiters": 96,
+    "database_pending_bytes": 3145728,
+    "total_threads": 53,
+    "management_threads": 2,
+    "supervisor_reserve_bytes": 33554432,
+    "thread_stack_bytes": 2097152,
+    "per_instance": {
+      "reserved_memory_bytes": 536870912,
+      "event_threads": 4,
+      "blocking_threads": 4,
+      "database_connections": 8,
+      "database_waiters": 32,
+      "database_pending_bytes": 1048576,
+      "total_threads": 17
+    }
+  },
+  "slots": [
+    {
+      "name": "a",
+      "listen_addr": "127.0.0.1:18081",
+      "probe_addr": "127.0.0.1:18181",
+      "control_addr": "127.0.0.1:19081",
+      "program": "/opt/ku/releases/current/service-a",
+      "env": {},
+      "manager_start": ["systemctl", "start", "ku-service@a"],
+      "manager_stop": ["systemctl", "stop", "ku-service@a"]
+    },
+    {
+      "name": "b",
+      "listen_addr": "127.0.0.1:18082",
+      "probe_addr": "127.0.0.1:18182",
+      "control_addr": "127.0.0.1:19082",
+      "program": "/opt/ku/releases/current/service-b",
+      "env": {},
+      "manager_start": ["systemctl", "start", "ku-service@b"],
+      "manager_stop": ["systemctl", "stop", "ku-service@b"]
+    },
+    {
+      "name": "spare",
+      "listen_addr": "127.0.0.1:18083",
+      "probe_addr": "127.0.0.1:18183",
+      "control_addr": "127.0.0.1:19083",
+      "program": "/opt/ku/releases/previous/service-spare",
+      "env": {},
+      "manager_start": ["systemctl", "start", "ku-service@spare"],
+      "manager_stop": ["systemctl", "stop", "ku-service@spare"]
+    }
+  ]
+}

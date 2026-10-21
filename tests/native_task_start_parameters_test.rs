@@ -135,6 +135,24 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     }
                 }
                 TaskOp::Print { value, .. } => map(value),
+                TaskOp::HttpMapGet {
+                    dst, request, key, ..
+                } => {
+                    map(dst);
+                    map(request);
+                    map(key);
+                }
+                TaskOp::HttpResponse {
+                    dst, body, status, ..
+                } => {
+                    map(dst);
+                    if let Some(body) = body {
+                        map(body);
+                    }
+                    if let Some(status) = status {
+                        map(status);
+                    }
+                }
             }
         }
         match &mut state.terminator {

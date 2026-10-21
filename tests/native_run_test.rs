@@ -1496,6 +1496,11 @@ char* PQerrorMessage(const PGconn* value) {
 }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { if (value && value->id >= 1 && value->id <= 4) ku_test_finish_counts[value->id]++; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }
@@ -1657,6 +1662,11 @@ int PQstatus(const PGconn* value) { (void)value; ku_test_connection_touches++; r
 char* PQerrorMessage(const PGconn* value) { (void)value; return "stub error"; }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; ku_test_connection_touches++; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; ku_test_connection_touches++; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { (void)value; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }

@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "captured_date": "2026-10-21",
+  "platform": "macOS 26.5.2 arm64",
+  "base_commit": "f0bb31f3420cde8e95ba3569f0fbd1af933c27bf",
+  "working_tree_is_modified": true,
+  "scope": "Actual macOS resident service reference, native blocked-operation retirement and unsupported hard-provider refusal; not final three-platform or sustained acceptance.",
+  "raw_summary_sha256": {
+    "reference": "29ca78d4d70bd90457f090ccbcfb5528e8db822807478ec9b1838774d4dda66a",
+    "blocking": "9cc346fae6cce66fb99d022555482b7d47f4aaca478ba1dcb0562e6ee778bec3",
+    "macos_provider": "54cd080269698b02c97c7d844c46b72abaa2e2af84e159367185fde5ce8c3aa1"
+  },
+  "reference": {
+    "cli_sha256": "6e0a1db29c6804c177ea997224fb5f197d26b5de32b695f291f4ba0703c4ca68",
+    "haproxy_version": "HAProxy version 3.4.7-8872a26 2026/10/14 - https://haproxy.org/",
+    "results": {
+      "proxy_config": "passed",
+      "normal_proxy": "passed",
+      "native_exit_recovery": {
+        "passed": true,
+        "recovery_ms": 286.342,
+        "old_generation": 1,
+        "new_generation": 2,
+        "surviving_requests": 10
+      },
+      "rolling": {
+        "passed": true,
+        "duration_ms": 1069.792
+      },
+      "rollback": {
+        "passed": true,
+        "duration_ms": 631.668,
+        "verified_proxy_requests": 20
+      }
+    },
+    "steady_resources": {
+      "process_count": 8,
+      "thread_count": 32,
+      "sum_rss_bytes": 65503232,
+      "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"
+    },
+    "rolling_resources": {
+      "process_count": 11,
+      "thread_count": 47,
+      "sum_rss_bytes": 79200256,
+      "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"
+    },
+    "cleanup_errors": []
+  },
+  "native_blocking_retirement": {
+    "status": "passed",
+    "cli_sha256": "4dfa8b04db2c54220b6dcf4d4c4422902378ea6aca30a823c67e769ad79c10d4",
+    "plan": {
+      "handler_timeout_ms": 1000,
+      "native_cleanup_grace_ms": 1000,
+      "native_drain_timeout_ms": 200,
+      "supervisor_drain_timeout_ms": 1500,
+      "replacement_ready_deadline_seconds": 10,
+      "event_loops": 4,
+      "blocking_threads": 5,
+      "held_requests": 1,
+      "surviving_instance_requests": 10
+    },
+    "kernel_wait_entry_ms": 102.612,
+    "held_http_response_ms": 1001.252,
+    "held_http_status": "HTTP/1.1 504 Gateway Timeout",
+    "first_not_ready_ms": 2135.49,
+    "replacement_ready_ms": 2580.322,
+    "replacement_status": {
+      "phase": "ready",
+      "generation": 2,
+      "restarts": 1,
+      "probe_failures": 0,
+      "last_reason": "runtime_unfinished_work",
+      "elapsed_ms": 3431,
+      "ready_after_ms": 3384,
+      "retired_after_ms": 3169,
+      "limit_metric": null,
+      "memory_peak_bytes": null,
+      "memory_limit_observed": null,
+      "last_exit_generation": 1,
+      "last_exit_code": 75,
+      "last_launcher_signal": null,
+      "launcher_status": "runtime_unfinished_work",
+      "termination_requested": false,
+      "unfinished_work_possible": true,
+      "database_outcome": "unknown",
+      "database_retry": false
+    },
+    "surviving_responses": [
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      },
+      {
+        "status": 200,
+        "body": "ready"
+      }
+    ],
+    "replacement_business": [
+      200,
+      "ready"
+    ],
+    "cleanup_errors": []
+  },
+  "macos_hard_provider": {
+    "status": "passed",
+    "cli_sha256": "080050e0c6fae66a103c5ec211476a9f7cb7e855dc00a7f8e1723fbc46ee35d1",
+    "plan": {
+      "worker_memory_bytes": 67108864,
+      "event_loops": 2,
+      "blocking_threads": 2,
+      "pressure_target_bytes": 268435456,
+      "replacement_deadline_seconds": 15,
+      "pressure_requests": 1
+    },
+    "unsupported_provider": {
+      "exit": 1,
+      "stderr": "ku service: strict process memory execution is unavailable on this platform; run Ku inside a Linux VM or host with a delegated cgroup v2 memory+pids domain, or on Windows with Job Object commit limits; macOS RLIMIT_AS and sampled RSS are not equivalent providers\n",
+      "application_started": false
+    },
+    "guarantee": "macOS native hard mode explicitly unavailable; no RSS-sampling substitute",
+    "cleanup_errors": []
+  },
+  "not_claimed": [
+    "Linux/Windows new service hard-limit integration passed before its CI runs",
+    "Windows Task Scheduler registration/start/stop passed before its CI runs",
+    "systemd/launchd host units actually installed in this local run",
+    "cross-host recovery or database RPO",
+    "formal 30-minute new runtime acceptance",
+    "historical HTTP 504 root cause or fix"
+  ]
+}

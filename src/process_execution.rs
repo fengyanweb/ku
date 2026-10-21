@@ -6,7 +6,7 @@
 //! failed program. Output is retained within a fixed byte allowance and emitted
 //! as streaming JSONL/base64 so receipts do not allocate copies of that output.
 
-mod platform;
+pub(crate) mod platform;
 
 use std::{
     collections::VecDeque,

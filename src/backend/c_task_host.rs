@@ -13,6 +13,7 @@ pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
         IrType::Bool => Ok("boolean"),
         IrType::Null => Ok("null_value"),
         IrType::Str => Ok("string"),
+        ty if crate::ir::task::http_response_type(ty) => Ok("http_response"),
         IrType::Array(inner) => match inner.as_ref() {
             IrType::Int => Ok("integer_array"),
             IrType::Bool => Ok("boolean_array"),
@@ -29,6 +30,7 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
         IrType::Bool => Ok(2),
         IrType::Null => Ok(3),
         IrType::Str => Ok(4),
+        ty if crate::ir::task::http_response_type(ty) => Ok(8),
         IrType::Array(inner) => match inner.as_ref() {
             IrType::Int => Ok(5),
             IrType::Bool => Ok(6),
@@ -40,6 +42,10 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
 }
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     out.check()?;
+    if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
+        out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
+    }
     out.push_str(HOST_ABI);
     if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
@@ -90,7 +96,11 @@ typedef struct KuTaskAdapterOutcomeV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string;
           KuResult_array_int integer_array; KuResult_array_bool boolean_array;
-          KuResult_array_str string_array; } value;
+          KuResult_array_str string_array;
+#if defined(KU_TASK_HTTP_TYPES)
+          KuResult_struct___ku_http_response http_response;
+#endif
+          } value;
 } KuTaskAdapterOutcomeV1;
 /* Appended kind 5--7 members must preserve the original kind 1--4 layout.
  * These compile-time assertions apply to the C target's actual ABI. */
@@ -100,10 +110,12 @@ typedef struct KuTaskAdapterOutcomeLegacyV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string; } value;
 } KuTaskAdapterOutcomeLegacyV1;
+#if !defined(KU_TASK_HTTP_TYPES)
 typedef char KuTaskOutcomeSizeUnchangedV1[
   sizeof(KuTaskAdapterOutcomeV1)==sizeof(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
 typedef char KuTaskOutcomeAlignmentUnchangedV1[
   KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1)==KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
+#endif
 typedef char KuTaskOutcomeOffsetsUnchangedV1[
   offsetof(KuTaskAdapterOutcomeV1,result_kind)==offsetof(KuTaskAdapterOutcomeLegacyV1,result_kind)
   && offsetof(KuTaskAdapterOutcomeV1,exit_class)==offsetof(KuTaskAdapterOutcomeLegacyV1,exit_class)
@@ -113,6 +125,10 @@ typedef char KuTaskOutcomeOffsetsUnchangedV1[
 typedef struct KuTaskAdapterTakeRequestV1 {
   KuTaskAdapterOutcomeV1* outcome;
   const KuTaskDriverTicketV1* parent;
+  /* Internal HTTP bridge retains payload bytes as a driver scratch receipt
+   * until response ownership returns to its HTTP buffer ledger. */
+  size_t retained_bytes;
+  uint32_t retain_payload_charge;
 } KuTaskAdapterTakeRequestV1;
 typedef struct KuTaskAdapterHostV1 {
   const KuTaskDriverTicketV1* ticket;
@@ -275,6 +291,13 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
     case 5: if (output->value.integer_array.ok || output->value.integer_array.value.data || output->value.integer_array.value.len || output->value.integer_array.value.capacity) return 0; error=&output->value.integer_array.error; break;
     case 6: if (output->value.boolean_array.ok || output->value.boolean_array.value.data || output->value.boolean_array.value.len || output->value.boolean_array.value.capacity) return 0; error=&output->value.boolean_array.error; break;
     case 7: if (output->value.string_array.ok || output->value.string_array.value.data || output->value.string_array.value.len || output->value.string_array.value.capacity) return 0; error=&output->value.string_array.error; break;
+#if defined(KU_TASK_HTTP_TYPES)
+    case 8: if (output->value.http_response.ok || output->value.http_response.value.status
+        || !ku_task_outcome_empty_string(output->value.http_response.value.content_type)
+        || !ku_task_outcome_empty_string(output->value.http_response.value.body)
+        || !ku_task_outcome_empty_string(output->value.http_response.value.location)) return 0;
+      error=&output->value.http_response.error; break;
+#endif
     default: return 0;
   }
   return ku_task_outcome_empty_string(error->domain) && ku_task_outcome_empty_string(error->code) && ku_task_outcome_empty_string(error->message);
@@ -288,6 +311,9 @@ static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* output) {
     case 5: ku_result_drop_array_int(&output->value.integer_array); break;
     case 6: ku_result_drop_array_bool(&output->value.boolean_array); break;
     case 7: ku_result_drop_array_str(&output->value.string_array); break;
+#if defined(KU_TASK_HTTP_TYPES)
+    case 8: ku_result_drop_struct___ku_http_response(&output->value.http_response); break;
+#endif
     default: break;
   }
   *output=(KuTaskAdapterOutcomeV1){0};
@@ -337,6 +363,9 @@ static uint32_t ku_task_value_take(KuTaskValueV1* value,
       case 5: output->value.integer_array.error=error; break;
       case 6: output->value.boolean_array.error=error; break;
       case 7: output->value.string_array.error=error; break;
+#if defined(KU_TASK_HTTP_TYPES)
+      case 8: output->value.http_response.error=error; break;
+#endif
       default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
     }
     *value=(KuTaskValueV1){0}; return KU_TASK_DRIVER_OK;

@@ -135,11 +135,36 @@ fn spawn_native_server_inner(
     observed: bool,
     max_requests: Option<usize>,
 ) -> Option<NativeHttpServer> {
+    spawn_native_server_settings(name, source, address, observed, max_requests, &[])
+}
+
+fn spawn_native_server_settings(
+    name: &str,
+    source: &str,
+    address: &str,
+    observed: bool,
+    max_requests: Option<usize>,
+    settings: &[(&str, &str)],
+) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
     fs::write(dir.join(entry), source.replace("__ADDRESS__", address)).expect("write ku source");
     let out = exe_name("server");
     let mut command = Command::new(ku_binary());
+    if let Some(required) = env::var_os("KU_NATIVE_REQUIRE_TSAN") {
+        assert_eq!(required, "1", "KU_NATIVE_REQUIRE_TSAN must be exactly 1");
+        let compiler = env::var("KU_CC").expect("HTTP TSan gate requires KU_CC");
+        assert!(
+            !compiler.is_empty() && !compiler.chars().any(char::is_whitespace),
+            "HTTP TSan gate requires one compiler executable without flags"
+        );
+        // The CLI invokes the C compiler itself, whereas the controlled C
+        // harness adds these flags directly. Both must instrument actual C.
+        command.env(
+            "KU_CC",
+            format!("{compiler} -fsanitize=thread -O1 -fno-omit-frame-pointer -g"),
+        );
+    }
     command
         .current_dir(&dir)
         .args(["build", "--native", entry, "-o", &out]);
@@ -169,6 +194,7 @@ fn spawn_native_server_inner(
     if observed {
         let mut command = Command::new(&exe);
         command.current_dir(&dir);
+        command.envs(settings.iter().copied());
         let service = match spawn_bounded_service(command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS) {
             Ok(service) => service,
             Err(error) => {
@@ -185,6 +211,7 @@ fn spawn_native_server_inner(
     }
     let mut command = Command::new(&exe);
     command.current_dir(&dir);
+    command.envs(settings.iter().copied());
     if let Some(max_requests) = max_requests {
         command.env("KU_HTTP_MAX_REQUESTS", max_requests.to_string());
     }
@@ -1006,7 +1033,7 @@ fn native_http_routing_matches_interpreter() {
     assert!(generated.contains("ku_http_socket_nonblocking(cli)"));
     assert!(generated.contains("send(socket_value, data, chunk, MSG_NOSIGNAL)"));
     assert!(generated.contains("setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE"));
-    assert!(generated.contains("pthread_create(&worker, NULL, ku_http_worker, &ctx)"));
+    assert!(generated.contains("pthread_create(&worker, &attributes, ku_http_worker, &ctx)"));
     assert!(generated.contains("pthread_join(workers[w], NULL)"));
     assert!(generated.contains("#define KU_HTTP_ACCEPT_PEER_BACKOFF_CAP_MS 8"));
     assert!(generated.contains("#define KU_HTTP_ACCEPT_RESOURCE_RETRY_CAP 8"));
@@ -3226,12 +3253,14 @@ fn main(): null! {
         write_timeout_ms: 2000, handler_timeout_ms: 2000})
     app.post("/echo", fn(req) { return http.text(req.body) })
     app.post("/double", fn(req) { return http.text(req.body + req.body) })
+    app.get("/large", fn() { return http.text("__LARGE__" + "!") })
     app.get("/ok", fn() { return http.text("ok") })
     app.listen("__ADDRESS__")?
     return ok(null)
 }
 "#;
-    let Some(mut server) = spawn_native_server("buffer-quota", source, &address) else {
+    let source = source.replace("__LARGE__", &"x".repeat(6000));
+    let Some(mut server) = spawn_native_server("buffer-quota", &source, &address) else {
         assert!(
             env::var_os("GITHUB_ACTIONS").is_none(),
             "CI requires a real native compiler"
@@ -3276,21 +3305,34 @@ fn main(): null! {
     assert!(response
         .to_ascii_lowercase()
         .contains("connection: close\r\n"));
-    let body = vec![b'x'; 1699];
-    for stream in &mut retained {
-        stream.set_nonblocking(false).unwrap();
-        stream.write_all(&body).unwrap();
-    }
-    for mut stream in retained {
-        let response =
-            read_http_stream_bytes_until(&mut stream, Instant::now() + Duration::from_secs(3))
-                .unwrap();
-        let response = String::from_utf8(response).unwrap();
-        assert_status(&response, "HTTP/1.1 200 OK");
-        assert_eq!(response.split_once("\r\n\r\n").unwrap().1.len(), 1700);
+    // The budget includes the projected request maps and copied body, as well
+    // as network input. Completing both retained bodies under this deliberately
+    // tiny budget is no longer a valid success assumption. Disconnect them,
+    // then observe actual reclamation with a fresh, smaller request.
+    drop(retained);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let request = format!("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 600\r\nConnection: close\r\n\r\n{}", "x".repeat(600));
+        let response = http_response(&address, &request, Duration::from_secs(3));
+        if response.starts_with("HTTP/1.1 200 OK") {
+            assert_eq!(response.split_once("\r\n\r\n").unwrap().1.len(), 600);
+            break;
+        }
+        assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+        assert!(
+            Instant::now() < deadline,
+            "disconnected input budget was not reclaimed"
+        );
+        thread::yield_now();
     }
     let request = format!("POST /double HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3000\r\nConnection: close\r\n\r\n{}", "x".repeat(3000));
     let response = http_response(&address, &request, Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+    let response = http_response(
+        &address,
+        "GET /large HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
     assert_status(&response, "HTTP/1.1 503 Service Unavailable");
     let response = http_response(
         &address,
@@ -3300,4 +3342,390 @@ fn main(): null! {
     assert_status(&response, "HTTP/1.1 200 OK");
     assert!(response.ends_with("ok"));
     drop(watchdog);
+}
+
+#[test]
+fn native_http_fixed_loops_share_limits_authenticate_control_and_drain() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import "std.http"
+fn main(): null! {
+    app = http.server({max_active_requests: 16, max_pending_requests: 16,
+        max_connections: 64, max_buffer_bytes: 1048576})
+    app.get("/ok", fn() { return http.text("ready") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    for count in [1, 2, 4] {
+        let address = unused_local_address();
+        let loops = count.to_string();
+        let Some(mut server) = spawn_native_server_settings(
+            "fixed-loops-control",
+            source,
+            &address,
+            false,
+            None,
+            &[
+                ("KU_EVENT_LOOPS", &loops),
+                ("KU_BLOCKING_THREADS", "4"),
+                ("KU_SERVICE_CONTROL_TOKEN", "regression-token"),
+            ],
+        ) else {
+            return;
+        };
+        let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+        for _ in 0..count * 4 {
+            let response = http_response(
+                &address,
+                "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                Duration::from_secs(3),
+            );
+            assert_status(&response, "HTTP/1.1 200 OK");
+            assert!(response.ends_with("ready"));
+        }
+        let forbidden = http_response(&address,
+            "POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
+        assert_status(&forbidden, "HTTP/1.1 403 Forbidden");
+        let metrics = http_response(&address,
+            "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
+        assert_status(&metrics, "HTTP/1.1 200 OK");
+        for index in 0..count {
+            assert!(metrics.contains(&format!("\"id\":{index},")), "{metrics}");
+        }
+        assert!(
+            !metrics.contains("\"requests\":0,"),
+            "every loop must execute business work: {metrics}"
+        );
+        let ready = http_response(&address,
+            "GET /__ku/health/ready HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
+        assert_status(&ready, "HTTP/1.1 200 OK");
+        assert!(ready.ends_with("regression-token"));
+        let mut persistent = connect_with_retry(&address, Duration::from_secs(3));
+        persistent
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
+        let frame =
+            read_http_stream_bytes_until(&mut persistent, Instant::now() + Duration::from_secs(3))
+                .unwrap();
+        assert_status(&String::from_utf8(frame).unwrap(), "HTTP/1.1 200 OK");
+        let drain = http_response(&address,
+            "POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
+        assert_status(&drain, "HTTP/1.1 200 OK");
+        // A completed persistent connection cannot admit a new request after
+        // the management drain acknowledgement, even on an old poll result.
+        let _ = persistent.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let status = watchdog.wait_for_natural_exit(Duration::from_secs(5));
+        assert!(status.success(), "drain exit: {status}");
+        assert!(!watchdog.timed_out());
+        match persistent.peek(&mut [0u8; 1]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            other => {
+                panic!("drained keep-alive must close without serving another request: {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import { http, time, fs } from "std"
+async fn Child(): str! { time.sleep(2)? return ok("Ku " + "世界") }
+async fn hello(): HttpResponse! {
+    text = (await Child())?
+    index=0
+    while(index<1000) {index=index+1}
+    text=text+""
+    return ok(http.text(text))
+}
+async fn echo(req: HttpRequest): HttpResponse! {
+    time.sleep(2)?
+    return ok(http.text(req.path.clone()))
+}
+async fn fields(req: HttpRequest): HttpResponse! {
+    time.sleep(2)?
+    key="host"
+    return ok(http.text(req.params.id + ":" + req.query["q"] + ":" + req.headers[key]))
+}
+async fn slow(): HttpResponse! { time.sleep(2000)? return ok(http.text("late")) }
+async fn disk(): HttpResponse! {
+    fs.write("async-owner.txt","disk 中文")?
+    text = fs.read("async-owner.txt")?
+    return ok(http.text(text))
+}
+fn main(): null! {
+    app = http.server({max_active_requests: 16, max_pending_requests: 16,
+        max_connections: 64, max_buffer_bytes: 2097152, handler_timeout_ms: 50})
+    route=hello
+    app.get("/hello", route)
+    app.get("/echo", echo)
+    app.get("/fields/{id}", fields)
+    app.get("/slow", slow)
+    app.get("/disk", disk)
+    app.get("/sync", fn() { return http.text("sync") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "async-http-owner",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "3"),
+            ("KU_SERVICE_CONTROL_TOKEN", "async-regression"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (path, body) in [
+        ("/hello", "Ku 世界"),
+        ("/echo", "/echo"),
+        ("/fields/one?q=value", "one:value:localhost"),
+        ("/disk", "disk 中文"),
+        ("/sync", "sync"),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with(body), "{response}");
+    }
+    let response = http_response(
+        &address,
+        "GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&response, "HTTP/1.1 504 Gateway Timeout");
+    let recovered = http_response(
+        &address,
+        "GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&recovered, "HTTP/1.1 200 OK");
+    assert!(recovered.ends_with("Ku 世界"));
+    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: async-regression\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 200 OK");
+    let exit = watchdog.wait_for_natural_exit(Duration::from_secs(5));
+    assert!(exit.success(), "async service drain exit: {exit}");
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker() {
+    use std::io::Read;
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const CLIENTS: usize = 24;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let source = format!(
+        r#"
+import {{http,net,bytes}} from "std"
+async fn network(): HttpResponse! {{
+    client=net.client({{host:"127.0.0.1",port:{port},tls:false,read_timeout_ms:3000}})?
+    request=bytes.from_str("A\0B")?
+    client.write(request)?
+    reply=client.read(1)?
+    code=reply.get(0)?
+    client.close()
+    if(code!=75) {{ fail "unexpected TCP reply" }}
+    return ok(http.text("network"))
+}}
+async fn timeout(): HttpResponse! {{
+    client=net.client({{host:"127.0.0.1",port:{port},tls:false,read_timeout_ms:40}})?
+    code="missing_timeout"
+    try {{reply=client.read(1)?}} catch(err) {{code=err.code.clone()}}
+    client.close()
+    return ok(http.text(code))
+}}
+fn main(): null! {{
+    app=http.server({{max_active_requests:64,max_pending_requests:64,max_connections:128,
+      max_buffer_bytes:4194304,handler_timeout_ms:4000}})
+    app.get("/network",network)
+    app.get("/timeout",timeout)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}}
+"#
+    )
+    .replace("\\0", "\0");
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "async-tcp-owner",
+        &source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "3"),
+            ("KU_SERVICE_CONTROL_TOKEN", "net-regression"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let peer = std::thread::spawn(move || {
+        let accept_next = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        return stream;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("bounded TCP accept: {error}"),
+                }
+            }
+        };
+        for _ in 0..2 {
+            let mut streams = Vec::new();
+            for _ in 0..CLIENTS {
+                let mut stream = accept_next();
+                let mut message = [0; 3];
+                stream.read_exact(&mut message).unwrap();
+                assert_eq!(&message, b"A\0B");
+                streams.push(stream);
+            }
+            // No reply until every request is waiting. A blocking read on the
+            // single DNS worker would prevent the other clients entering.
+            for mut stream in streams {
+                stream.write_all(b"K").unwrap();
+            }
+        }
+        let mut timed_out = accept_next();
+        let mut byte = [0];
+        assert_eq!(
+            timed_out.read(&mut byte).unwrap(),
+            0,
+            "timeout must close the physical socket"
+        );
+        drop(timed_out);
+        let mut recovered = accept_next();
+        let mut message = [0; 3];
+        recovered.read_exact(&mut message).unwrap();
+        assert_eq!(&message, b"A\0B");
+        recovered.write_all(b"K").unwrap();
+    });
+    for _ in 0..2 {
+        let requests: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                let address = address.clone();
+                std::thread::spawn(move || {
+                    let response = http_response(
+                        &address,
+                        "GET /network HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+                        Duration::from_secs(6),
+                    );
+                    assert_status(&response, "HTTP/1.1 200 OK");
+                    assert!(response.ends_with("network"), "{response}");
+                })
+            })
+            .collect();
+        for request in requests {
+            request.join().unwrap();
+        }
+    }
+    let timed_out = http_response(
+        &address,
+        "GET /timeout HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&timed_out, "HTTP/1.1 200 OK");
+    assert!(timed_out.ends_with("read_timeout"), "{timed_out}");
+    let recovered = http_response(
+        &address,
+        "GET /network HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&recovered, "HTTP/1.1 200 OK");
+    assert!(recovered.ends_with("network"));
+    peer.join().unwrap();
+    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: net-regression\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_async_handler_signature_stubs_cannot_execute_as_sync_calls() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = Cleanup(unique_temp_dir("async-handler-call-rejection"));
+    for (label, operation) in [
+        ("direct", "task=ready()"),
+        ("alias", "handler=ready; task=handler()"),
+        ("clone", "handler=ready.clone(); task=handler()"),
+    ] {
+        let source = format!(
+            r#"
+import http from "std.http"
+async fn ready(): HttpResponse! {{return ok(http.text("async"))}}
+fn main(): null! {{
+  app=http.server()
+  {operation}
+  app.get("/",ready)
+  return ok(null)
+}}
+"#
+        );
+        let path = directory.0.join(format!("{label}.ku"));
+        fs::write(&path, source).unwrap();
+        let artifact = directory.0.join(format!("{label}.c"));
+        let mut command = Command::new(ku_binary());
+        command
+            .current_dir(&directory.0)
+            .env("KU_CC", "")
+            .args(["build", "--native"])
+            .arg(&path)
+            .arg("-o")
+            .arg(&artifact);
+        let output = run_bounded(&mut command, RUN_TIMEOUT, BUILD_OUTPUT_LIMITS).unwrap();
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "{label} executed a signature stub: {message}"
+        );
+        assert!(!artifact.exists(), "{label} produced a native artifact");
+        assert!(
+            message.contains("cannot call, capture or pass that handler"),
+            "{label}: {message}"
+        );
+    }
 }

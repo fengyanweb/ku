@@ -1,0 +1,25 @@
+[Unit]
+Description=Ku resident HTTP supervisor (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ku
+Group=ku
+WorkingDirectory=/opt/ku/service
+ExecStart=/usr/bin/python3 /opt/ku/service/manage.py run /etc/ku/cluster.json %i
+# Ku restarts native instances; systemd only restarts a crashed supervisor.
+# An exhausted Ku restart intensity exits 1 and requires an operator action.
+Restart=on-abnormal
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=16s
+LimitNOFILE=8192
+TasksMax=512
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

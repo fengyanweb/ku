@@ -5101,6 +5101,18 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
         TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
             enum_ir_type(name)
         }
+        TypeName::Custom(name)
+            if name == "HttpRequest"
+                && !layouts.structs.iter().any(|layout| layout.name == *name) =>
+        {
+            IrType::Named(HTTP_REQUEST_TYPE.to_string())
+        }
+        TypeName::Custom(name)
+            if name == "HttpResponse"
+                && !layouts.structs.iter().any(|layout| layout.name == *name) =>
+        {
+            IrType::Named(HTTP_RESPONSE_TYPE.to_string())
+        }
         TypeName::Custom(name) => IrType::Named(name.clone()),
     }
 }

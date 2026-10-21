@@ -254,6 +254,20 @@ pub enum TaskOp {
         src: SlotId,
         field: String,
     },
+    HttpMapGet {
+        dst: SlotId,
+        request: SlotId,
+        key: SlotId,
+        map: String,
+    },
+    /// HTTP response construction moves an optional string payload. `kind`
+    /// uses 0=text, 1=html, 2=empty, 3=redirect; status is a Copy int.
+    HttpResponse {
+        dst: SlotId,
+        body: Option<SlotId>,
+        status: Option<SlotId>,
+        kind: u32,
+    },
     Read {
         slot: SlotId,
     },
@@ -507,7 +521,7 @@ pub(crate) fn local_net_type(ty: &IrType) -> bool {
         || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_net_client"))
 }
 fn parameter_type(ty: &IrType) -> bool {
-    primitive(ty) || error_type(ty) || flat_array(ty) || result_type(ty)
+    primitive(ty) || error_type(ty) || flat_array(ty) || result_type(ty) || http_type(ty)
 }
 fn value_type(ty: &IrType) -> bool {
     parameter_type(ty) || local_bytes_type(ty) || local_net_type(ty)
@@ -524,9 +538,20 @@ pub(crate) fn array_result(ty: &IrType) -> bool {
 pub(crate) fn error_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Named(name) if name == "__ku_error_type")
 }
+pub(crate) fn http_request_type(ty: &IrType) -> bool {
+    matches!(ty,IrType::Named(name) if name=="__ku_http_request")
+}
+pub(crate) fn http_response_type(ty: &IrType) -> bool {
+    matches!(ty,IrType::Named(name) if name=="__ku_http_response")
+}
+pub(crate) fn http_type(ty: &IrType) -> bool {
+    http_request_type(ty)
+        || http_response_type(ty)
+        || matches!(ty,IrType::Result(inner) if http_response_type(inner))
+}
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner) || http_response_type(inner))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -542,6 +567,7 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
         operation,
         TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
+            | TaskOp::HttpMapGet { .. }
             | TaskOp::StringClone { .. }
             | TaskOp::StringConcat { .. }
             | TaskOp::ArrayTryGet { .. }
@@ -563,7 +589,7 @@ pub(crate) fn replaces_owned_value(
     slot == dst
         && matches!(function.slots.get(dst.0), Some(TaskSlot {
             ty: TaskSlotType::Value { ty, borrowed: false }
-        }) if matches!(ty, IrType::Str | IrType::Result(_)) || flat_array(ty) || error_type(ty))
+        }) if matches!(ty, IrType::Str | IrType::Result(_)) || flat_array(ty) || error_type(ty) || http_type(ty))
 }
 
 fn slot_type(slot: &TaskSlot) -> KuResult<(&IrType, bool)> {
@@ -875,10 +901,10 @@ fn validate_shape(
     let mut has_scope_exit = false;
     let mut has_timer = false;
     let mut has_blocking = false;
-    let mut has_error_projection = array_result(&function.result) || function
+    let mut has_error_projection = http_type(&function.result) || array_result(&function.result) || function
         .slots
         .iter()
-        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || array_result(ty)));
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || array_result(ty) || http_type(ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -1257,7 +1283,7 @@ fn validate_shape(
                     let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
                     if dst == src
                         || destination_borrowed
-                        || !(primitive(source) || flat_array(source))
+                        || !(primitive(source) || flat_array(source) || http_response_type(source))
                         || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
                         || (source_borrowed && !copy_type(source))
                     {
@@ -1301,12 +1327,61 @@ fn validate_shape(
                     if dst == src
                         || borrowed
                         || destination != &IrType::Str
-                        || !error_type(source)
-                        || !matches!(field.as_str(), "domain" | "code" | "message")
+                        || !(error_type(source)
+                            && matches!(field.as_str(), "domain" | "code" | "message")
+                            || http_request_type(source)
+                                && matches!(field.as_str(), "method" | "path" | "body"))
                     {
                         return Err(invalid(
                             "ErrorField requires an Error, owned str destination and known field",
                         ));
+                    }
+                }
+                TaskOp::HttpResponse {
+                    dst,
+                    body,
+                    status,
+                    kind,
+                } => {
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    if borrowed
+                        || !http_response_type(destination)
+                        || *kind > 3u32
+                        || (*kind == 2 && body.is_some())
+                        || (*kind != 2 && body.is_none())
+                        || body == &Some(*dst)
+                        || status == &Some(*dst)
+                    {
+                        return Err(invalid("HttpResponse requires an owned response and valid constructor operands"));
+                    }
+                    if let Some(body) = body {
+                        let (ty, borrowed) = slot_type(get_slot(*body)?)?;
+                        if borrowed || ty != &IrType::Str {
+                            return Err(invalid("HttpResponse body must be an owned str"));
+                        }
+                    }
+                    if let Some(status) = status {
+                        if slot_type(get_slot(*status)?)?.0 != &IrType::Int {
+                            return Err(invalid("HttpResponse status must be int"));
+                        }
+                    }
+                }
+                TaskOp::HttpMapGet {
+                    dst,
+                    request,
+                    key,
+                    map,
+                } => {
+                    has_error_projection = true;
+                    if dst == request
+                        || dst == key
+                        || slot_type(get_slot(*dst)?)?.1
+                        || slot_type(get_slot(*dst)?)?.0 != &IrType::Str
+                        || !http_request_type(slot_type(get_slot(*request)?)?.0)
+                        || slot_type(get_slot(*key)?)?.0 != &IrType::Str
+                        || !matches!(map.as_str(), "params" | "query" | "headers")
+                    {
+                        return Err(invalid("HttpMapGet requires an owned str destination, request, string key and known map"));
                     }
                 }
                 TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
@@ -1774,8 +1849,9 @@ fn validate_regions_and_progress(
             _ => return Err(invalid("cleanup cannot complete or suspend")),
         }
     }
-    // Every cycle must cross an unconditional frame return: only Suspend
-    // guarantees that. Await may consume an already-ready/INLINE_FAILED value
+    // Every cycle must cross an unconditional raw-frame return: only Suspend
+    // guarantees that. Source cooperative emission may combine such latches
+    // inside its separate finite 64-dispatch quantum. Await may consume an already-ready/INLINE_FAILED value
     // and continue dispatching in this same poll, so it is not a progress cut.
     // ScopeDrain can also be immediately ready and is not a progress cut.
     // Scope stacks and carried ownership are checked on the original graph.
@@ -1907,6 +1983,8 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::MakeError { dst, .. }
         | TaskOp::WrapError { dst, .. }
         | TaskOp::ErrorField { dst, .. }
+        | TaskOp::HttpResponse { dst, .. }
+        | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::ArrayMake { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::StartIndirect { dst, .. }
@@ -2263,6 +2341,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
+        | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::Binary { dst, .. } => {
             state.must |= bit(*dst);
             state.may |= bit(*dst);
@@ -2277,6 +2356,11 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         }
         TaskOp::WrapOk { dst, src } => {
             let consumed = bit(*src) & owned;
+            state.must = (state.must & !consumed) | bit(*dst);
+            state.may = (state.may & !consumed) | bit(*dst);
+        }
+        TaskOp::HttpResponse { dst, body, .. } => {
+            let consumed = body.map_or(0, bit);
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
         }
@@ -2623,6 +2707,16 @@ fn live_states(
                     } => {
                         live = (live & !bit(*dst)) | bit(*src) | index.map_or(0, bit);
                     }
+                    TaskOp::HttpResponse {
+                        dst, body, status, ..
+                    } => {
+                        live = (live & !bit(*dst)) | body.map_or(0, bit) | status.map_or(0, bit);
+                    }
+                    TaskOp::HttpMapGet {
+                        dst, request, key, ..
+                    } => {
+                        live = (live & !bit(*dst)) | bit(*request) | bit(*key);
+                    }
                     TaskOp::ArrayTake {
                         dst,
                         array: left,
@@ -2750,6 +2844,20 @@ fn validate_ownership_and_plan(
                 return Err(invalid(
                     "read, move or drop of a slot that is not definitely initialized",
                 ));
+            }
+            if let TaskOp::HttpResponse { body, status, .. } = operation {
+                if body
+                    .iter()
+                    .chain(status)
+                    .any(|slot| state.must & bit(*slot) == 0)
+                {
+                    return Err(invalid("HttpResponse reads an uninitialized operand"));
+                }
+            }
+            if let TaskOp::HttpMapGet { request, key, .. } = operation {
+                if state.must & (bit(*request) | bit(*key)) != (bit(*request) | bit(*key)) {
+                    return Err(invalid("HttpMapGet reads an uninitialized operand"));
+                }
             }
             if let TaskOp::Bytes {
                 index: Some(index), ..

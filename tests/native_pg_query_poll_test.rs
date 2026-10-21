@@ -972,7 +972,7 @@ enum {
   T_COLUMN_CHANGE, T_MISSING_TERMINAL, T_OOM_RESULT, T_OOM_CELLS, T_OOM_BYTES,
   T_ONLY_NULL_EMPTY, T_EXACT_BYTES, T_DISCARD_MANY, T_BAD_ROW_COUNT, T_BAD_TERMINAL_ROWS,
   T_BINARY, T_BINARY_ZERO_ROWS, T_BINARY_NULL, T_BINARY_INTERMEDIATE, T_BINARY_ERROR,
-  T_BINARY_LATE, T_BINARY_TERMINAL, T_MIXED_FORMAT, T_UNKNOWN_FORMAT
+  T_BINARY_LATE, T_BINARY_TERMINAL, T_MIXED_FORMAT, T_UNKNOWN_FORMAT, T_CANCELLED
 };
 struct pg_conn {
   int id, status, utf8, nonblocking, active, mode, index, total, pending_read;
@@ -991,6 +991,9 @@ static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
 static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
 static int poisoned_consumes = 0;
+static int cancellation_mode, cancel_tokens, cancel_sends, cancel_frees;
+struct pg_cancel { PGconn* connection; };
+static struct pg_cancel cancel_token;
 static size_t fail_malloc_size = 0;
 static int injected_allocation_failures = 0;
 static int fail_runtime_allocation_after = 0, single_row_calls = 0, read_ahead_calls = 0;
@@ -1141,6 +1144,29 @@ const char* PQparameterStatus(const PGconn* conn, const char* parameter) {
   return conn->utf8 ? "UTF8" : "LATIN1";
 }
 int PQsetnonblocking(PGconn* conn, int mode) { if (fail_nonblocking) return -1; conn->nonblocking = mode; return 0; }
+/* Existing modes simulate unavailable cancellation; explicit modes exercise
+   confirmed cancellation, acknowledgement without retirement, and send failure. */
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* connection) { (void)connection; return 0; }
+PGcancel* PQgetCancel(PGconn* connection) {
+  if (!cancellation_mode) return NULL;
+  if (cancel_tokens) bad_calls++;
+  cancel_tokens++; cancel_token.connection=connection; return &cancel_token;
+}
+int PQcancel(PGcancel* cancel, char* error, int length) {
+  (void)error; (void)length; cancel_sends++;
+  if (ku_database_budget_snapshot().pending_operations != 1) bad_calls++;
+  if (cancellation_mode==3) return 0;
+  if (cancellation_mode==1) {
+    cancel->connection->mode=T_CANCELLED;
+    cancel->connection->index=0; cancel->connection->total=1;
+  }
+  return 1;
+}
+void PQfreeCancel(PGcancel* cancel) {
+  if (cancel!=&cancel_token || cancel_tokens!=1) bad_calls++;
+  cancel_tokens--; cancel_frees++;
+}
 void PQfinish(PGconn* conn) {
   if (!conn) return;
   if (ku_test_pg_pool_lock_depth != 0) ku_test_pg_finishes_while_pool_locked++;
@@ -1242,6 +1268,7 @@ PGresult* PQgetResult(PGconn* conn) {
   if (conn->mode == T_MULTI || conn->mode == T_LIMIT_INTERMEDIATE || conn->mode == T_LIMIT_FINAL || conn->mode == T_INVALID_INTERMEDIATE || conn->mode == T_BINARY_INTERMEDIATE)
     result->status = (result->number & 1) ? 9 : KU_PGRES_TUPLES_OK;
   if (conn->mode == T_DISCARD_MANY) result->status = result->number <= 40 || result->number == 42 ? 9 : KU_PGRES_TUPLES_OK;
+  if (conn->mode == T_CANCELLED) result->status = KU_PGRES_FATAL_ERROR;
   if (conn->mode == T_ERROR) result->status = result->number == 1 ? KU_PGRES_COMMAND_OK : 7;
   else if ((conn->mode == T_ERROR_AFTER_ROWS || conn->mode == T_ERROR_AFTER_INVALID || conn->mode == T_BINARY_ERROR) && result->number == 2) result->status = 7;
   else if (conn->mode == T_MISSING_TERMINAL) result->status = 9;
@@ -1925,6 +1952,27 @@ int main(void) {
   ku_pg_client_release(flight_pool, flight_slot, 1, clock_ms + 50);
   ku_drop_pg_client(&flight_pool);
   CHECK(!flight_pool && live_connections == 0 && live_results == 0 && starts == finishes);
+  size_t confirmed_before=ku_database_budget_snapshot().confirmed_cancellations;
+  for (cancellation_mode=1; cancellation_mode<=3; cancellation_mode++) {
+    KuResult_pg_client cancellable=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,1,5000,5000,20);
+    CHECK(cancellable.ok && cancellable.value);
+    mode_on_send=T_READ_TIMEOUT;
+    int sends_before=user_sends, cancel_before=cancel_sends;
+    KuResult_pg_result cancelled=ku_pg_client_query(cancellable.value,text("SELECT cancelled"),empty_params);
+    CHECK(error_is(cancelled,"execution_unknown") && user_sends==sends_before+1);
+    CHECK(cancel_sends==cancel_before+1 && !cancel_tokens && cancel_frees==cancel_sends);
+    CHECK(cancellable.value->active==0 && !cancellable.value->conns[0]);
+    CHECK(ku_database_budget_snapshot().pending_operations==0
+        && ku_database_budget_snapshot().pending_bytes==0);
+    CHECK(ku_database_budget_snapshot().confirmed_cancellations==confirmed_before+1);
+    ku_error_drop(&cancelled.error);
+    mode_on_send=T_OK;
+    KuResult_pg_result after_cancel=ku_pg_client_query(cancellable.value,text("SELECT fresh_request"),empty_params);
+    CHECK(after_cancel.ok && user_sends==sends_before+2);
+    ku_drop_pg_result(&after_cancel.value); ku_drop_pg_client(&cancellable.value);
+  }
+  cancellation_mode=0;
+
   CHECK(ku_test_pg_pool_lock_depth == 0 && ku_test_pg_finishes_while_pool_locked == 0);
   CHECK(bad_calls == 0);
   CHECK(shutdowns > 0 && poisoned_consumes >= 2 && single_row_calls > 0 && read_ahead_calls == 0);

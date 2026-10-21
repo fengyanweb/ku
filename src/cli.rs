@@ -867,6 +867,8 @@ Usage:
   ku template list      List built-in project templates
   ku supervise [limits] -- <entry>...
                         Run isolated workers with OS memory limits (see --help)
+  ku service [options] -- <native-program> [args...]
+                        Manage a resident HTTP instance (see service --help)
   ku run [--locked|--offline] [file.ku]
                         Run a package entry or Ku source file
   ku check [--locked|--offline] [file.ku]
@@ -940,6 +942,8 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
         Some("init") => run_init_command(&args),
         Some("template") => run_template_command(&args),
         Some("supervise") => crate::process_execution::run_supervise_command(&args),
+        Some("service") => crate::service_supervision::run_service_command(&args),
+        Some("__service_child") => crate::service_supervision::run_service_child(&args),
         Some("run") => {
             if args.get(2).is_some_and(|arg| arg == "build") {
                 return Err(command_error(
@@ -2752,7 +2756,12 @@ fn write_native_c_to(
 ) -> Result<PathBuf, KuError> {
     let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
-    if !native_task_entry {
+    let mixed_http_tasks = !native_task_entry
+        && program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::Item::Function(function) if function.is_async));
+    if !native_task_entry && !mixed_http_tasks {
         reject_native_async(&program)?;
     }
     Checker::new().check(&program).map_err(|err| {
@@ -2781,6 +2790,32 @@ fn write_native_c_to(
         // erased async flags. Unsupported source fails before artifact writes.
         let tasks = ir::task_lower::lower_program(&program)?;
         backend::c::generate_native_task_c_source(&tasks, &options)?
+    } else if mixed_http_tasks {
+        let tasks = ir::task_lower::lower_service_handlers(&program)?;
+        // Only the setup/signature side is synchronous. Real async bodies are
+        // compiled exactly once into verified Task frames above. These typed
+        // placeholders cannot run a body with its async marker erased.
+        let mut setup = program.clone();
+        for item in &mut setup.items {
+            if let crate::ast::Item::Function(function) = item {
+                if function.is_async {
+                    function.is_async = false;
+                    function.body = vec![crate::ast::Stmt::Fail {
+                        value: crate::ast::Expr::new(
+                            crate::ast::ExprKind::Literal(crate::ast::Literal::String(
+                                "async HTTP handlers must be registered with app.get/post/put/del"
+                                    .to_string(),
+                            )),
+                            function.span,
+                        ),
+                        span: function.span,
+                    }];
+                }
+            }
+        }
+        let lowered = ir::lower_program(&setup)?;
+        let optimized = ir::optimize_program(&lowered);
+        backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
     } else {
         let lowered = ir::lower_program(&program)?;
         let optimized = ir::optimize_program(&lowered);

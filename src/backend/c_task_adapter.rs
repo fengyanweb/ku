@@ -33,6 +33,10 @@ pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<
     }
     out.check()?;
     out.push_str(ADAPTER_ABI);
+    if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot|matches!(&slot.ty,TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
+        out.push_str(HTTP_ADAPTER_ABI);
+    }
     if tasks.functions.iter().any(|function| {
         function.states.iter().any(|state| {
             state
@@ -52,7 +56,7 @@ pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<
 }
 
 fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
-    out.push_str("static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>7u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n");
+    out.push_str("static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>8u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n");
     for function in &tasks.functions {
         out.check()?;
         let id = function.id.0;
@@ -63,7 +67,7 @@ fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
 }
 
 fn supported_type(ty: &IrType) -> bool {
-    if crate::ir::task::error_type(ty) {
+    if crate::ir::task::error_type(ty) || crate::ir::task::http_type(ty) {
         return true;
     }
     match ty {
@@ -84,11 +88,23 @@ fn owned(ty: &IrType) -> bool {
         || crate::ir::task::error_type(ty)
         || crate::ir::task::local_bytes_type(ty)
         || crate::ir::task::local_net_type(ty)
+        || crate::ir::task::http_type(ty)
 }
 
 // The generated branch itself guards the access: inactive Result fields must
 // not be validated, charged or dereferenced, even if their bytes look unusual.
 fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> String {
+    if crate::ir::task::http_request_type(ty) || crate::ir::task::http_response_type(ty) {
+        let fields = if crate::ir::task::http_request_type(ty) {
+            ["method", "path", "body"]
+        } else {
+            ["content_type", "body", "location"]
+        };
+        return fields
+            .iter()
+            .map(|name| body(&format!("({place}).{name}")))
+            .collect();
+    }
     match ty {
         IrType::Str => body(place),
         IrType::Array(inner) if inner.as_ref() == &IrType::Str => format!(
@@ -127,6 +143,13 @@ fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
     }
     if matches!(ty, IrType::Named(name) if name == "__ku_net_client") {
         return format!("  if ({place}) {{ if (sizeof(KuNetClient)>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=sizeof(KuNetClient); }}\n");
+    }
+    if crate::ir::task::http_request_type(ty) {
+        let leaves = active_strings(ty, place, &|leaf| {
+            format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if(checked!=KU_TASK_DRIVER_OK) return checked;\n")
+        });
+        let maps=["params","query","headers"].iter().map(|name|format!("  checked=ku_task_adapter_http_map_charge(({place}).{name},&{total}); if(checked!=KU_TASK_DRIVER_OK) return checked;\n")).collect::<String>();
+        return leaves + &maps;
     }
     if let IrType::Array(element) = ty {
         let c_element = super::c_type(element).expect("flat element C type");
@@ -250,7 +273,11 @@ fn array_input_guard(
                 ty: IrType::Str | IrType::Array(_),
                 ..
             } => 1,
-            TaskSlotType::Value { ty, .. } if crate::ir::task::error_type(ty) => 3,
+            TaskSlotType::Value { ty, .. }
+                if crate::ir::task::error_type(ty) || crate::ir::task::http_type(ty) =>
+            {
+                3
+            }
             _ => 0,
         })
         .sum::<usize>()
@@ -299,6 +326,11 @@ fn array_input_guard(
                 &format!("(*arg_{index})"),
                 &register_string,
             ));
+        }
+        if matches!(ty,TaskSlotType::Value{ty,..} if crate::ir::task::http_request_type(ty)) {
+            for field in ["params", "query", "headers"] {
+                code.push_str(&format!("  checked=ku_task_adapter_http_map_charge(arg_{index}->{field},&total); if(checked!=KU_TASK_DRIVER_OK) return checked;\n"));
+            }
         }
     }
     code.push_str(&format!("  for (size_t i=0;i<base_count;i++) {{\n    checked=ku_task_adapter_buffer_excludes(base[i],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n    for (size_t j=0;j<i;j++) if (ku_task_adapter_buffers_overlap(base[i],base[j])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }}\n",parameters.len()));
@@ -354,8 +386,8 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         )
     });
     let dynamic_projection = blocking
-        || crate::ir::task::array_result(&function.result)
-        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty)))
+        || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
         || function.states.iter().any(|state| {
             state
                 .operations
@@ -514,9 +546,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             ));
         }
     }
-    let has_array_parameters = parameters
-        .iter()
-        .any(|(_, ty)| parameter_array(ty).is_some());
+    let has_array_parameters = parameters.iter().any(|(_, ty)| {
+        parameter_array(ty).is_some()
+            || matches!(ty,TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty))
+    });
     let mut hosted_runtime_inputs = String::new();
     if has_array_parameters {
         out.push_str(&array_input_guard(&id, &parameters, &declarations)?);
@@ -609,7 +642,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@RECONCILE_FIELDS@", &reconcile_fields)
         .replace("@RECONCILE_CALL@", if blocking { "ku_task_blocking_reconcile_charge(&instance->ticket,&instance->blocking,sizeof(*instance),bytes)" } else { "ku_task_driver_reconcile_charge(&instance->ticket,sizeof(*instance),bytes)" })
         .replace("@ALLOCATION_HOST@", if dynamic_projection { "sizeof(KuTaskAdapterHostV1),KU_TASK_ALLOCATION_HOST_ABI_VERSION,instance,ku_task_@ID@_reconcile_charge" } else { "0,0,NULL,NULL" })
-        .replace("@RECONCILE_RETURN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;" } else { "" })
+        .replace("@RECONCILE_RETURN@", if dynamic_projection { RECONCILE_AFTER_RESUME } else { "" })
         .replace("@RECONCILE_DRAIN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;" } else { "" })
         .replace("@RECONCILE_TAKE@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
         .replace("@RECONCILE_DROP@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
@@ -993,7 +1026,33 @@ static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
   size_t bytes=0;
   uint32_t status=KU_TASK_DRIVER_OK;
 @RECONCILE_FIELDS@
-  return @RECONCILE_CALL@;
+  status=@RECONCILE_CALL@;
+  return status;
+}
+"#;
+const RECONCILE_AFTER_RESUME: &str = r#"
+  if(ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)return KU_TASK_CONTROL_INVALID_STATE;
+"#;
+
+const HTTP_ADAPTER_ABI: &str = r#"
+/* HTTP parser-produced maps contain only owned string keys/string values.
+ * Their allocations move with the request; no yyjson/foreign node is borrowed.
+ * Header/body/target limits bound this finite table scan. */
+static uint32_t ku_task_adapter_http_map_charge(KuObject* map,size_t* bytes) {
+  if (!map) return KU_TASK_DRIVER_OK;
+  if (!map->entries || map->len>map->cap || map->cap>65536u
+      || map->cap>(SIZE_MAX-sizeof(*map))/sizeof(KuEntry)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t fixed=sizeof(*map)+map->cap*sizeof(KuEntry);
+  if (fixed>SIZE_MAX-*bytes) return KU_TASK_DRIVER_LIMIT;
+  *bytes+=fixed;
+  for(size_t i=0;i<map->cap;i++) if(map->entries[i].used) {
+    KuEntry* entry=&map->entries[i];
+    if(entry->value.tag!=KU_STR) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    uint32_t status=ku_task_adapter_string_charge(entry->key,bytes);
+    if(status==KU_TASK_DRIVER_OK) status=ku_task_adapter_string_charge(entry->value.as.s,bytes);
+    if(status!=KU_TASK_DRIVER_OK) return status;
+  }
+  return KU_TASK_DRIVER_OK;
 }
 "#;
 
@@ -1227,6 +1286,8 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   KuTaskAdapterTakeRequestV1* request=(KuTaskAdapterTakeRequestV1*)destination;
   if (!ku_task_driver_external_storage(instance->ticket.driver,request,sizeof(*request),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterTakeRequestV1))
       || ku_task_frame_ranges_overlap(instance,sizeof(*instance),request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(request->retained_bytes || request->retain_payload_charge>1u
+      || (request->parent && request->retain_payload_charge)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
   if (!instance->payload_initialized) return KU_TASK_CONTROL_RESULT_TAKEN;
 @REQUEST_ALIASES@
   KuTaskAdapterOutcomeV1* outcome=request->outcome;
@@ -1247,6 +1308,10 @@ static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   if (request->parent) {
     checked=ku_task_driver_transfer_charge(&instance->ticket,request->parent,payload_charge,sizeof(*instance));
     if (checked!=KU_TASK_DRIVER_OK) return checked;
+  } else if(request->retain_payload_charge) {
+    checked=ku_task_driver_extract_charge(&instance->ticket,payload_charge,sizeof(*instance));
+    if(checked!=KU_TASK_DRIVER_OK) return checked;
+    request->retained_bytes=payload_charge;
   }
   *output = ku_result_move_@SUFFIX@(&instance->payload);
   outcome->result_kind=@KIND@u; outcome->exit_class=instance->exit_class;
