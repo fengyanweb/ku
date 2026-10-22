@@ -321,5 +321,137 @@ class RecoveryHTTPDeadlineContracts(unittest.TestCase):
             fixture.DeadlineHTTPConnection("localhost", 9, time.monotonic() + 1)
 
 
+class FreshReadRecoveryContracts(unittest.TestCase):
+    def scenario(self, responses, *, initial_time=100.0, progress_seconds=0):
+        clock = SimpleNamespace(now=initial_time)
+        expected = {"rows": 1, "text": "中文🙂"}
+        pending = list(responses)
+        requests, progress, recovery = [], [], {}
+        last = {}
+
+        def read(path, *, deadline):
+            requests.append((path, deadline, clock.now))
+            self.assertTrue(pending, "recovery sent an unexpected additional request")
+            elapsed, outcome = pending.pop(0)
+            last.clear()
+            last.update(sequence=len(requests), route=path, started_monotonic=clock.now)
+            clock.now += elapsed
+            last["finished_monotonic"] = clock.now
+            if isinstance(outcome, Exception):
+                last["exception"] = type(outcome).__name__
+                raise outcome
+            last.update(status=200, body_prefix=outcome)
+            return outcome
+
+        def mark(index):
+            progress.append(index)
+            clock.now += progress_seconds
+
+        def execute():
+            with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+                fixture.recover_new_reads(
+                    read, lambda: last, expected, recovery, began=100.0, deadline_seconds=5,
+                    max_new_reads=8,
+                    intermediate_errors=["query_error", "execution_unknown", "acquire_timeout"],
+                    start_event="all pressure requests completed", progress=mark)
+
+        return SimpleNamespace(run=execute, requests=requests, progress=progress,
+                               recovery=recovery, pending=pending, expected=expected)
+
+    def test_transient_result_then_distinct_read_success_keeps_complete_ledger(self):
+        for code in ("acquire_timeout", "execution_unknown", "query_error"):
+            with self.subTest(code=code):
+                scenario = self.scenario([(0.109, "error:" + code),
+                                          (0.016, '{"rows":1,"text":"中文🙂"}')])
+                scenario.run()
+                self.assertEqual(scenario.requests, [("/read", 105.0, 100.0),
+                                                     ("/read", 105.0, 100.109)])
+                self.assertTrue(scenario.recovery["recovered"])
+                self.assertFalse(scenario.recovery["failed_request_replay"])
+                observations = scenario.recovery["observations"]
+                self.assertEqual([row["sequence"] for row in observations], [1, 2])
+                self.assertEqual(observations[0]["body_prefix"], "error:" + code)
+                self.assertAlmostEqual(observations[0]["recovery_elapsed_seconds"], 0.109)
+                self.assertEqual(json.loads(observations[1]["body_prefix"]), scenario.expected)
+
+    def test_later_new_request_keeps_original_deadline_instead_of_renewing(self):
+        scenario = self.scenario([(4, "error:acquire_timeout"),
+                                  (0.75, '{"rows":1,"text":"中文🙂"}')])
+        scenario.run()
+        self.assertEqual(scenario.requests, [("/read", 105.0, 100.0), ("/read", 105.0, 104.0)])
+        self.assertEqual(scenario.recovery["absolute_deadline_monotonic"], 105.0)
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 4.75)
+
+    def test_expired_window_sends_no_new_read(self):
+        scenario = self.scenario([], initial_time=105.0)
+        with self.assertRaisesRegex(TimeoutError, "absolute deadline exceeded after 0"):
+            scenario.run()
+        self.assertEqual(scenario.requests, [])
+        self.assertEqual(scenario.progress, [])
+        self.assertEqual(scenario.recovery["observations"], [])
+        self.assertFalse(scenario.recovery["recovered"])
+
+    def test_checkpoint_time_consumes_same_window_and_cannot_send_after_expiry(self):
+        scenario = self.scenario([], progress_seconds=5)
+        with self.assertRaisesRegex(TimeoutError, "absolute deadline exceeded after 0"):
+            scenario.run()
+        self.assertEqual(scenario.progress, [1])
+        self.assertEqual(scenario.requests, [])
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 5)
+
+    def test_response_at_deadline_is_not_recovery(self):
+        scenario = self.scenario([(5, '{"rows":1,"text":"中文🙂"}')])
+        with self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(len(scenario.requests), 1)
+        self.assertEqual(len(scenario.recovery["observations"]), 1)
+        self.assertFalse(scenario.recovery["recovered"])
+        self.assertEqual(scenario.recovery["finished_monotonic"], 105.0)
+
+    def test_all_eight_allowed_errors_exhaust_new_read_count_without_replay(self):
+        scenario = self.scenario([(0.125, "error:acquire_timeout")] * 8)
+        with self.assertRaises(AssertionError):
+            scenario.run()
+        self.assertEqual(len(scenario.requests), 8)
+        self.assertEqual([path for path, _, _ in scenario.requests], ["/read"] * 8)
+        self.assertEqual(len(scenario.recovery["observations"]), 8)
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 1.0)
+        self.assertFalse(scenario.recovery["recovered"])
+
+    def test_transient_errors_exhaust_window_without_sending_another_read(self):
+        scenario = self.scenario([(3, "error:execution_unknown"), (2, "error:acquire_timeout"),
+                                  (0.1, '{"rows":1,"text":"中文🙂"}')])
+        with self.assertRaisesRegex(TimeoutError, "absolute deadline exceeded after 2"):
+            scenario.run()
+        self.assertEqual(scenario.requests, [("/read", 105.0, 100.0), ("/read", 105.0, 103.0)])
+        self.assertEqual(len(scenario.pending), 1)
+        self.assertEqual(len(scenario.recovery["observations"]), 2)
+        self.assertFalse(scenario.recovery["recovered"])
+
+    def test_unknown_error_or_unexpected_body_fails_without_next_read(self):
+        for body, error in (("error:permission_denied", AssertionError),
+                            ('{"rows":2,"text":"中文🙂"}', AssertionError),
+                            ("not JSON", json.JSONDecodeError)):
+            with self.subTest(body=body):
+                scenario = self.scenario([(0.1, body), (0.1, '{"rows":1,"text":"中文🙂"}')])
+                with self.assertRaises(error):
+                    scenario.run()
+                self.assertEqual(len(scenario.requests), 1)
+                self.assertEqual(len(scenario.pending), 1)
+                self.assertEqual(scenario.recovery["observations"][0]["body_prefix"], body)
+                self.assertFalse(scenario.recovery["recovered"])
+
+    def test_failed_new_request_is_recorded_and_never_replayed(self):
+        scenario = self.scenario([(0.2, RuntimeError("HTTP 503")),
+                                  (0.1, '{"rows":1,"text":"中文🙂"}')])
+        with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
+            scenario.run()
+        self.assertEqual(len(scenario.requests), 1)
+        self.assertEqual(len(scenario.pending), 1)
+        self.assertEqual(scenario.recovery["observations"][0]["exception"], "RuntimeError")
+        self.assertFalse(scenario.recovery["recovered"])
+        self.assertAlmostEqual(scenario.recovery["elapsed_seconds"], 0.2)
+
+
 if __name__ == "__main__":
     unittest.main()

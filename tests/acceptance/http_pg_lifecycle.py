@@ -84,6 +84,46 @@ class DeadlineHTTPConnection(http.client.HTTPConnection):
         self.sock = connection
 
 
+def recover_new_reads(request, observe, expected, recovery, *, began, deadline_seconds,
+                      max_new_reads, intermediate_errors, start_event, progress):
+    """Observe bounded fresh reads after a fault; never replay the failed operation."""
+    deadline = began + deadline_seconds
+    recovery.update(observations=[], recovered=False, failed_request_replay=False,
+                    started_monotonic=began, absolute_deadline_monotonic=deadline,
+                    start_event=start_event,
+                    deadline_semantics=f"one absolute {deadline_seconds:g}s window; each new request has min(4s, remaining window), including connect/write/all reads")
+    allowed = {"error:" + code for code in intermediate_errors}
+    try:
+        for index in range(max_new_reads):
+            if time.monotonic() >= deadline:
+                break
+            progress(index + 1)
+            # Progress checkpoints and scheduling consume the same window too.
+            if time.monotonic() >= deadline:
+                break
+            try:
+                body = request("/read", deadline=deadline)
+            finally:
+                observation = dict(observe())
+                observation["recovery_elapsed_seconds"] = time.monotonic() - began
+                recovery["observations"].append(observation)
+            if body.startswith("error:"):
+                assert body in allowed, observation
+                continue
+            assert json.loads(body) == expected, observation
+            deadline_remaining(deadline)
+            recovery["recovered"] = True
+            break
+    finally:
+        recovery["finished_monotonic"] = time.monotonic()
+        recovery["elapsed_seconds"] = recovery["finished_monotonic"] - began
+    if recovery["finished_monotonic"] > deadline or (
+            not recovery["recovered"] and recovery["finished_monotonic"] >= deadline):
+        recovery["recovered"] = False
+        raise TimeoutError(f"database recovery absolute deadline exceeded after {len(recovery['observations'])} new read requests")
+    assert recovery["recovered"], recovery
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -675,41 +715,33 @@ def main():
                 # that the second request succeeds. These are distinct read-only
                 # requests; no failed operation or write is replayed.
                 began = time.monotonic()
-                deadline = began + report["parameters"]["fault_recovery_deadline_seconds"]
-                recovery = {"observations": [], "recovered": False, "failed_request_replay": False,
-                            "started_monotonic": began, "absolute_deadline_monotonic": deadline,
-                            "start_event": "pg_terminate_backend returned and termination result recorded",
-                            "deadline_semantics": "one absolute 5s window; each new request has min(4s, remaining window), including connect/write/all reads"}
+                recovery = {}
                 report["disconnect_recovery"] = recovery
-                allowed = {"error:" + code for code in report["parameters"]["disconnect_recovery_intermediate_errors"]}
-                for index in range(report["parameters"]["disconnect_recovery_max_new_reads"]):
-                    if time.monotonic() >= deadline:
-                        break
-                    progress("fault:disconnect-new-read", new_request=index + 1)
-                    body = request("/read", deadline=deadline)
-                    observation = dict(report["last_request"])
-                    observation["recovery_elapsed_seconds"] = time.monotonic() - began
-                    recovery["observations"].append(observation)
-                    if body.startswith("error:"):
-                        assert body in allowed, observation
-                        continue
-                    assert json.loads(body) == expected, observation
-                    recovery["recovered"] = time.monotonic() <= deadline
-                    break
-                assert recovery["recovered"], recovery
-                recovery["finished_monotonic"] = time.monotonic()
-                recovery["elapsed_seconds"] = recovery["finished_monotonic"] - began
-                assert recovery["finished_monotonic"] <= deadline, recovery
+                recover_new_reads(request, lambda: report["last_request"], expected, recovery,
+                                  began=began,
+                                  deadline_seconds=report["parameters"]["fault_recovery_deadline_seconds"],
+                                  max_new_reads=report["parameters"]["disconnect_recovery_max_new_reads"],
+                                  intermediate_errors=report["parameters"]["disconnect_recovery_intermediate_errors"],
+                                  start_event="pg_terminate_backend returned and termination result recorded",
+                                  progress=lambda index: progress("fault:disconnect-new-read", new_request=index))
                 report["checks"]["database_disconnect_recovery"] = {
                     "first": recovery["observations"][0]["body_prefix"], "next": "passed",
                     "new_read_requests": len(recovery["observations"]), "failed_request_replay": False}
                 progress("fault:bounded-dependency-pressure")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
                     outcomes = list(pool.map(lambda _: request("/slow"), range(12)))
+                began = time.monotonic()
                 counts = {value: outcomes.count(value) for value in sorted(set(outcomes))}
                 assert all(value.startswith("error:") for value in outcomes), counts
-                progress("fault:bounded-dependency-pressure-new-read")
-                assert json.loads(request("/read")) == expected
+                recovery = {}
+                report["pressure_recovery"] = recovery
+                recover_new_reads(request, lambda: report["last_request"], expected, recovery,
+                                  began=began,
+                                  deadline_seconds=report["parameters"]["fault_recovery_deadline_seconds"],
+                                  max_new_reads=report["parameters"]["disconnect_recovery_max_new_reads"],
+                                  intermediate_errors=report["parameters"]["disconnect_recovery_intermediate_errors"],
+                                  start_event="all 12 pressure requests completed and the client pool joined",
+                                  progress=lambda index: progress("fault:bounded-dependency-pressure-new-read", new_request=index))
                 report["checks"]["bounded_dependency_pressure_recovery"] = counts
             progress("http:connection-accounting")
             connections = int(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'"))
