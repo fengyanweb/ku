@@ -2178,5 +2178,536 @@
     },
     "client_sha256": "ef4f157e6dc50bc95838c0b1adc89890432e6e9a54d1e14995bf85dda3c49400",
     "original_report_sha256": "50c8595314f1d9b760001b2358f9a54c5f9cb5aec2fef5ef6deb73d59e9ed075"
+  },
+  "mac_reactor_scan": {
+    "kind": "Finite actual generated C blocking pool scan diagnosis; not capacity acceptance",
+    "scope": "N1 and N4 each one-second work128k window, fixed counters; two monotonic samples per interests scan, none per lock",
+    "failure": null,
+    "rows": [
+      {
+        "loops": 1,
+        "exit": 0,
+        "counts": {
+          "outside_locks": 13,
+          "owners": [
+            {
+              "owner": 0,
+              "locks": 41027584,
+              "scans": 20033,
+              "scan_wall_ns": 476968000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 1,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            },
+            {
+              "owner": 2,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            },
+            {
+              "owner": 3,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            }
+          ]
+        },
+        "client_ledger": {
+          "active_after_cleanup": 0,
+          "completed": 80,
+          "completed_in_measurement_window": 64,
+          "correct_in_measurement_window": 64,
+          "failure_kinds": {},
+          "failure_stages": {},
+          "http_statuses": {
+            "200": 80
+          },
+          "no_request_bytes_written": 0,
+          "not_started": 0,
+          "not_started_reasons": {
+            "client_queue_full": 0,
+            "queued_or_closed_at_cutoff": 0,
+            "scheduler_at_cutoff": 0
+          },
+          "planned": 80,
+          "planned_reconciled": true,
+          "request_bytes_written": 26391,
+          "request_write_completed": 80,
+          "request_write_partial": 0,
+          "response_bytes_read": 640,
+          "results": {
+            "correct_success": 80,
+            "http_rejected": 0,
+            "other_http_failure": 0,
+            "transport_or_timeout_failure": 0,
+            "unfinished_at_cutoff": 0
+          },
+          "server_received": null,
+          "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+          "started": 80,
+          "started_reconciled": true
+        },
+        "client_timing": {
+          "cutoff_snapshot": {
+            "completed": 64,
+            "inflight": 16,
+            "observed_seconds": 1.000273459,
+            "started": 80
+          },
+          "first_started_seconds": 8.2209e-05,
+          "last_completion_seconds": 1.190716917,
+          "last_started_seconds": 0.991518334,
+          "measurement_seconds": 1,
+          "with_cleanup_seconds": 1.1907231249999999
+        },
+        "server_delta": {
+          "observation_seconds": 1.698736541999999,
+          "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+          "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+          "complete_requests_received": 80,
+          "connections_accepted": 16,
+          "admitted": 80,
+          "responses_prepared": {
+            "success_responses": 80,
+            "rejected_responses": 0,
+            "timeout_responses": 0,
+            "other_responses": 0
+          },
+          "event_threads": [
+            {
+              "id": 0,
+              "cpu_seconds": 0.792256084,
+              "cpu_sample_window_seconds": 1.762,
+              "cpu_sample_age_before_ms": 73,
+              "cpu_sample_age_after_ms": 9,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 80
+            }
+          ],
+          "event_cpu_seconds": 0.792256084,
+          "average_event_cores_over_observation_window": 0.46637960885167123,
+          "native_process_cpu_seconds": 0.79,
+          "native_process_cpu_window_seconds": 1.6924778329999999,
+          "task_driver_timing": {
+            "enabled_before": false,
+            "enabled_after": false,
+            "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+            "lock_count_delta": 0,
+            "lock_wait_ns_delta": 0,
+            "lock_hold_ns_delta": 0,
+            "condition_count_delta": 0,
+            "condition_sleep_reacquire_ns_delta": 0,
+            "clock_errors_delta": 0,
+            "max_lock_wait_ns_before": 0,
+            "max_lock_wait_ns_after": 0,
+            "max_lock_hold_ns_before": 0,
+            "max_lock_hold_ns_after": 0,
+            "max_condition_sleep_reacquire_ns_before": 0,
+            "max_condition_sleep_reacquire_ns_after": 0
+          },
+          "counter_errors": []
+        },
+        "interpretation": {
+          "all_scans_have_no_active_net_wait": true,
+          "locks_per_nonempty_owner_scan": {
+            "0": 2048.0
+          },
+          "sum_scan_wall_seconds": 0.476968,
+          "scan_wall_scope": "Includes waiting for the shared pool mutex and scan time, so N4 owner durations overlap and are not CPU time."
+        }
+      },
+      {
+        "loops": 4,
+        "exit": 0,
+        "counts": {
+          "outside_locks": 12,
+          "owners": [
+            {
+              "owner": 0,
+              "locks": 8214528,
+              "scans": 4011,
+              "scan_wall_ns": 800253000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 1,
+              "locks": 8218624,
+              "scans": 4013,
+              "scan_wall_ns": 808889000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 2,
+              "locks": 8216576,
+              "scans": 4012,
+              "scan_wall_ns": 803112000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 3,
+              "locks": 8218624,
+              "scans": 4013,
+              "scan_wall_ns": 805004000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            }
+          ]
+        },
+        "client_ledger": {
+          "active_after_cleanup": 0,
+          "completed": 64,
+          "completed_in_measurement_window": 48,
+          "correct_in_measurement_window": 48,
+          "failure_kinds": {},
+          "failure_stages": {},
+          "http_statuses": {
+            "200": 64
+          },
+          "no_request_bytes_written": 0,
+          "not_started": 0,
+          "not_started_reasons": {
+            "client_queue_full": 0,
+            "queued_or_closed_at_cutoff": 0,
+            "scheduler_at_cutoff": 0
+          },
+          "planned": 64,
+          "planned_reconciled": true,
+          "request_bytes_written": 21175,
+          "request_write_completed": 64,
+          "request_write_partial": 0,
+          "response_bytes_read": 512,
+          "results": {
+            "correct_success": 64,
+            "http_rejected": 0,
+            "other_http_failure": 0,
+            "transport_or_timeout_failure": 0,
+            "unfinished_at_cutoff": 0
+          },
+          "server_received": null,
+          "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+          "started": 64,
+          "started_reconciled": true
+        },
+        "client_timing": {
+          "cutoff_snapshot": {
+            "completed": 48,
+            "inflight": 16,
+            "observed_seconds": 1.000754291,
+            "started": 64
+          },
+          "first_started_seconds": 6.083e-06,
+          "last_completion_seconds": 1.028712166,
+          "last_started_seconds": 0.805327333,
+          "measurement_seconds": 1,
+          "with_cleanup_seconds": 1.028742458
+        },
+        "server_delta": {
+          "observation_seconds": 1.0744191250000004,
+          "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+          "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+          "complete_requests_received": 64,
+          "connections_accepted": 16,
+          "admitted": 64,
+          "responses_prepared": {
+            "success_responses": 64,
+            "rejected_responses": 0,
+            "timeout_responses": 0,
+            "other_responses": 0
+          },
+          "event_threads": [
+            {
+              "id": 0,
+              "cpu_seconds": 0.584697083,
+              "cpu_sample_window_seconds": 1.091,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 30,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 1,
+              "cpu_seconds": 0.587646375,
+              "cpu_sample_window_seconds": 1.102,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 19,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 2,
+              "cpu_seconds": 0.5893965,
+              "cpu_sample_window_seconds": 1.092,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 29,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 3,
+              "cpu_seconds": 0.593304833,
+              "cpu_sample_window_seconds": 1.102,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 19,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            }
+          ],
+          "event_cpu_seconds": 2.355044791,
+          "average_event_cores_over_observation_window": 2.1919237439113894,
+          "native_process_cpu_seconds": 2.37,
+          "native_process_cpu_window_seconds": 1.0683880420000005,
+          "task_driver_timing": {
+            "enabled_before": false,
+            "enabled_after": false,
+            "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+            "lock_count_delta": 0,
+            "lock_wait_ns_delta": 0,
+            "lock_hold_ns_delta": 0,
+            "condition_count_delta": 0,
+            "condition_sleep_reacquire_ns_delta": 0,
+            "clock_errors_delta": 0,
+            "max_lock_wait_ns_before": 0,
+            "max_lock_wait_ns_after": 0,
+            "max_lock_hold_ns_before": 0,
+            "max_lock_hold_ns_after": 0,
+            "max_condition_sleep_reacquire_ns_before": 0,
+            "max_condition_sleep_reacquire_ns_after": 0
+          },
+          "counter_errors": []
+        },
+        "interpretation": {
+          "all_scans_have_no_active_net_wait": true,
+          "locks_per_nonempty_owner_scan": {
+            "0": 2048.0,
+            "1": 2048.0,
+            "2": 2048.0,
+            "3": 2048.0
+          },
+          "sum_scan_wall_seconds": 3.217258,
+          "scan_wall_scope": "Includes waiting for the shared pool mutex and scan time, so N4 owner durations overlap and are not CPU time."
+        }
+      }
+    ],
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "2d0aa719d2cbfa9f60d6ea178493f2710cd13ff0823887638d4f046139a02311",
+      "native_sha256": "2324b48ee13deb1c6e56ab4eba09e143eadad413d508988a201e1b05d24c1dbb",
+      "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-reactor-scan-0eeehnh7/.ku/build/release/c/ddcXpN6hJyfYx07xTgtoyEwm499zQ9mzqc_v04WV_3U/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-reactor-scan-0eeehnh7/capacity\n",
+      "generated_c_sha256": [
+        "dbc66bf54ce88ea5f2afc732c5dd75d03d7343faf1ff777ead84bfa46da5b4d3"
+      ]
+    },
+    "cli_sha256": "eb062a29b55cb361a07629f485bbfd6a8600a0bb9198ba1136f290ddd6bbcb7b",
+    "instrumented_c_sha256": "d029e863f35376897f478ed11c700731374a82d10783891b47435275b15a2a5f",
+    "instrumented_native_sha256": "7ec79a2915156ccc0f55d80edb1337da2b0747c23c741ae7fedf19ef1711bd1b",
+    "temporary_directory_removed": true,
+    "original_report_sha256": "53cda07918968c9380b6de1368f50ba1e7165878d5131a34f83069560c828faf"
+  },
+  "mac_scalar_actual_guards": {
+    "kind": "Finite actual multicore fixture scalar guard diagnosis; not performance acceptance",
+    "seconds": 1,
+    "loops": 1,
+    "production_changed": false,
+    "failure": null,
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "d17a39bf9fe0296b2af392603447fa5c7ea6ae4064c90db8ec8dfaa108878fda",
+      "native_sha256": "e81fd016ee1778bbe81844bbe8c2fb78a4fbc8ea0a51d6faaaedc5f21cb44a02",
+      "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-scalar-guards-00tov3a5/.ku/build/release/c/xxuAdwOeBOyLOeDCuecovV5q3h81cK9N75u4q0LCwl4/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-scalar-guards-00tov3a5/capacity\n",
+      "generated_c_sha256": [
+        "e91acf1aefc69e1387ba670966b029d732b168fbf638d262c1eede885251aefb"
+      ]
+    },
+    "cli_sha256": "8ed73b1c936ffddd38d80b7e4eb80cfda984e0e49b9572999be3c9ca56fb85aa",
+    "instrumented_sha256": "ee182f3054e9eafe59725e1a7dcba4ac33d17546b01c242884b898b3c4ad9e89",
+    "native_sha256": "3b1cde70cf13f6aaabd848fc419727c88573597e63a7496bc8371541b2a82d52",
+    "exit": 0,
+    "counts": {
+      "marker": 768000,
+      "marker_pure": 767904,
+      "marker_dirty": 96,
+      "resume": 768288,
+      "skip": 767904
+    },
+    "guard_failure_counts": {
+      "frame_not_pending": 96,
+      "frame_uninitialized": 0,
+      "payload_initialized": 0,
+      "result_initialized": 96,
+      "child_slot_initialized": 192,
+      "receipt_mask_nonzero": 0,
+      "wait_driver_nonnull": 192,
+      "drain_started": 0,
+      "tls_absent": 0,
+      "tls_driver_mismatch": 0,
+      "tls_slot_mismatch": 0,
+      "tls_generation_mismatch": 0,
+      "tls_control_mismatch": 0,
+      "no_budget_marker": 288,
+      "not_scalar_quantum": 384,
+      "intent_touched": 192,
+      "phase_not_live": 0
+    },
+    "first_non_scalar_states": [
+      {
+        "state": 0,
+        "quantum_first_dirty_count": 96,
+        "generated_c_line": 16399,
+        "body": "  __ku_charge_unchanged=0;\n  frame->s_1 = ku_string_static((const uint8_t*)\"work\", 4);\n  frame->header.initialized |= (UINT64_C(1) << 1);\n  { KuValue* field_value=ku_object_get(frame->s_0.query,frame->s_1);\n  KuString field_string=field_value && field_value->tag==KU_STR ? field_value->as.s : (KuString){0};\n  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,field_string,&frame->s_2);\n  if(cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {\n    if (cleanup) goto ku_task_terminated;\n    frame->result=(KuResult_struct___ku_http_response){false,(KuStruct___ku_http_response){0}, ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"memory_limit\",12),ku_string_static((const uint8_t*)\"request map projection allocation rejected\",42))};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n  frame->header.cleanup_state = UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_EXIT_STAGED; frame->header.running=0; return KU_TASK_FRAME_EXIT_STAGED;\n  }\n  if(cloned!=KU_TASK_DRIVER_OK) {frame->header.running=0;return KU_TASK_FRAME_INVALID_STATE;}\n  }\n  frame->header.initialized |= (UINT64_C(1) << 2);\n  if (frame->header.initialized & (UINT64_C(1) << 1)) {\n  frame->header.initialized &= ~ (UINT64_C(1) << 1);\n  ku_string_drop(&frame->s_1);\n  }\n  frame->s_3=(int64_t)(ku_string_char_len(frame->s_2));\n  frame->header.initialized |= (UINT64_C(1) << 3);\n  if (frame->header.initialized & (UINT64_C(1) << 2)) {\n  frame->header.initialized &= ~ (UINT64_C(1) << 2);\n  ku_string_drop(&frame->s_2);\n  }\n  frame->s_4 = frame->s_3;\n  frame->header.initialized |= (UINT64_C(1) << 4);\n  frame->s_5 = INT64_C(1000);\n  frame->header.initialized |= (UINT64_C(1) << 5);\n  { uint32_t arithmetic_status = ku_int_mul(frame->s_4, frame->s_5, &frame->s_6);\n  if (arithmetic_status != KU_INT_OK) {\n    if (cleanup) goto ku_task_terminated;\n    frame->result=(KuResult_struct___ku_http_response){false,(KuStruct___ku_http_response){0}, ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n  frame->header.cleanup_state = UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_EXIT_STAGED; frame->header.running=0; return KU_TASK_FRAME_EXIT_STAGED;\n  } }\n  fra"
+      }
+    ],
+    "task_slot_mask": "13523993021644800",
+    "counter_scope": "Only generated work function id1; fixed counters, one stderr vector at normal exit, N1 serial owner; no lock clock instrumentation.",
+    "temporary_directory_removed": true,
+    "measurement_summary": {
+      "client_configuration": {
+        "address": "127.0.0.1:63523",
+        "automatic_retries": false,
+        "compression": false,
+        "duration_seconds": 1,
+        "expected_bytes": 8,
+        "keep_alive": true,
+        "keepalive_idle_retirement_ms": 500,
+        "max_response_bytes": 65536,
+        "max_response_header_bytes": 32768,
+        "maximum_live_connections": 16,
+        "mode": "closed",
+        "path": "/work?work=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&seed=sss",
+        "per_request_timeout_ms": 3000,
+        "pipelining": false,
+        "queue_descriptors_limit": 64,
+        "redirects": false,
+        "target_rps": 0,
+        "workers": 16
+      },
+      "client_ledger": {
+        "active_after_cleanup": 0,
+        "completed": 96,
+        "completed_in_measurement_window": 80,
+        "correct_in_measurement_window": 80,
+        "failure_kinds": {},
+        "failure_stages": {},
+        "http_statuses": {
+          "200": 96
+        },
+        "no_request_bytes_written": 0,
+        "not_started": 0,
+        "not_started_reasons": {
+          "client_queue_full": 0,
+          "queued_or_closed_at_cutoff": 0,
+          "scheduler_at_cutoff": 0
+        },
+        "planned": 96,
+        "planned_reconciled": true,
+        "request_bytes_written": 31671,
+        "request_write_completed": 96,
+        "request_write_partial": 0,
+        "response_bytes_read": 768,
+        "results": {
+          "correct_success": 96,
+          "http_rejected": 0,
+          "other_http_failure": 0,
+          "transport_or_timeout_failure": 0,
+          "unfinished_at_cutoff": 0
+        },
+        "server_received": null,
+        "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+        "started": 96,
+        "started_reconciled": true
+      },
+      "client_timing": {
+        "cutoff_snapshot": {
+          "completed": 80,
+          "inflight": 16,
+          "observed_seconds": 1.0002805,
+          "started": 96
+        },
+        "first_started_seconds": 1.1625e-05,
+        "last_completion_seconds": 1.126889166,
+        "last_started_seconds": 0.944436375,
+        "measurement_seconds": 1,
+        "with_cleanup_seconds": 1.12689775
+      },
+      "server_delta": {
+        "observation_seconds": 1.6487145830000003,
+        "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+        "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+        "complete_requests_received": 96,
+        "connections_accepted": 16,
+        "admitted": 96,
+        "responses_prepared": {
+          "success_responses": 96,
+          "rejected_responses": 0,
+          "timeout_responses": 0,
+          "other_responses": 0
+        },
+        "event_threads": [
+          {
+            "id": 0,
+            "cpu_seconds": 0.847513167,
+            "cpu_sample_window_seconds": 1.695,
+            "cpu_sample_age_before_ms": 66,
+            "cpu_sample_age_after_ms": 20,
+            "cpu_clock_errors_delta": 0,
+            "complete_requests_received": 96
+          }
+        ],
+        "event_cpu_seconds": 0.847513167,
+        "average_event_cores_over_observation_window": 0.5140448054131149,
+        "native_process_cpu_seconds": 0.86,
+        "native_process_cpu_window_seconds": 1.6468359170000006,
+        "task_driver_timing": {
+          "enabled_before": false,
+          "enabled_after": false,
+          "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+          "lock_count_delta": 0,
+          "lock_wait_ns_delta": 0,
+          "lock_hold_ns_delta": 0,
+          "condition_count_delta": 0,
+          "condition_sleep_reacquire_ns_delta": 0,
+          "clock_errors_delta": 0,
+          "max_lock_wait_ns_before": 0,
+          "max_lock_wait_ns_after": 0,
+          "max_lock_hold_ns_before": 0,
+          "max_lock_hold_ns_after": 0,
+          "max_condition_sleep_reacquire_ns_before": 0,
+          "max_condition_sleep_reacquire_ns_after": 0
+        },
+        "counter_errors": []
+      },
+      "client_first_errors": null,
+      "scope": "Counts were measured on this shared macOS desktop; 1 second diagnosis plus finite request cleanup, no capacity claim."
+    },
+    "interpretation": {
+      "actual_fast_path_confirmed": true,
+      "pure_marker_count_matches_actual_skip": true,
+      "typed_entry_counterexample": "Generated work frame state0 materializes an owned string projection from HttpRequest.query[\"work\"] via ku_task_host_clone_string; it drops the key and projected string after length evaluation. This quantum must remain non-scalar and reconcile. The computation loop itself is scalar and skips on all 767904 observed pure yields.",
+      "child_wait_guard_scope": "192 child-slot / wait-driver / explicit-intent observations occur during the two digits awaits for 96 completed requests. None blocks the preceding integer computation loop.",
+      "next_step_boundary": "This disproves a scalar guard miss in actual HTTP work. No classifier expansion or fixture modification is justified by this run; it does not establish end-to-end improvement."
+    },
+    "original_report_sha256": "80ecba4ab7fcb2d66186921e24730c2f24b651e6e4f1241a417012814972b057"
   }
 }

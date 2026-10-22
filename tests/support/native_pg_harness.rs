@@ -4,7 +4,7 @@
 
 #[allow(dead_code)]
 #[path = "bounded_process.rs"]
-mod bounded_process;
+pub mod bounded_process;
 
 use std::env;
 use std::fs;

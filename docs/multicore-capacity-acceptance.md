@@ -29,6 +29,16 @@ HTTP pump 总额仍是 32，`pump(1)` 仍只消耗 1，driver/worker polls 按�
 
 据此增加保守的单量子证明：仅 Int/Bool/Null 的常量、读写、运算和无资源释放，以及已验证的空 scope 控制转移，才保持本次局部 `charge_unchanged` 标志。未知操作、owned 值操作、调用、等待等一律清除标志。只有真实预算耗尽的 Pending、匹配的 TLS/代次/control、phase LIVE、未触达显式 intent，且没有活跃 child、receipt、wait、drain、payload/result 时，adapter 才省略本次重复扫描。含 Blocking 或 finally 的函数静态禁用，以覆盖外部输出和异常隐式释放。没有缓存共享 charge，也没有延迟分配准入或最终退款；完整、失败、混合量子及 take/drop 等原核对仍执行。这是局部 Task IR 证明，不进入暂停的通用值或 AST 分析。
 
+### 网络空扫描的独立争用
+
+前述统计只覆盖 driver 锁，遗漏了另一把 blocking pool 锁。`c_task_reactor.c::ku_task_net_interests` 旧实现每次 HTTP turn 扫 1,024 个槽，对每槽取锁两次；CPU-only、NET_WAIT 为 0 时仍如此。真实生成 C 的一秒诊断中，N1 20,033 次 scan 对应 41,027,584 次 pool 锁；N4 每 owner 约 4,011—4,013 次 scan，每 scan 同样 2,048 锁。N1 scan 墙钟合计 0.477s，N4 各线程合计 3.217s，后者重叠且包含争锁，不能当作 CPU 秒。单独优化 driver 后 Linux 短对照仍有 N4 回退，未启动正式容量；这些失败继续保留。
+
+最小修复是入口一次持锁扫元数据，非活动槽直接跳过。确需推进网络操作时先解锁，dispatch 完再加锁；重新读取当前 state、owner、socket 和 generation，形成一致的 poll snapshot。OS 操作仍在锁外，取消、期限、容量错误及迟到代次契约保留，无新队列或计数字段。永久回归检查空表仅一次锁、解锁期间代次/owner/DONE 变化、锁失败和容量错误都不遗留持锁，再复用真实 TCP/HTTP 取消及回收检查。
+
+曾试验私有 HTTP handle 的负向 LIVE 快返；只移除该分支的相同生成 C 对照约 446.4 请求/秒，保留为 443.0，未证明收益。该 7 行分支及其专用新增测试已撤掉，HTTP readiness 继续完整走原锁。没有为了保留优化而扩大实现。
+
+当前本机短诊断（非正式验收）在相同 128k 输入下，N4 的旧 reactor / 旧 driver / 全部候选分别约 64 / 128 / 455 请求/秒；后两者均使用新 reactor。最终 N1 约 139；旧 5000-loop 路径最终 N4/N1 约 8,447/3,480。5s 开放过载 11,385 个计划全部启动，1,922 正确响应、9,463 明确 503、无传输/期限失败；公平性探针通过。该短窗含本机资源竞争及收尾，不替代三轮 30s 扩核、30s 等待/过载、三平台回归或最终持续窗口。
+
 ## 旧约 40ms 样本的证据边界
 
 本地证据根目录为 `/Users/mac/Downloads/Ku_多核容量验收_2026-10-22/`：

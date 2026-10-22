@@ -278,7 +278,18 @@ fn native_task_adapter_factory_ownership_budget_and_failure_execute_in_c() {
             "forbidden adapter path {forbidden}"
         );
     }
-    assert!(adapter.contains("KU_TASK_DRIVER_YIELD"));
+    assert!(adapter.contains("ku_task_driver_begin_quantum"));
+    let default_intent = generated
+        .split_once("static uint32_t ku_task_driver_begin_quantum(")
+        .expect("generated default-intent helper")
+        .1
+        .split_once("\n}\n")
+        .expect("default-intent helper boundary")
+        .0;
+    assert!(default_intent.contains("execution->default_yield=1;"));
+    assert!(
+        default_intent.contains("return ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_YIELD);")
+    );
     // Shared drain code now supports hosted Tasks, but these Value-only R4
     // frames still suspend by yielding and cannot register a source wait.
     for id in 0..11 {
@@ -291,7 +302,9 @@ fn native_task_adapter_factory_ownership_budget_and_failure_execute_in_c() {
             .split_once(cleanup_signature.as_str())
             .expect("concrete adapter cleanup boundary")
             .0;
-        assert!(resume.contains("KU_TASK_DRIVER_YIELD"));
+        assert!(
+            resume.contains("ku_task_driver_begin_quantum(&instance->ticket,&instance->control)")
+        );
         assert!(!resume.contains("KU_TASK_DRIVER_WAIT"));
     }
     let factories = &generated[instance_start..adapter_end];

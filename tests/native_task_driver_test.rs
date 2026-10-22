@@ -2122,7 +2122,7 @@ fn native_task_driver_hot_yield_services_marker_before_cancellation() {
     let clock_entry = "static uint64_t ku_task_driver_now_ms(void) {";
     let lock_entry = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
     let unlock_entry = "static int ku_task_driver_unlock(KuTaskDriverV1* driver) {";
-    let poll = "uint32_t outcome = ku_task_control_poll(&execution);";
+    let poll = "outcome=ku_task_control_poll(&execution);";
     let published = "driver->building--;\n    slot->state = KU_TASK_DRIVER_PARKED;\n    if (source && !driver->closing) {\n      ku_task_driver_enqueue_local(driver, ticket->slot, parent->executor_worker);\n    } else ku_task_driver_enqueue(driver, ticket->slot);";
     for unique in [
         "typedef struct KuString {",

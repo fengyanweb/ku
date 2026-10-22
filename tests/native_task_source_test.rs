@@ -1908,7 +1908,7 @@ async fn main(): null! {
 
 #[test]
 fn native_task_tcp_late_readiness_cannot_mutate_a_reused_job_generation() {
-    let generated = native_task_transport_source(
+    let mut generated = native_task_transport_source(
         r#"
 import net from "std.net"
 async fn main(): null! {
@@ -1923,6 +1923,56 @@ async fn main(): null! {
         "static int ku_unused_source_main(void) {",
         1,
     );
+    let lock = "static int ku_task_blocking_lock(KuTaskBlockingPoolV1* pool) {";
+    assert_eq!(generated.matches(lock).count(), 1);
+    generated = generated.replacen(
+        lock,
+        r#"
+static KU_THREAD_LOCAL size_t fixture_locks,fixture_depth,fixture_fail_after;
+static int fixture_mode,fixture_bad_dispatch;
+static int fixture_original_lock(KuTaskBlockingPoolV1* pool);
+static int ku_task_blocking_lock(KuTaskBlockingPoolV1* pool) {
+  if(fixture_fail_after && !--fixture_fail_after)return -1;
+  int status=fixture_original_lock(pool);
+  if(!status) {fixture_locks++;fixture_depth++;} return status;
+}
+static int fixture_original_lock(KuTaskBlockingPoolV1* pool) {"#,
+        1,
+    );
+    let unlock = "static void ku_task_blocking_unlock(KuTaskBlockingPoolV1* pool) {";
+    assert_eq!(generated.matches(unlock).count(), 1);
+    generated = generated.replacen(
+        unlock,
+        r#"
+static void fixture_original_unlock(KuTaskBlockingPoolV1* pool);
+static void ku_task_blocking_unlock(KuTaskBlockingPoolV1* pool) {
+  if(!fixture_depth)abort();fixture_depth--;fixture_original_unlock(pool);
+}
+static void fixture_original_unlock(KuTaskBlockingPoolV1* pool) {"#,
+        1,
+    );
+    let dispatch = "static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,size_t index,uint64_t generation,uint32_t events) {";
+    assert_eq!(generated.matches(dispatch).count(), 1);
+    // Only control the unlocked interleaving. The original interests routine,
+    // pool lock, stale-generation dispatch and shutdown all execute unchanged.
+    generated = generated.replacen(dispatch, r#"
+static KuNetClient fixture_clients[2];
+static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1*,size_t,size_t,uint64_t,uint32_t);
+static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,size_t index,uint64_t generation,uint32_t events) {
+  if(!fixture_mode)return fixture_original_dispatch(pool,owner,index,generation,events);
+  if(fixture_depth) {fixture_bad_dispatch=1;return KU_TASK_DRIVER_INTERNAL;}
+  if(fixture_mode==4)return KU_TASK_DRIVER_INTERNAL;
+  if(fixture_mode==5) {fixture_fail_after=1u;return KU_TASK_DRIVER_OK;}
+  if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
+  KuTaskBlockingJobV1* job=&pool->jobs[index];
+  if(fixture_mode==1) {
+    job->generation=generation+1u;job->cancelled=0;
+    job->net_client=&fixture_clients[1];job->net_deadline+=100u;
+  } else if(fixture_mode==2)job->state=KU_TASK_BLOCKING_DONE;
+  else if(fixture_mode==3)job->net_owner=owner+2u;
+  ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_OK;
+}
+static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,size_t index,uint64_t generation,uint32_t events) {"#, 1);
     let source = format!(
         "{generated}\n{}",
         r#"
@@ -1932,16 +1982,60 @@ int main(void) {
      stack. Production roots use static/heap storage; mirror that here. */
   KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*pool));
   CHECK(pool);uint64_t deadline=ku_task_driver_now_ms()+1000u;
-  CHECK(ku_task_blocking_init(pool,1u,1u,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_init(pool,KU_TASK_DRIVER_MAX_SLOTS,1u,deadline)==KU_TASK_DRIVER_OK);
+  KuTaskNetPollV1 interests[2]={{0}};uint64_t next=UINT64_MAX;
+  size_t before=fixture_locks;
+  CHECK(ku_task_net_interests(NULL,0u,interests,2u,&next)==0u && fixture_locks==before);
+  CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==0u);
+  CHECK(fixture_locks-before==1u && !fixture_depth && next==UINT64_MAX);
+  fixture_fail_after=1u;
+  CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==SIZE_MAX && !fixture_depth);
+  CHECK(!ku_net_socket_startup());
+  for(size_t i=0;i<2u;i++) {
+    fixture_clients[i].socket_value=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    CHECK(fixture_clients[i].socket_value!=KU_NET_INVALID_SOCKET);
+  }
   CHECK(!ku_task_blocking_lock(pool));
   KuTaskBlockingJobV1* job=&pool->jobs[0];job->generation=2u;job->state=KU_TASK_BLOCKING_NET_WAIT;
   job->net_owner=1u;job->kind=6u;job->net_requested=17;job->net_deadline=deadline;
+  job->net_client=&fixture_clients[0];
   ku_task_blocking_unlock(pool);
   CHECK(ku_task_net_dispatch(pool,0u,0u,1u,KU_TASK_NET_READ|KU_TASK_NET_ERROR)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_net_dispatch(pool,1u,0u,2u,KU_TASK_NET_READ)==KU_TASK_DRIVER_OK);
   CHECK(!ku_task_blocking_lock(pool));
   CHECK(job->generation==2u && job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_requested==17 && !job->cancelled && !pool->fault);
-  memset(job,0,sizeof(*job));ku_task_blocking_unlock(pool);
+  ku_task_blocking_unlock(pool);
+  before=fixture_locks;next=UINT64_MAX;
+  CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==1u);
+  CHECK(fixture_locks-before==1u && !fixture_depth && next==deadline);
+  CHECK(interests[0].generation==2u && interests[0].slot==0u
+    && interests[0].socket_value==(uintptr_t)fixture_clients[0].socket_value
+    && interests[0].events==KU_TASK_NET_READ);
+  before=fixture_locks;next=UINT64_MAX;
+  CHECK(ku_task_net_interests(pool,1u,interests,2u,&next)==0u);
+  CHECK(fixture_locks-before==1u && !fixture_depth && next==UINT64_MAX);
+  CHECK(ku_task_net_interests(pool,0u,NULL,0u,&next)==SIZE_MAX && !fixture_depth);
+  CHECK(!ku_task_blocking_lock(pool));CHECK(pool->fault==KU_TASK_DRIVER_LIMIT);pool->fault=0;
+  ku_task_blocking_unlock(pool);
+  for(int mode=1;mode<=5;mode++) {
+    CHECK(!ku_task_blocking_lock(pool));
+    job->generation=10u+(uint64_t)mode;job->state=KU_TASK_BLOCKING_NET_WAIT;
+    job->net_owner=1u;job->kind=6u;job->cancelled=1;
+    job->net_client=&fixture_clients[0];job->net_deadline=deadline;
+    ku_task_blocking_unlock(pool);
+    fixture_mode=mode;next=UINT64_MAX;before=fixture_locks;
+    size_t count=ku_task_net_interests(pool,0u,interests,2u,&next);
+    CHECK(!fixture_depth && !fixture_bad_dispatch);
+    if(mode==1) {
+      CHECK(count==1u && interests[0].generation==12u && next==deadline+100u);
+      CHECK(interests[0].socket_value==(uintptr_t)fixture_clients[1].socket_value);
+    } else if(mode==2 || mode==3)CHECK(count==0u && next==UINT64_MAX);
+    else CHECK(count==SIZE_MAX);
+    CHECK(fixture_locks-before==(mode<=3 ? 3u : 1u));
+    fixture_mode=0;
+  }
+  CHECK(!ku_task_blocking_lock(pool));memset(job,0,sizeof(*job));ku_task_blocking_unlock(pool);
+  for(size_t i=0;i<2u;i++)ku_net_socket_close(fixture_clients[i].socket_value);
   CHECK(ku_task_blocking_finish(pool,deadline)==KU_TASK_DRIVER_OK);
   CHECK(pool->initialized==KU_TASK_DRIVER_STORAGE_ZERO && !pool->resources
       && !pool->resident && !pool->queued && !pool->running

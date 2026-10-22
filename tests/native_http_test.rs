@@ -14,12 +14,10 @@
 //!
 //! When no C compiler is present every test skips cleanly instead of failing.
 
-#[path = "support/bounded_process.rs"]
-pub mod bounded_process;
-
 #[allow(dead_code)]
 #[path = "support/native_pg_harness.rs"]
 mod native_c_harness;
+use native_c_harness::bounded_process;
 
 use std::env;
 use std::fs;
@@ -3079,7 +3077,7 @@ fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
 #[test]
 fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
     let region = |start: &str, end: &str| {
         format!(
             "{start}{}",

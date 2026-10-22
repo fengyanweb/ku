@@ -55,7 +55,7 @@ def build(ku, root, peer_port):
 
 
 def baseline_natives(root):
-    """Same final frontend/fixture/flags; replace only the two changed runtimes.
+    """Same final frontend/fixture/flags; replace only the named runtime(s).
 
     These are explicitly derived comparison artifacts, never final products or
     claims that the entire final compiler was built from the historical commit.
@@ -65,7 +65,7 @@ def baseline_natives(root):
     reference = "c1de5e3245bff62eb0b422d5c39a5212a1d1723b"
     repo = Path(__file__).resolve().parents[2]
     old, hashes = {}, {}
-    for name in ("c_http_runtime.c", "c_task_driver.rs"):
+    for name in ("c_http_runtime.c", "c_task_driver.rs", "c_task_reactor.c"):
         path = "src/backend/" + name
         local = subprocess.run(["git", "show", reference+":"+path], cwd=repo,
                                capture_output=True, timeout=5)
@@ -81,11 +81,12 @@ def baseline_natives(root):
     current_driver = (repo / "src/backend/c_task_driver.rs").read_text().split('const DRIVER_ABI: &str = r#"', 1)[1].rsplit('"#;', 1)[0]
     old_driver = old["c_task_driver.rs"].split('const DRIVER_ABI: &str = r#"', 1)[1].rsplit('"#;', 1)[0]
     current_http = (repo / "src/backend/c_http_runtime.c").read_text()
+    current_reactor = (repo / "src/backend/c_task_reactor.c").read_text()
     generated = list(root.rglob("capacity.c"))
     if len(generated) != 1:
         raise RuntimeError("ambiguous generated comparison source")
     final_c = generated[0].read_text()
-    if final_c.count(current_driver) != 1 or final_c.count(current_http) != 1:
+    if final_c.count(current_driver) != 1 or final_c.count(current_http) != 1 or final_c.count(current_reactor) != 1:
         raise RuntimeError("CLI and working-tree runtime text differ; rebuild the actual CLI")
     before_driver = final_c.replace(current_driver, old_driver, 1)
     entry = "ku_task_driver_begin_quantum(&instance->ticket,&instance->control)"
@@ -102,12 +103,13 @@ def baseline_natives(root):
     scalar_count = before_driver.count(scalar)
     before_driver = before_driver.replace(scalar, "(0)")
     before_both = before_driver.replace(current_http, old["c_http_runtime.c"], 1)
+    before_scan = final_c.replace(current_reactor, old["c_task_reactor.c"], 1)
     outputs, manifest = {}, {"reference": reference, "old_source_sha256": hashes,
                             "restored_adapter_entries": changed_entries,
                             "restored_dispatch_markers": marker_count,
                             "disabled_scalar_reconcile_fast_paths": scalar_count,
-                            "scope": "Final frontend and fixture; historical driver and/or HTTP runtime replacement only; release C flags unchanged (-O2)."}
-    for name, text in (("before_driver", before_driver), ("before_both", before_both)):
+                            "scope": "Final frontend and fixture; each derived variant replaces only its named historical runtime (driver, driver+HTTP, or reactor); all other runtimes remain final. Not whole historical compiler builds. Release C flags unchanged (-O2)."}
+    for name, text in (("before_driver", before_driver), ("before_both", before_both), ("before_scan", before_scan)):
         source, executable = root / (name+".c"), root / name
         source.write_text(text)
         args = ["clang", str(source), "-std=c11", "-o", str(executable), "-O2", "-pthread"]
@@ -125,6 +127,7 @@ def compare(executable, baselines, client, root, checkpoint=None):
         for loops in order:
             for pair in (
                 (("before_driver", baselines["before_driver"], work_path(128), checksum(128)),
+                 ("before_scan", baselines["before_scan"], work_path(128), checksum(128)),
                  ("final_driver", executable, work_path(128), checksum(128))),
                 (("before_both_legacy", baselines["before_both"], "/cpu", "cpu-ready"),
                  ("final_legacy", executable, "/cpu", "cpu-ready")),
@@ -348,7 +351,7 @@ def assessment(report):
     }
     comparison = report.get("short_comparison", [])
     paired = {}
-    for variant in ("before_driver", "final_driver", "before_both_legacy", "final_legacy"):
+    for variant in ("before_driver", "before_scan", "final_driver", "before_both_legacy", "final_legacy"):
         paired[variant] = {}
         for n in (1, 2, 4):
             rows = [r for r in comparison if r["variant"] == variant and r["loops"] == n]
@@ -359,6 +362,7 @@ def assessment(report):
     pair_valid = all(row["all_correct"] for variant in paired.values() for row in variant.values())
     checks["comparison_correct"] = pair_valid
     checks["candidate_driver_benefit"] = pair_valid and paired["final_driver"][4]["median_rps"] >= paired["before_driver"][4]["median_rps"] * 1.05
+    checks["reactor_scan_benefit"] = pair_valid and paired["final_driver"][4]["median_rps"] >= paired["before_scan"][4]["median_rps"] * 1.05
     checks["legacy_final_no_material_four_owner_regression"] = pair_valid and paired["final_legacy"][4]["median_rps"] >= paired["final_legacy"][1]["median_rps"] * .95
     result.update(checks=checks, passed=all(checks.values()), failed=[name for name, passed in checks.items() if not passed])
     return result
@@ -422,7 +426,7 @@ def main():
         report["short_comparison"] = compare(executable, baseline, client, root, comparison_checkpoint)
         preliminary = assessment(report)
         report["short_comparison_gate"] = {name: preliminary["checks"][name] for name in (
-            "comparison_correct", "candidate_driver_benefit", "legacy_final_no_material_four_owner_regression")}
+            "comparison_correct", "candidate_driver_benefit", "reactor_scan_benefit", "legacy_final_no_material_four_owner_regression")}
         save()
         report["lock_diagnosis"] = lock_probe(executable, client, root)
         save()

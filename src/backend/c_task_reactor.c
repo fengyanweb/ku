@@ -196,27 +196,32 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
 static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTaskNetPollV1* items,size_t capacity,uint64_t* deadline) {
   if(!pool)return 0;
   size_t count=0;
+  if(ku_task_blocking_lock(pool))return SIZE_MAX;
   for(size_t i=0;i<pool->capacity;i++) {
-    if(ku_task_blocking_lock(pool))return SIZE_MAX;
     KuTaskBlockingJobV1* job=&pool->jobs[i];
     int active=job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u;
+    if(!active)continue;
     uint64_t generation=job->generation;
-    int advance=active && (job->cancelled || pool->closing || ku_net_now_ms()>=job->net_deadline
+    int advance=job->cancelled || pool->closing || ku_net_now_ms()>=job->net_deadline
         || job->kind==8u || !job->net_client || job->net_client->socket_value==KU_NET_INVALID_SOCKET
-        || (job->kind==7u && !job->net_write.len));
-    ku_task_blocking_unlock(pool);
-    if(advance && ku_task_net_dispatch(pool,owner,i,generation,0u)>KU_TASK_DRIVER_PENDING)return SIZE_MAX;
-    if(ku_task_blocking_lock(pool))return SIZE_MAX;
-    job=&pool->jobs[i];
+        || (job->kind==7u && !job->net_write.len);
+    if(advance) {
+      /* NET_STEP and its bounded OS operation remain outside the pool lock.
+       * Cancellation/consumption can replace this slot before reacquisition. */
+      ku_task_blocking_unlock(pool);
+      if(ku_task_net_dispatch(pool,owner,i,generation,0u)>KU_TASK_DRIVER_PENDING)return SIZE_MAX;
+      if(ku_task_blocking_lock(pool))return SIZE_MAX;
+      job=&pool->jobs[i];
+    }
     if(job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u && job->net_client
         && job->net_client->socket_value!=KU_NET_INVALID_SOCKET) {
       if(job->net_deadline<*deadline)*deadline=job->net_deadline;
-      if(count<capacity)items[count++]=(KuTaskNetPollV1){(uintptr_t)job->net_client->socket_value,i,generation,
+      if(count<capacity)items[count++]=(KuTaskNetPollV1){(uintptr_t)job->net_client->socket_value,i,job->generation,
           job->kind==6u?KU_TASK_NET_READ:KU_TASK_NET_WRITE};
       else {pool->fault=KU_TASK_DRIVER_LIMIT;ku_task_blocking_unlock(pool);return SIZE_MAX;}
     }
-    ku_task_blocking_unlock(pool);
   }
+  ku_task_blocking_unlock(pool);
   return count;
 }
 

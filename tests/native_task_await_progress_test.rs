@@ -275,7 +275,7 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
             (String::new(), String::new())
         };
         let mut generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
-        let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{}\n{}\nstatic void fixture_source_resume(void*);\nstatic void fixture_source_poll_returned(void*,uint32_t);\n",
+        let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{}\n{}\nstatic void fixture_source_resume(void*);\nstatic void fixture_source_poll_returned(void*,uint32_t,size_t);\n",
             native_task_ledger::LEDGER_LOCK, native_allocation_harness::ALLOCATION_HOOK,
             native_task_ledger::LOCKED_ALLOCATIONS);
         generated = replace_once(
@@ -292,11 +292,11 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
         // The real R2 poll has returned with no driver mutex held. This quantum
         // is still RUNNING until the driver's following locked publication;
         // Pending has not released the control lifecycle pin or execution lease.
-        let returned = "    uint32_t outcome = ku_task_control_poll(&execution);";
+        let returned = "      outcome=ku_task_control_poll(&execution);";
         generated = replace_once(
             generated,
             returned,
-            &format!("{returned}\n    fixture_source_poll_returned(driver,outcome);"),
+            &format!("{returned}\n      fixture_source_poll_returned(driver,outcome,quanta);"),
         );
         generated = replace_once(
             generated,
@@ -320,13 +320,14 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
 const SOURCE_WHILE_MAIN: &str = r#"
 static KuTestEvent fixture_two_polls,fixture_release;
 static unsigned fixture_resumes,fixture_returned_polls;
+static size_t fixture_prior_unpublished_polls;
 static int64_t fixture_last_counter;
 static KuTaskInstance_0* fixture_parent;
 static void fixture_source_resume(void* raw) {
   if (!fixture_parent) fixture_parent=(KuTaskInstance_0*)raw;
   CHECK(fixture_parent==raw); fixture_resumes++;
 }
-static void fixture_source_poll_returned(void* raw,uint32_t outcome) {
+static void fixture_source_poll_returned(void* raw,uint32_t outcome,size_t prior_unpublished) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)raw;
   fixture_returned_polls++;
   if (fixture_returned_polls<=2u) { @COUNTER_PROGRESS@ }
@@ -334,7 +335,11 @@ static void fixture_source_poll_returned(void* raw,uint32_t outcome) {
     CHECK(outcome==KU_TASK_CONTROL_PENDING && fixture_resumes==2u);
     KuTaskDriverSnapshotV1 snapshot={0};
     CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
-    CHECK(snapshot.polls==1u && !snapshot.queued && snapshot.running==1u);
+    /* The owner may keep both returned polls in one bounded segment. The
+     * current return is not counted in quanta until this hook returns. */
+    CHECK(snapshot.polls+prior_unpublished==fixture_returned_polls-1u
+        && !snapshot.queued && snapshot.running==1u);
+    fixture_prior_unpublished_polls=prior_unpublished;
     CHECK(ku_test_event_set(&fixture_two_polls));
     CHECK(ku_test_event_wait(&fixture_release,2000u));
   }
@@ -371,7 +376,8 @@ int main(void) {
   CHECK(fixture_parent==(KuTaskInstance_0*)root.owner.lease.control);
   CHECK(fixture_resumes==2u && fixture_returned_polls==2u);
   KuTaskDriverSnapshotV1 blocked={0}; CHECK(ku_task_driver_snapshot(driver,&blocked)==KU_TASK_DRIVER_OK);
-  CHECK(blocked.polls==1u && !blocked.queued && blocked.running==1u && !blocked.building
+  CHECK(blocked.polls+fixture_prior_unpublished_polls==fixture_returned_polls-1u
+      && !blocked.queued && blocked.running==1u && !blocked.building
       && blocked.resident==1u && blocked.reserved_bytes==sizeof(KuTaskInstance_0)
       && !blocked.fault && !blocked.clock_fault);
   CHECK(ku_task_control_atomic_load(&fixture_parent->control.phase)==KU_TASK_CONTROL_LIVE
