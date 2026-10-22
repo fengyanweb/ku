@@ -451,12 +451,82 @@ func (c *countedConn) Write(p []byte) (int, error) {
 	return n, e
 }
 
-type worker struct {
-	c      config
-	l      *ledger
+type idleConnection struct {
 	conn   *countedConn
 	reader *bufio.Reader
 	last   time.Time
+}
+
+// Connections belong to one request while checked out. A successful request
+// returns its connection to this bounded LIFO pool, independent of its worker.
+// Expiry is checked before another distinct plan, with no background I/O.
+type connectionPool struct {
+	mu       sync.Mutex
+	idle     []*idleConnection
+	capacity int
+	timeout  time.Duration
+	l        *ledger
+	closed   bool
+}
+
+func newConnectionPool(c config, l *ledger) *connectionPool {
+	return &connectionPool{capacity: c.concurrency, timeout: c.idle, l: l}
+}
+
+func (p *connectionPool) discard(connection *idleConnection) {
+	_ = connection.conn.Close()
+	p.l.mu.Lock()
+	p.l.live--
+	p.l.mu.Unlock()
+}
+
+func (p *connectionPool) take() (*idleConnection, bool) {
+	for {
+		p.mu.Lock()
+		if p.closed || len(p.idle) == 0 {
+			closed := p.closed
+			p.mu.Unlock()
+			return nil, closed
+		}
+		index := len(p.idle) - 1
+		connection := p.idle[index]
+		p.idle[index] = nil
+		p.idle = p.idle[:index]
+		p.mu.Unlock()
+		if p.timeout > 0 && time.Since(connection.last) >= p.timeout {
+			p.discard(connection)
+			continue
+		}
+		return connection, false
+	}
+}
+
+func (p *connectionPool) put(connection *idleConnection) {
+	p.mu.Lock()
+	if p.closed || len(p.idle) >= p.capacity {
+		p.mu.Unlock()
+		p.discard(connection)
+		return
+	}
+	p.idle = append(p.idle, connection)
+	p.mu.Unlock()
+}
+
+func (p *connectionPool) close() {
+	p.mu.Lock()
+	p.closed = true
+	idle := p.idle
+	p.idle = nil
+	p.mu.Unlock()
+	for _, connection := range idle {
+		p.discard(connection)
+	}
+}
+
+type worker struct {
+	c    config
+	l    *ledger
+	pool *connectionPool
 }
 
 func (w *worker) execute(j job) {
@@ -486,16 +556,6 @@ func enqueuePlanned(c config, l *ledger, j job, queue chan<- job, now time.Time)
 	}
 }
 
-func (w *worker) close() {
-	if w.conn != nil {
-		_ = w.conn.Close()
-		w.conn = nil
-		w.reader = nil
-		w.l.mu.Lock()
-		w.l.live--
-		w.l.mu.Unlock()
-	}
-}
 func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, error) {
 	header := make([]byte, 0, 1024)
 	lineStart := 0
@@ -522,11 +582,15 @@ func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, 
 func (w *worker) request(j job, began time.Time) (r result) {
 	r.category = "connection_error"
 	deadline := j.scheduled.Add(w.c.timeout)
-	if w.conn != nil && w.c.idle > 0 && began.Sub(w.last) >= w.c.idle {
-		w.close()
-	}
 	var connection *countedConn
+	var lease *idleConnection
 	var before int64
+	discard := func() {
+		if lease != nil {
+			w.pool.discard(lease)
+			lease = nil
+		}
+	}
 	defer func() {
 		r.completed = time.Now()
 		if connection != nil {
@@ -541,10 +605,11 @@ func (w *worker) request(j job, began time.Time) (r result) {
 				r.stage = "completed_after_absolute_deadline"
 			}
 		}
-		if r.category == "timeout" || r.category == "connection_error" || r.category == "protocol_error" || r.category == "body_error" {
-			w.close()
-		} else if w.conn != nil {
-			w.last = r.completed
+		if !r.responseComplete || r.category == "timeout" || r.category == "connection_error" || r.category == "protocol_error" || r.category == "body_error" {
+			discard()
+		} else if lease != nil {
+			lease.last = r.completed
+			w.pool.put(lease)
 		}
 	}()
 	fail := func(stage string, e error) {
@@ -563,7 +628,18 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		r.category = "not_started_deadline"
 		return
 	}
-	if w.conn == nil {
+	var closed bool
+	lease, closed = w.pool.take()
+	if closed {
+		r.stage = "connection_pool_closed"
+		return
+	}
+	// Pool expiry/locking and dialing spend the same original request budget.
+	if !time.Now().Before(deadline) {
+		r.category, r.stage = "timeout", "before_dial_deadline"
+		return
+	}
+	if lease == nil {
 		w.l.mu.Lock()
 		w.l.dials++
 		w.l.mu.Unlock()
@@ -574,14 +650,14 @@ func (w *worker) request(j job, began time.Time) (r result) {
 			fail("dial", e)
 			return
 		}
-		w.conn = &countedConn{Conn: conn}
-		w.reader = bufio.NewReaderSize(w.conn, 8192)
+		counted := &countedConn{Conn: conn}
+		lease = &idleConnection{conn: counted, reader: bufio.NewReaderSize(counted, 8192)}
 		w.l.mu.Lock()
 		w.l.live++
 		w.l.peakLive = max(w.l.peakLive, w.l.live)
 		w.l.mu.Unlock()
 	}
-	connection = w.conn
+	connection = lease.conn
 	before = connection.written
 	connection.first = time.Time{}
 	if e := connection.SetDeadline(deadline); e != nil {
@@ -597,12 +673,16 @@ func (w *worker) request(j job, began time.Time) (r result) {
 	if body != nil {
 		req.Body = io.NopCloser(bytes.NewReader(body))
 	}
+	if !time.Now().Before(deadline) {
+		r.category, r.stage = "timeout", "before_write_deadline"
+		return
+	}
 	if e := req.Write(connection); e != nil {
 		fail("write", e)
 		return
 	}
 	r.writeComplete = true
-	response, e := readResponse(w.reader, req)
+	response, e := readResponse(lease.reader, req)
 	if e != nil {
 		fail("read_parse_header", e)
 		return
@@ -611,14 +691,14 @@ func (w *worker) request(j job, began time.Time) (r result) {
 	if encoding := response.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
 		r.category = "protocol_error"
 		r.stage = "unexpected_content_encoding"
-		w.close()
+		discard()
 		_ = response.Body.Close()
 		return
 	}
 	payload, e := io.ReadAll(io.LimitReader(response.Body, maxBody+1))
 	r.bytesRead = int64(len(payload))
 	if e != nil || len(payload) > maxBody {
-		w.close()
+		discard()
 		_ = response.Body.Close()
 		if e != nil {
 			fail("read_body", e)
@@ -631,7 +711,7 @@ func (w *worker) request(j job, began time.Time) (r result) {
 	_ = response.Body.Close()
 	r.responseComplete = true
 	if response.Close || response.StatusCode < 200 {
-		w.close()
+		discard()
 	}
 	switch response.StatusCode {
 	case 200:
@@ -838,20 +918,21 @@ func run(c config) (map[string]any, error) {
 	}
 	gate := make(chan struct{})
 	queue := make(chan job, c.queue)
+	pool := newConnectionPool(c, l)
 	var workers sync.WaitGroup
 	for i := 0; i < c.concurrency; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			w := worker{c: c, l: l}
-			defer w.close()
+			w := worker{c: c, l: l, pool: pool}
 			<-gate
 			for j := range queue {
 				w.execute(j)
 			}
 		}()
 	}
-	l.origin = time.Now()
+	var anchor monotonicAnchor
+	l.origin, anchor = captureMonotonicAnchor(time.Now, readKernelMonotonic)
 	l.cutoff = l.origin.Add(c.duration)
 	close(gate)
 	planned := uint64(math.Ceil(c.duration.Seconds() * c.rate))
@@ -874,6 +955,7 @@ func run(c config) (map[string]any, error) {
 	}
 	close(queue)
 	workers.Wait()
+	pool.close()
 	finished := time.Now()
 	if l.events != nil {
 		l.events.close()
@@ -903,7 +985,7 @@ func run(c config) (map[string]any, error) {
 	for name, data := range c.corpora {
 		hashes[name] = data.hash
 	}
-	out := map[string]any{"schema": "ku-cross-stack-client-v2", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_bucket_limit": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_resolution_us": 10, "validation_in_driver_cost": true}}
+	out := map[string]any{"schema": "ku-cross-stack-client-v4", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_bucket_limit": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_resolution_us": 10, "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
 	clocks["planned_cutoff_offset_ns"] = c.duration.Nanoseconds()
@@ -916,6 +998,7 @@ func run(c config) (map[string]any, error) {
 	clocks["last_actual_completed_rid"] = l.lastActualCompletedRID
 	clocks["last_complete_response_offset_ns"] = offset(l.lastCompleteResponse, l.origin)
 	clocks["last_complete_response_unix_ns"] = unixNano(l.lastCompleteResponse)
+	anchor.annotate(clocks)
 	clocks["last_actual_completed_definition"] = "last terminal timestamp among actually sent plans, including timeout/transport errors; full response tracked separately"
 	clocks["tail_policy"] = "planned arrivals may start after cutoff only before their original scheduled_at+timeout; late window completions never increase window goodput"
 	clocks["actual_clock_frozen"] = "after all planned requests reached one terminal state; does not renew the planned cutoff or request deadlines"
@@ -934,10 +1017,10 @@ func parse() (config, error) {
 	flag.StringVar(&c.events, "events", "", "exclusive-create streaming gzip CSV, queue 8192; overflow invalidates run")
 	flag.Float64Var(&duration, "duration", 30, "arrival window seconds (0..3600)")
 	flag.Float64Var(&c.rate, "rate", 100, "open arrivals per second (positive, total <=10000000)")
-	flag.IntVar(&c.concurrency, "concurrency", 128, "fixed workers/connections (1..16384)")
+	flag.IntVar(&c.concurrency, "concurrency", 128, "maximum in-flight requests and idle pool capacity (1..16384)")
 	flag.IntVar(&c.queue, "queue", 256, "bounded pending plan descriptors (0..65536)")
 	flag.Float64Var(&timeout, "timeout", 3, "absolute seconds from scheduled_at, including queue/dial/write/read")
-	flag.IntVar(&idleMS, "keepalive-idle-ms", 500, "retire a previous idle connection before the next distinct plan")
+	flag.IntVar(&idleMS, "keepalive-idle-ms", 500, "retire expired shared idle connections before the next distinct plan")
 	flag.Uint64Var(&c.prefix, "rid-prefix", 0, "numeric run prefix 1..999999999; zero generates random prefix")
 	flag.Parse()
 	if _, _, e := net.SplitHostPort(c.address); e != nil {

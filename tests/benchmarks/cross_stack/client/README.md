@@ -34,8 +34,25 @@ One planned request has exactly one terminal category: correct, explicit
 503/429 rejection, other HTTP, timeout, connection error, protocol error, wrong
 body, or one of the client `not_started_*` reasons. There is no Transport,
 redirect, compression, HTTP pipelining or retry; even a failed reused connection
-is never replayed. A new plan can dial a new connection. Old idle connections
-are retired only before a new distinct plan (`--keepalive-idle-ms`, default 500).
+is never replayed. A new plan can dial a new connection. All workers share a
+bounded LIFO idle connection pool, so the next request reuses the most recently
+returned connection even when another worker handled its previous request.
+The worker limit still bounds in-flight requests; idle pool capacity equals that
+same limit. A connection is exclusively checked out for one complete request,
+then returned only after the entire response has been read and validated.
+Old idle connections are retired before another distinct plan
+(`--keepalive-idle-ms`, default 500), with no background probe or replay.
+I/O, protocol, body-validation and timeout failures discard the connection;
+`Connection: close` also discards it. Fully read 503/429 replies may keep their
+connection. Checked-out connections receive the new plan's original absolute
+deadline before writing; the pool never renews a request deadline. The pool is
+closed after all workers finish, including the original-deadline completion
+tail, and cleanup counters must return to zero.
+
+This shared-pool policy remains in client schema `ku-cross-stack-client-v4`. Earlier v2
+results retain their per-worker connection policy and are diagnostic evidence,
+not interchangeable main-table results. Actual `resources.dials` and sent counts
+must still be reported: keep-alive support alone does not prove connection reuse.
 
 `attempted` means the worker began the operation. `sent` means at least one
 request byte was written; `sent_at` is the timestamp before that first positive
@@ -54,8 +71,22 @@ round percentiles. p95/p99/p99.9 are null below 20/100/1,000 observations.
 There is a shared hard limit of 1,000,000 distinct sparse histogram buckets.
 Per-second result/latency fields are **plan cohorts**; the separately named
 `correct_by_completion_second` fields are actual completion-window counts.
-The report's `origin_unix_ns` associates its relative monotonic CSV clocks with
-wall time; do not directly subtract unsynchronized clocks from different hosts.
+On Linux, v4 brackets one standard `clock_gettime(CLOCK_MONOTONIC)` syscall
+between two `time.Now` calls at arrival origin. The later Go timestamp is the
+origin; its kernel-monotonic estimate is the kernel read plus half the bracket's
+Go-monotonic duration. `configuration.origin_monotonic_ns` records that estimate;
+`origin_monotonic_uncertainty_ns` records the full bracket as a conservative error
+bound. `origin_monotonic_status` is `available` or `unavailable`, with an explicit
+`origin_monotonic_reason` when unavailable. No further kernel calls are added to
+the request path. Planned cutoff, actual send/completion, and complete-response
+`*_monotonic_ns` fields add their existing Go-monotonic offsets to this anchor.
+These fields and CSV offsets share the Linux sampler's CLOCK_MONOTONIC domain;
+cross-process association must check availability and the frozen uncertainty
+gate. That gate is separate from request SLOs and `valid_driver`.
+All `*_unix_ns` fields remain raw human-readable wall timestamps, which may jump;
+they must never determine recovery or resource-window association. Other systems
+emit null anchor/derived values with an explicit unsupported-platform reason.
+macOS smoke results do not establish Linux cross-process timing accuracy.
 
 CSV output is streamed through an 8,192-record nonblocking queue to gzip, with a
 1-GiB uncompressed limit. Reports are capped at 16 MiB, error samples at 24, total

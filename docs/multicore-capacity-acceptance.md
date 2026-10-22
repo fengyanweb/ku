@@ -273,23 +273,30 @@ API实查main protection返回Branch not protected、repository rulesets为空�
 
 ### R04 实际候选安装包
 
-本机已按原 `package-release.ps1` 重新构建匹配的 CLI、rlib/deps、TLS pack 和 VSIX，
-再由原 exporter 导出并实际解包验证。绑定源码 `8210e5200c466d9041807d04a68c1844ba9cbd6f`，
+原发布工作流 [39826397242](https://github.com/fengyanweb/ku/actions/runs/39826397242) 已从
+`a2d96a6fdff4c4de1bc4318a237424081c57cfe3` 实际生成三个目标的归档，并通过完整资产集合核验。
+生产源码、锁文件及打包输入与 `8210e5200c466d9041807d04a68c1844ba9cbd6f` 相同；
+`dce36c7fc6c7122ed26aa7c5ba19bfccc89da6ec` 只改变测试及基准，也沿用这些产物。
 包内仍为 `0.0.18` 的**未公开运行时候选**，不是更新已公开的 v0.0.18-r1。
 
-| 项目 | 实际结果 |
-| --- | --- |
-| macOS ARM64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`，39,350,405 bytes |
-| SHA256 | `a6da51da3c31cbf5dfdf360c6754b57349a5aaee2f84c9ff22dd547e26b3c4d1` |
-| 安装检查 | 最终归档逐文件验证，270 项文件/187 项第三方文件；解包 CLI 的 version、check hello、run hello、run JSON 均通过 |
-| 关联服务 | 解包 CLI 构建原有多循环 fixture；/ok、/timer、/cpu 正文正确，实际 2 loops，Task 归零，drain 退出 0 |
-| 清理 | 临时解包/C/native 树、约 109 MB 重复 bundle 已删除；归档、manifest 和紧凑收据保留 |
-| Linux/Windows | 原 CI 39778863985 的 release-bundle、verify-release 是 skipped，无可复用安装包；仍需实际产物任务 |
+| 归档 | 字节数 | SHA256 |
+| --- | ---: | --- |
+| `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` | 47,760,342 | `68e796bb74cd7b454a662cb4ff91748acdd8a83cb2868b56bf4e810c975bcb07` |
+| `ku-v0.0.18-aarch64-apple-darwin.tar.gz` | 39,329,004 | `0b704394494665254a1e720c6dc7185949022211d4bc1eda68674c67598be0b8` |
+| `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz` | 43,488,355 | `52c6495338e194b606d8c1ee7fb70e763eec63f0562ec1e703f965ec4d000b0e` |
 
-本机材料目录：`/Users/mac/Downloads/mac-candidate/8210e5200c466d9041807d04a68c1844ba9cbd6f/`。
-该处 `candidate-status.json`、安装 manifest、`service-smoke.json` 与 `cleanup.json` 各自保留证据，
-不会将 launcher 返回 0 或 CI 跳过当作产物成功。旧 CI 的生产/锁/打包输入与候选相同，但没有归档，
-因此不替代新产物验证。现有发布标签、Release 和官网均未更改。
+三个归档均已下载，逐一核对字节数、SHA256、manifest 的提交及平台身份；文件数依次为274/270/260，
+各自最终解包 CLI 的 version、check hello、run hello、run JSON 四项检查均退出0，许可证/随包文件由原 exporter 核验。
+归档和集中收据位于 `/Users/mac/Downloads/Ku_跨语言对照_2026-10-22/ci-assets-a2d96a6/verification.json`。
+旧 CI 39778863985 的 skipped 任务仍为 skipped，不能替代这次实际构建；新工作流的完整测试失败另列，
+产物生成与安装冒烟通过不等于整轮 CI 通过。
+
+另保留8210e52本机 Mac 独立安装验证：原打包/export流程实际运行，解包 CLI 构建原有多循环 fixture；
+/ok、/timer、/cpu 正文正确，实际2 loops、Task归零、drain退出0。该归档为39,350,405字节，
+SHA256 `a6da51da3c31cbf5dfdf360c6754b57349a5aaee2f84c9ff22dd547e26b3c4d1`；
+材料在 `/Users/mac/Downloads/mac-candidate/8210e5200c466d9041807d04a68c1844ba9cbd6f/`。
+临时解包/C/native树、约109MB重复bundle和约87MB重复下载已删除，独有归档及收据保留。
+现有发布标签、Release 和官网均未更改。
 
 ### T01—T08 跨语言对照准备
 
@@ -319,8 +326,41 @@ v2 只修驱动：窗口后已有计划继续受原绝对期限约束，goodput 
 原计划撤压起点+5s仍是主要恢复门槛，实际最后业务发送及其独立恢复视图另外列出，不能替代失败的主要结论。
 真实排队过期限、事件/直方图溢出等仍使发生器无效。
 
+v2四栈CPU共同86rps的五轮均完整正确，但每栈12,900次都重新建连，
+原因是256个worker独占连接、轮转超过500ms空闲期限。这是重连诊断，不能充当持续连接主表。
+v3保留相同并发、队列、空闲和请求期限，统一改共享有界LIFO池；Linux黄金28窗口224/224正确，
+实际28次dial、退出连接0。准备记录又证实guest墙钟在15秒内回调约269ms，
+使Unix关联与单调offset不一致；它不能证明服务超时根因。
+v4改用Linux CLOCK_MONOTONIC锚点关联资源和恢复，保留误差界，Unix仅供阅读。
+锚点缺失/误差超过1ms时容量上档截尾；原5秒恢复门槛保守计入锚点误差，绝不续约。
+
+T07的第一次生成器候选仅减少已知状态跳转的中央selector，保留每步phase/64dispatch预算，
+不改IR/AST或值管理。诊断采样确认frame2_drive约46.86% self、check约9.16%，
+HTTP loop约12.50%、poll内核路径约11.78%；原始perf和反汇编留在外部证据目录。
+候选生成C增加1.21%、text增加0.34%，6项相关回归通过。
+无重诊断A/B先固定128rps，baseline一轮1121次timeout，预设门槛失败；
+只补一次已知共同86rps确认，candidate一轮125次timeout，仍未满足全正确和成本范围分离门槛。
+两组中位CPU成本分别下降31.85%/28.48%，但这些数不能掩盖失败或作为正式收益结论。
+候选已定向恢复到原生成器，外部补丁/机器码/全部轮次保留；不继续重跑至出现合格窗口。
+
 推送 `a2d96a6fdff4c4de1bc4318a237424081c57cfe3` 的原 CI 39826397242 已真实完成三平台
 release-bundle 和完整产物集合校验，不能与旧 skipped 任务混淆。Mac full-tests 提前失败于既有测试的
 130ms 内须发出3段的调度假设：实际正确触发 TimeoutError。已有测试改为受控时钟/底层传输确定性证明
 剩余期限8/5/2，并保留原真实socket完整读取；逐次续期的反例必须失败。仅测试改动，不改业务期限，
-原 CI 失败日志继续保留，修正后的定向 CI 结果另记。
+原 CI 失败日志继续保留。修正后的 [Mac定向CI39830634661](https://github.com/fengyanweb/ku/actions/runs/39830634661)
+已成功，日志确认实际checkout为 `dce36c7fc6c7122ed26aa7c5ba19bfccc89da6ec`；24项验收通过，
+部署契约通过，平台不适用项单列跳过。该定向结果不改写a2原失败，也不代表本轮重复生成产物。
+
+同一a2完整CI的Windows失败不同：Rust库测试
+`registry_server::tests::registry_v1_real_tls_publish_acl_idempotency_conflict_restart_and_race`
+读取响应超过绝对期限，随后race线程join失败；829通过/1失败/2忽略。
+该job的24项Python验收已通过，不能用Mac夹具修正覆盖此失败。
+完整日志和失败摘录保存在 `/Users/mac/Downloads/mac-candidate/a2d96a6fdff4c4de1bc4318a237424081c57cfe3/`，
+Windows这一项仍需定向定位，未无理由重跑整套验收。
+
+Windows失败另确认测试窗口不一致：该服务从accept起允许5秒，而raw TLS测试发送完才新建3秒读期限，
+普通测试agent一直使用8秒操作预算。仅修 `registry_server.rs::tests`，产品代码逐字节未变：
+每次操作从准备/连接前取既有8秒绝对D，TCP/TLS/发送/完整读取/关闭继承同D；
+首发与唯一明确429后的独立冲突检查受16秒总上界约束，未知结果不重放。
+原3秒parser/滴流回归不变。本机6项helper回归及原发布竞态单例通过；Windows实际补验另记。
+旧3850ms dispatch慢因仍未知，不能将期限错配写成已经还原了旧请求的全部原因。

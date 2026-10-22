@@ -76,7 +76,7 @@ def template(value, replacements):
     return value
 
 def arrival_cpu(samples, label, start, end):
-    rows = sorted((d['wall_time_ns'], d['cpu_stat'].get('usage_usec', 0))
+    rows = sorted((d['monotonic_ns'], d['cpu_stat'].get('usage_usec', 0))
                   for sample in samples for d in sample['domains'] if d['label'] == label)
     def at(target):
         for left, right in zip(rows, rows[1:]):
@@ -89,7 +89,19 @@ def arrival_cpu(samples, label, start, end):
         return {'available':False, 'reason':'arrival endpoints not bracketed by resource samples'}
     return {'available':True,'cpu_seconds':max(0,last[0]-first[0])/1e6,
             'conservative_endpoint_uncertainty_seconds':(first[1]+last[1])/1e6,
-            'method':'linear interpolation of 1Hz cumulative cgroup CPU; uncertainty is full CPU in endpoint brackets'}
+            'method':'linear interpolation of 1Hz cumulative cgroup CPU on Linux CLOCK_MONOTONIC; uncertainty is full CPU in endpoint brackets'}
+
+def measurement_clock(configuration):
+    origin=configuration.get('origin_monotonic_ns')
+    uncertainty=configuration.get('origin_monotonic_uncertainty_ns')
+    if (configuration.get('origin_monotonic_status')!='available' or type(origin) is not int or origin<0
+            or type(uncertainty) is not int or uncertainty<0):
+        return {'available':False,'reason':'measurement_monotonic_clock_unavailable'}
+    if uncertainty>1_000_000:
+        return {'available':False,'reason':'measurement_monotonic_clock_uncertain',
+                'uncertainty_ns':uncertainty,'limit_ns':1_000_000}
+    return {'available':True,'origin_ns':origin,'uncertainty_ns':uncertainty,
+            'clock':'Linux CLOCK_MONOTONIC; Unix timestamps are display only'}
 
 def quiet_metrics(stack, value):
     def zero(mapping, fields):
@@ -558,7 +570,7 @@ class Harness:
                     value = service.metrics()
                 except Exception as error:
                     value = {'observation_error': repr(error)}
-                runtime_samples.append({'wall_time_ns': time.time_ns(), 'metrics': value})
+                runtime_samples.append({'wall_time_ns': time.time_ns(), 'monotonic_ns':time.monotonic_ns(), 'metrics': value})
                 if runtime_stop.wait(5):
                     break
         runtime_thread = threading.Thread(target=runtime_work, daemon=True) if runtime_metrics else None
@@ -599,13 +611,30 @@ class Harness:
                                   'observer_cpu_seconds': (observer_after.ru_utime + observer_after.ru_stime) - (observer_before.ru_utime + observer_before.ru_stime),
                                   'observer_cpu_scope': 'whole coordinator process during this client lifetime; overlapping probe-client observers are not additive',
                                   'service_exited': service.process.poll() is not None}
+        first_driver=next((d for sample in samples for d in sample['domains'] if d['label']=='driver'),None)
+        if first_driver:
+            elapsed=(driver_after['monotonic_ns']-first_driver['monotonic_ns'])/1e9
+            driver_cpu=(driver_after['cpu_stat'].get('usage_usec',0)-first_driver['cpu_stat'].get('usage_usec',0))/1e6
+            fraction=driver_cpu/(3*elapsed) if elapsed>0 else None
+        else:
+            elapsed=driver_cpu=fraction=None
+        result['service_cost']['driver_headroom']={'domain_cpu_seconds':driver_cpu,
+            'domain_lifetime_seconds':elapsed,'quota_cores':3,'fraction_of_quota':fraction,
+            'saturated':fraction is not None and fraction>=.9,
+            'gate':'average whole-driver CPU >=90% of its quota censors server capacity; bursts and queueing still require raw-evidence review'}
         if runtime_metrics:
             write_json(output / 'runtime-metrics.json', {'interval_seconds':5,'maximum':125,'samples':runtime_samples,
                         'allocator_counts':'Go/Node standard metrics only; Rust allocator totals not available without instrumentation; Ku existing ledgers only'})
             result['runtime_metrics_path'] = str(output / 'runtime-metrics.json')
-        start = result['configuration']['origin_unix_ns']
-        end = start + int(duration * 1e9)
-        result['service_cost']['arrival_window_cpu_estimate'] = arrival_cpu(samples, service.domain.label, start, end)
+        clock=measurement_clock(result['configuration'])
+        result['service_cost']['cross_process_clock']=clock
+        if clock['available']:
+            start=clock['origin_ns']
+            estimate=arrival_cpu(samples,service.domain.label,start,start+int(duration*1e9))
+            estimate['client_anchor_uncertainty_ns']=clock['uncertainty_ns']
+        else:
+            estimate={'available':False,'reason':clock['reason']}
+        result['service_cost']['arrival_window_cpu_estimate']=estimate
         write_json(report, result)
         return result
     def close(self):
@@ -622,6 +651,9 @@ def qualification(result, workload):
     """Small-tail samples stay explicit, never silently treated as p99 evidence."""
     ledger = result['ledger']
     reasons = []
+    clock=measurement_clock(result.get('configuration',{}))
+    if not clock['available']:
+        reasons.append(clock['reason'])
     if not result.get('valid_driver'):
         reasons.append('invalid_driver_or_not_started')
     if not ledger.get('planned_reconciled'):
@@ -633,6 +665,8 @@ def qualification(result, workload):
     if result.get('service_cost', {}).get('service_exited'):
         reasons.append('service_exited')
     cost = result.get('service_cost', {})
+    if cost.get('driver_headroom',{}).get('saturated'):
+        reasons.append('driver_cpu_saturated')
     if not cost.get('before') or not cost.get('after'):
         reasons.append('resource_endpoints_missing')
     if cost.get('sampler_overflow') or cost.get('sampler_error'):
@@ -696,9 +730,11 @@ def derive_verified_rates(state, summaries):
 
 def upper_point(rate, result, gate, report):
     reasons=gate.get('reasons',[])
-    if result.get('valid_driver') is not True or 'invalid_driver_or_not_started' in reasons or 'unreconciled_plan' in reasons:
+    if result.get('valid_driver') is not True or any(reason in reasons for reason in
+            ('invalid_driver_or_not_started','unreconciled_plan','driver_cpu_saturated')):
         kind,censored='driver_invalid_censored',True
-    elif any(reason in reasons for reason in ('resource_endpoints_missing','resource_observation_invalid')):
+    elif any(reason in reasons for reason in ('resource_endpoints_missing','resource_observation_invalid',
+                'measurement_monotonic_clock_unavailable','measurement_monotonic_clock_uncertain')):
         kind,censored='measurement_invalid_censored',True
     elif gate.get('eligible_for_formal_candidate') is False:
         kind,censored='service_or_slo_failure',False
@@ -708,46 +744,58 @@ def upper_point(rate, result, gate, report):
             'qualification':gate,'report':str(report)}
 
 def business_send_end(configuration):
-    key='last_actual_sent_unix_ns'
+    key='last_actual_sent_monotonic_ns'
     if key not in configuration:
-        return {'status':'unknown_missing_client_field','unix_ns':None,'field':'configuration.'+key}
+        return {'status':'unknown_missing_client_field','monotonic_ns':None,'field':'configuration.'+key}
     value=configuration[key]
     if value is None:
-        return {'status':'not_applicable_no_actual_business_send','unix_ns':None,'field':'configuration.'+key}
-    origin=configuration['origin_unix_ns']
+        return {'status':'not_applicable_no_actual_business_send','monotonic_ns':None,'field':'configuration.'+key}
+    clock=measurement_clock(configuration)
+    if not clock['available']:
+        return {'status':clock['reason'],'monotonic_ns':None,'field':'configuration.'+key}
+    origin=clock['origin_ns']
     offset=configuration.get('last_actual_sent_offset_ns')
-    if type(value) is not int or value<origin or (type(offset) is int and value-origin!=offset):
-        return {'status':'unknown_invalid_or_inconsistent_client_field','unix_ns':None,'field':'configuration.'+key}
-    return {'status':'observed','unix_ns':value,'offset_ns':value-origin,'field':'configuration.'+key}
+    if type(value) is not int or value<origin or type(offset) is not int or value-origin!=offset:
+        return {'status':'unknown_invalid_or_inconsistent_client_field','monotonic_ns':None,'field':'configuration.'+key}
+    return {'status':'observed','monotonic_ns':value,'offset_ns':offset,
+            'unix_ns_display_only':configuration.get('last_actual_sent_unix_ns'),
+            'anchor_uncertainty_ns':clock['uncertainty_ns'],'field':'configuration.'+key}
 
-def recovery_probe_views(rows, probe_origin, starts):
-    views={name:{'origin_unix_ns':start,'deadline_seconds':5,'first_complete_new_probe':None,
+def recovery_probe_views(rows, probe_origin, starts, uncertainty_ns=0):
+    views={name:{'origin_monotonic_ns':start,'deadline_seconds':5,'first_complete_new_probe':None,
+                 'combined_anchor_uncertainty_ns':uncertainty_ns,'boundary_ambiguous_correct_probes':0,
                  'probe_phases':{'before_withdrawal':{},'within5s_after_withdrawal':{},'later':{}},
-                 'last_observed_probe_plan_unix_ns':None}
+                 'last_observed_probe_plan_monotonic_ns':None}
            for name,start in starts.items() if start is not None}
     for row in rows:
         planned=probe_origin+int(row['scheduled_ns'])
         completed=probe_origin+int(row['completed_ns'])
         for value in views.values():
-            start=value['origin_unix_ns']
+            start=value['origin_monotonic_ns']
             phase='before_withdrawal' if planned<start else ('within5s_after_withdrawal' if planned<start+5_000_000_000 else 'later')
             counts=value['probe_phases'][phase]
             counts[row['terminal']]=counts.get(row['terminal'],0)+1
-            previous=value['last_observed_probe_plan_unix_ns']
-            value['last_observed_probe_plan_unix_ns']=planned if previous is None else max(previous,planned)
+            previous=value['last_observed_probe_plan_monotonic_ns']
+            value['last_observed_probe_plan_monotonic_ns']=planned if previous is None else max(previous,planned)
             if row['terminal']=='correct' and planned>=start and completed<=start+5_000_000_000:
+                if planned-uncertainty_ns<start or completed+uncertainty_ns>start+5_000_000_000:
+                    value['boundary_ambiguous_correct_probes']+=1
+                    continue
                 sample={'rid':row['rid'],'planned_after_seconds':(planned-start)/1e9,
-                        'complete_after_seconds':(completed-start)/1e9}
+                        'complete_after_seconds':(completed-start)/1e9,
+                        'complete_after_seconds_upper_bound':(completed-start+uncertainty_ns)/1e9}
                 first=value['first_complete_new_probe']
                 if first is None or sample['complete_after_seconds']<first['complete_after_seconds']:
                     value['first_complete_new_probe']=sample
     for value in views.values():
         first=value['first_complete_new_probe']
-        last=value['last_observed_probe_plan_unix_ns']
-        covered=last is not None and last>=value['origin_unix_ns']+5_000_000_000
+        last=value['last_observed_probe_plan_monotonic_ns']
+        covered=last is not None and last-uncertainty_ns>=value['origin_monotonic_ns']+5_000_000_000
         value['observation_covers_full5s']=covered
-        value['recovered']=True if first else (False if covered else None)
-        value['status']='recovered' if first else ('not_recovered_within5s' if covered else 'unknown_incomplete_probe_window')
+        ambiguous=value['boundary_ambiguous_correct_probes']>0
+        value['recovered']=True if first else (False if covered and not ambiguous else None)
+        value['status']='recovered' if first else ('unknown_boundary_clock_uncertainty' if ambiguous else
+                ('not_recovered_within5s' if covered else 'unknown_incomplete_probe_window'))
     return views
 
 class Case:
@@ -1024,22 +1072,31 @@ class Case:
                     if probe_error:
                         raise RuntimeError('independent probe driver failure: '+probe_error[0])
                     probes=probe_result[0]
-                    cutoff=result['configuration']['origin_unix_ns']+int(self.args.formal_seconds*1e9)
-                    origin=probes['configuration']['origin_unix_ns']
+                    business_clock=measurement_clock(result['configuration'])
+                    probe_clock=measurement_clock(probes['configuration'])
                     sent_end=business_send_end(result['configuration'])
-                    with gzip.open(probes['events']['path'],'rt',newline='') as source:
-                        views=recovery_probe_views(csv.DictReader(source),origin,
-                            {'planned_cutoff':cutoff,'actual_business_send_end':sent_end['unix_ns']})
-                    primary=views['planned_cutoff']
+                    cutoff=None
+                    views={}
+                    if business_clock['available'] and probe_clock['available']:
+                        cutoff=business_clock['origin_ns']+int(self.args.formal_seconds*1e9)
+                        with gzip.open(probes['events']['path'],'rt',newline='') as source:
+                            views=recovery_probe_views(csv.DictReader(source),probe_clock['origin_ns'],
+                                {'planned_cutoff':cutoff,'actual_business_send_end':sent_end['monotonic_ns']},
+                                business_clock['uncertainty_ns']+probe_clock['uncertainty_ns'])
+                    primary=views.get('planned_cutoff',{'status':'unknown_monotonic_clock',
+                        'recovered':None,'first_complete_new_probe':None,'probe_phases':{},
+                        'business_clock':business_clock,'probe_clock':probe_clock})
                     actual=views.get('actual_business_send_end',{'status':sent_end['status'],
-                        'origin_unix_ns':None,'deadline_seconds':5,'recovered':None,'first_complete_new_probe':None})
+                        'origin_monotonic_ns':None,'deadline_seconds':5,'recovered':None,'first_complete_new_probe':None})
                     actual['role']='additional view only; never replaces or widens the planned-cutoff5s gate'
-                    tail=(sent_end['unix_ns']-cutoff)/1e9 if sent_end['unix_ns'] is not None else None
-                    write_json(directory/'recovery.json',{'recovered':primary['first_complete_new_probe'] is not None,'first_complete_new_probe':primary['first_complete_new_probe'],
-                        'origin':'exact business arrival cutoff = client origin_unix_ns + frozen duration',
-                        'business_cutoff_unix_ns':cutoff,'deadline_seconds':5,'probe_phases':primary['probe_phases'],
+                    tail=(sent_end['monotonic_ns']-cutoff)/1e9 if cutoff is not None and sent_end['monotonic_ns'] is not None else None
+                    write_json(directory/'recovery.json',{'recovered':primary['recovered'],'first_complete_new_probe':primary['first_complete_new_probe'],
+                        'origin':'business arrival cutoff = Linux CLOCK_MONOTONIC origin + frozen duration; anchor uncertainty conservatively included',
+                        'business_cutoff_monotonic_ns':cutoff,'deadline_seconds':5,'probe_phases':primary['probe_phases'],
+                        'clock_scope':'all recovery gates and resource correlation use CLOCK_MONOTONIC; Unix values are display-only and may step',
                         'planned_cutoff_recovery_view':primary,
-                        'last_actual_business_sent_unix_ns':sent_end['unix_ns'],
+                        'last_actual_business_sent_monotonic_ns':sent_end['monotonic_ns'],
+                        'last_actual_business_sent_unix_ns_display_only':result['configuration'].get('last_actual_sent_unix_ns'),
                         'last_actual_business_sent_status':sent_end['status'],
                         'last_actual_business_sent_evidence':sent_end,
                         'actual_send_tail_seconds_relative_to_planned_cutoff':tail,
