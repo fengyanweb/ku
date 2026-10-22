@@ -3215,17 +3215,17 @@ static void fixture_part(KuHttpConnection* connection,const void* bytes,size_t l
     let checks = r#"
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
-  static const unsigned char small[9]={'H',0,'I','a','b','c','d','e','f'};
+  static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
   fixture_reset(&connection,0);
-  for (size_t i=0;i<9;i++) fixture_part(&connection,small+i,1u);
+  for (size_t i=0;i<9;i++) fixture_part(&connection,fixture_prefix_bytes+i,1u);
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_calls==1 && fixture_max_vectors==9 && fixture_emitted==9);
-  CHECK(fixture_completed==1 && !fixture_closed && !memcmp(fixture_wire,small,9));
+  CHECK(fixture_completed==1 && !fixture_closed && !memcmp(fixture_wire,fixture_prefix_bytes,9));
   CHECK(connection.output.part==9 && !connection.output.offset && connection.deadline==1000);
 
   for (size_t i=0;i<sizeof(fixture_body);i++) fixture_body[i]=(unsigned char)(i%251u);
   fixture_reset(&connection,1);
-  fixture_part(&connection,small,3); fixture_part(&connection,"header:",7);
+  fixture_part(&connection,fixture_prefix_bytes,3); fixture_part(&connection,"header:",7);
   fixture_part(&connection,"J",1); fixture_part(&connection,fixture_body,sizeof(fixture_body));
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_calls==3 && fixture_emitted==4 && !fixture_completed && !fixture_closed);
@@ -3241,17 +3241,17 @@ int main(void) {
   CHECK(connection.output.part==4 && !connection.output.offset && connection.deadline==1000);
   CHECK(fixture_max_bytes==65536u && !memcmp(fixture_wire,fixture_expected,fixture_expected_length));
 
-  fixture_reset(&connection,2); fixture_part(&connection,small,9);
+  fixture_reset(&connection,2); fixture_part(&connection,fixture_prefix_bytes,9);
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_calls==32 && !fixture_emitted && !connection.output.part && !connection.output.offset);
   CHECK(!fixture_completed && !fixture_closed && connection.deadline==1000);
   for (int mode=3;mode<=4;mode++) {
-    fixture_reset(&connection,mode); fixture_part(&connection,small,9);
+    fixture_reset(&connection,mode); fixture_part(&connection,fixture_prefix_bytes,9);
     ku_http_connection_write(&connection,&server);
     CHECK(fixture_calls==1 && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_PEER_WRITE);
     CHECK(!fixture_emitted && !fixture_completed && !connection.output.part && !connection.output.offset);
   }
-  fixture_reset(&connection,0); fixture_part(&connection,small,9); fixture_now=1000;
+  fixture_reset(&connection,0); fixture_part(&connection,fixture_prefix_bytes,9); fixture_now=1000;
   ku_http_connection_write(&connection,&server);
   CHECK(!fixture_calls && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_WRITE_DEADLINE);
   CHECK(!fixture_emitted && !fixture_completed && connection.deadline==1000);
