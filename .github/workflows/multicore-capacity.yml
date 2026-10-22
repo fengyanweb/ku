@@ -1,7 +1,9 @@
 name: Multicore execution and capacity acceptance
-run-name: Multicore ${{ inputs.scope }} at ${{ github.sha }}
+run-name: Multicore ${{ inputs.scope || github.event.label.name }} at ${{ github.event.pull_request.head.sha || github.sha }}
 
 on:
+  pull_request:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       scope:
@@ -19,13 +21,14 @@ concurrency:
 
 jobs:
   capacity:
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["diagnose-multicore","run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
     name: ${{ matrix.os }} ${{ inputs.scope }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.scope == 'diagnose' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
+        os: ${{ fromJSON((inputs.scope == 'diagnose' || github.event.label.name == 'diagnose-multicore') && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
@@ -33,14 +36,14 @@ jobs:
       GOTOOLCHAIN: local
       GOPROXY: "off"
       GOSUMDB: "off"
-      KU_EXPECTED_SOURCE_SHA: ${{ github.sha }}
-      KU_CAPACITY_SCOPE: ${{ inputs.scope }}
+      KU_EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      KU_CAPACITY_SCOPE: ${{ inputs.scope || (github.event.label.name == 'diagnose-multicore' && 'diagnose' || github.event.label.name == 'run-multicore-all' && 'all' || 'capacity') }}
 
     steps:
       - name: Check out the requested source exactly
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Freeze source, invocation and evidence location
@@ -69,7 +72,7 @@ jobs:
           PY
 
       - name: Install bounded loopback diagnostic tools on Linux
-        if: runner.os == 'Linux' && inputs.scope != 'capacity'
+        if: runner.os == 'Linux' && env.KU_CAPACITY_SCOPE != 'capacity'
         shell: bash
         run: |
           set -euo pipefail
@@ -128,7 +131,7 @@ jobs:
           retention-days: 30
 
   windows-regression:
-    if: inputs.scope != 'diagnose'
+    if: (github.event_name == 'workflow_dispatch' && inputs.scope != 'diagnose') || contains(fromJSON('["run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
     name: Windows affected native regressions
     runs-on: windows-2025
     timeout-minutes: 30
@@ -141,7 +144,7 @@ jobs:
       - name: Check out the same requested source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install pinned Rust and verify the C compiler
