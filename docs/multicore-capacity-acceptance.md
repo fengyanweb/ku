@@ -73,7 +73,7 @@ HTTP pump 总额仍是 32，`pump(1)` 仍只消耗 1，driver/worker polls 按�
 
 ## 最终源码与固定验收
 
-生产修复冻结于 `245b9afe22a0eeb7b25a7d9a79e699cb75ae77a0`，容量驱动在 `461b46aa4474206f727afe06a9ac02be2a111bd8` 另行隔离等待组期限；两者间唯一差异为 `tests/acceptance/multicore_capacity.py`。专用 timer/TCP 等待组请求期限 45s，结束并退出该实例后，公平性、业务过载和连接组在新实例恢复原默认 30s。Go 客户端期限始终 3s。原持续夹具的 handler 1s、timer 25ms 和 50rps 普通负载未改动。
+生产修复冻结于 `245b9afe22a0eeb7b25a7d9a79e699cb75ae77a0`，容量驱动在 `461b46aa4474206f727afe06a9ac02be2a111bd8` 另行隔离等待组期限；两者间唯一差异为 `tests/acceptance/multicore_capacity.py`。专用 timer/TCP 等待组请求期限 45s，结束并退出该实例后，公平性、业务过载和连接组在新实例恢复原默认 30s。Go CPU/热负载/业务压力客户端统一绝对期限为3s；专用等待使用独立selector客户端（timer50s、TCP40s），详见下表。原持续夹具的 handler 1s、timer 25ms 和 50rps 普通负载未改动。
 
 最终容量为 Linux/macOS 同输入 N1/2/4，预热 5s、计时 30s、各三轮交错，闭环 32 客户端；工作量先校准一次再固定。无代理、TLS 或数据库，事件线程执行真实 async 整数计算，运行时 query 输入决定工作量，8 字节 checksum 进入响应并逐次校验。旧 CPU5000 路径单列 8 客户端短对照，不能拿它替代重计算容量。driver 与 reactor 修前派生变体均使用最终 frontend、同一夹具、`clang -O2` 和相同客户端数；原源码固定为 `c1de5e3`，不冒充整个历史编译器构建。
 
@@ -96,7 +96,7 @@ HTTP pump 总额仍是 32，`pump(1)` 仍只消耗 1，driver/worker polls 按�
 
 两平台 timer 32/64/128 均达到并在各 30s 窗口维持目标，空闲等待 CPU 约为单核的 0.066%—0.133%；128 档无额外普通请求额度承诺。TCP64 同时由服务和受控对端确认等待，恢复67.45/68.74ms。热点期间三条 probe 每完整秒持续完成，Linux ok/timer/file p99为1.77/26.46/2.29ms，Mac4.54/53.18/20.20ms，均低于250ms。连接64/128/256的独立30s占用边界检查通过，结束后队列、Task、连接与字节归零。
 
-Linux 开放业务压力冻结为802rps，30s计划和实际均24,060：4,163正确、19,897明确503、其它/传输/未完成/未启动均零；服务全流量计数另含独立probe，保留下界及差额。撤压恢复上界1.311784s。Mac 原CI预检99.0667rps在2s窗口计划199、实际198且全正确，最后计划仅距截止1.346ms，小于该样本调度延迟p99=1.9ms，所以严格门槛失败、没有启动过载；原run保留失败。预检现在先向上量化为100rps，严格未启动零门槛不变；本机补验200/200正确，30s的991rps全部29,730次发起，7,302正确/22,427明确503/1次EOF，独立probe另有1次reset；该旧补验仍为not_closed，逐连接关联另外记录。
+Linux 开放业务压力冻结为802rps，30s计划和实际均24,060：4,163正确、19,897明确503、其它/传输/未完成/未启动均零。独立Python probes另计104次：31正确、69明确503、1次RemoteDisconnected、3次1s客户端超时；不声称全部流量零传输失败。服务计数另含独立probe，保留下界及差额。撤压恢复上界1.311784s。Mac 原CI预检99.0667rps在2s窗口计划199、实际198且全正确，最后计划仅距截止1.346ms，小于该样本调度延迟p99=1.9ms，所以严格门槛失败、没有启动过载；原run保留失败。预检现在先向上量化为100rps，严格未启动零门槛不变；本机补验200/200正确，30s的991rps全部29,730次发起，7,302正确/22,427明确503/1次EOF，独立probe另有1次reset；该旧补验仍为not_closed，逐连接关联另外记录。
 
 对应生产源码的 Linux 30 分钟 [39778033004](https://github.com/fengyanweb/ku/actions/runs/39778033004) 已通过：普通阶段88,500次全部正确、未启动/客户端拒绝均零，warm/steady/recovery p99为25.5/25.5/25.6ms。过载计划4,500、实际1,812，其中1,467正确、326明确503、19次直接连接终止；2,688发生器额度拒绝单列，不能据此宣称实际150rps。撤载125.415ms恢复，最终记录/字节归零，正常退出0；RSS从warm约2.59MB到steady约2.61MB，压力后约3.26MB并在recovery维持，线程11、阶段末FD15。该窗口证明此配置持续结果，不证明历史七次504已修复，也不代替独立开放业务压力。
 
@@ -139,13 +139,13 @@ python3 -u -B tests/acceptance/multiloop_load.py --ku target/release/ku --loops 
 | CPU/等待/公平/压力driver | 容量461，修正预检整rps与PG故障探测的driver401；诊断日志前缀另做脱敏 | 401未改变运行时或原持续夹具；旧Mac199计划/198发起的失败不改写；Go不自动重放失败请求 |
 | 最终持续窗口 | [245源码30m](https://github.com/fengyanweb/ku/actions/runs/39778033004) | 与461 Linux容量CLI SHA完全相同；88500普通正确，零错误/舍弃，撤载125.415ms，记录归零、退出0 |
 
-Windows 原整轮的具体失败是故障后第2个新请求 HTTP200/`error:acquire_timeout`，原日志只显示JSONDecodeError。源码中100ms acquire期限同时约束新连接建立，并未保证第二次请求必成功；这没有证明生产退化。修正验收为既有5秒恢复窗口内最多8个独立只读新请求，每次原期限，只允许已定义的query_error/execution_unknown/acquire_timeout作为中间状态，未知HTTP/传输/JSON仍立即失败，完整expected必须返回。原始故障/错误计算入记录，写入不重放。该次定向实际只发两次，62ms恢复。
+Windows 原整轮的具体失败是故障后第2个新请求 HTTP200/`error:acquire_timeout`，原日志只显示JSONDecodeError。源码中100ms acquire期限同时约束新连接建立，并未保证第二次请求必成功；这没有证明生产退化。修正验收为既有5秒恢复窗口内最多8个独立只读新请求，只允许已定义的query_error/execution_unknown/acquire_timeout作为中间状态，未知HTTP/传输/JSON仍立即失败，完整expected必须返回。原始故障/错误计算入记录，写入不重放。该次定向实际只发两次，62ms恢复；旧初始socket期限会随分段读取续约，本轮修正验收驱动绝对截止后另做定向检查（C03）。
 
 ## Mac 附加压力的剩余边界
 
 本机未插桩30s补验保留为`not_closed`：业务1次EOF尚未逐条关联。随后单次有界关联诊断只证实一个独立probe reset：同TCP连接的前次200完成，服务按既有压力策略在HEADER/无部分数据/无Task状态关闭，客户端46.545ms后才复用；这不能自动解释原业务EOF。诊断构建另出现138次完整响应头等待超时，保留4个样本均为新连接，不能扩大成138个已逐条确认，也不能冒称HTTP504或全部归为idle回收。该构建修改了临时结构和时钟/连接元数据，具有测量扰动，不用它推导未插桩性能比。
 
-最后只做一次固定6s的连接生命周期短采集：5946次全部启动，1693正确/4253明确503、业务异常0，另有1次独立probe连接错误；未取得≥2.5s异常生命周期，未触发线程采样。它不能代替30s门槛或覆盖旧失败。`accept→header_complete→async_submit→response_prepare→write/close`中的submit只表示提交，不伪称首次执行；内部原因未定位。所有追加采集均已结束，未放宽gates、未增加timeout、未重试请求，也未据猜测修改生产代码。
+上一阶段最后一次为固定6s的连接生命周期短采集：5946次全部启动，1693正确/4253明确503、业务异常0，另有1次独立probe连接错误；未取得≥2.5s异常生命周期，未触发线程采样。它不能代替30s门槛或覆盖旧失败。`accept→header_complete→async_submit→response_prepare→write/close`中的submit只表示提交，不伪称首次执行；内部原因未定位。该阶段采集已结束；本轮有界复验见C04，未放宽gates、未增加timeout、未重试请求，也未据猜测修改生产代码。
 
 因此当前只交付已验证的Linux完整压力范围与Mac计算/等待/公平范围；**不承诺Mac在991rps该超载条件下无传输/期限失败**。后续若需要承诺该平台此类超载行为，应先取得未插桩异常的请求阶段和线程证据，再决定最小修复，不重跑无关长测或重做调度架构。
 
@@ -154,3 +154,85 @@ Windows 原整轮的具体失败是故障后第2个新请求 HTTP200/`error:acqu
 生产变更集中于`c_http_runtime.c`（bounded gather写回、Mac零期限负向探测）、`c_task.rs/c_task_adapter.rs/c_task_driver.rs`（64-dispatch量子证明与有界交接）、`c_task_reactor.c`（空网络扫描锁）及`c_task_http.rs`（私有LIVE负向readiness）；保留现有所有权、取消与最终回收协议。对应永久回归及原scheduler probe计数适配，测试SDK宏冲突/CRLF夹具修正不影响业务API。验收driver/夹具与本报告是任务书要求的永久复现材料，没有新增生产依赖。
 
 数据库没有新增/修改/删除或migration；网站、v0.0.18标签、JSON与两个暂停项未动。原工作区87项修改的状态及tracked diff SHA与开始时相等；自有临时探针、生成C/Go/native、副本、测试目录与进程均清理，必要有界失败证据保留于报告根目录。实现工作树保留供PR审阅，不是垃圾副本；主工作区不自动覆盖或reset。最终只更新代码分支与PR说明，未合并、发布或部署官网。
+
+## C01—C06 最终复核（2026-10-22）
+
+本轮确认并修复一处验收驱动总截止，补强已有HTTP永久回归，没有新增生产运行时改动。`git diff 245b9afe HEAD -- src`为空：461b46aa只改容量期限隔离；401d50c只改预检和PG驱动；bcaf0d6只加报告/证据及诊断正文脱敏；本轮45b3b29只改PG驱动/单测及HTTP已有回归。数据库schema、JSON默认、两个暂停模块及网站未动。
+
+### C01 产物与最终旧路径
+
+最终容量目录名中的bb9ca12是workflow merge SHA，report实际受测源码为干净461b46aa，两树相同。Rust/cargo1.89.0、Go1.27.2；Linux Ubuntu clang18.1.3 x86_64，Mac Apple clang17.0.0/Xcode16.4 arm64。CLI用`cargo build --locked --release --bin ku`，native用`ku build --backend c --profile release --emit-c`、C11/`-O2 -pthread`。两平台夹具相同，peer端口展开导致expanded-source不同。所有完整身份见原JSON的frozen_capacity_runs及新增final_legacy_cpu5000_summary。
+
+| 最终产物SHA-256 | Linux | macOS |
+|---|---|---|
+| CLI | 05be28e442c2fed0475ff89111f4052dd518f80de83bdb98e3f7d839f8f9f930 | 0d7bf0bbccd6e64fc8f11e60abf3bbdd5dbd16cf0f92c35bf4e539b969d76cc6 |
+| native | f756a4157e37fd12468034436d3cb643960679df020051e0d901d625a8f85209 | 7313c9bb852d014e99cc602984263ffd7451f38fd9d46aef57c394e668482538 |
+| generated C | 93e1056c5fda877cf9c60be80ab4daf7ff381d3d0d4674ee6f4754141f9b1517 | 59c65537ebe42a84a335785be38c6b404cd6d22cd280b5a83ffc23edca0e48e4 |
+
+最终CPU5000配对来自同一最终run的short_comparison：8客户端、1s预热+5s测量、三轮交错；各格按轮0/1/2列“rps / p99毫秒”，不是早期32客户端诊断。
+
+| 平台/N | 最终frontend＋基线HTTP/driver片段 | 最终native |
+|---|---|---|
+| Linux1 | 191/43.1；195.2/42.1；191.4/43.1 | 5629.4/1.8；5546/1.8；5643.6/1.8 |
+| Linux2 | 195.2/42.9；195.2/42.1；192.6/43.1 | 7881.2/1.3；8228/1.3；7593/1.7 |
+| Linux4 | 195.2/43；195.2/42.4；194.6/42.4 | 8464.8/1.7；8523.4/1.7；8559.6/1.7 |
+| Mac1 | 2876.4/3.7；2560/6.2；2986.8/3.6 | 6758.8/1.6；6788.6/1.9；6637/2.1 |
+| Mac2 | 4146/2.6；4299/3.2；4345.8/2.8 | 11032.4/1.2；10801.6/1.4；10614.8/1.4 |
+| Mac4 | 2928/7.6；2962/6.9；3004/8 | 12124.2/2.3；12011.6/2.3；12511/2 |
+
+修前派生体保留最终reactor，只替换c1de5e3的HTTP/driver，恢复7处adapter入口、移除7处budget marker、禁用5处scalar快返，不代表整个旧编译器。原JSON保留36条配对；另6条capacity.legacy为正式CPU后的final-only5s/8客户端：Linux N1/2/4为5401.4/7905.8/8473.2rps、p99为1.9/1.3/1.7ms；Mac6765.4/10937.4/12493.8、p99为1.8/1.3/1.9ms。18轮512k原正式结果全部保留。
+
+### C02 真实期限与无重放
+
+| 组别 | 客户端期限 | 服务期限与成功定义 |
+|---|---|---|
+| CPU/legacy | Go raw TCP，实际worker执行起dial/write/header/body共用绝对3s | whole30s/handler45s；完整200且checksum/body相等 |
+| timer35s | capacity_wait._Cohort selector；每socket创建起绝对50s；驱动总收尾began+51s | 专用whole45s/handler45s；真实35s后完整200/wait-ready，非取消 |
+| TCP64 | 同一selector绝对40s；Ku net连接1s/读取40s | whole45s/handler45s；服务与peer持有64达30s，释放K后64个完整network-ready，释放起5s恢复 |
+| 公平/业务压力 | Go同一绝对3s；热点4worker，开放压力512worker/queue256 | 新实例whole恢复30s、handler45s；终态互斥计数 |
+| 公平/压力独立probe | Python runtime_matrix.call，1s socket操作期限，非绝对总期限 | 逐次分类；公平每秒推进且p99≤250ms；主动过载错误另计 |
+| 等待普通probe | 同一Python路径，2s socket操作期限 | 等待实例45s；32/64timer及TCP完整正确，128timer不承诺额外普通额度 |
+| 原30分钟 | multiloop_load.request，3s socket操作期限，非绝对总期限 | whole默认30s/handler1s/timer25ms；50rps普通窗口零错误，过载另列 |
+
+源码入口：capacity_wait.py::_Cohort/timer_wait/network_wait、multicore_capacity.py::capacity关闭等待实例后新建普通实例、capacity_client.go::worker.request、runtime_matrix.py::call。最终timer实际完整返回约35.002—35.010s，线程均11，FD15→47/79/143→15；TCP实际观测30.001/30.002s，FD15→143→15，64/64完整返回、账本归零。原证据足够，不补跑等待。
+
+Go调用链为ledger.start→w.request一次→必要时DialContext→SetDeadline(起点+3s)→Request.Write一次→自定义完整头读取/http.ReadResponse→有界完整体→终态分类。未使用http.Client/Transport，错误立即返回关闭；下一计划新建连接不等于重发失败计划，started对应一次请求尝试。保留keep-alive，不增加重试。
+
+开放计划ceil(duration*rate)，目标began+index/rate，截止began+duration；scheduler过期、queue满、worker取到过期计划分别计scheduler_at_cutoff/client_queue_full/queued_or_closed_at_cutoff，不发送。已started只按原3s有限收尾，窗口外完成不回填吞吐。预检99.0667→100提高速率、最后目标由1.998654s提前至1.99s；旧199/198仍失败，未启动零门槛不改。
+
+### C03 Windows绝对恢复截止
+
+已确认缺口属于验收驱动：初始socket timeout不能约束BufferedReader多次读，慢滴头/体可续约。仅恢复分支使用DeadlineHTTPConnection/DeadlineSocket，每次connect/send/recv_into重算min(单次进入+4s,统一5s截止)-当前时刻，过期不建socket，完整读取/解码后再次检查。默认及持久路径不改，不增加业务timeout。5s从pg_terminate_backend返回且终止结果记录后起算，不包括终止SQL自身；最多8次独立新只读/read，每次新sequence/连接。未知HTTP/传输/正文/JSON立即失败；三种已定义中间错误不计成功；原丢失确认写、实际1行及无重放断言未改。
+
+旧401d50c的31+31ms/62ms、退出前实际1条DB连接/退出后0是原相对样本，不能伪造新绝对时钟。新驱动45b3b29的[Windows PG/host定向run](https://github.com/fengyanweb/ku/actions/runs/39799865611)已通过，实际checkout45b3b29。终止1条DB连接后两次独立新读：sequence9在933.890→933.906s返回execution_unknown（16ms），sequence10在933.906→933.937s返回完整72B expected（31ms）；统一截止938.890s，累计47ms，没有续约成新的5s。DB pending/bytes为0，退出前实际1条连接、正常退出0后DB连接0；原丢失确认写实际1行且未重放。Windows原生宿主以LOCAL SERVICE注册三项，故障504为1000ms，2328ms首次不ready、2984ms替代gen2 ready，存活实例10/10正确，替代业务200，退出75原因如实保留、宿主停止0、残留进程与cleanup为空。此scope跳过Caddy，不能称本轮重验了Caddy。CLI SHA为1a52d1bdd6d7ef5451435e38a3191b29e95c6bc5c32cdf51e953770eb3c6afa1，宿主native SHA为62dff94fa24a72463cea8e58e86acbf96813710c4f4f98f11713c4bdc3f48384；PG使用原debug C夹具，未冒称release容量产物。新增正常响应、慢滴头/体、过期零socket、拒绝DNS五项永久回归复用test_http_pg_lifecycle.py，本机16项中15通过/1Windows ACL平台跳过；CI实际验收单测24/24、部署契约21/21、release CLI构建和Windows全workspace/all-targets clippy均通过。真实慢滴反例用130ms预算、35ms间隔：旧socket读取466ms后才完整返回，新绝对期限131ms即抛timeout；旧最终检查原本也会拒绝晚成功，本轮修的是调用及时终止。
+
+### C04 Mac有界收尾
+
+生产idle-pressure仅处理HEADER+reused+buffered=carry=0且先MSG_PEEK。内核已有字节保留；已读前缀、BODY/JOB/ASYNC/WRITE/REUSE_WAIT不进入。输出全部完成才next_request，未退休job/Task保持CLOSED而不立即复用。现有真实TCP回归有完整pipeline、pending满的明确503屏障、当前body完整响应后关闭及pending全部响应。新增控制回归提取实际pressure分支，在部分写/EAGAIN之间检查，核对游标/原deadline；覆盖queued字节、EINTR、空闲EAGAIN/EOF及8种非idle状态。真实TCP另验压力关闭后再复用只能FIN/RST而非新响应/超时。两个精确测试本机通过；Task代次/退休/退款联合引用已有driver、真实HTTP及最终资源回落，不称pressure harness单独证明全量计费。
+
+只新增一次未插桩release30s991rps：normal200/200正确；业务29730全部started=6775正确+22955明确503，其它/传输/unfinished/notstarted均0。独立probe135次=46正确+88明确503+1reset，未逐连接关联；不能并成全流量零错误。撤载恢复上界1.351473s，20项资源归零，exit0。原fixture/flags/预算、Go绝对3s、whole30s/handler45s不变；完整身份和原结果在mac-close-final-release.json，本机M1并非独占环境。一次准备参数错误发生于服务/流量启动前，随证据保留，临时目录清理，不计额外压力窗口。
+
+本轮未证明新的生产缺陷，未做猜测性修复。旧三项仍分开：release1次业务EOF未定因；原probe3 reset有唯一连接/时间关联，符合idle契约；插桩138次头等待超时仅4个明确fresh样本，未定因，非HTTP504。新release业务通过不覆盖旧失败，新独立probe reset也不能被旧probe3证据解释。按有界停止条件，Mac991附加项仍未收口，本轮停止采集，不再加第二个30s或新插桩碰运气。
+
+关闭契约参考[RFC9112 §9.5/9.6](https://www.rfc-editor.org/rfc/rfc9112.html#section-9.5)，标准允许idle竞争不代表Ku任意关闭都正确，也不改变旧零传输失败实验的失败状态。
+
+### C05 快路径与永久回归
+
+| 变更 | 已有入口及边界 |
+|---|---|
+| 64-dispatch/TLS | native_task_source_test的quantum_default、segments_keep：嵌套TLS、timer/未知Pending、pump1/32、显式yield及1ms边界；HTTP pump仍32 |
+| scalar charge | 同target的scalar_quantum：owned、child、Blocking/finally、溢出错误、cancel、最终reserved_bytes=0；未知/call/分配释放保守回退，未跳准入/最终退款 |
+| reactor重查 | 同target的tcp_late_readiness及真实TCP：generation/socket/state/owner变化、dispatch/重锁失败不遗留锁 |
+| 私有LIVE | native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease：完成/cancel/finishing、无效lease/ABI/size/alignment、一次take/drop/adopt/refund；旧gen由driver退休复用旧wake=STALE及真实HTTP退休联合覆盖，不称LIVE单测直接注入旧gen |
+| Mac select(0) | native_http_macos_zero_poll_preserves_real_socket_events_and_fallbacks：真实listener/TCP/UDP、关闭/半关闭/refused/满发送、fd/未知mask、errno/revents及原poll回退 |
+| gather/close | native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets及native_http_reuses_framed_requests_and_yields_idle_connections：9vector/64KiB、262144B/32call、partial/EINTR/EAGAIN/peer错误/deadline、pressure状态与完整wire |
+
+最终capacity affected日志逐条保留Linux53/Mac54/Windows50通过，Mac专有仅Mac执行。原三平台套件/ASan184/TSan13/真实HTTP及宿主结果按源码复用；本轮只补改动相关路径，不重复36次内存矩阵或30分钟。
+
+### C06 四种状态和门禁
+
+主验收：原任务核心功能与指定平台范围完成。Mac991附加项：旧异常未定因/未收口，不称全平台压力通过。A19：真实跨主机未执行，最少需授权两台独立宿主、可切换入口/健康路由、隔离PG主备故障域和允许故障注入的演练环境。PR2：仅提交/推送/更新，未合并、未打标签、未发布、未部署官网。
+
+API实查main protection返回Branch not protected、repository rulesets为空，没有required checks；bcaf0d6的check-runs=0/status contexts=0，空集合state=pending不代表已有失败或绿色。原39778863985仍失败，39785156409定向通过；本轮实际驱动只补39799865611并已通过，不增加无关全量重跑。误指向旧bcaf的dispatch39799100744已取消，不作为修复验证。新CI实际checkout、模块结果和清理收据写入同一证据JSON。
+
+复核与清理收据：同一原始根目录下completion-local-checks.json、completion-closeout-ci/{ci-receipt.json,windows-job.log,service-lifecycle-windows-2025/*.json}及mac-close-final-release.json；下载ZIP在内存校验CRC后只保留必要JSON/日志。主工作区87项修改的status及diff摘要未变；临时构建和socket/进程均清理，外置共享cargo缓存保留复用。子智能体任务结束后停止；本轮新增内容均为必要永久回归或紧凑证据，不保留一次性脚本。
