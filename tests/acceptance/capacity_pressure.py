@@ -191,7 +191,11 @@ def run_pressure(service, client, path, expected, measured_capacity_rps, seconds
     _validate_seconds(seconds)
     if not _finite(measured_capacity_rps) or measured_capacity_rps <= 0:
         raise ValueError("measured_capacity_rps must be finite and positive")
-    normal_rate = measured_capacity_rps * .5
+    # Freeze a whole-request rate before starting. A fractional rate may place
+    # its ceil-count final arrival less than one scheduler tick before cutoff.
+    # Rounding UP keeps at least half capacity and a full final interval;
+    # every planned request must still start and complete correctly.
+    normal_rate = max(1, math.ceil(measured_capacity_rps * .5))
     overload_rate = min(10000, max(1, math.ceil(measured_capacity_rps * 5)))
     plan = {"normal_precheck_seconds": 2, "normal_rate": normal_rate,
             "overload_seconds": seconds, "overload_rate": overload_rate,

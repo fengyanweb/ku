@@ -343,6 +343,8 @@ def main():
                              "database_waiters": 8, "database_pending_bytes": 1048576,
                              "acquire_timeout_ms": 100, "query_timeout_ms": 150, "handler_timeout_ms": 2000,
                              "fault_recovery_deadline_seconds": 5,
+                             "disconnect_recovery_max_new_reads": 8,
+                             "disconnect_recovery_intermediate_errors": ["query_error", "execution_unknown", "acquire_timeout"],
                              "http_client_connection_policy": "eight persistent clients, no failed-request replay" if args.performance_seconds else "one connection per isolated fault request",
                              "database_transport": "direct Ku/libpq to private PostgreSQL; no fault proxy" if args.performance_seconds else "private Python fault proxy, capacity eight connections",
                              "tls": "disabled only inside isolated loopback fixture"},
@@ -361,6 +363,7 @@ def main():
         database_port, http_port = port(), port()
         data = root / "data"
         service = None
+        request = None
         proxy = None
         control_token = None
         started = False
@@ -420,11 +423,20 @@ def main():
             with logs.open("wb") as log:
                 service = subprocess.Popen([executable], cwd=root, env=environment, stdout=log, stderr=log)
 
-            def request(path, method="GET", control=False, persistent=None):
-                observation = {"route": path[:256], "method": method[:16], "status": None,
+            request_lock = threading.Lock()
+
+            def request(path, method="GET", control=False, persistent=None, phase=None, deadline=None):
+                entered = time.monotonic()
+                phase = (phase or report.get("acceptance_phase", "http:unknown"))[:128]
+                observation = {"phase": phase, "route": path[:256], "method": method[:16], "status": None,
                                "body_prefix": None}
-                report["last_request"] = observation
-                connection = persistent or http.client.HTTPConnection("127.0.0.1", http_port, timeout=4)
+                with request_lock:
+                    if not args.performance_seconds:
+                        observation["sequence"] = report.get("request_observations_total", 0) + 1
+                        report["request_observations_total"] = observation["sequence"]
+                    report["last_request"] = dict(observation)
+                timeout = 4 if deadline is None else min(4, max(0.001, deadline - entered))
+                connection = persistent or http.client.HTTPConnection("127.0.0.1", http_port, timeout=timeout)
                 try:
                     headers = {"X-Ku-Control-Token": control_token} if control else {}
                     if persistent is not None:
@@ -437,14 +449,26 @@ def main():
                     observation.update(body_prefix=prefix.decode("utf-8", errors="replace"),
                                        body_prefix_raw_bytes=min(len(raw_body), 2048),
                                        body_bytes=len(raw_body), body_prefix_truncated=len(raw_body) > 2048)
-                    report["last_request"] = observation
                     body = raw_body.decode()
                     if response.status != 200:
-                        raise RuntimeError(f"HTTP {response.status}: {body}")
+                        raise RuntimeError(f"HTTP {response.status}: {observation['body_prefix']}")
                     return body
+                except Exception as error:
+                    observation["exception"] = f"{type(error).__name__}: {error}".replace(control_token, "<control-token>")[:2048]
+                    raise
                 finally:
                     if persistent is None:
                         connection.close()
+                    observation["elapsed_seconds"] = time.monotonic() - entered
+                    with request_lock:
+                        report["last_request"] = dict(observation)
+                        if not args.performance_seconds:
+                            # Keep bounded fault evidence without adding disk I/O
+                            # to the separate read-throughput measurement.
+                            history = report.setdefault("request_observations", [])
+                            history.append(dict(observation))
+                            del history[:-32]
+                            checkpoint(report, args.output, phase + ":request", request=observation)
 
             deadline = time.monotonic() + 10
             progress("http:readiness")
@@ -574,13 +598,38 @@ def main():
                 assert json.loads(request("/read")) == expected
                 report["checks"]["commit_acknowledgement_lost"] = {"reported": unknown, "actual_rows": int(count), "replayed": False}
                 progress("fault:disconnect-terminate-backend")
-                sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'")
-                progress("fault:disconnect-first-read")
-                first = request("/read")
-                assert first.startswith("error:") or json.loads(first) == expected
-                progress("fault:disconnect-recovery-read")
-                assert json.loads(request("/read")) == expected
-                report["checks"]["database_disconnect_recovery"] = {"first": first, "next": "passed"}
+                terminated = sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'")
+                report["disconnect_backend_termination"] = {
+                    "attempted": len(terminated.splitlines()),
+                    "reported_terminated": terminated.splitlines().count("t"),
+                    "raw_result": terminated[:256]}
+                # Acquire retires stale slots lazily and a replacement connect
+                # shares the original acquire deadline. No contract promises
+                # that the second request succeeds. These are distinct read-only
+                # requests; no failed operation or write is replayed.
+                began = time.monotonic()
+                deadline = began + report["parameters"]["fault_recovery_deadline_seconds"]
+                recovery = {"observations": [], "recovered": False, "failed_request_replay": False}
+                report["disconnect_recovery"] = recovery
+                allowed = {"error:" + code for code in report["parameters"]["disconnect_recovery_intermediate_errors"]}
+                for index in range(report["parameters"]["disconnect_recovery_max_new_reads"]):
+                    if time.monotonic() >= deadline:
+                        break
+                    progress("fault:disconnect-new-read", new_request=index + 1)
+                    body = request("/read", deadline=deadline)
+                    observation = dict(report["last_request"])
+                    observation["recovery_elapsed_seconds"] = time.monotonic() - began
+                    recovery["observations"].append(observation)
+                    if body.startswith("error:"):
+                        assert body in allowed, observation
+                        continue
+                    assert json.loads(body) == expected, observation
+                    recovery["recovered"] = time.monotonic() <= deadline
+                    break
+                assert recovery["recovered"], recovery
+                report["checks"]["database_disconnect_recovery"] = {
+                    "first": recovery["observations"][0]["body_prefix"], "next": "passed",
+                    "new_read_requests": len(recovery["observations"]), "failed_request_replay": False}
                 progress("fault:bounded-dependency-pressure")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
                     outcomes = list(pool.map(lambda _: request("/slow"), range(12)))
@@ -627,10 +676,24 @@ def main():
                 failure = failure.replace(control_token, "<control-token>")
             report["failure"] = failure[:2048]
             report["failure_phase"] = report.get("acceptance_phase", report.get("current_phase", "unknown"))
+            report["failure_request"] = dict(report.get("last_request", {}))
             report["failure_trace"] = [
                 {"file": Path(frame.filename).name[:128], "line": frame.lineno,
                  "function": frame.name[:128]}
                 for frame in traceback.extract_tb(error.__traceback__, limit=-12)]
+            # JSONDecodeError alone hides valid HTTP error bodies such as
+            # error:acquire_timeout. Print and persist the original response
+            # before a distinct control request can replace last_request.
+            checkpoint(report, args.output, "diagnostic:failure", failure=report["failure"],
+                       failure_phase=report["failure_phase"], request=report["failure_request"])
+            if request is not None and service is not None and service.poll() is None:
+                try:
+                    report["failure_runtime_metrics"] = json.loads(request(
+                        "/__ku/metrics", control=True, phase="diagnostic:failure-metrics"))
+                except Exception as metrics_error:
+                    report["failure_runtime_metrics_error"] = (
+                        f"{type(metrics_error).__name__}: {metrics_error}"
+                        .replace(control_token, "<control-token>"))[:2048]
             if logs.is_file():
                 report["service_log_tail"] = logs.read_text(encoding="utf-8", errors="replace")[-8192:]
             raise
