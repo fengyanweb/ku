@@ -302,6 +302,14 @@ def capacity(ku, executable, client, root, args, save, peer):
     service = Service(executable, root, 4, request_timeout_ms=45000)
     try:
         collect_waiting(service, peer, args.waiting, result, save)
+    finally:
+        result["waiting_exit"] = service.stop()
+    # The long-wait fixture's dedicated deadline must not leak into the
+    # ordinary fairness/overload/connection groups. Keep their original 30s
+    # whole-request limit and the independent Go 3s client deadline.
+    service = Service(executable, root, 4, request_timeout_ms=30000)
+    result["ordinary_request_timeout_ms"] = service.request_timeout_ms
+    try:
         result["fairness"] = run_fairness(service, client, path, expected)
         save(result)
         measured = [r["measurement"]["client"]["rates"]["correct_per_measurement_second"] for r in result["rounds"] if r["loops"] == 4]
@@ -311,7 +319,7 @@ def capacity(ku, executable, client, root, args, save, peer):
         result["connection_occupancy"] = run_connection_occupancy(service, seconds=30)
         save(result)
     finally:
-        result["waiting_exit"] = service.stop()
+        result["capacity_exit"] = service.stop()
     return result
 
 
@@ -404,6 +412,8 @@ def assessment(report):
         "connection_occupancy": data.get("connection_occupancy", {}).get("passed") is True
             and data.get("connection_occupancy", {}).get("formal_30_second_windows") is True,
         "waiting_service_exit": data.get("waiting_exit") == 0,
+        "capacity_service_exit": data.get("capacity_exit") == 0,
+        "ordinary_request_deadline_unchanged": data.get("ordinary_request_timeout_ms") == 30000,
     }
     comparison = report.get("short_comparison", [])
     paired = {}
