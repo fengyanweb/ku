@@ -9,7 +9,7 @@ on:
         description: 'full runs all gates; platform scopes reuse passed checks on unchanged runtime sources'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery]
 
 permissions:
   contents: read
@@ -160,7 +160,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-service' && '[{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]' || github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"}]' || '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"},{"os":"ubuntu-24.04","tls_target":"x86_64-unknown-linux-gnu"},{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]') }}
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-service' && '[{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]' || github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && inputs.scope != 'service-recovery' && '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"}]' || '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"},{"os":"ubuntu-24.04","tls_target":"x86_64-unknown-linux-gnu"},{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]') }}
     env:
       CARGO_INCREMENTAL: "0"
       KU_NATIVE_TLS_LINK_REQUIRED: "1"
@@ -430,7 +430,7 @@ jobs:
           }
 
       - name: Reject platform-specific clippy warnings
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || inputs.scope == 'service-recovery'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run every default test target without stopping at the first failure
@@ -446,12 +446,18 @@ jobs:
           --test service_supervision_test --test native_task_adapter_test
           -- --nocapture --test-threads=2
 
+      - name: Verify service control and resident lifecycle regressions
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'service-recovery'
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --release --test service_supervision_test -- --nocapture --test-threads=2
+
       - name: Verify native scheduler probe correctness, not performance
-        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service')
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery')
         run: cargo test --locked --release --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
       - name: Verify resident hard memory provider recovery or explicit platform rejection
-        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service')
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery')
         shell: bash
         run: |
           set -euo pipefail
@@ -478,7 +484,7 @@ jobs:
           fi
 
       - name: Verify native blocking retirement and resident replacement
-        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service')
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery')
         shell: bash
         run: |
           set -euo pipefail
@@ -487,7 +493,7 @@ jobs:
             --output "$RUNNER_TEMP/ku-native-blocking-retirement.json"
 
       - name: Verify short native runtime matrix with actual bounded blocking regression
-        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service')
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery')
         shell: bash
         run: |
           set -euo pipefail
