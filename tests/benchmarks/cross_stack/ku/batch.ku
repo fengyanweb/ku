@@ -1,0 +1,29 @@
+// Fixed algorithm shared with the HTTP handler and every comparison stack.
+import { fs, json, time } from "std"
+
+fn main(): null! {
+    input = json.decode(fs.read("batch.json")?)?
+    iterations = input["iterations"]?.as_int()?
+    seed = input["seed"]?.as_int()?
+    repeat = input["repeat"]?.as_int()?
+    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 1024) {
+        fail "CPU fixture input outside common integer range"
+    }
+    checksums:[int] = []
+    // 1ms monotonic resolution is explicit; process startup and input are excluded.
+    began = time.steady_millis()
+    round = 0
+    while (round < repeat) {
+        total = seed
+        i = 0
+        while (i < iterations) {
+            total = (total * 33 + i + seed) % 100000000
+            i = i + 1
+        }
+        checksums = checksums.push(total)
+        round = round + 1
+    }
+    elapsed = time.steady_millis() - began
+    println(json.encode({checksums: checksums, compute_ms: elapsed})?)
+    return ok(null)
+}

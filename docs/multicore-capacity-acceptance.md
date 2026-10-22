@@ -66,6 +66,7 @@ HTTP pump 总额仍是 32，`pump(1)` 仍只消耗 1，driver/worker polls 按�
 ## 固定资源与支持边界
 
 - N=1/2/4 只改变真实事件线程数。后台合计固定 **5**：HTTP 同步 handler 4、Task 文件/TLS/DNS 1；`KU_THREAD_BUDGET=16`，不能让 N=4 隐式多拿后台份额。Ku 显式线程数与 OS/FFI 辅助线程、栈预留、RSS/Windows 提交内存分别记录。
+- 上述 N 是验收时显式设置的 `KU_EVENT_LOOPS`，不是运行时默认值。未设置时，`c_runtime_config.c::ku_runtime_loop_count` 按可用 CPU、最多 8 循环及 `KU_THREAD_BUDGET` 剩余额度的一半自动选择；HTTP 启动还会按全实例活动、pending 和剩余 HTTP 后台份额缩小。显式循环数最大 32，超过实际容量或后台配额会拒绝启动，不静默增加额度。
 - 夹具全实例上限固定：连接 256、活动请求 128、pending 128、HTTP 缓冲 8MiB、Task 接入账本 16MiB；不是每 owner 一整份。固定 owner 的本地活动/排队份额仍可能先饱和，需记录真实接入/拒绝；不能只看全局总量推断所有循环均可接入。
 - `KU_TASK_MAX_BYTES` 不是任意 Task 全堆计量，HTTP 账本不是整体 RSS；第三方库、分配器保留、线程栈另有归属。Linux cgroup v2 / Windows Job 的进程限制与这些账本不同；macOS 原生不提供对应隔离，外部 supervisor/代理也不自动处于限制域内。
 - native async lowering 目前只接受已支持的 Task 原语和已知顶层 async helper。没有 PostgreSQL/MySQL/Redis Task 操作或通用同步调用桥；直接在 async handler 构造/调用此类 DB client 会在 native async 子集诊断处拒绝，不能解释成已异步执行。现有 DB handler 走同步 HTTP 后台；阻塞不能偷偷搬回事件线程，数据库不自动重试。
@@ -114,7 +115,7 @@ python3 -u -B tests/acceptance/multiloop_load.py --ku target/release/ku --loops 
 
 ## 使用建议与未验证范围
 
-保持现有默认 1 个循环。计算负载可在本次固定预算内选择 2 或 4，先按实际硬件和 workload 量测；I/O 等待容量与事件线程数不同，不为等待自动增加后台总线程。这里没有证明 32 循环、万级同时活动请求、任意长同步指令可抢占或所有数据库操作可进入 native async handler。高于 `FD_SETSIZE` 的 macOS socket 仍正确回落 poll，但其性能没有由负向探测短测证明。
+需要保守起点时，建议显式设置 `KU_EVENT_LOOPS=1`；这是一项使用建议，代码默认按 CPU、线程预算和 HTTP 容量自动选择，并非固定 1 个循环。计算负载可在本次固定预算内选择 2 或 4，先按实际硬件和 workload 量测；I/O 等待容量与事件线程数不同，不为等待自动增加后台总线程。这里没有证明 32 循环、万级同时活动请求、任意长同步指令可抢占或所有数据库操作可进入 native async handler。高于 `FD_SETSIZE` 的 macOS socket 仍正确回落 poll，但其性能没有由负向探测短测证明。
 
 运行时分配账本、RSS 与 OS 进程域限制分别解释；协调器/代理不自动受 worker 硬限制，单 Task 全堆未精确计量，macOS 原生对应硬隔离不支持。原 A19 跨主机演练仍缺授权环境，与本轮单机 B01—B08 独立。历史七次 504 仍未定因，不能用本轮新路径结果倒推其根因。数据库无 schema/migration 变化，也不自动重试或重放。官网、v0.0.18 标签、JSON 旧默认及两个暂停模块维持原边界。
 
@@ -236,3 +237,78 @@ Go调用链为ledger.start→w.request一次→必要时DialContext→SetDeadlin
 API实查main protection返回Branch not protected、repository rulesets为空，没有required checks；bcaf0d6的check-runs=0/status contexts=0，空集合state=pending不代表已有失败或绿色。原39778863985仍失败，39785156409定向通过；本轮实际驱动只补39799865611并已通过，不增加无关全量重跑。误指向旧bcaf的dispatch39799100744已取消，不作为修复验证。新CI实际checkout、模块结果和清理收据写入同一证据JSON。
 
 复核与清理收据：同一原始根目录下completion-local-checks.json、completion-closeout-ci/{ci-receipt.json,windows-job.log,service-lifecycle-windows-2025/*.json}及mac-close-final-release.json；下载ZIP在内存校验CRC后只保留必要JSON/日志。主工作区87项修改的status及diff摘要未变；临时构建和socket/进程均清理，外置共享cargo缓存保留复用。子智能体任务结束后停止；本轮新增内容均为必要永久回归或紧凑证据，不保留一次性脚本。
+
+## 本轮独立候选交付准备（R01/R03/A19，2026-10-22）
+
+### 版本范围与发布状态
+
+原定 v0.0.18 的发布归属以 [冻结清单](v0.0.18.md#冻结范围与原任务清单)、[R7.135 原决定](v0.0.18-worklog.md#r7135-v0018-release-scope-frozen-by-user-2026-10-20)及[修订版说明](v0.0.18-r1.md)为准。旧版已实际交付：[v0.0.18-r1 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) 绑定 `f0bb31f3420cde8e95ba3569f0fbd1af933c27bf`，[tag CI 39613361721](https://github.com/fengyanweb/ku/actions/runs/39613361721) 的 17 项 job 全部成功，包含三个目标的实际安装包、完整资产核验和公开发布；不能把旧日志中“待最终 CI/发布”的历史状态当成今天仍欠交付。main 上的对应合并为 `2cc964d8a6652486c71271f4fd3562ceafa59551`。
+
+10 月 21 日原多事件循环任务书与 B01—B08 任务书已约定独立分支承载、不倒灌旧版发布范围。本分支是后续运行时候选，**未公开发布**，不覆盖旧标签、旧资产或旧版说明。此次交付核对起点为 `8210e5200c466d9041807d04a68c1844ba9cbd6f`、[PR #2](https://github.com/fengyanweb/ku/pull/2)（`codex/multiloop-runtime` → `main`）；生产修复及各模块有效证据仍按上文 SHA 对应。候选包内 Cargo/CLI/VSIX 暂保留 `0.0.18`，此号码不能区分旧发布包与候选，必须同时核对完整提交及 manifest、`RELEASE.json` 的身份；本节不决定新版本或标签。
+
+| 原要求/本轮工作 | 当前状态 | 具体剩余动作 |
+|---|---|---|
+| v0.0.18 冻结功能、0.0.18-r1 具体修复及安装发布 | 已公开交付；不重新增加发布前置 | 保留原下载、许可证和已知限制 |
+| 多事件循环核心、B01—B08 指定平台主验收、C01—C06 | 按本报告及集中 JSON 收口；旧整轮失败、取消与定向补验分别保留 | 不重复无关容量、30 分钟或 36 次内存验证 |
+| 新增 T01—T08 四栈业务、资源与竞争力对照 | 正在执行；尚无跨语言竞争优势结论 | 冻结同机/同资源/同语义配置，完成结果与差距处理后形成最终发布决定 |
+| 当前独立候选的安装产物与公开交付 | 尚未完成最终候选冻结/产物准备；PR 未合并，无新标签或 Release | T 阶段代码冻结后按现有发布格式准备真实产物、提交身份及小范围安装冒烟，再依据适用授权推进明确动作 |
+| Mac991 附加异常 | 有界调查已结束，相关现象仍按 C04 分别保留 | 仅在出现新可定位证据、明确契约违例或承诺该场景时再开；不追加碰运气长测 |
+| A19 真实跨主机演练 | 准备材料已有；缺外部环境，未实测 | 取得下文唯一环境信息组，再按原契约执行 |
+
+完整 M:N、解释器全面挂起、剩余阻塞库与完整数据库 SDK/平台矩阵、延后的 Redis/MySQL 公开配置、单 Task 精确全堆计量及协调器自身 OS 限制仍按原[后续计划](roadmap-decisions.md#v0018-发布冻结后的计划)处理。当前分支实现的局部网络与后台路径不能据此把这些大项整体改成完成，也不把暂停模块或 Mac 附加未知临时变成旧版本阻塞。
+
+### 随本候选交付的能力与边界说明
+
+- **配置与执行路径。** native C 支持固定 owner 的多事件循环；默认由代码自动选择，保守起点可显式 `KU_EVENT_LOOPS=1`。`KU_BLOCKING_THREADS` 为全实例后台总数，`KU_THREAD_BUDGET` 默认 16；混合 Task 文件/网络适配会保留一个共享 Task 后台份额。`KU_HTTP_REQUEST_TIMEOUT_MS` 默认 30000，读取、排队、执行与写出共用绝对期限；超时不表示原生工作已物理停止。完整配置见[运行时配置](multiloop-runtime.md#配置与总量)。改变循环数须同时核对全实例活动、pending 与后台份额，不将每个循环预算重复相加。
+- **异步能力与数据库。** native async 的已接入 timer、普通 TCP readiness 和已支持的 helper 在 owner 上推进；DNS、文件和 TLS 等既有适配仍使用有界后台。数据库 handler 通过同步 HTTP 后台持独占连接 lease，当前 native async 不支持直接调用 PostgreSQL/MySQL/Redis client。未接入组合明确拒绝；不新增隐式 clone、Result 自动解包或用户 spawn API。数据库操作和失败 HTTP 不自动重放，结果未知要保留未知，后续独立新请求成功不能证明原操作成功或回滚。完整边界见[数据库执行说明](database-runtime.md)。
+- **预算与平台。** HTTP/Task 分配账本不是整体 RSS，单 Task 全堆未精确计量；线程栈、第三方库及分配器保留不能从该账本推导为零。Linux 的可选硬模式要求专用可写空 cgroup v2 委托、可用 memory/pids 控制器及祖先允许迁移；Windows 约束 Job 提交内存，提交失败不一定杀进程；macOS 原生明确拒绝对应硬隔离，普通服务恢复仍可用。受控域覆盖 launcher、native 服务及其第三方分配，supervisor/代理在域外；部署总预留不等于整个系统绝对封顶。`ku supervise` 管有限程序批次，`ku service` 管常驻实例，完整条件见[进程执行说明](process-execution.md)和[服务部署](../deploy/service/README.md#可选-os-限制)。
+- **已验证范围与性能。** 本报告的 Linux/Mac 扩核、timer32/64/128、TCP64、公平性、Linux30分钟及 Windows 定向恢复只适用于各自列明的提交、完整软件栈、硬件和夹具；Linux N4 的单位工作 CPU 成本高于 N2。802/991rps 是过载输入，不是正确处理能力；CPU5000 配对是派生片段对照，不是整个历史编译器的通用倍数。T01—T08 正在执行，本节不据架构、所有权或无 GC 宣称性能领先。
+- **已知限制与兼容性。** Mac 旧 release 业务 EOF、已关联的旧 idle probe reset、插桩头等待超时与新未关联 probe reset 分开保留，不写成全平台所有流量零错误；A19 未实测。本分支结果不追认历史七次504根因。JSON 沿用旧默认；通用值复制/释放与 AST 后续分析继续暂停。0.0.x 不承诺内部 Task ABI/生成 C 兼容，候选部署应使用对应 CLI 重新构建并保留旧产物/配置供回滚；官网未上传或部署。
+
+### A19 已有材料与一次性环境缺项
+
+准备内容集中在 [deploy/service/README.md 的“多主机边界”](../deploy/service/README.md#多主机边界)（当前第155—221行），不另建一套 runbook。这里已有双宿主拓扑、配置/启动与停止命令、真实 readiness、单故障注入与撤销、恢复接流和回滚、请求账本、数据库确认/未知写入及 RPO 核对、最终资源清理；配套文件是 [cluster.example.json](../deploy/service/cluster.example.json)、[外层 HAProxy 配置](../deploy/service/haproxy.multihost.example.cfg)及同目录 systemd/launchd/Windows 宿主模板。独立客户端固定地址，360秒/最多720次，故障前20条正确、恢复以连续10条正确确认；动作前后使用同一客户端单调时钟，保留故障时刻区间。现有演练目标为宿主/入口10秒、数据库30秒，总恢复清理窗口120秒；设施不满足时须在故障前记录目标与依据，不能事后放宽。
+
+**仍需提供唯一一组真实环境信息与权限：**应用宿主 A/B 的标识、OS/架构/资源/故障域和允许停启的范围；独立客户端及固定入口/VIP、备用入口、健康摘除/恢复与切换/撤销命令；独有测试 PG 的连接方式、主备/备份故障域、复制与数据丢失边界、可注入故障及选主/恢复/回滚命令；隔离测试数据、执行负责人及以上各动作的授权范围。凭据使用原有私密配置，不写进报告。在这些条件取得前仅保持材料就绪，不购买机器、不触碰真实业务库，也不用同机多进程冒充 A19 已验收。
+
+### R04 实际候选安装包
+
+本机已按原 `package-release.ps1` 重新构建匹配的 CLI、rlib/deps、TLS pack 和 VSIX，
+再由原 exporter 导出并实际解包验证。绑定源码 `8210e5200c466d9041807d04a68c1844ba9cbd6f`，
+包内仍为 `0.0.18` 的**未公开运行时候选**，不是更新已公开的 v0.0.18-r1。
+
+| 项目 | 实际结果 |
+| --- | --- |
+| macOS ARM64 | `ku-v0.0.18-aarch64-apple-darwin.tar.gz`，39,350,405 bytes |
+| SHA256 | `a6da51da3c31cbf5dfdf360c6754b57349a5aaee2f84c9ff22dd547e26b3c4d1` |
+| 安装检查 | 最终归档逐文件验证，270 项文件/187 项第三方文件；解包 CLI 的 version、check hello、run hello、run JSON 均通过 |
+| 关联服务 | 解包 CLI 构建原有多循环 fixture；/ok、/timer、/cpu 正文正确，实际 2 loops，Task 归零，drain 退出 0 |
+| 清理 | 临时解包/C/native 树、约 109 MB 重复 bundle 已删除；归档、manifest 和紧凑收据保留 |
+| Linux/Windows | 原 CI 39778863985 的 release-bundle、verify-release 是 skipped，无可复用安装包；仍需实际产物任务 |
+
+本机材料目录：`/Users/mac/Downloads/mac-candidate/8210e5200c466d9041807d04a68c1844ba9cbd6f/`。
+该处 `candidate-status.json`、安装 manifest、`service-smoke.json` 与 `cleanup.json` 各自保留证据，
+不会将 launcher 返回 0 或 CI 跳过当作产物成功。旧 CI 的生产/锁/打包输入与候选相同，但没有归档，
+因此不替代新产物验证。现有发布标签、Release 和官网均未更改。
+
+### T01—T08 跨语言对照准备
+
+新增永久基准位于 `tests/benchmarks/cross_stack/`，包含四栈业务服务、锁文件、三种黄金语料、
+公共 Go 负载端及 Linux cgroup 编排。固定协议及源码清单先于正式计时保存；正式成绩尚未填写。
+本轮 Linux 黄金检查已完成 28 个短窗口、224/224 正确请求，覆盖四栈的小响应、三种 JSON、
+CPU 校验、25ms timer 和私有 PostgreSQL 主键查询。它仅证明功能一致，不能用于性能排名。
+
+比较环境为同一 Ubuntu 24.04 ARM64/8 vCPU/4 GiB 虚拟机，服务总域占 CPU0—3、1 GiB，
+负载端 CPU4—6/1 GiB、私有 PG16 CPU7/512 MiB，均无 swap；另有 1/2 核及 256 MiB 档。
+这是虚拟机内同条件对照，不声称独占宿主物理核或证明裸机成绩。
+固定 Go1.27.2、Node24.18.0、Rust1.89.0（沿用仓库兼容工具链）、clang18，依赖锁和完整版本在构建收据中。
+
+已确认并保留两项能力差异：Ku JSON/DB 正文从现有有界同步后台执行，JSON 子树取值成本也计入；
+现有 native 文本响应头为 text/plain，另外三栈为 application/json。正文均真实 decode/构造/encode，
+不宣称完整响应头接口等同。CLI 当前不支持 Linux ARM64 自动链接，本基准对未修改的生成 C 显式
+使用 clang18/C11/O2/pthread 编译并记录原架构拒绝、C/ELF 哈希和动态依赖；这不新增官方发布平台。
+Ku 文件输入按实际程序相对基址布局，不修改生成 C 或运行时文件规则。
+
+正式容量、五轮尾延迟与成本、等待档位、10 分钟混合窗口及 T07 差距处理仍待执行。
+持续速率和两种过载只根据五轮正式合格点派生，不使用短探索候选冒充容量。
+JSON 旧默认、两个暂停模块、历史七次504和原36次内存验证保持原边界。

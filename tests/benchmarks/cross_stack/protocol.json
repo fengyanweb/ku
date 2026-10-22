@@ -1,0 +1,241 @@
+{
+  "schema": 1,
+  "status": "frozen_before_measurement",
+  "candidate_base": "8210e5200c466d9041807d04a68c1844ba9cbd6f",
+  "service": "HTTP/1.1 keep-alive, no compression/TLS/proxy",
+  "endpoints": {
+    "ok": {
+      "method": "GET",
+      "path": "/ok",
+      "expected": "ok:{rid}"
+    },
+    "json_object": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "object",
+      "expected": "new envelope {id:rid string,counter:input.counter+1,data:deep decoded input.data}"
+    },
+    "json_array": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "array"
+    },
+    "json_escape": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "escape"
+    },
+    "cpu": {
+      "method": "GET",
+      "path": "/work",
+      "work_units": [
+        480,
+        512,
+        544,
+        576
+      ],
+      "seed_lengths": [
+        1,
+        3,
+        7,
+        11
+      ],
+      "expected": "{rid}:{checksum:08d}"
+    },
+    "timer": {
+      "method": "GET",
+      "path": "/timer",
+      "milliseconds": 25,
+      "expected": "timer:{rid}"
+    },
+    "wait": {
+      "method": "GET",
+      "path": "/wait",
+      "milliseconds": 35000,
+      "expected": "wait:{rid}"
+    },
+    "tcp": {
+      "method": "GET",
+      "path": "/tcp",
+      "peer": "write K, read K after controlled release",
+      "expected": "tcp:{rid}"
+    },
+    "db": {
+      "method": "GET",
+      "path": "/db",
+      "query": "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
+      "keys": 1024,
+      "expected": "{id:int,label:str,score:int,rid:str}"
+    },
+    "mixed": {
+      "basis_points": {
+        "json_object": 7000,
+        "db": 2000,
+        "timer": 900,
+        "cpu": 100
+      },
+      "deterministic_schedule": "index mod100:0..69 JSON;70..89 DB;90..98 timer;99 CPU"
+    }
+  },
+  "cpu_algorithm": {
+    "integer": "signed64 in Ku/Go/Rust; Node exact Number intermediates <2^53",
+    "iterations": "work_units*1000",
+    "seed": "seed query string length",
+    "initial": "total=seed",
+    "step": "total=(total*33+i+seed)%100000000; i=0..iterations-1",
+    "overflow": "none by bounds; maximum intermediate <3.4e9",
+    "batch": {
+      "input": "batch.json",
+      "fields": {
+        "iterations": 512000,
+        "seed": 3,
+        "repeat": 64
+      },
+      "output": "{checksums:[int],compute_ms:monotonic milliseconds}",
+      "cold_start": "repeat=0 in a fresh process, reported separately; never subtracted from repeat=64"
+    }
+  },
+  "corpora": {
+    "object": {
+      "path": "corpora/object.json",
+      "bytes": 1048,
+      "sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "array": {
+      "path": "corpora/array.json",
+      "bytes": 937,
+      "sha256": "96e17f4ef99d04bede9f7208d0fa94f8b2f0dbeebc53c417e4b0624e7fda3ae1",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "escape": {
+      "path": "corpora/escape.json",
+      "bytes": 4116,
+      "sha256": "a5916fe82167409eb847eb0021da550a2c9bcaa224c80f1d62e91210dd72d8af",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    }
+  },
+  "database": {
+    "table": "cross_stack_items",
+    "columns": {
+      "id": "integer primary key",
+      "label": "text not null",
+      "score": "integer not null"
+    },
+    "rows": 1024,
+    "label": "item-<id>-中文🙂",
+    "score": "id*17",
+    "pool_total": 16,
+    "retry": false,
+    "cache_results": false,
+    "isolated_fixture_only": true
+  },
+  "resources": {
+    "service_cpu_counts": [
+      1,
+      2,
+      4
+    ],
+    "service_memory_bytes": 1073741824,
+    "small_memory_bytes": 268435456,
+    "service_domain": "whole cgroup including primary/workers/background/GC",
+    "service_cpuset": "0..cores-1",
+    "driver_cpuset": "4-6 if8vCPU available; actual written in environment manifest",
+    "database_cpuset": "7 if8vCPU available",
+    "cpu_max": "cores*100000 100000",
+    "memory_swap_max": 0,
+    "Ku_background_threads": 17,
+    "Ku_thread_budget": 64,
+    "Ku_HTTP_active": 1024,
+    "Ku_HTTP_pending": 128,
+    "Ku_HTTP_connections": 4096,
+    "Ku_task_bytes": 67108864,
+    "unmatched_admission_controls": "record actual native framework semantics; no artificial slow layer"
+  },
+  "SLO": {
+    "success_fraction_planned": 0.999,
+    "body_errors": 0,
+    "ok_p99_ms": 100,
+    "json_p99_ms": 100,
+    "cpu_p99_ms": 1000,
+    "db_p99_ms": 250,
+    "timer_p99_ms": 100,
+    "primary_latency": "scheduled-to-complete; sent-to-complete and schedule lag also shown",
+    "ordinary_absolute_timeout_seconds": 3,
+    "long_wait_timeout_seconds": 50,
+    "recovery_seconds": 5,
+    "ordinary_absolute_timeout_origin": "scheduled arrival, including client queue/dial/write/read and full response validation",
+    "waiting_server_absolute_timeout_ms": 45000,
+    "waiting_deadline_scope": "dedicated long-wait instances only; 35s timer / 30s TCP hold cannot fit ordinary server default30s; ordinary matrix unchanged"
+  },
+  "matrix": {
+    "warmup_seconds": 30,
+    "maximum_warmup_seconds": 120,
+    "formal_seconds": 30,
+    "formal_repeats": 5,
+    "capacity_explore_seconds": 5,
+    "maximum_boundary_refinements": 3,
+    "waiting_counts": [
+      32,
+      64,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "waiting_stop": "confirmed hard limit/SLO/resource failure; no higher fake capacity",
+    "wait_observation_seconds": 30,
+    "sustained_seconds": 600,
+    "sustained_rate": "60% of minimum nonzero five-round verified mixed capacity; mark partial-stack comparison if any stack has no verified qualified point; never use provisional short-window capacity",
+    "overload_multiple": 5,
+    "overload_seconds": 30,
+    "max_hotspots": 2,
+    "max_candidates_per_hotspot": 2,
+    "warmup_policy": "30 seconds once for every stack and CPU/memory/workload case; native services retained between interleaved rounds only after all actual jobs are drained",
+    "resume_prime_seconds": 3,
+    "inactive_services": "whole idle service cgroup frozen between interleaved rounds, freeze/resume history retained; 3s prime excluded uniformly",
+    "vm_memory_fallback": "if whole guest available memory falls below 800MiB while retaining idle services, restart every stack for that case and repeat uniform 30s warmup; record fallback",
+    "waiting_warmup": "all stacks: 30s at32rps of ordinary25ms timer before the held cohort; complete all responses before baseline"
+  },
+  "measurement": {
+    "histogram_resolution_us": 10,
+    "all_outcomes": "mutually exclusive; failed results never excluded from denominators",
+    "times": [
+      "scheduled_at",
+      "sent_at",
+      "completed_at"
+    ],
+    "late": "associated event, not second terminal count",
+    "events": "bounded streaming compressed CSV allowed; output overflow invalidates run",
+    "no_retry": true,
+    "small_tail_samples": "fewer than 100 correct observations has no p99; do not claim SLO compliance. Five formal round distributions are merged, never average percentiles",
+    "capacity_search_ceiling_rps": 100000,
+    "driver_headroom": "driver invalidity or CPU saturation censors server capacity; it is not a server capacity failure"
+  },
+  "known_capability_differences": {
+    "json_response_mime": {
+      "ku": "text/plain; charset=utf-8 via current native http.text; decoded/encoded body validated as JSON",
+      "go_rust_node": "application/json; charset=utf-8",
+      "claim": "body-equivalent business comparison; no claim of identical response-header API capability"
+    },
+    "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts."
+  }
+}
