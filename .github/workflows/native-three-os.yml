@@ -539,7 +539,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $env:PYTHONUTF8 = '1'
           $env:PATH = (Join-Path $env:PGROOT 'bin') + ';' + $env:PATH
-          & python -B tests/acceptance/http_pg_lifecycle.py `
+          cargo build --locked --release --example acceptance-runner
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance runner build failed' }
+          & (Join-Path $PWD 'target/release/examples/acceptance-runner.exe') 180 python -u -B tests/acceptance/http_pg_lifecycle.py `
             --ku (Join-Path $PWD 'target/release/ku.exe') --loops 4 `
             --output (Join-Path $env:RUNNER_TEMP 'ku-http-pg-lifecycle.json')
           if ($LASTEXITCODE -ne 0) { throw 'HTTP PostgreSQL lifecycle failed' }
