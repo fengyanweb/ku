@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'diagnose: bounded Linux diagnosis; capacity: Linux/macOS acceptance; all: both'
+        description: 'diagnose: bounded Linux diagnosis; capacity: full acceptance; all: both; waiting: affected waits only'
         type: choice
         default: diagnose
-        options: [diagnose, capacity, all]
+        options: [diagnose, capacity, all, waiting]
 
 permissions:
   contents: read
@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   capacity:
-    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["diagnose-multicore","run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["diagnose-multicore","run-multicore-capacity","run-multicore-all","run-multicore-waiting"]'), github.event.label.name)
     name: ${{ matrix.os }} ${{ inputs.scope }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -37,7 +37,7 @@ jobs:
       GOPROXY: "off"
       GOSUMDB: "off"
       KU_EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      KU_CAPACITY_SCOPE: ${{ inputs.scope || (github.event.label.name == 'diagnose-multicore' && 'diagnose' || github.event.label.name == 'run-multicore-all' && 'all' || 'capacity') }}
+      KU_CAPACITY_SCOPE: ${{ inputs.scope || (github.event.label.name == 'diagnose-multicore' && 'diagnose' || github.event.label.name == 'run-multicore-all' && 'all' || github.event.label.name == 'run-multicore-waiting' && 'waiting' || 'capacity') }}
 
     steps:
       - name: Check out the requested source exactly
@@ -72,7 +72,7 @@ jobs:
           PY
 
       - name: Install bounded loopback diagnostic tools on Linux
-        if: runner.os == 'Linux' && env.KU_CAPACITY_SCOPE != 'capacity'
+        if: runner.os == 'Linux' && env.KU_CAPACITY_SCOPE != 'capacity' && env.KU_CAPACITY_SCOPE != 'waiting'
         shell: bash
         run: |
           set -euo pipefail
@@ -137,7 +137,7 @@ jobs:
           retention-days: 30
 
   windows-regression:
-    if: (github.event_name == 'workflow_dispatch' && inputs.scope != 'diagnose') || contains(fromJSON('["run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
+    if: (github.event_name == 'workflow_dispatch' && inputs.scope != 'diagnose' && inputs.scope != 'waiting') || contains(fromJSON('["run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
     name: Windows affected native regressions
     runs-on: windows-2025
     timeout-minutes: 30
