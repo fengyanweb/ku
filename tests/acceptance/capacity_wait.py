@@ -706,7 +706,7 @@ def run_waiting(service, seconds=30):
             "limits": "Management and ordinary probes run on the selector's controlling thread; their bounded call time can delay client reads. This driver does not claim an independent arrival-rate clock or Task TCP capacity."}
 
 
-def run_connection_occupancy(service, seconds=5, levels=(64, 128, 256)):
+def run_connection_occupancy(service, seconds=30, levels=(64, 128, 256)):
     """Rotate bounded incomplete bodies; never count them as business requests."""
     if not 0 < seconds <= 30 or not levels or any(not 1 <= level <= 256 for level in levels):
         raise ValueError("occupancy requires 1..256 sockets and a 0..30 second window")
@@ -718,18 +718,15 @@ def run_connection_occupancy(service, seconds=5, levels=(64, 128, 256)):
         samples, probes = [], []
         before = process_sample(service.child.pid)
         attempt_limit = target * (math.ceil(seconds) + 2)
-        next_launch = began
         next_sample = began
-        maximum_lag = 0.0
         try:
             while time.monotonic() < began + seconds:
-                now = time.monotonic()
+                # Refill in finite batches, rather than spending the complete
+                # 1s server body deadline gradually creating the first cohort.
                 for _ in range(32):
-                    if now < next_launch or len(cohort.active) >= target or cohort.started + cohort.not_started >= attempt_limit:
+                    if len(cohort.active) >= target or cohort.started + cohort.not_started >= attempt_limit:
                         break
-                    maximum_lag = max(maximum_lag, now - next_launch)
                     cohort.launch()
-                    next_launch += 1 / target
                 cohort.pump(.02)
                 if time.monotonic() >= next_sample:
                     samples.append(_metrics(service, began))
@@ -747,21 +744,50 @@ def run_connection_occupancy(service, seconds=5, levels=(64, 128, 256)):
         valid = [row for row in samples if row.get("management_ok")]
         unexpected = {key: value for key, value in completion["counts"].items()
                       if key not in ("http_body_timeout", "http_rejected", "closed_by_generator_at_phase_end")}
+        # Active slots and the pending FIFO are disjoint native counters. One
+        # connection is conservatively deducted for the metrics request itself.
+        # A 256-client tier probes the configured admission boundary; it does
+        # not claim that 256 incomplete requests remain concurrently admitted.
+        minimum_occupancy = math.ceil(min(target, 128) * .9)
+        for row in valid:
+            row["partial_peer_occupancy_lower_bound"] = max(
+                0, row["connections"] + row["pending_connections"] - 1)
+        occupied = [row for row in valid
+                    if row["partial_peer_occupancy_lower_bound"] >= minimum_occupancy]
+        checks = {
+            "all_management_samples_valid": bool(valid) and len(valid) == len(samples),
+            "client_started_connected_and_sent_target": completion["started"] >= target
+                and completion["connected"] >= target
+                and completion["request_prefix_fully_sent"] >= target
+                and completion["not_started"] == 0,
+            "observed_real_body_wait_completion": completion["counts"].get("http_body_timeout", 0) > 0,
+            "half_samples_reach_declared_occupancy": len(occupied) >= max(1, math.ceil(len(valid) / 2)),
+            "late_window_reaches_declared_occupancy": any(row["at_seconds"] >= seconds * .8 for row in occupied),
+            "no_unexpected_outcomes": not unexpected,
+            "client_ledger_balanced": completion["ledger_balanced"],
+            "recovered": recovery["passed"],
+        }
         results.append({"target_client_socket_limit": target, "window_seconds": pressure_ended - began,
                         "total_phase_seconds": time.monotonic() - began,
                         "requested_window_seconds": seconds, "maximum_attempts": attempt_limit,
-                        "planned_start_rate_per_second": target, "maximum_launch_batch": 32,
+                        "formal_30_second_window": seconds == 30 and pressure_ended - began >= 30,
+                        "launch_policy": "Refill available client slots in batches of at most 32 per selector turn; finite attempt cap.",
+                        "maximum_launch_batch": 32,
                         "actual_started_per_second": completion["started"] / (pressure_ended - began),
-                        "maximum_start_schedule_lag_ms": maximum_lag * 1000,
                         "client": completion, "samples": samples, "ordinary_probes": probes,
+                        "minimum_partial_peer_occupancy": minimum_occupancy,
+                        "occupancy_samples_reaching_minimum": len(occupied),
+                        "valid_occupancy_samples": len(valid),
+                        "peak_partial_peer_occupancy_lower_bound": max(
+                            (row["partial_peer_occupancy_lower_bound"] for row in valid), default=0),
                         "peak_server_connections": max((row["connections"] for row in valid), default=0),
                         "peak_server_pending_connections": max((row["pending_connections"] for row in valid), default=0),
                         "complete_business_requests_from_partial_body_peers": 0,
                         "resources_before": before, "resources_waiting": during,
                         "resources_after": process_sample(service.child.pid), "recovery": recovery,
                         "unexpected_outcomes": unexpected,
-                        "passed": bool(valid) and all(row["management_ok"] for row in samples)
-                            and not unexpected and completion["ledger_balanced"] and recovery["passed"],
-                        "meaning": "Incomplete 4000-byte bodies (one byte sent), rotated around the fixture's 1s body deadline. Report observed peaks; the socket cap is not proof all sockets were concurrently held at the server. Phase-end generator closes are explicit and are not successes."})
+                        "checks": checks, "passed": all(checks.values()),
+                        "meaning": "Incomplete 4000-byte bodies (one byte sent), refilled around the fixture's unchanged 1s body deadline. At least half of management samples and one in the final 20% must witness the declared lower bound after deducting one management connection. The 64/128 tiers require at least 58/116; 256 is an admission-boundary probe requiring at least 116, not proof of 256 simultaneous peers. At least one complete 408 proves a real body wait; all-503 and zero-start runs fail. Phase-end generator closes are explicit and are not successes."})
     return {"levels": results, "selector_threads": 0, "maximum_client_sockets": max(levels),
+            "formal_30_second_windows": all(row["formal_30_second_window"] for row in results),
             "passed": all(row["passed"] for row in results)}

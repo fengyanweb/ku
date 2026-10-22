@@ -133,11 +133,13 @@ def compare(executable, baselines, client, root, checkpoint=None):
                  ("final_legacy", executable, "/cpu", "cpu-ready")),
             ):
                 for name, binary, path, expected in pair[::1 if repetition % 2 == 0 else -1]:
+                    concurrency = 8 if path == "/cpu" else 32
                     service = Service(binary, root, loops)
-                    row = {"variant": name, "loops": loops, "repetition": repetition}
+                    row = {"variant": name, "loops": loops, "repetition": repetition,
+                           "client_concurrency": concurrency}
                     try:
-                        row["warmup"] = run_client(service, client, path, expected, 1, concurrency=32 if "driver" in name else 8)
-                        row["measurement"] = run_client(service, client, path, expected, 5, concurrency=32 if "driver" in name else 8)
+                        row["warmup"] = run_client(service, client, path, expected, 1, concurrency=concurrency)
+                        row["measurement"] = run_client(service, client, path, expected, 5, concurrency=concurrency)
                     finally:
                         row["exit"] = service.stop()
                     result.append(row)
@@ -288,7 +290,7 @@ def capacity(ku, executable, client, root, args, save, peer):
         import statistics
         result["business_overload"] = run_pressure(service, client, path, expected, statistics.median(measured), seconds=30)
         save(result)
-        result["connection_occupancy"] = run_connection_occupancy(service)
+        result["connection_occupancy"] = run_connection_occupancy(service, seconds=30)
         save(result)
     finally:
         result["waiting_exit"] = service.stop()
@@ -329,8 +331,14 @@ def assessment(report):
     def client_headroom(row):
         m = row["measurement"]
         cpu = m.get("client_cpu", {}).get("seconds")
-        wall = m.get("server_delta", {}).get("observation_seconds", 0)
-        return isinstance(cpu, (int, float)) and wall > 0 and cpu / wall <= .5
+        # wait4 gives Go process-lifetime CPU. Its own measurement+cleanup wall
+        # is conservative (startup is not credited) and cannot be diluted by
+        # native/Python samples or a slow observer join after Go has exited.
+        wall = m.get("client", {}).get("timing", {}).get("with_cleanup_seconds")
+        return (isinstance(cpu, (int, float)) and not isinstance(cpu, bool)
+                and 0 <= cpu < float("inf")
+                and isinstance(wall, (int, float)) and not isinstance(wall, bool)
+                and 0 < wall < float("inf") and cpu / wall <= .5)
     checks = {
         "formal_cpu_plan": report["plan"]["duration"] == 30 and report["plan"]["warmup"] == 5 and report["plan"]["repeat"] == 3,
         "nine_correct_reconciled_samples": enough,
@@ -346,7 +354,8 @@ def assessment(report):
         "network_waiting": data.get("network_waiting", {}).get("passed") is True and data.get("network_waiting", {}).get("formal_30_second_window") is True,
         "hot_fairness": data.get("fairness", {}).get("passed") is True,
         "business_overload": data.get("business_overload", {}).get("passed") is True,
-        "connection_occupancy": data.get("connection_occupancy", {}).get("passed") is True,
+        "connection_occupancy": data.get("connection_occupancy", {}).get("passed") is True
+            and data.get("connection_occupancy", {}).get("formal_30_second_windows") is True,
         "waiting_service_exit": data.get("waiting_exit") == 0,
     }
     comparison = report.get("short_comparison", [])
