@@ -177,7 +177,7 @@ jobs:
         run: |
           rustup set profile minimal
           rustup toolchain install 1.89.0 --no-self-update
-          rustup component add clippy --toolchain 1.89.0
+          rustup component add clippy rustfmt --toolchain 1.89.0
           rustup default 1.89.0
           rustc --version --verbose
 
