@@ -2,6 +2,9 @@
 #if !defined(_WIN32)
 #include <sys/uio.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/select.h>
+#endif
 #define KU_HTTP_MAX_SEGS 64
 /* Longest accepted request target, pinned to the interpreter's
    MAX_REQUEST_TARGET_BYTES (src/stdlib/http.rs). A longer target is answered with
@@ -1202,6 +1205,39 @@ static void ku_http_condition_broadcast(KuHttpCondition* condition) {
   if (pthread_cond_broadcast(condition) != 0) { fputs("http queue condition broadcast failed\n", stderr); exit(1); }
 }
 static int ku_http_poll(KuHttpPollFd* items, size_t count, int timeout_ms) {
+#if defined(__APPLE__)
+  /* These private interests contain sockets only. Empty poll(0) calls dominate
+     ready-Task turns on Darwin. Use select only to prove that this turn has no
+     events; poll still supplies every positive/error result and all unsupported
+     or blocking cases. No I/O turn
+     or Task quantum is skipped, and no persistent kernel registration is kept. */
+  if (timeout_ms == 0 && items && count) {
+    fd_set reads, writes, exceptions;
+    FD_ZERO(&reads); FD_ZERO(&writes); FD_ZERO(&exceptions);
+    int nfds = 0, supported = 1;
+    for (size_t i = 0; i < count; i++) {
+      int fd = items[i].fd;
+      short events = items[i].events;
+      if (fd < 0) continue;
+      if (fd >= FD_SETSIZE || !(events & (POLLIN | POLLOUT))
+          || (events & ~(POLLIN | POLLOUT))) { supported = 0; break; }
+      if (events & POLLIN) FD_SET(fd, &reads);
+      if (events & POLLOUT) FD_SET(fd, &writes);
+      FD_SET(fd, &exceptions);
+      if (fd >= nfds) nfds = fd + 1;
+    }
+    if (supported) {
+      int previous_errno = errno;
+      struct timeval zero = {0, 0};
+      int ready = select(nfds, &reads, &writes, &exceptions, &zero);
+      errno = previous_errno;
+      if (ready == 0) {
+        for (size_t i = 0; i < count; i++) items[i].revents = 0;
+        return 0;
+      }
+    }
+  }
+#endif
   return poll(items, (nfds_t)count, timeout_ms);
 }
 static int ku_http_socket_nonblocking(KuHttpSocket socket_value) {

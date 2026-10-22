@@ -2958,5 +2958,176 @@
         "sha256": "66d8a7735197848ff561970012dd93adb54ae896a25141482b8e417bebfff36e"
       }
     ]
+  },
+  "mac_empty_poll_diagnosis_and_candidate": {
+    "scope": "One bounded instrumented diagnosis locates the interval, followed by a separate uninstrumented A/B/B/A. Neither is formal acceptance; no claim that OS scheduling versus kernel-internal wait has been uniquely distinguished. Only socket interests, no new event backend.",
+    "entries": [
+      {
+        "kind": "Conditional finite poll0 diagnosis after actual N1 low CPU reproduced; not acceptance",
+        "plan": {
+          "loops": 1,
+          "work_units": 512,
+          "concurrency": 32,
+          "seconds": 5,
+          "sampling_stride": 64,
+          "sample_limit_per_thread": 8192,
+          "fixed_thread_slots": 8,
+          "native_sample_seconds": 1,
+          "production_changed": false
+        },
+        "failure": null,
+        "cli_sha256": "12ee85d818105d8f0d99ac49dffa5c37252c876860b41e3040b9b9ee8bc2db8e",
+        "cli_variant": {
+          "sha256_matches_parent_verified_readiness_candidate": true,
+          "http_live_readiness_branch": "present in parent-verified CLI hash; both diagnostics use the same supplied candidate, not the earlier unpatched production CLI",
+          "source_identity_scope": "Recorded CLI hash and emitted C/native hashes; current Git HEAD is not substituted for binary provenance."
+        },
+        "build": {
+          "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+          "expanded_source_sha256": "58aac80177acd3863b5a28b7613c9541a43265f0fcf25ad63362f5ad1cbac0e6",
+          "native_sha256": "3adfb04eb1e8d41cb8b3214538efdaa85386833cacb4900424229f9aaed8be68",
+          "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-n1-poll0-ywr97f3b/.ku/build/release/c/ojR2me0hVD7oV43wtq05Z6REtCmZTJi-WwinbeMaodw/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-n1-poll0-ywr97f3b/capacity\n",
+          "generated_c_sha256": [
+            "426149f12ffcd365fdb7ea7e624160c2c49b00752c2f38f3c7841381736284d9"
+          ]
+        },
+        "instrumented_c_sha256": "7ce9802aa5126c8ca1b357facca5fef085471d39c5dfb2e0a8129c19dba78378",
+        "instrumented_native_sha256": "2fb6481e32b159b7f892dfb82ee6800f921fd16d89cd26d0970142758d2b18b9",
+        "summary": {
+          "zero_poll_calls": 192047,
+          "sampled_zero_poll_calls": 3000,
+          "sample_wall_ns": 40282000,
+          "sample_thread_cpu_ns": 7788198,
+          "sample_non_cpu_ns": 32493802,
+          "sample_non_cpu_fraction": 0.8066581103222283,
+          "mean_sample_wall_us": 13.427333333333333,
+          "mean_sample_thread_cpu_us": 2.596066,
+          "stride_extrapolated_non_cpu_seconds": 2.079603328,
+          "estimate_scope": "Extrapolation only; deterministic sparse samples and the one intrusive sample can perturb this window. It is not an exact sum for all poll calls.",
+          "observed_ready_task_range": [
+            31,
+            32
+          ],
+          "observed_resident_task_range": [
+            32,
+            32
+          ],
+          "sample_event_thread_poll_stack_hits": 57,
+          "sample_event_thread_total_stack_hits": 93,
+          "conclusion": "Substantial wall time without matching thread CPU occurs inside the zero-timeout poll call interval while 31-32 Tasks remain ready. This refutes ready-queue starvation as the cause of this sample. It does not uniquely distinguish kernel-internal waiting from OS descheduling during that call interval."
+        },
+        "temporary_directory_removed": true,
+        "raw_file": "mac-n1-512k-poll0-diagnosis.json",
+        "raw_sha256": "b9d8f086f3324915a5044f22c7c48148e87c1c86ba58fbb85de64e205217c2dd"
+      },
+      {
+        "kind": "Temporary generated-C macOS select-negative candidate; two interleaved 5-second A/B pairs, not acceptance",
+        "plan": {
+          "order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "A": "original poll",
+          "B": "negative select fast path; positive/error/unsupported falls back to original poll",
+          "seconds": 5,
+          "loops": 1,
+          "work_units": 512,
+          "concurrency": 32,
+          "production_changed": false,
+          "timing_probes": false,
+          "driver_quantum_unchanged": 64,
+          "http_pump_budget_unchanged": 32
+        },
+        "failure": null,
+        "cli_sha256": "12ee85d818105d8f0d99ac49dffa5c37252c876860b41e3040b9b9ee8bc2db8e",
+        "build": {
+          "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+          "expanded_source_sha256": "3374e954409e42325da363ab8311b27cf458128ec68eb62085ad26ed3770edb5",
+          "native_sha256": "a3856d3c379a0c6e64945e1148e168a47a82f6761f6d56fb05becf9d7ec1d7ea",
+          "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-select-negative-ab-h9vvbkwi/.ku/build/release/c/KwbfcT04AshKwNeCX7wKq55ahwpia9xAM0o_mal-YhU/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-select-negative-ab-h9vvbkwi/capacity\n",
+          "generated_c_sha256": [
+            "458dfe894310cb3d6ec8b9d1e9595e0136c36cdd75a9946dbad06e2674447193"
+          ]
+        },
+        "A": {
+          "generated_c_sha256": "458dfe894310cb3d6ec8b9d1e9595e0136c36cdd75a9946dbad06e2674447193",
+          "native_sha256": "5137a711d7c0df64df881f89a628d61f1e6a7d3aca91a7c73d5a5640ac293f80",
+          "flags": [
+            "-std=c11",
+            "-O2",
+            "-pthread"
+          ]
+        },
+        "B": {
+          "generated_c_sha256": "4834be9ee63c903aebbea6e3de9edb678e747c81ade063f5030746fb8bcdc82e",
+          "native_sha256": "8965ed8cbccd7be771ec7517296cd65319927fb2fe8f1151c43722658cf1966f",
+          "flags": [
+            "-std=c11",
+            "-O2",
+            "-pthread"
+          ]
+        },
+        "primary_sources": [
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/sys_socket.c",
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket2.c",
+          "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/select.2.html",
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/sys_generic.c"
+        ],
+        "review": "Actual ku_http_poll call sites contain sockets only. XNU socket read readiness includes pending errors/receive shutdown and write readiness includes errors/send shutdown. Invalid descriptors make select fail, causing original poll fallback. events=0 and flags outside POLLIN/POLLOUT reject the fast path. Positive revents always come from poll; a negative select clears stale revents. This source-based argument and smoke cases do not establish all kernel versions/devices.",
+        "review_limitations": [
+          "The actual C socket smoke used AF_UNIX socketpair and invalid descriptors. It did not cover TCP connect refusal/RST or TCP full send buffers during half-close; those are required permanent regressions before production inclusion.",
+          "Read/write event and error semantics were checked against current Apple open source, not a source-identical build of every deployed macOS kernel.",
+          "Both candidate and baseline used recorded release CLI hash and identically rebuilt generated C with -O2 -pthread. No 30-minute or complete platform acceptance is claimed.",
+          "Task resident count was checked after Go cleanup. Client connections are zero in the client ledger; Service then exits normally. No assertion that persistent server sockets were continuously zero before normal shutdown is made."
+        ],
+        "socket_smoke": "negative-read-write-eof-hup-invalid-event-fallback-ok",
+        "summary": {
+          "A": {
+            "correct_rps": [
+              34,
+              32
+            ],
+            "event_cores": [
+              0.5663475225037166,
+              0.5971795309240653
+            ],
+            "native_cpu_seconds": [
+              3.26,
+              3.1
+            ],
+            "go_cpu_seconds": [
+              0.028606,
+              0.027718
+            ],
+            "all_correct_and_reclaimed": true
+          },
+          "B": {
+            "correct_rps": [
+              64,
+              64
+            ],
+            "event_cores": [
+              0.959595825292727,
+              0.9612267467225306
+            ],
+            "native_cpu_seconds": [
+              5.13,
+              5.05
+            ],
+            "go_cpu_seconds": [
+              0.038659,
+              0.038612999999999995
+            ],
+            "all_correct_and_reclaimed": true
+          },
+          "median_rps_gain": 0.9393939393939394
+        },
+        "temporary_directory_removed": true,
+        "raw_file": "mac-select-negative-ab.json",
+        "raw_sha256": "368cd0aaa3a00cf6717022f4a95126af8ae526ac98c1f89a0da8d22eb2f3b907"
+      }
+    ]
   }
 }

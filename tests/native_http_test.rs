@@ -3688,6 +3688,198 @@ fn main(): null! {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn native_http_macos_zero_poll_preserves_real_socket_events_and_fallbacks() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let poll = format!(
+        "static int ku_http_poll({}",
+        runtime
+            .rsplit_once("static int ku_http_poll(")
+            .expect("POSIX HTTP poll")
+            .1
+            .split_once("static int ku_http_socket_nonblocking(")
+            .unwrap()
+            .0
+    );
+    // Both thin counters call the real OS. Positive revents come from the
+    // very poll call made by the helper, avoiding a second readiness snapshot.
+    let header = r#"
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/resource.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef struct pollfd KuHttpPollFd;
+static int poll_calls,select_calls,polled_result,polled_errno;
+static short polled_revents[3];
+static int counted_poll(struct pollfd* f,nfds_t n,int timeout) {
+ poll_calls++; polled_result=poll(f,n,timeout); polled_errno=errno;
+ for(nfds_t i=0;i<n && i<3;i++) polled_revents[i]=f[i].revents;
+ return polled_result;
+}
+static int counted_select(int n,fd_set* r,fd_set* w,fd_set* e,struct timeval* t) {
+ select_calls++; return select(n,r,w,e,t);
+}
+#define poll counted_poll
+#define select counted_select
+"#;
+    let checks = r#"
+#undef poll
+#undef select
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"zero-poll check line %d: %s (errno %d)\n",__LINE__,#c,errno); return 97; } } while(0)
+/* mode: 0=negative fast return; 1=select then original poll;
+ * 2=unsupported input bypasses select; 3=negative fd may be ignored/fallback;
+ * 4=readiness may change between the saturation probe and this call. */
+static int check_items(struct pollfd* f,nfds_t n,int timeout,int mode) {
+ for(nfds_t i=0;i<n;i++) f[i].revents=0x7fff;
+ poll_calls=select_calls=0; errno=EDOM;
+ int result=ku_http_poll(f,n,timeout),saved=errno;
+ if(mode==0) { CHECK(!result && !poll_calls && select_calls==1 && saved==EDOM); }
+ if(mode==1) { CHECK(poll_calls==1 && select_calls==1); }
+ if(mode==2) { CHECK(poll_calls==1 && !select_calls); }
+ if(mode==4) { CHECK(select_calls==1); }
+ if(poll_calls) {
+  CHECK(result==polled_result && saved==polled_errno);
+  for(nfds_t i=0;i<n;i++) CHECK(f[i].revents==polled_revents[i]);
+ } else {
+  CHECK(!result && saved==EDOM); for(nfds_t i=0;i<n;i++) CHECK(!f[i].revents);
+  if(mode!=4) {
+   struct pollfd reference[3]; memcpy(reference,f,n*sizeof(*f));
+   CHECK(poll(reference,n,0)==0); /* stable empty reads only */
+  }
+ }
+ return 0;
+}
+static int check_fd(int fd,short events,int timeout,int mode) {
+ struct pollfd item={fd,events,0}; return check_items(&item,1,timeout,mode);
+}
+static int nonblocking(int fd) {
+ int flags=fcntl(fd,F_GETFL,0); return flags<0 ? -1 : fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+}
+static int bound_socket(int type,struct sockaddr_in* address) {
+ int fd=socket(AF_INET,type,0); if(fd<0)return -1;
+ memset(address,0,sizeof(*address)); address->sin_family=AF_INET;
+ address->sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+ if(bind(fd,(struct sockaddr*)address,sizeof(*address))) {close(fd);return -1;}
+ socklen_t size=sizeof(*address);
+ if(getsockname(fd,(struct sockaddr*)address,&size) || nonblocking(fd)) {close(fd);return -1;}
+ return fd;
+}
+static int wait_ready(int fd,short events) {
+ struct pollfd item={fd,events,0}; return poll(&item,1,2000)>0 ? 0 : -1;
+}
+static int tcp_pair(int pair[2]) {
+ struct sockaddr_in address; int listener=bound_socket(SOCK_STREAM,&address);
+ CHECK(listener>=0 && listen(listener,4)==0);
+ pair[0]=socket(AF_INET,SOCK_STREAM,0); CHECK(pair[0]>=0 && !nonblocking(pair[0]));
+ int connected=connect(pair[0],(struct sockaddr*)&address,sizeof(address));
+ CHECK(!connected || errno==EINPROGRESS);
+ CHECK(!wait_ready(listener,POLLIN)); pair[1]=accept(listener,NULL,NULL); close(listener);
+ CHECK(pair[1]>=0 && !nonblocking(pair[1]));
+ int yes=1; CHECK(!setsockopt(pair[0],SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof(yes)));
+ CHECK(!setsockopt(pair[1],SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof(yes))); return 0;
+}
+int main(void) {
+ int pair[2]; char byte;
+ CHECK(!tcp_pair(pair));
+ CHECK(!check_fd(pair[0],POLLIN,0,0));
+ CHECK(!check_fd(pair[0],POLLOUT,0,1));
+ CHECK(send(pair[1],"K",1,0)==1 && !wait_ready(pair[0],POLLIN));
+ CHECK(!check_fd(pair[0],POLLIN,0,1)); CHECK(recv(pair[0],&byte,1,0)==1 && byte=='K');
+ CHECK(!shutdown(pair[1],SHUT_WR) && !wait_ready(pair[0],POLLIN));
+ CHECK(!check_fd(pair[0],POLLIN,0,1)); CHECK(recv(pair[0],&byte,1,0)==0);
+ close(pair[1]); CHECK(!check_fd(pair[0],POLLIN|POLLOUT,0,1));
+ CHECK(!check_fd(pair[0],POLLOUT,0,1)); close(pair[0]);
+
+ /* A bounded full TCP sender remains watched for write/error/hangup. */
+ CHECK(!tcp_pair(pair)); int small_buffer=4096;
+ CHECK(!setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&small_buffer,sizeof(small_buffer)));
+ CHECK(!setsockopt(pair[1],SOL_SOCKET,SO_RCVBUF,&small_buffer,sizeof(small_buffer)));
+ char payload[8192]={0}; size_t sent=0; int saturated=0;
+ for(int turn=0;turn<4096 && sent<8388608u;turn++) {
+  ssize_t count=send(pair[0],payload,sizeof(payload),0);
+  if(count>0) {sent+=(size_t)count;continue;}
+  CHECK(count<0 && (errno==EAGAIN || errno==EWOULDBLOCK));
+  struct pollfd item={pair[0],POLLOUT,0};
+  if(poll(&item,1,5)==0) {saturated=1;break;}
+ }
+ CHECK(saturated && sent>0); CHECK(!check_fd(pair[0],POLLOUT,0,4));
+ close(pair[1]); CHECK(!wait_ready(pair[0],POLLIN|POLLOUT));
+ CHECK(!check_fd(pair[0],POLLIN|POLLOUT,0,1)); close(pair[0]);
+
+ /* UDP wake receiver, and listener readiness without consuming accept. */
+ struct sockaddr_in address; int receiver=bound_socket(SOCK_DGRAM,&address);
+ int sender=socket(AF_INET,SOCK_DGRAM,0); CHECK(receiver>=0 && sender>=0);
+ CHECK(!connect(sender,(struct sockaddr*)&address,sizeof(address)));
+ CHECK(!check_fd(receiver,POLLIN,0,0)); CHECK(send(sender,"K",1,0)==1);
+ CHECK(!wait_ready(receiver,POLLIN) && !check_fd(receiver,POLLIN,0,1));
+ CHECK(recv(receiver,&byte,1,0)==1); CHECK(!check_fd(receiver,POLLIN,0,0));
+ int listener=bound_socket(SOCK_STREAM,&address); CHECK(listener>=0 && !listen(listener,4));
+ CHECK(!check_fd(listener,POLLIN,0,0)); int client=socket(AF_INET,SOCK_STREAM,0);
+ CHECK(client>=0 && !nonblocking(client)); int result=connect(client,(struct sockaddr*)&address,sizeof(address));
+ CHECK(!result || errno==EINPROGRESS); CHECK(!wait_ready(listener,POLLIN));
+ CHECK(!check_fd(listener,POLLIN,0,1)); int accepted=accept(listener,NULL,NULL);
+ CHECK(accepted>=0); close(accepted); close(client); close(listener);
+
+ /* Close a fresh loopback port before connecting: Darwin can keep SYNs
+  * pending while a bound socket has not yet called listen. */
+ int reservation=bound_socket(SOCK_STREAM,&address); CHECK(reservation>=0);
+ close(reservation);
+ client=socket(AF_INET,SOCK_STREAM,0); CHECK(client>=0 && !nonblocking(client));
+ result=connect(client,(struct sockaddr*)&address,sizeof(address));
+ CHECK(result<0 && (errno==EINPROGRESS || errno==ECONNREFUSED));
+ int in_progress=errno==EINPROGRESS;
+ CHECK(!wait_ready(client,POLLOUT)); CHECK(!check_fd(client,POLLOUT,0,1));
+ int error=0; socklen_t length=sizeof(error);
+ CHECK(!getsockopt(client,SOL_SOCKET,SO_ERROR,&error,&length));
+ CHECK(in_progress ? error==ECONNREFUSED : (error==0 || error==ECONNREFUSED));
+ close(client);
+
+ CHECK(!check_fd(receiver,0,0,2)); CHECK(!check_fd(receiver,POLLPRI,0,2));
+ CHECK(!check_fd(receiver,POLLIN,1,2)); CHECK(!check_fd(receiver,POLLIN|POLLPRI,0,2));
+ int invalid=dup(receiver); CHECK(invalid>=0); close(invalid);
+ CHECK(!check_fd(invalid,POLLIN,0,1)); CHECK(!check_fd(-1,POLLIN,0,3));
+ struct pollfd mixed[2]={{receiver,POLLIN,0},{-1,POLLOUT,0}};
+ CHECK(!check_items(mixed,2,0,0)); CHECK(!check_items(NULL,0,0,2));
+ struct rlimit original_limit,raised;
+ CHECK(!getrlimit(RLIMIT_NOFILE,&original_limit)); raised=original_limit;
+ if(raised.rlim_cur<=FD_SETSIZE) {raised.rlim_cur=FD_SETSIZE+1u;CHECK(raised.rlim_cur<=raised.rlim_max && !setrlimit(RLIMIT_NOFILE,&raised));}
+ int high=fcntl(receiver,F_DUPFD,FD_SETSIZE); CHECK(high>=FD_SETSIZE);
+ CHECK(!check_fd(high,POLLIN,0,2)); close(high);
+ CHECK(!setrlimit(RLIMIT_NOFILE,&original_limit));
+ close(receiver); close(sender); puts("macos-zero-poll-ok"); return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-macos-zero-poll");
+    let path = directory.path().join("poll.c");
+    fs::write(&path, format!("{header}{poll}{checks}")).unwrap();
+    let executable = native_c_harness::compile_harness(directory.path(), &path, "poll")
+        .expect("macOS socket regression requires the native C compiler");
+    let output = run_bounded(
+        &mut Command::new(&executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "macOS poll regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("macos-zero-poll-ok"));
+}
+
+#[test]
 fn native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let bridge = include_str!("../src/backend/c_task_http.rs");
