@@ -5,8 +5,10 @@ import io
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -189,6 +191,87 @@ class FixtureProcessContracts(unittest.TestCase):
                 stop = Mock()
                 fixture.cleanup_fixture({"status": "passed"}, output, None, None, Path(temporary) / "data", stop, False)
             stop.assert_not_called()
+
+
+class RecoveryHTTPDeadlineContracts(unittest.TestCase):
+    def exchange(self, chunks, interval, budget):
+        """A bounded real peer drips data faster than a per-read timeout."""
+        stop = threading.Event()
+        failures = []
+        sent = []
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(0.5)
+
+        def peer():
+            try:
+                with listener.accept()[0] as connection:
+                    connection.settimeout(0.5)
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        part = connection.recv(4096)
+                        if not part:
+                            return
+                        request += part
+                        if len(request) > 8192:
+                            raise AssertionError("fixture request exceeds bounded header")
+                    for chunk in chunks:
+                        connection.sendall(chunk)
+                        sent.append(chunk)
+                        if stop.wait(interval):
+                            break
+            except OSError as error:
+                if not stop.is_set():
+                    failures.append(error)
+
+        thread = threading.Thread(target=peer)
+        thread.start()
+        began = time.monotonic()
+        connection = fixture.DeadlineHTTPConnection("127.0.0.1", listener.getsockname()[1], began + budget)
+        try:
+            connection.request("GET", "/read")
+            response = connection.getresponse()
+            body = response.read()
+            fixture.deadline_remaining(connection.deadline)
+            return response.status, body
+        finally:
+            connection.close()
+            stop.set()
+            listener.close()
+            thread.join(timeout=0.6)
+            self.assertFalse(thread.is_alive(), "bounded peer must exit")
+            self.assertFalse(failures, failures)
+            self.assertLess(time.monotonic() - began, 0.8)
+            if interval:
+                self.assertGreaterEqual(len(sent), 3, "peer must make progress before total deadline")
+
+    def test_complete_response_within_absolute_budget(self):
+        self.assertEqual(self.exchange([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"], 0, 0.5),
+                         (200, b"ok"))
+
+    def test_dripping_headers_cannot_renew_the_absolute_budget(self):
+        with self.assertRaises((TimeoutError, socket.timeout)):
+            self.exchange([b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"X-Drip: "]
+                          + [b"x"] * 32 + [b"\r\n\r\nok"], 0.035, 0.13)
+
+    def test_dripping_body_cannot_renew_the_absolute_budget(self):
+        with self.assertRaises((TimeoutError, socket.timeout)):
+            self.exchange([b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n"]
+                          + [b"x"] * 32, 0.035, 0.13)
+
+    def test_expired_deadline_opens_no_socket(self):
+        connection = fixture.DeadlineHTTPConnection("127.0.0.1", 9, time.monotonic() - 1)
+        try:
+            with patch.object(fixture, "DeadlineSocket") as factory, self.assertRaises(TimeoutError):
+                connection.request("GET", "/read")
+            factory.assert_not_called()
+        finally:
+            connection.close()
+
+    def test_deadline_connection_does_not_add_dns_to_the_budget(self):
+        with self.assertRaises(ValueError):
+            fixture.DeadlineHTTPConnection("localhost", 9, time.monotonic() + 1)
 
 
 if __name__ == "__main__":

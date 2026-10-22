@@ -3101,6 +3101,14 @@ fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() 
         "static void ku_http_connection_write(",
         "static void ku_http_connection_observe_job(",
     );
+    let phases = region(
+        "enum {\n  KU_HTTP_IO_FREE = 0",
+        "typedef struct {\n  KuHttpSocket socket_value;",
+    );
+    let pressure = region(
+        "      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&",
+        "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)",
+    );
     let header = r#"
 #include <stdint.h>
 #include <stddef.h>
@@ -3127,20 +3135,25 @@ static ssize_t fixture_sendmsg(int,const struct msghdr*,int);
 typedef struct { int unused; } KuStruct___ku_http_response;
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr,"gather check failed at %d: %s\n",__LINE__,#condition); return 97; } } while (0)
 static int fixture_mode, fixture_error, fixture_completed, fixture_closed, fixture_close_reason;
+static int fixture_peeks, fixture_peek_result, fixture_peek_error;
+static struct { int count; } pending;
 static size_t fixture_calls, fixture_emitted, fixture_expected_length, fixture_max_bytes, fixture_max_vectors;
 static unsigned long long fixture_now;
 static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_body[300000];
 "#;
     let edges = r#"
-typedef struct { KuHttpSocket socket_value; unsigned long long deadline; KuHttpOutput output; } KuHttpConnection;
+typedef struct {
+  KuHttpSocket socket_value; unsigned long long deadline; KuHttpOutput output;
+  int phase,reused; size_t buffered,carry_length;
+} KuHttpConnection;
 typedef struct { int unused; } KuHttpServer;
-enum { KU_HTTP_CLOSE_WRITE_DEADLINE=1, KU_HTTP_CLOSE_PEER_WRITE=2 };
+enum { KU_HTTP_CLOSE_WRITE_DEADLINE=1, KU_HTTP_CLOSE_PEER_WRITE=2, KU_HTTP_CLOSE_IDLE_PRESSURE=3 };
 static unsigned long long ku_http_now_ms(void) { return fixture_now; }
 static int ku_http_socket_last_error(void) { return fixture_error; }
 static int ku_http_socket_error_interrupted(int error) { return error==FIXTURE_INTERRUPTED; }
 static int ku_http_socket_would_block(int error) { return error==FIXTURE_WOULD_BLOCK; }
 static void ku_http_count_transport_close(KuHttpConnection* connection,int reason) { (void)connection; fixture_close_reason=reason; }
-static void ku_http_connection_close(KuHttpConnection* connection) { (void)connection; fixture_closed++; }
+static void ku_http_connection_close(KuHttpConnection* connection) { connection->phase=KU_HTTP_IO_FREE; fixture_closed++; }
 static void ku_http_connection_next_request(KuHttpConnection* connection,KuHttpServer* server) {
   (void)connection; (void)server; fixture_completed++;
 }
@@ -3201,6 +3214,8 @@ static void fixture_reset(KuHttpConnection* connection,int mode) {
   memset(connection,0,sizeof(*connection));
   connection->socket_value=(KuHttpSocket)42; connection->deadline=1000;
   fixture_now=100; fixture_mode=mode; fixture_error=0; fixture_completed=fixture_closed=fixture_close_reason=0;
+  fixture_peeks=0; fixture_peek_result=-1; fixture_peek_error=FIXTURE_WOULD_BLOCK; pending.count=1;
+  connection->phase=KU_HTTP_IO_WRITE; connection->reused=1;
   fixture_calls=fixture_emitted=fixture_max_bytes=fixture_max_vectors=0;
   fixture_expected_length=0;
 }
@@ -3212,6 +3227,20 @@ static void fixture_part(KuHttpConnection* connection,const void* bytes,size_t l
   fixture_expected_length+=length;
 }
 "#;
+    // The same production pressure decision is run between output turns and
+    // at each admission state. recv is the only controlled readiness edge;
+    // the real-socket keep-alive regression below covers the wire lifecycle.
+    let pressure_edges = r#"
+static int fixture_recv(KuHttpSocket socket_value,char* byte,size_t length,int flags) {
+  if(socket_value!=(KuHttpSocket)42 || length!=1u || flags!=MSG_PEEK) abort();
+  fixture_peeks++; fixture_error=fixture_peek_error;
+  if(fixture_peek_result>0) *byte='G';
+  return fixture_peek_result;
+}
+#define recv fixture_recv
+static void fixture_pressure(KuHttpConnection* connection) {
+"#;
+    let pressure_end = "}\n#undef recv\n";
     let checks = r#"
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
@@ -3230,9 +3259,14 @@ int main(void) {
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_calls==3 && fixture_emitted==4 && !fixture_completed && !fixture_closed);
   CHECK(connection.output.part==1 && connection.output.offset==1 && connection.deadline==1000);
+  fixture_pressure(&connection);
+  CHECK(!fixture_peeks && !fixture_closed && connection.phase==KU_HTTP_IO_WRITE);
+  CHECK(connection.output.part==1 && connection.output.offset==1);
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_calls==6 && fixture_emitted==12 && !fixture_completed && !fixture_closed);
   CHECK(connection.output.part==3 && connection.output.offset==1 && connection.deadline==1000);
+  fixture_pressure(&connection);
+  CHECK(!fixture_peeks && !fixture_closed && connection.phase==KU_HTTP_IO_WRITE);
   ku_http_connection_write(&connection,&server);
   CHECK(fixture_emitted==12u+262144u && !fixture_completed && !fixture_closed);
   CHECK(connection.output.part==3 && connection.output.offset==262145u);
@@ -3255,12 +3289,50 @@ int main(void) {
   ku_http_connection_write(&connection,&server);
   CHECK(!fixture_calls && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_WRITE_DEADLINE);
   CHECK(!fixture_emitted && !fixture_completed && connection.deadline==1000);
+
+  /* A fully read previous response may become idle, but a successor already
+     queued in the kernel must survive the pressure decision without a read. */
+  fixture_reset(&connection,0); connection.phase=KU_HTTP_IO_HEADER; connection.reused=1;
+  pending.count=0; fixture_pressure(&connection);
+  CHECK(!fixture_peeks && !fixture_closed);
+  pending.count=1; fixture_peek_result=1; fixture_pressure(&connection);
+  CHECK(fixture_peeks==1 && !fixture_closed && connection.phase==KU_HTTP_IO_HEADER);
+  CHECK(!connection.buffered && !connection.carry_length && connection.deadline==1000);
+  fixture_peek_result=-1; fixture_peek_error=FIXTURE_INTERRUPTED; fixture_pressure(&connection);
+  CHECK(fixture_peeks==2 && !fixture_closed);
+  fixture_peek_error=FIXTURE_WOULD_BLOCK; fixture_pressure(&connection);
+  CHECK(fixture_peeks==3 && fixture_closed==1 && connection.phase==KU_HTTP_IO_FREE);
+  CHECK(fixture_close_reason==KU_HTTP_CLOSE_IDLE_PRESSURE && !fixture_completed);
+  fixture_reset(&connection,0); connection.phase=KU_HTTP_IO_HEADER; connection.reused=1;
+  fixture_peek_result=0; fixture_pressure(&connection);
+  CHECK(fixture_peeks==1 && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_IDLE_PRESSURE);
+
+  /* Already consumed header/carry bytes, a body, admitted work and pending
+     output are not idle. The original deadline and output cursor survive. */
+  for(int state=0;state<8;state++) {
+    fixture_reset(&connection,0); connection.reused=1;
+    if(state<2) { connection.phase=KU_HTTP_IO_HEADER; connection.buffered=state==0; connection.carry_length=state==1; }
+    else {
+      static const int phases[]={KU_HTTP_IO_BODY,KU_HTTP_IO_JOB,KU_HTTP_IO_ASYNC,
+        KU_HTTP_IO_WRITE,KU_HTTP_IO_REUSE_WAIT,KU_HTTP_IO_CLOSED_ASYNC};
+      connection.phase=phases[state-2];
+    }
+    connection.output.part=2; connection.output.offset=7;
+    int previous=connection.phase;
+    fixture_pressure(&connection);
+    CHECK(!fixture_peeks && !fixture_closed && connection.phase==previous);
+    CHECK(connection.deadline==1000 && connection.output.part==2 && connection.output.offset==7);
+  }
   puts("gather-write-ok"); return 0;
 }
 "#;
     let directory = native_c_harness::TempDir::new("http-gather-write");
     let path = directory.path().join("gather.c");
-    fs::write(&path, format!("{header}{output}{edges}{write}{checks}")).unwrap();
+    fs::write(
+        &path,
+        format!("{header}{output}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
+    )
+    .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "gather")
     else {
         assert!(
@@ -3394,6 +3466,23 @@ fn main(): null! {
         0,
         "idle reuse yields its active slot"
     );
+    // The old connection cannot acquire a new request after its observed
+    // pressure close. TCP may accept the local write before reporting FIN/RST.
+    let after_close = idle
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .and_then(|()| idle.read(&mut [0; 1]));
+    match after_close {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) => {}
+        other => panic!("closed idle socket must not process a successor: {other:?}"),
+    }
 
     // Fill the pending FIFO while one body is incomplete. Observing the
     // over-limit 503 is a real admission barrier, without scheduling sleeps.

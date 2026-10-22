@@ -28,6 +28,62 @@ sys.dont_write_bytecode = True
 from multiloop_load import process_sample
 
 
+def deadline_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("HTTP absolute recovery deadline exceeded")
+    return remaining
+
+
+class DeadlineSocket(socket.socket):
+    """One absolute budget, including every buffered HTTP receive and send."""
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+
+    def connect(self, address):
+        self.settimeout(deadline_remaining(self.deadline))
+        return super().connect(address)
+
+    def sendall(self, data, flags=0):
+        remaining = memoryview(data)
+        while remaining:
+            self.settimeout(deadline_remaining(self.deadline))
+            sent = super().send(remaining, flags)
+            if not sent:
+                raise ConnectionError("HTTP request write made no progress")
+            remaining = remaining[sent:]
+
+    def recv_into(self, buffer, nbytes=0, flags=0):
+        # socket.makefile -> SocketIO -> recv_into is the path used by
+        # http.client's buffered status/header/body readers. A socket timeout
+        # set only at connection creation would renew on every such read.
+        self.settimeout(deadline_remaining(self.deadline))
+        return super().recv_into(buffer, nbytes, flags)
+
+
+class DeadlineHTTPConnection(http.client.HTTPConnection):
+    """Private literal-IPv4 fixture connection; no DNS, tunnel or retry path."""
+
+    def __init__(self, host, port, deadline):
+        if host != "127.0.0.1":
+            raise ValueError("absolute-deadline fixture requires literal loopback IPv4")
+        super().__init__(host, port)
+        self.deadline = deadline
+
+    def connect(self):
+        deadline_remaining(self.deadline)  # Do not even open a socket after expiry.
+        connection = DeadlineSocket(self.deadline)
+        try:
+            connection.connect((self.host, self.port))
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except BaseException:
+            connection.close()
+            raise
+        self.sock = connection
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -429,14 +485,19 @@ def main():
                 entered = time.monotonic()
                 phase = (phase or report.get("acceptance_phase", "http:unknown"))[:128]
                 observation = {"phase": phase, "route": path[:256], "method": method[:16], "status": None,
-                               "body_prefix": None}
+                               "body_prefix": None, "started_monotonic": entered}
                 with request_lock:
                     if not args.performance_seconds:
                         observation["sequence"] = report.get("request_observations_total", 0) + 1
                         report["request_observations_total"] = observation["sequence"]
                     report["last_request"] = dict(observation)
-                timeout = 4 if deadline is None else min(4, max(0.001, deadline - entered))
-                connection = persistent or http.client.HTTPConnection("127.0.0.1", http_port, timeout=timeout)
+                if deadline is not None and persistent is not None:
+                    raise ValueError("absolute recovery deadline requires a distinct new connection")
+                request_deadline = None if deadline is None else min(entered + 4, deadline)
+                if request_deadline is not None:
+                    observation["absolute_deadline_monotonic"] = request_deadline
+                connection = persistent or (http.client.HTTPConnection("127.0.0.1", http_port, timeout=4)
+                    if request_deadline is None else DeadlineHTTPConnection("127.0.0.1", http_port, request_deadline))
                 try:
                     headers = {"X-Ku-Control-Token": control_token} if control else {}
                     if persistent is not None:
@@ -450,6 +511,11 @@ def main():
                                        body_prefix_raw_bytes=min(len(raw_body), 2048),
                                        body_bytes=len(raw_body), body_prefix_truncated=len(raw_body) > 2048)
                     body = raw_body.decode()
+                    if request_deadline is not None:
+                        # Buffered data may need no additional socket read.
+                        # Completion, decoding and scheduling still consume the
+                        # same absolute budget; late success is never accepted.
+                        deadline_remaining(request_deadline)
                     if response.status != 200:
                         raise RuntimeError(f"HTTP {response.status}: {observation['body_prefix']}")
                     return body
@@ -459,7 +525,8 @@ def main():
                 finally:
                     if persistent is None:
                         connection.close()
-                    observation["elapsed_seconds"] = time.monotonic() - entered
+                    observation["finished_monotonic"] = time.monotonic()
+                    observation["elapsed_seconds"] = observation["finished_monotonic"] - entered
                     with request_lock:
                         report["last_request"] = dict(observation)
                         if not args.performance_seconds:
@@ -609,7 +676,10 @@ def main():
                 # requests; no failed operation or write is replayed.
                 began = time.monotonic()
                 deadline = began + report["parameters"]["fault_recovery_deadline_seconds"]
-                recovery = {"observations": [], "recovered": False, "failed_request_replay": False}
+                recovery = {"observations": [], "recovered": False, "failed_request_replay": False,
+                            "started_monotonic": began, "absolute_deadline_monotonic": deadline,
+                            "start_event": "pg_terminate_backend returned and termination result recorded",
+                            "deadline_semantics": "one absolute 5s window; each new request has min(4s, remaining window), including connect/write/all reads"}
                 report["disconnect_recovery"] = recovery
                 allowed = {"error:" + code for code in report["parameters"]["disconnect_recovery_intermediate_errors"]}
                 for index in range(report["parameters"]["disconnect_recovery_max_new_reads"]):
@@ -627,6 +697,9 @@ def main():
                     recovery["recovered"] = time.monotonic() <= deadline
                     break
                 assert recovery["recovered"], recovery
+                recovery["finished_monotonic"] = time.monotonic()
+                recovery["elapsed_seconds"] = recovery["finished_monotonic"] - began
+                assert recovery["finished_monotonic"] <= deadline, recovery
                 report["checks"]["database_disconnect_recovery"] = {
                     "first": recovery["observations"][0]["body_prefix"], "next": "passed",
                     "new_read_requests": len(recovery["observations"]), "failed_request_replay": False}
