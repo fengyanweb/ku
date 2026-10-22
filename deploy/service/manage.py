@@ -238,7 +238,8 @@ def start(config, slot):
         # units for production ownership, with finite host restart intensity.
         OWNED_SUPERVISORS[slot["name"]] = subprocess.Popen(
             command(config, slot), env=environment(config, slot),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=config.get("_supervisor_stderr", {}).get(slot["name"], subprocess.DEVNULL))
     try:
         return wait_ready(config, slot, config["operation_timeout_seconds"])
     except BaseException:

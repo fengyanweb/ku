@@ -224,6 +224,90 @@ fn repeated_startup_failure_is_bounded_and_leaves_no_listener() {
     assert!(TcpStream::connect_timeout(&fixture.service, Duration::from_millis(100)).is_err());
 }
 
+#[test]
+fn reset_control_peers_leave_the_same_coordinator_and_generation_running() {
+    let mut fixture = start("normal", &[]);
+    wait_status(&mut fixture, |status| {
+        status.contains("\"phase\":\"ready\"") && status.contains("\"generation\":1")
+    });
+    // Queue a reset before the bounded control loop accepts the connection.
+    // Darwin can accept that fd, then reject its timeout setsockopt with EINVAL.
+    for _ in 0..4 {
+        let stream = TcpStream::connect_timeout(&fixture.control, Duration::from_millis(100))
+            .expect("connect isolated control peer");
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        (&linger as *const libc::linger).cast(),
+                        std::mem::size_of_val(&linger) as libc::socklen_t,
+                    )
+                },
+                0,
+                "configure reset peer: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{
+                setsockopt, WSAGetLastError, LINGER, SOL_SOCKET, SO_LINGER,
+            };
+            // Winsock uses two u16 fields, unlike Unix's two-int linger.
+            let linger = LINGER {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    setsockopt(
+                        stream.as_raw_socket() as _,
+                        SOL_SOCKET,
+                        SO_LINGER,
+                        (&linger as *const LINGER).cast(),
+                        std::mem::size_of_val(&linger) as i32,
+                    )
+                },
+                0,
+                "configure reset peer WSA error: {}",
+                unsafe { WSAGetLastError() }
+            );
+        }
+        drop(stream);
+    }
+    let status = wait_status(&mut fixture, |status| {
+        status.contains("\"phase\":\"ready\"") && status.contains("\"generation\":1")
+    });
+    assert!(status.contains("\"restarts\":0"), "{status}");
+    assert!(fixture.supervisor.try_wait().unwrap().is_none());
+    assert!(request(fixture.service, "GET", "/value", None)
+        .unwrap()
+        .ends_with("value=17"));
+    assert!(request(fixture.control, "POST", "/stop", Some(TOKEN))
+        .unwrap()
+        .starts_with("HTTP/1.1 202"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = fixture.supervisor.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "requested stop did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(TcpStream::connect_timeout(&fixture.service, Duration::from_millis(100)).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn supervisor_loss_retires_the_normal_native_service() {

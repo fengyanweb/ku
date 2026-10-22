@@ -519,12 +519,18 @@ fn service_stop(listener: &TcpListener, policy: &Policy, state: &Status) -> Resu
                 return Ok(false);
             }
             let response_timeout = policy.probe_timeout.min(Duration::from_millis(200));
-            stream
-                .set_read_timeout(Some(response_timeout))
-                .map_err(command_error)?;
-            stream
-                .set_write_timeout(Some(response_timeout))
-                .map_err(command_error)?;
+            // Accepted sockets can inherit the listener's nonblocking mode.
+            // A peer reset can also make timeout setup fail (Darwin EINVAL).
+            // Both setup and failure belong to this one bounded connection,
+            // not to the coordinator or its healthy managed service.
+            if stream
+                .set_nonblocking(false)
+                .and_then(|()| stream.set_read_timeout(Some(response_timeout)))
+                .and_then(|()| stream.set_write_timeout(Some(response_timeout)))
+                .is_err()
+            {
+                return Ok(false);
+            }
             let request = read_headers(&mut stream, MAX_CONTROL_REQUEST);
             let (code, body, stop) = match request {
                 Ok(request) if valid_control_token(&request, &policy.control_token) => {

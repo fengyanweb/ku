@@ -606,6 +606,7 @@ def main():
                                             "http_200": 0, "status_codes": []}}
     report["diagnostic"] = diagnostic
     known_owned = {}
+    supervisor_errors = {}
 
     def bounded_text(value, limit=256):
         text = str(value)
@@ -700,6 +701,12 @@ def main():
             config_path = root / "cluster.json"
             config_path.write_text(json.dumps(config_data))
             config = M.load(config_path)
+            # The supervisor only emits its final CLI error; native output is
+            # still discarded by ku service. Anonymous files avoid pipe-reader
+            # threads and preserve a bounded tail for a failed coordinator.
+            supervisor_errors = {slot["name"]: tempfile.TemporaryFile()
+                                 for slot in config["slots"]}
+            config["_supervisor_stderr"] = supervisor_errors
             report["parameters"] = {"service_options": config["service_options"], "deployment_budget": config["deployment_budget"],
                                     "recovery_deadline_seconds": 10, "operation_timeout_seconds": config["operation_timeout_seconds"],
                                     "proxy_threads": 1, "tls": "loopback HTTP only; no TLS in this isolated fixture"}
@@ -838,6 +845,15 @@ def main():
             diagnostic["owned_after_cleanup"] = owned_receipt()
             diagnostic["proxy_after_cleanup"] = (None if proxy is None else
                 {"pid": proxy.pid, "returncode": proxy.poll()})
+            diagnostic["supervisor_stderr_tails"] = {}
+            for name, capture in supervisor_errors.items():
+                try:
+                    capture.seek(0, os.SEEK_END)
+                    capture.seek(max(0, capture.tell()-8192))
+                    diagnostic["supervisor_stderr_tails"][name] = bounded_text(
+                        capture.read(8192).decode("utf-8", errors="replace"), 8192)
+                finally:
+                    capture.close()
             report["duration_seconds"] = round(time.monotonic() - started, 3)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
