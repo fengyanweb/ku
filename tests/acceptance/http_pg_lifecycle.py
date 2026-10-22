@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 sys.dont_write_bytecode = True
 from multiloop_load import process_sample
@@ -347,6 +348,8 @@ def main():
                              "tls": "disabled only inside isolated loopback fixture"},
               "checks": {}, "status": "running"}
     def progress(phase, **details):
+        if phase.startswith(("http:", "fault:")):
+            report["acceptance_phase"] = phase
         checkpoint(report, args.output, phase, **details)
 
     def execute(arguments, **kwargs):
@@ -359,6 +362,7 @@ def main():
         data = root / "data"
         service = None
         proxy = None
+        control_token = None
         started = False
         logs = root / "http.log"
         try:
@@ -417,6 +421,9 @@ def main():
                 service = subprocess.Popen([executable], cwd=root, env=environment, stdout=log, stderr=log)
 
             def request(path, method="GET", control=False, persistent=None):
+                observation = {"route": path[:256], "method": method[:16], "status": None,
+                               "body_prefix": None}
+                report["last_request"] = observation
                 connection = persistent or http.client.HTTPConnection("127.0.0.1", http_port, timeout=4)
                 try:
                     headers = {"X-Ku-Control-Token": control_token} if control else {}
@@ -424,7 +431,14 @@ def main():
                         headers["Connection"] = "keep-alive"
                     connection.request(method, path, headers=headers)
                     response = connection.getresponse()
-                    body = response.read(1024 * 1024).decode()
+                    observation["status"] = response.status
+                    raw_body = response.read(1024 * 1024)
+                    prefix = raw_body.replace(control_token.encode("ascii"), b"<control-token>")[:2048]
+                    observation.update(body_prefix=prefix.decode("utf-8", errors="replace"),
+                                       body_prefix_raw_bytes=min(len(raw_body), 2048),
+                                       body_bytes=len(raw_body), body_prefix_truncated=len(raw_body) > 2048)
+                    report["last_request"] = observation
+                    body = raw_body.decode()
                     if response.status != 200:
                         raise RuntimeError(f"HTTP {response.status}: {body}")
                     return body
@@ -510,8 +524,10 @@ def main():
                     "scope": "HTTP read -> Ku four-connection libpq client -> private PostgreSQL directly -> per-field JSON validation; no Python fault proxy; same-host fixed eight persistent HTTP clients; no failed-request replay or write faults"}
                 assert completed > 0 and not failures, report["throughput"]
             else:
+                progress("http:parameters-fields-unicode-null")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["parameters_fields_unicode_null"] = "passed"
+                progress("http:write-normal")
                 assert request("/insert/normal") == "中文🙂 payload"
                 if os.name == "nt":
                     # Retain the previous oracle's literal bytes as evidence;
@@ -538,34 +554,47 @@ def main():
                     "id_utf8_hex": b"normal".hex(), "payload_utf8_hex": payload_bytes.hex(),
                     "octet_length": len(payload_bytes)}], write_observation
                 report["checks"]["write_side_effect"] = "exactly one row"
+                progress("http:large-result")
                 assert request("/rows") == "10000:10000"
                 report["checks"]["large_result"] = "10000 rows, 2 columns, last row verified"
+                progress("fault:slow-query")
                 slow = request("/slow")
                 assert slow == "error:execution_unknown", slow
+                progress("fault:timeout-new-read")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["timeout_and_new_request_recovery"] = slow
+                progress("fault:acknowledgement-lost-write")
                 proxy.drop_insert.set()
                 unknown = request("/insert/lost")
                 assert proxy.dropped.wait(1) and unknown == "error:execution_unknown", unknown
+                progress("fault:acknowledgement-lost-side-effect")
                 count = sql("SELECT count(*) FROM ku_events WHERE id='lost'")
                 assert count == "1", count
+                progress("fault:acknowledgement-lost-new-read")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["commit_acknowledgement_lost"] = {"reported": unknown, "actual_rows": int(count), "replayed": False}
+                progress("fault:disconnect-terminate-backend")
                 sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'")
+                progress("fault:disconnect-first-read")
                 first = request("/read")
                 assert first.startswith("error:") or json.loads(first) == expected
+                progress("fault:disconnect-recovery-read")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["database_disconnect_recovery"] = {"first": first, "next": "passed"}
+                progress("fault:bounded-dependency-pressure")
                 with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
                     outcomes = list(pool.map(lambda _: request("/slow"), range(12)))
                 counts = {value: outcomes.count(value) for value in sorted(set(outcomes))}
                 assert all(value.startswith("error:") for value in outcomes), counts
+                progress("fault:bounded-dependency-pressure-new-read")
                 assert json.loads(request("/read")) == expected
                 report["checks"]["bounded_dependency_pressure_recovery"] = counts
+            progress("http:connection-accounting")
             connections = int(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'"))
             report["database_connections_after_dependency_pressure"] = connections
             assert connections <= 4, connections
             report["database_connections_before_exit"] = connections
+            progress("http:runtime-metrics")
             report["runtime_metrics"] = json.loads(request("/__ku/metrics", control=True))
             assert len(report["runtime_metrics"]["loops"]) == args.loops
             assert all(loop["requests"] for loop in report["runtime_metrics"]["loops"])
@@ -577,6 +606,7 @@ def main():
             if not args.performance_seconds:
                 assert database_metrics["confirmed_cancellations"] > 0
                 report["checks"]["cancel_confirmed_and_local_charge_retired"] = database_metrics["confirmed_cancellations"]
+            progress("http:normal-drain")
             request("/__ku/drain", method="POST", control=True)
             try:
                 service.wait(timeout=5)
@@ -586,12 +616,21 @@ def main():
                 raise RuntimeError("service did not terminate within 5 seconds")
             assert service.returncode == 0, service.returncode
             report["checks"]["normal_drain_exit"] = service.returncode
+            progress("http:connections-after-exit")
             assert sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'") == "0"
             report["checks"]["database_connections_after_exit"] = 0
             report["status"] = "checks_passed"
         except Exception as error:
             report["status"] = "failed"
-            report["failure"] = f"{type(error).__name__}: {error}"
+            failure = f"{type(error).__name__}: {error}"
+            if control_token:
+                failure = failure.replace(control_token, "<control-token>")
+            report["failure"] = failure[:2048]
+            report["failure_phase"] = report.get("acceptance_phase", report.get("current_phase", "unknown"))
+            report["failure_trace"] = [
+                {"file": Path(frame.filename).name[:128], "line": frame.lineno,
+                 "function": frame.name[:128]}
+                for frame in traceback.extract_tb(error.__traceback__, limit=-12)]
             if logs.is_file():
                 report["service_log_tail"] = logs.read_text(encoding="utf-8", errors="replace")[-8192:]
             raise
