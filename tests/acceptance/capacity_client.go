@@ -26,6 +26,8 @@ import (
 
 const histogramBuckets = 100001 // 0.1 ms, final bucket includes >= 10 seconds.
 const maxResponseHeaderBytes = 32768
+const errorSampleLimit = 24
+const errorSamplesPerCategory = 4
 
 type histogram struct {
 	buckets [histogramBuckets]uint64
@@ -95,6 +97,8 @@ type outcome struct {
 	bytesWritten                         uint64
 	writeCompleted                       bool
 	responseBytes                        int
+	responseHeaderBytes                  int
+	responseHeaderFramingComplete        bool
 }
 
 type ledger struct {
@@ -110,6 +114,8 @@ type ledger struct {
 	statuses                                  map[string]uint64
 	stages                                    map[string]uint64
 	failureKinds                              map[string]uint64
+	errorSamplesByCategory                    map[string]uint64
+	errorsObservedBySampleCategory            map[string]uint64
 	samples                                   []map[string]any
 	latency, successfulLatency, queueLatency  histogram
 	endToEndLatency, schedulerLag             histogram
@@ -121,7 +127,8 @@ type ledger struct {
 func newLedger() *ledger {
 	return &ledger{counts: map[string]uint64{"correct_success": 0, "http_rejected": 0,
 		"other_http_failure": 0, "transport_or_timeout_failure": 0, "unfinished_at_cutoff": 0},
-		statuses: make(map[string]uint64), stages: make(map[string]uint64), failureKinds: make(map[string]uint64)}
+		statuses: make(map[string]uint64), stages: make(map[string]uint64), failureKinds: make(map[string]uint64),
+		errorSamplesByCategory: make(map[string]uint64), errorsObservedBySampleCategory: make(map[string]uint64)}
 }
 
 func (l *ledger) start(j job, now time.Time) {
@@ -176,11 +183,22 @@ func (l *ledger) finish(j job, began time.Time, result outcome) {
 			l.correctInWindow++
 		}
 	}
-	if result.category != "correct_success" && len(l.samples) < 12 {
-		l.samples = append(l.samples, map[string]any{"request_id": j.id, "category": result.category,
-			"status": result.status, "stage": result.stage, "failure_kind": result.failureKind, "detail": result.detail,
-			"request_bytes_written": result.bytesWritten, "request_write_completed": result.writeCompleted,
-			"elapsed_ms": float64(now.Sub(began)) / 1e6})
+	if result.category != "correct_success" {
+		sampleCategory := result.category
+		if result.failureKind != "" {
+			sampleCategory += "/" + result.failureKind
+		}
+		l.errorsObservedBySampleCategory[sampleCategory]++
+		if len(l.samples) < errorSampleLimit && l.errorSamplesByCategory[sampleCategory] < errorSamplesPerCategory {
+			l.errorSamplesByCategory[sampleCategory]++
+			l.samples = append(l.samples, map[string]any{"request_id": j.id, "category": result.category,
+				"sample_category": sampleCategory, "status": result.status, "stage": result.stage,
+				"failure_kind": result.failureKind, "detail": result.detail,
+				"request_bytes_written": result.bytesWritten, "request_write_completed": result.writeCompleted,
+				"response_header_bytes_read":       result.responseHeaderBytes,
+				"response_header_framing_complete": result.responseHeaderFramingComplete,
+				"elapsed_ms":                       float64(now.Sub(began)) / 1e6})
+		}
 	}
 }
 
@@ -221,7 +239,7 @@ func boundedText(s string) string {
 	return s
 }
 
-func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, error) {
+func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, int, bool, error) {
 	// ReadResponse does not itself impose a total MIME header bound. Preserve
 	// its parser while bounding that input, including arbitrarily long lines.
 	header := make([]byte, 0, 1024)
@@ -229,14 +247,14 @@ func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, 
 	for {
 		part, err := reader.ReadSlice('\n')
 		if len(header)+len(part) > maxResponseHeaderBytes {
-			return nil, fmt.Errorf("response header exceeds %d bytes", maxResponseHeaderBytes)
+			return nil, len(header) + len(part), false, fmt.Errorf("response header exceeds %d bytes", maxResponseHeaderBytes)
 		}
 		header = append(header, part...)
 		if err != nil {
 			if errors.Is(err, bufio.ErrBufferFull) {
 				continue
 			}
-			return nil, err
+			return nil, len(header), false, err
 		}
 		line := header[lineStart:]
 		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
@@ -244,7 +262,8 @@ func readResponse(reader *bufio.Reader, request *http.Request) (*http.Response, 
 		}
 		lineStart = len(header)
 	}
-	return http.ReadResponse(bufio.NewReaderSize(io.MultiReader(bytes.NewReader(header), reader), 8192), request)
+	response, err := http.ReadResponse(bufio.NewReaderSize(io.MultiReader(bytes.NewReader(header), reader), 8192), request)
+	return response, len(header), true, err
 }
 
 func (w *worker) request(j job, began time.Time) (result outcome) {
@@ -312,7 +331,8 @@ func (w *worker) request(j job, began time.Time) (result outcome) {
 		return
 	}
 	result.writeCompleted = true
-	response, err := readResponse(w.reader, request)
+	response, headerBytes, headerComplete, err := readResponse(w.reader, request)
+	result.responseHeaderBytes, result.responseHeaderFramingComplete = headerBytes, headerComplete
 	if err != nil {
 		failAt("read_status", err)
 		return
@@ -614,7 +634,10 @@ func run(c config) map[string]any {
 			"goroutines_peak": resource.peakGoroutines,
 			"cpu_seconds":     nil, "cpu_note": "External process CPU sampling is required; Go heap counters are not RSS or total process memory."},
 		"first_errors": l.samples,
-		"scope":        "One planned operation is one GET attempt. HTTP 429/503 are rejection; other status or wrong body is other_http_failure. A request still running at cutoff is observed separately and classified exactly once after finite cleanup. No server capacity claim is inferred from planned or written counts.",
+		"error_sampling": map[string]any{"total_limit": errorSampleLimit, "per_sample_category_limit": errorSamplesPerCategory,
+			"retained_by_sample_category": l.errorSamplesByCategory, "observed_by_sample_category": l.errorsObservedBySampleCategory,
+			"read_status_scope": "Dial/write already succeeded; read_status covers reading and parsing the complete response headers, not just the status line or first byte. response_header_bytes_read counts header bytes consumed before that result."},
+		"scope": "One planned operation is one GET attempt. HTTP 429/503 are rejection; other status or wrong body is other_http_failure. A request still running at cutoff is observed separately and classified exactly once after finite cleanup. No server capacity claim is inferred from planned or written counts.",
 	}
 }
 

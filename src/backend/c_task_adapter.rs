@@ -1218,7 +1218,7 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
-    if (ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
+    if (ku_task_driver_begin_quantum(&instance->ticket,&instance->control)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
     status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
   }
 @RECONCILE_RETURN@

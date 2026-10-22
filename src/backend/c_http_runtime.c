@@ -1,4 +1,7 @@
 #define KU_NATIVE_RUNTIME_HTTP_SOCKET 1
+#if !defined(_WIN32)
+#include <sys/uio.h>
+#endif
 #define KU_HTTP_MAX_SEGS 64
 /* Longest accepted request target, pinned to the interpreter's
    MAX_REQUEST_TARGET_BYTES (src/stdlib/http.rs). A longer target is answered with
@@ -1544,6 +1547,51 @@ typedef struct {
   int count; int part;
   size_t offset;
 } KuHttpOutput;
+/* One bounded syscall publishes adjacent status/header/body slices together.
+   Sending the short status line separately can stall subsequent bytes until
+   a delayed ACK on a persistent TCP connection. These vectors borrow the
+   response owner's storage only for this synchronous nonblocking call. */
+static int ku_http_output_send(KuHttpSocket socket_value,const KuHttpOutput* output,size_t limit) {
+#if defined(_WIN32)
+  WSABUF vectors[9];
+#else
+  struct iovec vectors[9];
+#endif
+  size_t count=0, total=0;
+  if (limit>(size_t)65536) limit=(size_t)65536;
+  for (int part=output->part; part<output->count && count<9 && total<limit; part++) {
+    size_t offset=part==output->part ? output->offset : 0;
+    size_t length=output->parts[part].length-offset;
+    if (length>limit-total) length=limit-total;
+    if (!length) continue;
+#if defined(_WIN32)
+    vectors[count].buf=(CHAR*)(output->parts[part].bytes+offset);
+    vectors[count].len=(ULONG)length;
+#else
+    vectors[count].iov_base=(void*)(output->parts[part].bytes+offset);
+    vectors[count].iov_len=length;
+#endif
+    total+=length; count++;
+  }
+  if (!count) return 0;
+#if defined(_WIN32)
+  DWORD sent=0;
+  if (WSASend(socket_value,vectors,(DWORD)count,&sent,0,NULL,NULL)==SOCKET_ERROR) return -1;
+  return (int)sent;
+#else
+  struct msghdr message={0};
+  message.msg_iov=vectors; message.msg_iovlen=count;
+#if defined(__APPLE__)
+  /* Accepted sockets already use SO_NOSIGPIPE. */
+  ssize_t sent=sendmsg(socket_value,&message,0);
+#elif defined(MSG_NOSIGNAL)
+  ssize_t sent=sendmsg(socket_value,&message,MSG_NOSIGNAL);
+#else
+#error "std.http POSIX transport requires MSG_NOSIGNAL or SO_NOSIGPIPE"
+#endif
+  return (int)sent; /* The bounded vector sum is at most 65536. */
+#endif
+}
 enum {
   KU_HTTP_IO_FREE = 0, KU_HTTP_IO_HEADER = 1, KU_HTTP_IO_BODY = 2,
   KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
@@ -1841,10 +1889,8 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
       ku_http_connection_close(connection); return;
     }
     if (output->part >= output->count) { ku_http_connection_next_request(connection, server); return; }
-    KuHttpPart* part = &output->parts[output->part];
-    size_t remaining = part->length - output->offset;
-    if (remaining > (size_t)65536) remaining = (size_t)65536;
-    int sent = ku_http_socket_send(connection->socket_value, part->bytes + output->offset, remaining);
+    size_t remaining=(size_t)262144-bytes;
+    int sent=ku_http_output_send(connection->socket_value,output,remaining);
     if (sent < 0) {
       int error = ku_http_socket_last_error();
       if (ku_http_socket_error_interrupted(error)) continue;
@@ -1856,9 +1902,13 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
       ku_http_count_transport_close(connection,KU_HTTP_CLOSE_PEER_WRITE);
       ku_http_connection_close(connection); return;
     }
-    output->offset += (size_t)sent;
     bytes += (size_t)sent;
-    if (output->offset == part->length) { output->part++; output->offset = 0; }
+    size_t advanced=(size_t)sent;
+    while (advanced && output->part<output->count) {
+      size_t left=output->parts[output->part].length-output->offset;
+      if (advanced<left) { output->offset+=advanced; advanced=0; }
+      else { advanced-=left; output->part++; output->offset=0; }
+    }
   }
   if (output->part >= output->count) ku_http_connection_next_request(connection, server);
 }

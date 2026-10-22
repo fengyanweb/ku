@@ -459,6 +459,233 @@ int main(void) {
 }
 "#;
 
+#[test]
+fn native_task_quantum_default_preserves_wait_and_rejects_unregistered_pending() {
+    let generated = native(
+        "import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<512) { index=index+1 } time.sleep(1000)? return ok(index) } async fn InvalidPending(): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+    );
+    let invalid = "static uint32_t ku_task_1_resume(void* raw) {";
+    assert_eq!(generated.matches(invalid).count(), 1);
+    let generated = generated
+        .replacen(
+            invalid,
+            "static uint32_t ku_task_1_resume(void* raw) { (void)raw; return KU_TASK_CONTROL_PENDING; }\nstatic uint32_t ku_task_1_resume_original(void* raw) {",
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_unused_source_main(void) {",
+            1,
+        );
+    let source = generated
+        + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"quantum intent line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int invalid) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskValueV1 task={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  uint64_t deadline=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),
+    1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  CHECK((invalid ? ku_task_1_start_value(&driver,&task) : ku_task_0_start_value(&driver,&task))==KU_TASK_DRIVER_OK);
+  KuTaskDriverTicketV1 old=task.ticket;
+  /* An enclosing executor's TLS record must survive each nested pump. No
+   * stack record may remain published after its run_one has returned. */
+  KuTaskDriverExecutionV1 enclosing={0};
+  ku_task_driver_execution=&enclosing;
+  uint64_t next=UINT64_MAX;
+  uint32_t pumped=ku_task_driver_pump(&driver,0u,1u,&next);
+  CHECK(ku_task_driver_execution==&enclosing && !enclosing.default_yield);
+  if(invalid) {
+    CHECK(pumped==KU_TASK_DRIVER_INTERNAL && driver.fault==KU_TASK_DRIVER_INTERNAL);
+    CHECK(!driver.queued && driver.resident==1u && !slots[0].intent);
+    CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING);
+  } else {
+    CHECK(pumped==KU_TASK_DRIVER_OK && !driver.fault);
+    CHECK(driver.queued==1u && slots[0].intent==KU_TASK_DRIVER_YIELD && next==0u);
+    for(size_t turn=0;turn<256u && slots[0].timer_state!=KU_TASK_DRIVER_TIMER_ARMED;turn++) {
+      CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+      CHECK(ku_task_driver_execution==&enclosing);
+    }
+    CHECK(slots[0].timer_state==KU_TASK_DRIVER_TIMER_ARMED && driver.timers==1u);
+    CHECK(slots[0].intent==KU_TASK_DRIVER_WAIT && slots[0].state==KU_TASK_DRIVER_PARKED);
+    CHECK(!driver.queued && next!=UINT64_MAX && next>ku_task_driver_now_ms());
+  }
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  uint32_t closing=ku_task_driver_request_close(&driver,deadline);
+  CHECK(closing==(invalid ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_OK));
+  for(size_t turn=0;turn<32u && driver.workers_exited!=1u;turn++) {
+    pumped=ku_task_driver_pump(&driver,0u,1u,&next);
+    CHECK(pumped==(invalid ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_OK)
+      || (!invalid && pumped==KU_TASK_DRIVER_PENDING));
+    CHECK(ku_task_driver_execution==&enclosing && !enclosing.default_yield);
+  }
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers
+    && !driver.reserved_bytes && driver.workers_exited==1u);
+  CHECK(ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  ku_task_driver_execution=NULL;
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_case(0));
+  CHECK(!fixture_case(1));
+  puts("quantum-default-wait-invalid-pending-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-quantum-intent");
+    let path = directory.path().join("quantum_intent.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "quantum_intent") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "quantum-default-wait-invalid-pending-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_segments_keep_quantum_limits_and_explicit_intent_boundaries() {
+    let mut generated = native(
+        "import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<5000) { index=index+1 } return ok(index) } async fn Touch(): int! { time.sleep(0)? index=0; while(index<5000) { index=index+1 } return ok(index) } async fn main(): null! { return ok(null) }",
+    );
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    // A controlled monotonic clock makes segment-cap and boundary assertions
+    // deterministic. Real wall-clock fairness remains a separate HTTP gate.
+    generated = generated.replacen(
+        clock,
+        "static uint64_t fixture_clock=1000u;\nstatic size_t fixture_lock_entries,fixture_calls,fixture_last_lock,fixture_same_segment;\nstatic int fixture_mode,fixture_touch_seen,fixture_touch_boundary;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {",
+        1,
+    );
+    let lock = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
+    assert_eq!(generated.matches(lock).count(), 1);
+    generated = generated.replacen(lock, &format!("{lock}\n  fixture_lock_entries++;"), 1);
+    for id in 0..2 {
+        let signature = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        assert_eq!(generated.matches(&signature).count(), 1);
+        generated = generated.replacen(
+            &signature,
+            &format!(
+                r#"static uint32_t ku_task_{id}_resume_inner(void* raw);
+static uint32_t ku_task_{id}_resume(void* raw) {{
+  if(fixture_calls && fixture_last_lock==fixture_lock_entries) fixture_same_segment++;
+  if({id}u==1u && fixture_calls==1u)
+    fixture_touch_boundary=fixture_lock_entries>fixture_last_lock;
+  fixture_calls++;
+  uint32_t result=ku_task_{id}_resume_inner(raw);
+  if({id}u==1u && fixture_calls==1u)
+    fixture_touch_seen=ku_task_driver_execution && ku_task_driver_execution->intent_touched
+      && ku_task_driver_execution->cooperative_yield;
+  fixture_last_lock=fixture_lock_entries;
+  if(fixture_mode==2) fixture_clock++;
+  return result;
+}}
+static uint32_t ku_task_{id}_resume_inner(void* raw) {{"#
+            ),
+            1,
+        );
+    }
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    ) + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"segment boundary line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int mode) {
+  fixture_mode=mode;
+  fixture_calls=fixture_last_lock=fixture_same_segment=0;
+  fixture_touch_seen=fixture_touch_boundary=0;
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskValueV1 task={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  uint64_t deadline=fixture_clock+1000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),
+    1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  CHECK((mode==1 ? ku_task_1_start_value(&driver,&task) : ku_task_0_start_value(&driver,&task))==KU_TASK_DRIVER_OK);
+  KuTaskDriverTicketV1 old=task.ticket;
+  uint64_t next=UINT64_MAX;
+  if(mode==0) {
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+    CHECK(driver.polls==1u && driver.workers[0].polls==1u && fixture_calls==1u);
+    CHECK(driver.queued==1u && next==0u);
+  }
+  uint64_t before_polls=driver.polls;
+  size_t before_calls=fixture_calls, before_locks=fixture_lock_entries;
+  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.polls-before_polls==32u && fixture_calls-before_calls==32u);
+  CHECK(driver.workers[0].polls==driver.polls && driver.queued==1u && next==0u);
+  if(mode==0) {
+    CHECK(fixture_same_segment==31u);
+    CHECK(fixture_lock_entries-before_locks==2u);
+  } else if(mode==1) {
+    CHECK(fixture_touch_seen && fixture_touch_boundary);
+    CHECK(fixture_same_segment==30u);
+  } else {
+    CHECK(!fixture_same_segment && fixture_lock_entries-before_locks==33u);
+  }
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers
+    && !driver.reserved_bytes && driver.workers_exited==1u && !driver.fault);
+  CHECK(!ku_task_driver_execution && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+int main(void) {
+  for(int mode=0;mode<3;mode++) CHECK(!fixture_case(mode));
+  puts("task-segment-quantum-intent-clock-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-segment-boundaries");
+    let path = directory.path().join("segments.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "segments") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-segment-quantum-intent-clock-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 const MOVES_AND_AWAITS: &str = r#"
 async fn main(): null! {
     first = Child(3)

@@ -11,11 +11,18 @@ import http.client
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import platform
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 from multiloop_load import process_sample
 from runtime_matrix import cpu_sample
@@ -26,6 +33,193 @@ SAMPLE_LIMIT = 128
 ERROR_LIMIT = 12
 CLIENT_OUTPUT_LIMIT = 1024 * 1024
 REQUEST_TIMEOUT_MS = 3000
+
+
+def _small_text(path, limit=4096):
+    with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+        value = handle.read(limit + 1)
+    if len(value) > limit:
+        raise ValueError("environment input exceeds fixed read limit: " + str(path))
+    return value.strip()
+
+
+def measurement_environment(native_pid=None):
+    """Visible CPU bounds, including every visible cgroup-v2 ancestor.
+
+    This records shared-host capacity, never a reservation for the native
+    process. Hidden host ancestors, other tenants and macOS thread placement
+    cannot be established by reading the guest's logical CPU count.
+    """
+    result = {"platform": platform.platform(), "machine": platform.machine(),
+              "python_version": sys.version.split()[0], "logical_cpus": os.cpu_count(),
+              "same_host_generator": True, "exclusive_cpu_reservation": False,
+              "errors": [], "native_pid": native_pid}
+    limits = []
+    if result["logical_cpus"]:
+        limits.append(result["logical_cpus"])
+    if hasattr(os, "sched_getaffinity"):
+        for name, pid in (("observer_affinity", 0), ("native_affinity", native_pid)):
+            if pid is None:
+                continue
+            try:
+                affinity = sorted(os.sched_getaffinity(pid))
+                result[name] = affinity
+                if not affinity:
+                    raise ValueError("empty CPU affinity")
+                limits.append(len(affinity))
+            except (OSError, ValueError) as error:
+                result["errors"].append(name + ": " + str(error)[:160])
+    else:
+        result["affinity_scope"] = "The platform exposes no sched_getaffinity; owner thread placement is not established."
+    if platform.system() == "Linux":
+        try:
+            memberships = _small_text("/proc/self/cgroup", 16384)
+            result["observer_cgroup_membership"] = memberships
+            membership = next(line.split(":", 2)[2] for line in memberships.splitlines() if line.startswith("0::"))
+            if native_pid is not None:
+                native_memberships = _small_text(f"/proc/{native_pid}/cgroup", 16384)
+                result["native_cgroup_membership"] = native_memberships
+                if native_memberships != memberships:
+                    raise ValueError("native and observer cgroup membership differ; their CPU quotas need separate analysis")
+            mounts = []
+            for line in _small_text("/proc/self/mountinfo", 1048576).splitlines():
+                before, after = line.split(" - ", 1)
+                if after.split()[0] != "cgroup2":
+                    continue
+                fields = before.split()
+                decode = lambda value: value.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+                mount_root = PurePosixPath(decode(fields[3]))
+                try:
+                    relative = PurePosixPath(membership).relative_to(mount_root)
+                except ValueError:
+                    continue
+                mounts.append((len(mount_root.parts), mount_root, Path(decode(fields[4])), relative))
+            if not mounts:
+                raise ValueError("no cgroup-v2 mount maps the current membership")
+            _, mount_root, mount_point, relative = max(mounts, key=lambda row: row[0])
+            mount_point = mount_point.resolve()
+            current = (mount_point / str(relative)).resolve()
+            current.relative_to(mount_point)
+            result["cgroup_v2_mount"] = {"root": str(mount_root), "point": str(mount_point)}
+            ancestors = []
+            for _ in range(64):
+                row = {"path": str(current)}
+                maximum = current / "cpu.max"
+                try:
+                    cpu_max = _small_text(maximum)
+                except FileNotFoundError:
+                    cpu_max = None  # Root/controller files can be absent.
+                if cpu_max is not None:
+                    row["cpu_max"] = cpu_max
+                    quota, period = row["cpu_max"].split()
+                    if int(period) <= 0:
+                        raise ValueError("invalid cgroup CPU period")
+                    if quota != "max":
+                        if int(quota) <= 0:
+                            raise ValueError("invalid cgroup CPU quota")
+                        row["quota_cpus"] = int(quota) / int(period)
+                        limits.append(row["quota_cpus"])
+                for name in ("cpuset.cpus.effective", "cpu.stat"):
+                    if (current / name).is_file():
+                        row[name] = _small_text(current / name)
+                ancestors.append(row)
+                if current == mount_point:
+                    break
+                current = current.parent
+            else:
+                raise ValueError("cgroup ancestor traversal exceeded fixed 64-level bound")
+            result["visible_cgroup_v2_ancestors"] = ancestors
+            result["quota_scope"] = "All visible ancestors of this mapped cgroup-v2 mount. Host ancestors outside the namespace remain unobservable; cpu.stat values are cumulative snapshots."
+        except (OSError, ValueError, StopIteration, IndexError) as error:
+            result["errors"].append("Linux CPU limits: " + str(error)[:256])
+        try:
+            cpuinfo = _small_text("/proc/cpuinfo", 2097152)
+            packages, cores, models = set(), set(), set()
+            for block in cpuinfo.split("\n\n"):
+                values = dict(line.split(":", 1) for line in block.splitlines() if ":" in line)
+                values = {key.strip(): value.strip() for key, value in values.items()}
+                if "physical id" in values and "core id" in values:
+                    packages.add(values["physical id"])
+                    cores.add((values["physical id"], values["core id"]))
+                if "model name" in values:
+                    models.add(values["model name"])
+            result["cpu_models"] = sorted(models)[:8]
+            result["visible_physical_cores"] = len(cores) if cores else None
+            result["visible_cpu_packages"] = len(packages) if packages else None
+            result["topology_scope"] = "Guest-visible /proc/cpuinfo topology, not a dedicated-host reservation or affinity-filtered physical core count."
+            result["cpu_pressure"] = _small_text("/proc/pressure/cpu")
+            result["load_average"] = _small_text("/proc/loadavg")
+        except (OSError, ValueError) as error:
+            result["topology_note"] = str(error)[:256]
+    elif platform.system() == "Darwin":
+        keys = ["hw.physicalcpu", "hw.logicalcpu", "hw.memsize", "hw.model", "machdep.cpu.brand_string"]
+        keys += [f"hw.perflevel{level}.{field}" for level in range(2)
+                 for field in ("name", "physicalcpu", "logicalcpu")]
+        try:
+            query = subprocess.run(["sysctl", *keys], capture_output=True, text=True, timeout=3)
+            result["sysctl"] = dict(line.split(": ", 1) for line in query.stdout[:8192].splitlines() if ": " in line)
+            result["sysctl_optional_missing"] = query.stderr[:1024]
+            logical = result["sysctl"].get("hw.logicalcpu")
+            if logical is not None:
+                limits.append(int(logical))
+            result["quota_scope"] = "Native macOS has no Linux cgroup quota. Logical contexts can include performance/efficiency clusters; placement, frequency and other host work are not controlled."
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            result["errors"].append("macOS CPU metadata: " + str(error)[:256])
+    else:
+        result["errors"].append("CPU quota traversal is not implemented on this measurement platform")
+    result["effective_visible_cpu_bound"] = min(limits) if limits and not result["errors"] else None
+    result["capacity_bound_scope"] = "Upper bound from visible logical CPUs, affinity and quotas; the Go client, Python observer and sampler subprocesses share it with the native service. It is not a count of equivalent dedicated performance cores."
+    return result
+
+
+def _observer_usage():
+    result = {"monotonic": time.monotonic(), "python_cpu_seconds": time.process_time()}
+    if resource is None:
+        result["rusage_unavailable"] = True
+        return result
+    fields = ("ru_utime", "ru_stime", "ru_maxrss", "ru_minflt", "ru_majflt",
+              "ru_nvcsw", "ru_nivcsw", "ru_inblock", "ru_oublock")
+    try:
+        for name, who in (("self", resource.RUSAGE_SELF), ("waited_children", resource.RUSAGE_CHILDREN)):
+            usage = resource.getrusage(who)
+            result[name] = {field: getattr(usage, field) for field in fields}
+    except (OSError, ValueError) as error:
+        result["rusage_error"] = type(error).__name__ + ": " + str(error)[:160]
+    return result
+
+
+def _observer_cost(before, after, generator_usage, sampler_cost):
+    errors = []
+    wall = _delta(before["monotonic"], after["monotonic"], "observer.wall", errors)
+    python_cpu = _delta(before["python_cpu_seconds"], after["python_cpu_seconds"], "observer.python_cpu", errors)
+    result = {"before": before, "after": after, "wall_seconds": wall,
+              "python_cpu_seconds": python_cpu,
+              "python_average_cores": python_cpu / wall if python_cpu is not None and wall else None,
+              "sampler_thread": dict(sampler_cost),
+              "max_rss_scope": "RUSAGE_SELF ru_maxrss is the Python process lifetime high-water mark, not this phase's incremental peak; bytes on macOS, KiB on Linux."}
+    if before.get("rusage_error") or after.get("rusage_error"):
+        errors.append("observer rusage snapshot failed")
+    children = []
+    for key in ("ru_utime", "ru_stime"):
+        if "waited_children" in before and "waited_children" in after:
+            children.append(_delta(before["waited_children"].get(key), after["waited_children"].get(key), "observer.waited_children." + key, errors))
+    children_cpu = sum(children) if len(children) == 2 and all(value is not None for value in children) else None
+    result["all_waited_child_cpu_seconds"] = children_cpu
+    generator_cpu = generator_usage.ru_utime + generator_usage.ru_stime if generator_usage is not None else None
+    result["generator_wait4_cpu_seconds"] = generator_cpu
+    other_cpu = None
+    if children_cpu is not None and generator_cpu is not None:
+        if children_cpu + 1e-6 < generator_cpu:
+            errors.append("waited child CPU is less than exact generator CPU")
+        else:
+            other_cpu = max(0, children_cpu - generator_cpu)
+    result["other_waited_child_cpu_seconds"] = other_cpu
+    total = python_cpu + other_cpu if python_cpu is not None and other_cpu is not None else None
+    result["observer_and_waited_tools_cpu_seconds"] = total
+    result["observer_and_waited_tools_average_cores"] = total / wall if total is not None and wall else None
+    result["scope"] = "Python process CPU includes its main and observer threads. RUSAGE_CHILDREN delta includes reaped Go and ps/lsof tools; subtracting exact wait4 Go CPU leaves tools plus any other concurrently reaped children. Live/unreaped children and unrelated host processes are excluded. The sampler thread CPU is a subset of Python CPU, never added twice."
+    result["errors"] = errors[:ERROR_LIMIT]
+    return result
 
 
 def checksum(work_units, seed=3):
@@ -221,10 +415,13 @@ def run_client(service, client_path, path, expected, seconds, concurrency=32, ra
     if not isinstance(expected, str):
         raise TypeError("expected must be text or UTF-8 bytes")
     client_path = Path(client_path).resolve(strict=True)
+    observer_before = _observer_usage()
+    execution_environment = measurement_environment(service.child.pid)
     initial = _metric_snapshot(service)
     native_before = _process_snapshot(service.child.pid, with_cpu=True)
     report = {"status": "running", "path": path, "seconds": seconds,
               "service_before": initial, "native_before": native_before,
+              "measurement_environment": execution_environment,
               "sampling": {"interval_seconds": SAMPLE_INTERVAL_SECONDS, "retained_samples_limit": SAMPLE_LIMIT}}
     samples = deque(maxlen=SAMPLE_LIMIT)
     sample_errors = []
@@ -238,6 +435,8 @@ def run_client(service, client_path, path, expected, seconds, concurrency=32, ra
     sampler = None
     usage = None
     timed_out = False
+    sampler_cost = {"thread_cpu_seconds": None,
+                    "scope": "Observer thread CPU only, excluding waited ps/lsof subprocesses; a subset of Python process CPU."}
     began = time.monotonic()
 
     def observe_resource(name, snapshot):
@@ -248,35 +447,51 @@ def run_client(service, client_path, path, expected, seconds, concurrency=32, ra
 
     def sample():
         nonlocal sample_count, maximum_sample_seconds, client_last_live
-        next_sample = time.monotonic()
-        while not stop_sampler.wait(max(0, next_sample - time.monotonic())):
-            sample_began = time.monotonic()
-            row = {"elapsed_seconds": sample_began - began}
-            try:
-                metrics = _metric_snapshot(service)
-                row["metric_duration_ms"] = metrics["duration_ms"]
-                row["metrics"] = _compressed(metrics["metrics"])
-                for key, value in row["metrics"].items():
-                    peaks[key] = max(value, peaks.get(key, value))
-            except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
-                row["metrics_error"] = type(error).__name__ + ": " + str(error)[:256]
-                if len(sample_errors) < ERROR_LIMIT:
-                    sample_errors.append(row["metrics_error"])
-            native = _process_snapshot(service.child.pid)
-            row["native"] = native["value"]
-            observe_resource("native", native)
-            client = _process_snapshot(child.pid, with_cpu=True)
-            row["client"] = client["value"]
-            observe_resource("client", client)
-            if _number(client["value"].get("cpu_seconds")):
-                client_last_live = client
-            row["sample_duration_seconds"] = time.monotonic() - sample_began
-            maximum_sample_seconds = max(maximum_sample_seconds, row["sample_duration_seconds"])
-            samples.append(row)
-            sample_count += 1
-            next_sample += SAMPLE_INTERVAL_SECONDS
-            if next_sample < time.monotonic():
-                next_sample = time.monotonic() + SAMPLE_INTERVAL_SECONDS
+        thread_clock = getattr(time, "thread_time", None)
+        cpu_began = thread_clock() if thread_clock is not None else None
+        try:
+            next_sample = time.monotonic()
+            while not stop_sampler.wait(max(0, next_sample - time.monotonic())):
+                sample_began = time.monotonic()
+                row = {"elapsed_seconds": sample_began - began}
+                try:
+                    metrics = _metric_snapshot(service)
+                    row["metric_duration_ms"] = metrics["duration_ms"]
+                    row["metrics"] = _compressed(metrics["metrics"])
+                    for key, value in row["metrics"].items():
+                        peaks[key] = max(value, peaks.get(key, value))
+                except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
+                    row["metrics_error"] = type(error).__name__ + ": " + str(error)[:256]
+                    if len(sample_errors) < ERROR_LIMIT:
+                        sample_errors.append(row["metrics_error"])
+                native = _process_snapshot(service.child.pid)
+                row["native"] = native["value"]
+                observe_resource("native", native)
+                client = _process_snapshot(child.pid, with_cpu=True)
+                row["client"] = client["value"]
+                observe_resource("client", client)
+                if _number(client["value"].get("cpu_seconds")):
+                    client_last_live = client
+                row["sample_duration_seconds"] = time.monotonic() - sample_began
+                maximum_sample_seconds = max(maximum_sample_seconds, row["sample_duration_seconds"])
+                samples.append(row)
+                sample_count += 1
+                next_sample += SAMPLE_INTERVAL_SECONDS
+                if next_sample < time.monotonic():
+                    next_sample = time.monotonic() + SAMPLE_INTERVAL_SECONDS
+        except Exception as error:
+            sampler_cost["error"] = type(error).__name__ + ": " + str(error)[:256]
+            if len(sample_errors) < ERROR_LIMIT:
+                sample_errors.append("observer thread failed: " + sampler_cost["error"])
+        finally:
+            if thread_clock is not None:
+                cpu_ended = thread_clock()
+                if cpu_ended >= cpu_began:
+                    sampler_cost["thread_cpu_seconds"] = cpu_ended - cpu_began
+                else:
+                    sampler_cost["error"] = "observer thread CPU counter decreased"
+            else:
+                sampler_cost["error"] = "time.thread_time is unavailable"
 
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error_output:
         command = [str(client_path), "--address", "127.0.0.1:" + str(service.port), "--path", path,
@@ -378,4 +593,12 @@ def run_client(service, client_path, path, expected, seconds, concurrency=32, ra
     report["status"] = "measured" if report.get("client_exit") == 0 and not timed_out and not report.get("client_parse_error") and not report.get("sampler_did_not_stop") and not report.get("server_after_error") and ledger.get("planned_reconciled") is True and ledger.get("started_reconciled") is True else "failed"
     report["measurement_valid"] = report["status"] == "measured" and not report.get("server_delta", {}).get("counter_errors") and not sample_errors
     report["status_scope"] = "measured confirms driver termination and bookkeeping, not acceptance of throughput, errors, CPU scaling, fairness or recovery thresholds. The caller applies the frozen gates."
+    observer_after = _observer_usage()
+    report["observer_cost"] = _observer_cost(observer_before, observer_after, usage, sampler_cost)
+    report["observation_windows"] = {
+        "event_cpu_wall_seconds": report.get("server_delta", {}).get("observation_seconds"),
+        "go_measurement_wall_seconds": report.get("client", {}).get("timing", {}).get("measurement_seconds"),
+        "go_with_cleanup_wall_seconds": report.get("client", {}).get("timing", {}).get("with_cleanup_seconds"),
+        "python_wrapper_wall_seconds": observer_after["monotonic"] - observer_before["monotonic"],
+        "meaning": "Use the event counter's own outer observation wall as its CPU denominator. The Go throughput window is separate; dividing outer-window event CPU by configured Go duration can overstate core use. Observer CPU includes metadata, startup, sampling and finite cleanup costs."}
     return report

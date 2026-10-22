@@ -15,14 +15,17 @@ import platform
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 sys.dont_write_bytecode = True
 from multiloop_load import Service, atomic_json
 from runtime_matrix import machine_environment
+from capacity_cpu import measurement_environment
 
 
 def digest(path):
@@ -49,6 +52,89 @@ def build(ku, root, peer_port):
     return executable, {"fixture_sha256": digest(fixture), "expanded_source_sha256": digest(source),
                         "native_sha256": digest(executable), "build_output": output,
                         "generated_c_sha256": [digest(p) for p in generated]}
+
+
+def baseline_natives(root):
+    """Same final frontend/fixture/flags; replace only the two changed runtimes.
+
+    These are explicitly derived comparison artifacts, never final products or
+    claims that the entire final compiler was built from the historical commit.
+    The immutable old source is read locally first, otherwise from this public
+    repository. No copied runtime or comparison binary is retained in the repo.
+    """
+    reference = "c1de5e3245bff62eb0b422d5c39a5212a1d1723b"
+    repo = Path(__file__).resolve().parents[2]
+    old, hashes = {}, {}
+    for name in ("c_http_runtime.c", "c_task_driver.rs"):
+        path = "src/backend/" + name
+        local = subprocess.run(["git", "show", reference+":"+path], cwd=repo,
+                               capture_output=True, timeout=5)
+        if local.returncode == 0:
+            data = local.stdout
+        else:
+            with urllib.request.urlopen("https://raw.githubusercontent.com/fengyanweb/ku/"+reference+"/"+path, timeout=20) as response:
+                data = response.read(1048577)
+            if len(data) > 1048576:
+                raise RuntimeError("comparison source exceeds fixed read bound")
+        old[name] = data.decode()
+        hashes[path] = hashlib.sha256(data).hexdigest()
+    current_driver = (repo / "src/backend/c_task_driver.rs").read_text().split('const DRIVER_ABI: &str = r#"', 1)[1].rsplit('"#;', 1)[0]
+    old_driver = old["c_task_driver.rs"].split('const DRIVER_ABI: &str = r#"', 1)[1].rsplit('"#;', 1)[0]
+    current_http = (repo / "src/backend/c_http_runtime.c").read_text()
+    generated = list(root.rglob("capacity.c"))
+    if len(generated) != 1:
+        raise RuntimeError("ambiguous generated comparison source")
+    final_c = generated[0].read_text()
+    if final_c.count(current_driver) != 1 or final_c.count(current_http) != 1:
+        raise RuntimeError("CLI and working-tree runtime text differ; rebuild the actual CLI")
+    before_driver = final_c.replace(current_driver, old_driver, 1)
+    entry = "ku_task_driver_begin_quantum(&instance->ticket,&instance->control)"
+    changed_entries = before_driver.count(entry)
+    if not changed_entries:
+        raise RuntimeError("comparison requires the candidate generated entry")
+    before_driver = before_driver.replace(entry, "ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)")
+    marker = "    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control);"
+    marker_count = before_driver.count(marker)
+    if not marker_count:
+        raise RuntimeError("comparison requires the actual dispatch-budget marker")
+    before_driver = before_driver.replace("    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n"+marker+"\n", "")
+    before_both = before_driver.replace(current_http, old["c_http_runtime.c"], 1)
+    outputs, manifest = {}, {"reference": reference, "old_source_sha256": hashes,
+                            "restored_adapter_entries": changed_entries,
+                            "restored_dispatch_markers": marker_count,
+                            "scope": "Final frontend and fixture; historical driver and/or HTTP runtime replacement only; release C flags unchanged (-O2)."}
+    for name, text in (("before_driver", before_driver), ("before_both", before_both)):
+        source, executable = root / (name+".c"), root / name
+        source.write_text(text)
+        args = ["clang", str(source), "-std=c11", "-o", str(executable), "-O2", "-pthread"]
+        command(args, cwd=root)
+        outputs[name] = executable
+        manifest[name] = {"generated_c_sha256": digest(source), "native_sha256": digest(executable), "command": args}
+    return outputs, manifest
+
+
+def compare(executable, baselines, client, root):
+    from capacity_cpu import checksum, run_client, work_path
+    result = []
+    # Interleave both variants and N; short A/B is separate from formal 30s CPU.
+    for repetition, order in enumerate(((1, 2, 4), (4, 1, 2), (2, 4, 1))):
+        for loops in order:
+            for pair in (
+                (("before_driver", baselines["before_driver"], work_path(128), checksum(128)),
+                 ("final_driver", executable, work_path(128), checksum(128))),
+                (("before_both_legacy", baselines["before_both"], "/cpu", "cpu-ready"),
+                 ("final_legacy", executable, "/cpu", "cpu-ready")),
+            ):
+                for name, binary, path, expected in pair[::1 if repetition % 2 == 0 else -1]:
+                    service = Service(binary, root, loops)
+                    row = {"variant": name, "loops": loops, "repetition": repetition}
+                    try:
+                        row["warmup"] = run_client(service, client, path, expected, 1, concurrency=32 if "driver" in name else 8)
+                        row["measurement"] = run_client(service, client, path, expected, 5, concurrency=32 if "driver" in name else 8)
+                    finally:
+                        row["exit"] = service.stop()
+                    result.append(row)
+    return result
 
 
 def trace_exchange(service, count=12):
@@ -103,7 +189,7 @@ def diagnose(executable, root, evidence):
                     os.killpg(child.pid, signal.SIGINT)
                     child.wait(timeout=3)
                 except (OSError, subprocess.TimeoutExpired):
-                    subprocess.run(["sudo", "-n", "kill", "-INT", str(child.pid)], timeout=3, check=False)
+                    subprocess.run(["sudo", "-n", "kill", "-INT", "--", "-"+str(child.pid)], timeout=3, check=False)
                     child.wait(timeout=3)
             log.close()
             data = (root / (name + ".txt")).read_bytes()
@@ -116,9 +202,10 @@ def diagnose(executable, root, evidence):
     return result
 
 
-def capacity(ku, executable, client, root, args, save):
+def capacity(ku, executable, client, root, args, save, peer):
     from capacity_cpu import checksum, run_client, work_path
-    from capacity_wait import run_connection_occupancy, run_waiting
+    from capacity_wait import run_connection_occupancy, run_network_waiting, run_waiting
+    from capacity_pressure import run_fairness, run_pressure
     result = {"calibration": [], "rounds": [], "legacy": []}
     service = Service(executable, root, 1)
     try:
@@ -158,10 +245,82 @@ def capacity(ku, executable, client, root, args, save):
     try:
         result["waiting"] = run_waiting(service, seconds=args.waiting)
         save(result)
+        result["network_waiting"] = run_network_waiting(service, peer, seconds=args.waiting)
+        save(result)
+        result["fairness"] = run_fairness(service, client, path, expected)
+        save(result)
+        measured = [r["measurement"]["client"]["rates"]["correct_per_measurement_second"] for r in result["rounds"] if r["loops"] == 4]
+        import statistics
+        result["business_overload"] = run_pressure(service, client, path, expected, statistics.median(measured), seconds=30)
+        save(result)
         result["connection_occupancy"] = run_connection_occupancy(service)
         save(result)
     finally:
         result["waiting_exit"] = service.stop()
+    return result
+
+
+def assessment(report):
+    """Apply the thresholds frozen in plan, never reinterpret a failed sample."""
+    result = {"scope": "B03--B06 local-platform gates; CI/correctness/source audit remain separate"}
+    data = report.get("capacity", {})
+    groups = {n: [r for r in data.get("rounds", []) if r["loops"] == n] for n in (1, 2, 4)}
+    def correct(row):
+        value = row.get("measurement", {})
+        ledger = value.get("client", {}).get("ledger", {})
+        started = ledger.get("started", 0)
+        return (row.get("exit") == 0 and value.get("measurement_valid") is True
+                and started > 0 and ledger.get("not_started") == 0
+                and ledger.get("results", {}).get("correct_success") == started
+                and value.get("server_delta", {}).get("complete_requests_received") == started)
+    summary = {}
+    for n, rows in groups.items():
+        rates = [r["measurement"]["client"]["rates"]["correct_per_measurement_second"] for r in rows]
+        cores = [r["measurement"]["server_delta"].get("average_event_cores_over_observation_window") for r in rows]
+        summary[n] = {"rates": rates, "median_rps": statistics.median(rates) if rates else None,
+                      "event_cores": cores, "all_samples_correct": bool(rows) and all(map(correct, rows))}
+    result["cpu"] = summary
+    complete = all(len(groups[n]) == 3 for n in groups)
+    one, two, four = (summary[n] for n in (1, 2, 4))
+    enough = complete and all(r["all_samples_correct"] for r in summary.values())
+    def client_headroom(row):
+        m = row["measurement"]
+        cpu = m.get("client_cpu", {}).get("seconds")
+        wall = m.get("server_delta", {}).get("observation_seconds", 0)
+        return isinstance(cpu, (int, float)) and wall > 0 and cpu / wall <= .5
+    checks = {
+        "formal_cpu_plan": report["plan"]["duration"] == 30 and report["plan"]["warmup"] == 5 and report["plan"]["repeat"] == 3,
+        "nine_correct_reconciled_samples": enough,
+        "go_generator_below_half_core": enough and all(client_headroom(r) for rows in groups.values() for r in rows),
+        "one_owner_compute_bound": enough and min(one["event_cores"]) >= .65,
+        "four_owner_real_multicore": enough and min(four["event_cores"]) > 1.1,
+        "four_owner_gain_exceeds_round_range": enough and min(four["rates"]) > max(one["rates"]),
+        "four_owner_median_gain_at_least_ten_percent": enough and four["median_rps"] >= one["median_rps"] * 1.10,
+        "two_owner_no_material_regression": enough and two["median_rps"] >= one["median_rps"] * .95,
+        "four_owner_no_material_regression_from_two": enough and four["median_rps"] >= two["median_rps"] * .95,
+        "owners_all_execute": enough and all(all(o.get("complete_requests_received", 0) > 0 for o in r["measurement"]["server_delta"]["event_threads"]) for rows in groups.values() for r in rows),
+        "timer_waiting": data.get("waiting", {}).get("passed") is True and data.get("waiting", {}).get("formal_30_second_windows") is True,
+        "network_waiting": data.get("network_waiting", {}).get("passed") is True and data.get("network_waiting", {}).get("formal_30_second_window") is True,
+        "hot_fairness": data.get("fairness", {}).get("passed") is True,
+        "business_overload": data.get("business_overload", {}).get("passed") is True,
+        "connection_occupancy": data.get("connection_occupancy", {}).get("passed") is True,
+        "waiting_service_exit": data.get("waiting_exit") == 0,
+    }
+    comparison = report.get("short_comparison", [])
+    paired = {}
+    for variant in ("before_driver", "final_driver", "before_both_legacy", "final_legacy"):
+        paired[variant] = {}
+        for n in (1, 2, 4):
+            rows = [r for r in comparison if r["variant"] == variant and r["loops"] == n]
+            rates = [r["measurement"]["client"]["rates"]["correct_per_measurement_second"] for r in rows]
+            paired[variant][n] = {"rates": rates, "median_rps": statistics.median(rates) if rates else None,
+                                 "all_correct": len(rows) == 3 and all(map(correct, rows))}
+    result["short_comparison"] = paired
+    pair_valid = all(row["all_correct"] for variant in paired.values() for row in variant.values())
+    checks["comparison_correct"] = pair_valid
+    checks["candidate_driver_benefit"] = pair_valid and paired["final_driver"][4]["median_rps"] >= paired["before_driver"][4]["median_rps"] * 1.05
+    checks["legacy_final_no_material_four_owner_regression"] = pair_valid and paired["final_legacy"][4]["median_rps"] >= paired["final_legacy"][1]["median_rps"] * .95
+    result.update(checks=checks, passed=all(checks.values()), failed=[name for name, passed in checks.items() if not passed])
     return result
 
 
@@ -185,36 +344,52 @@ def main():
     report = {"source_commit": command(["git", "rev-parse", "HEAD"], cwd=repo).strip(),
               "source_dirty": bool(command(["git", "status", "--porcelain"], cwd=repo)),
               "cli_sha256": digest(args.ku), "environment": machine_environment(),
+              "capacity_environment": measurement_environment(),
               "plan": vars(args) | {"ku": str(args.ku), "output": str(args.output),
                  "loops": [1, 2, 4], "client_concurrency": 32, "total_background_threads": 5,
                  "thread_budget": 16, "task_bytes": 16777216,
                  "dedicated_wait_handler_deadline_ms": 45000,
                  "original_sustained_handler_deadline_ms": 1000}}
+    report["plan"]["frozen_gates"] = {"normal_errors": 0, "go_generator_maximum_one_core_fraction": .5,
+        "n1_minimum_event_cores": .65, "n4_minimum_event_cores": 1.1,
+        "n4_over_n1_median_minimum": 1.10, "n4_round_minimum_above_n1_round_maximum": True,
+        "material_median_regression_fraction": .05, "candidate_driver_minimum_median_gain": .05,
+        "fairness_p99_ms": 250, "recovery_seconds": 5,
+        "scope": "Conservative local acceptance criteria frozen before traffic, not universal performance promises. Noisy or CPU-limited environments fail/invalidate rather than receiving relaxed thresholds."}
     save = lambda value=None: atomic_json(args.output, report)
     save()
-    with tempfile.TemporaryDirectory(prefix="ku-multicore-capacity-") as directory:
+    from capacity_wait import NetworkPeer
+    with tempfile.TemporaryDirectory(prefix="ku-multicore-capacity-") as directory, NetworkPeer() as peer:
         root = Path(directory)
-        executable, identity = build(args.ku, root, 39081)
+        executable, identity = build(args.ku, root, peer.port)
         report["build"] = identity
         save()
         if args.mode in ("diagnose", "all"):
             report["diagnosis"] = diagnose(executable, root, args.output.parent)
             save()
+        client = root / ("client.exe" if os.name == "nt" else "client")
+        report["go_version"] = command([args.go, "version"]).strip()
+        command([args.go, "build", "-trimpath", "-o", str(client),
+                 str(repo / "tests/acceptance/capacity_client.go")], cwd=root)
+        report["client_sha256"] = digest(client)
+        baseline, baseline_manifest = baseline_natives(root)
+        report["comparison_inputs"] = baseline_manifest
+        save()
+        report["short_comparison"] = compare(executable, baseline, client, root)
+        save()
         if args.mode in ("capacity", "all"):
-            client = root / ("client.exe" if os.name == "nt" else "client")
-            report["go_version"] = command([args.go, "version"]).strip()
-            command([args.go, "build", "-trimpath", "-o", str(client),
-                     str(repo / "tests/acceptance/capacity_client.go")], cwd=root)
-            report["client_sha256"] = digest(client)
             def checkpoint(value):
                 report["capacity"] = value
                 save()
-            report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint)
+            report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint, peer)
+            report["assessment"] = assessment(report)
             save()
     report["temporary_directory_removed"] = True
     save()
     print(json.dumps({"report": str(args.output), "source": report["source_commit"],
                       "mode": args.mode, "temporary_directory_removed": True}))
+    if args.mode in ("capacity", "all") and not report["assessment"]["passed"]:
+        raise SystemExit("Frozen capacity gates failed: " + ", ".join(report["assessment"]["failed"]))
 
 
 if __name__ == "__main__":

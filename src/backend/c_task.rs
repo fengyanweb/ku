@@ -851,7 +851,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             mask
                         }
                     });
-            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  }}\n"));
+            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
         }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {

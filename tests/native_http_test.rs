@@ -17,6 +17,10 @@
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
 
+#[allow(dead_code)]
+#[path = "support/native_pg_harness.rs"]
+mod native_c_harness;
+
 use std::env;
 use std::fs;
 #[cfg(not(unix))]
@@ -3070,6 +3074,216 @@ fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
     // (including the legacy inline acceptor fallback if worker creation fails).
     // Marker writes prove actions occurred, not exactly-once counts or D values.
     // This is not a multi-worker, allocation-ledger or production-soak claim.
+}
+
+#[test]
+fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let region = |start: &str, end: &str| {
+        format!(
+            "{start}{}",
+            runtime
+                .split_once(start)
+                .expect("production HTTP region starts")
+                .1
+                .split_once(end)
+                .expect("production HTTP region ends")
+                .0
+        )
+    };
+    // Compile the actual production output layout, scatter/gather syscall and
+    // cursor-update loop. Only the OS syscall and connection lifecycle edges
+    // are controlled; no scheduling delay or TCP stack timing is an assertion.
+    let output = region(
+        "typedef struct { const char* bytes; size_t length; } KuHttpPart;",
+        "\nenum {\n  KU_HTTP_IO_FREE",
+    );
+    let write = region(
+        "static void ku_http_connection_write(",
+        "static void ku_http_connection_observe_job(",
+    );
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#if defined(_WIN32)
+#include <winsock2.h>
+typedef SOCKET KuHttpSocket;
+#define FIXTURE_INTERRUPTED WSAEINTR
+#define FIXTURE_WOULD_BLOCK WSAEWOULDBLOCK
+static int fixture_WSASend(SOCKET,LPWSABUF,DWORD,LPDWORD,DWORD,LPWSAOVERLAPPED,LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+#define WSASend fixture_WSASend
+#else
+#include <sys/socket.h>
+#include <sys/uio.h>
+typedef int KuHttpSocket;
+#define FIXTURE_INTERRUPTED EINTR
+#define FIXTURE_WOULD_BLOCK EAGAIN
+static ssize_t fixture_sendmsg(int,const struct msghdr*,int);
+#define sendmsg fixture_sendmsg
+#endif
+typedef struct { int unused; } KuStruct___ku_http_response;
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr,"gather check failed at %d: %s\n",__LINE__,#condition); return 97; } } while (0)
+static int fixture_mode, fixture_error, fixture_completed, fixture_closed, fixture_close_reason;
+static size_t fixture_calls, fixture_emitted, fixture_expected_length, fixture_max_bytes, fixture_max_vectors;
+static unsigned long long fixture_now;
+static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_body[300000];
+"#;
+    let edges = r#"
+typedef struct { KuHttpSocket socket_value; unsigned long long deadline; KuHttpOutput output; } KuHttpConnection;
+typedef struct { int unused; } KuHttpServer;
+enum { KU_HTTP_CLOSE_WRITE_DEADLINE=1, KU_HTTP_CLOSE_PEER_WRITE=2 };
+static unsigned long long ku_http_now_ms(void) { return fixture_now; }
+static int ku_http_socket_last_error(void) { return fixture_error; }
+static int ku_http_socket_error_interrupted(int error) { return error==FIXTURE_INTERRUPTED; }
+static int ku_http_socket_would_block(int error) { return error==FIXTURE_WOULD_BLOCK; }
+static void ku_http_count_transport_close(KuHttpConnection* connection,int reason) { (void)connection; fixture_close_reason=reason; }
+static void ku_http_connection_close(KuHttpConnection* connection) { (void)connection; fixture_closed++; }
+static void ku_http_connection_next_request(KuHttpConnection* connection,KuHttpServer* server) {
+  (void)connection; (void)server; fixture_completed++;
+}
+static int fixture_transfer(const char* const* buffers,const size_t* lengths,size_t count) {
+  if (!count || count>9) abort();
+  size_t total=0;
+  for (size_t i=0;i<count;i++) {
+    if (!lengths[i] || lengths[i]>65536u || total>65536u-lengths[i]) abort();
+    if (fixture_emitted+total+lengths[i]>fixture_expected_length) abort();
+    if (memcmp(buffers[i],fixture_expected+fixture_emitted+total,lengths[i])) abort();
+    total+=lengths[i];
+  }
+  if (total>fixture_max_bytes) fixture_max_bytes=total;
+  if (count>fixture_max_vectors) fixture_max_vectors=count;
+  size_t call=fixture_calls++;
+  if (fixture_mode==2 || (fixture_mode==1 && (call==0 || call==4))) {
+    fixture_error=FIXTURE_INTERRUPTED; return -1;
+  }
+  if (fixture_mode==1 && (call==2 || call==5)) {
+    fixture_error=FIXTURE_WOULD_BLOCK; return -1;
+  }
+  if (fixture_mode==3) return 0;
+  if (fixture_mode==4) { fixture_error=12345; return -1; }
+  size_t accepted=fixture_mode==1 && call==1 ? 4u : fixture_mode==1 && call==3 ? 8u : total;
+  if (accepted>total) abort();
+  size_t remaining=accepted;
+  for (size_t i=0;i<count && remaining;i++) {
+    size_t bytes=lengths[i]<remaining ? lengths[i] : remaining;
+    memcpy(fixture_wire+fixture_emitted,buffers[i],bytes);
+    fixture_emitted+=bytes; remaining-=bytes;
+  }
+  return (int)accepted;
+}
+#if defined(_WIN32)
+static int fixture_WSASend(SOCKET socket_value,LPWSABUF vectors,DWORD count,LPDWORD sent,DWORD flags,
+    LPWSAOVERLAPPED overlapped,LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
+  if (socket_value!=(KuHttpSocket)42 || flags || overlapped || completion || count>9) abort();
+  const char* buffers[9]; size_t lengths[9];
+  for (size_t i=0;i<count;i++) { buffers[i]=vectors[i].buf; lengths[i]=vectors[i].len; }
+  int result=fixture_transfer(buffers,lengths,(size_t)count);
+  *sent=result<0 ? 0 : (DWORD)result;
+  return result<0 ? SOCKET_ERROR : 0;
+}
+#else
+static ssize_t fixture_sendmsg(int socket_value,const struct msghdr* message,int flags) {
+  if (socket_value!=42 || message->msg_iovlen>9) abort();
+#if defined(__APPLE__)
+  if (flags) abort();
+#else
+  if (flags!=MSG_NOSIGNAL) abort();
+#endif
+  const char* buffers[9]; size_t lengths[9];
+  for (size_t i=0;i<(size_t)message->msg_iovlen;i++) { buffers[i]=message->msg_iov[i].iov_base; lengths[i]=message->msg_iov[i].iov_len; }
+  return (ssize_t)fixture_transfer(buffers,lengths,(size_t)message->msg_iovlen);
+}
+#endif
+static void fixture_reset(KuHttpConnection* connection,int mode) {
+  memset(connection,0,sizeof(*connection));
+  connection->socket_value=(KuHttpSocket)42; connection->deadline=1000;
+  fixture_now=100; fixture_mode=mode; fixture_error=0; fixture_completed=fixture_closed=fixture_close_reason=0;
+  fixture_calls=fixture_emitted=fixture_max_bytes=fixture_max_vectors=0;
+  fixture_expected_length=0;
+}
+static void fixture_part(KuHttpConnection* connection,const void* bytes,size_t length) {
+  KuHttpOutput* output=&connection->output;
+  if (output->count>=9 || fixture_expected_length+length>sizeof(fixture_expected)) abort();
+  output->parts[output->count++]=(KuHttpPart){(const char*)bytes,length};
+  memcpy(fixture_expected+fixture_expected_length,bytes,length);
+  fixture_expected_length+=length;
+}
+"#;
+    let checks = r#"
+int main(void) {
+  KuHttpConnection connection; KuHttpServer server={0};
+  static const unsigned char small[9]={'H',0,'I','a','b','c','d','e','f'};
+  fixture_reset(&connection,0);
+  for (size_t i=0;i<9;i++) fixture_part(&connection,small+i,1u);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_calls==1 && fixture_max_vectors==9 && fixture_emitted==9);
+  CHECK(fixture_completed==1 && !fixture_closed && !memcmp(fixture_wire,small,9));
+  CHECK(connection.output.part==9 && !connection.output.offset && connection.deadline==1000);
+
+  for (size_t i=0;i<sizeof(fixture_body);i++) fixture_body[i]=(unsigned char)(i%251u);
+  fixture_reset(&connection,1);
+  fixture_part(&connection,small,3); fixture_part(&connection,"header:",7);
+  fixture_part(&connection,"J",1); fixture_part(&connection,fixture_body,sizeof(fixture_body));
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_calls==3 && fixture_emitted==4 && !fixture_completed && !fixture_closed);
+  CHECK(connection.output.part==1 && connection.output.offset==1 && connection.deadline==1000);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_calls==6 && fixture_emitted==12 && !fixture_completed && !fixture_closed);
+  CHECK(connection.output.part==3 && connection.output.offset==1 && connection.deadline==1000);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_emitted==12u+262144u && !fixture_completed && !fixture_closed);
+  CHECK(connection.output.part==3 && connection.output.offset==262145u);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_completed==1 && !fixture_closed && fixture_emitted==fixture_expected_length);
+  CHECK(connection.output.part==4 && !connection.output.offset && connection.deadline==1000);
+  CHECK(fixture_max_bytes==65536u && !memcmp(fixture_wire,fixture_expected,fixture_expected_length));
+
+  fixture_reset(&connection,2); fixture_part(&connection,small,9);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_calls==32 && !fixture_emitted && !connection.output.part && !connection.output.offset);
+  CHECK(!fixture_completed && !fixture_closed && connection.deadline==1000);
+  for (int mode=3;mode<=4;mode++) {
+    fixture_reset(&connection,mode); fixture_part(&connection,small,9);
+    ku_http_connection_write(&connection,&server);
+    CHECK(fixture_calls==1 && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_PEER_WRITE);
+    CHECK(!fixture_emitted && !fixture_completed && !connection.output.part && !connection.output.offset);
+  }
+  fixture_reset(&connection,0); fixture_part(&connection,small,9); fixture_now=1000;
+  ku_http_connection_write(&connection,&server);
+  CHECK(!fixture_calls && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_WRITE_DEADLINE);
+  CHECK(!fixture_emitted && !fixture_completed && connection.deadline==1000);
+  puts("gather-write-ok"); return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-gather-write");
+    let path = directory.path().join("gather.c");
+    fs::write(&path, format!("{header}{output}{edges}{write}{checks}")).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "gather")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires the deterministic native write regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(&executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .expect("bounded native gather write regression");
+    assert!(
+        output.status.success(),
+        "native gather write regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("gather-write-ok"));
 }
 
 #[test]
