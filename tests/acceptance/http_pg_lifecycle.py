@@ -446,7 +446,7 @@ def main():
                     observation["status"] = response.status
                     raw_body = response.read(1024 * 1024)
                     prefix = raw_body.replace(control_token.encode("ascii"), b"<control-token>")[:2048]
-                    observation.update(body_prefix=prefix.decode("utf-8", errors="replace"),
+                    observation.update(body_prefix=prefix.decode("utf-8", errors="replace").replace(control_token, "<control-token>"),
                                        body_prefix_raw_bytes=min(len(raw_body), 2048),
                                        body_bytes=len(raw_body), body_prefix_truncated=len(raw_body) > 2048)
                     body = raw_body.decode()
