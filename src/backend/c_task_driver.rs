@@ -348,6 +348,13 @@ struct KuTaskDriverV1 {
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
   size_t timers, peak_timers;
   uint64_t polls, wakes, waits, shutdown_deadline, next_deadline;
+  /* Private opt-in diagnostics, fixed storage; all counters are mutex-owned.
+   * Condition sleep/reacquire is separate from acquired-mutex wait and hold. */
+  uint32_t timing_enabled;
+  uint64_t timing_lock_count, timing_lock_wait_ns, timing_max_lock_wait_ns;
+  uint64_t timing_lock_hold_ns, timing_max_lock_hold_ns, timing_hold_started_ns;
+  uint64_t timing_condition_count, timing_condition_wait_ns, timing_max_condition_wait_ns;
+  uint64_t timing_clock_errors;
   /* Immutable while LIVE; close/ready callbacks are called without mutex. */
   void* blocking_pool;
   size_t blocking_pool_bytes;
@@ -381,19 +388,83 @@ static uint64_t ku_task_driver_now_ms(void) {
 #endif
 }
 static uint64_t ku_task_driver_min(uint64_t a, uint64_t b) { return a < b ? a : b; }
-static int ku_task_driver_lock(KuTaskDriverV1* driver) {
+/* A zero/failing/backwards sample is diagnostic loss, never elapsed time.
+ * Saturation preserves bounded counters even during a very long-lived run. */
+static uint64_t ku_task_driver_timing_now_ns(void) {
 #if defined(_WIN32)
-  AcquireSRWLockExclusive(&driver->mutex); return 0;
+  LARGE_INTEGER counter, frequency;
+  if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0
+      || !QueryPerformanceCounter(&counter) || counter.QuadPart<=0) return 0;
+  uint64_t ticks=(uint64_t)counter.QuadPart, hz=(uint64_t)frequency.QuadPart;
+  uint64_t seconds=ticks/hz, remainder=ticks%hz;
+  if (seconds>UINT64_MAX/UINT64_C(1000000000)
+      || remainder>UINT64_MAX/UINT64_C(1000000000)) return 0;
+  uint64_t whole=seconds*UINT64_C(1000000000), fraction=remainder*UINT64_C(1000000000)/hz;
+  return fraction>UINT64_MAX-whole ? 0 : whole+fraction;
 #else
-  return pthread_mutex_lock(&driver->mutex);
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC,&value) || value.tv_sec<0
+      || value.tv_nsec<0 || value.tv_nsec>=1000000000L) return 0;
+  uint64_t seconds=(uint64_t)value.tv_sec;
+  if (seconds>UINT64_MAX/UINT64_C(1000000000)) return 0;
+  uint64_t whole=seconds*UINT64_C(1000000000), fraction=(uint64_t)value.tv_nsec;
+  return fraction>UINT64_MAX-whole ? 0 : whole+fraction;
 #endif
 }
+static void ku_task_driver_timing_add(uint64_t* counter,uint64_t amount) {
+  *counter=amount>UINT64_MAX-*counter ? UINT64_MAX : *counter+amount;
+}
+static void ku_task_driver_timing_interval(KuTaskDriverV1* driver,uint64_t from,uint64_t to,
+    uint64_t* total,uint64_t* maximum) {
+  if (!from || !to || to<from) { ku_task_driver_timing_add(&driver->timing_clock_errors,1u); return; }
+  uint64_t duration=to-from;
+  ku_task_driver_timing_add(total,duration);
+  if (duration>*maximum) *maximum=duration;
+}
+static void ku_task_driver_timing_hold_end(KuTaskDriverV1* driver,uint64_t now) {
+  ku_task_driver_timing_interval(driver,driver->timing_hold_started_ns,now,
+      &driver->timing_lock_hold_ns,&driver->timing_max_lock_hold_ns);
+  driver->timing_hold_started_ns=0;
+}
+static int ku_task_driver_lock(KuTaskDriverV1* driver) {
+  uint64_t started=driver->timing_enabled ? ku_task_driver_timing_now_ns() : 0;
+#if defined(_WIN32)
+  AcquireSRWLockExclusive(&driver->mutex);
+  int result=0;
+#else
+  int result=pthread_mutex_lock(&driver->mutex);
+#endif
+  if (!result && driver->timing_enabled) {
+    uint64_t now=ku_task_driver_timing_now_ns();
+    ku_task_driver_timing_add(&driver->timing_lock_count,1u);
+    ku_task_driver_timing_interval(driver,started,now,&driver->timing_lock_wait_ns,&driver->timing_max_lock_wait_ns);
+    driver->timing_hold_started_ns=now;
+  }
+  return result;
+}
 static int ku_task_driver_unlock(KuTaskDriverV1* driver) {
+  if (driver->timing_enabled) ku_task_driver_timing_hold_end(driver,ku_task_driver_timing_now_ns());
 #if defined(_WIN32)
   ReleaseSRWLockExclusive(&driver->mutex); return 0;
 #else
   return pthread_mutex_unlock(&driver->mutex);
 #endif
+}
+/* Condition APIs release/reacquire the OS mutex internally. Pause hold timing
+ * before sleeping; the separate duration includes sleep AND mutex reacquire,
+ * and must not be interpreted as ready-for-CPU or mutex contention alone. */
+static uint64_t ku_task_driver_timing_condition_begin(KuTaskDriverV1* driver) {
+  if (!driver->timing_enabled) return 0;
+  uint64_t now=ku_task_driver_timing_now_ns();
+  ku_task_driver_timing_hold_end(driver,now);
+  return now;
+}
+static void ku_task_driver_timing_condition_end(KuTaskDriverV1* driver,uint64_t started) {
+  if (!driver->timing_enabled) return;
+  uint64_t now=ku_task_driver_timing_now_ns();
+  ku_task_driver_timing_add(&driver->timing_condition_count,1u);
+  ku_task_driver_timing_interval(driver,started,now,&driver->timing_condition_wait_ns,&driver->timing_max_condition_wait_ns);
+  driver->timing_hold_started_ns=now;
 }
 static void ku_task_driver_signal(KuTaskDriverV1* driver) {
 #if defined(_WIN32)
@@ -445,10 +516,18 @@ static int ku_task_driver_wait_on(
     uint64_t remaining = deadline - now;
     delay = remaining >= (uint64_t)INFINITE ? INFINITE - 1u : (DWORD)remaining;
   }
-  if (SleepConditionVariableSRW(condition, &driver->mutex, delay, 0)) return 0;
-  return GetLastError() == ERROR_TIMEOUT ? 1 : -1;
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
+  int slept=SleepConditionVariableSRW(condition, &driver->mutex, delay, 0);
+  DWORD error=slept ? 0 : GetLastError();
+  ku_task_driver_timing_condition_end(driver,timing_started);
+  return slept ? 0 : error == ERROR_TIMEOUT ? 1 : -1;
 #else
-  if (deadline == UINT64_MAX) return pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
+  if (deadline == UINT64_MAX) {
+    uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
+    int result=pthread_cond_wait(condition, &driver->mutex);
+    ku_task_driver_timing_condition_end(driver,timing_started);
+    return result == 0 ? 0 : -1;
+  }
   uint64_t remaining = deadline - now;
   /* Use at most a day for the OS conversion, then recheck the absolute budget.
    * This is a platform range bound, not a progress-poll interval. */
@@ -457,6 +536,7 @@ static int ku_task_driver_wait_on(
 #if defined(__APPLE__)
   timeout.tv_sec = (time_t)(remaining / 1000u);
   timeout.tv_nsec = (long)((remaining % 1000u) * 1000000u);
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
   int result = pthread_cond_timedwait_relative_np(condition, &driver->mutex, &timeout);
 #else
   /* The condition uses CLOCK_MONOTONIC too. Reconstructing from a SECOND clock
@@ -466,8 +546,10 @@ static int ku_task_driver_wait_on(
   timeout.tv_sec = (time_t)(wake_at / 1000u);
   if ((uint64_t)timeout.tv_sec != wake_at / 1000u) return -1;
   timeout.tv_nsec = (long)((wake_at % 1000u) * 1000000u);
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
   int result = pthread_cond_timedwait(condition, &driver->mutex, &timeout);
 #endif
+  ku_task_driver_timing_condition_end(driver,timing_started);
   return result == 0 ? 0 : result == ETIMEDOUT ? 1 : -1;
 #endif
 }
@@ -479,11 +561,14 @@ static int ku_task_driver_wait_work(KuTaskDriverV1* driver, uint64_t deadline) {
 }
 static int ku_task_driver_wait_without_clock(KuTaskDriverV1* driver) {
   KuTaskDriverConditionV1* condition = &driver->work_condition;
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
 #if defined(_WIN32)
-  return SleepConditionVariableSRW(condition, &driver->mutex, INFINITE, 0) ? 0 : -1;
+  int result=SleepConditionVariableSRW(condition, &driver->mutex, INFINITE, 0) ? 0 : -1;
 #else
-  return pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
+  int result=pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
 #endif
+  ku_task_driver_timing_condition_end(driver,timing_started);
+  return result;
 }
 static uint32_t ku_task_driver_check_lifecycle(KuTaskDriverV1* driver) {
   if (!ku_task_frame_storage_valid(driver, sizeof(*driver), sizeof(*driver),
@@ -2738,6 +2823,8 @@ static uint32_t ku_task_driver_init_impl(
   driver->external_loops=external!=0; driver->fixed_owner=external!=0;
   driver->event_context=event_context; driver->event_wake=event_wake;
   driver->shutdown_deadline = startup_deadline; driver->next_deadline = UINT64_MAX;
+  const char* timing=getenv("KU_TASK_DRIVER_TIMING");
+  driver->timing_enabled=timing && !strcmp(timing,"1");
   driver->closing = 1; driver->fault = KU_TASK_DRIVER_INTERNAL;
 #if defined(_WIN32)
   InitializeSRWLock(&driver->mutex);

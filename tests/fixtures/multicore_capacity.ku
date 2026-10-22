@@ -1,0 +1,89 @@
+// Private acceptance template. multicore_capacity.py replaces __PEER_PORT__.
+// The 45s handler deadline belongs only to this 35s waiting-capacity fixture;
+// it does not change the original sustained fixture's 1s deadline.
+import { http, time, fs, net, bytes } from "std"
+
+// This bounded helper keeps each generated Task frame below its 64-slot limit.
+async fn digits(number: int): str! {
+    value = number
+    d0 = 48 + value % 10
+    value = value / 10
+    d1 = 48 + value % 10
+    value = value / 10
+    d2 = 48 + value % 10
+    value = value / 10
+    d3 = 48 + value % 10
+    encoded = bytes.from_array([d3, d2, d1, d0])?
+    text = encoded.to_str()?
+    return ok(text)
+}
+
+async fn work(req: HttpRequest): HttpResponse! {
+    iterations = req.query["work"].len() * 1000
+    seed = req.query["seed"].len()
+    if (iterations < 1000 || iterations > 1000000) { fail "work outside fixture bound" }
+    i = 0
+    total = seed
+    while (i < iterations) {
+        total = (total * 33 + i + seed) % 100000000
+        i = i + 1
+    }
+    left = (await digits(total / 10000))?
+    right = (await digits(total % 10000))?
+    return ok(http.text(left + right))
+}
+
+async fn legacy(): HttpResponse! {
+    total = 0
+    i = 0
+    while (i < 5000) { total = total + i; i = i + 1 }
+    if (total != 12497500) { fail "incorrect calculation" }
+    return ok(http.text("cpu-ready"))
+}
+
+async fn timer(): HttpResponse! {
+    time.sleep(25)?
+    return ok(http.text("timer-ready"))
+}
+
+async fn waiting(): HttpResponse! {
+    time.sleep(35000)?
+    return ok(http.text("wait-ready"))
+}
+
+async fn network(): HttpResponse! {
+    client = net.client({host: "127.0.0.1", port: __PEER_PORT__, tls: false,
+        connect_timeout_ms: 1000, read_timeout_ms: 40000})?
+    request = bytes.from_str("K")?
+    client.write(request)?
+    reply = client.read(1)?
+    code = reply.get(0)?
+    client.close()
+    if (code != 75) { fail "incorrect network reply" }
+    return ok(http.text("network-ready"))
+}
+
+async fn file(): HttpResponse! {
+    value = fs.read("capacity.txt")?
+    return ok(http.text(value))
+}
+
+fn main(): null! {
+    address = fs.read("http.addr")?
+    app = http.server({max_connections: 256, max_active_requests: 128,
+        max_pending_requests: 128, max_buffer_bytes: 8388608,
+        max_header_bytes: 4096, max_body_bytes: 65536,
+        handler_timeout_ms: 45000, idle_timeout_ms: 1000,
+        read_header_timeout_ms: 1000, read_body_timeout_ms: 1000,
+        write_timeout_ms: 1000})
+    app.get("/ok", fn() { return http.text("ok-ready") })
+    app.post("/echo", fn(req) { return http.text(req.body) })
+    app.get("/work", work)
+    app.get("/cpu", legacy)
+    app.get("/timer", timer)
+    app.get("/wait", waiting)
+    app.get("/network", network)
+    app.get("/file", file)
+    app.listen(address)?
+    return ok(null)
+}

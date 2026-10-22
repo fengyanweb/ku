@@ -6,7 +6,8 @@ mod native_harness;
 
 use ku::{backend::c, checker::Checker, ir::task_lower, lexer::Lexer, parser::Parser};
 use native_harness::{
-    compile_harness, run_bounded, TempDir, BUILD_LIMITS, BUILD_TIMEOUT, RUN_LIMITS, RUN_TIMEOUT,
+    compile_harness, run_bounded, TempDir, BUILD_LIMITS, BUILD_TIMEOUT,
+    NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS, RUN_TIMEOUT,
 };
 use std::{fs, process::Command};
 
@@ -166,6 +167,297 @@ int main(void) {
         "external-task-owners-ok\n"
     );
 }
+
+#[test]
+fn native_task_external_owners_overlap_and_reclaim_after_cancel() {
+    let mut generated = native(
+        "async fn Work(value: int): int! { index=0; total=value; while(index<512) { total=total+1; index=index+1 } return ok(total) } async fn main(): null! { return ok(null) }",
+    );
+    // Wrap the generated callbacks, preserving the source-generated frame,
+    // control CAS, dispatch budget, and actual external-owner pump path.
+    for (signature, replacement) in [
+        (
+            "static uint32_t ku_task_0_resume(void* raw) {",
+            "static uint32_t ku_task_0_resume(void* raw);\nstatic uint32_t ku_task_0_resume_inner(void* raw) {",
+        ),
+        (
+            "static void ku_task_0_drop_frame(void* raw) {",
+            "static void ku_task_0_drop_frame(void* raw);\nstatic void ku_task_0_drop_frame_inner(void* raw) {",
+        ),
+        (
+            "static void ku_task_0_dispose(KuTaskControlV1* control, void* raw) {",
+            "static void ku_task_0_dispose(KuTaskControlV1* control, void* raw);\nstatic void ku_task_0_dispose_inner(KuTaskControlV1* control, void* raw) {",
+        ),
+    ] {
+        assert_eq!(generated.matches(signature).count(), 1);
+        generated = generated.replacen(signature, replacement, 1);
+    }
+    assert_eq!(generated.matches("typedef struct KuString {").count(), 1);
+    let source = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_unused_source_main(void) {",
+            1,
+        )
+        + EXTERNAL_PARALLEL_MAIN;
+    let directory = TempDir::new("task-external-parallel");
+    let path = directory.path().join("external_parallel.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "external_parallel") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "external owners must clean up before reporting absent overlap:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "external-task-parallel-cleanup-ok\nexternal-task-parallel-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+const EXTERNAL_PARALLEL_MAIN: &str = r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"external parallel line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+#if defined(_WIN32)
+typedef DWORD FixtureThreadId;
+static SRWLOCK fixture_lock=SRWLOCK_INIT;
+static void fixture_probe_lock(void) { AcquireSRWLockExclusive(&fixture_lock); }
+static void fixture_probe_unlock(void) { ReleaseSRWLockExclusive(&fixture_lock); }
+static FixtureThreadId fixture_thread_id(void) { return GetCurrentThreadId(); }
+static int fixture_same_thread(FixtureThreadId a,FixtureThreadId b) { return a==b; }
+#else
+typedef pthread_t FixtureThreadId;
+static pthread_mutex_t fixture_lock=PTHREAD_MUTEX_INITIALIZER;
+static void fixture_probe_lock(void) { if(pthread_mutex_lock(&fixture_lock)) abort(); }
+static void fixture_probe_unlock(void) { if(pthread_mutex_unlock(&fixture_lock)) abort(); }
+static FixtureThreadId fixture_thread_id(void) { return pthread_self(); }
+static int fixture_same_thread(FixtureThreadId a,FixtureThreadId b) { return pthread_equal(a,b); }
+#endif
+typedef struct FixtureProbe {
+  void* context;
+  size_t calls,active,maximum_active,frame_drops,disposals;
+  FixtureThreadId thread;
+  KuTestEvent entered,ran,retired;
+} FixtureProbe;
+typedef struct FixtureOwner {
+  KuTaskDriverV1* driver;
+  size_t index;
+} FixtureOwner;
+static FixtureProbe fixture_probes[2];
+static KuTestEvent fixture_release,fixture_cleanup,fixture_finalize;
+static int fixture_gate_failed;
+static size_t fixture_probe_index(void* raw) {
+  if(raw==fixture_probes[0].context) return 0;
+  if(raw==fixture_probes[1].context) return 1;
+  abort();
+}
+static uint32_t ku_task_0_resume(void* raw) {
+  FixtureProbe* probe=&fixture_probes[fixture_probe_index(raw)];
+  fixture_probe_lock();
+  probe->active++;
+  if(probe->active>probe->maximum_active) probe->maximum_active=probe->active;
+  int first=++probe->calls==1u;
+  if(first) probe->thread=fixture_thread_id();
+  fixture_probe_unlock();
+  if(first) {
+    int entered=ku_test_event_set(&probe->entered);
+    /* A broken serial implementation is released by the controller after its
+     * shared observation window. This longer guard only bounds test cleanup. */
+    int released=ku_test_event_wait(&fixture_release,5000u);
+    if(!entered || !released) {
+      fixture_probe_lock(); fixture_gate_failed=1; fixture_probe_unlock();
+    }
+  }
+  uint32_t outcome=ku_task_0_resume_inner(raw);
+  fixture_probe_lock(); probe->active--; fixture_probe_unlock();
+  return outcome;
+}
+static void ku_task_0_drop_frame(void* raw) {
+  fixture_probe_lock(); fixture_probes[fixture_probe_index(raw)].frame_drops++; fixture_probe_unlock();
+  ku_task_0_drop_frame_inner(raw);
+}
+static void ku_task_0_dispose(KuTaskControlV1* control,void* raw) {
+  fixture_probe_lock(); fixture_probes[fixture_probe_index(raw)].disposals++; fixture_probe_unlock();
+  ku_task_0_dispose_inner(control,raw);
+}
+static void fixture_owner_wake(void* context,size_t owner) { (void)context; (void)owner; }
+static unsigned long fixture_remaining(uint64_t deadline) {
+  uint64_t now=ku_task_driver_now_ms();
+  if(now==UINT64_MAX || now>=deadline) return 0;
+  return (unsigned long)(deadline-now);
+}
+static int fixture_owner_run(void* raw) {
+  FixtureOwner* owner=(FixtureOwner*)raw;
+  KuTaskDriverV1* driver=owner->driver;
+  int outcome=0;
+  /* Pure ready source work: each real owner advances only its own bounded
+   * queue. No sleeps or mock completion supply the source-loop result. */
+  for(size_t turn=0;turn<256u;turn++) {
+    uint64_t next=UINT64_MAX;
+    uint32_t status=ku_task_driver_pump(driver,owner->index,1u,&next);
+    if(status>KU_TASK_DRIVER_PENDING) { outcome=1; break; }
+    if(ku_task_driver_lock(driver)) { outcome=2; break; }
+    size_t ready=driver->workers[owner->index].local_queued;
+    ku_task_driver_unlock(driver);
+    if(!ready) break;
+    if(turn==255u) outcome=3;
+  }
+  if(!ku_test_event_set(&fixture_probes[owner->index].ran)) outcome=4;
+  if(!ku_test_event_wait(&fixture_cleanup,5000u)) return 5;
+  /* The controller has dropped owners and requested close. The original
+   * bound threads, rather than a controller impersonating them, retire slots. */
+  for(size_t turn=0;turn<64u;turn++) {
+    uint64_t next=UINT64_MAX;
+    uint32_t status=ku_task_driver_pump(driver,owner->index,1u,&next);
+    if(status>KU_TASK_DRIVER_PENDING) { outcome=6; break; }
+    if(ku_task_driver_lock(driver)) { outcome=7; break; }
+    size_t ready=driver->workers[owner->index].local_queued;
+    ku_task_driver_unlock(driver);
+    if(!ready) break;
+    if(turn==63u) outcome=8;
+  }
+  /* A loop can be locally empty while the other owner still retires work.
+   * Join that explicit phase before checking the driver's global exit rule. */
+  if(!ku_test_event_set(&fixture_probes[owner->index].retired)) outcome=9;
+  if(!ku_test_event_wait(&fixture_finalize,5000u)) return 10;
+  if(ku_task_driver_lock(driver)) return 11;
+  int exited=driver->workers[owner->index].state==KU_TASK_DRIVER_WORKER_EXITED;
+  ku_task_driver_unlock(driver);
+  if(!exited) {
+    uint64_t next=UINT64_MAX;
+    if(ku_task_driver_pump(driver,owner->index,1u,&next)>KU_TASK_DRIVER_PENDING) return 12;
+  }
+  return outcome;
+}
+int main(void) {
+  KuTaskDriverV1 driver={0};
+  KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
+  KuTaskValueV1 tasks[2]={0};
+  KuTaskDriverCleanupReceiptV1 cancelled={0};
+  KuTaskDriverTicketV1 old={0};
+  KuTestThread threads[2]={0};
+  FixtureOwner owners[2]={{&driver,0u},{&driver,1u}};
+  FixtureThreadId controller=fixture_thread_id();
+  CHECK(ku_test_event_init(&fixture_release) && ku_test_event_init(&fixture_cleanup)
+    && ku_test_event_init(&fixture_finalize));
+  for(size_t i=0;i<2u;i++)
+    CHECK(ku_test_event_init(&fixture_probes[i].entered) && ku_test_event_init(&fixture_probes[i].ran)
+      && ku_test_event_init(&fixture_probes[i].retired));
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  uint64_t deadline=ku_task_driver_now_ms()+5000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,2u,ring,2u,fixed+2u*sizeof(KuTaskInstance_0),2u,deadline,NULL,fixture_owner_wake)==KU_TASK_DRIVER_OK);
+  for(size_t i=0;i<2u;i++) {
+    int64_t input=(int64_t)i+16;
+    CHECK(ku_task_0_start_value(&driver,&input,&tasks[i])==KU_TASK_DRIVER_OK);
+    CHECK(slots[tasks[i].ticket.slot].owner_worker==i+1u);
+    fixture_probes[i].context=tasks[i].owner.lease.control->context;
+  }
+  old=tasks[0].ticket;
+  size_t started=0;
+  for(;started<2u;started++) if(!ku_test_thread_start(&threads[started],fixture_owner_run,&owners[started])) break;
+  uint64_t observation_deadline=ku_task_driver_now_ms()+1000u;
+  int entered[2]={0};
+  for(size_t i=0;i<started;i++)
+    entered[i]=ku_test_event_wait(&fixture_probes[i].entered,fixture_remaining(observation_deadline));
+  int parallel=started==2u && entered[0] && entered[1];
+  int cancellation_while_running=0;
+  if(parallel) {
+    fixture_probe_lock();
+    parallel=fixture_probes[0].active==1u && fixture_probes[1].active==1u
+      && !fixture_same_thread(fixture_probes[0].thread,fixture_probes[1].thread)
+      && !fixture_same_thread(fixture_probes[0].thread,controller)
+      && !fixture_same_thread(fixture_probes[1].thread,controller);
+    fixture_probe_unlock();
+    KuTaskDriverSnapshotV1 held={0};
+    parallel=parallel && ku_task_driver_snapshot(&driver,&held)==KU_TASK_DRIVER_OK
+      && held.running==2u && held.resident==2u && !held.queued && !held.fault;
+    cancellation_while_running=ku_task_driver_owner_drop_receipt(
+        &tasks[0].ticket,&tasks[0].owner,deadline,&cancelled)==KU_TASK_DRIVER_OK;
+    if(cancellation_while_running) {
+      cancellation_while_running=ku_task_control_atomic_load(
+          &((KuTaskInstance_0*)fixture_probes[0].context)->control.phase)==KU_TASK_CONTROL_REQUESTED_CANCEL;
+      tasks[0]=(KuTaskValueV1){0};
+    }
+  }
+  /* Release every gate BEFORE any red assertion or join. In the serial case
+   * the second callback can enter later and observes the already-open gate. */
+  int cleanup_ok=ku_test_event_set(&fixture_release);
+  for(size_t i=0;i<started;i++)
+    if(!ku_test_event_wait(&fixture_probes[i].ran,5000u)) cleanup_ok=0;
+  int correct=0;
+  if(started==2u) {
+    KuTaskAdapterOutcomeV1 value={0};
+    uint32_t taken=ku_task_value_take(&tasks[1],NULL,&value);
+    correct=taken==KU_TASK_CONTROL_OK && value.result_kind==1u
+      && value.value.integer.ok && value.value.integer.value==529;
+    ku_task_outcome_drop(&value);
+  }
+  for(size_t i=0;i<2u;i++) if(tasks[i].owner.lease.control) {
+    if(ku_task_value_drop(&tasks[i],deadline)!=KU_TASK_DRIVER_OK) cleanup_ok=0;
+  }
+  if(ku_task_driver_request_close(&driver,deadline)!=KU_TASK_DRIVER_OK) cleanup_ok=0;
+  if(!ku_test_event_set(&fixture_cleanup)) cleanup_ok=0;
+  for(size_t i=0;i<started;i++)
+    if(!ku_test_event_wait(&fixture_probes[i].retired,5000u)) cleanup_ok=0;
+  /* A rare thread-start failure has no bound owner for that index. Close now
+   * permits the controller to retire just those never-bound logical owners. */
+  for(size_t i=started;i<2u;i++) {
+    uint64_t next=UINT64_MAX;
+    if(ku_task_driver_pump(&driver,i,64u,&next)>KU_TASK_DRIVER_PENDING) cleanup_ok=0;
+  }
+  if(!ku_test_event_set(&fixture_finalize)) cleanup_ok=0;
+  for(size_t i=0;i<started;i++) {
+    if(!ku_test_thread_join(&threads[i],5000u) || threads[i].outcome) cleanup_ok=0;
+  }
+  KuTaskDriverSnapshotV1 final={0};
+  int empty=ku_task_driver_snapshot(&driver,&final)==KU_TASK_DRIVER_OK
+    && !final.resident && !final.building && !final.queued && !final.running
+    && !final.reserved_bytes && !final.timers && !final.fault && final.workers_exited==2u;
+  int stale=ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE;
+  int receipt=!cancelled.driver || ku_task_driver_cleanup_receipt_read(&cancelled)==KU_TASK_DRIVER_CLEANUP_ACK;
+  if(ku_task_driver_join(&driver,ku_task_driver_now_ms()+1000u)!=KU_TASK_DRIVER_OK) cleanup_ok=0;
+  if(ku_task_driver_destroy(&driver)!=KU_TASK_DRIVER_OK) cleanup_ok=0;
+  int unique=1;
+  for(size_t i=0;i<2u;i++) {
+    FixtureProbe* probe=&fixture_probes[i];
+    if(probe->active || probe->maximum_active>1u || probe->frame_drops!=1u || probe->disposals!=1u) unique=0;
+    if(!ku_test_event_destroy(&probe->entered) || !ku_test_event_destroy(&probe->ran)
+      || !ku_test_event_destroy(&probe->retired)) cleanup_ok=0;
+  }
+  if(!ku_test_event_destroy(&fixture_release) || !ku_test_event_destroy(&fixture_cleanup)
+    || !ku_test_event_destroy(&fixture_finalize)) cleanup_ok=0;
+#if !defined(_WIN32)
+  if(pthread_mutex_destroy(&fixture_lock)) cleanup_ok=0;
+#endif
+  if(!cleanup_ok || !empty || !stale || !receipt || !unique) {
+    fprintf(stderr,"external cleanup flags: cleanup=%d empty=%d stale=%d receipt=%d unique=%d resident=%zu queued=%zu running=%zu bytes=%zu exited=%zu fault=%u owner_outcomes=%d,%d drops=%zu,%zu disposals=%zu,%zu\n",
+      cleanup_ok,empty,stale,receipt,unique,final.resident,final.queued,final.running,
+      final.reserved_bytes,final.workers_exited,final.fault,threads[0].outcome,threads[1].outcome,
+      fixture_probes[0].frame_drops,fixture_probes[1].frame_drops,
+      fixture_probes[0].disposals,fixture_probes[1].disposals);
+  }
+  CHECK(cleanup_ok && empty && stale && receipt && unique);
+  puts("external-task-parallel-cleanup-ok");
+  CHECK(parallel && cancellation_while_running && correct
+    && fixture_probes[1].calls>1u && !fixture_gate_failed);
+  puts("external-task-parallel-ok"); return 0;
+}
+"#;
 
 const MOVES_AND_AWAITS: &str = r#"
 async fn main(): null! {

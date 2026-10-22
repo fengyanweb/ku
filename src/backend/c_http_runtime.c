@@ -14,6 +14,9 @@
 #define KU_HTTP_MAX_PENDING_REQUESTS 8192LL
 #define KU_HTTP_READ_CHUNK 8192
 static long ku_http_env_limit(const char*,long,long);
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+static void ku_http_task_driver_timing(void*,uint64_t[10]);
+#endif
 
 /* Private platform boundary. HTTP parsing/routing above the socket calls is
    byte-for-byte shared by Windows, Linux and macOS. */
@@ -34,6 +37,32 @@ static void ku_http_atomic_decrement(KuHttpAtomicCounter* counter) { (void)atomi
 #endif
 
 static unsigned long long ku_http_now_ms(void) { return __ku_handler_now_ms(); }
+/* CPU consumed by the calling event-owner OS thread only. This excludes
+   coordinator/background workers and elapsed time spent sleeping or ready for
+   CPU. Read at a bounded frequency, not at each Task dispatch. */
+static int ku_http_thread_cpu_ns(uint64_t* output) {
+#if defined(_WIN32)
+  FILETIME created, exited, kernel, user;
+  if (!GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user)) return 0;
+  ULARGE_INTEGER system_ticks, user_ticks;
+  system_ticks.LowPart=kernel.dwLowDateTime; system_ticks.HighPart=kernel.dwHighDateTime;
+  user_ticks.LowPart=user.dwLowDateTime; user_ticks.HighPart=user.dwHighDateTime;
+  if (system_ticks.QuadPart>UINT64_MAX-user_ticks.QuadPart) return 0;
+  uint64_t ticks=system_ticks.QuadPart+user_ticks.QuadPart;
+  if (ticks>UINT64_MAX/100u) return 0;
+  *output=ticks*100u;
+#else
+  struct timespec value;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID,&value) || value.tv_sec<0
+      || value.tv_nsec<0 || value.tv_nsec>=1000000000L) return 0;
+  uint64_t seconds=(uint64_t)value.tv_sec, fraction=(uint64_t)value.tv_nsec;
+  if (seconds>UINT64_MAX/UINT64_C(1000000000)) return 0;
+  uint64_t whole=seconds*UINT64_C(1000000000);
+  if (fraction>UINT64_MAX-whole) return 0;
+  *output=whole+fraction;
+#endif
+  return 1;
+}
 
 static int ku_http_socket_last_error(void) {
 #if defined(_WIN32)
@@ -1965,6 +1994,7 @@ typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, pending, workers, ready, exited, drained;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
+  uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
   unsigned long long transport_closes[KU_HTTP_CLOSE_REASON_COUNT];
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   KuHttpWake* wake;
@@ -1985,6 +2015,15 @@ struct KuHttpLoopGroup {
   const char* failure;
   KuHttpLoopOwner loops[KU_HTTP_MAX_LOOPS];
 };
+/* Called only by this owner's event thread with group->lock held. A failed or
+   backwards clock sample keeps the last valid CPU counter and marks the error. */
+static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint64_t sampled_ms,int valid) {
+  if (!valid || cpu_ns<owner->cpu_ns) {
+    if (owner->cpu_clock_errors!=UINT64_MAX) owner->cpu_clock_errors++;
+    return;
+  }
+  owner->cpu_ns=cpu_ns; owner->cpu_sample_ms=sampled_ms;
+}
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
 /* Branch witnesses, not request IDs or proof that a client observed this close.
@@ -2209,8 +2248,11 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     used = (size_t)n;
     for (int i=0; i<group->created; i++) {
       KuHttpLoopOwner* owner = &group->loops[i];
-      n = snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu}",
-        i?",":"",i,owner->accepted,owner->requests,(unsigned long long)owner->queued,(unsigned long long)owner->running,(unsigned long long)owner->resident,(unsigned long long)owner->connections,(unsigned long long)owner->pending_count);
+      uint64_t sampled_now=ku_http_now_ms();
+      uint64_t sample_age=sampled_now>=owner->cpu_sample_ms ? sampled_now-owner->cpu_sample_ms : 0;
+      n = snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
+        i?",":"",i,owner->accepted,owner->requests,(unsigned long long)owner->queued,(unsigned long long)owner->running,(unsigned long long)owner->resident,(unsigned long long)owner->connections,(unsigned long long)owner->pending_count,
+        (unsigned long long)owner->cpu_ns,(unsigned long long)owner->cpu_sample_ms,(unsigned long long)sample_age,(unsigned long long)owner->cpu_clock_errors);
       if (n<0 || (size_t)n>=sizeof(text)-used) _Exit(79);
       used+=(size_t)n;
     }
@@ -2274,6 +2316,15 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
       if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
     }
     text[used++]=']';
+    uint64_t driver_timing[10]={0};
+    ku_http_task_driver_timing(group->tasks,driver_timing);
+    n=snprintf(text+used,sizeof(text)-used,",\"task_driver_timing\":{\"enabled\":%s,\"lock_count\":%llu,\"lock_wait_ns\":%llu,\"max_lock_wait_ns\":%llu,\"lock_hold_ns\":%llu,\"max_lock_hold_ns\":%llu,\"condition_count\":%llu,\"condition_sleep_reacquire_ns\":%llu,\"max_condition_sleep_reacquire_ns\":%llu,\"clock_errors\":%llu}",
+      driver_timing[0]?"true":"false",(unsigned long long)driver_timing[1],
+      (unsigned long long)driver_timing[2],(unsigned long long)driver_timing[3],
+      (unsigned long long)driver_timing[4],(unsigned long long)driver_timing[5],
+      (unsigned long long)driver_timing[6],(unsigned long long)driver_timing[7],
+      (unsigned long long)driver_timing[8],(unsigned long long)driver_timing[9]);
+    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
     uint64_t blocking_states[16]={0};
     ku_http_task_blocking_metrics(group->tasks,blocking_states);
     n=snprintf(text+used,sizeof(text)-used,",\"task_blocking\":{\"resident\":%llu,\"queued\":%llu,\"running\":%llu,\"peak_resident\":%llu,\"peak_queued\":%llu,\"peak_running\":%llu,\"accepted\":%llu,\"rejected\":%llu,\"finished\":%llu,\"output_charge_bytes\":%llu,\"workers_created\":%llu,\"workers_exited\":%llu,\"cancelled_still_running\":%llu,\"net_wait\":%llu,\"net_step\":%llu}",
@@ -2374,6 +2425,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   int resource_accept_errors = 0;
   unsigned long long accept_retry_deadline = 0;
   unsigned long long health_deadline=ku_http_deadline_ms(500);
+  uint64_t next_cpu_sample_ms=0;
   const char* listen_failure = spawned == nworkers ? NULL : "handler thread startup failed";
   ku_http_mutex_lock(&group->lock);
   owner->wake = &wake; owner->ready = !listen_failure;
@@ -2387,7 +2439,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_mutex_unlock(&queue.lock);
     size_t occupied_connections = 0;
     for (int i=0; i<slot_count; i++) if (connections[i].socket_value != KU_HTTP_INVALID_SOCKET) occupied_connections++;
+    uint64_t sampled_cpu_ns=0, sampled_cpu_ms=ku_http_now_ms();
+    int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
+    int cpu_sample_valid=cpu_sample_due && ku_http_thread_cpu_ns(&sampled_cpu_ns);
+    if (cpu_sample_due) next_cpu_sample_ms=sampled_cpu_ms>UINT64_MAX-10u ? UINT64_MAX : sampled_cpu_ms+10u;
     ku_http_mutex_lock(&group->lock);
+    if (cpu_sample_due) ku_http_owner_cpu_sample(owner,sampled_cpu_ns,sampled_cpu_ms,cpu_sample_valid);
     owner->queued = queued; owner->running = running; owner->resident = resident;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
@@ -2724,7 +2781,10 @@ static void* ku_http_loop_thread(void* argument) {
 #else
   (void)cleanup_deadline;
 #endif
+  uint64_t final_cpu_ns=0, final_cpu_ms=ku_http_now_ms();
+  int final_cpu_valid=ku_http_thread_cpu_ns(&final_cpu_ns);
   ku_http_mutex_lock(&owner->group->lock);
+  ku_http_owner_cpu_sample(owner,final_cpu_ns,final_cpu_ms,final_cpu_valid);
   owner->ready = 0; owner->exited = 1;
   ku_http_mutex_unlock(&owner->group->lock);
   ku_http_group_notify(owner->group);

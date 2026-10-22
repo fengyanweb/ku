@@ -221,6 +221,20 @@ static void ku_http_task_metrics(void* raw,size_t owner,uint64_t output[8]) {
   }
   ku_task_driver_unlock(&runtime->driver);
 }
+/* Diagnostic snapshot only. Taking it has one normal lock acquisition; the
+ * current snapshot's still-held interval is included by its later unlock. */
+static void ku_http_task_driver_timing(void* raw,uint64_t output[10]) {
+  memset(output,0,10u*sizeof(*output));
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
+  if (!runtime || ku_task_driver_lock(&runtime->driver)) return;
+  KuTaskDriverV1* driver=&runtime->driver;
+  output[0]=driver->timing_enabled; output[1]=driver->timing_lock_count;
+  output[2]=driver->timing_lock_wait_ns; output[3]=driver->timing_max_lock_wait_ns;
+  output[4]=driver->timing_lock_hold_ns; output[5]=driver->timing_max_lock_hold_ns;
+  output[6]=driver->timing_condition_count; output[7]=driver->timing_condition_wait_ns;
+  output[8]=driver->timing_max_condition_wait_ns; output[9]=driver->timing_clock_errors;
+  ku_task_driver_unlock(driver);
+}
 static int ku_http_task_owner_exited(void* raw,size_t owner) {
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
   if(!runtime || owner>=runtime->driver.workers_created || ku_task_driver_lock(&runtime->driver)) return 0;
