@@ -382,7 +382,7 @@ typedef struct KuTaskDriverExecutionV1 {
   size_t slot;
   uint64_t generation;
   KuTaskControlV1* control;
-  uint32_t default_yield, cooperative_yield, intent_touched;
+  uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum;
 } KuTaskDriverExecutionV1;
 static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
 /* Called immediately after an existing mutex-owned explicit intent write.
@@ -1811,11 +1811,23 @@ static uint32_t ku_task_driver_begin_quantum(const KuTaskDriverTicketV1* ticket,
  * from timers, I/O, child waits, cleanup or a raw callback is not cooperative
  * ready work and must return through the original locked commit path. */
 static void ku_task_driver_note_quantum_yield(const KuTaskDriverTicketV1* ticket,
-    KuTaskControlV1* control) {
+    KuTaskControlV1* control,int scalar_quantum) {
   KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
   if (execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
-      && execution->generation==ticket->generation && execution->control==control)
+      && execution->generation==ticket->generation && execution->control==control) {
     execution->cooperative_yield=1;
+    execution->scalar_quantum=scalar_quantum!=0;
+  }
+}
+/* This local witness never reads cached shared charges. The adapter separately
+ * excludes blocking functions, active children/receipts, waits and drain. */
+static int ku_task_driver_scalar_quantum(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  return execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control
+      && execution->cooperative_yield && execution->scalar_quantum && !execution->intent_touched
+      && ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE;
 }
 static uint32_t ku_task_driver_wrapper_begin(
     const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
@@ -2704,7 +2716,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
-    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0};
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0};
     KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 
@@ -2716,7 +2728,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     uint32_t outcome=KU_TASK_CONTROL_PENDING;
     int segment_clock_fault=started==UINT64_MAX;
     do {
-      context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0;
+      context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0;
       outcome=ku_task_control_poll(&execution);
       quanta++;
       if (outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched

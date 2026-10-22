@@ -93,15 +93,19 @@ def baseline_natives(root):
     if not changed_entries:
         raise RuntimeError("comparison requires the candidate generated entry")
     before_driver = before_driver.replace(entry, "ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)")
-    marker = "    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control);"
+    marker = "    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);"
     marker_count = before_driver.count(marker)
     if not marker_count:
         raise RuntimeError("comparison requires the actual dispatch-budget marker")
     before_driver = before_driver.replace("    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n"+marker+"\n", "")
+    scalar = "ku_task_driver_scalar_quantum(&instance->ticket,&instance->control)"
+    scalar_count = before_driver.count(scalar)
+    before_driver = before_driver.replace(scalar, "(0)")
     before_both = before_driver.replace(current_http, old["c_http_runtime.c"], 1)
     outputs, manifest = {}, {"reference": reference, "old_source_sha256": hashes,
                             "restored_adapter_entries": changed_entries,
                             "restored_dispatch_markers": marker_count,
+                            "disabled_scalar_reconcile_fast_paths": scalar_count,
                             "scope": "Final frontend and fixture; historical driver and/or HTTP runtime replacement only; release C flags unchanged (-O2)."}
     for name, text in (("before_driver", before_driver), ("before_both", before_both)):
         source, executable = root / (name+".c"), root / name
@@ -113,7 +117,7 @@ def baseline_natives(root):
     return outputs, manifest
 
 
-def compare(executable, baselines, client, root):
+def compare(executable, baselines, client, root, checkpoint=None):
     from capacity_cpu import checksum, run_client, work_path
     result = []
     # Interleave both variants and N; short A/B is separate from formal 30s CPU.
@@ -134,6 +138,11 @@ def compare(executable, baselines, client, root):
                     finally:
                         row["exit"] = service.stop()
                     result.append(row)
+                    if checkpoint:
+                        checkpoint(result)
+                    print(json.dumps({"phase": "short_comparison", "variant": name, "loops": loops,
+                                      "repetition": repetition, "valid": row["measurement"]["measurement_valid"],
+                                      "correct_rps": row["measurement"]["client"]["rates"]["correct_per_measurement_second"]}), flush=True)
     return result
 
 
@@ -158,6 +167,26 @@ def trace_exchange(service, count=12):
     finally:
         connection.close()
     return samples
+
+
+def lock_probe(executable, client, root):
+    """Two-second final-source diagnosis; never a throughput/scaling sample."""
+    from capacity_cpu import checksum, run_client, work_path
+    previous = os.environ.get("KU_TASK_DRIVER_TIMING")
+    os.environ["KU_TASK_DRIVER_TIMING"] = "1"
+    try:
+        service = Service(executable, root, 4)
+    finally:
+        if previous is None:
+            os.environ.pop("KU_TASK_DRIVER_TIMING", None)
+        else:
+            os.environ["KU_TASK_DRIVER_TIMING"] = previous
+    result = {"scope": "Final-source bounded lock diagnosis; per-lock clock overhead perturbs performance. Excluded from timed capacity and comparison medians."}
+    try:
+        result["measurement"] = run_client(service, client, work_path(128), checksum(128), 2, concurrency=32)
+    finally:
+        result["exit"] = service.stop()
+    return result
 
 
 def diagnose(executable, root, evidence):
@@ -232,6 +261,9 @@ def capacity(ku, executable, client, root, args, save, peer):
                 item["exit"] = service.stop()
             result["rounds"].append(item)
             save(result)
+            print(json.dumps({"phase": "formal_cpu", "repetition": repetition, "loops": loops,
+                              "correct_rps": item["measurement"]["client"]["rates"]["correct_per_measurement_second"],
+                              "valid": item["measurement"]["measurement_valid"]}), flush=True)
     for loops in (1, 2, 4):
         service = Service(executable, root, loops)
         item = {"loops": loops}
@@ -269,8 +301,16 @@ def assessment(report):
         value = row.get("measurement", {})
         ledger = value.get("client", {}).get("ledger", {})
         started = ledger.get("started", 0)
+        reasons = ledger.get("not_started_reasons", {})
+        # Closed workers may create one final plan just before the deadline,
+        # then observe cutoff before starting it. It is retained as unstarted,
+        # never a request failure or claimed server arrival.
+        cutoff_only = (ledger.get("not_started", 0) <= 32
+                       and reasons.get("client_queue_full", 0) == 0
+                       and reasons.get("scheduler_at_cutoff", 0) == 0
+                       and ledger.get("not_started", 0) == reasons.get("queued_or_closed_at_cutoff", 0))
         return (row.get("exit") == 0 and value.get("measurement_valid") is True
-                and started > 0 and ledger.get("not_started") == 0
+                and started > 0 and cutoff_only
                 and ledger.get("results", {}).get("correct_success") == started
                 and value.get("server_delta", {}).get("complete_requests_received") == started)
     summary = {}
@@ -356,6 +396,7 @@ def main():
         "material_median_regression_fraction": .05, "candidate_driver_minimum_median_gain": .05,
         "fairness_p99_ms": 250, "recovery_seconds": 5,
         "scope": "Conservative local acceptance criteria frozen before traffic, not universal performance promises. Noisy or CPU-limited environments fail/invalidate rather than receiving relaxed thresholds."}
+    report["plan"]["frozen_gates"]["closed_client_cutoff"] = "At most one final unstarted plan per worker (32); only the explicit cutoff bucket. No queue rejection, request failure or false server-arrival credit is allowed. Open-arrival checks remain separate."
     save = lambda value=None: atomic_json(args.output, report)
     save()
     from capacity_wait import NetworkPeer
@@ -375,14 +416,26 @@ def main():
         baseline, baseline_manifest = baseline_natives(root)
         report["comparison_inputs"] = baseline_manifest
         save()
-        report["short_comparison"] = compare(executable, baseline, client, root)
+        def comparison_checkpoint(value):
+            report["short_comparison"] = value
+            save()
+        report["short_comparison"] = compare(executable, baseline, client, root, comparison_checkpoint)
+        preliminary = assessment(report)
+        report["short_comparison_gate"] = {name: preliminary["checks"][name] for name in (
+            "comparison_correct", "candidate_driver_benefit", "legacy_final_no_material_four_owner_regression")}
+        save()
+        report["lock_diagnosis"] = lock_probe(executable, client, root)
         save()
         if args.mode in ("capacity", "all"):
-            def checkpoint(value):
-                report["capacity"] = value
-                save()
-            report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint, peer)
-            report["assessment"] = assessment(report)
+            if all(report["short_comparison_gate"].values()):
+                def checkpoint(value):
+                    report["capacity"] = value
+                    save()
+                report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint, peer)
+                report["assessment"] = assessment(report)
+            else:
+                report["assessment"] = {"passed": False, "failed": ["short_comparison_gate"],
+                    "reason": "Short comparison did not establish candidate benefit/correctness and legacy recovery. Formal capacity was not started; inspect retained samples before another run."}
             save()
     report["temporary_directory_removed"] = True
     save()

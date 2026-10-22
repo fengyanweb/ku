@@ -25,6 +25,10 @@
 
 HTTP pump 总额仍是 32，`pump(1)` 仍只消耗 1，driver/worker polls 按实际次数累计。没有改 ready 队列架构、charge 缓存、线程总额或超时；收益须由关闭诊断的同输入 release 对照证明，否则不应仅凭机制保留优化。统一 `emit_frames` 在生成 frame 前先输出 driver/helper 和 host 类型；普通 frame-only 入口不启用 cooperative 分支，不存在缺少 helper 声明的生成路径。
 
+实际生成 C 的有界计数说明，仅合并交接仍不足：128,000 次迭代每请求约 8,008 个 control poll，N1/N4 的 reconcile 分别占 driver 锁调用约 63.69%/83.60%，HTTP readiness 检查约 31.76%/10.41%；合并后 run_one 交接只占约 2.10%/2.77%。一秒线程采样同时捕获 mutex 等待和 reconcile→map_charge 栈。计数覆盖诊断启动、采样及回收，不能直接当作正式计时窗口或逐请求精确占比；原始身份和精简线程记录见 `evidence/multicore-initial-diagnosis.json`。
+
+据此增加保守的单量子证明：仅 Int/Bool/Null 的常量、读写、运算和无资源释放，以及已验证的空 scope 控制转移，才保持本次局部 `charge_unchanged` 标志。未知操作、owned 值操作、调用、等待等一律清除标志。只有真实预算耗尽的 Pending、匹配的 TLS/代次/control、phase LIVE、未触达显式 intent，且没有活跃 child、receipt、wait、drain、payload/result 时，adapter 才省略本次重复扫描。含 Blocking 或 finally 的函数静态禁用，以覆盖外部输出和异常隐式释放。没有缓存共享 charge，也没有延迟分配准入或最终退款；完整、失败、混合量子及 take/drop 等原核对仍执行。这是局部 Task IR 证明，不进入暂停的通用值或 AST 分析。
+
 ## 旧约 40ms 样本的证据边界
 
 本地证据根目录为 `/Users/mac/Downloads/Ku_多核容量验收_2026-10-22/`：

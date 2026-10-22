@@ -686,6 +686,215 @@ int main(void) {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn native_task_scalar_quantum_reconciles_owned_changes_children_and_cleanup() {
+    let source = r#"
+import fs from "std.fs"
+async fn Work(value: str): str! {
+    text=value+"a"
+    i=0; total=3
+    while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
+    text=text+"b"
+    i=0
+    while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
+    return ok(text)
+}
+async fn Child(value: str): str! { return ok(value) }
+async fn Parent(value: str): str! {
+    child=Child(value)
+    i=0; total=3
+    while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
+    text=(await child)?
+    text=text+"c"
+    i=0
+    while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
+    return ok(text)
+}
+async fn Blocking(value: str): str! {
+    text=value+"d"
+    i=0; while(i<50000) { i=i+1 }
+    found=fs.exists("not-reached-by-fixture")
+    return ok(text)
+}
+async fn Finally(value: str): str! {
+    text=value+"e"
+    i=0
+    try { while(i<50000) { i=i+1 } } finally { text=text+"z" }
+    return ok(text)
+}
+async fn Failure(value: str): str! {
+    text=value+"f"
+    i=0; while(i<1000) { i=i+1 }
+    large=9223372036854775807
+    overflow=large+1
+    return ok(text)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    ast.items
+        .retain(|item| !matches!(item, ku::ast::Item::Import(_)));
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:fs".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let tasks = task_lower::lower_program(&ast).unwrap();
+    let child_mask = tasks.tasks.functions[2]
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot.ty, ku::ir::task::TaskSlotType::Task { .. }))
+        .fold(0u64, |mask, (index, _)| mask | (1u64 << index));
+    assert_ne!(child_mask, 0);
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    generated = generated.replacen(
+        "typedef struct KuString {",
+        "static size_t fixture_scans[6],fixture_skipped[6],fixture_pure_scans[6],fixture_mixed_scans[6],fixture_terminal_scans[6],fixture_child_scans;\ntypedef struct KuString {",
+        1,
+    );
+    for id in [0, 2, 3, 4, 5] {
+        let reconcile = format!("static uint32_t ku_task_{id}_reconcile_charge(void* raw) {{");
+        assert_eq!(generated.matches(&reconcile).count(), 1);
+        generated = generated.replacen(
+            &reconcile,
+            &format!("{reconcile}\n  fixture_scans[{id}]++;"),
+            1,
+        );
+        let resume = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        assert_eq!(generated.matches(&resume).count(), 1);
+        generated = generated.replacen(
+            &resume,
+            &format!(
+                r#"static uint32_t ku_task_{id}_resume_inner(void* raw);
+static uint32_t ku_task_{id}_resume(void* raw) {{
+  size_t before=fixture_scans[{id}];
+  uint32_t outcome=ku_task_{id}_resume_inner(raw);
+  KuTaskInstance_{id}* instance=(KuTaskInstance_{id}*)raw;
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  int scalar=execution && execution->cooperative_yield && execution->scalar_quantum;
+  if(outcome==KU_TASK_CONTROL_PENDING && scalar) {{
+    if(fixture_scans[{id}]==before) fixture_skipped[{id}]++;
+    else fixture_pure_scans[{id}]++;
+    if({id}u==2u && (instance->frame.header.initialized & UINT64_C({child_mask}))
+      && fixture_scans[{id}]>before) fixture_child_scans++;
+  }} else if(fixture_scans[{id}]>before) {{
+    if(outcome==KU_TASK_CONTROL_PENDING) fixture_mixed_scans[{id}]++;
+    else fixture_terminal_scans[{id}]++;
+  }}
+  return outcome;
+}}
+static uint32_t ku_task_{id}_resume_inner(void* raw) {{"#
+            ),
+            1,
+        );
+    }
+    let generated = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    );
+    let source = generated
+        + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"scalar reconcile line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(size_t id,int cancel) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
+  KuTaskValueV1 task={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  uint64_t deadline=ku_task_driver_now_ms()+2000u, next=UINT64_MAX;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,4u,ring,4u,fixed+131072u,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  uint8_t* buffer=malloc(16u); CHECK(buffer); memcpy(buffer,"payload",7u);
+  KuString input={buffer,7u,16u,KU_STRING_OWNED};
+  uint32_t started=id==0u ? ku_task_0_start_value(&driver,&input,&task)
+    : id==2u ? ku_task_2_start_value(&driver,&input,&task)
+    : id==3u ? ku_task_3_start_value(&driver,&input,&task)
+    : id==4u ? ku_task_4_start_value(&driver,&input,&task)
+    : ku_task_5_start_value(&driver,&input,&task);
+  CHECK(started==KU_TASK_DRIVER_OK && !input.ptr);
+  KuTaskDriverTicketV1 old=task.ticket;
+  size_t before_skip=fixture_skipped[id], before_pure=fixture_pure_scans[id];
+  for(size_t turn=0;turn<1024u;turn++) {
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    if(cancel && (fixture_skipped[id]>before_skip+4u || fixture_pure_scans[id]>before_pure+4u)) break;
+    if(ku_task_control_status(&task.owner.lease)!=KU_TASK_CONTROL_PENDING) break;
+  }
+  if(cancel) {
+    size_t before=fixture_scans[id];
+    CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+    for(size_t turn=0;turn<256u && driver.resident;turn++)
+      CHECK(ku_task_driver_pump(&driver,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+    CHECK(fixture_scans[id]>before);
+  } else if(id==5u) {
+    CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_FAILED);
+    KuTaskAdapterOutcomeV1 outcome={0}; size_t before=fixture_scans[id];
+    CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(fixture_scans[id]>before && outcome.result_kind==4u && !outcome.value.string.ok);
+    ku_task_outcome_drop(&outcome);
+    CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+    CHECK(fixture_skipped[id]>before_skip && fixture_terminal_scans[id]);
+  } else {
+    CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_COMPLETED);
+    KuTaskAdapterOutcomeV1 outcome={0}; size_t before=fixture_scans[id];
+    CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(fixture_scans[id]>before && outcome.result_kind==4u && outcome.value.string.ok);
+    KuString text=outcome.value.string.value;
+    CHECK(text.len==(id==0u ? 9u : 8u) && !memcmp(text.ptr,id==0u ? "payloadab" : "payloadc",text.len));
+    ku_task_outcome_drop(&outcome);
+    CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+    CHECK(fixture_skipped[id]>before_skip && fixture_mixed_scans[id] && fixture_terminal_scans[id]);
+  }
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<256u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,4u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers
+    && !driver.reserved_bytes && driver.workers_exited==1u && !driver.fault);
+  CHECK(!ku_task_driver_execution && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_case(0u,0)); CHECK(!fixture_case(0u,1));
+  CHECK(!fixture_case(2u,0)); CHECK(fixture_child_scans);
+  CHECK(!fixture_case(3u,1)); CHECK(!fixture_case(4u,1));
+  CHECK(!fixture_case(5u,0));
+  CHECK(fixture_pure_scans[3] && !fixture_skipped[3]);
+  CHECK(fixture_pure_scans[4] && !fixture_skipped[4]);
+  puts("scalar-quantum-owned-child-cleanup-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-scalar-reconcile");
+    let path = directory.path().join("scalar_reconcile.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "scalar_reconcile") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "scalar-quantum-owned-child-cleanup-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 const MOVES_AND_AWAITS: &str = r#"
 async fn main(): null! {
     first = Child(3)

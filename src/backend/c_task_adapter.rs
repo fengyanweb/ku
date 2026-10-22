@@ -643,6 +643,9 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@RECONCILE_CALL@", if blocking { "ku_task_blocking_reconcile_charge(&instance->ticket,&instance->blocking,sizeof(*instance),bytes)" } else { "ku_task_driver_reconcile_charge(&instance->ticket,sizeof(*instance),bytes)" })
         .replace("@ALLOCATION_HOST@", if dynamic_projection { "sizeof(KuTaskAdapterHostV1),KU_TASK_ALLOCATION_HOST_ABI_VERSION,instance,ku_task_@ID@_reconcile_charge" } else { "0,0,NULL,NULL" })
         .replace("@RECONCILE_RETURN@", if dynamic_projection { RECONCILE_AFTER_RESUME } else { "" })
+        .replace("@SCALAR_RECONCILE_SKIP@", if blocking || finally { "0" } else {
+            "status==KU_TASK_FRAME_PENDING && instance->frame_initialized && !instance->payload_initialized\n    && !instance->frame.header.result_initialized && !(instance->frame.header.initialized & UINT64_C(@TASK_MASK@))\n    && !instance->receipt_mask && !instance->wait.driver && !instance->drain_started\n    && ku_task_driver_scalar_quantum(&instance->ticket,&instance->control)"
+        })
         .replace("@RECONCILE_DRAIN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;" } else { "" })
         .replace("@RECONCILE_TAKE@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
         .replace("@RECONCILE_DROP@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
@@ -1031,7 +1034,10 @@ static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
 }
 "#;
 const RECONCILE_AFTER_RESUME: &str = r#"
-  if(ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)return KU_TASK_CONTROL_INVALID_STATE;
+  /* Only a proved scalar-only budget yield can omit this redundant scan.
+   * Final/failed/waiting/mixed callbacks and every other reconcile call stay. */
+  if(!(@SCALAR_RECONCILE_SKIP@)
+      && ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)return KU_TASK_CONTROL_INVALID_STATE;
 "#;
 
 const HTTP_ADAPTER_ABI: &str = r#"

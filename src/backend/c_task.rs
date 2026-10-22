@@ -800,13 +800,57 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         Ok(())
     }
 
+    // A local proof for one drive invocation, not a cached charge or a general
+    // ownership analysis. Unknown operations are deliberately non-scalar.
+    fn scalar_charge_state(&self, state: &crate::ir::task::TaskState) -> bool {
+        let scalar = |slot: SlotId| {
+            matches!(
+                self.function.slots[slot.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Int | IrType::Bool | IrType::Null,
+                    borrowed: false,
+                }
+            )
+        };
+        let operations = state.operations.iter().all(|operation| match operation {
+            TaskOp::Init { dst, value } => {
+                scalar(*dst)
+                    && matches!(
+                        value,
+                        TaskConstant::Int(_) | TaskConstant::Bool(_) | TaskConstant::Null
+                    )
+            }
+            TaskOp::Copy { dst, src } | TaskOp::Move { dst, src } => scalar(*dst) && scalar(*src),
+            TaskOp::Unary { dst, src, .. } => scalar(*dst) && scalar(*src),
+            TaskOp::Binary {
+                dst, left, right, ..
+            } => scalar(*dst) && scalar(*left) && scalar(*right),
+            TaskOp::Read { slot } => scalar(*slot),
+            // Scalar drops only clear their initialized bit; no destructor or
+            // allocation host is emitted for these exact types.
+            TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => scalar(*slot),
+            // This verified lexical annotation emits no runtime operation.
+            TaskOp::ScopeEnter { tasks, .. } => tasks.is_empty(),
+            _ => false,
+        });
+        operations
+            && match &state.terminator {
+                TaskTerminator::Jump { .. } | TaskTerminator::Suspend { .. } => true,
+                TaskTerminator::Branch { condition, .. } => scalar(*condition),
+                // The cooperative empty-manifest continuation only changes
+                // frame control fields; its separate Value drops are TaskOps.
+                TaskTerminator::ScopeDrain { scope, .. } => self.scopes[scope.0].task_mask == 0,
+                _ => false,
+            }
+    }
+
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
             self.prefix, self.frame_type
         ));
         if self.cooperative {
-            out.push_str("  size_t __ku_dispatch_budget=64u;\n");
+            out.push_str("  size_t __ku_dispatch_budget=64u;\n  int __ku_charge_unchanged=1;\n");
         }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
@@ -851,7 +895,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             mask
                         }
                     });
-            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
+            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
         }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
@@ -863,6 +907,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         for (index, state) in self.function.states.iter().enumerate() {
             out.check()?;
             out.push_str(&format!("ku_task_state_{index}:;\n"));
+            if self.cooperative && !self.scalar_charge_state(state) {
+                out.push_str("  __ku_charge_unchanged=0;\n");
+            }
             for (operation_id, operation) in state.operations.iter().enumerate() {
                 out.check()?;
                 self.emit_operation(out, operation, index, operation_id)?;
