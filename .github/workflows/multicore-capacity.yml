@@ -79,6 +79,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends strace tcpdump
 
+      - name: Provide the pinned bounded load generator toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+
       - name: Install pinned Rust and require the existing native tools
         shell: bash
         run: |
