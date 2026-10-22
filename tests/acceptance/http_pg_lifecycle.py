@@ -513,7 +513,30 @@ def main():
                 assert json.loads(request("/read")) == expected
                 report["checks"]["parameters_fields_unicode_null"] = "passed"
                 assert request("/insert/normal") == "中文🙂 payload"
-                assert sql("SELECT count(*) FROM ku_events WHERE id='normal' AND payload='中文🙂 payload'") == "1"
+                if os.name == "nt":
+                    # Retain the previous oracle's literal bytes as evidence;
+                    # correctness below is checked independently of this argv.
+                    report["psql_unicode_argv_literal_utf8_hex"] = sql(
+                        "SELECT encode(convert_to('中文🙂 payload', 'UTF8'), 'hex')")
+                # ASCII SQL and output avoid depending on Windows psql's
+                # non-ASCII argv conversion while checking the actual DB bytes.
+                write_observation = json.loads(sql(
+                    "SELECT json_build_object("
+                    "'server_encoding', current_setting('server_encoding'), "
+                    "'client_encoding', current_setting('client_encoding'), "
+                    "'total_count', (SELECT count(*) FROM ku_events), "
+                    "'rows', (SELECT COALESCE(json_agg(json_build_object("
+                    "'id_utf8_hex', encode(convert_to(id, 'UTF8'), 'hex'), "
+                    "'payload_utf8_hex', encode(convert_to(payload, 'UTF8'), 'hex'), "
+                    "'octet_length', octet_length(convert_to(payload, 'UTF8')))), '[]'::json) "
+                    "FROM (SELECT id, payload FROM ku_events ORDER BY id LIMIT 2) AS observed))"))
+                report["write_observation"] = write_observation
+                progress("http:write-observation")
+                payload_bytes = "中文🙂 payload".encode("utf-8")
+                assert write_observation["total_count"] == 1, write_observation
+                assert write_observation["rows"] == [{
+                    "id_utf8_hex": b"normal".hex(), "payload_utf8_hex": payload_bytes.hex(),
+                    "octet_length": len(payload_bytes)}], write_observation
                 report["checks"]["write_side_effect"] = "exactly one row"
                 assert request("/rows") == "10000:10000"
                 report["checks"]["large_result"] = "10000 rows, 2 columns, last row verified"

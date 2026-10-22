@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 
 HERE = Path(__file__).resolve().parent
@@ -600,9 +601,63 @@ def main():
     proxy = None
     config = None
     started = time.monotonic()
+    diagnostic = {"stage": "prepare", "slot_last_status": {},
+                  "surviving_b_requests": {"attempted": 0, "completed": 0,
+                                            "http_200": 0, "status_codes": []}}
+    report["diagnostic"] = diagnostic
+    known_owned = {}
+
+    def bounded_text(value, limit=256):
+        text = str(value)
+        if config is not None:
+            text = text.replace(config["_token"], "<control-token>")
+        return text[:limit]
+
+    def control_context(error):
+        context = getattr(error, "ku_control_context", None)
+        if not isinstance(context, dict):
+            return None
+        return {key: bounded_text(context[key]) if isinstance(context[key], str) else context[key]
+                for key in ("stage", "elapsed_ms", "error_type", "errno", "winerror", "detail")
+                if key in context and (context[key] is None or type(context[key]) in (str, int, float))}
+
+    def remember_owned():
+        for name, process in list(M.OWNED_SUPERVISORS.items())[:3]:
+            if process.pid in known_owned or len(known_owned) < 6:
+                known_owned[process.pid] = (name, process)
+
+    def stage(name):
+        diagnostic.update(stage=name, stage_elapsed_ms=round((time.monotonic()-started)*1000, 3))
+        remember_owned()
+
+    def record_status(slot, state):
+        # Only bounded lifecycle fields, never the config, argv, token or body.
+        fields = ("phase", "pid", "generation", "last_reason", "last_exit_generation",
+                  "last_exit_code", "last_launcher_signal", "launcher_status",
+                  "owned_supervisor_alive", "termination_requested", "unfinished_work_possible",
+                  "database_outcome", "database_retry", "control_error")
+        safe = {key: bounded_text(state[key]) if isinstance(state[key], str) else state[key]
+                for key in fields if key in state
+                and (state[key] is None or type(state[key]) in (str, int, bool))}
+        if isinstance(state.get("control_failure"), dict):
+            wrapper = RuntimeError()
+            wrapper.ku_control_context = state["control_failure"]
+            safe["control_failure"] = control_context(wrapper)
+        diagnostic["slot_last_status"][slot["name"]] = safe
+        return state
+
+    def slot_status(slot):
+        return record_status(slot, M.status(config, slot))
+
+    def owned_receipt():
+        remember_owned()
+        return [{"slot": name, "pid": pid, "returncode": process.poll()}
+                for pid, (name, process) in known_owned.items()]
+
     with tempfile.TemporaryDirectory(prefix="ku-svc-", dir="/tmp") as temporary:
         root = Path(temporary)
         try:
+            stage("freeze_cli_and_config")
             # Cargo may replace a workspace binary during independent checks.
             # Freeze one private CLI inode so the recorded hash identifies all
             # builds, generations and launcher invocations in this acceptance.
@@ -622,6 +677,7 @@ def main():
                                                    drain_timeout_ms=1000, startup_timeout_ms=5000)
             builds = {}
             for revision in ("previous", "new"):
+                stage(f"build_{revision}")
                 build = root / revision
                 build.mkdir()
                 source = (HERE / "http_service.ku").read_text().replace("Ku HTTP OK", f"Ku HTTP OK {revision}")
@@ -649,15 +705,22 @@ def main():
                                     "proxy_threads": 1, "tls": "loopback HTTP only; no TLS in this isolated fixture"}
             proxy_config = root / "haproxy.cfg"
             proxy_config.write_text(M.render(config))
+            stage("validate_proxy_config")
             validation = subprocess.run([args.haproxy, "-c", "-f", str(proxy_config)], capture_output=True, text=True, timeout=10)
             if validation.returncode:
                 raise RuntimeError(validation.stdout + validation.stderr)
             report["results"]["proxy_config"] = "passed"
+            stage("start_proxy")
             proxy = subprocess.Popen([args.haproxy, "-db", "-f", str(proxy_config)],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             a, b, spare = config["slots"]
-            M.start(config, a)
-            M.start(config, b)
+            stage("start_a")
+            record_status(a, M.start(config, a))
+            stage("start_b")
+            record_status(b, M.start(config, b))
+            report["initial_slot_status"] = {name: dict(diagnostic["slot_last_status"][name])
+                                              for name in ("a", "b")}
+            stage("normal_proxy")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 try:
@@ -670,16 +733,33 @@ def main():
             else:
                 raise RuntimeError("HAProxy did not admit the ready native instances")
             report["results"]["normal_proxy"] = "passed"
+            stage("steady_resource_snapshot")
             report["steady_resource_snapshot"] = resource_snapshot(proxy)
-            initial = M.status(config, a)
+            stage("native_exit_initial_a_status")
+            initial = slot_status(a)
             failure_started = time.monotonic()
-            os.kill(native_child(initial["pid"]), signal.SIGKILL)
-            ordinary = [M.call(b["listen_addr"], "GET", "/")[0] for _ in range(10)]
+            stage("native_exit_resolve_target")
+            target_pid = native_child(initial["pid"])
+            diagnostic["fault_target"] = {"slot": "a", "launcher_pid": initial["pid"],
+                                          "native_pid": target_pid, "generation": initial["generation"]}
+            stage("native_exit_send_sigkill")
+            os.kill(target_pid, signal.SIGKILL)
+            ordinary = []
+            for index in range(10):
+                stage(f"native_exit_surviving_b_request_{index+1}")
+                progress = diagnostic["surviving_b_requests"]
+                progress["attempted"] += 1
+                code = M.call(b["listen_addr"], "GET", "/")[0]
+                ordinary.append(code)
+                progress["completed"] += 1
+                progress["http_200"] += int(code == 200)
+                progress["status_codes"].append(code)
             if ordinary != [200] * 10:
                 raise RuntimeError(f"surviving instance results: {ordinary}")
+            stage("native_exit_wait_replacement")
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                recovered = M.status(config, a)
+                recovered = slot_status(a)
                 if recovered["phase"] == "ready" and recovered["generation"] > initial["generation"]:
                     break
                 time.sleep(.02)
@@ -689,42 +769,75 @@ def main():
                 "old_generation": initial["generation"], "new_generation": recovered["generation"], "surviving_requests": len(ordinary)}
             rolling_started = time.monotonic()
             def capture_coexist():
+                stage("rolling_resource_snapshot")
                 report["rolling_resource_snapshot"] = resource_snapshot(proxy)
+                stage("rolling_after_resource_snapshot")
+            stage("rolling")
             deployment = M.roll(config, "a", "spare", root / "spare" / "new", on_coexist=capture_coexist)
+            stage("rolling_proxy_responses")
             observations = [M.call(config["frontend_addr"], "GET", "/")[1] for _ in range(20)]
             if "Ku HTTP OK new" not in observations:
                 raise RuntimeError("new revision never received proxy traffic")
-            if M.status(config, a)["phase"] != "absent":
+            stage("rolling_old_slot_status")
+            if slot_status(a)["phase"] != "absent":
                 raise RuntimeError("old supervisor remained after rolling drain")
             report["results"]["rolling"] = {"passed": True, "duration_ms": round((time.monotonic() - rolling_started) * 1000, 3), "deployment": deployment}
             rollback_started = time.monotonic()
+            stage("rollback")
             M.roll(config, deployment["new_slot"], deployment["old_slot"], deployment["old_program"], rollback=True)
+            stage("rollback_proxy_responses")
             observations = [M.call(config["frontend_addr"], "GET", "/")[1] for _ in range(20)]
             if any(body != "Ku HTTP OK previous" for body in observations):
                 raise RuntimeError(f"rollback content mismatch: {observations}")
             report["results"]["rollback"] = {"passed": True, "duration_ms": round((time.monotonic() - rollback_started) * 1000, 3), "verified_proxy_requests": len(observations)}
+            stage("completed_checks")
             report["passed"] = True
         except BaseException as error:
             report["passed"] = False
-            report["failure"] = f"{type(error).__name__}: {error}"
+            report["failure"] = bounded_text(f"{type(error).__name__}: {error}", 2048)
+            diagnostic["failure_stage"] = diagnostic["stage"]
+            diagnostic["failure_elapsed_ms"] = round((time.monotonic()-started)*1000, 3)
+            diagnostic["trace"] = [{"file": Path(frame.filename).name[:128], "line": frame.lineno,
+                                    "function": frame.name[:128]}
+                                   for frame in traceback.extract_tb(error.__traceback__, limit=-12)]
+            diagnostic["ku_control_context"] = control_context(error)
+            diagnostic["owned_before_cleanup"] = owned_receipt()
+            diagnostic["proxy_before_cleanup"] = (None if proxy is None else
+                {"pid": proxy.pid, "returncode": proxy.poll()})
+            if config is not None:
+                # Once per fixed slot, existing one-second management reads;
+                # diagnostic failures never erase the original test failure.
+                for slot in config["slots"][:3]:
+                    try:
+                        slot_status(slot)
+                    except (OSError, RuntimeError, ValueError, http.client.HTTPException) as probe_error:
+                        diagnostic["slot_last_status"].setdefault(slot["name"], {}).update(
+                            diagnostic_error=bounded_text(f"{type(probe_error).__name__}: {probe_error}"))
         finally:
             cleanup_errors = []
+            remember_owned()
             if config is not None:
                 for slot in config["slots"]:
                     try:
                         M.stop(config, slot)
-                    except (OSError, RuntimeError, TimeoutError) as error:
-                        cleanup_errors.append(f"{slot['name']}: {error}")
+                    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+                        cleanup_errors.append(bounded_text(f"{slot['name']}: {error}"))
             if proxy is not None:
-                proxy.terminate()
                 try:
-                    proxy.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proxy.kill()
-                    proxy.wait(timeout=5)
+                    proxy.terminate()
+                    try:
+                        proxy.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proxy.kill()
+                        proxy.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError) as error:
+                    cleanup_errors.append(bounded_text(f"proxy: {type(error).__name__}: {error}"))
             report["cleanup_errors"] = cleanup_errors
             if cleanup_errors:
                 report["passed"] = False
+            diagnostic["owned_after_cleanup"] = owned_receipt()
+            diagnostic["proxy_after_cleanup"] = (None if proxy is None else
+                {"pid": proxy.pid, "returncode": proxy.poll()})
             report["duration_seconds"] = round(time.monotonic() - started, 3)
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
