@@ -31,9 +31,9 @@ fn main(): null! {
 ## 等待与固定归属
 
 - HTTP 连接、parser、响应写出和该请求的 Task 固定归属一个事件线程。子 Task 继承归属，不偷取活动 Task。
-- 同一 Task 只允许一个执行者；重复 wake 合并到其固定 ready 节点。外部 pump 每轮最多 64 个 Task 量子，source frame 每量子最多 64 个 dispatch；真实 timer/await/I/O 等待仍登记后挂起。
+- 同一 Task 只允许一个执行者；重复 wake 合并到其固定 ready 节点。driver 外部 pump 接受每轮最多 64 个 Task 量子，HTTP owner 每轮实际取 32 个；source frame 每量子最多 64 个 dispatch；真实 timer/await/I/O 等待仍登记后挂起。
 - 纯循环 latch 和没有 Task 的空 scope 在有限 dispatch 量子内继续，不为每个整数迭代进行两次调度。取消仍在 dispatch 边界检查。
-- 外部 loop 正在 pump 时不为每个自排队量子发送一次 socket 通知；pump 末尾在同一发布锁下重查 ready/期限。真正跨线程发布到已停泵的 owner 时仍发送持久唤醒，关闭和故障保留全组通知。
+- 外部loop正在pump时不为每个自排队量子发送socket通知；pump末尾在同一发布锁下重查ready/期限，剩余ready返回deadline0，不再在driver锁内发送多余自唤醒。真正跨线程发布到已停泵的owner时仍发送持久唤醒，关闭和故障保留全组通知。
 - 动态 owned 槽位仍在返回、真实等待、分配预付、子 Task 转账、清理和结果取出时执行原计费检查。曾定向试验只对纯 Copy 预算量子跳过一次重复扫描；生成 C 证明条件生效，但同负载没有证明收益，因此已移除两个私有状态位及该分支，保留完整检查与 owned 回归。
 
 `c_task_driver.rs` 的 external init/pump 不创建线程。实际线程由 HTTP loop 持有；没有创建成功的逻辑 owner 只能在无准入工作、请求关闭后由协调线程进行最后一次 pump，走正常 EXITED/join/destroy 路径。内部 raw C fixture 的旧共享队列模式仍保留，用于原 ABI 回归。
@@ -70,8 +70,12 @@ DNS/第三方库内部内存、OS socket 缓冲、线程栈和任意 Ku 堆不�
 - `tests/native_task_source_test.rs`：固定 owner、公平 pump、wake 合并、关闭与从未绑定 owner 的退出；原 source 到 native 执行、字符串/数组、目录、bytes、TCP partial binary/EOF、旧 generation readiness。
 - `tests/native_task_adapter_test.rs`：实际分配/所有权账本、子 Task transfer、finally/取消、原期限和 pool full；占住唯一原生 worker 时，排队任务取消仍必须移除并退役。
 - `tests/native_http_test.rs`：真实 mixed async HTTP，request map 点/索引、owned 文件输出转 response、timer 超时后恢复、同步 handler 兼容、拒绝签名 stub 执行；两批 24 条 TCP 等待须全部发出 binary 输入后才回复，随后验证 read timeout、物理 close、重连和自然 drain。
-- `tests/acceptance/runtime_matrix.py`、`tests/fixtures/multiloop_service.ku`：正式综合负载的独立入口；吞吐、分位数、资源回收和平台 CI 以相应实测报告为准，本接口文档不能代替验收报告。
+- `tests/acceptance/runtime_matrix.py`：三档短负载、真实等待和资源回落入口；`tests/acceptance/multiloop_load.py`：固定30分钟正式入口。二者复用 `tests/fixtures/multiloop_service.ku`，吞吐、分位数、资源回收和平台 CI 以各自实际报告为准，本接口文档不能代替验收报告。
 
 多循环不承诺线性加速。相同短循环负载的 owner/self-wake 改动前后对照已显示改进，N=4 仍可能低于 N=2；已捕获的共享 driver 元数据锁等待需如实说明，不能通过换负载、增加超时或改变账本放宽来隐藏。
 
-本机必要回归使用 macOS arm64、Rust 1.89.0：`cargo test --test native_task_source_test --test native_task_adapter_test` 的 16 条 source、12 条 adapter 全部通过，包含分配失败、owned 替换、子 Task 转账、取消和物理回收；`cargo test --test native_http_test native_http_async` 的 3 条 mixed HTTP 回归通过。这些记录先于纯 Copy 扫描试验的定向撤回，不代替撤回后的必要检查、正式综合负载、其他平台 CI 或最终提交号对应的质量检查。
+本机必要回归使用 macOS arm64、Rust 1.89.0：16 条 source、12 条 adapter 和 3 条 mixed HTTP 回归曾分别通过，包含分配失败、owned 替换、子 Task 转账、取消和物理回收。删除尾部多余通知后，source 目标重新执行 16/16 通过，新增断言覆盖零自通知的持续推进、停泵后的外部定向通知和关闭广播。早期局部结果保留各自身份，最终三平台和正式窗口以冻结源对应的集中报告为准。
+
+原生冻结源 `a31c113` 的三平台默认套件、Linux竞态/内存检测和新的正式30分钟已通过；其C/backend/IR与后续服务定向源一致。Rust协调器独立的RST退出修复由 `67d78d9` 三平台服务/真实PG检查通过。各次实际源、跳过项、旧失败和A19真实环境阻塞统一见[主验收记录](multiloop-runtime.md)，不将本接口文档当作平台验收证据。
+
+参考部署的Windows原生代理更新/回滚和平台辅助线程预留由独立 `e40ab1b`、run39709674234验证；它不改变本文Task执行线程、I/O或编译输入。操作阶段期限、完整进程成本及外部演练条件见主验收记录。
