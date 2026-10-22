@@ -1,12 +1,16 @@
 """Private PostgreSQL fixture setup must not broaden its parent permissions."""
 import json
+from contextlib import redirect_stdout
+import io
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 import http_pg_lifecycle as fixture
@@ -105,6 +109,86 @@ class WindowsPostgresDirectoryContracts(unittest.TestCase):
             child = Path(temporary) / "test-data"
             child.mkdir()
             (child / "probe.txt").write_text("private", encoding="utf-8")
+
+
+class FixtureProcessContracts(unittest.TestCase):
+    def test_timeout_keeps_sixty_second_command_and_bounded_reap(self):
+        child = Mock(pid=123, returncode=1)
+        child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 60), 1]
+        phases = []
+        with patch.object(fixture.subprocess, "Popen", return_value=child), self.assertRaises(RuntimeError):
+            fixture.run(["fixture-tool"], progress=lambda phase, **details: phases.append((phase, details)))
+        self.assertEqual(child.wait.call_args_list, [unittest.mock.call(timeout=60), unittest.mock.call(timeout=5)])
+        child.kill.assert_called_once()
+        child.communicate.assert_not_called()
+        self.assertEqual(phases[-1][0], "fixture-tool:timeout")
+
+    def test_background_descendant_holding_stdout_does_not_delay_tool_output(self):
+        with tempfile.TemporaryDirectory(prefix="ku-pg-tool-contract-") as temporary:
+            pid_file = Path(temporary) / "descendant.pid"
+            program = (
+                "import pathlib,subprocess,sys; "
+                "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(5)'],"
+                "stdout=sys.stdout,stderr=sys.stderr); "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid)); "
+                "print('tool-output-ready',flush=True)"
+            )
+            try:
+                entered = time.monotonic()
+                with redirect_stdout(io.StringIO()):
+                    output = fixture.run([sys.executable, "-c", program])
+                self.assertEqual(output, "tool-output-ready")
+                self.assertLess(time.monotonic() - entered, 3)
+            finally:
+                if pid_file.is_file():
+                    try:
+                        os.kill(int(pid_file.read_text()), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+    def test_cleanup_errors_are_saved_and_do_not_skip_remaining_cleanup(self):
+        stopped = []
+
+        class Service:
+            def poll(self):
+                return None
+
+            def kill(self):
+                stopped.append("http")
+                raise OSError("fixture HTTP stop failure")
+
+        class Proxy:
+            def close(self):
+                stopped.append("proxy")
+                raise OSError("fixture proxy stop failure")
+
+        def stop_database():
+            stopped.append("postgres")
+            raise OSError("fixture database stop failure")
+
+        with tempfile.TemporaryDirectory(prefix="ku-pg-cleanup-contract-") as temporary:
+            output = Path(temporary) / "result.json"
+            data = Path(temporary) / "data"
+            data.mkdir()
+            (data / "postmaster.pid").write_text("fixture-private-pid")
+            report = {"status": "failed", "failure": "original fixture failure", "checks": {"read": "passed"}}
+            with redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                fixture.cleanup_fixture(report, output, Service(), Proxy(), data, stop_database, False)
+            recorded = json.loads(output.read_text())
+            self.assertEqual(stopped, ["http", "proxy", "postgres"])
+            self.assertEqual(len(recorded["cleanup_errors"]), 3)
+            self.assertEqual(recorded["failure"], "original fixture failure")
+            self.assertEqual(recorded["checks"], {"read": "passed"})
+            self.assertEqual(recorded["current_phase"], "cleanup:finished")
+            self.assertFalse(output.with_name(output.name + ".tmp").exists())
+
+    def test_missing_private_pid_and_unstarted_server_are_not_stopped(self):
+        with tempfile.TemporaryDirectory(prefix="ku-pg-cleanup-contract-") as temporary:
+            output = Path(temporary) / "result.json"
+            with patch.object(fixture, "checkpoint"), patch("builtins.print"):
+                stop = Mock()
+                fixture.cleanup_fixture({"status": "passed"}, output, None, None, Path(temporary) / "data", stop, False)
+            stop.assert_not_called()
 
 
 if __name__ == "__main__":

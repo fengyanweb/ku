@@ -144,3 +144,13 @@ Windows CI 分成资源/退役与 PG/Task Scheduler 两个定向组，以免不�
 精简时间线、身份/patch摘要与竞争说明见[诊断记录](evidence/mac-tail-notify-diagnostic.json)，有界原始窗口及5秒报告保留在本机证据目录。修后本机fmt、workspace/all-targets clippy拒绝warnings、15项辅助回归（12过、3Windows专用跳过）通过。因为这次确实修改运行时，新冻结提交必须重新执行对应三平台检查和同参数正式30分钟，原d173的通过不能冒充修后通过。
 
 Windows PG辅助复验另修两处明确失败：SDDL把当前SID合法缩写为LA，不能全文字符串判断，改用SecurityIdentifier和Modify/OI/CI位；从pwsh父进程调用Windows PowerShell时，只在子环境移除PSModulePath，让引擎建立匹配的默认模块路径，父环境及PATH/libpq保留。真正PG检查仍由新Windows实跑结果确认，不把ACL脚本通过当数据库通过。
+
+## Windows PG 启动后的测试输出回收修正
+
+`9ac5ed9` 的定向 run39696743372 已验证11项管理及15项辅助回归通过，私有目录ACL准备成功：当前用户Modify/OI/CI的结构化规则有效，owner/父ACL未变，子进程独立模块路径生效。PG步骤仍长时间无进展，达到十分钟无输出检查后取消，不计通过。取消时原始栈确认：`pg_ctl start -w -t20` 的60秒subprocess.run先超时，随后Windows分支的无期限二次communicate卡在stdout读取线程join；当时checks为空，不能补写SQL已跑或PG业务失败。
+
+修正仅限验收设施：命令输出用临时文件，Popen.wait仍60秒，直接子回收最多5秒；阶段/实际PID/输出尾原子保存，清理逐项执行且总能记录，只有私有临时目录清理后才标通过。即使启动工具没正常返回，只要独有data目录内postmaster.pid存在，仍尝试停止该私有库。没有重放SQL或提高服务期限。
+
+新增测试专用Cargo example `acceptance-runner`，复用已有tests/support/bounded_process.rs包住**整段Python夹具**，不是每次pg_ctl；私有数据库可以正常存活到业务验证结束。WindowsCI对整个夹具用180秒绝对期限和有限输出/收尾。该目标不安装为Ku命令，未新增依赖，Cargo.lock不变。本机继承输出的孙进程超时样本约1.016秒返回124，普通失败退出码7原样保留；19项辅助回归16过、3Windows专用跳过，fmt及workspace/all-targets clippy拒绝warnings通过。下一轮必须实际执行PG成功/故障链路，不能用辅助检查通过替代。
+
+取消轮次的精简栈与原报告保留在本机 `final-ci-9ac5ed9-windows-pg-host/`；原报告缺最终status，按未完成保留。运行时源码自9ac5ed9后没有再变；新冻结提交包含测试设施修正，正式窗口和全量CI必须保留各自实际head身份。

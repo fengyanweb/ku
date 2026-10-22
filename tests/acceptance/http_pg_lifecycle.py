@@ -33,11 +33,104 @@ def port():
         return listener.getsockname()[1]
 
 
-def run(args, **kwargs):
-    result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", timeout=60, **kwargs)
-    if result.returncode:
-        raise RuntimeError(f"{Path(str(args[0])).name} failed: {result.stderr[-4000:]}")
-    return result.stdout.strip()
+def checkpoint(report, output, phase, **details):
+    """Keep one atomic current checkpoint, including during fixture cleanup."""
+    report["current_phase"] = phase
+    report["phase_details"] = details
+    report["updated_monotonic"] = time.monotonic()
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(output.name + ".tmp")
+    pending.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    pending.replace(output)
+    print(json.dumps({"phase": phase, **details}, ensure_ascii=False), flush=True)
+
+
+def run(args, progress=None, **kwargs):
+    """Wait for the tool, not EOF from an intentionally backgrounded server.
+
+    Windows subprocess.run kills only its direct child on timeout, then calls
+    communicate without a deadline. A descendant retaining stdout can therefore
+    outlive that timeout. Files avoid pipe-reader joins; the outer acceptance
+    process owns containment of the complete private fixture process tree.
+    """
+    tool = Path(str(args[0])).name
+    operation = next((str(arg) for arg in args[1:] if str(arg) in ("start", "stop")), None)
+    label = tool + (":" + operation if operation else "")
+
+    def mark(state, **details):
+        phase = label + ":" + state
+        if progress:
+            progress(phase, **details)
+        else:
+            print(json.dumps({"phase": phase, **details}), flush=True)
+
+    mark("starting", timeout_seconds=60)
+    began = time.monotonic()
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
+        mark("running", pid=child.pid, timeout_seconds=60)
+        timed_out = False
+        cleanup_error = None
+        try:
+            child.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                child.kill()
+                child.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_error = f"{type(error).__name__}: {error}"
+        captured = []
+        sizes = []
+        for stream in (stdout, stderr):
+            sizes.append(stream.seek(0, os.SEEK_END))
+            stream.seek(max(0, sizes[-1] - 65536))
+            captured.append(stream.read(65536).decode("utf-8", errors="replace"))
+        out, err = captured
+        mark("timeout" if timed_out else "finished", pid=child.pid, exit_code=child.returncode,
+             elapsed_seconds=time.monotonic() - began, stdout_bytes=sizes[0], stderr_bytes=sizes[1],
+             stdout_tail=out[-2000:], stderr_tail=err[-4000:], direct_child_cleanup_error=cleanup_error)
+        if timed_out:
+            raise RuntimeError(f"{tool} exceeded 60 seconds; direct-child cleanup: {cleanup_error or 'reaped'}")
+        if any(size > 65536 for size in sizes):
+            raise RuntimeError(f"{tool} exceeded the fixture's 65536-byte per-stream output limit")
+        if child.returncode:
+            raise RuntimeError(f"{tool} failed: {err[-4000:]}")
+        return out.strip()
+
+
+def cleanup_fixture(report, output, service, proxy, data, stop_database, started):
+    """Attempt every cleanup and save its result even if another cleanup fails."""
+    errors = []
+
+    def clean(label, action):
+        checkpoint(report, output, "cleanup:" + label + ":starting")
+        try:
+            action()
+        except Exception as error:
+            errors.append({"stage": label, "error": f"{type(error).__name__}: {error}"})
+
+    def stop_service():
+        if service is not None and service.poll() is None:
+            service.kill()
+            service.wait(timeout=5)
+
+    try:
+        clean("http", stop_service)
+        if proxy is not None:
+            clean("proxy", proxy.close)
+        # pg_ctl may have created a server before its launching tool failed.
+        # Only this fixture's private data path is inspected or stopped.
+        if started or (Path(data) / "postmaster.pid").is_file():
+            clean("postgres", stop_database)
+    finally:
+        report["cleanup_errors"] = errors
+        if errors:
+            report["status"] = "failed"
+        checkpoint(report, output, "cleanup:finished", error_count=len(errors))
+    if errors:
+        raise RuntimeError(f"private PostgreSQL fixture cleanup failed: {errors}")
 
 
 def prepare_windows_pg_directory(root, report):
@@ -252,7 +345,14 @@ def main():
                              "http_client_connection_policy": "eight persistent clients, no failed-request replay" if args.performance_seconds else "one connection per isolated fault request",
                              "database_transport": "direct Ku/libpq to private PostgreSQL; no fault proxy" if args.performance_seconds else "private Python fault proxy, capacity eight connections",
                              "tls": "disabled only inside isolated loopback fixture"},
-              "checks": {}}
+              "checks": {}, "status": "running"}
+    def progress(phase, **details):
+        checkpoint(report, args.output, phase, **details)
+
+    def execute(arguments, **kwargs):
+        return run(arguments, progress=progress, **kwargs)
+
+    progress("fixture:starting")
     with tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary:
         root = Path(temporary)
         database_port, http_port = port(), port()
@@ -262,14 +362,16 @@ def main():
         started = False
         logs = root / "http.log"
         try:
+            progress("fixture-acl:starting")
             prepare_windows_pg_directory(root, report)
+            progress("fixture-acl:finished")
             environment = os.environ | {"KU_EVENT_LOOPS": str(args.loops), "KU_BLOCKING_THREADS": "8",
                                         "KU_DB_MAX_CONNECTIONS": "4", "KU_DB_MAX_WAITERS": "8",
                                         "KU_DB_MAX_PENDING_BYTES": "1048576"}
             control_token = os.urandom(24).hex()
             environment["KU_SERVICE_CONTROL_TOKEN"] = control_token
             if not environment.get("KU_PG_LIB"):
-                libdir = Path(run([pg_config, "--libdir"]))
+                libdir = Path(execute([pg_config, "--libdir"]))
                 library = next((libdir / name for name in ["libpq.dylib", "libpq.so", "libpq.lib", "libpq.dll.a"]
                                 if (libdir / name).is_file()), None)
                 if library is None:
@@ -283,16 +385,16 @@ def main():
                 environment["KU_PG_LIB"] = str(private_lib)
             environment["PGCLIENTENCODING"] = "UTF8"
             environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
-            run([tools / "initdb", "-D", data, "-U", "ku_accept", "--auth-local=trust",
+            execute([tools / "initdb", "-D", data, "-U", "ku_accept", "--auth-local=trust",
                  "--auth-host=trust", "--encoding=UTF8", "--locale=C", "--no-instructions"])
             options = f"-h 127.0.0.1 -p {database_port} -c max_connections=24 -c shared_buffers=16MB"
             if os.name != "nt":
                 options += f' -k "{root}"'
-            run([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
+            execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
             started = True
 
             def sql(statement):
-                return run([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                return execute([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                             "-h", "127.0.0.1", "-p", str(database_port), "-U", "ku_accept",
                             "-d", "postgres", "-c", statement], env=environment)
 
@@ -309,7 +411,7 @@ def main():
             shutil.copyfile(source, local_source)
             executable = root / ("service.exe" if os.name == "nt" else "service")
             build_start = time.monotonic()
-            run([ku, "build", "--backend", "c", "--profile", args.profile, local_source, "-o", executable], cwd=root, env=environment)
+            execute([ku, "build", "--backend", "c", "--profile", args.profile, local_source, "-o", executable], cwd=root, env=environment)
             report["build_seconds"] = time.monotonic() - build_start
             with logs.open("wb") as log:
                 service = subprocess.Popen([executable], cwd=root, env=environment, stdout=log, stderr=log)
@@ -331,6 +433,7 @@ def main():
                         connection.close()
 
             deadline = time.monotonic() + 10
+            progress("http:readiness")
             while True:
                 if service.poll() is not None:
                     raise RuntimeError(f"HTTP service exited: {logs.read_text(encoding='utf-8')[-4000:]}")
@@ -343,6 +446,7 @@ def main():
                     raise RuntimeError("HTTP readiness deadline exceeded")
                 time.sleep(0.02)
             expected = {"text": "中文🙂 ' \\", "number": "42", "absent": True, "rows": 1, "cols": 3}
+            progress("http:acceptance")
             if args.performance_seconds:
                 before = process_sample(service.pid)
                 began = time.monotonic()
@@ -461,7 +565,7 @@ def main():
             report["checks"]["normal_drain_exit"] = service.returncode
             assert sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'") == "0"
             report["checks"]["database_connections_after_exit"] = 0
-            report["status"] = "passed"
+            report["status"] = "checks_passed"
         except Exception as error:
             report["status"] = "failed"
             report["failure"] = f"{type(error).__name__}: {error}"
@@ -469,15 +573,10 @@ def main():
                 report["service_log_tail"] = logs.read_text(encoding="utf-8", errors="replace")[-8192:]
             raise
         finally:
-            if service and service.poll() is None:
-                service.kill()
-                service.wait(timeout=5)
-            if proxy:
-                proxy.close()
-            if started:
-                run([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"])
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            cleanup_fixture(report, args.output, service, proxy, data,
+                lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"]), started)
+    report["status"] = "passed"
+    progress("fixture:finished")
     print(json.dumps(report, ensure_ascii=False))
 
 
