@@ -26,6 +26,11 @@ class DeploymentContracts(unittest.TestCase):
         token.write_text("a" * 32)
         token.chmod(0o600)
         self.config["control_token_file"] = str(token)
+        if sys.platform == "win32":
+            budget = self.config["deployment_budget"]
+            budget["per_instance"]["platform_thread_reserve"] = 16
+            budget["per_instance"]["total_threads"] += 16
+            budget["total_threads"] = budget["max_parallel_instances"]*budget["per_instance"]["total_threads"]+budget["management_threads"]
         self.path = self.root / "cluster.json"
         self.path.write_text(json.dumps(self.config))
 
@@ -50,6 +55,49 @@ class DeploymentContracts(unittest.TestCase):
         slot["env"]["KU_DB_MAX_CONNECTIONS"] = "100000"
         with self.assertRaisesRegex(ValueError, "conflicts"):
             M.environment(config, slot)
+
+    def test_windows_requires_explicit_platform_thread_reservation(self):
+        for value in (None, 0, 15, "16", True):
+            budget = self.config["deployment_budget"]["per_instance"]
+            budget.pop("platform_thread_reserve", None)
+            if value is not None:
+                budget["platform_thread_reserve"] = value
+            self.path.write_text(json.dumps(self.config))
+            with patch.object(M.sys, "platform", "win32"):
+                with self.assertRaisesRegex(ValueError, "platform_thread_reserve"):
+                    M.load(self.path)
+
+    def test_platform_threads_must_fit_both_each_slot_and_rolling_coexistence(self):
+        budget = self.config["deployment_budget"]
+        per = budget["per_instance"]
+        per["platform_thread_reserve"] = 16
+        required = per["event_threads"]+per["blocking_threads"]+9+16
+        budget["total_threads"] = 3*required+budget["management_threads"]
+        per["total_threads"] = required-1
+        self.path.write_text(json.dumps(self.config))
+        with patch.object(M.sys, "platform", "win32"):
+            with self.assertRaisesRegex(ValueError, "supervisor/launcher.*platform_thread_reserve"):
+                M.load(self.path)
+            per["total_threads"] = required
+            budget["total_threads"] -= 1
+            self.path.write_text(json.dumps(self.config))
+            with self.assertRaisesRegex(ValueError, "rolling coexistence.*total_threads"):
+                M.load(self.path)
+
+    def test_platform_reserve_does_not_increase_native_thread_budget(self):
+        budget = self.config["deployment_budget"]
+        per = budget["per_instance"]
+        with patch.object(M.sys, "platform", "win32"):
+            for reserve in (16, 32):
+                per["platform_thread_reserve"] = reserve
+                per["total_threads"] = per["event_threads"]+per["blocking_threads"]+9+reserve
+                budget["total_threads"] = 3*per["total_threads"]+budget["management_threads"]
+                self.path.write_text(json.dumps(self.config))
+                config = M.load(self.path)
+                environment = M.environment(config, config["slots"][0])
+                self.assertEqual(environment["KU_THREAD_BUDGET"], str(per["event_threads"]+per["blocking_threads"]+2))
+                self.assertEqual(environment["KU_EVENT_LOOPS"], str(per["event_threads"]))
+                self.assertEqual(environment["KU_BLOCKING_THREADS"], str(per["blocking_threads"]))
 
     def test_reference_proxy_disables_replay_and_hides_control_routes(self):
         rendered = M.render(M.load(self.path))

@@ -66,18 +66,27 @@ def load(path):
         if any(not isinstance(capacity.get(name), int) or isinstance(capacity.get(name), bool) or capacity[name] < minimum
                for name, minimum in (("management_threads", 34), ("management_memory_bytes", 134217728))):
             raise ValueError("Caddy requires explicit management_threads >= 34 and management_memory_bytes >= 128MiB reservations")
+    per_instance = capacity["per_instance"]
+    platform_threads = per_instance.get("platform_thread_reserve", 0)
+    if not isinstance(platform_threads, int) or isinstance(platform_threads, bool) or platform_threads < 0:
+        raise ValueError("platform_thread_reserve must be a nonnegative integer")
+    if sys.platform == "win32" and ("platform_thread_reserve" not in per_instance or platform_threads < 16):
+        raise ValueError("Windows requires explicit per_instance.platform_thread_reserve >= 16")
     for resource in ("reserved_memory_bytes", "event_threads", "blocking_threads", "database_connections", "total_threads", "database_waiters", "database_pending_bytes"):
-        per_instance = capacity["per_instance"][resource]
+        per_value = per_instance[resource]
         extra = capacity.get("management_threads", 0) if resource == "total_threads" else 0
         if resource == "reserved_memory_bytes":
             extra = capacity.get("management_memory_bytes", 0)
             if not isinstance(extra, int) or isinstance(extra, bool) or extra < 0:
                 raise ValueError("management_memory_bytes must be a nonnegative integer")
-        if not isinstance(per_instance, int) or per_instance < 0 or maximum * per_instance + extra > capacity[resource]:
+        if not isinstance(per_value, int) or per_value < 0 or maximum * per_value + extra > capacity[resource]:
             raise ValueError(f"rolling coexistence exceeds deployment {resource}")
-    per_instance = capacity["per_instance"]
-    if per_instance["total_threads"] < per_instance["event_threads"] + per_instance["blocking_threads"] + 9:
-        raise ValueError("total_threads must reserve native main/logger plus Ku supervisor/launcher threads")
+    # Include declared platform overhead in each coexisting slot, not once in
+    # the proxy allowance. Windows samples include additional runtime threads
+    # whose exact origins are not established; this is conservative admission,
+    # not a proved OS-thread hard cap or a request to create more native work.
+    if per_instance["total_threads"] < per_instance["event_threads"] + per_instance["blocking_threads"] + 9 + platform_threads:
+        raise ValueError("total_threads must reserve native main/logger plus Ku supervisor/launcher threads and platform_thread_reserve")
     for slot in config["slots"]:
         if slot.get("memory_limit_bytes", 0) + capacity["supervisor_reserve_bytes"] > per_instance["reserved_memory_bytes"]:
             raise ValueError("worker hard limit plus coordinator reserve exceeds instance reservation")
@@ -205,6 +214,7 @@ def environment(config, slot):
     derived = {
         "KU_EVENT_LOOPS": budget["event_threads"],
         "KU_BLOCKING_THREADS": budget["blocking_threads"],
+        # Platform/supervisor allowances reserve deployment capacity only.
         "KU_THREAD_BUDGET": budget["event_threads"] + budget["blocking_threads"] + 2,
         "KU_THREAD_STACK_BYTES": config["deployment_budget"]["thread_stack_bytes"],
         "KU_DB_MAX_CONNECTIONS": budget["database_connections"],

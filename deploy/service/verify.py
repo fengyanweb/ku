@@ -33,6 +33,24 @@ SPEC.loader.exec_module(M)
 ALLOCATED_ADDRESSES = set()
 
 
+def reserve_fixture_threads(budget, windows=None):
+    """Reserve measured full-process platform cost, not extra Ku workers.
+
+    The Windows auxiliary-thread sources are not uniquely attributed. Sixteen
+    is an explicit conservative admission reserve, not an OS thread hard cap.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    per_instance = budget["per_instance"]
+    reserve = 16 if windows else 0
+    per_instance["platform_thread_reserve"] = reserve
+    if windows:
+        per_instance["total_threads"] = (per_instance["event_threads"]
+            + per_instance["blocking_threads"]+9+reserve)
+        budget["total_threads"] = (budget["max_parallel_instances"]*per_instance["total_threads"]
+            + budget.get("management_threads", 0))
+
+
 class ProxyCapture:
     """Drain combined proxy output into one fixed 64 KiB temporary-file ring."""
 
@@ -149,6 +167,7 @@ fn main(): null! {
                 raise RuntimeError("hard-memory native fixture did not build")
             data = json.loads((HERE / "cluster.example.json").read_text(encoding="utf-8"))
             data["deployment_budget"]["per_instance"].update(event_threads=2, blocking_threads=2, total_threads=13)
+            reserve_fixture_threads(data["deployment_budget"])
             token = root / "token"
             token.write_text(secrets.token_hex(32), encoding="ascii")
             token.chmod(0o600)
@@ -339,6 +358,7 @@ fn main(): null! {
             budget = data["deployment_budget"]
             budget["per_instance"].update(blocking_threads=5, total_threads=18)
             budget.update(blocking_threads=15, total_threads=56)
+            reserve_fixture_threads(budget)
             token = root / "token"
             token.write_text(secrets.token_hex(32), encoding="ascii")
             token.chmod(0o600)
@@ -634,7 +654,7 @@ def windows_process_records():
             raise OSError(ctypes.get_last_error(), "CloseHandle(process snapshot)")
 
 
-def resource_snapshot(proxy):
+def resource_snapshot(proxy, include_roles=False):
     if os.name == "nt":
         records = windows_process_records()
         spec = importlib.util.spec_from_file_location("ku_service_resources", HERE.parents[1] / "tests/acceptance/multiloop_load.py")
@@ -644,7 +664,9 @@ def resource_snapshot(proxy):
         listing = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True, timeout=3, check=True)
         records = {int(parts[0]): {"ppid": int(parts[1]), "rss_bytes": int(parts[2]) * 1024}
                    for line in listing.stdout.splitlines() if len(parts := line.split()) == 3}
-    owners = {process.pid for process in M.OWNED_SUPERVISORS.values() if process.poll() is None}
+    owner_slots = {process.pid: name for name, process in M.OWNED_SUPERVISORS.items()
+                   if process.poll() is None}
+    owners = set(owner_slots)
     processes = set(owners)
     while True:
         descendants = {pid for pid, record in records.items() if record["ppid"] in processes}
@@ -666,24 +688,78 @@ def resource_snapshot(proxy):
         lines = [line for line in result.stdout.splitlines() if line.strip()]
         threads = len(lines) - (1 if os.uname().sysname == "Darwin" else 0)
         rows.append({"pid": pid, "threads": threads, **records[pid]})
-    return {"processes": rows, "process_count": len(rows), "thread_count": sum(row["threads"] for row in rows),
-            "sum_rss_bytes": sum(row["rss_bytes"] for row in rows),
-            "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"}
+    snapshot = {"processes": rows, "process_count": len(rows), "thread_count": sum(row["threads"] for row in rows),
+                "sum_rss_bytes": sum(row["rss_bytes"] for row in rows),
+                "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"}
+    if include_roles:
+        annotate_resource_roles(snapshot, owner_slots, os.getpid(), proxy.pid)
+    return snapshot
+
+
+def annotate_resource_roles(snapshot, owner_slots, manager_pid, proxy_pid):
+    """Assign each sampled process by exact parent ancestry to its owner slot."""
+    records = {row["pid"]: row for row in snapshot["processes"]}
+    for row in snapshot["processes"]:
+        pid = row["pid"]
+        if pid in (manager_pid, proxy_pid):
+            row.update(role="manager" if pid == manager_pid else "proxy", slot=None)
+            continue
+        ancestor, depth, seen = pid, 0, set()
+        while ancestor not in owner_slots and ancestor in records and ancestor not in seen:
+            seen.add(ancestor)
+            ancestor = records[ancestor]["ppid"]
+            depth += 1
+        if ancestor not in owner_slots:
+            row.update(role="unattributed", slot=None)
+        else:
+            row.update(role=("supervisor", "launcher", "native")[depth] if depth < 3 else "descendant",
+                       slot=owner_slots[ancestor])
 
 
 def validate_caddy_resources(snapshot, config, proxy_pid):
     budget = config["deployment_budget"]
-    management = [row for row in snapshot["processes"] if row["pid"] in (os.getpid(), proxy_pid)]
+    management = [row for row in snapshot["processes"] if row.get("role") in ("manager", "proxy")]
     usage = {"threads": sum(row["threads"] for row in management),
              "sum_rss_bytes": sum(row["rss_bytes"] for row in management),
              "thread_reservation": budget["management_threads"],
              "memory_reservation_bytes": budget["management_memory_bytes"]}
     snapshot["management_usage"] = usage
-    if (len(management) != 2 or usage["threads"] > usage["thread_reservation"]
-            or usage["sum_rss_bytes"] > usage["memory_reservation_bytes"]
-            or snapshot["thread_count"] > budget["total_threads"]
-            or snapshot["sum_rss_bytes"] > budget["reserved_memory_bytes"]):
-        raise RuntimeError(f"actual Caddy fixture resource sample exceeds frozen reservation: {usage}")
+    instance_usage = {}
+    errors = []
+    per_instance = budget["per_instance"]
+    slots = {slot["name"] for slot in config["slots"]}
+    for row in snapshot["processes"]:
+        if row in management:
+            continue
+        slot = row.get("slot")
+        if slot not in slots or row.get("role") not in ("supervisor", "launcher", "native", "descendant"):
+            errors.append(f"unattributed process {row['pid']}")
+            continue
+        entry = instance_usage.setdefault(slot, {"threads": 0, "sum_rss_bytes": 0, "processes": [],
+            "thread_reservation": per_instance["total_threads"],
+            "memory_reservation_bytes": per_instance["reserved_memory_bytes"]})
+        entry["threads"] += row["threads"]
+        entry["sum_rss_bytes"] += row["rss_bytes"]
+        entry["processes"].append({"pid": row["pid"], "role": row["role"], "threads": row["threads"]})
+    snapshot["instance_usage"] = instance_usage
+    for slot, entry in instance_usage.items():
+        if entry["threads"] > entry["thread_reservation"]:
+            errors.append(f"slot {slot} threads {entry['threads']} > {entry['thread_reservation']}")
+        if entry["sum_rss_bytes"] > entry["memory_reservation_bytes"]:
+            errors.append(f"slot {slot} RSS sum exceeds its reservation")
+    if {row["pid"] for row in management} != {os.getpid(), proxy_pid}:
+        errors.append("manager/proxy process attribution missing")
+    if usage["threads"] > usage["thread_reservation"]:
+        errors.append(f"management threads {usage['threads']} > {usage['thread_reservation']}")
+    if usage["sum_rss_bytes"] > usage["memory_reservation_bytes"]:
+        errors.append("management RSS sum exceeds its reservation")
+    if snapshot["thread_count"] > budget["total_threads"]:
+        errors.append(f"total threads {snapshot['thread_count']} > {budget['total_threads']}")
+    if snapshot["sum_rss_bytes"] > budget["reserved_memory_bytes"]:
+        errors.append("total RSS sum exceeds deployment reservation")
+    snapshot["reservation_errors"] = errors
+    if errors:
+        raise RuntimeError("actual Caddy fixture resource reservation failed: "+"; ".join(errors))
 
 
 def main():
@@ -798,6 +874,7 @@ def main():
             report["cli_sha256"] = hashlib.sha256(fixed_cli.read_bytes()).hexdigest()
             report["cli_snapshot"] = "private immutable CLI copy; deleted after process cleanup"
             config_data = json.loads((HERE / "cluster.example.json").read_text(encoding="utf-8"))
+            reserve_fixture_threads(config_data["deployment_budget"])
             token = root / "token"
             token.write_text(secrets.token_hex(32), encoding="ascii")
             token.chmod(0o600)
@@ -892,7 +969,7 @@ def main():
                 raise RuntimeError(f"{proxy_kind} did not admit the ready native instances")
             report["results"]["normal_proxy"] = "passed"
             stage("steady_resource_snapshot")
-            report["steady_resource_snapshot"] = resource_snapshot(proxy)
+            report["steady_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
             sampled_pids.update(row["pid"] for row in report["steady_resource_snapshot"]["processes"]
                                 if row["pid"] != os.getpid())
             if args.caddy:
@@ -935,7 +1012,7 @@ def main():
             rolling_started = time.monotonic()
             def capture_coexist():
                 stage("rolling_resource_snapshot")
-                report["rolling_resource_snapshot"] = resource_snapshot(proxy)
+                report["rolling_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
                 sampled_pids.update(row["pid"] for row in report["rolling_resource_snapshot"]["processes"]
                                     if row["pid"] != os.getpid())
                 if args.caddy:
@@ -961,7 +1038,7 @@ def main():
             report["results"]["rollback"] = {"passed": True, "duration_ms": round((time.monotonic() - rollback_started) * 1000, 3), "verified_proxy_requests": len(observations)}
             if os.name == "nt":
                 stage("final_resource_snapshot")
-                report["final_resource_snapshot"] = resource_snapshot(proxy)
+                report["final_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
                 sampled_pids.update(row["pid"] for row in report["final_resource_snapshot"]["processes"]
                                     if row["pid"] != os.getpid())
                 validate_caddy_resources(report["final_resource_snapshot"], config, proxy.pid)
