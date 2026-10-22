@@ -182,13 +182,19 @@ class Results:
 
 
 class Service:
-    def __init__(self, executable, root, loops):
+    def __init__(self, executable, root, loops, request_timeout_ms=None):
+        if request_timeout_ms is not None and (type(request_timeout_ms) is not int
+                                               or not 1 <= request_timeout_ms <= 300000):
+            raise ValueError("request_timeout_ms must be an integer in 1..300000")
+        self.request_timeout_ms = request_timeout_ms
         self.port, self.management = unused_port(), unused_port()
         self.token = "acceptance-internal-token"
         (root/"http.addr").write_text(f"127.0.0.1:{self.port}", encoding="ascii")
         environment = os.environ | {"KU_EVENT_LOOPS": str(loops), "KU_BLOCKING_THREADS": "5",
             "KU_THREAD_BUDGET": "16", "KU_SERVICE_CONTROL_TOKEN": self.token,
             "KU_SERVICE_PROBE_ADDR": f"127.0.0.1:{self.management}", "KU_TASK_MAX_BYTES": "16777216"}
+        if request_timeout_ms is not None:
+            environment["KU_HTTP_REQUEST_TIMEOUT_MS"] = str(request_timeout_ms)
         self.log = (root/f"service-{loops}.log").open("wb")
         self.child = subprocess.Popen([str(executable)], cwd=root, env=environment,
                                       stdout=self.log, stderr=self.log)

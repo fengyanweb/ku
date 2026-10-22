@@ -236,9 +236,30 @@ def diagnose(executable, root, evidence):
     return result
 
 
+def collect_waiting(service, peer, seconds, result, save):
+    from capacity_wait import run_network_waiting, run_waiting
+    result["waiting_deadlines"] = {"request_timeout_ms": service.request_timeout_ms,
+        "handler_timeout_ms": 45000, "runtime_default_request_timeout_ms": 30000,
+        "original_sustained_handler_timeout_ms": 1000}
+    result["waiting"] = run_waiting(service, seconds=seconds)
+    save(result)
+    result["network_waiting"] = run_network_waiting(service, peer, seconds=seconds)
+    save(result)
+
+
+def waiting_only(executable, root, args, save, peer):
+    result = {"scope": "Only timer 32/64/128 and native TCP 64 waiting groups; CPU, A/B, fairness, overload and connection occupancy are not rerun."}
+    service = Service(executable, root, 4, request_timeout_ms=45000)
+    try:
+        collect_waiting(service, peer, args.waiting, result, save)
+    finally:
+        result["waiting_exit"] = service.stop()
+    return result
+
+
 def capacity(ku, executable, client, root, args, save, peer):
     from capacity_cpu import checksum, run_client, work_path
-    from capacity_wait import run_connection_occupancy, run_network_waiting, run_waiting
+    from capacity_wait import run_connection_occupancy
     from capacity_pressure import run_fairness, run_pressure
     result = {"calibration": [], "rounds": [], "legacy": []}
     service = Service(executable, root, 1)
@@ -278,12 +299,9 @@ def capacity(ku, executable, client, root, args, save, peer):
             item["exit"] = service.stop()
         result["legacy"].append(item)
         save(result)
-    service = Service(executable, root, 4)
+    service = Service(executable, root, 4, request_timeout_ms=45000)
     try:
-        result["waiting"] = run_waiting(service, seconds=args.waiting)
-        save(result)
-        result["network_waiting"] = run_network_waiting(service, peer, seconds=args.waiting)
-        save(result)
+        collect_waiting(service, peer, args.waiting, result, save)
         result["fairness"] = run_fairness(service, client, path, expected)
         save(result)
         measured = [r["measurement"]["client"]["rates"]["correct_per_measurement_second"] for r in result["rounds"] if r["loops"] == 4]
@@ -299,6 +317,35 @@ def capacity(ku, executable, client, root, args, save, peer):
 
 def assessment(report):
     """Apply the thresholds frozen in plan, never reinterpret a failed sample."""
+    if report.get("plan", {}).get("mode") == "waiting":
+        data = report.get("capacity", {})
+        timer, network = data.get("waiting", {}), data.get("network_waiting", {})
+        levels = timer.get("levels", [])
+        # At 128 the existing contract records a capacity boundary. Its ordinary
+        # probe and guaranteed-capacity observations are not required gates.
+        boundary_checks = ("ledger_balanced", "no_unfinished", "management_available", "recovered",
+            "resource_samples_valid", "native_threads_fixed", "waiting_cpu_within_existing_idle_limit",
+            "descriptors_recovered", "rss_recovered")
+        checks = {"formal_waiting_plan": report["plan"].get("waiting") == 30,
+            "timer_levels_32_64_128": [row.get("target") for row in levels] == [32, 64, 128],
+            "timer_waiting": timer.get("passed") is True and timer.get("formal_30_second_windows") is True,
+            "network_target_64": network.get("target") == 64,
+            "network_waiting": network.get("passed") is True and network.get("formal_30_second_window") is True,
+            "network_all_checks": bool(network.get("checks")) and all(value is True for value in network["checks"].values()),
+            "waiting_service_exit": data.get("waiting_exit") == 0,
+            "dedicated_wait_deadlines": data.get("waiting_deadlines", {}).get("request_timeout_ms") == 45000
+                and data.get("waiting_deadlines", {}).get("handler_timeout_ms") == 45000}
+        for row in levels:
+            required = row.get("checks", {})
+            names = boundary_checks if row.get("target") == 128 else boundary_checks + (
+                "all_requests_correct", "actual_timer_target_observed", "timer_target_maintained_at_samples",
+                "ordinary_requests_correct", "ordinary_p99_within_existing_limit")
+            checks[f"timer_{row.get('target')}_all_required_checks"] = (row.get("passed") is True
+                and row.get("formal_30_second_window") is True and bool(required)
+                and all(required.get(name) is True for name in names))
+        return {"scope": "Only the dedicated timer/TCP waiting groups. This supplement does not revalidate CPU, A/B, fairness, overload, connection occupancy, other platforms or the complete release.",
+            "checks": checks, "passed": all(checks.values()),
+            "failed": [name for name, passed in checks.items() if not passed]}
     result = {"scope": "B03--B06 local-platform gates; CI/correctness/source audit remain separate"}
     data = report.get("capacity", {})
     groups = {n: [r for r in data.get("rounds", []) if r["loops"] == n] for n in (1, 2, 4)}
@@ -381,7 +428,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ku", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("diagnose", "capacity", "all"), default="capacity")
+    parser.add_argument("--mode", choices=("diagnose", "capacity", "all", "waiting"), default="capacity")
     parser.add_argument("--go", default="go")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--warmup", type=float, default=5)
@@ -399,9 +446,12 @@ def main():
               "cli_sha256": digest(args.ku), "environment": machine_environment(),
               "capacity_environment": measurement_environment(),
               "plan": vars(args) | {"ku": str(args.ku), "output": str(args.output),
-                 "loops": [1, 2, 4], "client_concurrency": 32, "total_background_threads": 5,
+                 "loops": [4] if args.mode == "waiting" else [1, 2, 4],
+                 "client_concurrency": None if args.mode == "waiting" else 32, "total_background_threads": 5,
                  "thread_budget": 16, "task_bytes": 16777216,
                  "dedicated_wait_handler_deadline_ms": 45000,
+                 "dedicated_wait_request_deadline_ms": 45000,
+                 "runtime_default_request_deadline_ms": 30000,
                  "original_sustained_handler_deadline_ms": 1000}}
     report["plan"]["frozen_gates"] = {"normal_errors": 0, "go_generator_maximum_one_core_fraction": .5,
         "n1_minimum_event_cores": .65, "n4_minimum_event_cores": 1.1,
@@ -410,6 +460,11 @@ def main():
         "fairness_p99_ms": 250, "recovery_seconds": 5,
         "scope": "Conservative local acceptance criteria frozen before traffic, not universal performance promises. Noisy or CPU-limited environments fail/invalidate rather than receiving relaxed thresholds."}
     report["plan"]["frozen_gates"]["closed_client_cutoff"] = "At most one final unstarted plan per worker (32); only the explicit cutoff bucket. No queue rejection, request failure or false server-arrival credit is allowed. Open-arrival checks remain separate."
+    if args.mode == "waiting":
+        report["plan"]["frozen_gates"] = {"timer_targets": [32, 64, 128], "network_target": 64,
+            "observation_seconds_per_group": 30, "waiting_idle_one_core_limit_percent": 5,
+            "ordinary_p99_ms": 250, "recovery_seconds": 5,
+            "scope": "Existing timer/TCP checks only, including the existing 128-timer capacity-boundary rule; no other capacity gate is rerun or declared passed."}
     save = lambda value=None: atomic_json(args.output, report)
     save()
     from capacity_wait import NetworkPeer
@@ -418,43 +473,48 @@ def main():
         executable, identity = build(args.ku, root, peer.port)
         report["build"] = identity
         save()
-        if args.mode in ("diagnose", "all"):
-            report["diagnosis"] = diagnose(executable, root, args.output.parent)
+        def checkpoint(value):
+            report["capacity"] = value
             save()
-        client = root / ("client.exe" if os.name == "nt" else "client")
-        report["go_version"] = command([args.go, "version"]).strip()
-        command([args.go, "build", "-trimpath", "-o", str(client),
-                 str(repo / "tests/acceptance/capacity_client.go")], cwd=root)
-        report["client_sha256"] = digest(client)
-        baseline, baseline_manifest = baseline_natives(root)
-        report["comparison_inputs"] = baseline_manifest
-        save()
-        def comparison_checkpoint(value):
-            report["short_comparison"] = value
+        if args.mode == "waiting":
+            report["capacity"] = waiting_only(executable, root, args, checkpoint, peer)
+            report["assessment"] = assessment(report)
             save()
-        report["short_comparison"] = compare(executable, baseline, client, root, comparison_checkpoint)
-        preliminary = assessment(report)
-        report["short_comparison_gate"] = {name: preliminary["checks"][name] for name in (
-            "comparison_correct", "candidate_driver_benefit", "reactor_scan_benefit", "legacy_final_no_material_four_owner_regression")}
-        save()
-        report["lock_diagnosis"] = lock_probe(executable, client, root)
-        save()
-        if args.mode in ("capacity", "all"):
-            if all(report["short_comparison_gate"].values()):
-                def checkpoint(value):
-                    report["capacity"] = value
-                    save()
-                report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint, peer)
-                report["assessment"] = assessment(report)
-            else:
-                report["assessment"] = {"passed": False, "failed": ["short_comparison_gate"],
-                    "reason": "Short comparison did not establish candidate benefit/correctness and legacy recovery. Formal capacity was not started; inspect retained samples before another run."}
+        else:
+            if args.mode in ("diagnose", "all"):
+                report["diagnosis"] = diagnose(executable, root, args.output.parent)
+                save()
+            client = root / ("client.exe" if os.name == "nt" else "client")
+            report["go_version"] = command([args.go, "version"]).strip()
+            command([args.go, "build", "-trimpath", "-o", str(client),
+                     str(repo / "tests/acceptance/capacity_client.go")], cwd=root)
+            report["client_sha256"] = digest(client)
+            baseline, baseline_manifest = baseline_natives(root)
+            report["comparison_inputs"] = baseline_manifest
             save()
+            def comparison_checkpoint(value):
+                report["short_comparison"] = value
+                save()
+            report["short_comparison"] = compare(executable, baseline, client, root, comparison_checkpoint)
+            preliminary = assessment(report)
+            report["short_comparison_gate"] = {name: preliminary["checks"][name] for name in (
+                "comparison_correct", "candidate_driver_benefit", "reactor_scan_benefit", "legacy_final_no_material_four_owner_regression")}
+            save()
+            report["lock_diagnosis"] = lock_probe(executable, client, root)
+            save()
+            if args.mode in ("capacity", "all"):
+                if all(report["short_comparison_gate"].values()):
+                    report["capacity"] = capacity(args.ku, executable, client, root, args, checkpoint, peer)
+                    report["assessment"] = assessment(report)
+                else:
+                    report["assessment"] = {"passed": False, "failed": ["short_comparison_gate"],
+                        "reason": "Short comparison did not establish candidate benefit/correctness and legacy recovery. Formal capacity was not started; inspect retained samples before another run."}
+                save()
     report["temporary_directory_removed"] = True
     save()
     print(json.dumps({"report": str(args.output), "source": report["source_commit"],
                       "mode": args.mode, "temporary_directory_removed": True}))
-    if args.mode in ("capacity", "all") and not report["assessment"]["passed"]:
+    if args.mode in ("capacity", "all", "waiting") and not report["assessment"]["passed"]:
         raise SystemExit("Frozen capacity gates failed: " + ", ".join(report["assessment"]["failed"]))
 
 
