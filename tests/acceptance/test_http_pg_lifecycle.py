@@ -194,11 +194,58 @@ class FixtureProcessContracts(unittest.TestCase):
 
 
 class RecoveryHTTPDeadlineContracts(unittest.TestCase):
+    def scripted_drip(self, chunks, timeout_stage):
+        """Exercise the actual HTTP/deadline readers without peer scheduling."""
+        clock = SimpleNamespace(now=100.0)
+        timeouts = []
+        delivered = []
+        pending = list(chunks)
+
+        def receive(connection, buffer, nbytes=0, flags=0):
+            # Model only one transport wait and the socket's configured timeout.
+            # The production DeadlineSocket must calculate the remaining budget.
+            timeout = connection.gettimeout()
+            self.assertIsNotNone(timeout)
+            timeouts.append(timeout)
+            if timeout < 3:
+                clock.now += timeout
+                raise TimeoutError("scripted transport wait exceeded socket timeout")
+            clock.now += 3
+            self.assertTrue(pending, "HTTP reader requested data beyond the complete response")
+            chunk = pending.pop(0)
+            size = min(len(chunk), nbytes or len(buffer), len(buffer))
+            buffer[:size] = chunk[:size]
+            delivered.append(chunk[:size])
+            if size < len(chunk):
+                pending.insert(0, chunk[size:])
+            return size
+
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                patch.object(socket.socket, "connect", lambda connection, address: None), \
+                patch.object(socket.socket, "send", lambda connection, data, flags=0: len(data)), \
+                patch.object(socket.socket, "recv_into", receive):
+            connection = fixture.DeadlineHTTPConnection("127.0.0.1", 9, 108.0)
+            try:
+                connection.request("GET", "/read")
+                if timeout_stage == "headers":
+                    with self.assertRaises(TimeoutError):
+                        connection.getresponse()
+                else:
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    with self.assertRaises(TimeoutError):
+                        response.read()
+            finally:
+                connection.close()
+        self.assertEqual(timeouts, [8.0, 5.0, 2.0])
+        self.assertEqual(clock.now, 108.0)
+        self.assertEqual(delivered, chunks[:2])
+        self.assertEqual(pending, chunks[2:])
+
     def exchange(self, chunks, interval, budget):
         """A bounded real peer drips data faster than a per-read timeout."""
         stop = threading.Event()
         failures = []
-        sent = []
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
@@ -218,7 +265,6 @@ class RecoveryHTTPDeadlineContracts(unittest.TestCase):
                             raise AssertionError("fixture request exceeds bounded header")
                     for chunk in chunks:
                         connection.sendall(chunk)
-                        sent.append(chunk)
                         if stop.wait(interval):
                             break
             except OSError as error:
@@ -243,19 +289,20 @@ class RecoveryHTTPDeadlineContracts(unittest.TestCase):
             self.assertFalse(thread.is_alive(), "bounded peer must exit")
             self.assertFalse(failures, failures)
             self.assertLess(time.monotonic() - began, 0.8)
-            if interval:
-                self.assertGreaterEqual(len(sent), 3, "peer must make progress before total deadline")
 
     def test_complete_response_within_absolute_budget(self):
         self.assertEqual(self.exchange([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"], 0, 0.5),
                          (200, b"ok"))
 
     def test_dripping_headers_cannot_renew_the_absolute_budget(self):
+        self.scripted_drip([b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n",
+                            b"X-Drip: x\r\n\r\nok"], "headers")
         with self.assertRaises((TimeoutError, socket.timeout)):
             self.exchange([b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"X-Drip: "]
                           + [b"x"] * 32 + [b"\r\n\r\nok"], 0.035, 0.13)
 
     def test_dripping_body_cannot_renew_the_absolute_budget(self):
+        self.scripted_drip([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", b"o", b"k"], "body")
         with self.assertRaises((TimeoutError, socket.timeout)):
             self.exchange([b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n"]
                           + [b"x"] * 32, 0.035, 0.13)

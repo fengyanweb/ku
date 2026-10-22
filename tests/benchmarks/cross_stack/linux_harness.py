@@ -694,6 +694,62 @@ def derive_verified_rates(state, summaries):
             'derived_sustained_not_executed_reason':('no_formally_verified_nonzero_capacity' if minimum is None else
                 ('floor_60_percent_is_zero' if sustained==0 else None))}
 
+def upper_point(rate, result, gate, report):
+    reasons=gate.get('reasons',[])
+    if result.get('valid_driver') is not True or 'invalid_driver_or_not_started' in reasons or 'unreconciled_plan' in reasons:
+        kind,censored='driver_invalid_censored',True
+    elif any(reason in reasons for reason in ('resource_endpoints_missing','resource_observation_invalid')):
+        kind,censored='measurement_invalid_censored',True
+    elif gate.get('eligible_for_formal_candidate') is False:
+        kind,censored='service_or_slo_failure',False
+    else:
+        kind,censored='unknown_gate_censored',True
+    return {'rate':rate,'gate_kind':kind,'censored':censored,'valid_driver':result.get('valid_driver'),
+            'qualification':gate,'report':str(report)}
+
+def business_send_end(configuration):
+    key='last_actual_sent_unix_ns'
+    if key not in configuration:
+        return {'status':'unknown_missing_client_field','unix_ns':None,'field':'configuration.'+key}
+    value=configuration[key]
+    if value is None:
+        return {'status':'not_applicable_no_actual_business_send','unix_ns':None,'field':'configuration.'+key}
+    origin=configuration['origin_unix_ns']
+    offset=configuration.get('last_actual_sent_offset_ns')
+    if type(value) is not int or value<origin or (type(offset) is int and value-origin!=offset):
+        return {'status':'unknown_invalid_or_inconsistent_client_field','unix_ns':None,'field':'configuration.'+key}
+    return {'status':'observed','unix_ns':value,'offset_ns':value-origin,'field':'configuration.'+key}
+
+def recovery_probe_views(rows, probe_origin, starts):
+    views={name:{'origin_unix_ns':start,'deadline_seconds':5,'first_complete_new_probe':None,
+                 'probe_phases':{'before_withdrawal':{},'within5s_after_withdrawal':{},'later':{}},
+                 'last_observed_probe_plan_unix_ns':None}
+           for name,start in starts.items() if start is not None}
+    for row in rows:
+        planned=probe_origin+int(row['scheduled_ns'])
+        completed=probe_origin+int(row['completed_ns'])
+        for value in views.values():
+            start=value['origin_unix_ns']
+            phase='before_withdrawal' if planned<start else ('within5s_after_withdrawal' if planned<start+5_000_000_000 else 'later')
+            counts=value['probe_phases'][phase]
+            counts[row['terminal']]=counts.get(row['terminal'],0)+1
+            previous=value['last_observed_probe_plan_unix_ns']
+            value['last_observed_probe_plan_unix_ns']=planned if previous is None else max(previous,planned)
+            if row['terminal']=='correct' and planned>=start and completed<=start+5_000_000_000:
+                sample={'rid':row['rid'],'planned_after_seconds':(planned-start)/1e9,
+                        'complete_after_seconds':(completed-start)/1e9}
+                first=value['first_complete_new_probe']
+                if first is None or sample['complete_after_seconds']<first['complete_after_seconds']:
+                    value['first_complete_new_probe']=sample
+    for value in views.values():
+        first=value['first_complete_new_probe']
+        last=value['last_observed_probe_plan_unix_ns']
+        covered=last is not None and last>=value['origin_unix_ns']+5_000_000_000
+        value['observation_covers_full5s']=covered
+        value['recovered']=True if first else (False if covered else None)
+        value['status']='recovered' if first else ('not_recovered_within5s' if covered else 'unknown_incomplete_probe_window')
+    return views
+
 class Case:
     def __init__(self, harness, cores, memory, workload, args):
         self.h, self.cores, self.memory, self.workload, self.args = harness, cores, memory, workload, args
@@ -825,11 +881,13 @@ class Case:
                 continue
             start = 4 if self.workload == 'cpu' else 16
             rate, low, high = start, 0, None
+            high_record,high_history=None,[]
             observations = []
             for index in range(18):
                 result = self.observe(stack, rate, self.args.explore_seconds, f'explore-{index:02d}', prime=index > 0)
                 gate = result['qualification']
-                observations.append({'rate': rate, 'qualification': gate, 'report': str(self.path / f'explore-{index:02d}' / stack / 'client.json')})
+                report=self.path / f'explore-{index:02d}' / stack / 'client.json'
+                observations.append({'rate': rate, 'qualification': gate, 'valid_driver':result.get('valid_driver'),'report':str(report)})
                 if gate['eligible_for_formal_candidate']:
                     low = rate
                     if high is not None:
@@ -839,26 +897,34 @@ class Case:
                     rate = min(self.args.maximum_rate, rate * 2)
                 else:
                     high = rate
+                    high_record=upper_point(rate,result,gate,report)
+                    high_history.append(high_record)
                     if low == 0 and rate > 1:
                         rate = max(1,rate//2)
                         continue
                     break
             refinements = []
-            if high and low and 'invalid_driver_or_not_started' not in observations[-1]['qualification']['reasons']:
+            if high and low and high_record['gate_kind']=='service_or_slo_failure':
                 for index in range(3):
                     rate = max(low + 1, (low + high) // 2)
                     if rate >= high:
                         break
                     result = self.observe(stack, rate, self.args.explore_seconds, f'refine-{index:02d}')
-                    refinements.append({'rate': rate, 'qualification': result['qualification']})
+                    report=self.path/f'refine-{index:02d}'/stack/'client.json'
+                    refinements.append({'rate': rate, 'qualification': result['qualification'],
+                                        'valid_driver':result.get('valid_driver'),'report':str(report)})
                     if result['qualification']['eligible_for_formal_candidate']:
                         low = rate
                     else:
                         high = rate
+                        high_record=upper_point(rate,result,result['qualification'],report)
+                        high_history.append(high_record)
             self.state['capacity'][stack] = {'candidate_rate': low, 'next_failed_or_invalid_rate': high,
                                              'observations': observations, 'refinements': refinements,
                                              'claim': 'short-window candidate; formal five-round and tail checks still required',
-                                             'upper_bound_kind': 'not obtained / configured driver search ceiling' if high is None else ('driver invalid' if not result.get('valid_driver') else 'service/SLO failure')}
+                                             'upper_bound_kind': high_record['gate_kind'] if high_record else 'censored_no_failed_or_invalid_upper_point',
+                                             'upper_bound_censored':high_record['censored'] if high_record else True,
+                                             'upper_bound_point':high_record,'upper_bound_history':high_history}
             self.save()
         if 'common_rate' not in self.state:
             self.state['common_rate'] = max(1, math.floor(.6 * min(v['candidate_rate'] for v in self.state['capacity'].values() if v['candidate_rate'] > 0))) if any(v['candidate_rate'] > 0 for v in self.state['capacity'].values()) else None
@@ -960,23 +1026,25 @@ class Case:
                     probes=probe_result[0]
                     cutoff=result['configuration']['origin_unix_ns']+int(self.args.formal_seconds*1e9)
                     origin=probes['configuration']['origin_unix_ns']
-                    recovered=None
-                    phases={'before_withdrawal':{},'within5s_after_withdrawal':{},'later':{}}
+                    sent_end=business_send_end(result['configuration'])
                     with gzip.open(probes['events']['path'],'rt',newline='') as source:
-                        for row in csv.DictReader(source):
-                            planned=origin+int(row['scheduled_ns'])
-                            completed=origin+int(row['completed_ns'])
-                            phase='before_withdrawal' if planned<cutoff else ('within5s_after_withdrawal' if planned<cutoff+5_000_000_000 else 'later')
-                            counts=phases[phase]
-                            counts[row['terminal']]=counts.get(row['terminal'],0)+1
-                            if row['terminal']=='correct' and planned>=cutoff and completed<=cutoff+5_000_000_000:
-                                sample={'rid':row['rid'],'planned_after_seconds':(planned-cutoff)/1e9,
-                                        'complete_after_seconds':(completed-cutoff)/1e9}
-                                if recovered is None or sample['complete_after_seconds']<recovered['complete_after_seconds']:
-                                    recovered=sample
-                    write_json(directory/'recovery.json',{'recovered':recovered is not None,'first_complete_new_probe':recovered,
+                        views=recovery_probe_views(csv.DictReader(source),origin,
+                            {'planned_cutoff':cutoff,'actual_business_send_end':sent_end['unix_ns']})
+                    primary=views['planned_cutoff']
+                    actual=views.get('actual_business_send_end',{'status':sent_end['status'],
+                        'origin_unix_ns':None,'deadline_seconds':5,'recovered':None,'first_complete_new_probe':None})
+                    actual['role']='additional view only; never replaces or widens the planned-cutoff5s gate'
+                    tail=(sent_end['unix_ns']-cutoff)/1e9 if sent_end['unix_ns'] is not None else None
+                    write_json(directory/'recovery.json',{'recovered':primary['first_complete_new_probe'] is not None,'first_complete_new_probe':primary['first_complete_new_probe'],
                         'origin':'exact business arrival cutoff = client origin_unix_ns + frozen duration',
-                        'business_cutoff_unix_ns':cutoff,'deadline_seconds':5,'probe_phases':phases,
+                        'business_cutoff_unix_ns':cutoff,'deadline_seconds':5,'probe_phases':primary['probe_phases'],
+                        'planned_cutoff_recovery_view':primary,
+                        'last_actual_business_sent_unix_ns':sent_end['unix_ns'],
+                        'last_actual_business_sent_status':sent_end['status'],
+                        'last_actual_business_sent_evidence':sent_end,
+                        'actual_send_tail_seconds_relative_to_planned_cutoff':tail,
+                        'continued_business_sends_after_planned_cutoff':tail>0 if tail is not None else None,
+                        'actual_business_send_end_recovery_view':actual,
                         'probe_report':str(directory/'independent-probes'/'client.json'),
                         'actual_overload_multiple':rate/own,'requested_rate':wanted,'actual_rate':rate,
                         'rate_was_capped':rate!=wanted,'probe_driver_valid':probes['valid_driver'],

@@ -192,15 +192,17 @@ type secondStats struct {
 	completedKinds                    map[string]uint64
 }
 type ledger struct {
-	mu                                                   sync.Mutex
-	all                                                  *stats
-	types                                                map[string]*stats
-	seconds                                              []secondStats
-	budget                                               histogramBudget
-	origin, cutoff                                       time.Time
-	active, peakActive, live, peakLive, dials, peakQueue uint64
-	samples                                              []map[string]any
-	events                                               *eventWriter
+	mu                                                        sync.Mutex
+	all                                                       *stats
+	types                                                     map[string]*stats
+	seconds                                                   []secondStats
+	budget                                                    histogramBudget
+	origin, cutoff                                            time.Time
+	lastActualSent, lastActualCompleted, lastCompleteResponse time.Time
+	lastActualSentRID, lastActualCompletedRID                 string
+	active, peakActive, live, peakLive, dials, peakQueue      uint64
+	samples                                                   []map[string]any
+	events                                                    *eventWriter
 }
 
 func (l *ledger) typed(kind string) *stats {
@@ -256,6 +258,17 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	defer l.mu.Unlock()
 	if attempted {
 		l.active--
+	}
+	if sent {
+		if r.sent.After(l.lastActualSent) {
+			l.lastActualSent, l.lastActualSentRID = r.sent, j.rid
+		}
+		if r.completed.After(l.lastActualCompleted) {
+			l.lastActualCompleted, l.lastActualCompletedRID = r.completed, j.rid
+		}
+		if r.responseComplete && r.completed.After(l.lastCompleteResponse) {
+			l.lastCompleteResponse = r.completed
+		}
 	}
 	for _, s := range []*stats{l.all, l.typed(j.kind)} {
 		s.Results[r.category]++
@@ -330,6 +343,12 @@ func offset(t, origin time.Time) any {
 		return nil
 	}
 	return t.Sub(origin).Nanoseconds()
+}
+func unixNano(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UnixNano()
 }
 func truncate(s string) string {
 	if len(s) > 256 {
@@ -438,6 +457,33 @@ type worker struct {
 	conn   *countedConn
 	reader *bufio.Reader
 	last   time.Time
+}
+
+func (w *worker) execute(j job) {
+	now := time.Now()
+	if !now.Before(j.scheduled.Add(w.c.timeout)) {
+		w.l.finish(j, time.Time{}, result{category: "not_started_deadline", completed: now}, w.c)
+		return
+	}
+	w.l.start()
+	w.l.finish(j, now, w.request(j, now), w.c)
+}
+
+func enqueuePlanned(c config, l *ledger, j job, queue chan<- job, now time.Time) {
+	// The cutoff defines the arrival plan and the throughput window, not a
+	// replacement deadline. A delayed plan retains only its original budget.
+	if !now.Before(j.scheduled.Add(c.timeout)) {
+		l.finish(j, time.Time{}, result{category: "not_started_scheduler_deadline", completed: now}, c)
+		return
+	}
+	select {
+	case queue <- j:
+		l.mu.Lock()
+		l.peakQueue = max(l.peakQueue, uint64(len(queue)))
+		l.mu.Unlock()
+	default:
+		l.finish(j, time.Time{}, result{category: "not_started_queue", completed: now}, c)
+	}
 }
 
 func (w *worker) close() {
@@ -801,13 +847,7 @@ func run(c config) (map[string]any, error) {
 			defer w.close()
 			<-gate
 			for j := range queue {
-				now := time.Now()
-				if !now.Before(l.cutoff) {
-					l.finish(j, time.Time{}, result{category: "not_started_cutoff", completed: now}, c)
-					continue
-				}
-				l.start()
-				l.finish(j, now, w.request(j, now), c)
+				w.execute(j)
 			}
 		}()
 	}
@@ -826,19 +866,7 @@ func run(c config) (map[string]any, error) {
 			timer.Reset(delay)
 			<-timer.C
 		}
-		now := time.Now()
-		if !now.Before(l.cutoff) {
-			l.finish(j, time.Time{}, result{category: "not_started_scheduler", completed: now}, c)
-			continue
-		}
-		select {
-		case queue <- j:
-			l.mu.Lock()
-			l.peakQueue = max(l.peakQueue, uint64(len(queue)))
-			l.mu.Unlock()
-		default:
-			l.finish(j, time.Time{}, result{category: "not_started_queue", completed: now}, c)
-		}
+		enqueuePlanned(c, l, j, queue, time.Now())
 	}
 	timer.Stop()
 	if delay := time.Until(l.cutoff); delay > 0 {
@@ -875,7 +903,22 @@ func run(c config) (map[string]any, error) {
 	for name, data := range c.corpora {
 		hashes[name] = data.hash
 	}
-	out := map[string]any{"schema": "ku-cross-stack-client-v1", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_bucket_limit": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_resolution_us": 10, "validation_in_driver_cost": true}}
+	out := map[string]any{"schema": "ku-cross-stack-client-v2", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_bucket_limit": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_resolution_us": 10, "validation_in_driver_cost": true}}
+
+	clocks := out["configuration"].(map[string]any)
+	clocks["planned_cutoff_offset_ns"] = c.duration.Nanoseconds()
+	clocks["planned_cutoff_unix_ns"] = l.cutoff.UnixNano()
+	clocks["last_actual_sent_offset_ns"] = offset(l.lastActualSent, l.origin)
+	clocks["last_actual_sent_unix_ns"] = unixNano(l.lastActualSent)
+	clocks["last_actual_sent_rid"] = l.lastActualSentRID
+	clocks["last_actual_completed_offset_ns"] = offset(l.lastActualCompleted, l.origin)
+	clocks["last_actual_completed_unix_ns"] = unixNano(l.lastActualCompleted)
+	clocks["last_actual_completed_rid"] = l.lastActualCompletedRID
+	clocks["last_complete_response_offset_ns"] = offset(l.lastCompleteResponse, l.origin)
+	clocks["last_complete_response_unix_ns"] = unixNano(l.lastCompleteResponse)
+	clocks["last_actual_completed_definition"] = "last terminal timestamp among actually sent plans, including timeout/transport errors; full response tracked separately"
+	clocks["tail_policy"] = "planned arrivals may start after cutoff only before their original scheduled_at+timeout; late window completions never increase window goodput"
+	clocks["actual_clock_frozen"] = "after all planned requests reached one terminal state; does not renew the planned cutoff or request deadlines"
 	return out, nil
 }
 func parse() (config, error) {

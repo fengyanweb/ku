@@ -71,7 +71,11 @@ class Database:
             manifest = dict(uid=uid, gid=gid, stacks={}, protocol=str(self.root / "src/tests/benchmarks/cross_stack/protocol.json"),
                             cgroup_root="/sys/fs/cgroup/ku-cross-stack")
             self.save_manifest(manifest)
-        self.harness = Harness(self.root, self.directory / "evidence")
+        # Build completion and benchmark-driver revisions legitimately change
+        # the shared manifest. Each DB control invocation has its own receipt;
+        # a previous start identity must not prevent stopping our owned cluster.
+        self.harness = Harness(self.root, self.directory / "evidence" /
+                               ("invocation-" + str(time.time_ns())))
         self.environment = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8", PGCLIENTENCODING="UTF8")
         self.commands = []
 

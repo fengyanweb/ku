@@ -228,7 +228,10 @@
     "no_retry": true,
     "small_tail_samples": "fewer than 100 correct observations has no p99; do not claim SLO compliance. Five formal round distributions are merged, never average percentiles",
     "capacity_search_ceiling_rps": 100000,
-    "driver_headroom": "driver invalidity or CPU saturation censors server capacity; it is not a server capacity failure"
+    "driver_headroom": "driver invalidity or CPU saturation censors server capacity; it is not a server capacity failure",
+    "planned_window_tail": "stop creating plans at the frozen window end; already planned requests may start and complete until their original scheduled+absolute deadline. Do not discard at window cutoff, renew deadlines, replay, or credit completion-tail throughput to the window",
+    "client_schema": "ku-cross-stack-client-v2",
+    "overload_recovery_origins": "primary: planned arrival cutoff+5s unchanged; secondary: separately report last actual business sent+5s and continued-offering tail; secondary never rescues failed primary"
   },
   "known_capability_differences": {
     "json_response_mime": {
@@ -237,5 +240,6 @@
       "claim": "body-equivalent business comparison; no claim of identical response-header API capability"
     },
     "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts."
-  }
+  },
+  "revision": 2
 }

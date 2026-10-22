@@ -239,6 +239,129 @@ func TestLateWindowCompletionAndBoundedCSVLedger(t *testing.T) {
 	}
 }
 
+func TestQueuedLastPlanStillSendsAfterWindowWithinOriginalDeadline(t *testing.T) {
+	c := testConfig(t)
+	c.duration, c.rate, c.concurrency = 20*time.Millisecond, 100, 1
+	firstEntered, releaseFirst := make(chan struct{}), make(chan struct{})
+	var arrivals atomic.Uint32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrivals.Add(1) == 1 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		_, _ = io.WriteString(w, "ok:"+r.URL.Query().Get("rid"))
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	type outcome struct {
+		report map[string]any
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() { report, err := run(c); done <- outcome{report, err} }()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		close(releaseFirst)
+		t.Fatal("first planned request never reached the server")
+	}
+	// The second plan belongs to the original 20ms window but cannot leave
+	// the single worker until after that window. Its own 1s deadline remains.
+	time.Sleep(2 * c.duration)
+	close(releaseFirst)
+	var observed outcome
+	select {
+	case observed = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("planned tail did not terminate within its original deadline")
+	}
+	if observed.err != nil {
+		t.Fatal(observed.err)
+	}
+	l := observed.report["ledger"].(map[string]any)
+	if observed.report["valid_driver"] != true || arrivals.Load() != 2 || l["planned"] != uint64(2) || l["sent"] != uint64(2) || l["correct_total"] != uint64(2) || l["correct_in_window"] != uint64(0) || l["goodput_rps"] != float64(0) {
+		t.Fatalf("window cutoff discarded a still-live plan or backfilled goodput: %#v", observed.report)
+	}
+	clocks := observed.report["configuration"].(map[string]any)
+	if clocks["planned_cutoff_offset_ns"] != c.duration.Nanoseconds() || clocks["last_actual_sent_offset_ns"].(int64) <= c.duration.Nanoseconds() || clocks["last_actual_completed_offset_ns"].(int64) < clocks["last_actual_sent_offset_ns"].(int64) {
+		t.Fatalf("actual tail clocks lost their original window: %#v", clocks)
+	}
+	if clocks["last_actual_sent_rid"] != "0000000010000001" || clocks["last_actual_sent_unix_ns"] == nil || clocks["last_complete_response_offset_ns"] == nil {
+		t.Fatal(clocks)
+	}
+}
+
+func TestSchedulerAdmitsLivePlanAfterCutoff(t *testing.T) {
+	c := testConfig(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok:"+r.URL.Query().Get("rid"))
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	l := testLedger()
+	l.origin = time.Now().Add(-40 * time.Millisecond)
+	l.cutoff = l.origin.Add(c.duration)
+	l.seconds = make([]secondStats, 1)
+	j := job{kind: "ok", rid: "1", scheduled: l.cutoff.Add(-time.Millisecond)}
+	l.plan(j)
+	queue := make(chan job, 1)
+	enqueuePlanned(c, l, j, queue, time.Now())
+	if len(queue) != 1 {
+		t.Fatalf("scheduler discarded a plan before scheduled+timeout: %#v", l.all.Results)
+	}
+	w := worker{c: c, l: l}
+	w.execute(<-queue)
+	w.close()
+	if l.all.Results["correct"] != 1 || l.all.Sent != 1 || l.all.CorrectWindow != 0 || !l.lastActualSent.After(l.cutoff) {
+		t.Fatalf("admitted tail was not really sent: %#v", l.all)
+	}
+}
+
+func TestExpiredPlanNeverDialsOrRenewsDeadline(t *testing.T) {
+	c := testConfig(t)
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	c.address = listener.Addr().String()
+	makeExpired := func() (*ledger, job) {
+		l := testLedger()
+		l.origin = time.Now().Add(-2 * c.timeout)
+		l.cutoff = l.origin.Add(c.duration)
+		l.seconds = make([]secondStats, 1)
+		j := job{kind: "ok", rid: "1", scheduled: l.origin}
+		l.plan(j)
+		return l, j
+	}
+	l, j := makeExpired()
+	queue := make(chan job, 1)
+	enqueuePlanned(c, l, j, queue, time.Now())
+	if len(queue) != 0 || l.all.Results["not_started_scheduler_deadline"] != 1 || l.dials != 0 {
+		t.Fatalf("expired scheduler plan was admitted: %#v", l.all)
+	}
+	l, j = makeExpired()
+	w := worker{c: c, l: l}
+	w.execute(j)
+	if l.all.Results["not_started_deadline"] != 1 || l.all.Attempted != 0 || l.dials != 0 {
+		t.Fatalf("expired worker plan created an attempt: %#v", l.all)
+	}
+	// Also exercise the raw request guard directly: a fresh began timestamp
+	// cannot replace the expired scheduled_at deadline.
+	r := w.request(j, time.Now())
+	w.close()
+	if r.category != "not_started_deadline" || !r.sent.IsZero() || l.dials != 0 || !l.lastActualSent.IsZero() || unixNano(l.lastActualSent) != nil {
+		t.Fatalf("raw request renewed an expired plan: %+v", r)
+	}
+	_ = listener.SetDeadline(time.Now().Add(20 * time.Millisecond))
+	if conn, err := listener.Accept(); err == nil {
+		conn.Close()
+		t.Fatal("an expired plan created a socket or replay")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatal(err)
+	}
+}
+
 func TestDriverQueueLossHistogramAndEventOverflowAreExplicit(t *testing.T) {
 	c := testConfig(t)
 	c.duration = 40 * time.Millisecond
