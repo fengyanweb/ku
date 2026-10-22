@@ -38,13 +38,41 @@ def load(path):
     addresses = [slot[key] for slot in config["slots"] for key in ("listen_addr", "probe_addr", "control_addr")]
     if len(set(addresses)) != len(addresses) or config["frontend_addr"] in addresses:
         raise ValueError("business, runtime-probe, supervisor-control and frontend addresses must be distinct")
+    proxy_kind = config.get("proxy_kind", "haproxy")
+    if proxy_kind not in ("haproxy", "caddy"):
+        raise ValueError("proxy_kind must be haproxy or caddy")
+    if proxy_kind == "caddy":
+        admin = config.get("caddy_admin_addr", "")
+        try:
+            host, port = admin.rsplit(":", 1)
+            if host != "127.0.0.1" or not 0 < int(port) < 65536 or str(int(port)) != port:
+                raise ValueError
+            health = config.setdefault("caddy_health_addr", f"127.0.0.1:{int(port)+1}")
+            health_host, health_port = health.rsplit(":", 1)
+            if health_host != "127.0.0.1" or not 0 < int(health_port) < 65536 or str(int(health_port)) != health_port:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise ValueError("Caddy admin/health addresses must be nonzero 127.0.0.1 IP:ports") from None
+        if len(set(addresses + [config["frontend_addr"], admin, health])) != len(addresses) + 3:
+            raise ValueError("Caddy admin/health, frontend and slot addresses must be distinct")
+        states = config.get("proxy_slot_states", {})
+        if not isinstance(states, dict) or set(states) - {slot["name"] for slot in config["slots"]} or any(value not in ("ready", "maint") for value in states.values()):
+            raise ValueError("Caddy states must contain only fixed slot names and ready/maint")
     capacity = config["deployment_budget"]
     maximum = capacity["max_parallel_instances"]
     if not 3 <= maximum <= len(config["slots"]):
         raise ValueError("budget must permit two active instances and a rolling spare")
+    if proxy_kind == "caddy":
+        if any(not isinstance(capacity.get(name), int) or isinstance(capacity.get(name), bool) or capacity[name] < minimum
+               for name, minimum in (("management_threads", 34), ("management_memory_bytes", 134217728))):
+            raise ValueError("Caddy requires explicit management_threads >= 34 and management_memory_bytes >= 128MiB reservations")
     for resource in ("reserved_memory_bytes", "event_threads", "blocking_threads", "database_connections", "total_threads", "database_waiters", "database_pending_bytes"):
         per_instance = capacity["per_instance"][resource]
         extra = capacity.get("management_threads", 0) if resource == "total_threads" else 0
+        if resource == "reserved_memory_bytes":
+            extra = capacity.get("management_memory_bytes", 0)
+            if not isinstance(extra, int) or isinstance(extra, bool) or extra < 0:
+                raise ValueError("management_memory_bytes must be a nonnegative integer")
         if not isinstance(per_instance, int) or per_instance < 0 or maximum * per_instance + extra > capacity[resource]:
             raise ValueError(f"rolling coexistence exceeds deployment {resource}")
     per_instance = capacity["per_instance"]
@@ -299,6 +327,21 @@ def proxy_command(config, command):
 def proxy_state(config, slot, state):
     # HAProxy's local Runtime API changes admission before draining. No request
     # replay, redispatch or application-aware retry is performed here.
+    if config.get("proxy_kind") == "caddy":
+        if state not in ("ready", "maint"):
+            raise ValueError("invalid Caddy slot state")
+        # The local admin address is dedicated to this exact configuration.
+        # Never overwrite an unrelated or concurrently changed Caddy instance.
+        actual = caddy_admin(config, "GET", "/config/")
+        if json.loads(actual) != json.loads(render(config)):
+            raise RuntimeError("Caddy configuration differs from the owned deployment; refusing replacement")
+        candidate = dict(config)
+        candidate["proxy_slot_states"] = dict(config.get("proxy_slot_states", {}), **{slot["name"]: state})
+        caddy_admin(config, "POST", "/load", render(candidate).encode("utf-8"))
+        config["proxy_slot_states"] = candidate["proxy_slot_states"]
+        config["_caddy_loaded_at"] = time.monotonic()
+        write_config(config)
+        return
     response = proxy_command(config, f"set server ku/{slot['name']} state {state}")
     if response.strip():
         raise RuntimeError(f"HAProxy Runtime API: {response}")
@@ -306,6 +349,21 @@ def proxy_state(config, slot, state):
 
 def wait_proxy_ready(config, slot):
     deadline = time.monotonic() + config["operation_timeout_seconds"]
+    if config.get("proxy_kind") == "caddy":
+        # Caddy 2.11.7's upstream admin API exposes registration/failure counts,
+        # not active health. Its actual health gauge updates every ten seconds.
+        # Wait for a post-load update, not the initial optimistic health value.
+        fresh_after = config.get("_caddy_loaded_at", time.monotonic()) + 10.1
+        while time.monotonic() < deadline:
+            if time.monotonic() >= fresh_after:
+                upstreams = json.loads(caddy_admin(config, "GET", "/reverse_proxy/upstreams", deadline=deadline))
+                metrics = caddy_admin(config, "GET", "/metrics", deadline=deadline)
+                address = slot["listen_addr"]
+                gauge = f'caddy_reverse_proxy_upstreams_healthy{{upstream="{address}"}} 1'
+                if any(row.get("address") == address for row in upstreams) and gauge in metrics.splitlines():
+                    return
+            time.sleep(min(.05, max(0, deadline-time.monotonic())))
+        raise TimeoutError(f"Caddy has not reported active health for {slot['name']}; old instance retained")
     while time.monotonic() < deadline:
         rows = csv.DictReader(io.StringIO(proxy_command(config, "show stat").lstrip("# ")))
         if any(row.get("pxname") == "ku" and row.get("svname") == slot["name"]
@@ -353,6 +411,8 @@ def roll(config, old_name, new_name, program, rollback=False, on_coexist=None):
 
 
 def render(config):
+    if config.get("proxy_kind") == "caddy":
+        return render_caddy(config)
     token = config["_token"]
     result = f"""global
     maxconn 4096
@@ -382,6 +442,89 @@ backend ku
         check_port = slot["control_addr"].rsplit(":", 1)[1]
         result += f"    server {slot['name']} {slot['listen_addr']} check port {check_port} inter 250ms fall 2 rise 1 maxconn 1024 maxqueue 32\n"
     return result
+
+
+def caddy_admin(config, method, route, body=None, deadline=None):
+    """One absolute-deadline, byte-bounded management request; no retries.
+
+    HTTP/1.0 with Connection: close deliberately avoids chunked framing. Reading
+    headers through http.client would reset the socket timeout for every small
+    header fragment, so use a finite receive loop for this dedicated local API.
+    """
+    deadline = min(deadline or time.monotonic()+1, time.monotonic()+1)
+    host, port = config["caddy_admin_addr"].rsplit(":", 1)
+    if method not in ("GET", "POST") or not route.startswith("/") or any(c in route for c in "\r\n"):
+        raise ValueError("invalid Caddy management request")
+    body = body or b""
+    if len(body) > 262144:
+        raise ValueError("bounded Caddy admin request exceeded")
+    request = (f"{method} {route} HTTP/1.0\r\nHost: {config['caddy_admin_addr']}\r\n"
+               f"Origin: http://{config['caddy_admin_addr']}\r\nConnection: close\r\n"
+               f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode("ascii")+body
+    remaining = deadline-time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Caddy admin deadline")
+    with socket.create_connection((host, int(port)), timeout=remaining) as stream:
+        sent = 0
+        while sent < len(request):
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Caddy admin deadline")
+            stream.settimeout(remaining)
+            count = stream.send(request[sent:])
+            if not count:
+                raise ConnectionError("Caddy admin request closed")
+            sent += count
+        result = bytearray()
+        header_end = -1
+        while True:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Caddy admin deadline")
+            stream.settimeout(remaining)
+            chunk = stream.recv(min(4096, 262144+8192+5-len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+            if header_end < 0:
+                header_end = result.find(b"\r\n\r\n")
+                if (header_end < 0 and len(result) > 8192) or header_end > 8192:
+                    raise ValueError("bounded Caddy admin headers exceeded")
+            if header_end >= 0 and len(result)-header_end-4 > 262144:
+                raise ValueError("bounded Caddy admin response exceeded")
+        if header_end < 0:
+            raise http.client.HTTPException("incomplete Caddy admin response")
+        lines = bytes(result[:header_end]).decode("iso-8859-1").split("\r\n")
+        status = lines[0].split(" ", 2)
+        if len(status) < 2 or status[1] != "200":
+            raise RuntimeError(f"Caddy admin {method} {route} returned {status[1] if len(status)>1 else 'invalid status'}")
+        headers = dict(line.lower().split(":", 1) for line in lines[1:] if ":" in line)
+        response = bytes(result[header_end+4:])
+        if "transfer-encoding" in headers or ("content-length" in headers and int(headers["content-length"]) != len(response)):
+            raise http.client.HTTPException("invalid Caddy HTTP/1.0 response framing")
+        return response.decode("utf-8")
+
+
+def render_caddy(config):
+    """Caddy 2.11.7 native JSON; one fixed internal health router per proxy.
+
+    The health router maps Caddy's target-upstream header to a fixed supervisor
+    control port, so each backend's different health port is respected.
+    """
+    token = config["_token"]
+    transport = {"protocol": "http", "dial_timeout": "1s", "response_header_timeout": "5s", "keep_alive": {"enabled": False}, "versions": ["1.1"]}
+    states = config.get("proxy_slot_states", {})
+    active_slots = [slot for slot in config["slots"] if states.get(slot["name"], "ready") == "ready"]
+    health_routes = []
+    for slot in config["slots"]:
+        health_routes.append({"match": [{"path": ["/status"], "header": {"X-Ku-Proxy-Upstream": [slot["listen_addr"]]}}], "handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": slot["control_addr"]}], "transport": transport, "load_balancing": {"retries": 0, "try_duration": 0}, "headers": {"request": {"set": {"X-Ku-Control-Token": [token]}, "delete": ["X-Ku-Proxy-Upstream"]}}}], "terminal": True})
+    health_routes.append({"handle": [{"handler": "static_response", "status_code": 404}], "terminal": True})
+    proxy = {"@id": "ku_business_proxy", "handler": "reverse_proxy", "upstreams": [{"dial": slot["listen_addr"], "max_requests": 1024} for slot in active_slots], "transport": transport, "load_balancing": {"selection_policy": {"policy": "round_robin"}, "retries": 0, "try_duration": 0}, "health_checks": {"active": {"uri": "/status", "upstream": config["caddy_health_addr"], "headers": {"X-Ku-Proxy-Upstream": ["{http.reverse_proxy.active.target_upstream}"]}, "interval": "250ms", "timeout": "200ms", "passes": 1, "fails": 2, "expect_status": 200, "expect_body": '"phase"\\s*:\\s*"ready"', "max_size": 8192}}}
+    server_limits = {"read_header_timeout": "2s", "read_timeout": "5s", "write_timeout": "5s", "idle_timeout": "2s", "max_header_bytes": 8192, "automatic_https": {"disable": True}, "metrics": {}}
+    business = dict(server_limits, listen=[config["frontend_addr"]], routes=[{"match": [{"path": ["/__ku", "/__ku/*"]}], "handle": [{"handler": "static_response", "status_code": 404}], "terminal": True}, {"handle": [{"handler": "headers", "request": {"delete": ["X-Ku-Control-Token", "X-Ku-Proxy-Upstream"]}}, proxy], "terminal": True}])
+    health = dict(server_limits, listen=[config["caddy_health_addr"]], routes=health_routes)
+    result = {"@id": "ku_reference_proxy", "admin": {"listen": config["caddy_admin_addr"], "enforce_origin": True, "origins": ["http://"+config["caddy_admin_addr"]], "config": {"persist": False}}, "logging": {"logs": {"default": {"writer": {"output": "discard"}}}}, "apps": {"http": {"servers": {"ku_public": business, "ku_health": health}}}}
+    return json.dumps(result, ensure_ascii=True, indent=2)+"\n"
 
 
 @contextlib.contextmanager
