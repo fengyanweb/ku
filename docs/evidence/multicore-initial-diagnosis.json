@@ -2709,5 +2709,254 @@
       "next_step_boundary": "This disproves a scalar guard miss in actual HTTP work. No classifier expansion or fixture modification is justified by this run; it does not establish end-to-end improvement."
     },
     "original_report_sha256": "80ecba4ab7fcb2d66186921e24730c2f24b651e6e4f1241a417012814972b057"
+  },
+  "mac_high_residency_readiness": {
+    "diagnosis": {
+      "kind": "single bounded local Mac pressure diagnosis",
+      "created_utc": "20261022T111538Z",
+      "source_commit": "420b44a92e6e435e9ff1a70c89acc31e265acde4",
+      "cli_sha256": "7813f6f634bfe1aca6d91c96ee28779dc6791333cf1ee966874f6adec2087bc2",
+      "environment": {
+        "platform": "macOS-26.5.2-arm64-arm-64bit",
+        "machine": "arm64",
+        "python_version": "3.9.6",
+        "logical_cpus": 8,
+        "same_host_generator": true,
+        "exclusive_cpu_reservation": false,
+        "errors": [],
+        "native_pid": null,
+        "affinity_scope": "The platform exposes no sched_getaffinity; owner thread placement is not established.",
+        "sysctl": {
+          "hw.physicalcpu": "8",
+          "hw.logicalcpu": "8",
+          "hw.memsize": "8589934592",
+          "hw.model": "MacBookAir10,1",
+          "machdep.cpu.brand_string": "Apple M1",
+          "hw.perflevel0.name": "Performance",
+          "hw.perflevel0.physicalcpu": "4",
+          "hw.perflevel0.logicalcpu": "4",
+          "hw.perflevel1.name": "Efficiency",
+          "hw.perflevel1.physicalcpu": "4",
+          "hw.perflevel1.logicalcpu": "4"
+        },
+        "sysctl_optional_missing": "",
+        "quota_scope": "Native macOS has no Linux cgroup quota. Logical contexts can include performance/efficiency clusters; placement, frequency and other host work are not controlled.",
+        "effective_visible_cpu_bound": 8,
+        "capacity_bound_scope": "Upper bound from visible logical CPUs, affinity and quotas; the Go client, Python observer and sampler subprocesses share it with the native service. It is not a count of equivalent dedicated performance cores."
+      },
+      "scope": "One uninstrumented 3s N4/32 calibration and one instrumented 5s open-arrival overload; no production edit. Temporary counter/timing overhead invalidates performance-benefit comparisons. Local host is not the CI virtual Mac.",
+      "plan": {
+        "work_units": 512,
+        "loops": 4,
+        "calibration_seconds": 3,
+        "calibration_clients": 32,
+        "overload_seconds": 5,
+        "capacity_multiplier": 5,
+        "active_limit": 128,
+        "pending_limit": 128,
+        "client_deadline_ms": 3000,
+        "stack_seconds": 1,
+        "stack_interval_ms": 10,
+        "maximum_monitor_rows": 120
+      },
+      "build": {
+        "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+        "expanded_source_sha256": "bb3f8350d8f54ba9684f383a72a751458fdd81761857c0a951bdb560600349c8",
+        "native_sha256": "2d4dc0d53a2189dbb114b7717441ea82bd64166a073dbd5bb73071f845ae258a",
+        "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-pressure-once-9i21g6y9/.ku/build/release/c/UlKZlxGsxXUVAeykbM9G2xU9VranfczX8_fPMeC7H_4/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-pressure-once-9i21g6y9/capacity\n",
+        "generated_c_sha256": [
+          "b5b02369e2786daf52d7d81d8b2273e78dcdd52e0903bc08762c199433274827"
+        ]
+      },
+      "diagnostic_build": {
+        "original_c_sha256": "b5b02369e2786daf52d7d81d8b2273e78dcdd52e0903bc08762c199433274827",
+        "diagnostic_c_sha256": "fcae912d96a211b1f8a5836827e909c87de0b0559d109639f3d57e5084ca7f80",
+        "binary_sha256": "291f0986b78baaf21b07bb1d919e0ae2a5a1d25791312ab3b8a76866d2cff29f",
+        "counter_scope": "HTTP readiness lock acquisition count and LIVE-phase hits only; no branch change, no extra lock, relaxed atomic increments. Counters emitted once at process exit. Driver timing enabled; this perturbs runtime."
+      },
+      "http_readiness_counts": {
+        "ready_calls": 15731690,
+        "ready_live": 15731104
+      },
+      "analysis": {
+        "event_owner_thread_samples": [
+          {
+            "thread": "Thread_23179408",
+            "observations": 97,
+            "http_readiness_stack_observations": 36,
+            "control_poll_stack_observations": 22,
+            "mutex_wait_leaf_observations": 32
+          },
+          {
+            "thread": "Thread_23179409",
+            "observations": 97,
+            "http_readiness_stack_observations": 27,
+            "control_poll_stack_observations": 17,
+            "mutex_wait_leaf_observations": 33
+          },
+          {
+            "thread": "Thread_23179410",
+            "observations": 97,
+            "http_readiness_stack_observations": 25,
+            "control_poll_stack_observations": 19,
+            "mutex_wait_leaf_observations": 24
+          },
+          {
+            "thread": "Thread_23179411",
+            "observations": 97,
+            "http_readiness_stack_observations": 24,
+            "control_poll_stack_observations": 26,
+            "mutex_wait_leaf_observations": 22
+          }
+        ],
+        "sample_meaning": "Wall-time stack observations, not CPU attribution. Mutex wait leaves include readiness and pump paths; do not add overlapping parent/child stack counts. Sampling and per-lock clocks perturb execution.",
+        "normal_precheck_counters": {
+          "driver_locks": 233702,
+          "task_polls": 2400600
+        },
+        "overload_counters": {
+          "driver_locks": 16366718,
+          "task_polls": 15841280
+        },
+        "normal_locks_per_actual_poll": 0.09735149545946846,
+        "overload_locks_per_actual_poll": 1.0331689105930835,
+        "confirmed": "During this instrumented high-residency sample, all event owners repeatedly enter HTTP readiness and shared mutex waits while others compute. Process-wide HTTP LIVE-readiness checks exceed 15.7 million. This establishes a local hotspot, not the performance gain of skipping it.",
+        "unproven": "It does not explain the independent CI N1 0.56-core result, uniquely map every timeout to a server stage, or isolate uninstrumented cost. A separate single fixed-rate uninstrumented A/B is pending."
+      },
+      "temporary_directory_removed": true
+    },
+    "unprobed_single_pair": {
+      "kind": "single bounded same-host original/candidate overload comparison",
+      "created_utc": "20261022T112133Z",
+      "source_commit": "b0bb40b90c9c85dcb303c8dee52bb3224543d4b8",
+      "cli_sha256": "7813f6f634bfe1aca6d91c96ee28779dc6791333cf1ee966874f6adec2087bc2",
+      "plan": {
+        "work_units": 512,
+        "event_loops": 4,
+        "active_requests": 128,
+        "pending_requests": 128,
+        "request_deadline_ms": 3000,
+        "overload_seconds": 5,
+        "fixed_open_arrival_rps": 374,
+        "load_workers": 512,
+        "client_queue": 256,
+        "driver_timing": false,
+        "diagnostic_counters": false,
+        "repeats_per_variant": 1,
+        "order": [
+          "original",
+          "candidate"
+        ]
+      },
+      "limits": "One ordered short pair establishes only a diagnostic signal, not a performance distribution or formal acceptance. No source repository changes; both use the same native frontend, fixture, generator and original budgets/deadlines. Baseline capacity reference is prior measured 74.6666667 rps; ceil(5x)=374.",
+      "build": {
+        "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+        "expanded_source_sha256": "dba6fba2b4d1e92c47be5e99997a494be7396ba680b2915eaca83ecfb2168a39",
+        "native_sha256": "e51bc0ce4f711df41612936cf5d3b788e87e251b1e9f3db99cc420f56c6a508a",
+        "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-live-ab-once-hhu9ilfx/.ku/build/release/c/VwW64VhH_ZX2P1vNWio4LqROLgQ7-i5Tx0vwd69Dnw0/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-live-ab-once-hhu9ilfx/capacity\n",
+        "generated_c_sha256": [
+          "bfbe119210104f5d68ac2fc0c77c813e12259ecc2e11cc0730b3ba94de0601f2"
+        ]
+      },
+      "candidate": {
+        "original_c_sha256": "bfbe119210104f5d68ac2fc0c77c813e12259ecc2e11cc0730b3ba94de0601f2",
+        "candidate_c_sha256": "4d83bb1d3a2400e4ef0f2612bd7320dcf386a5f9162a0affe97ed809a0efac5a",
+        "candidate_binary_sha256": "beb1e19b4b67b7d89fdd6e5f440f8702b5aea454230bc6c0a98383e075842aae",
+        "only_replacement": "  if(cancel) handle->cancelled=1;\n  /* Experimental private-owner negative readiness only. No owner/lease move. */\n  if(!handle->cancelled && !handle->finishing && handle->value.tag==KU_TASK_VALUE_LIVE\n      && handle->value.ticket.driver==&runtime->driver\n      && handle->value.owner.lease.control\n      && ku_task_control_check_lease(&handle->value.owner.lease)==KU_TASK_CONTROL_OK\n      && ku_task_control_atomic_load(&handle->value.owner.lease.control->phase)==KU_TASK_CONTROL_LIVE)\n    return KU_TASK_DRIVER_PENDING;\n  if(!handle->finishing) {",
+        "proof_scope": "The used/private handle retains its unique owner lease until this owner thread takes/drops it. Cancel sets cancelled before this branch; finishing means owner can be consumed and excludes the branch. Non-LIVE atomic phases always retain the original locked path. ABI/storage/alignment checked through the existing lease checker; no registry/slot data read unlocked."
+      },
+      "analysis": {
+        "paired_results": [
+          {
+            "variant": "original",
+            "results": {
+              "correct_success": 523,
+              "http_rejected": 1181,
+              "other_http_failure": 0,
+              "transport_or_timeout_failure": 166,
+              "unfinished_at_cutoff": 0
+            },
+            "fully_sent": 1870,
+            "actual_starts": 1870,
+            "native_cpu_seconds": 13.76,
+            "native_cpu_wall_seconds": 8.568766416999999,
+            "event_cpu_seconds": 13.752439042,
+            "event_cpu_outer_wall_seconds": 8.48365025,
+            "event_cores": 1.6210520986529355,
+            "correct_in_measurement": 435,
+            "correct_measurement_rps": 87,
+            "go_with_cleanup_seconds": 7.999390375,
+            "go_cpu_seconds": 0.608132,
+            "remaining_checks": {
+              "ordinary_capacity_precheck_valid": true,
+              "overload_target_actual_starts": true,
+              "server_resource_edge_observed": true,
+              "unexplained_client_failure_absent": false,
+              "recovery_withdrawal_budget_confirmed": true
+            },
+            "recovery_upper_seconds": 4.529642958,
+            "final_resource_ledger": {
+              "buffer_bytes": 0,
+              "task_resident": 0,
+              "task_waiting": 0,
+              "http_queued": 0,
+              "pending": 0
+            },
+            "exit": 0
+          },
+          {
+            "variant": "candidate",
+            "results": {
+              "correct_success": 769,
+              "http_rejected": 1101,
+              "other_http_failure": 0,
+              "transport_or_timeout_failure": 0,
+              "unfinished_at_cutoff": 0
+            },
+            "fully_sent": 1870,
+            "actual_starts": 1870,
+            "native_cpu_seconds": 15.53,
+            "native_cpu_wall_seconds": 6.840821083000002,
+            "event_cpu_seconds": 15.522384501000001,
+            "event_cpu_outer_wall_seconds": 6.840913292,
+            "event_cores": 2.2690514904131898,
+            "correct_in_measurement": 514,
+            "correct_measurement_rps": 102.8,
+            "go_with_cleanup_seconds": 6.789862625,
+            "go_cpu_seconds": 0.625365,
+            "remaining_checks": {
+              "ordinary_capacity_precheck_valid": true,
+              "overload_target_actual_starts": true,
+              "server_resource_edge_observed": true,
+              "unexplained_client_failure_absent": true,
+              "recovery_withdrawal_budget_confirmed": true
+            },
+            "recovery_upper_seconds": 1.870852708000001,
+            "final_resource_ledger": {
+              "buffer_bytes": 0,
+              "task_resident": 0,
+              "task_waiting": 0,
+              "http_queued": 0,
+              "pending": 0
+            },
+            "exit": 0
+          }
+        ],
+        "confirmed": "Both variants start all 1870 requests at 374/s with identical fixed fixture budgets and 3s per-request client deadlines, no automatic retries, no timing/counter probes. In this single ordered short pair the candidate removes 166 observed response-header-stage deadlines and serves 246 more correct complete responses. Explicit 503 remains a refusal, never reclassified success. Both recover and exit cleanly.",
+        "boundary": "One original-then-candidate pair cannot establish repeatable platform-wide performance or eliminate shared-host/noise/order effects. Event CPU is normalized to its own observation window including different cleanup durations, not the fixed 5s arrival window. This experiment does not explain the distinct CI N1 0.56-core result or replace the formal acceptance matrix.",
+        "lifecycle": "The existing private/used HTTP handle range check runs first. Before take/drop transfer, its unique nonempty owner lease keeps control alive; cancelled/finishing/non-LIVE phases follow the original locked path. The candidate only observes immutable validated ABI/storage and atomic LIVE phase, and neither reads driver slots without a lock nor consumes ownership."
+      },
+      "temporary_directory_removed": true
+    },
+    "raw_evidence": [
+      {
+        "name": "mac-local-pressure-5s-20261022T111538Z.json",
+        "sha256": "e7c845a9af543be13babcde05fbb8ec04fb403c98e5e0fb727f02b28d32dffb8"
+      },
+      {
+        "name": "mac-local-live-readiness-ab-20261022T112133Z.json",
+        "sha256": "66d8a7735197848ff561970012dd93adb54ae896a25141482b8e417bebfff36e"
+      }
+    ]
   }
 }

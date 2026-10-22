@@ -251,6 +251,15 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
   if(at<first || at-first>=runtime->capacity*sizeof(*handle) || (at-first)%sizeof(*handle)
       || !handle->used) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   if(cancel) handle->cancelled=1;
+  /* This private handle still owns its lease until take/drop below. A LIVE
+   * control cannot have a completed payload; observe only its atomic phase.
+   * Other phases, cancellation and retirement keep the locked path. */
+  if(!handle->cancelled && !handle->finishing && handle->value.tag==KU_TASK_VALUE_LIVE
+      && handle->value.ticket.driver==&runtime->driver
+      && handle->value.owner.lease.control
+      && ku_task_control_check_lease(&handle->value.owner.lease)==KU_TASK_CONTROL_OK
+      && ku_task_control_atomic_load(&handle->value.owner.lease.control->phase)==KU_TASK_CONTROL_LIVE)
+    return KU_TASK_DRIVER_PENDING;
   if(!handle->finishing) {
     if(handle->cancelled) {
       handle->retired=handle->value.ticket;

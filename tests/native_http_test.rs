@@ -3688,6 +3688,196 @@ fn main(): null! {
 }
 
 #[test]
+fn native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let bridge = include_str!("../src/backend/c_task_http.rs");
+    let control = include_str!("../src/backend/c_task_control.rs");
+    let host = include_str!("../src/backend/c_task_host.rs");
+    let frame = include_str!("../src/backend/c_task.rs");
+    let region = |source: &str, start: &str, end: &str| {
+        format!(
+            "{start}{}",
+            source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+        )
+    };
+    // Exercise the production bridge, lease validation and storage guard. Only
+    // driver/result edges are deterministic stubs; no timing is an assertion.
+    let control_types = region(
+        control,
+        "typedef struct KuTaskControlV1 KuTaskControlV1;",
+        "static int ku_task_control_is_payload_terminal(",
+    );
+    let lease_check = region(
+        control,
+        "static uint32_t ku_task_control_check_lease(",
+        "static uint32_t ku_task_control_init(",
+    );
+    let storage_check = region(
+        frame,
+        "static int ku_task_frame_storage_valid(",
+        "static int ku_task_frame_ranges_overlap(",
+    );
+    let value_type = region(
+        host,
+        "typedef struct KuTaskValueV1 {",
+        "typedef struct KuTaskAdapterOutcomeV1 {",
+    );
+    let handle_type = region(
+        bridge,
+        "typedef struct KuHttpTaskHandle {",
+        "typedef struct KuHttpTaskRuntime {",
+    );
+    let poll = region(
+        bridge,
+        "static uint32_t ku_http_task_poll(",
+        "static uint32_t ku_http_task_runtime_close(",
+    );
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#if defined(_MSC_VER)
+#define KU_TASK_FRAME_ALIGNOF(T) __alignof(T)
+#else
+#define KU_TASK_FRAME_ALIGNOF(T) _Alignof(T)
+#endif
+#define KU_TASK_CONTROL_ABI_VERSION 2u
+enum { KU_TASK_CONTROL_OK=0, KU_TASK_CONTROL_PENDING=1, KU_TASK_CONTROL_COMPLETED=2,
+ KU_TASK_CONTROL_INVALID_ARGUMENT=7, KU_TASK_CONTROL_ABI_MISMATCH=8,
+ KU_TASK_CONTROL_LIVE=16, KU_TASK_CONTROL_REQUESTED_CANCEL=19, KU_TASK_CONTROL_COMMITTING=21 };
+enum { KU_TASK_DRIVER_OK=0, KU_TASK_DRIVER_PENDING=1, KU_TASK_DRIVER_WAIT_READY=2,
+ KU_TASK_DRIVER_INVALID_ARGUMENT=3, KU_TASK_DRIVER_INTERNAL=4, KU_TASK_DRIVER_STALE=5 };
+enum { KU_TASK_VALUE_EMPTY=0, KU_TASK_VALUE_LIVE=1, KU_TASK_VALUE_INLINE_FAILED=2 };
+typedef size_t KuAtomicRefcount;
+typedef uint64_t KuTaskControlDeadlineV1;
+typedef struct { int payload; } KuStruct___ku_http_response;
+typedef struct KuTaskDriverV1 { void* event_context; } KuTaskDriverV1;
+typedef struct { KuTaskDriverV1* driver; size_t slot; uint64_t generation; } KuTaskDriverTicketV1;
+static int locks,unlocks,phase_reads,takes,drops,releases,adopts,refunds,outcome_drops;
+static uint32_t ready_status,drop_status;
+static int slot_exists;
+static size_t ku_task_control_atomic_load(KuAtomicRefcount* value) { phase_reads++; return *value; }
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"readiness check line %d: %s\n",__LINE__,#c); return 97; } } while(0)
+"#;
+    let edges = r#"
+typedef struct { KuTaskDriverV1 driver; KuHttpTaskHandle* handles; size_t capacity; } KuHttpTaskRuntime;
+typedef struct { uint32_t result_kind; union { KuStruct___ku_http_response http_response; } value; } KuTaskAdapterOutcomeV1;
+typedef struct { KuTaskAdapterOutcomeV1* output; void* parent; size_t retained_bytes,http_result; } KuTaskAdapterTakeRequestV1;
+typedef struct { int unused; } KuTaskDriverSlotV1;
+static KuTaskDriverSlotV1 fixture_slot;
+static int ku_task_driver_lock(KuTaskDriverV1* d) { (void)d; locks++; return 0; }
+static int ku_task_driver_unlock(KuTaskDriverV1* d) { (void)d; unlocks++; return 0; }
+static KuTaskDriverSlotV1* ku_task_driver_find(const KuTaskDriverTicketV1* t) { (void)t; return slot_exists ? &fixture_slot : NULL; }
+static uint32_t ku_task_driver_wait_ready_locked(KuTaskDriverSlotV1* s) { (void)s; return ready_status; }
+static uint32_t ku_task_value_drop(KuTaskValueV1* v,uint64_t deadline) {
+ (void)deadline; drops++; if(drop_status==KU_TASK_DRIVER_OK) { *v=(KuTaskValueV1){0}; slot_exists=0; } return drop_status;
+}
+static uint32_t ku_task_value_take(KuTaskValueV1* v,void* parent,KuTaskAdapterOutcomeV1* out) {
+ (void)parent; takes++; out->result_kind=8; out->value.http_response.payload=42; *v=(KuTaskValueV1){0}; return 0;
+}
+static uint32_t ku_task_driver_take_result(const KuTaskDriverTicketV1* t,const KuTaskControlLeaseV1* l,KuTaskAdapterTakeRequestV1* r) {
+ (void)t; (void)l; takes++; r->output->result_kind=8; r->output->value.http_response.payload=42; r->retained_bytes=7; return 0;
+}
+static KuStruct___ku_http_response ku_result_move_struct___ku_http_response(KuStruct___ku_http_response* r) { KuStruct___ku_http_response v=*r; *r=(KuStruct___ku_http_response){0}; return v; }
+static KuStruct___ku_http_response ku_http_response_from_result(KuStruct___ku_http_response r) { return r; }
+static KuStruct___ku_http_response ku_move_struct___ku_http_response(KuStruct___ku_http_response* r) { return ku_result_move_struct___ku_http_response(r); }
+static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* r) { (void)r; outcome_drops++; }
+static void ku_drop_struct___ku_http_response(KuStruct___ku_http_response* r) { r->payload=0; }
+static size_t ku_http_task_response_admit(void* d,KuStruct___ku_http_response* r) { (void)d; (void)r; adopts++; return 17; }
+static uint32_t ku_task_driver_scratch_refund(KuTaskDriverV1* d,size_t n) { (void)d; refunds+=(int)n; return 0; }
+static void ku_http_task_handle_release(KuHttpTaskRuntime* r,KuHttpTaskHandle* h) { (void)r; releases++; h->used=0; }
+"#;
+    let checks = r#"
+static KuTaskControlV1 control;
+static KuHttpTaskHandle handle;
+static KuHttpTaskRuntime runtime;
+static void reset(void) {
+ memset(&control,0,sizeof(control)); memset(&handle,0,sizeof(handle)); memset(&runtime,0,sizeof(runtime));
+ control.abi_version=KU_TASK_CONTROL_ABI_VERSION; control.storage_size=sizeof(control); control.phase=KU_TASK_CONTROL_LIVE;
+ runtime.handles=&handle; runtime.capacity=1; handle.used=1; handle.value.tag=KU_TASK_VALUE_LIVE;
+ handle.value.owner.lease.control=&control; handle.value.ticket.driver=&runtime.driver;
+ locks=unlocks=phase_reads=takes=drops=releases=adopts=refunds=outcome_drops=0;
+ ready_status=KU_TASK_DRIVER_PENDING; drop_status=KU_TASK_DRIVER_OK; slot_exists=1;
+}
+int main(void) {
+ void* task; KuStruct___ku_http_response response={0}; size_t charge;
+ reset(); task=&handle; KuTaskValueV1 before=handle.value;
+ for(int i=0;i<128;i++) { charge=99; CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_PENDING); CHECK(charge==0); }
+ CHECK(phase_reads==128 && !locks && !unlocks && !takes && !drops && !releases && !adopts);
+ CHECK(task==&handle && !memcmp(&before,&handle.value,sizeof(before)));
+ control.phase=KU_TASK_CONTROL_COMPLETED; ready_status=KU_TASK_DRIVER_WAIT_READY;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(!task && response.payload==42 && charge==17 && locks==2 && unlocks==2);
+ CHECK(takes==1 && drops==1 && releases==1 && adopts==1 && refunds==7 && outcome_drops==1);
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+ CHECK(takes==1 && drops==1 && releases==1);
+ reset(); task=&handle; drop_status=KU_TASK_DRIVER_PENDING;
+ CHECK(ku_http_task_poll(&runtime,&task,1,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
+ CHECK(handle.cancelled && drops==1 && !phase_reads && !takes && !releases);
+ CHECK(handle.value.owner.lease.control==&control);
+ drop_status=KU_TASK_DRIVER_OK;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(!task && drops==2 && releases==1 && !adopts && !phase_reads);
+ reset(); task=&handle; handle.finishing=1;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(!task && releases==1 && !phase_reads && !takes && !drops);
+ reset(); task=&handle; handle.value.tag=KU_TASK_VALUE_INLINE_FAILED;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_OK);
+ CHECK(!task && takes==1 && releases==1 && !phase_reads && !locks && !drops);
+ for(int mode=0;mode<5;mode++) {
+  reset(); task=&handle;
+  if(mode==0) handle.value.owner.lease.control=NULL;
+  if(mode==1) handle.value.owner.lease.control=(KuTaskControlV1*)(uintptr_t)1;
+  if(mode==2) control.abi_version++;
+  if(mode==3) control.storage_size--;
+  if(mode==4) handle.value.ticket.driver=NULL;
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
+  CHECK(locks==1 && unlocks==1 && !phase_reads && !takes && !drops && !releases);
+ }
+ for(int mode=0;mode<2;mode++) {
+  reset(); task=&handle; control.phase=mode ? KU_TASK_CONTROL_COMMITTING : KU_TASK_CONTROL_REQUESTED_CANCEL;
+  CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_PENDING);
+  CHECK(locks==1 && unlocks==1 && phase_reads==1 && !takes && !drops);
+ }
+ reset(); task=&handle; handle.used=0;
+ CHECK(ku_http_task_poll(&runtime,&task,0,123,&response,&charge)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+ CHECK(!phase_reads && !locks); puts("live-readiness-ok"); return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-live-readiness");
+    let path = directory.path().join("readiness.c");
+    fs::write(&path, format!("{header}{control_types}{storage_check}{lease_check}{value_type}{handle_type}{edges}{poll}{checks}")).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "readiness")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires the native readiness regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(&executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "native readiness regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("live-readiness-ok"));
+}
+
+#[test]
 fn native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"
