@@ -767,6 +767,45 @@ fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() 
 }
 
 #[test]
+fn native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges() {
+    let directory = TempDir::new("async-query-turns");
+    let harness = query_stub_harness(&directory)
+        .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
+        .replacen("#define KU_PG_MAX_RESULT_ROWS 4ULL", "#define KU_PG_MAX_RESULT_ROWS 1024ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_CELLS 8ULL", "#define KU_PG_MAX_RESULT_CELLS 4096ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_BYTES 16ULL", "#define KU_PG_MAX_RESULT_BYTES 1048576ULL", 1)
+        .replacen("typedef struct KuPgAsyncTurn", "static size_t async_validated_bytes,async_copied_bytes,async_reported_bytes,async_reported_cells,async_protocol_results;\ntypedef struct KuPgAsyncTurn", 1)
+        .replacen("int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);", "async_validated_bytes+=count;int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);", 1)
+        .replacen("if(count)memcpy(result->bytes+result->bytes_len", "if(count)async_copied_bytes+=count;\n    if(count)memcpy(result->bytes+result->bytes_len", 1)
+        .replacen("int appended=ku_pg_async_materialize(op,&turn);", "int appended=ku_pg_async_materialize(op,&turn);async_reported_bytes=turn.bytes;async_reported_cells=turn.cells;", 1)
+        .replacen("enum {\n  T_OK", "static int async_fixture_rows,async_fixture_null_empty,async_fixture_invalid_row;static char async_fixture_data[4001];\nenum {\n  T_ASYNC_ROWS,T_OK", 1)
+        .replacen("switch (conn->mode) {", "switch (conn->mode) {\n    case T_ASYNC_ROWS: conn->total=async_fixture_rows+1;break;", 1)
+        .replacen("PGresult* PQgetResult(PGconn* conn) {", "PGresult* PQgetResult(PGconn* conn) { async_protocol_results++;", 1)
+        .replacen("int PQnfields(const PGresult* result) {", "int PQnfields(const PGresult* result) { if(result->mode==T_ASYNC_ROWS)return 3;", 1)
+        .replacen("int PQgetisnull(const PGresult* result, int row, int column) {", "int PQgetisnull(const PGresult* result, int row, int column) { if(result->mode==T_ASYNC_ROWS)return async_fixture_null_empty && column==0;", 1)
+        .replacen("char* PQgetvalue(const PGresult* result, int row, int column) {", "char* PQgetvalue(const PGresult* result, int row, int column) { if(result->mode==T_ASYNC_ROWS)return result->number==async_fixture_invalid_row?\"\\xff\":async_fixture_null_empty && column==1?\"\":async_fixture_data;", 1)
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_sequential_tests(void) {")
+        + ASYNC_TURN_SUITE;
+    let source = directory.path().join("async-query-turns.c");
+    fs::write(&source, harness).expect("write PG shared turn budget harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "async-query-turns") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| panic!("PG turn budget test exceeded process bounds: {error}"));
+    assert!(
+        output.status.success(),
+        "PG shared turn budget harness failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async shared turns closed loop\n"
+    );
+}
+
+#[test]
 #[ignore = "explicit opt-in: KU_PG_TEST_CONNINFO_FILE must parse as loopback before any connection"]
 fn native_pg_query_poller_live_loopback_roundtrip() {
     let Some(connfile) = env::var_os("KU_PG_TEST_CONNINFO_FILE").map(PathBuf::from) else {
@@ -2192,14 +2231,15 @@ int main(void) {
 "#;
 
 const ASYNC_QUERY_SUITE: &str = r#"
-typedef struct AsyncBudget {size_t bytes,peak;int reject,wakes;} AsyncBudget;
+typedef struct AsyncBudget {size_t bytes,peak,reserves,zero_reserves,refunds,zero_refunds;int reject,wakes;} AsyncBudget;
 static int async_reserve(void* context,size_t bytes) {
   AsyncBudget* b=(AsyncBudget*)context;
+  b->reserves++;if(!bytes)b->zero_reserves++;
   if(b->reject)return 0;
   if(bytes>SIZE_MAX-b->bytes)abort();b->bytes+=bytes;if(b->bytes>b->peak)b->peak=b->bytes;return 1;
 }
 static void async_refund(void* context,size_t bytes) {
-  AsyncBudget* b=(AsyncBudget*)context;if(bytes>b->bytes)abort();b->bytes-=bytes;
+  AsyncBudget* b=(AsyncBudget*)context;b->refunds++;if(!bytes)b->zero_refunds++;if(bytes>b->bytes)abort();b->bytes-=bytes;
 }
 static void async_wake(void* context) {((AsyncBudget*)context)->wakes++;}
 static KuPgAsyncOp* async_create(KuPgClient* p,AsyncBudget* b) {
@@ -2310,12 +2350,94 @@ int main(void) {
     if(after>=before && after>before) {CHECK(after-before<=65536u);copy_turns++;}
     if(row_phase==1)validation_turns++;
   }
-  CHECK(op->phase==KU_PG_ASYNC_DONE && op->output.ok && steps>=8 && copy_turns>=2 && validation_turns>=2);
+  CHECK(op->phase==KU_PG_ASYNC_DONE && op->output.ok && steps<1024 && copy_turns>=2 && validation_turns>=2);
   CHECK(op->output.value->rows==1 && op->output.value->bytes_len==131079);
   KuResult_str value=ku_pg_value(op->output.value,0,0);CHECK(value.ok && value.value.len==131079);
   CHECK(!memcmp(value.value.ptr,async_large_data,131079));ku_string_drop(&value.value);
   async_drop_output(op,&b,1);ku_pg_client_close_owned(opened.value);
   CHECK(live_connections==0 && live_results==0 && b.bytes==0);
   puts("pg async large row closed loop");return 0;
+}
+"#;
+
+const ASYNC_TURN_SUITE: &str = r#"
+static size_t async_turn_steps,async_cell_yields,async_byte_yields;
+static int async_measured_step(KuPgAsyncOp* op,int cancel) {
+  async_validated_bytes=async_copied_bytes=async_reported_bytes=async_reported_cells=async_protocol_results=0;
+  int done=ku_pg_async_step(op,3u,clock_ms,cancel);
+  if(async_validated_bytes+async_copied_bytes>65536u
+      || async_reported_bytes!=async_validated_bytes+async_copied_bytes
+      || async_reported_cells>64u || async_protocol_results>32u)abort();
+  if(async_reported_cells==64u)async_cell_yields++;
+  if(async_reported_bytes==65536u)async_byte_yields++;
+  async_turn_steps++;
+  if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,cancel);
+  return done;
+}
+static int async_measured_finish(KuPgAsyncOp* op) {
+  for(size_t i=0;i<1024;i++)if(async_measured_step(op,0))return 1;
+  return 0;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_ASYNC_ROWS;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* pool=opened.value;AsyncBudget budget={0};
+  async_fixture_rows=257;strcpy(async_fixture_data,"last");
+  KuPgAsyncOp* op=async_create(pool,&budget);int sends_before=user_sends,resets_before=reset_sends;
+  CHECK(async_measured_finish(op) && op->output.ok);
+  CHECK(op->output.value->rows==257 && op->output.value->cols==3
+      && op->output.value->bytes_len==257u*3u*4u);
+  CHECK(async_turn_steps<80 && async_cell_yields && !budget.zero_reserves && !budget.zero_refunds
+      && budget.reserves<32 && user_sends==sends_before+1 && reset_sends==resets_before+1);
+  size_t owned=0;CHECK(ku_pg_result_owned_bytes(op->output.value,&owned));
+  CHECK(budget.bytes==op->input_charge+owned && pool->active==0 && pool->conns[0]);
+  KuResult_str last=ku_pg_value(op->output.value,256,2);CHECK(last.ok && equals(last.value,"last"));
+  ku_string_drop(&last.value);async_drop_output(op,&budget,1);
+  CHECK(!budget.bytes && !ku_database_budget_snapshot().pending_operations
+      && !ku_database_budget_snapshot().pending_bytes);
+
+  /* A byte budget spans validation, copying and multiple rows. UTF8 at the
+   * end of each cell also crosses a partially consumed shared turn budget. */
+  async_fixture_rows=65;memset(async_fixture_data,'x',4000);async_fixture_data[4000]=0;
+  memcpy(async_fixture_data+3996,"\xf0\x9f\x99\x82",4);
+  async_turn_steps=async_byte_yields=0;op=async_create(pool,&budget);
+  CHECK(async_measured_finish(op) && op->output.ok && async_byte_yields);
+  CHECK(op->output.value->rows==65 && op->output.value->bytes_len==65u*3u*4000u);
+  last=ku_pg_value(op->output.value,64,2);CHECK(last.ok && last.value.len==4000
+      && !memcmp(last.value.ptr,async_fixture_data,4000));ku_string_drop(&last.value);
+  async_drop_output(op,&budget,1);CHECK(!budget.bytes && !budget.zero_reserves);
+
+  async_fixture_rows=257;async_fixture_null_empty=1;strcpy(async_fixture_data,"last");
+  op=async_create(pool,&budget);CHECK(async_measured_finish(op) && op->output.ok);
+  KuResult_bool absent=ku_pg_is_null(op->output.value,256,0);CHECK(absent.ok && absent.value);
+  last=ku_pg_value(op->output.value,256,1);CHECK(last.ok && !last.value.len);ku_string_drop(&last.value);
+  CHECK(op->output.value->bytes_len==257u*4u);async_drop_output(op,&budget,1);
+  async_fixture_null_empty=0;
+
+  /* Cancellation of a partially copied result still evicts the original lease;
+   * a late invalid row drains through the original result/reset path. */
+  op=async_create(pool,&budget);CHECK(!async_measured_step(op,0));
+  CHECK(!async_measured_step(op,0) && op->query.value && op->query.value->rows>0
+      && op->query.value->rows<257);
+  CHECK(async_measured_step(op,1) && error_is(op->output,"execution_unknown"));
+  CHECK(!pool->conns[0] && !pool->active);async_drop_output(op,&budget,0);
+  op=async_create(pool,&budget);
+  for(size_t i=0;!op->sent && i<32;i++)CHECK(!async_measured_step(op,0));
+  CHECK(op->sent && op->phase!=KU_PG_ASYNC_DONE);
+  clock_ms=op->deadline;CHECK(async_measured_step(op,0) && error_is(op->output,"execution_unknown"));
+  CHECK(!pool->conns[0] && !pool->active);async_drop_output(op,&budget,0);
+  async_fixture_invalid_row=129;op=async_create(pool,&budget);
+  CHECK(async_measured_finish(op) && !op->output.ok);async_drop_output(op,&budget,0);
+  async_fixture_invalid_row=0;async_fixture_rows=3;reset_mode_on_send=T_READ_TIMEOUT;
+  op=async_create(pool,&budget);
+  for(size_t i=0;op->phase!=KU_PG_ASYNC_RESET_READ && i<1024;i++)CHECK(!async_measured_step(op,0));
+  CHECK(op->phase==KU_PG_ASYNC_RESET_READ && op->output.ok && pool->active==1);
+  clock_ms=op->deadline;CHECK(async_measured_step(op,0) && op->output.ok && !pool->conns[0]);
+  last=ku_pg_value(op->output.value,2,2);CHECK(last.ok && equals(last.value,"last"));
+  ku_string_drop(&last.value);async_drop_output(op,&budget,1);
+  CHECK(!budget.bytes && !budget.zero_reserves && !budget.zero_refunds
+      && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
+  ku_pg_client_close_owned(pool);CHECK(!live_connections && !live_results && !bad_calls);
+  puts("pg async shared turns closed loop");return 0;
 }
 "#;

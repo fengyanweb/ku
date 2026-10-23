@@ -213,9 +213,10 @@ static void ku_pg_async_connected(KuPgAsyncOp* op,unsigned long long now,int can
 /* At most 64 KiB of UTF8 validation/copy and 64 cells per owner turn.
  * The current libpq single-row PGresult is retained until its bytes have been
  * copied; Ku's detached table never refers into it after PQclear. */
-static int ku_pg_async_materialize(KuPgAsyncOp* op) {
+typedef struct KuPgAsyncTurn { size_t bytes,cells; } KuPgAsyncTurn;
+static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
   const size_t byte_quantum=65536u,cell_quantum=64u;
-  size_t work=0,cells_work=0;
+  if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
   if(!op->row_phase) {
     int rows=PQntuples(op->row),cols=PQnfields(op->row);
     size_t previous=op->query.value ? op->query.value->rows:0;
@@ -231,11 +232,11 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op) {
     while(op->row_col<(size_t)op->row_columns) {
       int col=(int)op->row_col;
       if(PQfformat(op->row,col)!=0)return -4;
-      if(!op->row_rows || PQgetisnull(op->row,0,col)) {op->row_col++;if(++cells_work>=cell_quantum)return 0;continue;}
+      if(!op->row_rows || PQgetisnull(op->row,0,col)) {op->row_col++;if(++turn->cells>=cell_quantum)return 0;continue;}
       int length=PQgetlength(op->row,0,col);
       if(length<0 || (size_t)length>KU_PG_MAX_RESULT_BYTES-op->row_bytes)return -1;
       size_t remaining=(size_t)length-op->row_offset;
-      size_t count=remaining<byte_quantum-work?remaining:byte_quantum-work;
+      size_t count=remaining<byte_quantum-turn->bytes?remaining:byte_quantum-turn->bytes;
       const uint8_t* source=(const uint8_t*)PQgetvalue(op->row,0,col);
       if(count<remaining) {
         size_t end=op->row_offset+count;
@@ -244,12 +245,13 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op) {
         if(!count)return 0;
       }
       if(count) {
+        turn->bytes+=count;
         int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);
         if(valid!=1)return valid<0?-2: -5;
-        op->row_offset+=count;work+=count;
+        op->row_offset+=count;
       }
-      if(op->row_offset==(size_t)length) {op->row_bytes+=(size_t)length;op->row_col++;op->row_offset=0;cells_work++;}
-      if(work>=byte_quantum || cells_work>=cell_quantum)return 0;
+      if(op->row_offset==(size_t)length) {op->row_bytes+=(size_t)length;op->row_col++;op->row_offset=0;turn->cells++;}
+      if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
     }
     op->row_phase=2;
   }
@@ -261,7 +263,9 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op) {
     if(op->row_bytes>bc)bc=ku_pg_result_capacity(bc,op->row_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES);
     if(cc>(SIZE_MAX-sizeof(KuPgResult))/sizeof(KuPgCell) || bc>SIZE_MAX-sizeof(KuPgResult)-cc*sizeof(KuPgCell))return -1;
     size_t predicted=sizeof(KuPgResult)+cc*sizeof(KuPgCell)+bc;
-    if(predicted<previous || !op->budget.reserve(op->budget.context,predicted-previous))return -3;
+    if(predicted<previous)return -3;
+    size_t growth=predicted-previous;
+    if(growth && !op->budget.reserve(op->budget.context,growth))return -3;
     KuPgResult* result=op->query.value;
     if(!result) {result=(KuPgResult*)calloc(1,sizeof(*result));op->query.value=result;if(result)result->cols=(size_t)op->row_columns;}
     int allocated=result!=NULL;
@@ -271,8 +275,9 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op) {
     if(predicted>actual)op->budget.refund(op->budget.context,predicted-actual);
     if(!allocated)return -3;
     op->row_phase=3;op->row_col=op->row_offset=0;
-    /* Allocation/growth and copy use separate bounded owner turns. */
-    return 0;
+    /* Only an actual allocation/growth needs its own bounded owner turn.
+     * Existing capacity changes neither the allocation nor its byte charge. */
+    if(growth)return 0;
   }
   while(op->row_rows && op->row_col<(size_t)op->row_columns) {
     KuPgResult* result=op->query.value;int col=(int)op->row_col;
@@ -281,13 +286,13 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op) {
       cell->offset=(uint32_t)result->bytes_len;
       cell->len=PQgetisnull(op->row,0,col)?KU_PG_NULL_CELL:(uint32_t)PQgetlength(op->row,0,col);
     }
-    if(cell->len==KU_PG_NULL_CELL || !cell->len) {op->row_col++;if(++cells_work>=cell_quantum)return 0;continue;}
+    if(cell->len==KU_PG_NULL_CELL || !cell->len) {op->row_col++;if(++turn->cells>=cell_quantum)return 0;continue;}
     size_t remaining=(size_t)cell->len-op->row_offset;
-    size_t count=remaining<byte_quantum-work?remaining:byte_quantum-work;
+    size_t count=remaining<byte_quantum-turn->bytes?remaining:byte_quantum-turn->bytes;
     if(count)memcpy(result->bytes+result->bytes_len,(const uint8_t*)PQgetvalue(op->row,0,col)+op->row_offset,count);
-    result->bytes_len+=count;op->row_offset+=count;work+=count;
-    if(op->row_offset==(size_t)cell->len) {op->row_col++;op->row_offset=0;cells_work++;}
-    if(work>=byte_quantum || cells_work>=cell_quantum)return 0;
+    result->bytes_len+=count;op->row_offset+=count;turn->bytes+=count;
+    if(op->row_offset==(size_t)cell->len) {op->row_col++;op->row_offset=0;turn->cells++;}
+    if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
   }
   op->query.value->rows=op->row_next_rows;return 1;
 }
@@ -306,6 +311,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
         : ku_pg_query_timeout_error(),1);return 1;
   }
   if(op->phase==KU_PG_ASYNC_ACQUIRE) {int acquired=ku_pg_async_acquire(op,now);if(acquired || op->phase==KU_PG_ASYNC_ACQUIRE)return op->phase==KU_PG_ASYNC_DONE;}
+  KuPgAsyncTurn turn={0};
   /* A maximum of 32 protocol results per turn. Byte/row hard limits and the
    * original absolute deadline also apply in the shared detach implementation. */
   for(size_t work=0;work<32u;work++) {
@@ -316,7 +322,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
     }
     op->interest=0;
     if(op->row) {
-      int appended=ku_pg_async_materialize(op);
+      int appended=ku_pg_async_materialize(op,&turn);
       if(!appended)return 0;
       if(appended==-2 || appended==-3) {ku_pg_async_failure(op);return 1;}
       if(appended!=1) {ku_pg_async_drop_table(op,&op->query.value);op->query.validation=appended;}
@@ -389,7 +395,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
       if(rows!=(status==KU_PGRES_SINGLE_TUPLE?1:0) || columns<0 || (op->partial && op->columns!=columns)) {PQclear(next);ku_pg_async_failure(op);return 1;}
       if(!op->partial) {ku_pg_async_drop_query(op);op->columns=columns;}
       if(op->query.validation==1) {
-        op->row=next;op->row_phase=0;op->row_status=status;return 0;
+        op->row=next;op->row_phase=0;op->row_status=status;continue;
       }
       if(status==KU_PGRES_SINGLE_TUPLE) {op->partial=1;PQclear(next);}
       else {op->partial=0;op->query.terminal=next;}
@@ -398,7 +404,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
           || status<KU_PGRES_EMPTY_QUERY || status>KU_PGRES_SINGLE_TUPLE) {PQclear(next);ku_pg_async_failure(op);return 1;}
       ku_pg_async_drop_query(op);op->query.terminal=next;op->partial=0;
       if(status==KU_PGRES_COMMAND_OK) {
-        op->query.terminal=NULL;op->row=next;op->row_phase=0;op->row_status=status;return 0;
+        op->query.terminal=NULL;op->row=next;op->row_phase=0;op->row_status=status;continue;
       }
     }
     now=ku_pg_now_ms();
