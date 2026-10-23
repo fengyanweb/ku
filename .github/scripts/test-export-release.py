@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import tarfile
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -134,11 +135,151 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertEqual((installed / "ku").read_bytes(), (self.bundle / "ku").read_bytes())
             self.assertTrue((installed / "SHA256SUMS").is_file())
             return {"format": "test-receipt", "target": target}
-        with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check:
+        with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check, mock.patch.object(
+                EXPORT, "verify_runtime_installation", return_value={"status": "passed"}) as runtime:
             result = self.run_export(verify_install=True)
         self.assertEqual(check.call_count, 1)
+        runtime.assert_called_once_with(check.call_args.args[0], self.repo, self.target)
+        self.assertEqual(result["runtime_installation"], {"status": "passed"})
         manifest = json.loads(Path(result["manifest_path"]).read_bytes())
         self.assertEqual(manifest["installation_check"], {"format": "test-receipt", "target": self.target})
+        self.assertNotIn("runtime_installation", manifest)
+        self.assertEqual(len(list(self.output.iterdir())), 2)
+
+    def runtime_fixture(self):
+        self.put(self.repo / "tests/acceptance/multiloop_load.py", b"not executed by unit tests\n")
+        self.put(self.repo / "tests/fixtures/multiloop_service.ku", b"unmodified runtime fixture\n")
+        return {"status": "passed", "cli_sha256": EXPORT.file_hash(self.bundle / "ku"),
+                "fixture_sha256": EXPORT.file_hash(self.repo / "tests/fixtures/multiloop_service.ku"),
+                "runs": [{"loops": 2, "exit_code": 0, "phases": [{"name": "short", "arrivals": 3,
+                    "completed": 3, "counts": {"success": 3}, "client_shed": 0, "first_errors": []}],
+                    "final_metrics": {
+                        "loops": [dict(id=i, queued=0, running=0, resident=0, pending=0) for i in range(2)],
+                        "tasks": [dict(id=i, ready=0, waiting=0, running=0, resident=0, timers=0) for i in range(2)],
+                        "outcomes": [dict(id=i, queued_bytes=0) for i in range(2)]}}]}
+
+    def runtime_process(self, report, directories, **overrides):
+        def spawn(arguments, repo, working):
+            self.assertEqual(arguments[:3], [sys.executable, "-B", str(self.repo / "tests/acceptance/multiloop_load.py")])
+            self.assertEqual(arguments[3:13], ["--ku", str(self.bundle / "ku"), "--loops", "2",
+                                             "--duration", "3", "--rps", "1", "--profile", "release"])
+            destination = Path(arguments[-1])
+            directories.append(destination.parent)
+            self.assertEqual(repo, self.repo)
+            self.assertEqual(working, destination.parent)
+            destination.write_text(json.dumps(report), encoding="utf-8")
+            return EXPORT.subprocess.CompletedProcess(arguments, overrides.get("returncode", 0),
+                                                       overrides.get("stdout", b""), overrides.get("stderr", b""))
+        return spawn
+
+    def test_installed_runtime_smoke_checks_extracted_cli_and_cleans_temporary_tree(self):
+        report, directories = self.runtime_fixture(), []
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=self.runtime_process(report, directories)):
+            receipt = EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        self.assertEqual(receipt["requests"]["paths_in_order"], ["/ok", "/cpu", "/timer"])
+        self.assertEqual(receipt["observed_loops"], 2)
+        self.assertEqual(receipt["executable_sha256"], EXPORT.file_hash(self.bundle / "ku"))
+        self.assertEqual(receipt["drain_exit_code"], 0)
+        self.assertTrue(receipt["temporary_tree_removed"])
+        self.assertTrue(receipt["process_tree_cleanup_confirmed"])
+        self.assertTrue(directories and all(not root.exists() for root in directories))
+
+    def test_runtime_smoke_rejects_wrong_bodies_partial_runs_and_live_records(self):
+        baseline = self.runtime_fixture()
+        mutations = [
+            lambda value: value.update(cli_sha256="b" * 64),
+            lambda value: value["runs"][0]["phases"][0].update(counts={"success": 2, "wrong_body": 1}),
+            lambda value: value["runs"][0]["phases"][0].update(arrivals=2, completed=2),
+            lambda value: value["runs"][0].update(exit_code=-9),
+            lambda value: value["runs"][0]["final_metrics"]["tasks"][1].update(resident=1),
+            lambda value: value["runs"][0]["final_metrics"]["outcomes"][0].update(queued_bytes=1),
+            lambda value: value["runs"][0]["final_metrics"].update(loops=[]),
+        ]
+        for index, mutate in enumerate(mutations):
+            report, directories = copy.deepcopy(baseline), []
+            mutate(report)
+            with self.subTest(index=index), mock.patch.object(EXPORT, "run_runtime_check",
+                    side_effect=self.runtime_process(report, directories)):
+                with self.assertRaises(EXPORT.RuntimeSmokeError) as caught:
+                    EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+                self.assertEqual(caught.exception.evidence["status"], "failed")
+                self.assertIn("report_tail", caught.exception.evidence)
+                self.assertTrue(caught.exception.evidence["temporary_tree_removed"])
+                self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_smoke_owner_failure_is_not_reported_as_confirmed_cleanup(self):
+        report, directories = self.runtime_fixture(), []
+        spawn = self.runtime_process(report, directories)
+        def failed(*arguments):
+            spawn(*arguments)
+            raise SystemExit("installed runtime smoke exceeded 180 seconds; cleanup unconfirmed")
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=failed):
+            with self.assertRaisesRegex(EXPORT.RuntimeSmokeError, "180 seconds") as caught:
+                EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        self.assertFalse(caught.exception.evidence["process_tree_cleanup_confirmed"])
+        self.assertTrue(caught.exception.evidence["temporary_tree_removed"])
+        self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_failure_does_not_publish_unchecked_archive(self):
+        evidence = {"status": "failed", "temporary_tree_removed": True}
+        with mock.patch.object(EXPORT, "verify_installation", return_value={}), mock.patch.object(
+                EXPORT, "verify_runtime_installation", side_effect=EXPORT.RuntimeSmokeError("runtime failed", evidence)):
+            with self.assertRaisesRegex(EXPORT.RuntimeSmokeError, "runtime failed"):
+                self.run_export(verify_install=True)
+        self.assertFalse(any(self.output.iterdir()))
+
+    def test_runtime_failure_logs_are_bounded_and_temporary_files_are_removed(self):
+        report, directories = self.runtime_fixture(), []
+        spawn = self.runtime_process(report, directories, returncode=1, stderr=b"failure evidence\n" * 1000)
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=spawn):
+            with self.assertRaises(EXPORT.RuntimeSmokeError) as caught:
+                EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        evidence = caught.exception.evidence
+        self.assertEqual(evidence["driver_exit_code"], 1)
+        self.assertEqual(len(evidence["stderr_tail"].encode()), 8192)
+        self.assertTrue(evidence["temporary_tree_removed"])
+        self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_owner_retires_descendant_even_after_launcher_exits(self):
+        ready, escaped = self.root / "orphan-ready", self.root / "orphan-escaped"
+        descendant = ("from pathlib import Path; import time; "
+                      f"Path({str(ready)!r}).write_text('ready'); time.sleep(10); "
+                      f"Path({str(escaped)!r}).write_text('escaped'); print('descendant-escaped',flush=True)")
+        source = ("import subprocess,sys,time\nfrom pathlib import Path\n"
+                  f"subprocess.Popen([sys.executable,'-B','-c',{descendant!r}])\n"
+                  "deadline=time.monotonic()+2\n"
+                  f"while not Path({str(ready)!r}).exists():\n"
+                  "    if time.monotonic()>=deadline: raise RuntimeError('child did not start')\n"
+                  "    time.sleep(.01)\n"
+                  "print('parent-exited',flush=True)\n")
+        driver = self.root / "orphan-driver.py"
+        driver.write_text(source, encoding="utf-8")
+        began = time.monotonic()
+        result = EXPORT.run_runtime_check([sys.executable, "-B", str(driver)], self.root, self.root)
+        self.assertEqual(result.stdout.replace(b"\r\n", b"\n"), b"parent-exited\n")
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertTrue(ready.exists(), "the actual descendant never reached its held phase")
+        self.assertFalse(escaped.exists())
+
+    def test_runtime_result_is_single_cli_json_and_failure_only_uses_stderr(self):
+        arguments = ["export-release.py", "--bundle", str(self.bundle), "--output", str(self.output),
+                     "--repo", str(self.repo), "--metadata", str(self.metadata),
+                     "--rust-sysroot", str(self.sysroot), "--version", "0.0.17",
+                     "--target", self.target, "--commit", "a" * 40]
+        result = {"asset_path": "asset", "runtime_installation": {"status": "passed"}}
+        for failure in (False, True):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            error = EXPORT.RuntimeSmokeError("failed smoke", {"status": "failed"})
+            with self.subTest(failure=failure), mock.patch.object(sys, "argv", arguments), mock.patch.object(
+                    EXPORT, "export_release", side_effect=error if failure else None, return_value=result), \
+                    mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                self.assertEqual(EXPORT.main(), 1 if failure else 0)
+            if failure:
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(json.loads(stderr.getvalue().splitlines()[0])["runtime_installation"]["status"], "failed")
+            else:
+                self.assertEqual(json.loads(stdout.getvalue()), result)
+                self.assertEqual(stderr.getvalue(), "")
 
     def test_installed_commands_validate_version_examples_and_normal_exit(self):
         for name in ("hello.ku", "json.ku"):
