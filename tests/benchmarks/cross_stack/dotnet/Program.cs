@@ -16,7 +16,7 @@ static class Bench {
     if (args.Length > 0 && args[0] == "--batch") {
       using var input = JsonDocument.Parse(await File.ReadAllBytesAsync(args.Length > 1 ? args[1] : "batch.json"));
       int iterations = input.RootElement.GetProperty("iterations").GetInt32(), seed = input.RootElement.GetProperty("seed").GetInt32(), repeat = input.RootElement.GetProperty("repeat").GetInt32();
-      if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 1024) throw new ArgumentException("invalid CPU input");
+      if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 32768) throw new ArgumentException("invalid CPU input");
       long[] checksums = new long[repeat]; var clock = Stopwatch.StartNew(); for (int i = 0; i < repeat; i++) checksums[i] = Checksum(iterations, seed); clock.Stop();
       Console.WriteLine(JsonSerializer.Serialize(new { checksums, compute_ms = clock.Elapsed.TotalMilliseconds })); return;
     }

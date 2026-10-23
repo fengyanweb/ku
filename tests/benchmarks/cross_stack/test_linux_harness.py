@@ -165,6 +165,8 @@ class MeasurementRulesTest(unittest.TestCase):
         args=types.SimpleNamespace(case='c4-m268435456-mixed')
         self.assertEqual(sustained_case(args),(4,256*MIB,'mixed'))
         self.assertIn((4,256*MIB,'mixed'),list(cases(args)))
+        self.assertEqual(list(cases(args)).count((2,GIB,'json_object')),1)
+        self.assertEqual(declared_case_stacks(('ku','go','rust','node','java','dotnet','cpp'),2,GIB,'json_object'),('ku','go','rust','node'))
         self.assertEqual(declared_case_stacks(('ku','java','dotnet','cpp'),4,256*MIB,'mixed'),('ku','java','dotnet','cpp'))
         self.assertEqual(declared_case_stacks(('java','dotnet','cpp'),4,GIB,'json_escape'),())
         args.case='c4-m1073741824-cpu'

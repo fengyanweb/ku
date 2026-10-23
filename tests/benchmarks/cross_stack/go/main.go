@@ -65,7 +65,7 @@ func batch() error {
 	if err := json.Unmarshal(body, &input); err != nil {
 		return err
 	}
-	if input.Iterations < 1000 || input.Iterations > 1000000 || input.Seed < 1 || input.Seed > 1024 || input.Repeat < 0 || input.Repeat > 1024 {
+	if input.Iterations < 1000 || input.Iterations > 1000000 || input.Seed < 1 || input.Seed > 1024 || input.Repeat < 0 || input.Repeat > 32768 {
 		return errors.New("CPU fixture input outside common integer range")
 	}
 	checksums := make([]int64, input.Repeat)

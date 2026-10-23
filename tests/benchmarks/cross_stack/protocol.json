@@ -89,10 +89,22 @@
       "fields": {
         "iterations": 512000,
         "seed": 3,
-        "repeat": 64
+        "repeat": 32768
       },
       "output": "{checksums:[int],compute_ms:monotonic milliseconds}",
-      "cold_start": "repeat=0 in a fresh process, reported separately; never subtracted from repeat=64"
+      "expected_checksum_per_repeat": 22944003,
+      "formal_minimum_process_wall_seconds": 30,
+      "formal_minimum_compute_ms_per_process": 30000,
+      "process_group_absolute_deadline_seconds": 600,
+      "deadline_origin": "shared frozen-domain release through last natural child exit; no startup subtraction",
+      "maximum_bytes_per_stdout_or_stderr": 1048576,
+      "resource_sampling_interval_seconds": 0.1,
+      "maximum_resource_samples": 6016,
+      "resource_sampling_scope": "bounded100ms whole-domain snapshots cover the full600s execution window; subinterval peaks may be missed by sampled RSS/current; kernel memory.peak is retained",
+      "formal_eligibility": "all checksum outputs correct, all children exit naturally, original OOM/resource/cleanup gates pass, process wall>=30s and every process compute_ms>=30000; no sleeping, auto-increased work or selective retries to qualify",
+      "short_formal_window": "retain evidence, mark ineligible and stop later formal rounds for that stack; never silently increase repeat",
+      "previous_repeat64": "retained R&D only, excluded from the formal table",
+      "cold_start": "repeat=0 in a fresh process, reported separately with no30s minimum; never subtracted from repeat=32768"
     }
   },
   "corpora": {

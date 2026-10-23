@@ -1504,6 +1504,7 @@ def cases(args):
     for workload in ('ok', 'json_object', 'cpu'):
         yield 1, GIB, workload
     yield 2, GIB, 'cpu'
+    yield 2, GIB, 'json_object'
     yield 4, 256 * MIB, 'json_object'
     yield 4, 256 * MIB, 'mixed'
 

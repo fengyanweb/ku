@@ -6,7 +6,7 @@ fn main(): null! {
     iterations = input["iterations"]?.as_int()?
     seed = input["seed"]?.as_int()?
     repeat = input["repeat"]?.as_int()?
-    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 1024) {
+    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 32768) {
         fail "CPU fixture input outside common integer range"
     }
     checksums:[int] = []

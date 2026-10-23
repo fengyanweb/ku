@@ -53,4 +53,4 @@ whole-process elapsed time. No benchmark results should be inferred from build
 or functional-smoke timings.
 
 `repeat=0` is supported only for the separate fresh-process startup observation.
-It returns an empty checksum array and is never subtracted from `repeat=64`.
+It returns an empty checksum array and is never subtracted from `repeat=32768`.

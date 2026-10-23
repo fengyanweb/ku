@@ -3,7 +3,8 @@
 
 This is a fresh-process CLI workload, separate from HTTP and server-JIT results.
 repeat=0 observes fresh process startup; its duration is never subtracted from
-repeat=64. Four-core rows execute four independent processes in one total 4-core,
+the fixed repeat=32768 computation. Earlier repeat=64 rows are R&D only.
+Four-core rows execute four independent processes in one total 4-core,
 1-GiB domain, rather than granting four separate resource budgets.
 """
 from __future__ import annotations
@@ -28,11 +29,15 @@ ORDER_SEED = 20261023
 
 ITERATIONS = 512000
 SEED = 3
-REPEAT = 64
+REPEAT = 32768
 EXPECTED = 22944003
 ROUNDS = 7
-PROCESS_DEADLINE_SECONDS = 60
-STREAM_LIMIT = 65536
+PROCESS_DEADLINE_SECONDS = 600
+STREAM_LIMIT = 1048576
+MIN_PROCESS_WALL_SECONDS = 30
+MIN_COMPUTE_MS = 30000
+SAMPLE_INTERVAL_SECONDS = .1
+MAX_RESOURCE_SAMPLES = 6016
 
 
 def digest(path):
@@ -50,7 +55,7 @@ def parse_result(path, repeat):
     """Strictly validate every returned checksum, including the empty startup row."""
     path = Path(path)
     if path.stat().st_size > STREAM_LIMIT:
-        raise ValueError('batch stdout exceeded 65536 bytes')
+        raise ValueError('batch stdout exceeded the fixed 1-MiB limit')
 
     def reject_constant(value):
         raise ValueError('non-JSON numeric constant: ' + value)
@@ -67,6 +72,39 @@ def parse_result(path, repeat):
     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
         raise ValueError('invalid internal compute_ms')
     return value
+
+
+def formal_duration_eligibility(repeat, process_wall_seconds, compute_ms, processes):
+    """Classify actual durations; never sleep or increase work to qualify a row."""
+    def finite_at_least(value, minimum):
+        return type(value) in (int, float) and math.isfinite(value) and value >= minimum
+
+    if repeat == 0:
+        return {'applicable': False, 'eligible': False,
+                'process_wall_seconds': process_wall_seconds,
+                'internal_compute_ms_by_process': compute_ms,
+                'reasons': ['startup observation has no formal compute-duration requirement']}
+    reasons = []
+    if repeat != REPEAT:
+        reasons.append('nonformal repeat count; retain as R&D only')
+    if not finite_at_least(process_wall_seconds, MIN_PROCESS_WALL_SECONDS):
+        reasons.append('process wall shorter than 30s or invalid')
+    elif process_wall_seconds > PROCESS_DEADLINE_SECONDS:
+        reasons.append('process wall exceeds the absolute 600s deadline')
+    if len(compute_ms) != processes or not compute_ms:
+        reasons.append('missing internal compute duration for a process')
+    elif not all(finite_at_least(value, MIN_COMPUTE_MS) for value in compute_ms):
+        reasons.append('at least one internal compute duration is below 30000ms or invalid')
+    return {
+        'applicable': repeat != 0,
+        'frozen_formal_repeat': REPEAT,
+        'minimum_process_wall_seconds': MIN_PROCESS_WALL_SECONDS,
+        'minimum_internal_compute_ms_per_process': MIN_COMPUTE_MS,
+        'process_wall_seconds': process_wall_seconds,
+        'internal_compute_ms_by_process': compute_ms,
+        'eligible': not reasons,
+        'reasons': reasons,
+    }
 
 
 def cpu_seconds(before, after):
@@ -154,10 +192,17 @@ def run_group(harness, stack, cores, repeat, round_index, output):
     result = {
         'schema': 1, 'identity': identity,
         'kind': 'fresh_process_startup_observation' if repeat == 0 else 'independent_process_cpu',
+        'measurement_class': ('startup_observation' if repeat == 0 else
+                              'formal_candidate' if repeat == REPEAT else 'research_and_development'),
+        'formal_eligible': False,
         'limits': domain.settings, 'cgroup': str(domain.path),
         'batch_input': {'iterations': ITERATIONS, 'seed': SEED, 'repeat': repeat},
         'expected_checksum': EXPECTED, 'children': [], 'passed': False,
         'startup_subtracted': False,
+        'bounds': {'process_group_absolute_seconds': PROCESS_DEADLINE_SECONDS,
+                   'bytes_per_stdout_or_stderr': STREAM_LIMIT,
+                   'resource_sample_interval_seconds': SAMPLE_INTERVAL_SECONDS,
+                   'maximum_resource_samples': MAX_RESOURCE_SAMPLES},
         'timing': 'process-wall starts at shared frozen-domain release and ends at last child exit; internal compute is separate',
         'memory_scope': 'whole service cgroup, including all independent processes; kernel memory.peak retained',
         'internal_timer': 'Ku monotonic API has 1ms resolution; other stacks use their monotonic high-resolution API; printed decimals do not establish actual precision; intervals below20ms are not precise ratio evidence',
@@ -245,20 +290,21 @@ def run_group(harness, stack, cores, repeat, round_index, output):
             waiter = threading.Thread(target=wait_for_child, args=(process, entry), daemon=True)
             waiter.start()
             waiter_threads.append(waiter)
-        sampler = Sampler([domain], output / 'resources.json', interval=.02, maximum=4096).start()
+        sampler = Sampler([domain], output / 'resources.json',
+                          interval=SAMPLE_INTERVAL_SECONDS, maximum=MAX_RESOURCE_SAMPLES).start()
         before = domain.snapshot()
         released_ns = time.monotonic_ns()
         result['released_wall_time_ns'] = time.time_ns()
         domain.freeze(False)
-        deadline = time.monotonic() + PROCESS_DEADLINE_SECONDS
+        deadline_ns = released_ns + PROCESS_DEADLINE_SECONDS * 1000000000
         while any(waiter.is_alive() for waiter in waiter_threads):
-            if time.monotonic() >= deadline:
+            if time.monotonic_ns() >= deadline_ns:
                 timed_out = True
-                raise RuntimeError('batch exceeded the fixed 60s process-group deadline')
+                raise RuntimeError('batch exceeded the fixed absolute 600s process-group deadline')
             if any(path.stat().st_size > STREAM_LIMIT
                    for _, _, stdout, stderr in children for path in (stdout, stderr)):
                 overflow = True
-                raise RuntimeError('batch process output exceeded the fixed per-stream 65536-byte limit')
+                raise RuntimeError('batch process output exceeded the fixed per-stream 1-MiB limit')
             time.sleep(.005)
         for waiter in waiter_threads:
             waiter.join(timeout=1)
@@ -270,12 +316,16 @@ def run_group(harness, stack, cores, repeat, round_index, output):
         result['resource_after'] = after
         result['cpu_seconds'] = cpu_seconds(before, after)
         result['cpu_accounting_interval'] = 'entire shared domain from pre-release snapshot through all child exits, including startup/JIT/GC/output and failed work'
+        if ended_ns > deadline_ns:
+            timed_out = True
+            raise RuntimeError('batch child finished after the fixed absolute 600s deadline')
         for _, entry, stdout, stderr in children:
             entry['stdout_bytes'], entry['stderr_bytes'] = stdout.stat().st_size, stderr.stat().st_size
+            if max(entry['stdout_bytes'], entry['stderr_bytes']) > STREAM_LIMIT:
+                overflow = True
+                raise RuntimeError('batch process output exceeded the fixed per-stream 1-MiB limit')
             if entry['exit_code'] != 0:
                 raise RuntimeError('batch child exited nonzero: ' + str(entry['exit_code']))
-            if entry['stderr_bytes'] > STREAM_LIMIT:
-                raise RuntimeError('batch stderr exceeds limit')
             entry['result'] = parse_result(stdout, repeat)
             entry['wall_seconds_from_group_release'] = (entry['finished_monotonic_ns'] - released_ns) / 1e9
         total = cores * repeat
@@ -285,7 +335,13 @@ def run_group(harness, stack, cores, repeat, round_index, output):
         result['correct_computations_per_cpu_second'] = total / result['cpu_seconds'] if total and result['cpu_seconds'] else None
         memory_oom = after.get('memory_events', {}).get('oom_kill', 0) - before.get('memory_events', {}).get('oom_kill', 0)
         result['oom_kills'] = memory_oom
-        result['passed'] = memory_oom == 0
+        result['correctness_passed'] = memory_oom == 0
+        result['formal_duration'] = formal_duration_eligibility(
+            repeat, elapsed, [entry['result']['compute_ms'] for _, entry, *_ in children], cores)
+        # Startup is a separate observation. A short formal compute row stays
+        # visible and fails the run; it is never padded or retried with more work.
+        result['passed'] = result['correctness_passed'] and (
+            repeat != REPEAT or result['formal_duration']['eligible'])
     except BaseException as caught:
         error = caught
         result['error'] = repr(caught)
@@ -322,6 +378,7 @@ def run_group(harness, stack, cores, repeat, round_index, output):
             domain_rows = [sample['domains'][0] for sample in samples if sample.get('domains')]
             result['sampled_resources'] = {
                 'interval_seconds': sampler.interval, 'samples': len(samples),
+                'maximum_samples': MAX_RESOURCE_SAMPLES,
                 'peak_memory_current_bytes': max((row.get('memory_current', 0) or 0 for row in domain_rows), default=0),
                 'kernel_memory_peak_bytes': max((row.get('memory_peak', 0) or 0 for row in domain_rows), default=0),
                 'peak_threads': max((row.get('threads', 0) for row in domain_rows), default=0),
@@ -343,6 +400,8 @@ def run_group(harness, stack, cores, repeat, round_index, output):
         result['workdir_cleanup_errors'] = cleanup_errors
         if error is not None or result.get('sampler_error') or result.get('sampler_overflow') or not result['cgroup_removed'] or cleanup_errors:
             result['passed'] = False
+        result['formal_eligible'] = (result['passed'] and repeat == REPEAT
+                                     and result.get('formal_duration', {}).get('eligible', False))
         write_json(report_path, result)
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         raise error
@@ -356,7 +415,7 @@ def summary(rows, stacks=STACKS, core_points=(1,)):
             formal = [row for row in rows if row.get('identity', {}).get('cores') == cores
                       and row.get('identity', {}).get('stack') == stack
                       and row.get('identity', {}).get('repeat') == REPEAT]
-            valid = [row for row in formal if row.get('passed')]
+            valid = [row for row in formal if row.get('passed') and row.get('formal_eligible') is True]
             cold = [row for row in rows if row.get('identity', {}).get('cores') == cores
                     and row.get('identity', {}).get('stack') == stack
                     and row.get('identity', {}).get('repeat') == 0 and row.get('passed')]
@@ -365,6 +424,9 @@ def summary(rows, stacks=STACKS, core_points=(1,)):
             item = {'stack': stack, 'cores': cores, 'processes': cores,
                     'expected_formal_rounds': ROUNDS, 'valid_formal_rounds': len(valid),
                     'failed_formal_rounds': len(formal) - len(valid),
+                    'formal_ineligible_reasons': [row.get('formal_duration', {}).get('reasons') or
+                                                 [row.get('error', 'other validation or lifecycle gate failed')]
+                                                 for row in formal if row not in valid],
                     'fresh_process_startup_rounds': len(cold),
                     'startup_subtracted': False,
                     'cold_start_definition': 'repeat0 fresh process with ordinary page cache, not a cold-disk claim'}
@@ -390,6 +452,13 @@ def run(harness, output=None, stacks=STACKS, core_points=(1,)):
               'warmup': 'fresh processes are intentional; repeat0 is a separate observation without subtraction; Java/.NET/Node JIT and normal GC work belongs to each fresh process; this table is not prewarmed JIT peak speed',
               'matrix': {'cores': list(core_points), 'stacks': list(stacks), 'rounds': ROUNDS, 'order_seed': ORDER_SEED, 'order_by_round': interleaved_orders(stacks,ROUNDS,ORDER_SEED),
                          'iterations': ITERATIONS, 'seed': SEED, 'repeat': REPEAT,
+                         'formal_minimum_process_wall_seconds': MIN_PROCESS_WALL_SECONDS,
+                         'formal_minimum_compute_ms_per_process': MIN_COMPUTE_MS,
+                         'process_group_absolute_seconds': PROCESS_DEADLINE_SECONDS,
+                         'bytes_per_stdout_or_stderr': STREAM_LIMIT,
+                         'resource_sample_interval_seconds': SAMPLE_INTERVAL_SECONDS,
+                         'maximum_resource_samples': MAX_RESOURCE_SAMPLES,
+                         'previous_repeat64': 'R&D only; retained evidence is not merged into formal rows',
                          'memory_bytes_total_per_group': GIB, 'order': 'frozen seeded random interleaving; same seven paired windows per stack',
                          'processes_per_group': 'equal to cores; all share one total resource domain'},
               'rows': rows, 'skipped': [], 'passed': False}
@@ -407,11 +476,13 @@ def run(harness, output=None, stacks=STACKS, core_points=(1,)):
                     rows.append(row)
                     report['summaries'] = summary(rows,stacks,core_points)
                     write_json(output / 'summary.json', report)
-                    if not row['passed']:
+                    if not row['passed'] or (repeat != 0 and row.get('formal_eligible') is not True):
                         stopped[stack] = 'first invalid independent-process batch; preserve evidence and diagnose before more repeats'
                         break
     report['summaries'] = summary(rows,stacks,core_points)
-    report['passed'] = len(rows) == len(core_points) * ROUNDS * len(stacks) * 2 and all(row['passed'] for row in rows)
+    report['passed'] = len(rows) == len(core_points) * ROUNDS * len(stacks) * 2 and all(
+        row['passed'] and (row['identity']['repeat'] == 0 or row.get('formal_eligible') is True)
+        for row in rows)
     write_json(output / 'summary.json', report)
     return report
 

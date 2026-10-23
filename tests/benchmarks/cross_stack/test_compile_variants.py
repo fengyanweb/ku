@@ -5,9 +5,97 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import batch
 from compile_variants import profile_input, native_flags
 from profile_training import PLANS, expected, identity, plan, parse_output
 from build_linux import expand_ku_server
+
+
+class BatchWindowTests(unittest.TestCase):
+    """Synthetic outputs exercise gates without running the large CPU workload."""
+
+    def test_formal_input_limits_and_sampling_are_frozen_in_protocol(self):
+        root = Path(__file__).parent
+        contract = json.loads((root / 'protocol.json').read_text())['cpu_algorithm']['batch']
+        self.assertEqual(contract['fields'], {'iterations': batch.ITERATIONS,
+                                              'seed': batch.SEED, 'repeat': batch.REPEAT})
+        self.assertEqual(batch.REPEAT, 32768)
+        self.assertEqual(contract['formal_minimum_process_wall_seconds'], batch.MIN_PROCESS_WALL_SECONDS)
+        self.assertEqual(contract['formal_minimum_compute_ms_per_process'], batch.MIN_COMPUTE_MS)
+        self.assertEqual(contract['process_group_absolute_deadline_seconds'], batch.PROCESS_DEADLINE_SECONDS)
+        self.assertEqual(contract['maximum_bytes_per_stdout_or_stderr'], batch.STREAM_LIMIT)
+        self.assertEqual(contract['resource_sampling_interval_seconds'], batch.SAMPLE_INTERVAL_SECONDS)
+        self.assertEqual(contract['maximum_resource_samples'], batch.MAX_RESOURCE_SAMPLES)
+        self.assertGreater(batch.MAX_RESOURCE_SAMPLES * batch.SAMPLE_INTERVAL_SECONDS,
+                           batch.PROCESS_DEADLINE_SECONDS)
+        for source, repeat in [('ku/batch.ku', 'repeat'), ('go/main.go', 'input.Repeat'),
+                               ('java/src/main/java/ku/bench/Main.java', 'repeat'),
+                               ('dotnet/Program.cs', 'repeat'), ('cpp/main.cc', 'repeat')]:
+            with self.subTest(source=source):
+                text = (root / source).read_text()
+                self.assertIn(repeat + ' > 32768', text)
+                self.assertNotIn(repeat + ' > 1024', text)
+                self.assertIn('1024', text)  # Unrelated seed/HTTP bounds remain.
+
+    def test_actual_wall_and_every_compute_duration_required_but_cold_is_separate(self):
+        qualifies = lambda wall, timers: batch.formal_duration_eligibility(
+            batch.REPEAT, wall, timers, 4)['eligible']
+        self.assertTrue(qualifies(30, [30000] * 4))
+        self.assertTrue(qualifies(600, [30000] * 4))
+        for wall, timers in [(29.999, [30000] * 4), (600.001, [30000] * 4),
+                             (30, [30000, 29999.9, 30000, 30000]), (30, [30000] * 3),
+                             (30, []), (True, [30000] * 4),
+                             (float('nan'), [30000] * 4), (30, [float('inf')] * 4)]:
+            with self.subTest(wall=wall, timers=timers):
+                self.assertFalse(qualifies(wall, timers))
+        cold = batch.formal_duration_eligibility(0, .01, [0], 1)
+        self.assertFalse(cold['applicable'])
+        self.assertFalse(cold['eligible'])
+        self.assertEqual(len(cold['reasons']), 1)
+        legacy = batch.formal_duration_eligibility(64, 40, [40000], 1)
+        self.assertFalse(legacy['eligible'])
+        self.assertIn('R&D', legacy['reasons'][0])
+
+    def test_validates_entire_large_output_and_exact_one_mib_stream_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'stdout.json'
+            value = {'checksums': [batch.EXPECTED] * batch.REPEAT, 'compute_ms': 30000}
+            encoded = json.dumps(value)
+            self.assertLess(len(encoded), batch.STREAM_LIMIT)
+            path.write_text(encoded + ' ' * (batch.STREAM_LIMIT - len(encoded)))
+            self.assertEqual(len(batch.parse_result(path, batch.REPEAT)['checksums']), batch.REPEAT)
+            with path.open('a') as stream:
+                stream.write(' ')
+            with self.assertRaisesRegex(ValueError, '1-MiB'):
+                batch.parse_result(path, batch.REPEAT)
+            for wrong in (0, True, float(batch.EXPECTED)):
+                value['checksums'][-1] = wrong
+                path.write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, 'incorrect CPU checksum'):
+                    batch.parse_result(path, batch.REPEAT)
+
+    def test_short_formal_result_is_retained_and_stops_later_rounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+
+            def synthetic_group(harness, stack, cores, repeat, round_index, output):
+                calls.append((stack, round_index, repeat))
+                return {'identity': {'stack': stack, 'cores': cores, 'repeat': repeat},
+                        'passed': True, 'formal_eligible': False, 'process_wall_seconds': .1,
+                        'formal_duration': {'reasons': ['short formal compute window']}}
+
+            with patch.object(batch, 'ROUNDS', 2), \
+                    patch.object(batch, 'expected_checksum', return_value=batch.EXPECTED), \
+                    patch.object(batch, 'run_group', side_effect=synthetic_group):
+                report = batch.run(None, directory, stacks=('ku',))
+            self.assertEqual(calls, [('ku', 0, 0), ('ku', 0, batch.REPEAT)])
+            self.assertFalse(report['passed'])
+            self.assertEqual(len(report['rows']), 2)
+            self.assertEqual(len(report['skipped']), 1)
+            self.assertEqual(report['summaries'][0]['valid_formal_rounds'], 0)
+            self.assertEqual(report['summaries'][0]['failed_formal_rounds'], 1)
+            self.assertTrue((Path(directory) / 'summary.json').exists())
 
 
 class ProfileReceiptTests(unittest.TestCase):

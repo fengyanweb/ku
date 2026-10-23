@@ -25,7 +25,7 @@ public final class Main {
   static void batch(String input) throws Exception {
     JsonNode n = JSON.readTree(Files.readAllBytes(Path.of(input)));
     int iterations = n.path("iterations").asInt(), seed = n.path("seed").asInt(), repeat = n.path("repeat").asInt();
-    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 1024) throw new IllegalArgumentException("invalid CPU input");
+    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024 || repeat < 0 || repeat > 32768) throw new IllegalArgumentException("invalid CPU input");
     long[] values = new long[repeat]; long start = System.nanoTime();
     for (int i = 0; i < repeat; i++) values[i] = checksum(iterations, seed);
     double ms = (System.nanoTime() - start) / 1e6;
