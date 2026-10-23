@@ -396,14 +396,56 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
     )
 }
 
+/// A checked service-local async declaration, tied to its ordinary closure
+/// identity and existing typed capture cells. No second free-variable analysis
+/// or public reference type is introduced for native HTTP.
+#[derive(Debug, Clone)]
+pub struct MixedAsyncHandler {
+    pub declaration: crate::ast::FnDecl,
+    pub captures: Vec<(String, String, IrType)>,
+}
+
+pub fn lower_mixed_http_setup(program: &Program) -> KuResult<(IrProgram, Vec<MixedAsyncHandler>)> {
+    let handlers = Rc::new(RefCell::new(Vec::new()));
+    let lowered = lower_program_mode(
+        program,
+        Rc::new(RefCell::new(LowerBudget::new(LowerLimits::default()))),
+        Some(handlers.clone()),
+    )?;
+    let handlers = std::mem::take(&mut *handlers.borrow_mut());
+    Ok((lowered, handlers))
+}
+
+fn async_signature_placeholder(span: Span) -> Vec<Stmt> {
+    vec![Stmt::Fail {
+        value: Expr::new(
+            ExprKind::Literal(Literal::String(
+                "async HTTP handlers must be registered with app.get/post/put/del".into(),
+            )),
+            span,
+        ),
+        span,
+    }]
+}
+
 fn lower_program_with_budget(
     program: &Program,
     budget: Rc<RefCell<LowerBudget>>,
 ) -> KuResult<IrProgram> {
-    crate::ast::reject_compiled_async(
-        program,
-        "async/await is not supported by IR/native lowering yet",
-    )?;
+    lower_program_mode(program, budget, None)
+}
+
+fn lower_program_mode(
+    program: &Program,
+    budget: Rc<RefCell<LowerBudget>>,
+    mixed_async: Option<Rc<RefCell<Vec<MixedAsyncHandler>>>>,
+) -> KuResult<IrProgram> {
+    if mixed_async.is_none() {
+        crate::ast::reject_compiled_async(
+            program,
+            "async/await is not supported by IR/native lowering yet",
+        )?;
+    }
     let specialized = monomorph::specialize(program)?;
     let program = specialized.as_ref().unwrap_or(program);
     let layouts = lower_layouts(program);
@@ -473,6 +515,7 @@ fn lower_program_with_budget(
                 budget.clone(),
                 function.span,
             )?;
+            probe.mixed_async = mixed_async.clone();
             if let Some(sig) = signatures.get(&function.name) {
                 budget
                     .borrow_mut()
@@ -556,10 +599,23 @@ fn lower_program_with_budget(
                 budget.clone(),
                 function.span,
             )?;
+            lower.mixed_async = mixed_async.clone();
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
-            lower.lower_block_body("entry", &function.body, &function.params)?;
+            if let Some(handlers) = mixed_async.as_ref().filter(|_| function.is_async) {
+                handlers.borrow_mut().push(MixedAsyncHandler {
+                    declaration: function.clone(),
+                    captures: Vec::new(),
+                });
+                lower.lower_block_body(
+                    "entry",
+                    &async_signature_placeholder(function.span),
+                    &function.params,
+                )?;
+            } else {
+                lower.lower_block_body("entry", &function.body, &function.params)?;
+            }
             functions.push(IrFunction {
                 id: signature.id,
                 name: function.name.clone(),
@@ -1197,6 +1253,7 @@ struct FunctionLowerer<'a> {
     /// which would form a reference cycle). `None` everywhere else.
     self_recurse: Option<(String, FunctionId, IrType)>,
     self_param_modes: Vec<ParamMode>,
+    mixed_async: Option<Rc<RefCell<Vec<MixedAsyncHandler>>>>,
 }
 
 /// The source definition that owns a local binding. Statement offsets are
@@ -1327,6 +1384,7 @@ impl<'a> FunctionLowerer<'a> {
             captures: HashMap::new(),
             self_recurse: None,
             self_param_modes: Vec::new(),
+            mixed_async: None,
         })
     }
 
@@ -4083,6 +4141,7 @@ impl<'a> FunctionLowerer<'a> {
             self.budget.clone(),
             span,
         )?;
+        child.mixed_async = self.mixed_async.clone();
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases;
         for param in &ir_params {
@@ -4205,15 +4264,40 @@ impl<'a> FunctionLowerer<'a> {
             self.budget.clone(),
             function.span,
         )?;
+        child.mixed_async = self.mixed_async.clone();
         child.captures = function_captures.iter().cloned().collect();
-        child.local_names = aliases;
+        child.local_names = aliases.clone();
         for param in &ir_params {
             child.locals.insert(param.name.clone(), param.ty.clone());
         }
         // Wire self-recursion: a call to `name` in the body reuses the running env.
         child.self_recurse = Some((name.clone(), cid, return_type.clone()));
         child.self_param_modes = ir_params.iter().map(|p| p.mode).collect();
-        child.lower_block_body("entry", &function.body, &function.params)?;
+        if let Some(handlers) = self.mixed_async.as_ref().filter(|_| function.is_async) {
+            let mut declaration = function.clone();
+            declaration.name = format!("__ku_closure_{}", cid.0);
+            let typed_captures = function_captures
+                .iter()
+                .map(|(field, ty)| {
+                    let source = aliases
+                        .iter()
+                        .find_map(|(source, alias)| (alias == field).then(|| source.clone()))
+                        .unwrap_or_else(|| field.clone());
+                    (source, field.clone(), ty.clone())
+                })
+                .collect();
+            handlers.borrow_mut().push(MixedAsyncHandler {
+                declaration,
+                captures: typed_captures,
+            });
+            child.lower_block_body(
+                "entry",
+                &async_signature_placeholder(function.span),
+                &function.params,
+            )?;
+        } else {
+            child.lower_block_body("entry", &function.body, &function.params)?;
+        }
 
         let param_modes = ir_params.iter().map(|p| p.mode).collect();
         self.lifted_functions.borrow_mut().push(IrFunction {

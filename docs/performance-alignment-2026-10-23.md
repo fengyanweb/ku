@@ -67,7 +67,7 @@ Mac 研发预检 7 轮配对，完整进程 CPU 成本均值比 0.880，95% boot
 
 PgResult.value_int直接检查owned字段span，严格int64 token，不复制字符串、不创建JSON树，保持原value方法和DISCARD ALL。10条相关回归通过，另1条实库opt-in明确未运行；27格式边界、11坏span／NULL等矩阵及close client后独立结果读取已验证。实际PG全链收益尚待比较，不能由少了分配次数直接推断CPU或内存目标达成。
 
-normal表保留各驱动原方式，单独reset-equivalent表才对Go/Rust增加同lease清理、2s原操作期限和250ms获取上限。两表不能混用，不能把对照的正常归池写成已有DISCARD隔离合同。当前PG仍由同步HTTP后台线程泵进非阻塞libpq，并未接入native Task owner WAIT。
+normal表保留各驱动原方式，单独reset-equivalent表才对Go/Rust增加同lease清理、2s原操作期限和250ms获取上限。两表不能混用，不能把对照的正常归池写成已有DISCARD隔离合同。257c882基线PG由同步HTTP后台线程泵进libpq；后续本地候选已将原共享PgClient捕获、query/reset和typed结果接入native Task owner WAIT，保留显式sync变体。该新路径的有限正确性验证见后文，正式性能尚未验收。
 
 ### 容量、固定存储与真实配置
 
@@ -145,3 +145,35 @@ Windows首次push的PG前置C构建达到原120秒测试期限，日志只有C�
 Copy初始化位单变量Linux对照已补：257c882→b1ada03，2核/1GiB/120rps，7轮按种子20261023交错、每窗10秒，各窗1200/1200正确、自然回收。完整CPU成本新/旧几何比0.972507，95%配对区间[0.968957,0.976101]，约降低2.75%。同轮稳态内存比1.01953 [1.00062,1.04687]、观测峰值1.01073 [0.98202,1.03978]，没有节省内存的证据。p99比1.04595 [0.99189,1.15457]，其中一个新候选窗口10.2ms，尾延迟非劣仍证据不足。所有原始轮次保留；这是单变量研发点，不满足正式每窗30秒规则，也不是吞吐容量或本轮数值目标通过。
 
 下一独立算术候选只改变GCC/Clang支持时的加减溢出判断，使用内建overflow flag写局部临时量，失败仍不改变输出，便携实现保留。Linux实际汇编由多段符号/界限分支变为adds/subs与溢出分支。11项相关回归通过（含两种实现、边界与输出别名、首错/清理），尚待单变量完整调用收益验证；不修改乘除余数、Task配额或时钟。
+
+
+## 新成本证据及可挂起 PG 候选
+
+b1ada03在Linux双核/1GiB、2000rps×8秒的九点JSON诊断中，各窗16000/16000正确。完整服务CPU/正确响应如下；这是带软件采样的短诊断，不是容量或正式配对结论。
+
+| JSON | Ku µs | Go µs | Rust µs | Ku/Go | Ku/Rust |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 对象 | 75.27575 | 73.32175 | 55.62625 | 1.027 | 1.353 |
+| 数字数组 | 79.95325 | 201.89550 | 56.62500 | 0.396 | 1.412 |
+| 转义文本 | 103.21131 | 128.45650 | 112.56788 | 0.803 | 0.917 |
+
+Ku三点的kernel self约53%—57%，Wake通知children约15%—18%；这不是这些成本全部可删除的证据。Go实际1.27.2 ELF走encoding/json/v2兼容入口，不能拿未编译的旧mapEncoder解释其数组成本。Ku读data形成一次owned副本，然后move进新envelope，不是两次整树复制；http.json仅编码一次，不重复复制已生成正文。暂停的通用复制/释放分析没有展开。
+
+针对实际热点新增两个独立候选：旧JSON writer的整数分支使用20字节栈缓冲，保留完整int64范围及原字节限制；旧parser的普通ASCII连续片段一次append，escape、C0、UTF8继续走原路径。二者不引入新JSON库、不改变默认实现；收益需各自A/B决定，不将少调用次数写成实测提升。
+
+通知候选的初版UDP合并经独立复核后未采用：发送端EAGAIN不保证接收端可读。Linux/macOS改用非阻塞pipe并合并pending，Windows保持原UDP且不合并。三处消费路径均在清除通知后扫描实际工作再poll；满pipe、两个清除交错边界、4并发producer及1000次实际poll唤醒/确认永久回归，在普通、ASan/UBSan、TSan构建通过。新增pending为owner栈存储，最多264B，不自动计入Task堆账本；pipe内核存储也不等于Task分配账本。正式HTTP回归与收益仍需最终候选确认。
+
+PG分段诊断使用独立instrumented C，2000rps×5秒，control、仅计数、完整时钟各10000测量响应正确。完整诊断对control CPU比1.1637，约16.37%开销，不能直接当生产精确成本或机械相减。含预热/prime的10400次阶段样本中：排队wall28.57µs；worker CPU68.86/wall250.19µs；acquire CPU0.57/wall4.00µs；getter三个合计CPU0.93µs；JSON CPU1.82µs；reset CPU22.84/wall83.01µs。send、wait、prepare和reset有嵌套包含关系，不能相加。现有证据不支持pool获取或getter是主要差距。
+
+Go/Rust的reset-equivalent私库测试各2项实际执行通过：同lease清除GUC/临时表，清理失败或取消后不复用未清会话，完整结果仍由调用方持有。它们与normal路径分表，尚未跑正式七轮。
+
+本地PG候选复用原池和NET_WAIT代次注册：查询/reset由owner分步推进，只有建连仍可能交后台线程；每轮materialize受64KiB/64 cells/32 protocol结果限制。通知锁内pin、锁外回调，pool capture在第一次query前已保活，物理job未结束不退款或释放。此类async闭包捕获的原client在作用域内禁止close/move/替换及间接close；使用原scope/env回收。不是为每个请求新建池，也不把libpq内存冒称为精确Task计费。
+
+PG有限实库链25/25正确、自然drain/exit0，覆盖timer后查询、中文emoji参数、257行、131083B字段、6并发、150ms操作超时后execution_unknown及后续重连、DISCARD清理GUC。另用pg_stat_activity先证明慢查询已active再发真实RST，随后账本归零、新query正确、自然退出；unknown_results增加1、confirmed_cancellations为0，不推断服务端回滚。PG三条永久回归在普通、ASan/UBSan、TSan均通过；macOS不支持LSan，不称其通过。完整端到端数据来自未冻结dirty源，仅作功能证据，不能替代最终性能矩阵。
+
+算术候选的第一轮Linux单变量实验在第四个control窗口出现68/1200超时而立即停止；前三对都完整正确，全部原始窗口保留，没有删除异常后计算有利区间。control侧异常不能当候选收益或回归结论，也尚不能唯一归因于环境。该窗Task poll总量符合原计算总量，未知500为0、最终自然退休；需要有效环境窗口才能完成此候选收益判定。后验桌面CPU/系统swap占用不是同期因果证明。
+
+
+纯标量检查地址候选只在已启用Copy缓存的纯片段中缓存phase地址；每个原checkpoint仍acquire-load实际phase，保留cleanup→phase→64预算次序，在一般/owned/host边界清空地址。入口原有host非空验证，移除该已解引用路径的重复host非空判断。独立b1 C变体的frame2静态指令3938→3684，14个ldar不减少；这只是指令证据，尚非时间收益。70项相关回归通过，包括第1—64状态分别取消、原32poll/1ms边界与owned/child清理。当前JSON19、HTTP JSON4、HTTP41、稀疏参数3均通过；全目标严格Clippy与格式检查通过。旧slot-renamer已显式遍历新PG/JSON操作的全部槽位，没有用通配忽略新操作。
+
+b1ada03远程CI：PR run39975648033必要任务全部通过；push39975641602有Windows真实PG依赖加压后的acquire_timeout恢复失败，以及macOS产物上传DNS ENOTFOUND。两个运行分别保留，不能把PR成功覆盖push失败或将上传错误写成编译失败。新候选仍需自己的完整SHA检查和实际安装产物验证。

@@ -2756,14 +2756,6 @@ fn write_native_c_to(
 ) -> Result<PathBuf, KuError> {
     let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
-    let mixed_http_tasks = !native_task_entry
-        && program
-            .items
-            .iter()
-            .any(|item| matches!(item, crate::ast::Item::Function(function) if function.is_async));
-    if !native_task_entry && !mixed_http_tasks {
-        reject_native_async(&program)?;
-    }
     Checker::new().check(&program).map_err(|err| {
         let id = err.diagnostic_id();
         if matches!(
@@ -2790,36 +2782,17 @@ fn write_native_c_to(
         // erased async flags. Unsupported source fails before artifact writes.
         let tasks = ir::task_lower::lower_program(&program)?;
         backend::c::generate_native_task_c_source(&tasks, &options)?
-    } else if mixed_http_tasks {
-        let tasks = ir::task_lower::lower_service_handlers(&program)?;
-        // Only the setup/signature side is synchronous. Real async bodies are
-        // compiled exactly once into verified Task frames above. These typed
-        // placeholders cannot run a body with its async marker erased.
-        let mut setup = program.clone();
-        for item in &mut setup.items {
-            if let crate::ast::Item::Function(function) = item {
-                if function.is_async {
-                    function.is_async = false;
-                    function.body = vec![crate::ast::Stmt::Fail {
-                        value: crate::ast::Expr::new(
-                            crate::ast::ExprKind::Literal(crate::ast::Literal::String(
-                                "async HTTP handlers must be registered with app.get/post/put/del"
-                                    .to_string(),
-                            )),
-                            function.span,
-                        ),
-                        span: function.span,
-                    }];
-                }
-            }
-        }
-        let lowered = ir::lower_program(&setup)?;
-        let optimized = ir::optimize_program(&lowered);
-        backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
     } else {
-        let lowered = ir::lower_program(&program)?;
+        // Preserve each async handler's real lexical capture cells before
+        // replacing its setup-side body with a fatal signature placeholder.
+        let (lowered, bindings) = ir::lower_mixed_http_setup(&program)?;
         let optimized = ir::optimize_program(&lowered);
-        backend::c::generate_c_source_with_options(&optimized, &options)?
+        if bindings.is_empty() {
+            backend::c::generate_c_source_with_options(&optimized, &options)?
+        } else {
+            let tasks = ir::task_lower::lower_bound_service_handlers(&program, &bindings)?;
+            backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
+        }
     };
     write_text_artifact(output, c_source)
 }
@@ -8110,13 +8083,6 @@ fn split_command_words(value: &str) -> Result<Vec<String>, &'static str> {
         words.push(current);
     }
     Ok(words)
-}
-
-fn reject_native_async(program: &Program) -> Result<(), KuError> {
-    reject_compiled_async(
-        program,
-        "native C prototype does not support async/await yet; use the interpreter runtime",
-    )
 }
 
 struct TempBuildDir {

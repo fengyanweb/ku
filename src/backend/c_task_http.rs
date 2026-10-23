@@ -5,7 +5,28 @@ use crate::{
     ir::task::{TaskProgram, TaskSlotType},
 };
 
-pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+pub(super) fn is_handler(function: &crate::ir::task::TaskFunction) -> bool {
+    if !matches!(&function.result,crate::ir::IrType::Result(inner) if crate::ir::task::http_response_type(inner))
+    {
+        return false;
+    }
+    let mut parameters = function.parameters.iter();
+    let first = parameters.next();
+    let capture = |slot: &crate::ir::task::SlotId| matches!(&function.slots[slot.0].ty,TaskSlotType::Value {ty,borrowed:false} if crate::ir::task::pg_capture_type(ty));
+    if let Some(first) = first {
+        let request = matches!(&function.slots[first.0].ty,TaskSlotType::Value {ty,borrowed:false} if crate::ir::task::http_request_type(ty));
+        if !request && !capture(first) {
+            return false;
+        }
+    }
+    parameters.all(capture)
+}
+
+pub(super) fn emit(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    program: &crate::ir::IrProgram,
+) -> KuResult<()> {
     out.check()?;
     let blocking = task::uses_blocking_io(tasks);
     out.push_str(
@@ -77,30 +98,60 @@ static uint32_t ku_http_task_net_dispatch(void* raw,size_t owner,size_t slot,uin
         {
             continue;
         }
-        if function.parameters.len()>1 || function.parameters.first().is_some_and(|slot|
-            !matches!(&function.slots[slot.0].ty,TaskSlotType::Value {ty,borrowed:false} if crate::ir::task::http_request_type(ty))) {
+        if !is_handler(function) {
             // A helper with another signature can still return a response;
             // only an actual registered handler receives a factory symbol.
             continue;
         }
         let id = function.id.0;
-        let argument = if function.parameters.is_empty() {
-            ""
+        let has_request=function.parameters.first().is_some_and(|slot| matches!(&function.slots[slot.0].ty,TaskSlotType::Value {ty,..} if crate::ir::task::http_request_type(ty)));
+        let mut argument = if has_request {
+            ",req".to_string()
         } else {
-            ",req"
+            String::new()
         };
+        let setup = program
+            .functions
+            .iter()
+            .find(|setup| setup.name == function.name)
+            .ok_or_else(|| super::unsupported("missing native async handler setup binding"))?;
+        if setup.captures.len() + usize::from(has_request) != function.parameters.len() {
+            return Err(super::unsupported(
+                "native async handler capture arity mismatch",
+            ));
+        }
+        let mut captures = String::new();
+        let mut capture_drops = String::new();
+        if !setup.captures.is_empty() {
+            captures.push_str(&format!("  if(!environment) {{ ku_drop_struct___ku_http_request(req); ku_http_task_handle_release(runtime,handle); return KU_TASK_DRIVER_INVALID_ARGUMENT; }}\n  KuEnv_{}* captured=(KuEnv_{}*)environment;\n",setup.id.0,setup.id.0));
+        }
+        for (index, (field, ty)) in setup.captures.iter().enumerate() {
+            if !matches!(ty,crate::ir::IrType::Cell(inner) if matches!(inner.as_ref(),crate::ir::IrType::Named(name) if name=="__ku_pg_client"))
+            {
+                return Err(super::unsupported(
+                    "unsupported native async handler capture",
+                ));
+            }
+            let field = super::c_ident(field);
+            captures.push_str(&format!("  KuTaskPgCapture capture_{index}={{0}};\n  if(!ku_task_pg_capture_acquire(captured->{field}->value,environment,deadline,&capture_{index})) {{\n{capture_drops}    ku_drop_struct___ku_http_request(req); ku_http_task_handle_release(runtime,handle); return KU_TASK_DRIVER_CLOSED;\n  }}\n"));
+            argument.push_str(&format!(",&capture_{index}"));
+            capture_drops.push_str(&format!("  ku_task_pg_capture_drop(&capture_{index});\n"));
+        }
         out.push_str(&format!(
             r#"
-static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,
+static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,void* environment,uint64_t deadline,
     KuStruct___ku_http_request* req,void** output) {{
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
   if(!runtime || !req || !output || *output || owner>=runtime->driver.workers_created)
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
   KuHttpTaskHandle* handle=ku_http_task_handle_acquire(runtime,owner);
   if(!handle) {{ ku_drop_struct___ku_http_request(req); return KU_TASK_DRIVER_LIMIT; }}
+  if(environment) {{ ((KuEnvHeader*)environment)->retain(environment); handle->environment=environment; }}
+{captures}
   size_t previous=ku_task_driver_entry_owner;
   ku_task_driver_entry_owner=owner+1u;
   uint32_t status=ku_task_{id}_start_value(&runtime->driver{argument},&handle->value);
+{capture_drops}
   ku_task_driver_entry_owner=previous;
   ku_drop_struct___ku_http_request(req);
   if(status!=KU_TASK_DRIVER_OK) {{ ku_http_task_handle_release(runtime,handle); return status; }}
@@ -137,6 +188,7 @@ typedef struct KuHttpTaskHandle {
   KuHttpFailure failure;
   size_t retained_bytes,owner;
   uint32_t used,finishing,cancelled;
+  void* environment;
 } KuHttpTaskHandle;
 typedef struct KuHttpTaskRuntime {
   KuTaskDriverV1 driver;
@@ -169,9 +221,13 @@ static KuHttpTaskHandle* ku_http_task_handle_acquire(KuHttpTaskRuntime* runtime,
 }
 static void ku_http_task_handle_release(KuHttpTaskRuntime* runtime,KuHttpTaskHandle* handle) {
   if(ku_task_driver_lock(&runtime->driver)) return;
+  void* environment=NULL;
   if(!handle->used || !runtime->active_handles) runtime->driver.fault=KU_TASK_DRIVER_INTERNAL;
-  else { runtime->active_handles--; memset(handle,0,sizeof(*handle)); }
+  else { runtime->active_handles--; environment=handle->environment; memset(handle,0,sizeof(*handle)); }
   ku_task_driver_unlock(&runtime->driver);
+  /* A physical retirement receipt precedes every release of a live handle.
+   * Frame cancellation may already have dropped its local capture token. */
+  if(environment) ((KuEnvHeader*)environment)->release(environment);
 }
 static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_limit,
     void* event_context,void(*event_wake)(void*,size_t),uint64_t startup_deadline) {

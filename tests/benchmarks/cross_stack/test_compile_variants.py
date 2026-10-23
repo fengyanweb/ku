@@ -51,17 +51,19 @@ class ProfileReceiptTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_output(path,value)
 
-    def test_expansion_preserves_legacy_and_only_changes_selected_handlers(self):
+    def test_expansion_preserves_default_async_identity_and_only_changes_selected_handlers(self):
         source=Path(__file__).with_name('ku').joinpath('server.ku').read_text()
-        legacy=source.replace('__PEER_PORT__','19191')
-        self.assertEqual(expand_ku_server(source,19191),legacy)
+        current=source.replace('__PEER_PORT__','19191')
+        self.assertEqual(expand_ku_server(source,19191),current)
+        self.assertIn('    async fn database(req: HttpRequest): HttpResponse! {',current)
+        self.assertEqual(current.count('result.value_int('),2)
         response=expand_ku_server(source,19191,json_mode='response')
         encode_body=lambda x:x.split('fn encode(',1)[1].split('async fn work(',1)[0]
         prefix='    decoded = json.decode(req.body)?\n    counter = decoded["counter"]?.as_int()?\n    data = decoded["data"]?\n'
         self.assertIn(prefix,encode_body(response))
         self.assertNotIn('json.encode(',encode_body(response))
         self.assertIn('return ok(http.json(',encode_body(response))
-        self.assertEqual(response.split('fn main():',1)[1],legacy.split('fn main():',1)[1])
+        self.assertEqual(response.split('fn main():',1)[1],current.split('fn main():',1)[1])
         direct=expand_ku_server(source,19191,'direct','response')
         self.assertIn('while (text.len() < 8)',direct)
         self.assertIn('async fn work_response(',direct)

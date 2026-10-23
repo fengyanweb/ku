@@ -375,12 +375,13 @@ fn generate_c_source_with_frames_bounded(
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
     let task_net = frames.is_some_and(|(tasks, _, _)| {
-        tasks.functions.iter().any(|function| {
-            function.slots.iter().any(|slot| {
-                matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
+        task::uses_postgres(tasks)
+            || tasks.functions.iter().any(|function| {
+                function.slots.iter().any(|slot| {
+                    matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
                     if crate::ir::task::local_net_type(ty))
+                })
             })
-        })
     });
     let task_bytes = task_net
         || frames.is_some_and(|(tasks, _, _)| {
@@ -391,6 +392,7 @@ fn generate_c_source_with_frames_bounded(
                 })
             })
         });
+    let task_json = frames.is_some_and(|(tasks, _, _)| task::uses_json(tasks));
     let task_fs = frames.is_some_and(|(tasks, _, _)| task::uses_blocking_fs(tasks));
     let task_native_tls = frames.is_some_and(|(tasks, _, _)| {
         tasks.functions.iter().any(|function| {
@@ -452,6 +454,12 @@ fn generate_c_source_with_frames_bounded(
         for payload in [IrType::Named("__ku_net_client".to_string()), IrType::Null] {
             collect_result_type(&IrType::Result(Box::new(payload)), &mut frame_result_types)?;
         }
+    }
+    if task_json {
+        collect_result_type(
+            &IrType::Result(Box::new(IrType::Named("__ku_value".into()))),
+            &mut frame_result_types,
+        )?;
     }
     for function in &program.functions {
         validate_cfg(function)?;
@@ -707,7 +715,7 @@ fn generate_c_source_with_frames_bounded(
     emit_object_abi(
         &mut out,
         program,
-        task_net,
+        task_net || task_json,
         options.object_oom_fault_injection,
     )?;
     // Object-valued typed arrays need KuObject/KuValue to be complete before
@@ -746,7 +754,7 @@ fn generate_c_source_with_frames_bounded(
     emit_string_slice_helper(&mut out, program)?;
     emit_object_result_helpers(&mut out, program)?;
     emit_closure_value_wrappers(&mut out, program)?;
-    if program_uses_object(program) {
+    if program_uses_object(program) || task_json {
         // JSON returns Result<str> and its typed writers borrow fully-defined
         // arrays/closures/results. Keep it after all of those ABI phases rather
         // than defining functions over incomplete forward declarations.
@@ -775,11 +783,10 @@ fn generate_c_source_with_frames_bounded(
             out.push_str("static void* ku_http_task_runtime_new(size_t,size_t,size_t,void*,void(*)(void*,size_t),uint64_t);\nstatic uint32_t ku_http_task_pump(void*,size_t,size_t,uint64_t*);\nstatic uint32_t ku_http_task_runtime_close(void*,uint64_t);\nstatic uint32_t ku_http_task_runtime_free(void*,uint64_t);\nstatic size_t ku_http_task_blocking_threads(size_t);\nstatic uint32_t ku_http_task_poll(void*,void**,int,uint64_t,KuStruct___ku_http_response*,size_t*);\nstatic void ku_http_task_metrics(void*,size_t,uint64_t*);\nstatic void ku_http_task_blocking_metrics(void*,uint64_t*);\nstatic int ku_http_task_owner_exited(void*,size_t);\n");
             let handlers = tasks.functions.iter().filter(|function| matches!(&function.result,
                 IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_http_response")))
-                .filter(|function| function.parameters.len() <= 1 && function.parameters.first().is_none_or(|slot| matches!(&function.slots[slot.0].ty,
-                    crate::ir::task::TaskSlotType::Value { ty: IrType::Named(name), borrowed: false } if name == "__ku_http_request")))
+                .filter(|function| task_http::is_handler(function))
                 .collect::<Vec<_>>();
             for function in &handlers {
-                out.push_str(&format!("static uint32_t ku_http_task_start_{}(void*,size_t,KuStruct___ku_http_request*,void**);\n",function.id.0));
+                out.push_str(&format!("static uint32_t ku_http_task_start_{}(void*,size_t,void*,uint64_t,KuStruct___ku_http_request*,void**);\n",function.id.0));
             }
             out.push_str("static void* ku_http_async_factory(void* invoke) {\n");
             for function in handlers {
@@ -817,7 +824,7 @@ fn generate_c_source_with_frames_bounded(
             entry.is_some() || program_uses_http(program),
         )?;
         if program_uses_http(program) {
-            task_http::emit(&mut out, frames)?;
+            task_http::emit(&mut out, frames, program)?;
         }
     }
     if let Some((frames, _, Some(entry))) = frames {
@@ -3601,6 +3608,7 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         // pg opaque handles are the raw libpq pointers; NULL means moved-out/closed.
         IrType::Named(name) if name == "__ku_pg_result" => Ok("KuPgResult*".to_string()),
         IrType::Named(name) if name == "__ku_pg_client" => Ok("KuPgClient*".to_string()),
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok("KuTaskPgCapture".to_string()),
         IrType::Named(name) if name == "__ku_redis_client" => Ok("KuRedisClient*".to_string()),
         IrType::Named(name) if name == "__ku_bytes" => Ok("KuBytes".to_string()),
         IrType::Named(name) if name == "__ku_net_client" => Ok("KuNetClient*".to_string()),
@@ -5796,8 +5804,16 @@ static bool ku_json_parse_string(
       return ku_json_fail(error, "parse_error", "control character in json string");
     }
     if (byte < 0x80) {
-      if (!ku_json_buffer_byte(&buffer, byte, KU_JSON_MAX_INPUT_BYTES,
-              error, "json string is too large")) {
+      /* Copy one ordinary ASCII run. Quotes, escapes, C0 and non-ASCII still
+         enter their original validation paths at the same input byte. */
+      const uint8_t* start = parser->current - 1;
+      while (parser->current < parser->end) {
+        uint8_t next = *parser->current;
+        if (next < 0x20 || next >= 0x80 || next == '"' || next == '\\') break;
+        parser->current++;
+      }
+      if (!ku_json_buffer_append(&buffer, start, (size_t)(parser->current - start),
+              KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
         ku_json_buffer_drop(&buffer);
         return false;
       }
@@ -6259,9 +6275,19 @@ static bool ku_json_write_value(
     case KU_NULL:
       return ku_json_write_bytes(output, "null", 4, error);
     case KU_INT: {
-      int len = snprintf(number, sizeof(number), "%lld", (long long)value.as.i);
-      return len > 0 && (size_t)len < sizeof(number)
-          && ku_json_write_bytes(output, number, (size_t)len, error);
+      /* At most 19 magnitude digits and one sign. Unsigned subtraction keeps
+         INT64_MIN representable without signed negation or extra allocation. */
+      char digits[20];
+      size_t start = sizeof(digits);
+      uint64_t magnitude = (uint64_t)value.as.i;
+      bool negative = value.as.i < 0;
+      if (negative) magnitude = UINT64_C(0) - magnitude;
+      do {
+        digits[--start] = (char)('0' + magnitude % UINT64_C(10));
+        magnitude /= UINT64_C(10);
+      } while (magnitude != 0);
+      if (negative) digits[--start] = '-';
+      return ku_json_write_bytes(output, digits + start, sizeof(digits) - start, error);
     }
     case KU_FLOAT: {
       if (!isfinite(value.as.f)) {
@@ -14877,9 +14903,49 @@ invalid_integer:
             "#define KU_PG_CLIENT_DEFAULT_CONNECT_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_ACQUIRE_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_QUERY_TIMEOUT_MS 30000LL\n",
-            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int finalizing; int connect_in_flight; int backoff_timer_armed; KuDatabaseReservation budget; };\n",
+            "typedef struct KuPgAsyncWaiter { struct KuPgAsyncWaiter* next; struct KuPgAsyncWaiter* previous; void (*wake)(void*); void* context; size_t in_flight; int linked, notified; } KuPgAsyncWaiter;\n",
+            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int finalizing; int connect_in_flight; int backoff_timer_armed; size_t async_operations, capture_pins; KuPgAsyncWaiter* async_head; KuPgAsyncWaiter* async_tail; KuDatabaseReservation budget; };\n",
             "static void ku_pg_client_dispose(KuPgClient* p);\n",
-            "static int ku_pg_client_take_dispose_locked(KuPgClient* p) { if (!p->closing || p->finalizing || p->active != 0 || p->waiters != 0) return 0; p->finalizing = 1; return 1; }\n",
+            "static int ku_pg_client_take_dispose_locked(KuPgClient* p) { if (!p->closing || p->finalizing || p->active != 0 || p->waiters != 0 || p->async_operations != 0 || p->capture_pins != 0) return 0; p->finalizing = 1; return 1; }\n",
+            r#"/* Pin notifications before releasing the pool lock. The stable job cannot
+ * retire until every pinned callback returns. Drain every batch, including a
+ * close with more than 64 waiters; no subsequent release is required. */
+static void ku_pg_client_signal_locked(KuPgClient* p, int all) {
+  if (all) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv);
+  size_t remaining=p->waiters;
+  while (remaining) {
+    KuPgAsyncWaiter* batch[64]; size_t count=0;
+    for (KuPgAsyncWaiter* node=p->async_head;node && count<64u && count<remaining;node=node->next) {
+      if (node->notified) continue;
+      node->notified=1; node->in_flight++; batch[count++]=node;
+    }
+    if (!count) break;
+    remaining-=count;
+    ku_pg_mutex_unlock(&p->lock);
+    for (size_t i=0;i<count;i++) batch[i]->wake(batch[i]->context);
+    ku_pg_mutex_lock(&p->lock);
+    for (size_t i=0;i<count;i++) batch[i]->in_flight--;
+  }
+}
+"#,
+            r#"/* The checked PG capture binding is immutable while registered. Retain
+ * the actual pool as well as its lexical cell before admitting a source Task. */
+static int ku_pg_client_capture_retain(KuPgClient* p) {
+  if(!p)return 0;
+  ku_pg_mutex_lock(&p->lock);
+  int retained=!p->closing && p->capture_pins!=SIZE_MAX;
+  if(retained)p->capture_pins++;
+  ku_pg_mutex_unlock(&p->lock);return retained;
+}
+static void ku_pg_client_capture_release(KuPgClient* p) {
+  if(!p)return;
+  ku_pg_mutex_lock(&p->lock);
+  if(!p->capture_pins) {ku_pg_mutex_unlock(&p->lock);abort();}
+  p->capture_pins--;int dispose=ku_pg_client_take_dispose_locked(p);
+  ku_pg_mutex_unlock(&p->lock);
+  if(dispose)ku_pg_client_dispose(p);
+}
+"#,
             "static unsigned long long ku_pg_client_saturating_add_ms(unsigned long long now, unsigned long long delay) { return ~0ULL - now < delay ? ~0ULL : now + delay; }\n",
             "static unsigned long long ku_pg_client_backoff_delay_ms(KuPgClient* p, unsigned long long now) {\n",
             "  uint32_t failures = p->consecutive_connect_failures; unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);\n",
@@ -14945,12 +15011,12 @@ invalid_integer:
             "}\n",
             "static void ku_pg_client_handoff_available_locked(KuPgClient* p) {\n",
             "  if (!p || p->waiters == 0) return;\n",
-            "  for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }\n",
             "  if (p->connect_in_flight || ku_pg_now_ms() < p->reconnect_not_before_ms) return;\n",
-            "  for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }\n",
             "}\n",
             "static void ku_pg_client_release_backoff_timer_locked(KuPgClient* p, int owned) {\n",
-            "  if (!owned) return; p->backoff_timer_armed = 0; if (p->waiters != 0) ku_pg_cond_signal(&p->cv);\n",
+            "  if (!owned) return; p->backoff_timer_armed = 0; if (p->waiters != 0) ku_pg_client_signal_locked(p,0);\n",
             "}\n",
             // Acquire a slot (blocking). Returns slot index and sets *out; on connect
             // failure returns -1 with a static structured error. A reserved slot has
@@ -14974,7 +15040,7 @@ invalid_integer:
             "    if (made >= 0) {\n",
             "      now = ku_pg_now_ms();\n",
             "      if (now >= deadline) {\n",
-            "        p->connect_in_flight = 0; p->in_use[made] = 0; p->active--; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        p->connect_in_flight = 0; p->in_use[made] = 0; p->active--; ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_unlock(&p->lock);\n",
@@ -14983,7 +15049,7 @@ invalid_integer:
             "      PGconn* h = connect_attempt.conn;\n",
             "      if (!h) {\n",
             "        KuError e = connect_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? (acquire_limited_connect ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1) : ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"timed out connecting a PostgreSQL client connection\", sizeof(\"timed out connecting a PostgreSQL client connection\") - 1)) : ku_pg_connect_failure_error());\n",
-            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = e; if (dispose) ku_pg_client_dispose(p); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_lock(&p->lock);\n",
@@ -14993,8 +15059,8 @@ invalid_integer:
                while holding the lock so an expired reservation is rolled back
                instead of being installed and used by the query pump. */
             "      int connect_expired = ku_pg_now_ms() >= deadline;\n",
-            "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
-            "      p->conns[made] = h; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "      p->conns[made] = h; ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "      *out = h; return made;\n",
             "    }\n",
             "    now = ku_pg_now_ms();\n",
@@ -15004,7 +15070,7 @@ invalid_integer:
             "    if (p->reconnect_not_before_ms > now && !p->backoff_timer_armed) { p->backoff_timer_armed = 1; owns_backoff_timer = 1; if (p->reconnect_not_before_ms < wait_deadline) wait_deadline = p->reconnect_not_before_ms; }\n",
             "    unsigned long long remaining = wait_deadline - now;\n",
             "    p->waiters++; int wait_result = ku_pg_cond_wait_ms(&p->cv, &p->lock, remaining); p->waiters--; ku_pg_client_release_backoff_timer_locked(p, owns_backoff_timer);\n",
-            "    if (p->closing) { int dispose = ku_pg_client_take_dispose_locked(p); ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "    if (p->closing) { int dispose = ku_pg_client_take_dispose_locked(p); ku_pg_client_signal_locked(p,1); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
             "    if (wait_result != 0) { now = ku_pg_now_ms(); if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
             "    has_waited = 1;\n",
             "  }\n",
@@ -15041,7 +15107,7 @@ invalid_integer:
             "  if ((broken || p->closing) && p->conns[slot]) { discard = p->conns[slot]; p->conns[slot] = 0; }\n",
             "  p->in_use[slot] = 0; if (p->active > 0) p->active--;\n",
             "  int dispose = ku_pg_client_take_dispose_locked(p);\n",
-            "  if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "  if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (discard) PQfinish(discard);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
@@ -15074,7 +15140,7 @@ invalid_integer:
             "  if (!p) return;\n",
             "  ku_pg_mutex_lock(&p->lock);\n",
             "  p->closing = 1; int dispose = ku_pg_client_take_dispose_locked(p);\n",
-            "  ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "  ku_pg_client_signal_locked(p,1); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
             "static KuPgClient* ku_move_pg_client(KuPgClient** p) { KuPgClient* m = *p; *p = 0; return m; }\n",
@@ -15082,6 +15148,8 @@ invalid_integer:
             "static KuPgClient* ku_clone_pg_client(KuPgClient* c) { (void)c; fprintf(stderr, \"cannot clone a pg client\\n\"); exit(1); }\n",
             "static uint8_t ku_pg_client_close(KuPgClient* p) { ku_pg_client_close_owned(p); return 0; }\n",
         ));
+        out.push_str("#define KU_TASK_PG 1\n");
+        out.push_str(include_str!("c_pg_async_runtime.c"));
     }
     out.push('\n');
 }
@@ -16629,6 +16697,9 @@ fn c_binary(op: BinaryOp) -> &'static str {
 /// `c_value_expr`; copy types return the place unchanged.
 fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => {
+            Ok(format!("ku_task_pg_capture_move(&{place})"))
+        }
         IrType::Str => Ok(format!("ku_string_move(&{place})")),
         IrType::Array(element) => Ok(format!(
             "ku_array_move_{}(&{place})",
@@ -16701,6 +16772,7 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
 
 fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok(format!("ku_task_pg_capture_drop(&{expression});")),
         IrType::Array(element) => Ok(format!(
             "ku_array_drop_{}(&{expression});",
             c_type_suffix(element)?
@@ -16785,6 +16857,7 @@ fn c_array_type(element: &IrType) -> KuResult<String> {
 
 fn c_type_suffix(ty: &IrType) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok("pg_capture".into()),
         IrType::Int => Ok("int".to_string()),
         IrType::Float => Ok("float".to_string()),
         IrType::Bool => Ok("bool".to_string()),

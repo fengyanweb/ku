@@ -642,7 +642,9 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero) {
 }
 int main(void) {
   CHECK(!fixture_case(0,0,0));
-  CHECK(!fixture_case(7u,0,0)); CHECK(!fixture_case(63u,0,0)); CHECK(!fixture_case(64u,0,0));
+  /* Publish at every original state position, including the last state in
+   * the quantum. A cached phase VALUE would incorrectly execute past it. */
+  for(size_t cancel_at=1u;cancel_at<=64u;cancel_at++) CHECK(!fixture_case(cancel_at,0,0));
   CHECK(!fixture_case(0,1,0)); CHECK(!fixture_case(0,0,1));
   puts("task-scalar-exact-quantum-cancel-errors-ok"); return 0;
 }
@@ -909,7 +911,7 @@ async fn main(): null! { return ok(null) }
         assert!(drive.contains(&flushed));
         // This runs immediately before generic dispatch clock/_check helpers,
         // non-pure host states and terminated cleanup inspect the real header.
-        let observed=format!("{flushed}  if (fixture_copy_seen) {{ if ((frame->header.initialized & UINT64_C({mask})) != (__ku_copy_initialized & UINT64_C({mask}))) abort(); fixture_copy_seen=0; fixture_copy_flushes[{id}]++; }}\n");
+        let observed=format!("{flushed}  if (__ku_scalar_phase) abort();\n  if (fixture_copy_seen) {{ if ((frame->header.initialized & UINT64_C({mask})) != (__ku_copy_initialized & UINT64_C({mask}))) abort(); fixture_copy_seen=0; fixture_copy_flushes[{id}]++; }}\n");
         drive = drive.replace(&flushed, &observed);
         generated.replace_range(begin..end, &drive);
         let begin = generated

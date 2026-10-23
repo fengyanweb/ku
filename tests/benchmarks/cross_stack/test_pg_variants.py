@@ -69,7 +69,7 @@ class PGVariantManifestTest(unittest.TestCase):
                 derive(original, root / "out", "reset")
 
 
-class KuPGReadVariantTest(unittest.TestCase):
+class KuPGExecutionVariantTest(unittest.TestCase):
     def setUp(self):
         self.source = (Path(__file__).parent / "ku/server.ku").read_text()
 
@@ -77,27 +77,49 @@ class KuPGReadVariantTest(unittest.TestCase):
         self.assertEqual(expand_ku_server(self.source, 12345),
                          self.source.replace("__PEER_PORT__", "12345"))
 
-    def test_integer_mode_changes_only_two_numeric_reads(self):
-        original = expand_ku_server(self.source, 12345)
-        candidate = expand_ku_server(self.source, 12345, pg_read="int")
-        restored = candidate.replace("key = result.value_int(0, 0)?",
-                                     "key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?")
+    def test_sync_changes_only_handler_execution_and_optional_numeric_reads(self):
+        candidate = expand_ku_server(self.source, 12345)
+        sync_int = expand_ku_server(self.source, 12345, pg_execution="sync")
+        restored_execution = sync_int.replace('    app.get("/db", fn(req) {',
+                                               "    async fn database(req: HttpRequest): HttpResponse! {")
+        restored_execution = restored_execution.replace('        return http.text(status, body)\n    })',
+                                                        '        return ok(http.text(status, body))\n    }\n    app.get("/db", database)')
+        self.assertEqual(restored_execution, candidate)
+        legacy = expand_ku_server(self.source, 12345, pg_read="value", pg_execution="sync")
+        restored = sync_int.replace("key = result.value_int(0, 0)?",
+                                    "key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?")
         restored = restored.replace("score = result.value_int(0, 2)?",
                                     "score_value = json.decode(result.value(0, 2)?)?\n            score = score_value.as_int()?")
-        self.assertEqual(restored, original)
+        self.assertEqual(restored, legacy)
+        self.assertIn('app.get("/db", database)', candidate)
+        self.assertIn('return ok(http.text(status, body))', candidate)
+        for text in (sync_int, legacy):
+            self.assertIn('app.get("/db", fn(req) {', text)
+            self.assertIn('return http.text(status, body)', text)
+        self.assertNotIn("value_int(", legacy)
         self.assertEqual(candidate.count("value_int("), 2)
         self.assertIn("label = result.value(0, 1)?", candidate)
+        for text in (candidate, sync_int, legacy):
+            self.assertIn('SELECT id,label,score FROM cross_stack_items WHERE id=$1', text)
+            self.assertIn('max_connections: 16, max_waiters: 128', text)
 
     def test_composes_with_direct_and_json_response_and_rejects_unknown(self):
-        combined = expand_ku_server(self.source, 12345, "direct", "response", "int")
+        combined = expand_ku_server(self.source, 12345, "direct", "response", "int", "async")
         self.assertIn("text = str(total)", combined)
         self.assertIn("return ok(http.json({id:", combined)
         self.assertEqual(combined.count("value_int("), 2)
         with self.assertRaises(ValueError):
             expand_ku_server(self.source, 12345, pg_read="auto")
+        with self.assertRaises(ValueError):
+            expand_ku_server(self.source, 12345, pg_execution="auto")
+        with self.assertRaisesRegex(ValueError, "sync-only"):
+            expand_ku_server(self.source, 12345, pg_read="value")
         with self.assertRaises(RuntimeError):
-            expand_ku_server(self.source.replace("key_value = json.decode", "key_value = other_decode"),
-                             12345, pg_read="int")
+            expand_ku_server(self.source.replace("key = result.value_int", "key = other_value_int"),
+                             12345)
+        with self.assertRaises(RuntimeError):
+            expand_ku_server(self.source.replace("async fn database", "async fn other_database"),
+                             12345)
 
 
 if __name__ == "__main__":

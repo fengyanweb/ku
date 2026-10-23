@@ -439,13 +439,15 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         .expect("client acquire after handoff")
         .0;
     assert!(handoff.contains("p->waiters == 0"));
-    assert!(handoff
-        .contains("if (p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }"));
+    assert!(handoff.contains(
+        "if (p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }"
+    ));
     assert!(handoff.contains(
         "if (p->connect_in_flight || ku_pg_now_ms() < p->reconnect_not_before_ms) return;"
     ));
-    assert!(handoff
-        .contains("if (!p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }"));
+    assert!(handoff.contains(
+        "if (!p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }"
+    ));
     let poison = generated
         .split_once("static void ku_pg_break_connection(")
         .expect("connection poison")
@@ -553,9 +555,7 @@ static int ku_test_pg_acquire_calls = 0;
     assert!(output.stderr.is_empty());
 }
 
-#[test]
-fn native_pg_query_poller_stub_covers_backpressure_deadlines_and_owned_cleanup() {
-    let directory = TempDir::new("query-harness");
+fn query_stub_harness(directory: &TempDir) -> String {
     let generated = emit_c(directory.path(), fixture());
     let hook = r#"
 #if defined(_WIN32)
@@ -637,6 +637,13 @@ static int ku_test_pg_index_calls = 0;
         );
     harness.push_str("\n#undef malloc\n#undef calloc\n#undef realloc\n#undef free\n");
     harness.push_str(QUERY_STUB);
+    harness
+}
+
+#[test]
+fn native_pg_query_poller_stub_covers_backpressure_deadlines_and_owned_cleanup() {
+    let directory = TempDir::new("query-harness");
+    let harness = query_stub_harness(&directory);
     let source = directory.path().join("query-poll-harness.c");
     fs::write(&source, harness).expect("write query poll C harness");
     let Some(executable) = compile_harness(directory.path(), &source, "query-poll-harness") else {
@@ -656,6 +663,106 @@ static int ku_test_pg_index_calls = 0;
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "pg query poll closed loop\n"
+    );
+}
+
+#[test]
+fn native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins() {
+    let directory = TempDir::new("async-query-pump");
+    let harness = query_stub_harness(&directory).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    ) + ASYNC_QUERY_SUITE;
+    let source = directory.path().join("async-query-pump.c");
+    fs::write(&source, harness).expect("write resumable PG harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "async-query-pump") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| panic!("resumable PG test exceeded process bounds: {error}"));
+    assert!(
+        output.status.success(),
+        "resumable PG harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async pump closed loop\n"
+    );
+}
+
+#[test]
+fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
+    let directory = TempDir::new("async-query-notification-pin");
+    let harness = query_stub_harness(&directory)
+        // The sequential lock-depth probe is not a cross-thread counter.
+        // Product mutexes, callback pins and barriers remain fully instrumented.
+        .replace("ku_test_pg_pool_lock_depth++;", "")
+        .replace("ku_test_pg_pool_lock_depth--;", "")
+        .replacen(
+            "int main(void) {",
+            "static int ku_legacy_query_tests(void) {",
+            1,
+        )
+        + NATIVE_THREAD_LIFECYCLE_HARNESS
+        + &ASYNC_QUERY_SUITE.replace(
+            "int main(void) {",
+            "static int ku_async_sequential_tests(void) {",
+        )
+        + ASYNC_NOTIFICATION_PIN_SUITE;
+    let source = directory.path().join("async-query-notification-pin.c");
+    fs::write(&source, harness).expect("write PG notification pin harness");
+    let Some(executable) =
+        compile_harness(directory.path(), &source, "async-query-notification-pin")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| {
+            panic!("PG notification pin test exceeded process bounds: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "PG notification pin harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async notification pin closed loop\n"
+    );
+}
+
+#[test]
+fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() {
+    let directory = TempDir::new("async-query-large-row");
+    let harness=query_stub_harness(&directory)
+        .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
+        .replacen("#define KU_PG_MAX_RESULT_BYTES 16ULL", "#define KU_PG_MAX_RESULT_BYTES 200000ULL", 1)
+        .replacen("enum {\n  T_OK", "static int async_large_fixture; static char async_large_data[131080];\nenum {\n  T_OK", 1)
+        .replacen("char* PQgetvalue(const PGresult* result, int row, int column) {", "char* PQgetvalue(const PGresult* result, int row, int column) { if(async_large_fixture)return async_large_data;", 1)
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_sequential_tests(void) {")
+        + ASYNC_LARGE_ROW_SUITE;
+    let source = directory.path().join("async-query-large-row.c");
+    fs::write(&source, harness).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &source, "async-query-large-row")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "large PG row harness failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async large row closed loop\n"
     );
 }
 
@@ -2081,5 +2188,134 @@ int main(void) {
   CHECK(!live_runtime_allocations && !runtime_bytes);
   puts("pg query poll closed loop");
   return 0;
+}
+"#;
+
+const ASYNC_QUERY_SUITE: &str = r#"
+typedef struct AsyncBudget {size_t bytes,peak;int reject,wakes;} AsyncBudget;
+static int async_reserve(void* context,size_t bytes) {
+  AsyncBudget* b=(AsyncBudget*)context;
+  if(b->reject)return 0;
+  if(bytes>SIZE_MAX-b->bytes)abort();b->bytes+=bytes;if(b->bytes>b->peak)b->peak=b->bytes;return 1;
+}
+static void async_refund(void* context,size_t bytes) {
+  AsyncBudget* b=(AsyncBudget*)context;if(bytes>b->bytes)abort();b->bytes-=bytes;
+}
+static void async_wake(void* context) {((AsyncBudget*)context)->wakes++;}
+static KuPgAsyncOp* async_create(KuPgClient* p,AsyncBudget* b) {
+  KuError e={0};KuPgAsyncOp* op=ku_pg_async_create(p,ku_string_static((const uint8_t*)"SELECT 3",8),
+      (KuArray_str){0},clock_ms+2000,(KuPgAsyncBudget){b,async_reserve,async_refund},async_wake,b,&e);
+  if(!op) {fprintf(stderr,"create failed: %.*s\n",(int)e.code.len,e.code.ptr);abort();}return op;
+}
+static int async_finish(KuPgAsyncOp* op,int cancel) {
+  for(size_t i=0;i<1024;i++) {
+    if(ku_pg_async_step(op,3u,clock_ms,cancel))return 1;
+    if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,cancel);
+  }
+  return 0;
+}
+static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
+  if(!ku_pg_async_can_dispose(op))abort();
+  KuResult_pg_result result=ku_pg_async_take(op);if(result.ok!=expected_ok)abort();
+  size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
+  ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client captured=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
+  CHECK(captured.ok && ku_pg_client_capture_retain(captured.value));
+  ku_pg_client_close_owned(captured.value);CHECK(captured.value->closing && captured.value->capture_pins==1);
+  AsyncBudget capture_budget={0};KuError capture_error={0};
+  KuPgAsyncOp* rejected=ku_pg_async_create(captured.value,ku_string_static((const uint8_t*)"SELECT 3",8),(KuArray_str){0},clock_ms+2000,
+      (KuPgAsyncBudget){&capture_budget,async_reserve,async_refund},async_wake,&capture_budget,&capture_error);
+  CHECK(!rejected && !capture_budget.bytes);CHECK(ku_string_equal(capture_error.code,ku_string_static((const uint8_t*)"client_closed",13)));
+  ku_error_drop(&capture_error);ku_pg_client_capture_release(captured.value);CHECK(live_connections==0);
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;AsyncBudget b={0};
+  int waits_before=both_waits+read_waits;
+  KuPgAsyncOp* op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok);
+  CHECK(both_waits+read_waits==waits_before);CHECK(reset_sends==1);CHECK(p->active==0 && p->waiters==0);
+  CHECK(op->output.value->rows==1);KuResult_str value=ku_pg_value(op->output.value,0,0);CHECK(value.ok && value.value.len);ku_string_drop(&value.value);
+  async_drop_output(op,&b,1);
+  mode_on_send=T_NULL_EMPTY_UTF8;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok && op->output.value->rows==2 && op->output.value->cols==3);
+  KuResult_bool absent=ku_pg_is_null(op->output.value,0,0);CHECK(absent.ok && absent.value);async_drop_output(op,&b,1);
+  mode_on_send=T_BAD_UTF8;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(!op->output.ok);async_drop_output(op,&b,0);
+  mode_on_send=T_BINARY;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(!op->output.ok);async_drop_output(op,&b,0);
+  mode_on_send=T_ERROR;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(!op->output.ok);async_drop_output(op,&b,0);
+  mode_on_send=T_OK;op=async_create(p,&b);b.reject=1;CHECK(async_finish(op,0));CHECK(!op->output.ok);b.reject=0;async_drop_output(op,&b,0);
+  mode_on_send=T_OK;op=async_create(p,&b);CHECK(async_finish(op,0));async_drop_output(op,&b,1);
+  mode_on_send=T_READ_TIMEOUT;op=async_create(p,&b);CHECK(!ku_pg_async_step(op,0,clock_ms,0));CHECK(op->sent && op->interest==1u);
+  CHECK(async_finish(op,1));CHECK(!op->output.ok);CHECK(ku_string_equal(op->output.error.code,ku_string_static((const uint8_t*)"execution_unknown",17)));
+  CHECK(p->active==0 && p->conns[0]==NULL);async_drop_output(op,&b,0);
+  mode_on_send=T_OK;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok);async_drop_output(op,&b,1);
+  reset_mode_on_send=T_FLUSH_FAIL;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok && !p->conns[0]);async_drop_output(op,&b,1);
+  reset_mode_on_send=T_RESTORE;op=async_create(p,&b);CHECK(async_finish(op,0));async_drop_output(op,&b,1);
+  /* More waiters than one notification batch, with close and no subsequent
+   * lease release to hide a dropped notification. Every pin must be drained. */
+  mode_on_send=T_READ_TIMEOUT;KuPgAsyncOp* held=async_create(p,&b);CHECK(!ku_pg_async_step(held,0,clock_ms,0));
+  KuPgAsyncOp* waiters[128];AsyncBudget budgets[128];memset(budgets,0,sizeof(budgets));
+  for(size_t i=0;i<128;i++){waiters[i]=async_create(p,&budgets[i]);CHECK(!ku_pg_async_step(waiters[i],0,clock_ms,0));CHECK(waiters[i]->waiting);}
+  CHECK(p->waiters==128 && p->async_operations==129);ku_pg_client_close_owned(p);
+  for(size_t i=0;i<128;i++){CHECK(budgets[i].wakes==1);CHECK(waiters[i]->waiter.in_flight==0);CHECK(async_finish(waiters[i],1));async_drop_output(waiters[i],&budgets[i],0);}
+  CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
+  CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
+  puts("pg async pump closed loop");return 0;
+}
+"#;
+
+const ASYNC_NOTIFICATION_PIN_SUITE: &str = r#"
+static KuTestEvent pin_entered,pin_release;
+static void pinned_wake(void* context) {
+  (void)context;
+  if(!ku_test_event_set(&pin_entered) || !ku_test_event_wait(&pin_release,5000))abort();
+}
+static int close_for_pin(void* context) {ku_pg_client_close_owned((KuPgClient*)context);return 0;}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
+  CHECK(ku_test_event_init(&pin_entered) && ku_test_event_init(&pin_release));
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;AsyncBudget held_budget={0},wait_budget={0};
+  KuPgAsyncOp* held=async_create(p,&held_budget);CHECK(!ku_pg_async_step(held,0,clock_ms,0));
+  KuPgAsyncOp* waiting=async_create(p,&wait_budget);waiting->waiter.wake=pinned_wake;
+  CHECK(!ku_pg_async_step(waiting,0,clock_ms,0));CHECK(waiting->waiting);
+  KuTestThread thread;CHECK(ku_test_thread_start(&thread,close_for_pin,p));
+  CHECK(ku_test_event_wait(&pin_entered,5000));
+  CHECK(ku_pg_async_step(waiting,0,clock_ms,1));
+  CHECK(!ku_pg_async_can_dispose(waiting));
+  ku_pg_mutex_lock(&p->lock);CHECK(!waiting->waiter.linked && waiting->waiter.in_flight==1 && p->async_operations==2);ku_pg_mutex_unlock(&p->lock);
+  CHECK(ku_test_event_set(&pin_release));CHECK(ku_test_thread_join(&thread,5000));
+  CHECK(ku_pg_async_can_dispose(waiting));async_drop_output(waiting,&wait_budget,0);
+  CHECK(async_finish(held,1));async_drop_output(held,&held_budget,0);
+  CHECK(ku_test_event_destroy(&pin_entered) && ku_test_event_destroy(&pin_release));
+  CHECK(live_connections==0 && live_results==0);
+  puts("pg async notification pin closed loop");return 0;
+}
+"#;
+
+const ASYNC_LARGE_ROW_SUITE: &str = r#"
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  memset(async_large_data,'x',131079);async_large_data[131079]=0;
+  memcpy(async_large_data+65535,"\xf0\x9f\x99\x82",4);
+  memcpy(async_large_data+131073,"\xe4\xb8\xad\xe6\x96\x87",6);
+  async_large_fixture=1;
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,8,1000,1000,2000);
+  CHECK(opened.ok);AsyncBudget b={0};KuPgAsyncOp* op=async_create(opened.value,&b);
+  size_t steps=0,copy_turns=0,validation_turns=0;
+  while(op->phase!=KU_PG_ASYNC_DONE && steps++<1024) {
+    size_t before=op->query.value?op->query.value->bytes_len:0;
+    int row_phase=op->row_phase;
+    (void)ku_pg_async_step(op,3u,clock_ms,0);
+    size_t after=op->query.value?op->query.value->bytes_len:before;
+    if(after>=before && after>before) {CHECK(after-before<=65536u);copy_turns++;}
+    if(row_phase==1)validation_turns++;
+  }
+  CHECK(op->phase==KU_PG_ASYNC_DONE && op->output.ok && steps>=8 && copy_turns>=2 && validation_turns>=2);
+  CHECK(op->output.value->rows==1 && op->output.value->bytes_len==131079);
+  KuResult_str value=ku_pg_value(op->output.value,0,0);CHECK(value.ok && value.value.len==131079);
+  CHECK(!memcmp(value.value.ptr,async_large_data,131079));ku_string_drop(&value.value);
+  async_drop_output(op,&b,1);ku_pg_client_close_owned(opened.value);
+  CHECK(live_connections==0 && live_results==0 && b.bytes==0);
+  puts("pg async large row closed loop");return 0;
 }
 "#;

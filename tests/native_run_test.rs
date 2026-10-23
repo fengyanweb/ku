@@ -4954,13 +4954,57 @@ fn native_kuvalue_function_equality_does_not_consume_closure() {
 #[test]
 fn native_json_array_roundtrip() {
     let dir = unique_temp_dir("json-arr");
+    let mut integers = vec![i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+    for exponent in 0..=18 {
+        let power = 10_i64.pow(exponent);
+        integers.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+    }
+    let mut state = 0x6b75_6a73_6f6e_696e_u64;
+    for _ in 0..128 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        integers.push(state as i64);
+    }
+    integers.sort_unstable();
+    integers.dedup();
+    let integer_text = format!(
+        "[{}]",
+        integers
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    fs::write(dir.join("integers.json"), integer_text).expect("write integer boundary cases");
     fs::write(
         dir.join("main.ku"),
-        "import json from \"std.json\"\n\nfn main(): null! {\n    println(json.stringify(json.parse(\"[1,2,3]\")?)?)\n    println(json.stringify(json.parse(\"[{\\\"a\\\":1},{\\\"a\\\":2}]\")?)?)\n    println(json.stringify(json.parse(\"[]\")?)?)\n    return ok(null)\n}\n",
+        r#"import {json, fs} from "std"
+
+fn main(): null! {
+    println(json.stringify(json.parse("[1,2,3]")?)?)
+    println(json.stringify(json.parse("[{\"a\":1},{\"a\":2}]")?)?)
+    println(json.stringify(json.parse("[]")?)?)
+    canonical = fs.read("integers.json")?
+    values = json.decode(canonical)?
+    if (json.encode(values)? != canonical || json.stringify(json.try_parse(json.stringify(values)?)?)? != canonical) {
+        panic("integer JSON token changed at a sign, digit or int64 boundary")
+    }
+    if (json.encode(json.decode("-0")?)? != "0") {
+        panic("integer negative zero must remain canonical zero")
+    }
+    typed = [0, -1, 9223372036854775807, -9223372036854775807 - 1]
+    if (json.encode(typed)? != "[0,-1,9223372036854775807,-9223372036854775808]") {
+        panic("typed integer array used a different JSON formatter")
+    }
+    return ok(null)
+}
+"#,
     )
     .expect("write main.ku");
 
     let Some(exe) = native_build(&dir, "main.ku", "jsonarr") else {
+        fs::remove_dir_all(&dir).ok();
         return;
     };
 
@@ -5278,6 +5322,14 @@ fn main(): null! {
     ExpectReject("\"\\uD83D\\u0041\"")?
     ExpectReject("\"\\uDE00\"")?
     ExpectReject("\"unterminated")?
+    prefix = ""
+    i = 0
+    while (i < 257) { prefix = prefix + "a"; i = i + 1 }
+    decoded = json.decode("\"" + prefix + "\\n你😀\\\"\\\\/tail\"")?
+    if (decoded.as_str()? != prefix + "\n你😀\"\\/tail") { panic("ascii run boundary") }
+    ExpectReject("\"" + prefix + "\\x\"")?
+    ExpectReject("\"" + prefix + "\n\"")?
+    ExpectReject("\"" + prefix + "")?
     return ok(null)
 }
 "#,
@@ -5419,6 +5471,11 @@ fn native_json_input_and_output_limits_are_hard_boundaries() {
     fs::write(dir.join("float-ok.txt"), vec![b'a'; 999_953]).expect("write float boundary payload");
     fs::write(dir.join("float-too-large.txt"), vec![b'a'; 999_954])
         .expect("write oversized float boundary payload");
+    // INT64_MIN occupies the complete 20-byte integer buffer; these objects
+    // have 44 bytes of syntax/number text, including its minus sign.
+    fs::write(dir.join("int-ok.txt"), vec![b'a'; 999_956]).expect("write integer boundary payload");
+    fs::write(dir.join("int-too-large.txt"), vec![b'a'; 999_957])
+        .expect("write oversized integer boundary payload");
     fs::write(
         dir.join("main.ku"),
         r#"import fs from "std.fs"
@@ -5434,6 +5491,12 @@ fn FloatOutputTooLarge(): null! {
     scale = 10000000000.0
     number = scale * scale
     json.encode({ number: number, padding: fs.read("float-too-large.txt")? })?
+    return ok(null)
+}
+
+fn IntegerOutputTooLarge(): null! {
+    number = -9223372036854775807 - 1
+    json.encode({ number: number, padding: fs.read("int-too-large.txt")? })?
     return ok(null)
 }
 
@@ -5465,6 +5528,21 @@ fn main(): null! {
     }
     if (!caught_float) {
         panic("float decimal marker exceeded the output limit")
+    }
+    minimum = -9223372036854775807 - 1
+    integer_text = json.encode({ number: minimum, padding: fs.read("int-ok.txt")? })?
+    if (integer_text.byte_len() != 1000000) {
+        panic("integer sign or digits were not included in output accounting")
+    }
+    json.decode(integer_text)?
+    caught_integer = false
+    try {
+        IntegerOutputTooLarge()?
+    } catch (err) {
+        caught_integer = err.domain == "json" && err.code == "stringify_error"
+    }
+    if (!caught_integer) {
+        panic("integer sign or digits exceeded the output limit")
     }
     return ok(null)
 }

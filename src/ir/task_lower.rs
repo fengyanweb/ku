@@ -55,6 +55,11 @@ fn primitive(ty: &TypeName) -> Option<IrType> {
         TypeName::Custom(name) if name == "HttpResponse" => {
             Some(IrType::Named("__ku_http_response".into()))
         }
+        // This spelling is synthesized only after checked capture-cell
+        // binding. It is not a public type or a general async reference.
+        TypeName::Custom(name) if name == "__KuPgCapture" => {
+            Some(IrType::Named("__ku_pg_capture".into()))
+        }
         _ => None,
     }
 }
@@ -95,7 +100,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -198,13 +203,22 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
 /// Async bodies used by the native HTTP service's synchronous setup/main.
 /// The normal checker runs on the complete source before this bounded split.
 pub fn lower_service_handlers(program: &Program) -> KuResult<TaskProgram> {
-    let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http");
-    let filtered = Program {
+    lower_bound_service_handlers(program, &[])
+}
+
+pub fn lower_bound_service_handlers(
+    program: &Program,
+    bindings: &[super::MixedAsyncHandler],
+) -> KuResult<TaskProgram> {
+    let supported = |name: &str| matches!(name, "time" | "fs" | "net" | "bytes" | "http" | "json");
+    let mut filtered = Program {
         items: program
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Function(function) if function.is_async => Some(item.clone()),
+                Item::Function(function) if function.is_async && bindings.is_empty() => {
+                    Some(item.clone())
+                }
                 Item::Module(module) if module.name.strip_prefix("std:").is_some_and(supported) => {
                     Some(item.clone())
                 }
@@ -232,6 +246,25 @@ pub fn lower_service_handlers(program: &Program) -> KuResult<TaskProgram> {
             })
             .collect(),
     };
+    for binding in bindings {
+        let mut declaration = binding.declaration.clone();
+        for (source, _, ty) in &binding.captures {
+            if !matches!(ty, IrType::Cell(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_client"))
+            {
+                return Err(unsupported(
+                    "native async HTTP captures other than a read-only PostgreSQL client",
+                    declaration.span,
+                ));
+            }
+            declaration.params.push(crate::ast::Param {
+                name: source.clone(),
+                mode: ParamMode::Owned,
+                ty: Some(TypeName::Custom("__KuPgCapture".into())),
+                span: declaration.span,
+            });
+        }
+        filtered.items.push(Item::Function(declaration));
+    }
     lower_program_impl(&filtered, false).map(|native| native.tasks)
 }
 
@@ -262,9 +295,22 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
     let mut std_net = false;
     let mut std_bytes = false;
     let mut std_http = false;
+    let mut std_json = false;
     for item in &program.items {
         budget.analysis(1, Span::default())?;
         match item {
+            Item::Module(module) if module.name == "std:json" => {
+                std_json = true;
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std.json"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind,ImportKind::Namespace(name) if name=="json")) =>
+            {
+                std_json = true;
+                continue;
+            }
             Item::Module(module) if module.name == "std:http" => {
                 std_http = true;
                 continue;
@@ -280,7 +326,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
             Item::Import(import)
                 if import.path == "std"
                     && matches!(&import.kind,ImportKind::Named(names)
-                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"))) =>
+                if names.iter().all(|name|name.alias.is_none() && matches!(name.source.as_str(),"time"|"fs"|"net"|"bytes"|"http"|"json"))) =>
             {
                 if let ImportKind::Named(names) = &import.kind {
                     for name in names {
@@ -290,6 +336,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                             "net" => std_net = true,
                             "bytes" => std_bytes = true,
                             "http" => std_http = true,
+                            "json" => std_json = true,
                             _ => {}
                         }
                     }
@@ -447,6 +494,7 @@ fn lower_program_impl(program: &Program, require_entry: bool) -> KuResult<Native
                 std_net,
                 std_bytes,
                 std_http,
+                std_json,
             )?
             .lower(declaration)?,
         );
@@ -463,6 +511,7 @@ struct FunctionLowerer<'a> {
     std_net: bool,
     std_bytes: bool,
     std_http: bool,
+    std_json: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
@@ -537,6 +586,7 @@ impl<'a> FunctionLowerer<'a> {
         std_net: bool,
         std_bytes: bool,
         std_http: bool,
+        std_json: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
@@ -546,6 +596,7 @@ impl<'a> FunctionLowerer<'a> {
             std_net,
             std_bytes,
             std_http,
+            std_json,
             budget,
             function: TaskFunction {
                 id: signature.id,
@@ -1446,6 +1497,22 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if matches!(&object.kind,ExprKind::Variable(module) if module=="json")
+            && matches!(name, "encode" | "stringify")
+            && self.std_json
+            && self.local("json").is_none()
+            && !self.signatures.contains_key("json")
+        {
+            return self.json_encode_literal(args, span, depth);
+        }
+        if let ExprKind::Variable(variable) = &object.kind {
+            if let Some(source) = self.local(variable) {
+                if matches!(&self.function.slots[source.0].ty, TaskSlotType::Value {ty,borrowed:false} if task::local_pg_type(ty))
+                {
+                    return self.pg_method(source, name, args, span, depth);
+                }
+            }
+        }
         if matches!(&object.kind,ExprKind::Variable(module) if module=="http")
             && self.std_http
             && self.local("http").is_none()
@@ -1645,6 +1712,163 @@ impl<'a> FunctionLowerer<'a> {
             return self.string_or_callable_method_expression(object, name, span, depth);
         }
         self.indirect_call(callee, args, span, depth)
+    }
+
+    fn pg_method(
+        &mut self,
+        source: SlotId,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let capture = matches!(&self.function.slots[source.0].ty, TaskSlotType::Value {ty,..} if task::pg_capture_type(ty));
+        if capture {
+            if name != "query" || args.len() != 2 || self.in_finally_body {
+                return Err(unsupported(
+                    "a PostgreSQL capture supports only query(sql,params) outside finally",
+                    span,
+                ));
+            }
+            let sql = self.expression(&args[0], depth + 1)?;
+            let params = self.direct_argument_expression(
+                &args[1],
+                &value_slot(IrType::Array(Box::new(IrType::Str))),
+                depth + 1,
+            )?;
+            if self.function.slots[sql.0].ty != value_slot(IrType::Str)
+                || self.function.slots[params.0].ty
+                    != value_slot(IrType::Array(Box::new(IrType::Str)))
+            {
+                return Err(unsupported(
+                    "PostgreSQL query requires SQL and string parameters",
+                    span,
+                ));
+            }
+            let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Named(
+                "__ku_pg_result".into(),
+            )))))?;
+            let poll = self.state(TaskTerminator::Terminate)?;
+            let ready = self.state(TaskTerminator::Terminate)?;
+            let cleanup = self.cleanup_state()?;
+            self.terminate(TaskTerminator::Jump { target: poll })?;
+            self.function.states[poll.0].terminator = TaskTerminator::PgQuery {
+                client: source,
+                sql,
+                params,
+                dst,
+                ready,
+                cleanup,
+            };
+            self.current = Some(ready);
+            if !matches!(args[0].kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: sql })?;
+            }
+            if !matches!(args[1].kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: params })?;
+            }
+            return Ok(dst);
+        }
+        let (operation, result) = match name {
+            "rows" => (task::TaskPgResultOperation::Rows, IrType::Int),
+            "cols" => (task::TaskPgResultOperation::Cols, IrType::Int),
+            "value" => (
+                task::TaskPgResultOperation::Value,
+                IrType::Result(Box::new(IrType::Str)),
+            ),
+            "value_int" => (
+                task::TaskPgResultOperation::ValueInt,
+                IrType::Result(Box::new(IrType::Int)),
+            ),
+            "is_null" => (
+                task::TaskPgResultOperation::IsNull,
+                IrType::Result(Box::new(IrType::Bool)),
+            ),
+            _ => return Err(unsupported("this PostgreSQL result method", span)),
+        };
+        let indexed = !matches!(
+            operation,
+            task::TaskPgResultOperation::Rows | task::TaskPgResultOperation::Cols
+        );
+        if args.len() != if indexed { 2 } else { 0 } {
+            return Err(unsupported("PostgreSQL result method argument count", span));
+        }
+        let row = if indexed {
+            Some(self.expression(&args[0], depth + 1)?)
+        } else {
+            None
+        };
+        let col = if indexed {
+            Some(self.expression(&args[1], depth + 1)?)
+        } else {
+            None
+        };
+        let dst = self.slot(value_slot(result))?;
+        self.emit(TaskOp::PgResult {
+            dst,
+            source,
+            row,
+            col,
+            operation,
+        })?;
+        Ok(dst)
+    }
+
+    fn json_encode_literal(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        let [argument] = args else {
+            return Err(unsupported("json.encode argument count", span));
+        };
+        let ExprKind::ObjectLiteral { fields } = &argument.kind else {
+            return Err(unsupported(
+                "Task JSON encoding other than a scalar object literal",
+                span,
+            ));
+        };
+        if fields.len() > 64 {
+            return Err(unsupported("more than 64 JSON literal fields", span));
+        }
+        self.budget.analysis(fields.len(), span)?;
+        let mut canonical = std::collections::BTreeMap::new();
+        let mut owners = Vec::new();
+        for (key, expression) in fields {
+            if canonical.contains_key(key) {
+                return Err(unsupported(
+                    "duplicate field in a JSON object literal",
+                    expression.span,
+                ));
+            }
+            self.budget.text(key.len(), expression.span)?;
+            // Freeze each value before evaluating the next expression. A
+            // literal still moves its owned fields, exactly like sync JSON;
+            // only the writer's later inspection is a read-only borrow.
+            let source = self.expression(expression, depth + 1)?;
+            if !matches!(
+                &self.function.slots[source.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Int | IrType::Bool | IrType::Null | IrType::Str,
+                    borrowed: false
+                }
+            ) {
+                return Err(unsupported(
+                    "Task JSON fields other than int/bool/null/str",
+                    expression.span,
+                ));
+            }
+            let value = self.copy_or_move(source)?;
+            if owned_value(&self.function.slots[value.0].ty) {
+                owners.push(value);
+            }
+            canonical.insert(key.clone(), value);
+        }
+        let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
+        self.emit(TaskOp::JsonEncodeObject {
+            dst,
+            fields: canonical.into_iter().collect(),
+        })?;
+        for slot in owners.into_iter().rev() {
+            self.emit(TaskOp::Drop { slot })?;
+        }
+        Ok(dst)
     }
 
     // Calls carry signatures, argument vectors and ownership temporaries. Do

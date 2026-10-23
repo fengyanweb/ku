@@ -60,13 +60,17 @@ def benchmark_stack_sources(directory):
             and not {"target", "node_modules", "__pycache__", ".git"}.intersection(path.relative_to(directory).parts)}
 
 
-def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="value"):
+def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="int", pg_execution="async"):
     if mode not in ("helpers", "direct"):
         raise ValueError("unknown Ku formatting mode")
     if json_mode not in ("text", "response"):
         raise ValueError("unknown Ku JSON response mode")
     if pg_read not in ("value", "int"):
         raise ValueError("unknown Ku PG result read mode")
+    if pg_execution not in ("async", "sync"):
+        raise ValueError("unknown Ku PG execution mode")
+    if pg_execution == "async" and pg_read != "int":
+        raise ValueError("async PG requires typed integer reads; legacy dynamic JSON reads are sync-only")
     if text.count("__PEER_PORT__") != 1:
         raise RuntimeError("expected exactly one fixed peer substitution in Ku source")
     original = "    return (await work_response(req, total))"
@@ -83,21 +87,30 @@ def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read=
         if text.count(original_json) != 1:
             raise RuntimeError("expected exactly one original JSON handler encode/response")
         text = text.replace(original_json, "    return ok(http.json({id: req.query.rid.clone(), counter: counter + 1, data: data}))")
-    if pg_read == "int":
-        for original_read, replacement in (
-            ("            key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?",
-             "            key = result.value_int(0, 0)?"),
-            ("            score_value = json.decode(result.value(0, 2)?)?\n            score = score_value.as_int()?",
-             "            score = result.value_int(0, 2)?"),
-        ):
-            if text.count(original_read) != 1:
-                raise RuntimeError("expected exactly one original PG numeric result conversion")
+    original_pg = "    async fn database(req: HttpRequest): HttpResponse! {"
+    if text.count(original_pg) != 1:
+        raise RuntimeError("expected exactly one public async PG handler")
+    original_pg_end = '        return ok(http.text(status, body))\n    }\n    app.get("/db", database)'
+    if text.count(original_pg_end) != 1:
+        raise RuntimeError("expected exactly one public async PG response/registration")
+    if pg_execution == "sync":
+        text = text.replace(original_pg, '    app.get("/db", fn(req) {')
+        text = text.replace(original_pg_end, '        return http.text(status, body)\n    })')
+    for original_read, replacement in (
+        ("            key = result.value_int(0, 0)?",
+         "            key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?"),
+        ("            score = result.value_int(0, 2)?",
+         "            score_value = json.decode(result.value(0, 2)?)?\n            score = score_value.as_int()?"),
+    ):
+        if text.count(original_read) != 1:
+            raise RuntimeError("expected exactly one typed PG numeric result read")
+        if pg_read == "value":
             text = text.replace(original_read, replacement)
     return text
 
 
 class Builder:
-    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE, ku_format="helpers", ku_json="text", ku_pg_read="value"):
+    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE, ku_format="helpers", ku_json="text", ku_pg_read="int", ku_pg_execution="async"):
         if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
             raise RuntimeError("build helper requires the actual ARM64 Linux benchmark guest")
         if os.geteuid() != uid or os.getegid() != gid:
@@ -139,6 +152,7 @@ class Builder:
         self.initial_hashes = identities(self.source)
         self.candidate, self.uid, self.gid = candidate, uid, gid
         self.ku_format, self.ku_json, self.ku_pg_read = ku_format, ku_json, ku_pg_read
+        self.ku_pg_execution = ku_pg_execution
         self.manifest_path = self.root / "manifest.json"
         self.manifest = json.loads(self.manifest_path.read_text()) if self.manifest_path.exists() else {}
         previous = self.manifest.get("candidate_base")
@@ -217,7 +231,7 @@ class Builder:
         source = self.benchmark / "ku/server.ku"
         text = source.read_text(encoding="utf-8")
         expanded = work / "server.ku"
-        expanded.write_text(expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read), encoding="utf-8")
+        expanded.write_text(expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read, self.ku_pg_execution), encoding="utf-8")
         batch = work / "batch.ku"
         shutil.copyfile(self.benchmark / "ku/batch.ku", batch)
         outputs = {}
@@ -262,9 +276,11 @@ class Builder:
                                                env={}, build=dict(cli=str(ku), cli_sha256=digest(ku),
                                                                   formatting_mode=self.ku_format,
                                                                   json_response_mode=self.ku_json,
+                                                                  pg_execution_mode=self.ku_pg_execution,
+                                                                  pg_execution_semantics="async uses public local named handler capturing the original shared pool; query/reset suspend on the existing Task reactor; sync is the separately identified bounded HTTP worker baseline; no SQL retries",
                                                                   pg_read_mode=self.ku_pg_read,
                                                                   pg_read_semantics="value preserves original string plus JSON numeric decode; int uses checked owned-result span getter for id/score only; SQL, label, DISCARD and JSON/text response unchanged",
-                                                                  json_response_semantics="text preserves original encode plus text response; response uses public http.json, decoded input and Result propagation unchanged; database route remains original text API",
+                                                                  json_response_semantics="text preserves original encode plus text response; response uses public http.json, decoded input and Result propagation unchanged; database route uses public http.text in both PG execution modes",
                                                                   original_server_source_sha256=digest(source),
                                                                   expanded_server_source_sha256=digest(expanded),
                                                                   formatting_semantics="helpers preserves original three formatting tasks; direct uses public str(int), same explicit eight-digit zero padding; user Task semantics unchanged",
@@ -461,12 +477,14 @@ def main():
                         help="helpers preserves legacy benchmark; direct requires a candidate CLI with public str(int), records separate source identity")
     parser.add_argument("--ku-json", choices=("text", "response"), default="text",
                         help="text preserves original JSON handler bytes; response uses public http.json, separately identified; database route remains text")
-    parser.add_argument("--ku-pg-read", choices=("value", "int"), default="value",
-                        help="value preserves original numeric JSON conversions; int uses checked result.value_int for id/score only, separately identified")
+    parser.add_argument("--ku-pg-execution", choices=("async", "sync"), default="async",
+                        help="async uses the public captured-pool Task path; sync preserves the bounded-worker baseline, separately identified")
+    parser.add_argument("--ku-pg-read", choices=("value", "int"), default="int",
+                        help="int uses checked result.value_int for id/score; value preserves legacy numeric JSON conversion and requires --ku-pg-execution sync")
     parser.add_argument("--only", nargs="+", choices=("ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"),
                         default=["ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"])
     args = parser.parse_args()
-    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate, args.ku_format, args.ku_json, args.ku_pg_read)
+    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate, args.ku_format, args.ku_json, args.ku_pg_read, args.ku_pg_execution)
     try:
         for item in args.only:
             print(f"building {item}", flush=True)

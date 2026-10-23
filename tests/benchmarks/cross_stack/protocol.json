@@ -280,11 +280,19 @@
   },
   "known_capability_differences": {
     "json_response_mime": {
-      "ku": "text/plain; charset=utf-8 via current native http.text; decoded/encoded body validated as JSON",
-      "go_rust_node": "application/json; charset=utf-8",
-      "claim": "body-equivalent business comparison; no claim of identical response-header API capability"
+      "ku_json_text_mode": "/json uses text/plain; charset=utf-8 via public http.text; historical/default text API column",
+      "ku_json_response_mode": "/json uses application/json; charset=utf-8 via public http.json; separately identified expanded source and ELF",
+      "ku_database": "/db uses text/plain; charset=utf-8 via public http.text in both async and sync PG execution modes; JSON body still validated",
+      "go_java_dotnet_cpp": "/json and /db use application/json; charset=utf-8",
+      "rust_node": "/json and /db use application/json without an explicit charset parameter",
+      "claim": "JSON business bodies are validated equivalently; response MIME differs by actual public API and stack; historical results keep their original protocol/source hashes"
     },
-    "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts."
+    "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts.",
+    "ku_pg_execution": {
+      "default": "async named local handler captures the original initialized PgClient; public query suspends through Task; integer getters plus old JSON writer",
+      "legacy_sync": "explicit --ku-pg-execution sync; --ku-pg-read value preserves string-to-JSON numeric decode, int isolates getter change",
+      "unchanged": "same SQL, shared pool size16, DISCARD ALL, absolute deadlines, no SQL retry, response status/body/MIME; modes have distinct source/C/ELF hashes"
+    }
   },
   "revision": 5
 }

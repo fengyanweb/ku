@@ -21,7 +21,7 @@ async fn ready(req: HttpRequest): HttpResponse! {
 }
 
 // Native async frames do not currently accept KuValue locals. JSON therefore
-// uses the existing bounded synchronous HTTP path, just like database handlers.
+// uses the existing bounded synchronous HTTP path; typed PG output is async.
 fn encode(req: HttpRequest): HttpResponse! {
     decoded = json.decode(req.body)?
     counter = decoded["counter"]?.as_int()?
@@ -98,25 +98,24 @@ fn main(): null! {
     app.get("/timer", timer)
     app.get("/wait", waiting)
     app.get("/tcp", network)
-    // The ordinary synchronous handler uses Ku's bounded HTTP background pool.
+    // Reuse this original pool through the public checked async capture path.
     // Database operations are never retried or replayed by this benchmark.
-    app.get("/db", fn(req) {
+    async fn database(req: HttpRequest): HttpResponse! {
         body = "database_error"
         status = 500
         try {
             result = client.query("SELECT id,label,score FROM cross_stack_items WHERE id=$1",
                 [req.query.key.clone()])?
             if (result.rows() != 1) { fail "database key missing" }
-            key_value = json.decode(result.value(0, 0)?)?
-            key = key_value.as_int()?
+            key = result.value_int(0, 0)?
             label = result.value(0, 1)?
-            score_value = json.decode(result.value(0, 2)?)?
-            score = score_value.as_int()?
+            score = result.value_int(0, 2)?
             body = json.encode({id: key, label: label, score: score, rid: req.query.rid.clone()})?
             status = 200
         } catch (error) { body = "database_error:" + error.code.clone() }
-        return http.text(status, body)
-    })
+        return ok(http.text(status, body))
+    }
+    app.get("/db", database)
     app.listen(address)?
     return ok(null)
 }

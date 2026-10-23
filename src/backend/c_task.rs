@@ -115,10 +115,30 @@ pub(super) fn uses_blocking_fs(tasks: &TaskProgram) -> bool {
 
 pub(super) fn uses_blocking_net(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            matches!(
+                state.terminator,
+                TaskTerminator::BlockingNet { .. } | TaskTerminator::PgQuery { .. }
+            )
+        })
+    })
+}
+pub(super) fn uses_postgres(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
         function
             .states
             .iter()
-            .any(|state| matches!(state.terminator, TaskTerminator::BlockingNet { .. }))
+            .any(|state| matches!(state.terminator, TaskTerminator::PgQuery { .. }))
+    })
+}
+pub(super) fn uses_json(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            state
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TaskOp::JsonEncodeObject { .. }))
+        })
     })
 }
 pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
@@ -176,6 +196,7 @@ pub(super) fn emit_frames(
         uses_blocking_fs(tasks),
         uses_blocking_read_dir(tasks),
         uses_blocking_net(tasks),
+        uses_postgres(tasks),
     )?;
     super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
@@ -288,6 +309,7 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::error_type(ty)
                             || crate::ir::task::local_bytes_type(ty)
                             || crate::ir::task::local_net_type(ty)
+                            || crate::ir::task::local_pg_type(ty)
                             || crate::ir::task::http_type(ty))
                         && !persistent.contains(&index)
                     {
@@ -330,7 +352,7 @@ impl<'a> FrameEmitter<'a> {
                                 | TaskTerminator::BlockingWrite { .. }
                                 | TaskTerminator::BlockingRead { .. } | TaskTerminator::BlockingReadDir { .. }
                                 | TaskTerminator::BlockingExists { .. }
-                                | TaskTerminator::BlockingNet { .. }
+                                | TaskTerminator::BlockingNet { .. } | TaskTerminator::PgQuery { .. }
                         ) || state
                             .operations
                             .iter()
@@ -516,6 +538,7 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::error_type(ty)
                         || crate::ir::task::local_bytes_type(ty)
                         || crate::ir::task::local_net_type(ty)
+                        || crate::ir::task::local_pg_type(ty)
                         || crate::ir::task::http_type(ty))
             }
         }
@@ -969,14 +992,30 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         // Exactly the old phase-before-quantum ordering and one unit per IR
         // state. Only externally observable exits materialize the state number.
         // Cleanup still reads its clock on every original dispatch boundary.
+        let (phase, budget) = if self.scalar_cache_active.get() {
+            // Pure operations cannot replace the host/control identity. Cache
+            // its address only until the next general/owned/host boundary;
+            // the atomic phase VALUE is still acquired at every checkpoint.
+            (
+                "if (!__ku_scalar_phase) __ku_scalar_phase=&((KuTaskAdapterHostV1*)clock->host)->control->phase;\nif (ku_task_control_atomic_load(__ku_scalar_phase)!=KU_TASK_CONTROL_LIVE)",
+                // Hosted resume validates host before drive, and this exact
+                // path already dereferences it for the preceding phase read.
+                "if (!__ku_dispatch_budget--)",
+            )
+        } else {
+            (
+                "if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE)",
+                "if (clock->host && !__ku_dispatch_budget--)",
+            )
+        };
         out.push_str(&format!(
             "ku_task_scalar_check_{state}:;\n\
              if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
-             if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) {{\n\
+             {phase} {{\n\
                frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
                frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
              }}\n\
-             if (clock->host && !__ku_dispatch_budget--) {{\n\
+             {budget} {{\n\
                frame->header.state={state}u;\n\
                KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
                ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
@@ -988,6 +1027,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     fn emit_scalar_init_flush(&self, out: &mut COutput) {
         if self.scalar_cache_active.get() {
             let mask = self.scalar_cache_mask.get();
+            out.push_str("  __ku_scalar_phase=NULL;\n");
             // Merge only Copy bits. Owned/Task publications may have changed
             // the other header bits since this pure segment began.
             out.push_str(&format!(
@@ -1068,7 +1108,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             out.push_str("  size_t __ku_dispatch_budget=64u;\n  int __ku_charge_unchanged=1;\n");
         }
         if self.scalar_cache_active.get() {
-            out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n");
+            out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
         }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
@@ -1400,6 +1440,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         );
                         out.push_str(&format!("  {}=0;\n", self.place(*dst)));
                     }
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
+                TaskTerminator::PgQuery {
+                    client,
+                    sql,
+                    params,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t pg_status=ku_task_host_pg_query((KuTaskAdapterHostV1*)clock->host,{},{},{},&{});\n  if (pg_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (pg_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*client),self.place(*sql),self.place(*params),self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
@@ -1971,6 +2027,64 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 }
                 self.set_init(out, *dst, true);
             }
+            TaskOp::PgResult {
+                dst,
+                source,
+                row,
+                col,
+                operation,
+            } => {
+                use crate::ir::task::TaskPgResultOperation as Pg;
+                let source = self.place(*source);
+                let call = match operation {
+                    Pg::Rows => format!("ku_pg_rows({source})"),
+                    Pg::Cols => format!("ku_pg_cols({source})"),
+                    Pg::Value => format!(
+                        "ku_task_host_pg_value((KuTaskAdapterHostV1*)clock->host,{source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                    Pg::ValueInt => format!(
+                        "ku_pg_value_int({source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                    Pg::IsNull => format!(
+                        "ku_pg_is_null({source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                };
+                out.push_str(&format!("  {}={call};\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::JsonEncodeObject { dst, fields } => {
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                for (key, slot) in fields {
+                    keys.push(c_static_utf8_string(key));
+                    let wrapper = match self.slot_type(*slot)? {
+                        IrType::Int => "ku_v_int",
+                        IrType::Bool => "ku_v_bool",
+                        IrType::Str => "ku_v_str",
+                        IrType::Null => "ku_v_null",
+                        _ => return Err(unsupported("Task JSON field type")),
+                    };
+                    values.push(if wrapper == "ku_v_null" {
+                        "ku_v_null()".into()
+                    } else {
+                        format!("{wrapper}({})", self.place(*slot))
+                    });
+                }
+                let call = if fields.is_empty() {
+                    "ku_task_host_json_object((KuTaskAdapterHostV1*)clock->host,NULL,NULL,0u)"
+                        .to_string()
+                } else {
+                    format!("ku_task_host_json_object((KuTaskAdapterHostV1*)clock->host,(KuString[]){{{}}},(KuValue[]){{{}}},{}u)",keys.join(","),values.join(","),fields.len())
+                };
+                out.push_str(&format!("  {}={call};\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
             TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                 self.emit_slot_drop(out, *slot)?;
             }
@@ -2341,6 +2455,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         || crate::ir::task::local_bytes_type(ty)
         || crate::ir::task::local_net_type(ty)
         || crate::ir::task::http_type(ty)
+        || crate::ir::task::local_pg_type(ty)
     {
         return Ok(());
     }
@@ -2355,7 +2470,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {
@@ -2379,6 +2494,14 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+    if matches!(ty, IrType::Named(name) if name == "__ku_pg_result") {
+        return Ok(format!("({place}) == NULL"));
+    }
+    if crate::ir::task::pg_capture_type(ty) {
+        return Ok(format!(
+            "!({place}).client && !({place}).env && !({place}).deadline"
+        ));
+    }
     if crate::ir::task::http_response_type(ty) {
         let leaves = ["content_type", "body", "location"]
             .iter()

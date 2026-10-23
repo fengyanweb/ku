@@ -9,6 +9,64 @@ use ku::{backend::c, checker::Checker, ir, lexer::Lexer, parser::Parser};
 use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
 use std::{fs, process::Command};
 
+#[test]
+fn native_http_pg_capture_cannot_be_closed_or_moved_while_an_async_handler_is_registered() {
+    let template = r#"
+import {http, time} from "std"
+import pg from "std.pg"
+fn main(): null! {
+    client = pg.client({conninfo:"hostaddr=127.0.0.1",max_connections:1})?
+    async fn database(req:HttpRequest):HttpResponse! {
+        time.sleep(10)?
+        result = client.query("SELECT $1::text",[req.query.key.clone()])?
+        return ok(http.text(result.value(0,0)?))
+    }
+    __HELPER__
+    app = http.server()
+    app.get("/db",database)
+    probe = client.query("SELECT 1",[])?
+    if (probe.rows() != 1) { fail "ordinary pooled query failed" }
+    __OTHER_OPERATION__
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#;
+    ku::cli::check_source(
+        "pg-capture-close-baseline.ku",
+        &template
+            .replace("__OTHER_OPERATION__", "")
+            .replace("__HELPER__", ""),
+    )
+    .unwrap();
+    for (label, operation) in [
+        (
+            "sibling-close",
+            "app.get(\"/close\",fn(){client.close() return http.text(\"closed\")})",
+        ),
+        ("owner-close", "client.close()"),
+        ("owner-move", "moved = client moved.close()"),
+        (
+            "indirect-close",
+            "app.get(\"/close\",fn(){close_client() return http.text(\"closed\")})",
+        ),
+    ] {
+        let helper = if label == "indirect-close" {
+            "fn close_client(): null { client.close() return null }"
+        } else {
+            ""
+        };
+        let source = template
+            .replace("__OTHER_OPERATION__", operation)
+            .replace("__HELPER__", helper);
+        let error = ku::cli::check_source("pg-capture-close.ku", &source).unwrap_err();
+        assert!(
+            error.message.contains("captur") || error.message.contains("shared"),
+            "{label}: {error}"
+        );
+        eprintln!("{label}: {}", error.message);
+    }
+}
+
 fn parsed(source: &str) -> ku::ast::Program {
     let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
@@ -37,6 +95,7 @@ fn main(): null! {
     app.listen("127.0.0.1:0")?
     return ok(null)
 }
+
 "#;
     let ast = parsed(source);
     Checker::new().check(&ast).unwrap();
@@ -125,7 +184,7 @@ int main(void) {
   runtime->driver.byte_limit=baseline+sizeof(KuTaskInstance_0)-1u;
   ku_task_driver_unlock(&runtime->driver);
   KuStruct___ku_http_request request={0};void* task=NULL;
-  uint32_t status=ku_http_task_start_0(runtime,0u,&request,&task);
+  uint32_t status=ku_http_task_start_0(runtime,0u,NULL,deadline,&request,&task);
   fprintf(stderr,"root_byte_admission_status=%u task_published=%d resident=%zu\n",status,task!=NULL,runtime->driver.resident);
   CHECK(status==KU_TASK_DRIVER_LIMIT && !task && !runtime->active_handles);
   uint64_t budget[9]={0};ku_http_task_driver_budget(runtime,budget);
@@ -136,7 +195,7 @@ int main(void) {
    * publishing a child. A rejected root must not change any held receipt. */
   KuTaskDriverTicketV1 tickets[1024]={0};
   for(size_t i=0;i<1024u;i++)CHECK(ku_task_driver_reserve(&runtime->driver,1u,&tickets[i])==KU_TASK_DRIVER_OK);
-  status=ku_http_task_start_0(runtime,0u,&request,&task);
+  status=ku_http_task_start_0(runtime,0u,NULL,deadline,&request,&task);
   CHECK(status==KU_TASK_DRIVER_LIMIT && !task && !runtime->active_handles);
   ku_http_task_driver_budget(runtime,budget);
   CHECK(budget[1]==1024u && budget[7]==1u && budget[8]==1u);
@@ -170,4 +229,125 @@ int main(void) {
         String::from_utf8_lossy(&output.stdout).trim(),
         "http-root-admission-ok"
     );
+}
+
+#[test]
+fn native_http_local_async_pg_capture_uses_the_existing_cell_and_typed_result() {
+    let source = r#"
+import {http, time} from "std"
+import pg from "std.pg"
+fn main(): null! {
+    client = pg.client({conninfo: "hostaddr=127.0.0.1", max_connections: 1})?
+    async fn database(req: HttpRequest): HttpResponse! {
+        params = [req.query.key.clone()]
+        result = client.query("SELECT id,label FROM items WHERE id=$1", params)?
+        count = result.rows()
+        columns = result.cols()
+        number = result.value_int(0, 0)?
+        label = result.value(0, 1)?
+        missing = result.is_null(0, 1)?
+        time.sleep(1)?
+        if (count != 1 || columns != 2 || missing || params.len() != 1) { fail "invalid row" }
+        return ok(http.text(str(number) + ":" + label))
+    }
+    app = http.server()
+    app.get("/db", database)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#;
+    let mut ast = parsed(source);
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:pg".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let (setup, bindings) = ir::lower_mixed_http_setup(&ast).unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].captures.len(), 1);
+    let tasks = ir::task_lower::lower_bound_service_handlers(&ast, &bindings).unwrap();
+    let plan = ir::task::verify_and_plan(&tasks, Default::default()).unwrap();
+    let handler = &tasks.functions[0];
+    assert_eq!(handler.parameters.len(), 2);
+    assert_eq!(
+        handler
+            .states
+            .iter()
+            .filter(|state| matches!(state.terminator, ir::task::TaskTerminator::PgQuery { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        handler
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|operation| matches!(operation, ir::task::TaskOp::PgResult { .. }))
+            .count(),
+        5
+    );
+    let capture = handler.parameters[1];
+    assert!(plan.functions[0].slots.contains(&capture));
+    let generated = c::generate_mixed_http_c_source(&setup, &tasks, &Default::default()).unwrap();
+    assert!(generated.contains("ku_task_host_pg_query("));
+    assert!(generated.contains("ku_task_blocking_submit_pg("));
+    assert!(generated.contains("KuTaskPgCapture capture_0="));
+    assert!(generated.contains("handle->environment=environment"));
+    assert!(generated.contains("ku_task_pg_capture_drop(&frame->s_"));
+    assert!(!generated.contains("ku_clone_pg_client(captured"));
+    // The captured pool cannot be moved into another logical owner.
+    let mut invalid = tasks.clone();
+    invalid.functions[0].states[handler.entry.0]
+        .operations
+        .insert(
+            0,
+            ir::task::TaskOp::Move {
+                dst: ir::task::SlotId(handler.slots.len()),
+                src: capture,
+            },
+        );
+    invalid.functions[0]
+        .slots
+        .push(handler.slots[capture.0].clone());
+    assert!(ir::task::verify_and_plan(&invalid, Default::default())
+        .unwrap_err()
+        .message
+        .contains("capture is read-only"));
+    // The ordinary source checker retains its existing captured-close rule.
+    let invalid = source.replacen(
+        "params = [req.query.key.clone()]",
+        "client.close()\nparams = [req.query.key.clone()]",
+        1,
+    );
+    let mut invalid = parsed(&invalid);
+    invalid.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:pg".into(),
+            span: Default::default(),
+        }),
+    );
+    assert!(Checker::new().check(&invalid).is_err());
+    // Compile and link the actual bridge when development libpq is available;
+    // this performs no connection and never runs the generated setup function.
+    let mut discovery = Command::new("pg_config");
+    discovery.arg("--libdir");
+    if let Ok(found) = run_bounded(&mut discovery, RUN_TIMEOUT, RUN_LIMITS) {
+        if found.status.success() {
+            let libdir = std::path::PathBuf::from(String::from_utf8(found.stdout).unwrap().trim());
+            let directory = TempDir::new("async-pg-bridge-link");
+            let path = directory.path().join("async-pg.c");
+            fs::write(&path, &generated).unwrap();
+            assert!(native_harness::compile_harness_with_libpq(
+                directory.path(),
+                &path,
+                "async-pg",
+                &libdir
+            )
+            .is_some());
+        }
+    }
 }

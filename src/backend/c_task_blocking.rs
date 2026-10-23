@@ -10,6 +10,7 @@ pub(super) fn emit(
     files: bool,
     directory: bool,
     network: bool,
+    postgres: bool,
 ) -> KuResult<()> {
     out.push_str(TOKEN);
     if enabled {
@@ -28,7 +29,15 @@ pub(super) fn emit(
         } else {
             "#define KU_TASK_BLOCKING_DIRECTORY 0\n"
         });
+        out.push_str(if postgres {
+            "#define KU_TASK_BLOCKING_PG 1\n"
+        } else {
+            "#define KU_TASK_BLOCKING_PG 0\n"
+        });
         out.push_str(RUNTIME);
+        if postgres {
+            out.push_str(include_str!("c_task_pg_runtime.c"));
+        }
         if network {
             out.push_str(NETWORK_RUNTIME);
             out.push_str(include_str!("c_task_reactor.h"));
@@ -77,6 +86,12 @@ typedef struct KuTaskBlockingJobV1 {
   KuResult_array_str directory_result;
 #endif
   bool exists_value;
+#if KU_TASK_BLOCKING_PG
+  KuPgAsyncOp* pg_operation;
+  KuTaskBlockingPoolV1* pg_pool;
+  KuResult_pg_result pg_result;
+  uint32_t pg_ready;
+#endif
 #if KU_TASK_BLOCKING_NETWORK
   KuValue net_config[9];
   uint16_t net_present;
@@ -375,6 +390,9 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
 }
 #endif
 
+#if KU_TASK_BLOCKING_PG
+static void ku_task_pg_connect_run(KuTaskBlockingJobV1* job,int cancelled);
+#endif
 static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
   KuTaskBlockingPoolV1* pool=worker->pool;
   if (ku_task_blocking_lock(pool)) return;
@@ -412,6 +430,10 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     KuFsAllocatorV1 allocator={&allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
 #endif
     bool ok=false,exists_value=false;
+#if KU_TASK_BLOCKING_PG
+    if (kind==9u) ku_task_pg_connect_run(job,cancelled);
+    else
+#endif
 #if KU_TASK_BLOCKING_NETWORK
     if (kind>=5u) ku_task_blocking_net_run(job,cancelled,&allocation);
     else
@@ -467,6 +489,9 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     job->exists_value=exists_value;
 #if KU_TASK_BLOCKING_NETWORK
     if(ku_task_blocking_net_state_locked(pool,job,
+#if KU_TASK_BLOCKING_PG
+        job->kind==9u ||
+#endif
         job->net_resolved ? KU_TASK_BLOCKING_NET_WAIT : KU_TASK_BLOCKING_DONE)!=KU_TASK_DRIVER_OK)
       job->state=KU_TASK_BLOCKING_DONE;
 #else
@@ -746,6 +771,14 @@ static uint32_t ku_task_blocking_reconcile_charge(const KuTaskDriverTicketV1* ti
  * Its driver obligation remains until the sole executor consumes DONE. */
 static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job,size_t index) {
   job->cancelled=1;
+#if KU_TASK_BLOCKING_PG
+  if(job->kind==9u) {
+    job->pg_ready=1;
+    if(job->state!=KU_TASK_BLOCKING_QUEUED)return KU_TASK_DRIVER_OK;
+    /* A queued connect has no physical worker reference and can be detached
+     * below. A running resolver keeps the original physical retirement rule. */
+  }
+#endif
   if(job->state!=KU_TASK_BLOCKING_QUEUED)return KU_TASK_DRIVER_OK;
   size_t offset=0;
   while(offset<pool->queued && pool->ring[(pool->head+offset)%pool->capacity]!=index)offset++;
@@ -753,6 +786,15 @@ static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTask
   for(size_t i=offset;i+1u<pool->queued;i++)
     pool->ring[(pool->head+i)%pool->capacity]=pool->ring[(pool->head+i+1u)%pool->capacity];
   pool->queued--;
+#if KU_TASK_BLOCKING_PG
+  if(job->kind==9u) {
+    job->pg_operation->connected=(KuPgConnectAttempt){NULL,KU_PG_CONNECT_TIMED_OUT};
+    job->pg_operation->connect_ready=1;
+    uint32_t status=ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT);
+    if(status==KU_TASK_DRIVER_OK)status=ku_task_driver_wake(&job->ticket);
+    ku_task_blocking_signal(pool);return status;
+  }
+#endif
   ku_task_blocking_free(job->path);job->path=NULL;
   ku_task_blocking_free(job->content.ptr);job->content=(KuString){0};
   KuError error=ku_task_blocking_error("cancelled","queued operation was cancelled before execution");
@@ -819,6 +861,11 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
         pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_unlock(pool); return status;
       }
       if (kind==2u) {
+#if KU_TASK_BLOCKING_PG
+        if (job->kind==9u) {
+          if(job->pg_result.ok)ku_drop_pg_result(&job->pg_result.value);else ku_error_drop(&job->pg_result.error);
+        } else
+#endif
 #if KU_TASK_BLOCKING_NETWORK
         if (job->kind>=5u) {
           ku_drop_net_client(&job->net_client);
@@ -834,6 +881,9 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
         if (job->kind==1u) ku_result_drop_str(&job->read_result);
         else ku_result_drop_null(&job->result);
       }
+#if KU_TASK_BLOCKING_PG
+      else if (kind==9u) *(KuResult_pg_result*)output=job->pg_result;
+#endif
 #if KU_TASK_BLOCKING_DIRECTORY
       else if (kind==4u) *(KuResult_array_str*)output=job->directory_result;
 #endif

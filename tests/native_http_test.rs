@@ -4104,6 +4104,146 @@ int main(void) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("macos-zero-poll-ok"));
 }
 
+#[cfg(unix)]
+#[test]
+fn native_http_wake_coalesces_without_losing_work_at_clear_or_concurrent_publication() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let start = runtime
+        .find("typedef struct {\n  KuHttpSocket read_socket;")
+        .unwrap();
+    let end = runtime[start..]
+        .find("/* Payload/request-map quota")
+        .unwrap()
+        + start;
+    let wake = runtime[start..end].replace(
+        "  (void)ku_http_wake_pending_exchange(wake,0);",
+        "  test_at_clear(wake,0);\n  (void)ku_http_wake_pending_exchange(wake,0);\n  test_at_clear(wake,1);",
+    ).replace("write(wake->write_socket, &byte, 1)", "test_write(wake->write_socket, &byte, 1)");
+    let header = r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+typedef int KuHttpSocket;
+typedef _Atomic size_t KuAtomicRefcount;
+#define KU_HTTP_INVALID_SOCKET (-1)
+static void counter_init(KuAtomicRefcount* p) { atomic_init(p,(size_t)0); }
+static size_t counter_read(KuAtomicRefcount* p) { return atomic_load_explicit(p,memory_order_acquire); }
+static void counter_add(KuAtomicRefcount* p) { (void)atomic_fetch_add_explicit(p,1,memory_order_release); }
+static int ku_http_socket_last_error(void) { return errno; }
+static int ku_http_socket_would_block(int e) { return e==EAGAIN || e==EWOULDBLOCK; }
+static int ku_http_socket_error_interrupted(int e) { return e==EINTR; }
+static void ku_http_socket_close(KuHttpSocket s) { if(s>=0) close(s); }
+static int ku_http_socket_nonblocking(KuHttpSocket s) { int f=fcntl(s,F_GETFL,0); return f>=0 && !fcntl(s,F_SETFL,f|O_NONBLOCK); }
+static int ready(KuHttpSocket s,int timeout) { struct pollfd f={s,POLLIN,0}; return poll(&f,1,timeout)>0 && (f.revents&POLLIN); }
+static KuAtomicRefcount publications,send_calls;
+static ssize_t test_write(KuHttpSocket s,const char* p,size_t n) { counter_add(&send_calls);return write(s,p,n); }
+static void test_at_clear(void*,int);
+"#;
+    let checks = r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"wake check line %d: %s\n",__LINE__,#c); exit(97); } } while(0)
+static int clear_edge=-1;
+static void publish(KuHttpWake* w) { counter_add(&publications);ku_http_wake_notify(w); }
+static void test_at_clear(void* raw,int edge) {
+ if(clear_edge==edge) { clear_edge=-1;publish((KuHttpWake*)raw); }
+}
+static void* producer(void* raw) {
+ for(int i=0;i<1000;i++) publish((KuHttpWake*)raw);
+ return NULL;
+}
+static pthread_mutex_t baton_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t baton_cond=PTHREAD_COND_INITIALIZER;
+static size_t baton_permit,baton_ack;
+static void* baton_producer(void* raw) {
+ for(size_t i=1;i<=1000;i++) {
+  CHECK(!pthread_mutex_lock(&baton_lock));
+  while(baton_permit<i) CHECK(!pthread_cond_wait(&baton_cond,&baton_lock));
+  CHECK(!pthread_mutex_unlock(&baton_lock));
+  publish((KuHttpWake*)raw);
+  CHECK(!pthread_mutex_lock(&baton_lock));
+  while(baton_ack<i) CHECK(!pthread_cond_wait(&baton_cond,&baton_lock));
+  CHECK(!pthread_mutex_unlock(&baton_lock));
+ }
+ return NULL;
+}
+int main(void) {
+ counter_init(&publications);counter_init(&send_calls);
+ KuHttpWake w;CHECK(ku_http_wake_init(&w));
+ CHECK((fcntl(w.read_socket,F_GETFD)&FD_CLOEXEC) && (fcntl(w.write_socket,F_GETFD)&FD_CLOEXEC));
+ for(int i=0;i<512;i++) publish(&w);
+ CHECK(counter_read(&send_calls)==1 && ready(w.read_socket,0));
+ ku_http_wake_drain(&w);CHECK(counter_read(&publications)==512 && !ready(w.read_socket,0));
+ publish(&w);CHECK(ready(w.read_socket,0));size_t before=counter_read(&send_calls);
+ clear_edge=0;ku_http_wake_drain(&w);
+ CHECK(counter_read(&publications)==514 && counter_read(&send_calls)==before);
+ publish(&w);CHECK(ready(w.read_socket,0));before=counter_read(&send_calls);
+ clear_edge=1;ku_http_wake_drain(&w);
+ CHECK(counter_read(&send_calls)==before+1);
+ CHECK(counter_read(&publications)==516 && ready(w.read_socket,0));
+ ku_http_wake_drain(&w);
+ /* For a one-byte nonblocking pipe write, EAGAIN has an independently
+    observable readable endpoint. No equivalent assertion is made for UDP. */
+ char fill[512];memset(fill,1,sizeof(fill));size_t filled=0;
+ for(;;) { ssize_t n=write(w.write_socket,fill,sizeof(fill));if(n>0) {filled+=(size_t)n;continue;} CHECK(n<0 && ku_http_socket_would_block(errno));break; }
+ CHECK(filled>0 && ready(w.read_socket,0));
+ while(write(w.write_socket,fill,1)==1) filled++;
+ CHECK(ku_http_socket_would_block(errno));
+ before=counter_read(&send_calls);publish(&w);
+ CHECK(counter_read(&send_calls)==before+1 && errno==EAGAIN && ready(w.read_socket,0));
+ do {ku_http_wake_drain(&w);} while(ready(w.read_socket,0));
+ CHECK(counter_read(&publications)==517);
+ pthread_t threads[4];for(int i=0;i<4;i++) CHECK(!pthread_create(&threads[i],NULL,producer,&w));
+ size_t observed=517;
+ while(observed<4517) {
+  /* A timeout is a failure, never a reason to scan the publication counter. */
+  CHECK(ready(w.read_socket,2000));ku_http_wake_drain(&w);
+  observed=counter_read(&publications);
+ }
+ CHECK(observed==4517);
+ for(int i=0;i<4;i++) CHECK(!pthread_join(threads[i],NULL));
+ ku_http_wake_drain(&w);
+ pthread_t baton;CHECK(!pthread_create(&baton,NULL,baton_producer,&w));
+ for(size_t i=1;i<=1000;i++) {
+  CHECK(!pthread_mutex_lock(&baton_lock));baton_permit=i;
+  CHECK(!pthread_cond_broadcast(&baton_cond));CHECK(!pthread_mutex_unlock(&baton_lock));
+  CHECK(ready(w.read_socket,2000));ku_http_wake_drain(&w);
+  CHECK(counter_read(&publications)==4517+i);
+  CHECK(!pthread_mutex_lock(&baton_lock));baton_ack=i;
+  CHECK(!pthread_cond_broadcast(&baton_cond));CHECK(!pthread_mutex_unlock(&baton_lock));
+ }
+ CHECK(!pthread_join(baton,NULL));
+ ku_http_wake_close(&w);
+ CHECK(w.read_socket==KU_HTTP_INVALID_SOCKET && w.write_socket==KU_HTTP_INVALID_SOCKET);
+ CHECK(!pthread_cond_destroy(&baton_cond));CHECK(!pthread_mutex_destroy(&baton_lock));
+ puts("http-wake-coalescing-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-wake-coalescing");
+    let path = directory.path().join("wake.c");
+    fs::write(&path, format!("{header}{wake}{checks}")).unwrap();
+    let executable = native_c_harness::compile_harness(directory.path(), &path, "wake")
+        .expect("wake publication regression requires the native C compiler");
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "wake regression failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("http-wake-coalescing-ok"));
+}
+
 #[test]
 fn native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

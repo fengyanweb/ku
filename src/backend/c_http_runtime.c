@@ -1282,10 +1282,21 @@ static int ku_http_socket_nonblocking(KuHttpSocket socket_value) {
 static int ku_http_socket_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
 #endif
 
-/* A connected, private loopback datagram pair needs no connect/accept wait.
-   Both endpoints are nonblocking. A full receiver already makes poll readable;
-   no per-job completion can be lost when redundant wake bytes are coalesced. */
-typedef struct { KuHttpSocket read_socket; KuHttpSocket write_socket; } KuHttpWake;
+/* POSIX owners use a nonblocking byte pipe: a one-byte write is atomic and
+   EAGAIN means data is already buffered for poll. Windows keeps its existing
+   nonblocking loopback datagrams without coalescing; UDP send pressure alone
+   does not establish that its receiver is readable. */
+typedef struct {
+  KuHttpSocket read_socket; KuHttpSocket write_socket;
+#if !defined(_WIN32)
+  KuAtomicRefcount pending;
+#endif
+} KuHttpWake;
+#if !defined(_WIN32)
+static size_t ku_http_wake_pending_exchange(KuHttpWake* wake,size_t value) {
+  return atomic_exchange_explicit(&wake->pending,value,memory_order_acq_rel);
+}
+#endif
 static void ku_http_wake_close(KuHttpWake* wake) {
   ku_http_socket_close(wake->read_socket);
   ku_http_socket_close(wake->write_socket);
@@ -1293,6 +1304,17 @@ static void ku_http_wake_close(KuHttpWake* wake) {
 }
 static int ku_http_wake_init(KuHttpWake* wake) {
   wake->read_socket = wake->write_socket = KU_HTTP_INVALID_SOCKET;
+#if !defined(_WIN32)
+  atomic_init(&wake->pending,(size_t)0);
+  int descriptors[2];
+  if (pipe(descriptors) != 0) return 0;
+  wake->read_socket=descriptors[0]; wake->write_socket=descriptors[1];
+  if (!ku_http_socket_nonblocking(wake->read_socket) || !ku_http_socket_nonblocking(wake->write_socket)) goto failed;
+  for (size_t i=0;i<2;i++) {
+    int flags=fcntl(descriptors[i],F_GETFD,0);
+    if (flags<0 || fcntl(descriptors[i],F_SETFD,flags|FD_CLOEXEC)<0) goto failed;
+  }
+#else
   wake->read_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (wake->read_socket == KU_HTTP_INVALID_SOCKET) return 0;
   struct sockaddr_in address; memset(&address, 0, sizeof(address));
@@ -1300,30 +1322,36 @@ static int ku_http_wake_init(KuHttpWake* wake) {
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   address.sin_port = 0;
   if (bind(wake->read_socket, (struct sockaddr*)&address, sizeof(address)) != 0) goto failed;
-#if defined(_WIN32)
   int address_length = (int)sizeof(address);
-#else
-  socklen_t address_length = (socklen_t)sizeof(address);
-#endif
   if (getsockname(wake->read_socket, (struct sockaddr*)&address, &address_length) != 0) goto failed;
   wake->write_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (wake->write_socket == KU_HTTP_INVALID_SOCKET) goto failed;
   if (!ku_http_socket_nonblocking(wake->read_socket) || !ku_http_socket_nonblocking(wake->write_socket)) goto failed;
   if (connect(wake->write_socket, (struct sockaddr*)&address, sizeof(address)) != 0) goto failed;
+#endif
   return 1;
 failed:
   ku_http_wake_close(wake);
   return 0;
 }
 static void ku_http_wake_notify(KuHttpWake* wake) {
+#if !defined(_WIN32)
+  /* The consumer clears with acquire before its next work scan. A producer
+     after that clear installs a fresh byte; earlier publications join the scan.
+     This eight-byte marker is owner-stack storage, not a Task heap charge. */
+  if (ku_http_wake_pending_exchange(wake,1)) return;
+#endif
   const char byte = 1;
   for (int attempt = 0; attempt < 8; attempt++) {
+#if defined(_WIN32)
     int sent = ku_http_socket_send(wake->write_socket, &byte, 1);
+#else
+    ssize_t sent = write(wake->write_socket, &byte, 1);
+#endif
     if (sent == 1) return;
     int error = ku_http_socket_last_error();
     if (sent < 0 && ku_http_socket_would_block(error)) return;
     if (sent < 0 && ku_http_socket_error_interrupted(error)) continue;
-    /* Never leave accepted work waiting forever after a hard wake failure. */
     fputs("http reactor wake failed\n", stderr); exit(1);
   }
   fputs("http reactor wake repeatedly interrupted\n", stderr); exit(1);
@@ -1331,13 +1359,24 @@ static void ku_http_wake_notify(KuHttpWake* wake) {
 static void ku_http_wake_drain(KuHttpWake* wake) {
   char bytes[64];
   for (int turn = 0; turn < 256; turn++) {
+#if defined(_WIN32)
     int received = ku_http_socket_recv(wake->read_socket, bytes, sizeof(bytes));
     if (received >= 0) continue;
+#else
+    ssize_t received = read(wake->read_socket, bytes, sizeof(bytes));
+    if (received > 0) continue;
+    if (received == 0) { fputs("http reactor wake pipe closed\n",stderr); exit(1); }
+#endif
     int error = ku_http_socket_last_error();
-    if (ku_http_socket_would_block(error)) return;
+    if (ku_http_socket_would_block(error)) break;
     if (ku_http_socket_error_interrupted(error)) continue;
     fputs("http reactor wake read failed\n", stderr); exit(1);
   }
+#if !defined(_WIN32)
+  /* All three callers scan published work before their next poll. At the
+     bounded drain limit remaining pipe bytes also keep the descriptor ready. */
+  (void)ku_http_wake_pending_exchange(wake,0);
+#endif
 }
 
 /* Payload/request-map quota, independent from Task/frame budgets. Mutex
@@ -2442,8 +2481,12 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
     req.headers = input->headers; input->headers = NULL;
   }
   KuHttpLoopOwner* owner = ku_http_current_loop;
-  uint32_t status = ((uint32_t(*)(void*,size_t,KuStruct___ku_http_request*,void**))route->invoke)(
-      owner->group->tasks,(size_t)owner->index,&req,&connection->async_task);
+  /* One original handler deadline is carried through every PG wait/reset.
+     Computing it before factory admission cannot renew it at first query. */
+  connection->async_deadline = ku_http_deadline_ms((uint32_t)server->handler_timeout_ms);
+  if (connection->request_deadline && connection->request_deadline < connection->async_deadline) connection->async_deadline = connection->request_deadline;
+  uint32_t status = ((uint32_t(*)(void*,size_t,void*,uint64_t,KuStruct___ku_http_request*,void**))route->invoke)(
+      owner->group->tasks,(size_t)owner->index,route->env,connection->async_deadline,&req,&connection->async_task);
   ku_drop_struct___ku_http_request(&req);
   ku_http_buffer_refund(connection->budget,projection_charge);
   ku_http_input_drop(input);
@@ -2456,8 +2499,6 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   }
   ku_http_count_admitted();
   connection->phase = KU_HTTP_IO_ASYNC;
-  connection->async_deadline = ku_http_deadline_ms((uint32_t)server->handler_timeout_ms);
-  if (connection->request_deadline && connection->request_deadline < connection->async_deadline) connection->async_deadline = connection->request_deadline;
   return 1;
 #else
   (void)connection; (void)server; return 0;

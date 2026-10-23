@@ -2884,6 +2884,10 @@ impl Checker {
         } else {
             Some(self.check_expr(handler_arg)?)
         };
+        let async_handler = matches!(
+            &handler_type,
+            Some(Type::FunctionValue { is_async: true, .. })
+        );
         let handler_provenance = self.expression_closure_provenance(handler_arg);
         if handler_provenance.http_callable_body_uncertain {
             return Err(KuError::runtime(
@@ -2977,7 +2981,7 @@ impl Checker {
         }
         // Route registration mutates the named service in place. Returning the
         // service would create an untracked second owner of native's raw pointer.
-        self.freeze_http_shared_callables(&handler_provenance, span)?;
+        self.freeze_http_shared_callables(&handler_provenance, span, async_handler)?;
         Ok(Some(Type::Null))
     }
 
@@ -7541,6 +7545,14 @@ impl Checker {
     /// closure capture boundary (E0904) on the root and that the place is still
     /// live (a double move / move-through-moved-parent is rejected).
     fn record_move(&mut self, place: &PlacePath, span: Span) -> KuResult<()> {
+        // Only the native async PG capture path freezes this move-only pool.
+        // The existing shared graph identifies the original lexical binding;
+        // an unrelated same-named local or ordinary pool call is unaffected.
+        if let Ok(binding) = self.get_allow_moved(&place.root, span) {
+            if matches!(&binding.ty, Type::Native(name) if name == metadata::PG_CLIENT) {
+                self.reject_http_shared_write(binding.binding_id, span)?;
+            }
+        }
         self.reject_readonly_capture_move(place, span)?;
         let boundary = self.closure_capture_boundaries.last().copied();
         for (index, scope) in self.scopes.iter_mut().enumerate().rev() {

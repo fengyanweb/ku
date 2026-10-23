@@ -67,7 +67,10 @@ fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
 }
 
 fn supported_type(ty: &IrType) -> bool {
-    if crate::ir::task::error_type(ty) || crate::ir::task::http_type(ty) {
+    if crate::ir::task::error_type(ty)
+        || crate::ir::task::http_type(ty)
+        || crate::ir::task::local_pg_type(ty)
+    {
         return true;
     }
     match ty {
@@ -89,6 +92,7 @@ fn owned(ty: &IrType) -> bool {
         || crate::ir::task::local_bytes_type(ty)
         || crate::ir::task::local_net_type(ty)
         || crate::ir::task::http_type(ty)
+        || crate::ir::task::local_pg_type(ty)
 }
 
 // The generated branch itself guards the access: inactive Result fields must
@@ -131,6 +135,9 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
 // Charging is separate from pure leaf traversal: vector bytes are counted
 // once, while alias callbacks must never mutate any accounting variable.
 fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
+    if matches!(ty, IrType::Named(name) if name == "__ku_pg_result") {
+        return format!("  {{ size_t pg_bytes=0; if(!ku_pg_result_owned_bytes({place},&pg_bytes)) return KU_TASK_DRIVER_INVALID_ARGUMENT; if(pg_bytes>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=pg_bytes; }}\n");
+    }
     if let IrType::Result(inner) = ty {
         return format!(
             "  if (({place}).ok) {{\n{}  }} else {{\n{}  }}\n",
@@ -383,6 +390,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
                 | TaskTerminator::BlockingReadDir { .. }
                 | TaskTerminator::BlockingExists { .. }
                 | TaskTerminator::BlockingNet { .. }
+                | TaskTerminator::PgQuery { .. }
         )
     });
     let dynamic_projection = blocking

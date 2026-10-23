@@ -4,12 +4,46 @@
 
 | 适配 | 实际执行方式 | 连接与结果归属 |
 |---|---|---|
-| PostgreSQL/libpq | 非阻塞 libpq 接口及 poll/WSAPoll，由有界 handler 线程推进；不是事件线程上的数据库状态机 | pool lease 独占一个 PGconn；结果复制为 Ku 自有的有界表格，归还连接后仍有效 |
+| PostgreSQL/libpq，同步 handler | 非阻塞 libpq 接口及 poll/WSAPoll，由有界 handler 线程推进 | pool lease 独占一个 PGconn；结果复制为 Ku 自有的有界表格，归还连接后仍有效 |
+| PostgreSQL/libpq，局部 async HTTP handler | query、结果读取、DISCARD ALL 在 Task owner 上分步推进；池和 socket 等待挂起；连接建立使用有界后台任务 | 复用初始化时的同一个 pool；捕获 token 持有 pool 与原闭包环境直到清理，HTTP handle 继续持有环境直到物理任务退休 |
 | MySQL/MariaDB | 同步 C prepared-statement API，运行在有界 handler 线程 | 全进程 library once、逐线程 init/end，pool lease 独占 MYSQL；结果脱离原生 statement |
 | Redis | 同步 socket/RESP 操作，运行在有界 handler 线程 | pool lease 独占连接，命令与解析错误按既有规则丢弃失去协议同步的连接 |
 | 解释器、默认打包 runner、LLVM | 沿用已有支持矩阵；数据库模块仍为 native-only | 不宣称本轮新增其数据库实现 |
 
-libpq 允许连接在不同线程之间先后交接，禁止同一个连接同时被多个线程操作；MySQL 也需要独占连接及正确的线程初始化。这里使用已有 client 的锁与 lease；不将一个 raw handle 同时交给多个事件循环。native Task 的数据库调用仍按实际编译支持诊断，不能把同步 handler 的数据库覆盖扩大成所有 async Task 均支持。
+libpq 允许连接在不同线程之间先后交接，禁止同一个连接同时被多个线程操作；MySQL 也需要独占连接及正确的线程初始化。这里使用已有 client 的锁与 lease；不将一个 raw handle 同时交给多个事件循环。native Task 的 PG 支持限于下述 checked capture 路径，不代表所有数据库、任意 async 参数或动态 JSON 值都已支持。
+
+## Native async HTTP 中使用同一个 PostgreSQL pool
+
+在同步初始化作用域内创建 client，再由具名的局部 `async fn` 只读捕获；注册方式仍是普通 `app.get(path, handler)`。`client.query(sql, params)?` 在这个 Task 内会挂起，不占用后台线程等待 SQL 或会话重置。每个查询仍独占一个连接 lease，不会为每个请求创建连接池。
+
+```ku
+import {http, time} from "std"
+import pg from "std.pg"
+
+fn main(): null! {
+    client = pg.client({conninfo: "hostaddr=127.0.0.1 dbname=app",
+        max_connections: 16, max_waiters: 128})?
+    async fn echo(req: HttpRequest): HttpResponse! {
+        time.sleep(1)?
+        result = client.query("SELECT $1::text", [req.query.message.clone()])?
+        return ok(http.text(result.value(0, 0)?))
+    }
+    app = http.server()
+    app.get("/echo", echo)
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+```
+
+注册 async route 后，该 route 捕获的 PG binding 不能显式 `close()`、move 或替换。检查器按原 lexical binding 区分同名局部变量；普通 `query()` 仍借用原 pool。`listen()` 返回后也不解除这条静态冻结，应让原作用域与闭包环境正常结束释放资源；不要在该作用域末尾增加显式 `client.close()`。scope drop、正常退出和取消清理保持有效。
+
+捕获时就增加实际 pool 的持有计数，因此先等待 timer、尚未开始 query 时也不会失去 pool。每次 query 的 SQL/参数表达式按原顺序求值一次；挂起后只接收同代次操作结果。`PgResult` 为 Task 内的独占表格；`rows`、`cols`、`value`、`value_int`、`is_null` 沿用原错误与所有权规则。结果已从 libpq 复制，成功或失败的 `DISCARD ALL` 不使已取得的字段失效。PG result 不作为跨 Task 的任意动态 payload。
+
+HTTP 绝对期限在 handler 准入时形成，并与 pool/query 的原期限取最小值；取得连接、SQL、结果与重置不会重新计时。该 async 路径的取消会关闭并淘汰独占连接；SQL 已发出时报告 `execution_unknown`，不宣称服务端已回滚，也不自动重试。原同步路径的 libpq cancel/drain 行为见下文。
+
+这个 Task 子集也支持 `json.encode({id: result.value_int(0, 0)?, label: result.value(0, 1)?})?` 和兼容别名 `json.stringify`。仅限静态 object literal、`int`/`bool`/`null`/`str` 字段；不扩展 float、动态 KuValue 或嵌套数组/对象的 Task 存储支持。字段表达式依源码顺序各求值一次，再按现有 JSON 的键顺序输出。重复字段继续由检查器和 native lowerer 拒绝。
+
+literal 中的拥有型字符串按原规则移入临时字段；需要继续使用原变量时显式 `.clone()`。编码器只借读已经物化的字段，完成后释放临时 owner。使用原 JSON buffer、转义和整数 writer，输出上限仍为 1,000,000 字节。Task 会在分配前预留实际 buffer capacity；容量计算溢出、内存预算拒绝、分配失败和编码失败均返回错误 Result，失败 buffer 会清理并退款。该能力不更换 JSON 默认底层实现。
 
 ## PostgreSQL 整数字段
 
@@ -24,7 +58,7 @@ label = result.value(0, 1)?
 score = result.value_int(0, 2)?
 ```
 
-该方法沿用 PG 的 native C 支持边界，不新增解释器、LLVM 或 native Task 数据库执行路径；会话清理与 SQL 不自动重试的规则不变。
+该方法沿用 PG 的 native C 支持边界，并可用于上述局部 async HTTP 路径；不新增解释器或 LLVM 数据库实现，会话清理与 SQL 不自动重试的规则不变。
 
 ## 实例总额
 

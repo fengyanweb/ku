@@ -174,7 +174,38 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   }
   int cancelled=job->cancelled || pool->closing;
   ku_task_blocking_unlock(pool);
+#if KU_TASK_BLOCKING_PG
+  int done;
+  int queue_connect=0;
+  if(job->kind==9u) {
+    KuPgAsyncOp* operation=job->pg_operation;
+    done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);
+    queue_connect=operation->phase==KU_PG_ASYNC_CONNECT && !operation->connect_ready;
+    if(done && ku_pg_async_can_dispose(operation)) {
+      job->pg_result=ku_pg_async_take(operation);
+      ku_pg_async_dispose(operation,1);job->pg_operation=NULL;
+    } else if(done) {
+      /* A pinned pool notification is still using this stable job. Recheck
+       * within one millisecond, bounded by the original request deadline. */
+      done=0;
+      uint64_t now=ku_pg_now_ms();
+      uint64_t cleanup=ku_pg_client_saturating_add_ms(operation->deadline,KU_HANDLER_CLEANUP_GRACE_MS);
+      job->net_deadline=now<cleanup ? now+1u:cleanup;
+      if(job->net_deadline>cleanup)job->net_deadline=cleanup;
+      if(now>=cleanup) {
+        /* Preserve the pinned stable job; never free a callback's storage to
+         * satisfy a deadline. Report a bounded physical-retirement failure. */
+        if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
+        pool->fault=KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;pool->closing=1;
+        (void)ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT);
+        ku_task_blocking_signal(pool);ku_task_blocking_unlock(pool);
+        return KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;
+      }
+    }
+  } else done=ku_task_net_step(pool,job,events,cancelled);
+#else
   int done=ku_task_net_step(pool,job,events,cancelled);
+#endif
   /* Resolver copies are freed when connect completes, before its result can
    * move to a frame. Their receipt is refunded after physical free. */
   if(done && job->net_addresses) {
@@ -188,9 +219,20 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
   job=&pool->jobs[index];
   if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_STEP || job->net_owner!=owner+1u
-      || ku_task_blocking_net_state_locked(pool,job,done?KU_TASK_BLOCKING_DONE:KU_TASK_BLOCKING_NET_WAIT)!=KU_TASK_DRIVER_OK) {
+      || ku_task_blocking_net_state_locked(pool,job,
+#if KU_TASK_BLOCKING_PG
+        queue_connect ? KU_TASK_BLOCKING_QUEUED :
+#endif
+        done?KU_TASK_BLOCKING_DONE:KU_TASK_BLOCKING_NET_WAIT)!=KU_TASK_DRIVER_OK) {
     pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
   }
+#if KU_TASK_BLOCKING_PG
+  if(queue_connect) {
+    pool->ring[(pool->head+pool->queued)%pool->capacity]=index;pool->queued++;
+    if(pool->queued>pool->peak_queued)pool->peak_queued=pool->queued;
+    ku_task_blocking_signal(pool);
+  }
+#endif
   if(done) {
     if(pool->finished!=UINT64_MAX)pool->finished++;
     uint32_t status=ku_task_driver_wake(&job->ticket);
@@ -210,6 +252,35 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
     int active=job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u;
     if(!active)continue;
     uint64_t generation=job->generation;
+#if KU_TASK_BLOCKING_PG
+    if(job->kind==9u) {
+      KuPgAsyncOp* operation=job->pg_operation;int fd=-1;unsigned int events=0;
+      unsigned long long next=operation->deadline;
+      int immediate=ku_pg_async_interest(operation,&fd,&events,&next);
+      if(operation->phase==KU_PG_ASYNC_DONE && !ku_pg_async_can_dispose(operation)) {
+        uint64_t now=ku_pg_now_ms();next=now+1u;immediate=now>=job->net_deadline;
+      }
+      int advance=job->pg_ready || job->cancelled || pool->closing || ku_pg_now_ms()>=next || immediate;
+      job->pg_ready=0;
+      if(advance) {
+        ku_task_blocking_unlock(pool);
+        if(ku_task_net_dispatch(pool,owner,i,generation,0u)>KU_TASK_DRIVER_PENDING)return SIZE_MAX;
+        if(ku_task_blocking_lock(pool))return SIZE_MAX;
+        job=&pool->jobs[i];
+        if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_WAIT)continue;
+        operation=job->pg_operation;
+        immediate=ku_pg_async_interest(operation,&fd,&events,&next);
+        if(operation->phase==KU_PG_ASYNC_DONE && !ku_pg_async_can_dispose(operation))next=job->net_deadline;
+        else if(immediate)next=ku_pg_now_ms();
+      }
+      if(next<*deadline)*deadline=next;
+      if(fd>=0 && events) {
+        if(count<capacity)items[count++]=(KuTaskNetPollV1){(uintptr_t)(unsigned int)fd,i,job->generation,events};
+        else {pool->fault=KU_TASK_DRIVER_LIMIT;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+      }
+      continue;
+    }
+#endif
     int advance=job->cancelled || pool->closing || ku_net_now_ms()>=job->net_deadline
         || job->kind==8u || !job->net_client || job->net_client->socket_value==KU_NET_INVALID_SOCKET
         || (job->kind==7u && !job->net_write.len);
@@ -301,7 +372,7 @@ static int ku_task_net_root_wait(void* raw,size_t owner,uint64_t deadline) {
   if(count>root->capacity)return -1;
   KuTaskNetOsPollV1* fds=(KuTaskNetOsPollV1*)((uint8_t*)interests+root->capacity*sizeof(*interests));
   memset(fds,0,(count+1u)*sizeof(*fds));fds[0].fd=root->wakes[owner].reader;fds[0].events=KU_TASK_NET_OS_READ;
-  for(size_t i=0;i<count;i++) {fds[i+1].fd=(KuNetSocket)interests[i].socket_value;fds[i+1].events=(interests[i].events&KU_TASK_NET_READ)?KU_TASK_NET_OS_READ:KU_TASK_NET_OS_WRITE;}
+  for(size_t i=0;i<count;i++) {fds[i+1].fd=(KuNetSocket)interests[i].socket_value;fds[i+1].events=(short)(((interests[i].events&KU_TASK_NET_READ)?KU_TASK_NET_OS_READ:0)|((interests[i].events&KU_TASK_NET_WRITE)?KU_TASK_NET_OS_WRITE:0));}
   uint64_t now=ku_net_now_ms();int timeout=next==UINT64_MAX?-1:next<=now?0:next-now>(uint64_t)INT_MAX?INT_MAX:(int)(next-now);
 #if defined(_WIN32)
   int ready=WSAPoll(fds,(ULONG)(count+1u),timeout);

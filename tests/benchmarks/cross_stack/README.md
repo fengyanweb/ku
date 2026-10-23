@@ -11,8 +11,10 @@
 Node 多核使用 cluster，长计算在正常的有界后台执行。锁文件保留准确依赖。
 JSON 必须完整解码、构造新对象并重新编码；Ku 现有取值接口的子树复制成本也计入。
 数据库使用私有 PostgreSQL 16 的 1024 行夹具，总池 16，不重试业务查询。
-Ku 现有 native 入口只提供文本响应，JSON 正文使用 text/plain；另外三栈使用
-application/json。正文黄金规则相同，响应头能力存在差异，不能宣称接口完全等同。
+Ku 的 `/json` 在 `--ku-json text` 下使用 text/plain，`response` 模式通过公开
+`http.json` 使用 application/json；`/db` 两种执行路径都保持原 text/plain。
+Go/Java/.NET/C++ 的 JSON 响应带 UTF-8 charset；Rust/Node 使用无显式 charset 的
+application/json。正文黄金规则相同，响应头差异按实际 API 记录，不能宣称完全等同。
 
 HTTP 和计算的结果验证由公共 `client/` 执行。它按计划到达发起请求，不重放失败，
 普通绝对期限从计划到达开始，包含压测端排队和完整正文验证。
@@ -69,6 +71,20 @@ sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/database.py --roo
 ROOT/tools，源码目录保持可核对。安装脚本默认账号和路径由其开头的环境变量确定。
 实测前保存 environment、manifest、源码清单和程序哈希。改变冻结输入时使用新结果目录，
 不得把不同候选或配置的轮次拼在一起。
+
+## PostgreSQL 执行路径对照
+
+当前 Ku 默认源码使用具名局部 `async fn database` 捕获原初始化 pool：`query()` 挂起、
+`value_int()`/`value()` 读取独立结果，再通过原 `json.encode` 和 `http.text` 返回。
+`mixed` 组合直接访问同一个 `/db` 路由，不额外创建 client，也不使用测试专用数据库接口。
+SQL、16 连接总池、DISCARD ALL、原绝对期限及不重试约定不变。
+PG 的 `http.text` 仍与历史 Ku 对照列保持相同文本 MIME；不能将它写成 application/json。
+
+`build_linux.py --ku-pg-execution sync --ku-pg-read value` 单独构建旧有界 HTTP 线程路径和
+字符串→JSON 数字读取；`--ku-pg-execution sync --ku-pg-read int` 只分离 getter 的影响。
+默认是 `--ku-pg-execution async --ku-pg-read int`；async 不支持动态 KuValue，不能选择
+`value` 模式。三种组合分别使用隔离 benchmark root，manifest 记录执行模式、getter 模式、
+原源码、展开源码、生成 C 和实际 ELF 哈希。不得把旧 baseline 的历史成绩重新标为 async。
 
 ## 分阶段执行与清理
 

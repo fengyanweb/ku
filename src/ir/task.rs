@@ -100,6 +100,15 @@ pub enum TaskNetOperation {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPgResultOperation {
+    Rows,
+    Cols,
+    Value,
+    ValueInt,
+    IsNull,
+}
+
 /// Copy-only operations: source lowering maps existing syntax to these tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUnaryOp {
@@ -266,6 +275,19 @@ pub enum TaskOp {
         key: SlotId,
         map: String,
     },
+    PgResult {
+        dst: SlotId,
+        source: SlotId,
+        row: Option<SlotId>,
+        col: Option<SlotId>,
+        operation: TaskPgResultOperation,
+    },
+    /// Static scalar object keys are canonicalized only after every source
+    /// expression has been materialized, left to right, exactly once.
+    JsonEncodeObject {
+        dst: SlotId,
+        fields: Vec<(String, SlotId)>,
+    },
     /// HTTP response construction moves an optional string payload. `kind`
     /// uses 0=text, 1=html, 2=empty, 3=redirect; status is a Copy int.
     HttpResponse {
@@ -381,6 +403,17 @@ pub enum TaskTerminator {
     BlockingNet {
         operation: TaskNetOperation,
         inputs: [Option<SlotId>; 9],
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
+    /// One shared-pool lease, suspended on socket readiness or pool admission.
+    /// The captured-client token pins its existing closure cell; it is never a
+    /// fresh per-request pool or an arbitrary reference crossing suspension.
+    PgQuery {
+        client: SlotId,
+        sql: SlotId,
+        params: SlotId,
         dst: SlotId,
         ready: StateId,
         cleanup: StateId,
@@ -529,11 +562,24 @@ pub(crate) fn local_net_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Named(name) if name == "__ku_net_client")
         || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_net_client"))
 }
+pub(crate) fn pg_capture_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name == "__ku_pg_capture")
+}
+pub(crate) fn local_pg_type(ty: &IrType) -> bool {
+    pg_capture_type(ty)
+        || matches!(ty, IrType::Named(name) if name == "__ku_pg_result")
+        || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
+}
 fn parameter_type(ty: &IrType) -> bool {
-    primitive(ty) || error_type(ty) || flat_array(ty) || result_type(ty) || http_type(ty)
+    primitive(ty)
+        || error_type(ty)
+        || flat_array(ty)
+        || result_type(ty)
+        || http_type(ty)
+        || pg_capture_type(ty)
 }
 fn value_type(ty: &IrType) -> bool {
-    parameter_type(ty) || local_bytes_type(ty) || local_net_type(ty)
+    parameter_type(ty) || local_bytes_type(ty) || local_net_type(ty) || local_pg_type(ty)
 }
 
 pub(crate) fn flat_array(ty: &IrType) -> bool {
@@ -560,7 +606,7 @@ pub(crate) fn http_type(ty: &IrType) -> bool {
 }
 
 fn result_type(ty: &IrType) -> bool {
-    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner) || http_response_type(inner))
+    matches!(ty, IrType::Result(inner) if primitive(inner) || flat_array(inner) || http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
 
 fn copy_type(ty: &IrType) -> bool {
@@ -577,6 +623,8 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
         TaskOp::Bytes { .. }
             | TaskOp::ErrorField { .. }
             | TaskOp::HttpMapGet { .. }
+            | TaskOp::PgResult { .. }
+            | TaskOp::JsonEncodeObject { .. }
             | TaskOp::StringClone { .. }
             | TaskOp::PrimitiveString { .. }
             | TaskOp::StringConcat { .. }
@@ -719,7 +767,7 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
             "literal byte limit exceeded",
         )?;
         // Inspect the shape without recursively formatting or cloning raw types.
-        if !result_type(&function.result) {
+        if !result_type(&function.result) || local_pg_type(&function.result) {
             return Err(invalid(
                 "function completion must be Result of a supported primitive or flat array",
             ));
@@ -746,6 +794,25 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                 "operation limit exceeded",
             )?;
             for operation in &state.operations {
+                if let TaskOp::JsonEncodeObject { fields, .. } = operation {
+                    if fields.len() > limits.max_slots {
+                        return Err(invalid("JSON literal field limit exceeded"));
+                    }
+                    add_bounded(
+                        &mut operation_count,
+                        fields.len(),
+                        limits.max_operations,
+                        "operation limit exceeded",
+                    )?;
+                    for (key, _) in fields {
+                        add_bounded(
+                            &mut literal_bytes,
+                            key.len(),
+                            limits.max_literal_bytes,
+                            "literal byte limit exceeded",
+                        )?;
+                    }
+                }
                 if let TaskOp::ScopeEnter { tasks, .. } = operation {
                     if tasks.len() > limits.max_slots {
                         return Err(invalid("ScopeEnter member limit exceeded"));
@@ -839,6 +906,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
         | TaskTerminator::BlockingExists { ready, cleanup, .. }
         | TaskTerminator::BlockingNet { ready, cleanup, .. }
+        | TaskTerminator::PgQuery { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
         TaskTerminator::Complete { .. }
@@ -1208,6 +1276,9 @@ fn validate_shape(
                     }
                     let (destination, destination_borrowed) = slot_type(destination_slot)?;
                     let (source, source_borrowed) = slot_type(source_slot)?;
+                    if pg_capture_type(source) {
+                        return Err(invalid("a pinned PostgreSQL capture is read-only and cannot be moved or copied"));
+                    }
                     if dst == src || destination != source || destination_borrowed {
                         return Err(invalid("copy or move has invalid source/destination types"));
                     }
@@ -1405,6 +1476,63 @@ fn validate_shape(
                         || !matches!(map.as_str(), "params" | "query" | "headers")
                     {
                         return Err(invalid("HttpMapGet requires an owned str destination, request, string key and known map"));
+                    }
+                }
+                TaskOp::PgResult {
+                    dst,
+                    source,
+                    row,
+                    col,
+                    operation,
+                } => {
+                    let (source_type, source_borrowed) = slot_type(get_slot(*source)?)?;
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let indexed = !matches!(
+                        operation,
+                        TaskPgResultOperation::Rows | TaskPgResultOperation::Cols
+                    );
+                    let expected = match operation {
+                        TaskPgResultOperation::Rows | TaskPgResultOperation::Cols => IrType::Int,
+                        TaskPgResultOperation::Value => IrType::Result(Box::new(IrType::Str)),
+                        TaskPgResultOperation::ValueInt => IrType::Result(Box::new(IrType::Int)),
+                        TaskPgResultOperation::IsNull => IrType::Result(Box::new(IrType::Bool)),
+                    };
+                    if source == dst
+                        || source_borrowed
+                        || borrowed
+                        || destination != &expected
+                        || !matches!(source_type, IrType::Named(name) if name == "__ku_pg_result")
+                        || indexed != row.is_some()
+                        || indexed != col.is_some()
+                    {
+                        return Err(invalid(
+                            "PgResult requires its owned result and matching typed operands",
+                        ));
+                    }
+                    for input in [row, col].into_iter().flatten() {
+                        if input == dst || slot_type(get_slot(*input)?)? != (&IrType::Int, false) {
+                            return Err(invalid("PgResult indexes must be Copy integers"));
+                        }
+                    }
+                }
+                TaskOp::JsonEncodeObject { dst, fields } => {
+                    has_error_projection = true;
+                    if slot_type(get_slot(*dst)?)?
+                        != (&IrType::Result(Box::new(IrType::Str)), false)
+                    {
+                        return Err(invalid("JSON literal requires an owned string Result"));
+                    }
+                    let mut previous: Option<&str> = None;
+                    for (key, input) in fields {
+                        let (ty, borrowed) = slot_type(get_slot(*input)?)?;
+                        if input == dst
+                            || borrowed
+                            || !primitive(ty)
+                            || previous.is_some_and(|previous| previous >= key.as_str())
+                        {
+                            return Err(invalid("JSON literal requires distinct sorted keys and materialized scalar values"));
+                        }
+                        previous = Some(key);
                     }
                 }
                 TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
@@ -1660,6 +1788,30 @@ fn validate_shape(
                     }
                 }
             }
+            TaskTerminator::PgQuery {
+                client,
+                sql,
+                params,
+                dst,
+                ..
+            } => {
+                has_blocking = true;
+                let (client_type, client_borrowed) = slot_type(get_slot(*client)?)?;
+                if client_borrowed
+                    || !pg_capture_type(client_type)
+                    || slot_type(get_slot(*sql)?)? != (&IrType::Str, false)
+                    || slot_type(get_slot(*params)?)?
+                        != (&IrType::Array(Box::new(IrType::Str)), false)
+                    || slot_type(get_slot(*dst)?)?
+                        != (
+                            &IrType::Result(Box::new(IrType::Named("__ku_pg_result".into()))),
+                            false,
+                        )
+                    || [client, sql, params].contains(&dst)
+                {
+                    return Err(invalid("PgQuery requires a pinned captured client, SQL, string params and owned result"));
+                }
+            }
             TaskTerminator::Await { task, dst, .. } => {
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed
@@ -1748,7 +1900,8 @@ fn validate_regions_and_progress(
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. }
-            | TaskTerminator::BlockingNet { ready, .. } => pending.push(*ready),
+            | TaskTerminator::BlockingNet { ready, .. }
+            | TaskTerminator::PgQuery { ready, .. } => pending.push(*ready),
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
                 pending.push(*ready);
@@ -1793,6 +1946,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::BlockingNet {
+            cleanup: target, ..
+        }
+        | TaskTerminator::PgQuery {
             cleanup: target, ..
         }
         | TaskTerminator::ScopeDrain {
@@ -1900,6 +2056,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
                         | TaskTerminator::BlockingNet { .. }
+                        | TaskTerminator::PgQuery { .. }
                 )
             {
                 budget.spend()?;
@@ -1939,6 +2096,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::BlockingReadDir { .. }
                         | TaskTerminator::BlockingExists { .. }
                         | TaskTerminator::BlockingNet { .. }
+                        | TaskTerminator::PgQuery { .. }
                 )
             {
                 budget.spend()?;
@@ -2009,6 +2167,8 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::ErrorField { dst, .. }
         | TaskOp::HttpResponse { dst, .. }
         | TaskOp::HttpMapGet { dst, .. }
+        | TaskOp::PgResult { dst, .. }
+        | TaskOp::JsonEncodeObject { dst, .. }
         | TaskOp::ArrayMake { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::StartIndirect { dst, .. }
@@ -2146,7 +2306,8 @@ fn validate_scope_layout(
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. }
-            | TaskTerminator::BlockingNet { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingNet { ready, .. }
+            | TaskTerminator::PgQuery { ready, .. } => [Some(ready), None],
             ref term => successors(term),
         };
         for target in next.into_iter().flatten() {
@@ -2324,7 +2485,8 @@ fn validate_scope_exits(
             | TaskTerminator::BlockingRead { ready, .. }
             | TaskTerminator::BlockingReadDir { ready, .. }
             | TaskTerminator::BlockingExists { ready, .. }
-            | TaskTerminator::BlockingNet { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingNet { ready, .. }
+            | TaskTerminator::PgQuery { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
         };
@@ -2367,6 +2529,8 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
         | TaskOp::HttpMapGet { dst, .. }
+        | TaskOp::PgResult { dst, .. }
+        | TaskOp::JsonEncodeObject { dst, .. }
         | TaskOp::Binary { dst, .. } => {
             state.must |= bit(*dst);
             state.may |= bit(*dst);
@@ -2427,6 +2591,7 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Unary { .. } => budget.spend()?,
+        TaskOp::JsonEncodeObject { fields, .. } => budget.spend_many(fields.len())?,
         TaskOp::Binary { .. } | TaskOp::StringConcat { .. } | TaskOp::ArrayTryGet { .. } => {
             budget.spend_many(2)?
         }
@@ -2488,6 +2653,12 @@ fn edge_states(
             ..
         }
         | TaskTerminator::BlockingNet {
+            dst,
+            ready,
+            cleanup,
+            ..
+        }
+        | TaskTerminator::PgQuery {
             dst,
             ready,
             cleanup,
@@ -2665,6 +2836,12 @@ fn live_states(
                     ready,
                     cleanup,
                     ..
+                }
+                | TaskTerminator::PgQuery {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
                 } => (live_in[ready.0] & !bit(dst)) | (live_in[cleanup.0] & !tasks),
                 TaskTerminator::TryResult {
                     ok_value,
@@ -2692,6 +2869,12 @@ fn live_states(
                 TaskTerminator::BlockingRead { path, .. }
                 | TaskTerminator::BlockingReadDir { path, .. }
                 | TaskTerminator::BlockingExists { path, .. } => live |= bit(path),
+                TaskTerminator::PgQuery {
+                    client,
+                    sql,
+                    params,
+                    ..
+                } => live |= bit(client) | bit(sql) | bit(params),
                 TaskTerminator::BlockingNet { inputs, .. } => {
                     live |= inputs
                         .iter()
@@ -2737,6 +2920,22 @@ fn live_states(
                         dst, body, status, ..
                     } => {
                         live = (live & !bit(*dst)) | body.map_or(0, bit) | status.map_or(0, bit);
+                    }
+                    TaskOp::JsonEncodeObject { dst, fields } => {
+                        live = (live & !bit(*dst))
+                            | fields.iter().fold(0, |mask, (_, slot)| mask | bit(*slot));
+                    }
+                    TaskOp::PgResult {
+                        dst,
+                        source,
+                        row,
+                        col,
+                        ..
+                    } => {
+                        live = (live & !bit(*dst))
+                            | bit(*source)
+                            | row.map_or(0, bit)
+                            | col.map_or(0, bit);
                     }
                     TaskOp::HttpMapGet {
                         dst, request, key, ..
@@ -2883,6 +3082,21 @@ fn validate_ownership_and_plan(
                     return Err(invalid("HttpResponse reads an uninitialized operand"));
                 }
             }
+            if let TaskOp::JsonEncodeObject { fields, .. } = operation {
+                budget.spend_many(fields.len())?;
+                if fields.iter().any(|(_, slot)| state.must & bit(*slot) == 0) {
+                    return Err(invalid("JSON literal reads an uninitialized field"));
+                }
+            }
+            if let TaskOp::PgResult {
+                source, row, col, ..
+            } = operation
+            {
+                let required = bit(*source) | row.map_or(0, bit) | col.map_or(0, bit);
+                if state.must & required != required {
+                    return Err(invalid("PgResult reads an uninitialized operand"));
+                }
+            }
             if let TaskOp::HttpMapGet { request, key, .. } = operation {
                 if state.must & (bit(*request) | bit(*key)) != (bit(*request) | bit(*key)) {
                     return Err(invalid("HttpMapGet reads an uninitialized operand"));
@@ -2996,6 +3210,7 @@ fn validate_ownership_and_plan(
             | TaskTerminator::BlockingReadDir { .. }
             | TaskTerminator::BlockingExists { .. }
             | TaskTerminator::BlockingNet { .. }
+            | TaskTerminator::PgQuery { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
                     if state.must & bit(task) == 0 {
@@ -3025,6 +3240,21 @@ fn validate_ownership_and_plan(
                     && state.may & masks.borrowed != 0
                 {
                     return Err(invalid("borrowed value cannot cross ScopeDrain boundary"));
+                }
+                if let TaskTerminator::PgQuery {
+                    client,
+                    sql,
+                    params,
+                    dst,
+                    ..
+                } = block.terminator
+                {
+                    let required = bit(client) | bit(sql) | bit(params);
+                    if state.must & required != required || state.may & bit(dst) != 0 {
+                        return Err(invalid(
+                            "PgQuery reads an uninitialized operand or overwrites a live result",
+                        ));
+                    }
                 }
                 if let TaskTerminator::BlockingNet { inputs, dst, .. } = block.terminator {
                     let required = inputs
@@ -3068,6 +3298,12 @@ fn validate_ownership_and_plan(
                     }
                 }
                 let timer_argument = match block.terminator {
+                    TaskTerminator::PgQuery {
+                        client,
+                        sql,
+                        params,
+                        ..
+                    } => bit(client) | bit(sql) | bit(params),
                     TaskTerminator::BlockingNet { inputs, .. } => inputs
                         .iter()
                         .flatten()
@@ -3561,6 +3797,7 @@ fn finally_plan(
             | TaskTerminator::BlockingReadDir { ready, cleanup, .. }
             | TaskTerminator::BlockingExists { ready, cleanup, .. }
             | TaskTerminator::BlockingNet { ready, cleanup, .. }
+            | TaskTerminator::PgQuery { ready, cleanup, .. }
             | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
                 if stack.last().is_some_and(|target| *target != cleanup)
                     || (stack.is_empty() && entries[cleanup.0])
@@ -3768,6 +4005,28 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
             visit(left);
             visit(right);
         }
+        TaskOp::JsonEncodeObject { dst, fields } => {
+            visit(dst);
+            for (_, slot) in fields {
+                visit(slot);
+            }
+        }
+        TaskOp::PgResult {
+            dst,
+            source,
+            row,
+            col,
+            ..
+        } => {
+            visit(dst);
+            visit(source);
+            if let Some(slot) = row {
+                visit(slot);
+            }
+            if let Some(slot) = col {
+                visit(slot);
+            }
+        }
         TaskOp::HttpResponse {
             dst, body, status, ..
         } => {
@@ -3820,6 +4079,18 @@ fn source_term_slots(term: &mut TaskTerminator, visit: &mut impl FnMut(&mut Slot
         | TaskTerminator::BlockingReadDir { path, dst, .. }
         | TaskTerminator::BlockingExists { path, dst, .. } => {
             visit(path);
+            visit(dst);
+        }
+        TaskTerminator::PgQuery {
+            client,
+            sql,
+            params,
+            dst,
+            ..
+        } => {
+            visit(client);
+            visit(sql);
+            visit(params);
             visit(dst);
         }
         TaskTerminator::BlockingNet { inputs, dst, .. } => {
@@ -3907,7 +4178,8 @@ pub(crate) fn compact_source_scalar_slots(
             | TaskTerminator::BlockingReadDir { dst, .. }
             | TaskTerminator::BlockingExists { dst, .. }
             | TaskTerminator::BlockingWrite { dst, .. }
-            | TaskTerminator::BlockingNet { dst, .. } => candidate[dst.0] = false,
+            | TaskTerminator::BlockingNet { dst, .. }
+            | TaskTerminator::PgQuery { dst, .. } => candidate[dst.0] = false,
             TaskTerminator::TryResult {
                 ok_value,
                 err_result,

@@ -143,6 +143,28 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     map(request);
                     map(key);
                 }
+                TaskOp::PgResult {
+                    dst,
+                    source,
+                    row,
+                    col,
+                    ..
+                } => {
+                    map(dst);
+                    map(source);
+                    if let Some(row) = row {
+                        map(row);
+                    }
+                    if let Some(col) = col {
+                        map(col);
+                    }
+                }
+                TaskOp::JsonEncodeObject { dst, fields } => {
+                    map(dst);
+                    for (_, value) in fields {
+                        map(value);
+                    }
+                }
                 TaskOp::HttpResponse {
                     dst, body, status, ..
                 } => {
@@ -183,6 +205,18 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 for input in inputs.iter_mut().flatten() {
                     map(input);
                 }
+                map(dst);
+            }
+            TaskTerminator::PgQuery {
+                client,
+                sql,
+                params,
+                dst,
+                ..
+            } => {
+                map(client);
+                map(sql);
+                map(params);
                 map(dst);
             }
             TaskTerminator::TryResult {
