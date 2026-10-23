@@ -177,3 +177,6 @@ PG有限实库链25/25正确、自然drain/exit0，覆盖timer后查询、中文
 纯标量检查地址候选只在已启用Copy缓存的纯片段中缓存phase地址；每个原checkpoint仍acquire-load实际phase，保留cleanup→phase→64预算次序，在一般/owned/host边界清空地址。入口原有host非空验证，移除该已解引用路径的重复host非空判断。独立b1 C变体的frame2静态指令3938→3684，14个ldar不减少；这只是指令证据，尚非时间收益。70项相关回归通过，包括第1—64状态分别取消、原32poll/1ms边界与owned/child清理。当前JSON19、HTTP JSON4、HTTP41、稀疏参数3均通过；全目标严格Clippy与格式检查通过。旧slot-renamer已显式遍历新PG/JSON操作的全部槽位，没有用通配忽略新操作。
 
 b1ada03远程CI：PR run39975648033必要任务全部通过；push39975641602有Windows真实PG依赖加压后的acquire_timeout恢复失败，以及macOS产物上传DNS ENOTFOUND。两个运行分别保留，不能把PR成功覆盖push失败或将上传错误写成编译失败。新候选仍需自己的完整SHA检查和实际安装产物验证。
+
+
+旧Windows PG恢复失败已核实为8次新只读先耗尽：0.984秒内均返回acquire_timeout，原5秒窗口尚剩约4秒，不代表已观察5秒不恢复；同SHA PR首个新读成功也不能解释旧失败原因。验收驱动保持原绝对5秒、每请求min(4秒,剩余)、最多8次且不重放SQL，只将新读最早开始按0/.625/.../4.375秒分布，并区分次数耗尽与绝对期限。模拟2秒才恢复的旧测量缺口及迟到成功/异常/越期不发送等回归通过：Python全组27项，26通过，1项原Windows ACL在Mac不适用。它修复观察时序，不是产品超时或数据库恢复修复；8次均失败仍失败，旧CI原结果保留。

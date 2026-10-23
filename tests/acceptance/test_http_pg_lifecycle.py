@@ -322,11 +322,12 @@ class RecoveryHTTPDeadlineContracts(unittest.TestCase):
 
 
 class FreshReadRecoveryContracts(unittest.TestCase):
-    def scenario(self, responses, *, initial_time=100.0, progress_seconds=0):
+    def scenario(self, responses, *, initial_time=100.0, progress_seconds=0,
+                 sleep_extra_seconds=0):
         clock = SimpleNamespace(now=initial_time)
         expected = {"rows": 1, "text": "中文🙂"}
         pending = list(responses)
-        requests, progress, recovery = [], [], {}
+        requests, progress, recovery, sleeps = [], [], {}, []
         last = {}
 
         def read(path, *, deadline):
@@ -347,8 +348,14 @@ class FreshReadRecoveryContracts(unittest.TestCase):
             progress.append(index)
             clock.now += progress_seconds
 
+        def sleep(seconds):
+            self.assertGreater(seconds, 0)
+            sleeps.append(seconds)
+            clock.now += seconds + sleep_extra_seconds
+
         def execute():
-            with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+            with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now,
+                                                              sleep=sleep)):
                 fixture.recover_new_reads(
                     read, lambda: last, expected, recovery, began=100.0, deadline_seconds=5,
                     max_new_reads=8,
@@ -356,7 +363,8 @@ class FreshReadRecoveryContracts(unittest.TestCase):
                     start_event="all pressure requests completed", progress=mark)
 
         return SimpleNamespace(run=execute, requests=requests, progress=progress,
-                               recovery=recovery, pending=pending, expected=expected)
+                               recovery=recovery, pending=pending, expected=expected,
+                               sleeps=sleeps)
 
     def test_transient_result_then_distinct_read_success_keeps_complete_ledger(self):
         for code in ("acquire_timeout", "execution_unknown", "query_error"):
@@ -365,7 +373,7 @@ class FreshReadRecoveryContracts(unittest.TestCase):
                                           (0.016, '{"rows":1,"text":"中文🙂"}')])
                 scenario.run()
                 self.assertEqual(scenario.requests, [("/read", 105.0, 100.0),
-                                                     ("/read", 105.0, 100.109)])
+                                                     ("/read", 105.0, 100.625)])
                 self.assertTrue(scenario.recovery["recovered"])
                 self.assertFalse(scenario.recovery["failed_request_replay"])
                 observations = scenario.recovery["observations"]
@@ -373,6 +381,20 @@ class FreshReadRecoveryContracts(unittest.TestCase):
                 self.assertEqual(observations[0]["body_prefix"], "error:" + code)
                 self.assertAlmostEqual(observations[0]["recovery_elapsed_seconds"], 0.109)
                 self.assertEqual(json.loads(observations[1]["body_prefix"]), scenario.expected)
+                self.assertEqual(observations[1]["recovery_scheduled_monotonic"], 100.625)
+                self.assertEqual(scenario.recovery["stop_reason"], "recovered")
+
+    def test_two_second_recovery_is_observed_without_more_reads_or_time(self):
+        scenario = self.scenario([(0.125, "error:acquire_timeout")] * 4
+                                  + [(0.125, '{"rows":1,"text":"中文🙂"}')])
+        scenario.run()
+        self.assertEqual([row[2] - 100 for row in scenario.requests],
+                         [0, 0.625, 1.25, 1.875, 2.5])
+        self.assertTrue(all(row[1] == 105 for row in scenario.requests))
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 2.625)
+        self.assertTrue(scenario.recovery["recovered"])
+        self.assertFalse(scenario.recovery["failed_request_replay"])
+        self.assertFalse(scenario.recovery["full_deadline_window_elapsed"])
 
     def test_later_new_request_keeps_original_deadline_instead_of_renewing(self):
         scenario = self.scenario([(4, "error:acquire_timeout"),
@@ -399,6 +421,17 @@ class FreshReadRecoveryContracts(unittest.TestCase):
         self.assertEqual(scenario.requests, [])
         self.assertEqual(scenario.recovery["elapsed_seconds"], 5)
 
+    def test_probe_wait_that_crosses_deadline_sends_no_new_read(self):
+        scenario = self.scenario([(0.125, "error:acquire_timeout")], sleep_extra_seconds=4.5)
+        with self.assertRaisesRegex(TimeoutError, "absolute deadline exceeded after 1"):
+            scenario.run()
+        self.assertEqual(scenario.requests, [("/read", 105.0, 100.0)])
+        self.assertEqual(scenario.progress, [1])
+        self.assertEqual(scenario.sleeps, [0.5])
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 5.125)
+        self.assertEqual(scenario.recovery["stop_reason"], "absolute_deadline")
+        self.assertTrue(scenario.recovery["full_deadline_window_elapsed"])
+
     def test_response_at_deadline_is_not_recovery(self):
         scenario = self.scenario([(5, '{"rows":1,"text":"中文🙂"}')])
         with self.assertRaises(TimeoutError):
@@ -408,14 +441,18 @@ class FreshReadRecoveryContracts(unittest.TestCase):
         self.assertFalse(scenario.recovery["recovered"])
         self.assertEqual(scenario.recovery["finished_monotonic"], 105.0)
 
-    def test_all_eight_allowed_errors_exhaust_new_read_count_without_replay(self):
+    def test_all_eight_allowed_errors_exhaust_distributed_count_without_replay(self):
         scenario = self.scenario([(0.125, "error:acquire_timeout")] * 8)
         with self.assertRaises(AssertionError):
             scenario.run()
         self.assertEqual(len(scenario.requests), 8)
         self.assertEqual([path for path, _, _ in scenario.requests], ["/read"] * 8)
         self.assertEqual(len(scenario.recovery["observations"]), 8)
-        self.assertEqual(scenario.recovery["elapsed_seconds"], 1.0)
+        self.assertEqual([row[2] - 100 for row in scenario.requests],
+                         [0, 0.625, 1.25, 1.875, 2.5, 3.125, 3.75, 4.375])
+        self.assertEqual(scenario.recovery["elapsed_seconds"], 4.5)
+        self.assertEqual(scenario.recovery["stop_reason"], "new_read_limit")
+        self.assertFalse(scenario.recovery["full_deadline_window_elapsed"])
         self.assertFalse(scenario.recovery["recovered"])
 
     def test_transient_errors_exhaust_window_without_sending_another_read(self):

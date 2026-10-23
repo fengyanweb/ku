@@ -91,10 +91,22 @@ def recover_new_reads(request, observe, expected, recovery, *, began, deadline_s
     recovery.update(observations=[], recovered=False, failed_request_replay=False,
                     started_monotonic=began, absolute_deadline_monotonic=deadline,
                     start_event=start_event,
+                    max_new_reads=max_new_reads,
+                    probe_schedule="earliest start at began + index * window / max_new_reads; overdue probes start immediately",
+                    stop_reason="request_or_validation_error",
                     deadline_semantics=f"one absolute {deadline_seconds:g}s window; each new request has min(4s, remaining window), including connect/write/all reads")
     allowed = {"error:" + code for code in intermediate_errors}
     try:
         for index in range(max_new_reads):
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            # Spread the bounded fresh reads over the existing window. Eight
+            # fast acquire errors must not consume every probe in its first
+            # second. Waiting does not renew either absolute deadline.
+            scheduled = began + index * deadline_seconds / max_new_reads
+            if now < scheduled:
+                time.sleep(min(scheduled - now, deadline - now))
             if time.monotonic() >= deadline:
                 break
             progress(index + 1)
@@ -105,6 +117,7 @@ def recover_new_reads(request, observe, expected, recovery, *, began, deadline_s
                 body = request("/read", deadline=deadline)
             finally:
                 observation = dict(observe())
+                observation["recovery_scheduled_monotonic"] = scheduled
                 observation["recovery_elapsed_seconds"] = time.monotonic() - began
                 recovery["observations"].append(observation)
             if body.startswith("error:"):
@@ -113,13 +126,21 @@ def recover_new_reads(request, observe, expected, recovery, *, began, deadline_s
             assert json.loads(body) == expected, observation
             deadline_remaining(deadline)
             recovery["recovered"] = True
+            recovery["stop_reason"] = "recovered"
             break
+        if not recovery["recovered"]:
+            recovery["stop_reason"] = ("absolute_deadline" if time.monotonic() >= deadline
+                                       else "new_read_limit")
     finally:
         recovery["finished_monotonic"] = time.monotonic()
         recovery["elapsed_seconds"] = recovery["finished_monotonic"] - began
+        recovery["full_deadline_window_elapsed"] = recovery["finished_monotonic"] >= deadline
+        if recovery["full_deadline_window_elapsed"] and not recovery["recovered"]:
+            recovery["stop_reason"] = "absolute_deadline"
     if recovery["finished_monotonic"] > deadline or (
             not recovery["recovered"] and recovery["finished_monotonic"] >= deadline):
         recovery["recovered"] = False
+        recovery["stop_reason"] = "absolute_deadline"
         raise TimeoutError(f"database recovery absolute deadline exceeded after {len(recovery['observations'])} new read requests")
     assert recovery["recovered"], recovery
 
