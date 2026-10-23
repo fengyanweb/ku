@@ -22,26 +22,53 @@ const CHECKED_INT_RUNTIME: &str = r#"
  * The caller maps OVERFLOW to "integer overflow" and DIV_ZERO to "division
  * by zero"; these statuses do not define public Error domain/code values. */
 enum { KU_INT_OK = 0u, KU_INT_OVERFLOW = 1u, KU_INT_DIV_ZERO = 2u };
+/* Keep the portable path for MSVC and compilers without these exact builtins.
+ * This private feature macro is undefined before any user code is emitted. */
+#if defined(__has_builtin)
+# if __has_builtin(__builtin_add_overflow) && __has_builtin(__builtin_sub_overflow)
+#  define KU_INT_USE_OVERFLOW_BUILTINS 1
+# endif
+#elif defined(__GNUC__) && __GNUC__ >= 5
+# define KU_INT_USE_OVERFLOW_BUILTINS 1
+#endif
+#ifndef KU_INT_USE_OVERFLOW_BUILTINS
+# define KU_INT_USE_OVERFLOW_BUILTINS 0
+#endif
 static uint32_t ku_int_neg(int64_t value, int64_t* out) {
   if (value == INT64_MIN) return KU_INT_OVERFLOW;
   *out = -value;
   return KU_INT_OK;
 }
 static uint32_t ku_int_add(int64_t left, int64_t right, int64_t* out) {
+#if KU_INT_USE_OVERFLOW_BUILTINS
+  /* A builtin writes its wrapped result even on overflow. Use a private
+   * temporary so failure still leaves out (including either input alias) intact. */
+  int64_t result;
+  if (__builtin_add_overflow(left, right, &result)) return KU_INT_OVERFLOW;
+  *out = result;
+#else
   /* MAX-right is evaluated only for positive right; MIN-right only for
    * negative right. Both bounds themselves are representable. */
   if ((right > 0 && left > INT64_MAX - right)
       || (right < 0 && left < INT64_MIN - right)) return KU_INT_OVERFLOW;
   *out = left + right;
+#endif
   return KU_INT_OK;
 }
 static uint32_t ku_int_sub(int64_t left, int64_t right, int64_t* out) {
+#if KU_INT_USE_OVERFLOW_BUILTINS
+  int64_t result;
+  if (__builtin_sub_overflow(left, right, &result)) return KU_INT_OVERFLOW;
+  *out = result;
+#else
   /* Do not negate right: right may be INT64_MIN. */
   if ((right > 0 && left < INT64_MIN + right)
       || (right < 0 && left > INT64_MAX + right)) return KU_INT_OVERFLOW;
   *out = left - right;
+#endif
   return KU_INT_OK;
 }
+#undef KU_INT_USE_OVERFLOW_BUILTINS
 static uint32_t ku_int_mul(int64_t left, int64_t right, int64_t* out) {
   /* Every divisor below is nonzero. INT64_MIN is divided only by a
    * positive value; MAX/negative is always representable. In the final
