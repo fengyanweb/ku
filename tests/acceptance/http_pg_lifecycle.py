@@ -3,7 +3,10 @@
 
 No existing db.conn, credentials or database are read. Requires PostgreSQL server
 tools and libpq development files. Proxy faults affect only this fixture. Output
-is evidence, never a claim that an unknown write was rolled back.
+is evidence, never a claim that an unknown write was rolled back. By default the
+synchronous and named async handlers run sequentially in separate private
+clusters. The requested output embeds both independent lane reports, including
+the current phase, so the existing CI artifact retains either lane's failure.
 """
 
 import argparse
@@ -145,6 +148,19 @@ def recover_new_reads(request, observe, expected, recovery, *, began, deadline_s
     assert recovery["recovered"], recovery
 
 
+def recover_fault_reads(request, report, expected, recovery_key, source_request, *,
+                        start_event, progress):
+    """Use the fault response's completion, including later checkpoint/oracle time."""
+    recovery = {}
+    report[recovery_key] = recovery
+    recover_new_reads(request, lambda: report["last_request"], expected, recovery,
+                      began=source_request["finished_monotonic"],
+                      deadline_seconds=report["parameters"]["fault_recovery_deadline_seconds"],
+                      max_new_reads=report["parameters"]["disconnect_recovery_max_new_reads"],
+                      intermediate_errors=report["parameters"]["disconnect_recovery_intermediate_errors"],
+                      start_event=start_event, progress=progress)
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -218,12 +234,18 @@ def run(args, progress=None, **kwargs):
         return out.strip()
 
 
-def cleanup_fixture(report, output, service, proxy, data, stop_database, started):
+def cleanup_fixture(report, output, service, proxy, data, stop_database, started,
+                    on_checkpoint=None):
     """Attempt every cleanup and save its result even if another cleanup fails."""
     errors = []
 
+    def mark(phase, **details):
+        checkpoint(report, output, phase, **details)
+        if on_checkpoint is not None:
+            on_checkpoint(report)
+
     def clean(label, action):
-        checkpoint(report, output, "cleanup:" + label + ":starting")
+        mark("cleanup:" + label + ":starting")
         try:
             action()
         except Exception as error:
@@ -246,7 +268,7 @@ def cleanup_fixture(report, output, service, proxy, data, stop_database, started
         report["cleanup_errors"] = errors
         if errors:
             report["status"] = "failed"
-        checkpoint(report, output, "cleanup:finished", error_count=len(errors))
+        mark("cleanup:finished", error_count=len(errors))
     if errors:
         raise RuntimeError(f"private PostgreSQL fixture cleanup failed: {errors}")
 
@@ -433,25 +455,27 @@ class DatabaseProxy:
             raise RuntimeError("fixture proxy failed to terminate")
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ku", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--loops", type=int, default=4)
     parser.add_argument("--performance-seconds", type=int, default=0, help="Run only bounded read throughput for 3..60s; omit fault replay")
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
-    args = parser.parse_args()
+    parser.add_argument("--lane", choices=["both", "sync", "async"], default="both",
+                        help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
+    args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
+    return args
+
+
+def run_lane(args, lane, on_checkpoint=None):
     ku = args.ku.resolve()
-    pg_config = shutil.which("pg_config") or "pg_config"
-    tools = Path(run([pg_config, "--bindir"]))
-    suffix = ".exe" if os.name == "nt" else ""
-    for name in ["initdb", "pg_ctl", "psql"]:
-        if not (tools / (name + suffix)).is_file():
-            raise RuntimeError(f"missing PostgreSQL server tool: {name}")
-    source = Path(__file__).resolve().parents[1] / "fixtures/http_pg_lifecycle.ku"
+    filename = "http_pg_lifecycle.ku" if lane == "sync" else "http_pg_lifecycle_async.ku"
+    source = Path(__file__).resolve().parents[1] / "fixtures" / filename
     report = {"platform": os.uname().sysname if hasattr(os, "uname") else os.name,
+              "lane": lane, "fixture": filename,
               "event_loops": args.loops, "database_retry": False,
               "cli_sha256": hashlib.sha256(ku.read_bytes()).hexdigest(),
               "fixture_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -462,6 +486,7 @@ def main():
                              "fault_recovery_deadline_seconds": 5,
                              "disconnect_recovery_max_new_reads": 8,
                              "disconnect_recovery_intermediate_errors": ["query_error", "execution_unknown", "acquire_timeout"],
+                             "post_fault_recovery_contract": "fresh reads within the existing 5s/8-read bound; first read need not succeed; window starts at original fault response completion and includes checkpoints and write-side-effect checks",
                              "http_client_connection_policy": "eight persistent clients, no failed-request replay" if args.performance_seconds else "one connection per isolated fault request",
                              "database_transport": "direct Ku/libpq to private PostgreSQL; no fault proxy" if args.performance_seconds else "private Python fault proxy, capacity eight connections",
                              "tls": "disabled only inside isolated loopback fixture"},
@@ -470,11 +495,19 @@ def main():
         if phase.startswith(("http:", "fault:")):
             report["acceptance_phase"] = phase
         checkpoint(report, args.output, phase, **details)
+        if on_checkpoint is not None:
+            on_checkpoint(report)
 
     def execute(arguments, **kwargs):
         return run(arguments, progress=progress, **kwargs)
 
     progress("fixture:starting")
+    pg_config = shutil.which("pg_config") or "pg_config"
+    tools = Path(execute([pg_config, "--bindir"]))
+    suffix = ".exe" if os.name == "nt" else ""
+    for name in ["initdb", "pg_ctl", "psql"]:
+        if not (tools / (name + suffix)).is_file():
+            raise RuntimeError(f"missing PostgreSQL server tool: {name}")
     with tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary:
         root = Path(temporary)
         database_port, http_port = port(), port()
@@ -711,19 +744,25 @@ def main():
                 report["checks"]["large_result"] = "10000 rows, 2 columns, last row verified"
                 progress("fault:slow-query")
                 slow = request("/slow")
+                slow_request = dict(report["last_request"])
                 assert slow == "error:execution_unknown", slow
                 progress("fault:timeout-new-read")
-                assert json.loads(request("/read")) == expected
+                recover_fault_reads(request, report, expected, "timeout_recovery", slow_request,
+                                    start_event="original /slow response finished; subsequent checkpoints consume this window",
+                                    progress=lambda index: progress("fault:timeout-new-read", new_request=index))
                 report["checks"]["timeout_and_new_request_recovery"] = slow
                 progress("fault:acknowledgement-lost-write")
                 proxy.drop_insert.set()
                 unknown = request("/insert/lost")
+                lost_write_request = dict(report["last_request"])
                 assert proxy.dropped.wait(1) and unknown == "error:execution_unknown", unknown
                 progress("fault:acknowledgement-lost-side-effect")
                 count = sql("SELECT count(*) FROM ku_events WHERE id='lost'")
                 assert count == "1", count
                 progress("fault:acknowledgement-lost-new-read")
-                assert json.loads(request("/read")) == expected
+                recover_fault_reads(request, report, expected, "lost_write_recovery", lost_write_request,
+                                    start_event="original /insert/lost response finished; proxy confirmation, exactly-one-row oracle and checkpoints consume this window",
+                                    progress=lambda index: progress("fault:acknowledgement-lost-new-read", new_request=index))
                 report["checks"]["commit_acknowledgement_lost"] = {"reported": unknown, "actual_rows": int(count), "replayed": False}
                 progress("fault:disconnect-terminate-backend")
                 terminated = sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'")
@@ -774,13 +813,18 @@ def main():
             assert len(report["runtime_metrics"]["loops"]) == args.loops
             assert all(loop["requests"] for loop in report["runtime_metrics"]["loops"])
             database_metrics = report["runtime_metrics"]["database"]
-            assert database_metrics["reserved_connections"] == 4
-            assert database_metrics["reserved_waiters"] == 8
-            assert database_metrics["pending_operations"] == 0
-            assert database_metrics["pending_bytes"] == 0
+            validate_database_metrics(database_metrics, lane, not args.performance_seconds)
             if not args.performance_seconds:
-                assert database_metrics["confirmed_cancellations"] > 0
-                report["checks"]["cancel_confirmed_and_local_charge_retired"] = database_metrics["confirmed_cancellations"]
+                if lane == "sync":
+                    report["checks"]["cancel_confirmed_and_local_charge_retired"] = database_metrics["confirmed_cancellations"]
+                else:
+                    # The async pump evicts/shuts down a failed lease; it does
+                    # not execute synchronous PQcancel + drain confirmation.
+                    report["checks"]["unknown_outcome_and_local_charge_retired"] = {
+                        "unknown_results": database_metrics["unknown_results"],
+                        "confirmed_cancellations": database_metrics["confirmed_cancellations"],
+                        "database_rollback_confirmed": False,
+                        "failed_request_replay": False}
             progress("http:normal-drain")
             request("/__ku/drain", method="POST", control=True)
             try:
@@ -825,10 +869,110 @@ def main():
             raise
         finally:
             cleanup_fixture(report, args.output, service, proxy, data,
-                lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"]), started)
+                lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"]), started,
+                on_checkpoint=on_checkpoint)
     report["status"] = "passed"
     progress("fixture:finished")
-    print(json.dumps(report, ensure_ascii=False))
+    return report
+
+
+def validate_database_metrics(metrics, lane, with_faults):
+    assert metrics["reserved_connections"] == 4, metrics
+    assert metrics["reserved_waiters"] == 8, metrics
+    assert metrics["pending_operations"] == 0, metrics
+    assert metrics["pending_bytes"] == 0, metrics
+    if with_faults:
+        if lane == "sync":
+            assert metrics["confirmed_cancellations"] > 0, metrics
+        else:
+            assert metrics["unknown_results"] > 0, metrics
+
+
+def run_lanes(args):
+    lanes = ["sync", "async"] if args.lane == "both" else [args.lane]
+    output = args.output.resolve()
+    report = {"status": "running", "required_lanes": lanes, "lanes": {},
+              "database_retry": False,
+              "execution_policy": "sequential independent private clusters; no failed-request replay",
+              "throughput_policy": "independent per-lane measurements; never pool lane QPS",
+              "outer_acceptance_deadline": "unchanged; controlled by the existing CI process owner"}
+    checkpoint(report, output, "lanes:starting")
+    blocked = None
+    interruption = None
+    for lane in lanes:
+        raw_output = output.with_name(f"{output.stem}.{lane}{output.suffix or '.json'}")
+        entry = {"status": "blocked" if blocked else "running", "report_file": str(raw_output)}
+        report["lanes"][lane] = entry
+        if blocked:
+            entry["reason"] = blocked
+            checkpoint(report, output, "lane:blocked", lane=lane)
+            continue
+
+        def mirror(raw):
+            # Existing phase boundaries only. In particular no disk writes are
+            # added to the separate read-throughput request loop.
+            entry["report"] = raw
+            checkpoint(report, output, "lane:checkpoint", lane=lane,
+                       lane_phase=raw.get("current_phase"))
+
+        lane_args = argparse.Namespace(**(vars(args) | {"output": raw_output}))
+        # Replace any earlier invocation's raw output before preflight. An old
+        # successful cleanup receipt must never authorize the next new lane.
+        checkpoint({"lane": lane, "status": "running"}, raw_output, "lane:starting")
+        error = None
+        try:
+            run_lane(lane_args, lane, mirror)
+        except BaseException as failure:
+            error = failure
+            if not isinstance(failure, Exception):
+                interruption = failure
+        finally:
+            # Cleanup writes directly to the independent raw report even when
+            # an earlier check raises; always retain that final cleanup result.
+            if raw_output.is_file():
+                try:
+                    with raw_output.open("rb") as stream:
+                        raw_bytes = stream.read(1048577)
+                    if len(raw_bytes) > 1048576:
+                        raise ValueError("lane report exceeds its 1 MiB evidence limit")
+                    entry["report_sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+                    entry["report"] = json.loads(raw_bytes)
+                except (OSError, ValueError) as failure:
+                    entry["report_read_error"] = f"{type(failure).__name__}: {failure}"[:2048]
+                    error = error or failure
+                    blocked = f"{lane} lane final report is unavailable; cleanup is not confirmed"
+            raw = entry.get("report", {})
+            cleanup_confirmed = raw.get("cleanup_errors") == []
+            entry["status"] = ("passed" if error is None and raw.get("status") == "passed"
+                               and cleanup_confirmed else "failed")
+            if error is not None:
+                entry["failure"] = f"{type(error).__name__}: {error}"[:2048]
+                if raw.get("status") != "failed" and "report_read_error" not in entry:
+                    raw["status"] = "failed"
+                    raw["failure"] = entry["failure"]
+                    checkpoint(raw, raw_output, "lane:failed")
+                    entry["report_sha256"] = hashlib.sha256(raw_output.read_bytes()).hexdigest()
+            if not cleanup_confirmed:
+                blocked = f"{lane} lane cleanup is not confirmed; no further fixture may start"
+            if interruption is not None:
+                blocked = f"{lane} lane interrupted; no further fixture may start"
+            if entry["status"] != "passed":
+                report["status"] = "failed"
+            checkpoint(report, output, "lane:finished", lane=lane, status=entry["status"])
+
+    report["status"] = "passed" if all(entry["status"] == "passed" for entry in report["lanes"].values()) else "failed"
+    checkpoint(report, output, "lanes:finished")
+    if interruption is not None:
+        raise interruption
+    if report["status"] != "passed":
+        raise RuntimeError(f"HTTP PostgreSQL lifecycle failed; independent reports: {output}")
+    return report
+
+
+def main():
+    report = run_lanes(parse_args())
+    print(json.dumps({"status": report["status"], "lanes": {
+        lane: entry["status"] for lane, entry in report["lanes"].items()}}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

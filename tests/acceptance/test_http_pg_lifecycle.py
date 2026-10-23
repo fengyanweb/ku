@@ -1,4 +1,5 @@
-"""Private PostgreSQL fixture setup must not broaden its parent permissions."""
+"""Private PostgreSQL setup, independent lanes and bounded recovery contracts."""
+import hashlib
 import json
 from contextlib import redirect_stdout
 import io
@@ -193,6 +194,129 @@ class FixtureProcessContracts(unittest.TestCase):
             stop.assert_not_called()
 
 
+class LaneOrchestrationContracts(unittest.TestCase):
+    def exercise(self, *, failure_lane=None, cleanup_errors=None, lane="both",
+                 performance_seconds=0):
+        with tempfile.TemporaryDirectory(prefix="ku-pg-lane-contract-") as temporary:
+            root = Path(temporary)
+            ku = root / "ku"
+            ku.write_bytes(b"fixture CLI identity, never executed")
+            output = root / "lifecycle.json"
+            args = fixture.parse_args(["--ku", str(ku), "--output", str(output),
+                                       "--lane", lane, "--performance-seconds", str(performance_seconds)])
+            invoked = []
+            snapshots = []
+
+            def run_lane(arguments, selected, on_checkpoint):
+                invoked.append(selected)
+                self.assertEqual(arguments.ku, ku)
+                self.assertEqual(arguments.performance_seconds, performance_seconds)
+                filename = "http_pg_lifecycle.ku" if selected == "sync" else "http_pg_lifecycle_async.ku"
+                source = Path(fixture.__file__).resolve().parents[1] / "fixtures" / filename
+                raw = {"status": "running", "lane": selected, "fixture": filename,
+                       "fixture_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                       "cli_sha256": hashlib.sha256(ku.read_bytes()).hexdigest(),
+                       "database_retry": False}
+                fixture.checkpoint(raw, arguments.output, "fault:slow-query")
+                on_checkpoint(raw)
+                current = json.loads(output.read_text())
+                self.assertEqual(current["phase_details"]["lane"], selected)
+                self.assertEqual(current["lanes"][selected]["report"], raw)
+                snapshots.append(current)
+                raw["status"] = "failed" if selected == failure_lane else "passed"
+                raw["cleanup_errors"] = cleanup_errors if selected == failure_lane and cleanup_errors else []
+                if performance_seconds:
+                    raw["throughput"] = {"requests_per_second": 100 if selected == "sync" else 200}
+                fixture.checkpoint(raw, arguments.output, "fixture:finished")
+                if selected == failure_lane:
+                    raise RuntimeError("original lane assertion failed")
+                return raw
+
+            with patch.object(fixture, "run_lane", side_effect=run_lane), redirect_stdout(io.StringIO()):
+                if failure_lane:
+                    with self.assertRaisesRegex(RuntimeError, "lifecycle failed"):
+                        fixture.run_lanes(args)
+                else:
+                    fixture.run_lanes(args)
+            aggregate = json.loads(output.read_text())
+            for entry in aggregate["lanes"].values():
+                if entry["status"] == "blocked":
+                    self.assertFalse(Path(entry["report_file"]).exists())
+                else:
+                    raw_bytes = Path(entry["report_file"]).read_bytes()
+                    self.assertEqual(entry["report_sha256"], hashlib.sha256(raw_bytes).hexdigest())
+                    self.assertEqual(entry["report"], json.loads(raw_bytes))
+            self.assertFalse(output.with_name(output.name + ".tmp").exists())
+            return aggregate, invoked, snapshots
+
+    def test_default_runs_both_lanes_and_keeps_separate_current_evidence(self):
+        args = fixture.parse_args(["--ku", "ku", "--output", "report.json"])
+        self.assertEqual(args.lane, "both")
+        report, invoked, snapshots = self.exercise()
+        self.assertEqual(invoked, ["sync", "async"])
+        self.assertEqual(report["status"], "passed")
+        lanes = report["lanes"]
+        self.assertEqual(lanes["sync"]["report"]["cli_sha256"], lanes["async"]["report"]["cli_sha256"])
+        self.assertNotEqual(lanes["sync"]["report"]["fixture_sha256"], lanes["async"]["report"]["fixture_sha256"])
+        self.assertEqual(snapshots[1]["lanes"]["sync"]["status"], "passed")
+        self.assertFalse(report["database_retry"])
+
+    def test_failed_lane_keeps_failure_and_runs_other_lane_only_after_cleanup(self):
+        for failed in ("sync", "async"):
+            with self.subTest(failed=failed):
+                report, invoked, _ = self.exercise(failure_lane=failed)
+                self.assertEqual(invoked, ["sync", "async"])
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(report["lanes"][failed]["report"]["status"], "failed")
+                self.assertEqual(report["lanes"][failed]["failure"], "RuntimeError: original lane assertion failed")
+
+    def test_failed_cleanup_blocks_next_cluster_instead_of_starting_it(self):
+        report, invoked, _ = self.exercise(failure_lane="sync", cleanup_errors=[{"stage": "postgres"}])
+        self.assertEqual(invoked, ["sync"])
+        self.assertEqual(report["lanes"]["async"]["status"], "blocked")
+        self.assertIn("cleanup is not confirmed", report["lanes"]["async"]["reason"])
+
+    def test_missing_cleanup_evidence_blocks_next_cluster(self):
+        with tempfile.TemporaryDirectory(prefix="ku-pg-lane-contract-") as temporary:
+            args = fixture.parse_args(["--ku", "ku", "--output", str(Path(temporary) / "result.json")])
+            stale_raw = args.output.with_name("result.sync.json")
+            stale_raw.write_text(json.dumps({"status": "passed", "cleanup_errors": []}))
+            with patch.object(fixture, "run_lane", side_effect=RuntimeError("preflight failed")) as runner, \
+                    redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                fixture.run_lanes(args)
+            self.assertEqual(runner.call_count, 1)
+            report = json.loads(args.output.read_text())
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["lanes"]["sync"]["report"]["status"], "failed")
+            self.assertNotIn("cleanup_errors", report["lanes"]["sync"]["report"])
+            self.assertEqual(report["lanes"]["async"]["status"], "blocked")
+
+    def test_explicit_lane_and_throughput_results_stay_independent(self):
+        report, invoked, _ = self.exercise(lane="async", performance_seconds=3)
+        self.assertEqual(invoked, ["async"])
+        self.assertEqual(report["lanes"]["async"]["report"]["throughput"]["requests_per_second"], 200)
+        report, invoked, _ = self.exercise(performance_seconds=3)
+        self.assertEqual(invoked, ["sync", "async"])
+        self.assertNotIn("throughput", report)
+        self.assertEqual([entry["report"]["throughput"]["requests_per_second"]
+                          for entry in report["lanes"].values()], [100, 200])
+
+    def test_async_unknown_does_not_claim_synchronous_cancel_confirmation(self):
+        metrics = {"reserved_connections": 4, "reserved_waiters": 8,
+                   "pending_operations": 0, "pending_bytes": 0,
+                   "confirmed_cancellations": 0, "unknown_results": 1}
+        fixture.validate_database_metrics(metrics, "async", True)
+        with self.assertRaises(AssertionError):
+            fixture.validate_database_metrics(metrics, "sync", True)
+        metrics["unknown_results"] = 0
+        with self.assertRaises(AssertionError):
+            fixture.validate_database_metrics(metrics, "async", True)
+        fixture.validate_database_metrics(metrics, "async", False)
+        for key in ("pending_operations", "pending_bytes"):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                fixture.validate_database_metrics(metrics | {key: 1}, "async", False)
+
+
 class RecoveryHTTPDeadlineContracts(unittest.TestCase):
     def scripted_drip(self, chunks, timeout_stage):
         """Exercise the actual HTTP/deadline readers without peer scheduling."""
@@ -322,6 +446,49 @@ class RecoveryHTTPDeadlineContracts(unittest.TestCase):
 
 
 class FreshReadRecoveryContracts(unittest.TestCase):
+    def test_fault_response_origin_includes_later_side_effect_and_checkpoint_time(self):
+        expected = {"rows": 1, "text": "中文🙂"}
+        report = {"parameters": {"fault_recovery_deadline_seconds": 5,
+                                 "disconnect_recovery_max_new_reads": 8,
+                                 "disconnect_recovery_intermediate_errors": ["acquire_timeout"]},
+                  "last_request": {"finished_monotonic": 104.7}}
+        clock = SimpleNamespace(now=104.8)
+        calls = []
+
+        def read(path, *, deadline):
+            calls.append((path, deadline, clock.now))
+            clock.now += 0.1
+            body = json.dumps(expected)
+            report["last_request"] = {"body_prefix": body, "finished_monotonic": clock.now}
+            return body
+
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+            fixture.recover_fault_reads(read, report, expected, "lost_write_recovery",
+                                        {"finished_monotonic": 100.0},
+                                        start_event="original INSERT response finished",
+                                        progress=lambda index: None)
+        self.assertEqual(calls, [("/read", 105.0, 104.8)])
+        recovery = report["lost_write_recovery"]
+        self.assertEqual(recovery["started_monotonic"], 100.0)
+        self.assertAlmostEqual(recovery["elapsed_seconds"], 4.9)
+        self.assertFalse(recovery["failed_request_replay"])
+
+    def test_side_effect_check_consuming_fault_window_cannot_start_new_read(self):
+        report = {"parameters": {"fault_recovery_deadline_seconds": 5,
+                                 "disconnect_recovery_max_new_reads": 8,
+                                 "disconnect_recovery_intermediate_errors": ["acquire_timeout"]}}
+        read = Mock()
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 105.0)), \
+                self.assertRaises(TimeoutError):
+            fixture.recover_fault_reads(read, report, {}, "timeout_recovery",
+                                        {"finished_monotonic": 100.0},
+                                        start_event="original /slow response finished",
+                                        progress=lambda index: None)
+        read.assert_not_called()
+        self.assertEqual(report["timeout_recovery"]["observations"], [])
+        self.assertEqual(report["timeout_recovery"]["absolute_deadline_monotonic"], 105.0)
+        self.assertEqual(report["timeout_recovery"]["stop_reason"], "absolute_deadline")
+
     def scenario(self, responses, *, initial_time=100.0, progress_seconds=0,
                  sleep_extra_seconds=0):
         clock = SimpleNamespace(now=initial_time)
