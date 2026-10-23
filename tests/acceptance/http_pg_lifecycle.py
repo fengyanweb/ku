@@ -161,6 +161,101 @@ def recover_fault_reads(request, report, expected, recovery_key, source_request,
                       start_event=start_event, progress=progress)
 
 
+SESSION_OBSERVATION_SQL = (
+    "WITH sessions AS MATERIALIZED ("
+    "SELECT pid, state, query_start, state_change, wait_event_type, wait_event, "
+    "left(query, 128) AS query_prefix FROM pg_stat_activity "
+    "WHERE application_name='ku_runtime_acceptance') "
+    "SELECT json_build_object('count', (SELECT count(*) FROM sessions), "
+    "'rows', (SELECT COALESCE(json_agg(observed), '[]'::json) FROM "
+    "(SELECT * FROM sessions ORDER BY pid LIMIT 24) AS observed))")
+
+
+def observe_database_connections(sql, history, *, maximum, began, deadline,
+                                 max_observations=8, progress=None):
+    """Observe remote session retirement; never replay a business operation.
+
+    Client lease destruction does not synchronously terminate its server query.
+    Every observation includes a total count and at most 24 state rows from the
+    same read-only statement. The caller supplies the already running window.
+    """
+    if not 1 <= max_observations <= 8 or maximum < 0:
+        raise ValueError("invalid bounded database connection observation")
+    if deadline is None and max_observations != 1:
+        raise ValueError("immediate observation cannot introduce a wait")
+    history.update(observations=[], recovered=False, started_monotonic=began,
+                   absolute_deadline_monotonic=deadline, maximum_connections=maximum,
+                   max_observations=max_observations, row_limit=24,
+                   query_prefix_characters=128, business_operation_replay=False,
+                   probe_schedule="first observation immediately; later earliest starts at began + index * original_window / max_observations; overdue slots do not renew the window",
+                   stop_reason="observation_error")
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("database session retirement absolute deadline exceeded")
+        return value
+
+    try:
+        for index in range(max_observations):
+            scheduled = began if deadline is None else began + index * (deadline - began) / max_observations
+            if deadline is not None:
+                remaining()
+                wait = scheduled - time.monotonic()
+                if index and wait > 0:
+                    time.sleep(min(wait, remaining()))
+                remaining()
+            if progress is not None:
+                progress(index + 1)
+            if deadline is not None:
+                remaining()  # Checkpoints cannot renew the original window.
+            observation = {"sequence": index + 1, "scheduled_monotonic": scheduled,
+                           "started_monotonic": time.monotonic()}
+            history["observations"].append(observation)
+            try:
+                value = json.loads(sql(SESSION_OBSERVATION_SQL, deadline=deadline))
+                if (not isinstance(value, dict) or type(value.get("count")) is not int
+                        or value["count"] < 0 or not isinstance(value.get("rows"), list)
+                        or len(value["rows"]) > 24
+                        or any(not isinstance(row, dict) for row in value["rows"])):
+                    raise ValueError("invalid bounded database session observation")
+                observation.update(count=value["count"], rows=value["rows"])
+            except Exception as error:
+                observation["error"] = f"{type(error).__name__}: {error}"[:1024]
+                raise
+            finally:
+                observation["finished_monotonic"] = time.monotonic()
+            if deadline is not None:
+                remaining()  # A late zero/count below the cap is not a pass.
+            if value["count"] <= maximum:
+                history.update(recovered=True, stop_reason="observed_within_limit")
+                return value["count"]
+        history["stop_reason"] = "observation_limit"
+        raise AssertionError(f"database connections remain above {maximum}: {value['count']}")
+    except TimeoutError:
+        history["stop_reason"] = "absolute_deadline"
+        raise
+    finally:
+        history["finished_monotonic"] = time.monotonic()
+        history["elapsed_seconds"] = history["finished_monotonic"] - began
+
+
+def wait_service_exit(service, deadline):
+    """The HTTP drain and direct process wait consume one existing window."""
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("service drain absolute deadline exceeded")
+        service.wait(timeout=remaining)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("service drain absolute deadline exceeded")
+    except (subprocess.TimeoutExpired, TimeoutError):
+        if service.poll() is None:
+            service.kill()
+            service.wait(timeout=3)
+        raise TimeoutError("service did not terminate within the shared 5 second drain window")
+
+
 def port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -180,7 +275,7 @@ def checkpoint(report, output, phase, **details):
     print(json.dumps({"phase": phase, **details}, ensure_ascii=False), flush=True)
 
 
-def run(args, progress=None, **kwargs):
+def run(args, progress=None, timeout_seconds=60, deadline=None, **kwargs):
     """Wait for the tool, not EOF from an intentionally backgrounded server.
 
     Windows subprocess.run kills only its direct child on timeout, then calls
@@ -191,6 +286,18 @@ def run(args, progress=None, **kwargs):
     tool = Path(str(args[0])).name
     operation = next((str(arg) for arg in args[1:] if str(arg) in ("start", "stop")), None)
     label = tool + (":" + operation if operation else "")
+    if timeout_seconds <= 0 or timeout_seconds > 60:
+        raise ValueError("fixture tool timeout must be positive and at most 60 seconds")
+    if deadline is None and timeout_seconds != 60:
+        deadline = time.monotonic() + timeout_seconds
+
+    def wait_budget():
+        if deadline is None:
+            return timeout_seconds
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{tool} absolute acceptance deadline exceeded")
+        return min(timeout_seconds, remaining)
 
     def mark(state, **details):
         phase = label + ":" + state
@@ -199,22 +306,31 @@ def run(args, progress=None, **kwargs):
         else:
             print(json.dumps({"phase": phase, **details}), flush=True)
 
-    mark("starting", timeout_seconds=60)
+    wait_budget()  # Do not launch another tool after an expired window.
+    mark("starting", timeout_seconds=timeout_seconds)
     began = time.monotonic()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
-        mark("running", pid=child.pid, timeout_seconds=60)
+        child = None
         timed_out = False
         cleanup_error = None
         try:
-            child.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+            wait_budget()  # Checkpoints, file setup and Popen consume the window.
+            child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
+            mark("running", pid=child.pid, timeout_seconds=timeout_seconds)
             try:
-                child.kill()
-                child.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                cleanup_error = f"{type(error).__name__}: {error}"
+                child.wait(timeout=wait_budget())
+                wait_budget()  # Process creation and a late exit count too.
+            except (subprocess.TimeoutExpired, TimeoutError):
+                timed_out = True
+        finally:
+            # Also reap this direct child if a checkpoint raises or execution
+            # is interrupted. The outer owner still contains the fixture tree.
+            if child is not None and (timed_out or child.poll() is None):
+                try:
+                    child.kill()
+                    child.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    cleanup_error = f"{type(error).__name__}: {error}"
         captured = []
         sizes = []
         for stream in (stdout, stderr):
@@ -225,8 +341,13 @@ def run(args, progress=None, **kwargs):
         mark("timeout" if timed_out else "finished", pid=child.pid, exit_code=child.returncode,
              elapsed_seconds=time.monotonic() - began, stdout_bytes=sizes[0], stderr_bytes=sizes[1],
              stdout_tail=out[-2000:], stderr_tail=err[-4000:], direct_child_cleanup_error=cleanup_error)
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True  # Output capture and its checkpoint share the cap.
         if timed_out:
-            raise RuntimeError(f"{tool} exceeded 60 seconds; direct-child cleanup: {cleanup_error or 'reaped'}")
+            message = f"{tool} exceeded {timeout_seconds:g} seconds; direct-child cleanup: {cleanup_error or 'reaped'}"
+            if deadline is not None:
+                raise TimeoutError(message)
+            raise RuntimeError(message)
         if any(size > 65536 for size in sizes):
             raise RuntimeError(f"{tool} exceeded the fixture's 65536-byte per-stream output limit")
         if child.returncode:
@@ -484,6 +605,8 @@ def run_lane(args, lane, on_checkpoint=None):
                              "database_waiters": 8, "database_pending_bytes": 1048576,
                              "acquire_timeout_ms": 100, "query_timeout_ms": 150, "handler_timeout_ms": 2000,
                              "fault_recovery_deadline_seconds": 5,
+                             "session_retirement_max_observations": 8,
+                             "session_retirement_contract": "pressure session observations share the original join-to-recovery 5s window; drain, process exit and zero-session observations share one 5s window from the drain request; client close does not confirm remote query termination",
                              "disconnect_recovery_max_new_reads": 8,
                              "disconnect_recovery_intermediate_errors": ["query_error", "execution_unknown", "acquire_timeout"],
                              "post_fault_recovery_contract": "fresh reads within the existing 5s/8-read bound; first read need not succeed; window starts at original fault response completion and includes checkpoints and write-side-effect checks",
@@ -550,10 +673,40 @@ def run_lane(args, lane, on_checkpoint=None):
             execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
             started = True
 
-            def sql(statement):
-                return execute([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+            def sql(statement, deadline=None):
+                budget = {}
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("database observation deadline expired before psql launch")
+                    budget = {"timeout_seconds": min(60, remaining), "deadline": deadline}
+                value = execute([tools / "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                             "-h", "127.0.0.1", "-p", str(database_port), "-U", "ku_accept",
-                            "-d", "postgres", "-c", statement], env=environment)
+                            "-d", "postgres", "-c", statement], env=environment, **budget)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("database observation returned after its absolute deadline")
+                return value
+
+            def check_connection_retirement(history_field, count_field, activity_field,
+                                            maximum, began, deadline, observations):
+                history = {}
+                report[history_field] = history
+                try:
+                    return observe_database_connections(
+                        sql, history, maximum=maximum, began=began, deadline=deadline,
+                        max_observations=observations,
+                        progress=lambda index: progress("http:session-retirement", stage=history_field,
+                                                        observation=index))
+                finally:
+                    samples = history.get("observations", [])
+                    if samples and "count" in samples[0]:
+                        first = samples[0]
+                        # Keep the first measured count and its bounded state
+                        # sample even if later observations confirm retirement.
+                        report[count_field] = first["count"]
+                        if first["count"] > maximum:
+                            report[activity_field] = {**first, "observed_count": first["count"],
+                                                      "row_limit": 24, "query_prefix_characters": 128}
 
             report["postgres_version"] = sql("SHOW server_version")
             sql("CREATE TABLE ku_events(id text PRIMARY KEY, payload text NOT NULL)")
@@ -804,9 +957,13 @@ def run_lane(args, lane, on_checkpoint=None):
                                   progress=lambda index: progress("fault:bounded-dependency-pressure-new-read", new_request=index))
                 report["checks"]["bounded_dependency_pressure_recovery"] = counts
             progress("http:connection-accounting")
-            connections = int(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'"))
-            report["database_connections_after_dependency_pressure"] = connections
-            assert connections <= 4, connections
+            pressure = report.get("pressure_recovery")
+            connections = check_connection_retirement(
+                "pressure_connection_retirement", "database_connections_after_dependency_pressure",
+                "database_connection_overflow_activity", 4,
+                pressure["started_monotonic"] if pressure else time.monotonic(),
+                pressure["absolute_deadline_monotonic"] if pressure else None,
+                report["parameters"]["session_retirement_max_observations"] if pressure else 1)
             report["database_connections_before_exit"] = connections
             progress("http:runtime-metrics")
             report["runtime_metrics"] = json.loads(request("/__ku/metrics", control=True))
@@ -826,17 +983,20 @@ def run_lane(args, lane, on_checkpoint=None):
                         "database_rollback_confirmed": False,
                         "failed_request_replay": False}
             progress("http:normal-drain")
-            request("/__ku/drain", method="POST", control=True)
-            try:
-                service.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                service.kill()
-                service.wait(timeout=3)
-                raise RuntimeError("service did not terminate within 5 seconds")
+            drain_began = time.monotonic()
+            drain_deadline = drain_began + report["parameters"]["fault_recovery_deadline_seconds"]
+            report["normal_drain"] = {"started_monotonic": drain_began,
+                                      "absolute_deadline_monotonic": drain_deadline,
+                                      "start_event": "original drain request begins; request, checkpoints, process wait and session observations share this window"}
+            request("/__ku/drain", method="POST", control=True, deadline=drain_deadline)
+            wait_service_exit(service, drain_deadline)
             assert service.returncode == 0, service.returncode
             report["checks"]["normal_drain_exit"] = service.returncode
             progress("http:connections-after-exit")
-            assert sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='ku_runtime_acceptance'") == "0"
+            check_connection_retirement(
+                "drain_connection_retirement", "database_connections_after_exit",
+                "database_connections_after_exit_activity", 0, drain_began, drain_deadline,
+                report["parameters"]["session_retirement_max_observations"])
             report["checks"]["database_connections_after_exit"] = 0
             report["status"] = "checks_passed"
         except Exception as error:

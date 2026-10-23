@@ -194,6 +194,299 @@ class FixtureProcessContracts(unittest.TestCase):
             stop.assert_not_called()
 
 
+class FixtureAbsoluteDeadlineContracts(unittest.TestCase):
+    def test_expired_tool_deadline_opens_no_child(self):
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 105.0)), \
+                patch.object(fixture.subprocess, "Popen") as launch, \
+                self.assertRaises(TimeoutError):
+            fixture.run(["fixture-tool"], deadline=105.0, progress=Mock())
+        launch.assert_not_called()
+
+    def test_starting_checkpoint_consumes_tool_budget_before_launch(self):
+        clock = SimpleNamespace(now=100.0)
+
+        def progress(phase, **details):
+            clock.now += 5.0
+
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                patch.object(fixture.subprocess, "Popen") as launch, \
+                self.assertRaises(TimeoutError):
+            fixture.run(["fixture-tool"], deadline=105.0, progress=progress)
+        launch.assert_not_called()
+
+    def test_short_tool_budget_includes_checkpoints_and_process_creation(self):
+        clock = SimpleNamespace(now=100.0)
+        child = Mock(pid=123, returncode=0)
+        child.poll.return_value = 0
+
+        def launch(*args, **kwargs):
+            clock.now += 0.5
+            return child
+
+        def progress(phase, **details):
+            if phase.endswith((":starting", ":running")):
+                clock.now += 0.5
+
+        def wait(*, timeout):
+            self.assertEqual(timeout, 0.5)
+            clock.now += 0.25
+
+        child.wait.side_effect = wait
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                patch.object(fixture.subprocess, "Popen", side_effect=launch):
+            fixture.run(["fixture-tool"], timeout_seconds=2, progress=progress)
+        self.assertEqual(clock.now, 101.75)
+        child.kill.assert_not_called()
+        child.communicate.assert_not_called()
+
+    def test_late_process_creation_kills_and_reaps_with_bounded_cleanup(self):
+        clock = SimpleNamespace(now=100.0)
+        child = Mock(pid=123, returncode=0)
+        child.poll.return_value = None
+
+        def launch(*args, **kwargs):
+            clock.now = 105.0
+            return child
+
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                patch.object(fixture.subprocess, "Popen", side_effect=launch), \
+                self.assertRaises(TimeoutError):
+            fixture.run(["fixture-tool"], deadline=105.0, progress=Mock())
+        child.kill.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+        child.communicate.assert_not_called()
+
+    def test_tool_timeout_reaps_direct_child_without_renewing_deadline(self):
+        child = Mock(pid=123, returncode=1)
+        child.poll.return_value = None
+        child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 5), 1]
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 100.0)), \
+                patch.object(fixture.subprocess, "Popen", return_value=child), \
+                self.assertRaises(TimeoutError):
+            fixture.run(["fixture-tool"], deadline=105.0, progress=Mock())
+        self.assertEqual(child.wait.call_args_list,
+                         [unittest.mock.call(timeout=5.0), unittest.mock.call(timeout=5)])
+        child.kill.assert_called_once()
+        child.communicate.assert_not_called()
+
+    def test_running_checkpoint_failure_still_kills_and_reaps_child(self):
+        child = Mock(pid=123, returncode=None)
+        child.poll.return_value = None
+
+        def progress(phase, **details):
+            if phase.endswith(":running"):
+                raise RuntimeError("checkpoint failure")
+
+        with patch.object(fixture.subprocess, "Popen", return_value=child), \
+                self.assertRaisesRegex(RuntimeError, "checkpoint failure"):
+            fixture.run(["fixture-tool"], progress=progress)
+        child.kill.assert_called_once()
+        child.wait.assert_called_once_with(timeout=5)
+
+    def test_late_output_checkpoint_cannot_turn_exit_zero_into_success(self):
+        clock = SimpleNamespace(now=100.0)
+        child = Mock(pid=123, returncode=0)
+        child.poll.return_value = 0
+
+        def progress(phase, **details):
+            if phase.endswith(":finished"):
+                clock.now = 105.0
+
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                patch.object(fixture.subprocess, "Popen", return_value=child), \
+                self.assertRaises(TimeoutError):
+            fixture.run(["fixture-tool"], deadline=105.0, progress=progress)
+        child.wait.assert_called_once_with(timeout=5.0)
+        child.kill.assert_not_called()
+
+    def test_drain_after_other_work_uses_only_existing_remaining_time(self):
+        service = Mock()
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 104.8)):
+            fixture.wait_service_exit(service, deadline=105.0)
+        self.assertAlmostEqual(service.wait.call_args.kwargs["timeout"], 0.2)
+        service.kill.assert_not_called()
+
+    def test_drain_expiry_never_reopens_a_five_second_window(self):
+        service = Mock()
+        service.poll.return_value = None
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 105.0)), \
+                self.assertRaises(TimeoutError):
+            fixture.wait_service_exit(service, deadline=105.0)
+        service.kill.assert_called_once()
+        service.wait.assert_called_once_with(timeout=3)
+
+    def test_direct_exit_at_deadline_is_late_even_with_exit_zero(self):
+        clock = SimpleNamespace(now=104.8)
+        service = Mock()
+        service.poll.return_value = 0
+        service.wait.side_effect = lambda **kwargs: setattr(clock, "now", 105.0)
+        with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now)), \
+                self.assertRaises(TimeoutError):
+            fixture.wait_service_exit(service, deadline=105.0)
+        self.assertEqual(service.wait.call_count, 1)
+        service.kill.assert_not_called()
+
+
+class RemoteSessionRetirementContracts(unittest.TestCase):
+    def scenario(self, observations, *, initial_time=100.0, progress_seconds=0,
+                 deadline=105.0, maximum=4, max_observations=8, sleep_extra_seconds=0):
+        clock = SimpleNamespace(now=initial_time)
+        pending = list(observations)
+        calls, checkpoints, sleeps, history = [], [], [], {}
+
+        def sql(statement, *, deadline):
+            calls.append((statement, deadline, clock.now))
+            self.assertTrue(pending, "unexpected additional database observation")
+            elapsed, value = pending.pop(0)
+            clock.now += elapsed
+            if isinstance(value, Exception):
+                raise value
+            return json.dumps(value)
+
+        def progress(sequence):
+            checkpoints.append(sequence)
+            clock.now += progress_seconds
+
+        def sleep(seconds):
+            self.assertGreater(seconds, 0)
+            sleeps.append(seconds)
+            clock.now += seconds + sleep_extra_seconds
+
+        def execute():
+            with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: clock.now,
+                                                              sleep=sleep)):
+                return fixture.observe_database_connections(
+                    sql, history, maximum=maximum, began=100.0, deadline=deadline,
+                    max_observations=max_observations, progress=progress)
+
+        return SimpleNamespace(run=execute, calls=calls, checkpoints=checkpoints,
+                               sleeps=sleeps, history=history, pending=pending, clock=clock)
+
+    def test_remote_sessions_can_retire_within_original_window(self):
+        states = [{"pid": index, "state": "active", "wait_event": "PgSleep"}
+                  for index in range(4)] + [{"pid": 4, "state": "idle"}]
+        scenario = self.scenario([(0.1, {"count": 5, "rows": states}),
+                                  (0.1, {"count": 1, "rows": states[-1:]})])
+        self.assertEqual(scenario.run(), 1)
+        self.assertEqual([row[2] for row in scenario.calls], [100.0, 100.625])
+        self.assertEqual([row[1] for row in scenario.calls], [105.0, 105.0])
+        self.assertTrue(all(row[0] == fixture.SESSION_OBSERVATION_SQL for row in scenario.calls))
+        self.assertIn("LIMIT 24", scenario.calls[0][0])
+        self.assertIn("left(query, 128)", scenario.calls[0][0])
+        self.assertEqual([row["count"] for row in scenario.history["observations"]], [5, 1])
+        self.assertEqual(scenario.history["observations"][0]["rows"], states)
+        self.assertEqual(scenario.history["absolute_deadline_monotonic"], 105.0)
+        self.assertTrue(scenario.history["recovered"])
+        self.assertFalse(scenario.history["business_operation_replay"])
+
+    def test_permanent_excess_is_bounded_by_original_eight_observations(self):
+        scenario = self.scenario([(0.1, {"count": 5, "rows": []})] * 8)
+        with self.assertRaises(AssertionError):
+            scenario.run()
+        self.assertEqual(len(scenario.calls), 8)
+        self.assertEqual([row[2] for row in scenario.calls],
+                         [100.0, 100.625, 101.25, 101.875, 102.5, 103.125, 103.75, 104.375])
+        self.assertEqual(scenario.history["stop_reason"], "observation_limit")
+        self.assertFalse(scenario.history["recovered"])
+
+    def test_nonmonotonic_session_counts_preserve_each_observation(self):
+        scenario = self.scenario([(0.05, {"count": count, "rows": []}) for count in (5, 7, 6, 4)])
+        self.assertEqual(scenario.run(), 4)
+        self.assertEqual([row["count"] for row in scenario.history["observations"]], [5, 7, 6, 4])
+        self.assertEqual(len(scenario.calls), 4)
+
+    def test_new_reads_and_logs_consuming_window_do_not_renew_it(self):
+        scenario = self.scenario([(0.1, {"count": 1, "rows": []})], initial_time=104.8)
+        self.assertEqual(scenario.run(), 1)
+        self.assertEqual([row[1:] for row in scenario.calls], [(105.0, 104.8)])
+        self.assertAlmostEqual(scenario.history["elapsed_seconds"], 4.9)
+
+    def test_expired_window_sends_no_session_query(self):
+        scenario = self.scenario([], initial_time=105.0)
+        with self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(scenario.calls, [])
+        self.assertEqual(scenario.checkpoints, [])
+        self.assertEqual(scenario.history["observations"], [])
+        self.assertEqual(scenario.history["stop_reason"], "absolute_deadline")
+
+    def test_progress_checkpoint_can_exhaust_window_without_launching_sql(self):
+        scenario = self.scenario([], progress_seconds=5)
+        with self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(scenario.calls, [])
+        self.assertEqual(scenario.checkpoints, [1])
+        self.assertEqual(scenario.history["elapsed_seconds"], 5)
+
+    def test_slow_query_cannot_report_late_zero_as_success(self):
+        scenario = self.scenario([(5, {"count": 0, "rows": []})], maximum=0)
+        with self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(len(scenario.calls), 1)
+        self.assertEqual(scenario.history["observations"][0]["count"], 0)
+        self.assertEqual(scenario.history["observations"][0]["finished_monotonic"], 105.0)
+        self.assertFalse(scenario.history["recovered"])
+
+    def test_response_decoding_time_is_part_of_existing_window(self):
+        scenario = self.scenario([(4.8, {"count": 0, "rows": []})], maximum=0)
+        decoder = json.loads
+
+        def decode(text):
+            value = decoder(text)
+            scenario.clock.now += 0.2
+            return value
+
+        with patch.object(fixture.json, "loads", side_effect=decode), self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(scenario.history["observations"][0]["finished_monotonic"], 105.0)
+        self.assertFalse(scenario.history["recovered"])
+
+    def test_oversleep_beyond_deadline_cannot_launch_next_session_query(self):
+        scenario = self.scenario([(0.1, {"count": 5, "rows": []})], sleep_extra_seconds=4.5)
+        with self.assertRaises(TimeoutError):
+            scenario.run()
+        self.assertEqual(len(scenario.calls), 1)
+        self.assertEqual(scenario.checkpoints, [1])
+        self.assertEqual(scenario.history["stop_reason"], "absolute_deadline")
+
+    def test_sql_error_is_preserved_without_replaying_or_more_observations(self):
+        scenario = self.scenario([(0.2, RuntimeError("observation tool failed")),
+                                  (0.1, {"count": 0, "rows": []})])
+        with self.assertRaisesRegex(RuntimeError, "observation tool failed"):
+            scenario.run()
+        self.assertEqual(len(scenario.calls), 1)
+        self.assertEqual(len(scenario.pending), 1)
+        self.assertIn("RuntimeError", scenario.history["observations"][0]["error"])
+        self.assertFalse(scenario.history["recovered"])
+
+    def test_immediate_mode_never_adds_waits_or_additional_queries(self):
+        for count, accepted in ((4, True), (5, False)):
+            with self.subTest(count=count):
+                scenario = self.scenario([(0.1, {"count": count, "rows": []})],
+                                         deadline=None, max_observations=1)
+                if accepted:
+                    self.assertEqual(scenario.run(), 4)
+                else:
+                    with self.assertRaises(AssertionError):
+                        scenario.run()
+                self.assertEqual(len(scenario.calls), 1)
+                self.assertEqual(scenario.sleeps, [])
+                self.assertIsNone(scenario.calls[0][1])
+
+    def test_invalid_counts_or_unbounded_state_rows_fail_without_next_query(self):
+        malformed = [{"count": count, "rows": []} for count in (-1, True, 1.0, "1", None)]
+        malformed += [{"count": 1, "rows": rows} for rows in ({}, None, ["not a state"], [{}] * 25)]
+        malformed += [[], None, {"count": 1}, {"rows": []}]
+        for value in malformed:
+            with self.subTest(value=value):
+                scenario = self.scenario([(0.1, value), (0.1, {"count": 0, "rows": []})])
+                with self.assertRaises(ValueError):
+                    scenario.run()
+                self.assertEqual(len(scenario.calls), 1)
+                self.assertEqual(len(scenario.pending), 1)
+                self.assertFalse(scenario.history["recovered"])
+
+
 class LaneOrchestrationContracts(unittest.TestCase):
     def exercise(self, *, failure_lane=None, cleanup_errors=None, lane="both",
                  performance_seconds=0):
