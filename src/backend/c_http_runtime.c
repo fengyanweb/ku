@@ -676,8 +676,35 @@ static KuString ku_http_string_copy(const char* ptr, size_t len) {
   memcpy(data, ptr, len);
   return (KuString){ data, len, len, KU_STRING_OWNED };
 }
+/* Cold failure witnesses are fixed storage. No error strings, request bodies,
+ * pointers or credentials are copied into diagnostics. Result error names only
+ * classify the transport decision; they do not assert an unforgeable origin. */
+enum {
+  KU_HTTP_ERROR_UNKNOWN, KU_HTTP_ERROR_HANDLER_RESULT, KU_HTTP_ERROR_HANDLER_500,
+  KU_HTTP_ERROR_TASK_LIMIT, KU_HTTP_ERROR_TASK_CLOSED, KU_HTTP_ERROR_TASK_OOM,
+  KU_HTTP_ERROR_DRIVER, KU_HTTP_ERROR_INVALID_RESPONSE, KU_HTTP_ERROR_ALLOCATION,
+  KU_HTTP_ERROR_PROJECTION, KU_HTTP_ERROR_QUEUE, KU_HTTP_ERROR_DEADLINE,
+  KU_HTTP_ERROR_HANDLER_EXIT, KU_HTTP_ERROR_PARSER_INVARIANT, KU_HTTP_ERROR_PEER_RESET, KU_HTTP_ERROR_COUNT
+};
+typedef struct KuHttpFailure {
+  uint64_t task_slot,task_generation,function_id;
+  uint32_t reason,driver_status,stage;
+} KuHttpFailure;
+static KU_THREAD_LOCAL KuHttpFailure ku_http_failure_current;
+static int ku_http_error_name(KuString value,const char* text) {
+  size_t n=strlen(text); return value.len==n && (!n || !memcmp(value.ptr,text,n));
+}
+static uint32_t ku_http_result_failure(KuError* error) {
+  if(ku_http_error_name(error->domain,"task")) {
+    if(ku_http_error_name(error->code,"too_many_tasks")) return KU_HTTP_ERROR_TASK_LIMIT;
+    if(ku_http_error_name(error->code,"runtime_stopped")) return KU_HTTP_ERROR_TASK_CLOSED;
+    if(ku_http_error_name(error->code,"out_of_memory") || ku_http_error_name(error->code,"memory_limit")) return KU_HTTP_ERROR_TASK_OOM;
+  }
+  return KU_HTTP_ERROR_HANDLER_RESULT;
+}
 static KuStruct___ku_http_response ku_http_response_from_result(KuResult_struct___ku_http_response r) {
-  if (r.ok) { KuStruct___ku_http_response v = r.value; r.value = (KuStruct___ku_http_response){0}; return v; }
+  if (r.ok) { if(r.value.status==500) ku_http_failure_current.reason=KU_HTTP_ERROR_HANDLER_500; KuStruct___ku_http_response v = r.value; r.value = (KuStruct___ku_http_response){0}; return v; }
+  ku_http_failure_current.reason=ku_http_result_failure(&r.error);
   KuStruct___ku_http_response v;
   v.status = 500;
   v.content_type = ku_string_static((const uint8_t*)"text/plain; charset=utf-8", 25);
@@ -1053,6 +1080,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
   size_t param_count = 0;
   KuHttpHandler* route = ku_http_trie_match(server->root, segs, seglens, nseg, 0, method, param_values, param_value_lens, &param_count);
   if (route && param_count != route->nparams) {
+    ku_http_failure_current.reason=KU_HTTP_ERROR_PARSER_INVARIANT;
     return ku_http_status_response(500, "Internal Server Error");
   }
   if (route) {
@@ -1107,6 +1135,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
          handler may complete after its original deadline; drop that response
          before selecting 504/500. Failed Result transport was dropped above. */
       if (!route->returns_result) ku_drop_struct___ku_http_response(&resp);
+      ku_http_failure_current.reason=handler_timed_out ? KU_HTTP_ERROR_DEADLINE : KU_HTTP_ERROR_HANDLER_EXIT;
       return handler_timed_out
         ? ku_http_status_response(504, "Gateway Timeout")
         : ku_http_status_response(500, "Internal Server Error");
@@ -1365,6 +1394,7 @@ struct KuHttpJob {
   KuHttpInput input;
   KuStruct___ku_http_response response;
   unsigned long long handler_deadline, request_deadline;
+  KuHttpFailure failure;
   int claimed; int started; int completed; int cancelled;
 };
 static int ku_http_job_projection(KuHttpJob* job,size_t bytes) {
@@ -1441,12 +1471,17 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   if (cancelled) { job->cancelled = 1; job->completed = 1; }
   ku_http_mutex_unlock(&job->lock);
   if (cancelled) { ku_http_input_drop(&job->input); ku_http_wake_notify(job->queue->wake); return; }
+  ku_http_failure_current=(KuHttpFailure){0};
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
+  KuHttpFailure failure=ku_http_failure_current;
+  failure.stage=2;
+  if(response.status==500 && !failure.reason) failure.reason=KU_HTTP_ERROR_HANDLER_500;
   ku_http_input_drop(&job->input);
   size_t response_charge = ku_http_buffer_admit_response(job->budget, &response);
   ku_http_buffer_refund(job->budget,job->projection_charge); job->projection_charge=0;
   ku_http_mutex_lock(&job->lock);
   job->response_charge = response_charge;
+  job->failure = failure;
   job->response = response;
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
@@ -1634,10 +1669,21 @@ enum {
   KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7,
   KU_HTTP_IO_ASYNC = 8, KU_HTTP_IO_CLOSED_ASYNC = 9
 };
-typedef struct {
+typedef struct KuHttpActiveSet {
+  struct KuHttpConnection* connections;
+  int* indices;
+  int count,capacity,free_head;
+  size_t sockets;
+} KuHttpActiveSet;
+typedef struct KuHttpConnection {
   KuHttpSocket socket_value;
   KuHttpBufferBudget* budget;
+  KuHttpActiveSet* active_set;
+  int active_position,free_next;
   int phase; int poll_index; int management;
+  uint64_t connection_slot,connection_generation,request_sequence;
+  unsigned char request_id[48]; uint32_t request_id_length,request_id_truncated;
+  KuHttpFailure failure;
   unsigned long long deadline, request_deadline;
   char* header; size_t capacity; size_t buffered;
   size_t body_received;
@@ -1646,11 +1692,51 @@ typedef struct {
   KuHttpInput input;
   KuHttpJob* job;
   void* async_task;
-  int async_cancelled;
+  int async_cancelled, peer_read_paused;
   unsigned long long async_deadline, async_cleanup_deadline;
   KuHttpOutput output;
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
+typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
+/* Owner-thread-only indices borrow fixed connection storage. Neither the
+   dense table nor the free chain owns a socket, Task, job, or lease. */
+static void ku_http_active_begin(KuHttpConnection* connection) {
+  KuHttpActiveSet* active=connection->active_set;
+  if(!active) return; /* Dedicated management/rejection storage. */
+  int slot=(int)(connection-active->connections);
+  if(slot<0 || slot>=active->capacity || active->free_head!=slot
+      || connection->active_position!=-1 || active->count>=active->capacity) {
+    fputs("http active-slot admission invariant failed\n",stderr); exit(1);
+  }
+  active->free_head=connection->free_next;
+  connection->active_position=active->count;
+  active->indices[active->count++]=slot;
+  active->sockets++;
+}
+static void ku_http_active_retire(KuHttpConnection* connection) {
+  KuHttpActiveSet* active=connection->active_set;
+  if(!active || connection->active_position<0) return;
+  int slot=(int)(connection-active->connections),position=connection->active_position;
+  if(position>=active->count || active->indices[position]!=slot) {
+    fputs("http active-slot retirement invariant failed\n",stderr); exit(1);
+  }
+  int last=active->indices[--active->count];
+  if(position<active->count) {
+    active->indices[position]=last;
+    active->connections[last].active_position=position;
+  }
+  connection->active_position=-1;
+  connection->free_next=active->free_head;
+  active->free_head=slot;
+}
+static KuHttpConnection* ku_http_polled_connection(KuHttpActiveSet* active,
+    const KuHttpPollConnection* interest,int poll_index,KuHttpSocket socket_value) {
+  if(interest->slot<0 || interest->slot>=active->capacity) return NULL;
+  KuHttpConnection* connection=&active->connections[interest->slot];
+  if(connection->active_position<0 || connection->connection_generation!=interest->generation
+      || connection->poll_index!=poll_index || connection->socket_value!=socket_value) return NULL;
+  return connection;
+}
 enum {
   KU_HTTP_CLOSE_IDLE_PRESSURE, KU_HTTP_CLOSE_RESPONSE_POLICY,
   KU_HTTP_CLOSE_WRITE_DEADLINE, KU_HTTP_CLOSE_PEER_WRITE,
@@ -1658,6 +1744,8 @@ enum {
   KU_HTTP_CLOSE_REASON_COUNT
 };
 static void ku_http_count_transport_close(KuHttpConnection*,int);
+static void ku_http_connection_identity(KuHttpConnection*);
+static void ku_http_record_failure(KuHttpConnection*,int);
 static void ku_http_output_part(KuHttpOutput* output, const char* bytes, size_t length) {
   if (!length) return;
   if (output->count >= 9) { fputs("http response segment bound exceeded\n", stderr); exit(1); }
@@ -1668,6 +1756,10 @@ static void ku_http_count_response(int);
 static void ku_http_count_admitted(void);
 static void ku_http_connection_close(KuHttpConnection* connection) {
   if (connection->socket_value != KU_HTTP_INVALID_SOCKET) {
+    if(connection->active_set) {
+      if(!connection->active_set->sockets) { fputs("http active socket accounting failed\n",stderr); exit(1); }
+      connection->active_set->sockets--;
+    }
     ku_http_socket_shutdown_write(connection->socket_value);
     ku_http_socket_close(connection->socket_value);
     connection->socket_value = KU_HTTP_INVALID_SOCKET;
@@ -1694,8 +1786,12 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
     return;
   }
   if (connection->job) ku_http_job_release(connection->job);
+  ku_http_active_retire(connection);
+  KuHttpActiveSet* active=connection->active_set;
+  int free_next=connection->free_next;
   memset(connection, 0, sizeof(*connection));
   connection->socket_value = KU_HTTP_INVALID_SOCKET;
+  connection->active_set=active; connection->active_position=-1; connection->free_next=free_next;
 }
 static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
   free(connection->header); connection->header = NULL;
@@ -1710,6 +1806,8 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
     ku_drop_struct___ku_http_response(&response);
     ku_http_buffer_refund(connection->budget, response_charge); response_charge = 0; admitted = 1;
     response = ku_http_status_response(500, "Internal Server Error");
+    connection->failure.reason=KU_HTTP_ERROR_INVALID_RESPONSE;
+    connection->failure.stage=4;
   }
   if (!admitted) response_charge = ku_http_buffer_admit_response(connection->budget, &response);
   connection->output.charge = response_charge;
@@ -1717,6 +1815,7 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
   KuHttpOutput* output = &connection->output;
   output->response = response;
   ku_http_count_response((int)response.status);
+  if(response.status>=500) ku_http_record_failure(connection,(int)response.status);
   size_t body_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
     ? 0 : response.body.len;
   int first_length = snprintf(output->first, sizeof(output->first), "HTTP/1.1 %lld %s\r\n", (long long)response.status, ku_http_status_text(response.status));
@@ -1747,19 +1846,27 @@ static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServ
 }
 static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer* server, int status) {
   connection->keep_alive = 0;
+  if(!connection->failure.reason && (status==504 || status==408)) connection->failure.reason=KU_HTTP_ERROR_DEADLINE;
+  if(!connection->failure.reason && status==503) connection->failure.reason=KU_HTTP_ERROR_PROJECTION;
   ku_http_connection_response(connection, server, ku_http_status_response(status, ku_http_status_text(status)), 0, 0);
 }
 static void ku_http_connection_start(KuHttpConnection* connection, KuHttpSocket socket_value, KuHttpServer* server) {
+  ku_http_active_begin(connection);
+  KuHttpActiveSet* active=connection->active_set;
+  int position=connection->active_position;
   memset(connection, 0, sizeof(*connection));
+  connection->active_set=active; connection->active_position=position;
   connection->socket_value = socket_value;
   connection->budget = server->buffer_budget;
   connection->phase = KU_HTTP_IO_HEADER;
+  ku_http_connection_identity(connection);
+  connection->request_sequence=1;
   connection->request_deadline = ku_http_deadline_ms(server->request_timeout_ms);
   if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
   connection->capacity = 1024;
   connection->header = (char*)malloc(connection->capacity);
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) ku_http_connection_status(connection, server, 500);
+  if (!connection->header) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); }
 }
 /* A response may be published before the worker releases its real reference.
    Reuse the physical slot only after that owner retires, exactly as close does. */
@@ -1776,6 +1883,10 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   memset(&connection->output, 0, sizeof(connection->output));
   connection->keep_alive = 0; connection->reused = 1;
+  if(connection->request_sequence!=UINT64_MAX) connection->request_sequence++;
+  connection->request_id_length=0; connection->request_id_truncated=0;
+  connection->peer_read_paused=0;
+  connection->failure=(KuHttpFailure){0};
   connection->request_deadline = 0;
   connection->buffered = 0; connection->body_received = 0;
   if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
@@ -1783,7 +1894,7 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   connection->header = (char*)malloc(connection->capacity);
   connection->phase = KU_HTTP_IO_HEADER;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) ku_http_connection_status(connection, server, 500);
+  if (!connection->header) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); }
 }
 static int ku_http_control_request(KuHttpConnection*, KuHttpServer*);
 static void ku_http_count_request(void);
@@ -1796,12 +1907,19 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   if (ku_http_control_request(connection, server)) return;
   if (connection->management) { ku_http_connection_status(connection,server,404); return; }
   ku_http_count_request();
+  KuValue* rid=connection->input.headers ? ku_object_get(connection->input.headers,
+      ku_string_static((const uint8_t*)"x-request-id",12)) : NULL;
+  if(rid && rid->tag==KU_STR) {
+    size_t n=rid->as.s.len;
+    if(n>sizeof(connection->request_id)) { n=sizeof(connection->request_id); connection->request_id_truncated=1; }
+    memcpy(connection->request_id,rid->as.s.ptr,n); connection->request_id_length=(uint32_t)n;
+  }
   if (!ku_http_utf8_valid((const uint8_t*)connection->input.body, connection->input.body_len)) {
     ku_http_connection_status(connection, server, 400); return;
   }
   if (ku_http_async_submit(connection, server)) return;
   KuHttpJob* job = ku_http_job_new(queue, &connection->input);
-  if (!job) { ku_http_connection_status(connection, server, 500); return; }
+  if (!job) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); return; }
   job->request_deadline = connection->request_deadline;
   connection->job = job;
   connection->phase = KU_HTTP_IO_JOB;
@@ -1816,7 +1934,7 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   char incoming[KU_HTTP_READ_CHUNK];
   int received;
   if (connection->carry_length) {
-    if (connection->carry_length > sizeof(incoming)) { ku_http_connection_status(connection, server, 500); return; }
+    if (connection->carry_length > sizeof(incoming)) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
     received = (int)connection->carry_length;
     memcpy(incoming, connection->carry, connection->carry_length);
     free(connection->carry); connection->carry = NULL;
@@ -1838,7 +1956,7 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   if (connection->reused && !connection->buffered && !connection->request_deadline
       && !ku_http_reused_request_admit()) { ku_http_connection_close(connection); return; }
   size_t scan_from = connection->buffered;
-  if ((size_t)received > SIZE_MAX - scan_from) { ku_http_connection_status(connection, server, 500); return; }
+  if ((size_t)received > SIZE_MAX - scan_from) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
   size_t needed = scan_from + (size_t)received;
   if (needed > connection->capacity) {
     size_t capacity = connection->capacity;
@@ -1873,7 +1991,7 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
     size_t header_length = index - 3;
     connection->input.budget = connection->budget;
     int status = ku_http_parse_complete_header(server, header, header_length, &connection->input);
-    if (status) { ku_http_connection_status(connection, server, status); return; }
+    if (status) { if(status==500) connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, status); return; }
     connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_body_timeout_ms > 0 ? server->read_body_timeout_ms : 10000));
     connection->keep_alive = connection->input.keep_alive;
     size_t prefix = needed - (index + 1);
@@ -1881,7 +1999,7 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
     size_t extra = needed - (index + 1) - prefix;
     if (extra && connection->keep_alive) {
       /* At most this one finite recv chunk can be ahead of the current body. */
-      if (extra > KU_HTTP_READ_CHUNK) { ku_http_connection_status(connection, server, 500); return; }
+      if (extra > KU_HTTP_READ_CHUNK) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
       if (!ku_http_buffer_reserve(connection->budget, extra)) { ku_http_connection_status(connection, server, 503); return; }
       connection->carry = (char*)malloc(extra);
       if (!connection->carry) {
@@ -1966,6 +2084,7 @@ static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpS
   int cancelled = job->cancelled;
   if (completed && !cancelled) {
     response = job->response; response_charge = job->response_charge;
+    connection->failure=job->failure;
     job->response = (KuStruct___ku_http_response){0}; job->response_charge = 0;
   }
   ku_http_mutex_unlock(&job->lock);
@@ -2010,6 +2129,7 @@ static void ku_http_reject_read(KuHttpConnection* connection, KuHttpServer* serv
   }
 }
 static int ku_http_free_slot(KuHttpConnection* connections, int count) {
+  if(count>0 && connections[0].active_set) return connections[0].active_set->free_head;
   for (int index = 0; index < count; index++) if (connections[index].phase == KU_HTTP_IO_FREE) return index;
   return -1;
 }
@@ -2080,6 +2200,7 @@ typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, pending, workers, ready, exited, drained;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
+  KuHttpConnection* connection_base; uint64_t connection_generation;
   uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
   unsigned long long transport_closes[KU_HTTP_CLOSE_REASON_COUNT];
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
@@ -2099,6 +2220,13 @@ struct KuHttpLoopGroup {
   unsigned long long accepted, max_requests, drain_deadline;
   uint32_t drain_ms;
   const char* failure;
+  uint64_t error_counts[KU_HTTP_ERROR_COUNT],error_sample_count,error_samples_dropped,http_500_total,unknown_500;
+  struct {
+    KuHttpFailure failure;
+    uint64_t owner,request_sequence,connection_slot,connection_generation,at_ms;
+    unsigned char request_id[48]; uint32_t request_id_length,request_id_truncated;
+    int phase,status;
+  } error_samples[8];
   KuHttpLoopOwner loops[KU_HTTP_MAX_LOOPS];
 };
 /* Called only by this owner's event thread with group->lock held. A failed or
@@ -2112,6 +2240,52 @@ static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint
 }
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
+static void ku_http_connection_identity(KuHttpConnection* connection) {
+  KuHttpLoopOwner* owner=ku_http_current_loop;
+  connection->connection_slot=UINT64_MAX;
+  if(!owner) return;
+  uintptr_t first=(uintptr_t)owner->connection_base,at=(uintptr_t)connection;
+  if(first && at>=first && at-first<(size_t)owner->slots*sizeof(*connection)
+      && !((at-first)%sizeof(*connection))) connection->connection_slot=(at-first)/sizeof(*connection);
+  if(owner->connection_generation!=UINT64_MAX) owner->connection_generation++;
+  connection->connection_generation=owner->connection_generation;
+}
+static void ku_http_record_failure(KuHttpConnection* connection,int status) {
+  KuHttpLoopOwner* owner=ku_http_current_loop;
+  if(!owner || connection->management) return;
+  uint32_t reason=connection->failure.reason;
+  if(reason>=KU_HTTP_ERROR_COUNT) reason=KU_HTTP_ERROR_UNKNOWN;
+  KuHttpLoopGroup* group=owner->group;
+  ku_http_mutex_lock(&group->lock);
+  if(group->error_counts[reason]!=UINT64_MAX) group->error_counts[reason]++;
+  if(status==500) {
+    if(group->http_500_total!=UINT64_MAX) group->http_500_total++;
+    if(reason==KU_HTTP_ERROR_UNKNOWN && group->unknown_500!=UINT64_MAX) group->unknown_500++;
+  }
+  /* Do not let ordinary 503/deadline pressure consume the bounded evidence
+     for internal failures. A new 500 may replace an older peer-reset sample. */
+  size_t sample=8u;
+  int eligible=status==500 || reason==KU_HTTP_ERROR_PEER_RESET;
+  if(eligible && group->error_sample_count<8u) sample=(size_t)group->error_sample_count++;
+  else if(status==500) for(size_t i=0;i<8u;i++) if(group->error_samples[i].status!=500) {
+    sample=i; if(group->error_samples_dropped!=UINT64_MAX) group->error_samples_dropped++; break;
+  }
+  if(sample<8u) {
+    size_t i=sample;
+    group->error_samples[i].failure=connection->failure;
+    group->error_samples[i].failure.reason=reason;
+    group->error_samples[i].owner=(uint64_t)owner->index;
+    group->error_samples[i].request_sequence=connection->request_sequence;
+    group->error_samples[i].connection_slot=connection->connection_slot;
+    group->error_samples[i].connection_generation=connection->connection_generation;
+    group->error_samples[i].at_ms=ku_http_now_ms();
+    group->error_samples[i].phase=connection->phase; group->error_samples[i].status=status;
+    memcpy(group->error_samples[i].request_id,connection->request_id,sizeof(connection->request_id));
+    group->error_samples[i].request_id_length=connection->request_id_length;
+    group->error_samples[i].request_id_truncated=connection->request_id_truncated;
+  } else if(eligible && group->error_samples_dropped!=UINT64_MAX) group->error_samples_dropped++;
+  ku_http_mutex_unlock(&group->lock);
+}
 /* Branch witnesses, not request IDs or proof that a client observed this close.
    Counts are fixed storage and publication never performs diagnostic I/O.
    response_policy includes explicit Connection:close, error responses and
@@ -2239,7 +2413,7 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   KuHttpHandler* route = ku_http_trie_match(server->root, segs, seglens, nseg, 0, method, param_values, param_value_lens, &param_count);
 
   if (!route || route->returns_result != 2) return 0;
-  if (param_count != route->nparams) { ku_http_connection_status(connection,server,500); return 1; }
+  if (param_count != route->nparams) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection,server,500); return 1; }
   KuStruct___ku_http_request req = {0};
   size_t projection_charge=0;
   if (route->arity == 1) {
@@ -2263,7 +2437,7 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   ku_drop_struct___ku_http_request(&req);
   ku_http_buffer_refund(connection->budget,projection_charge);
   ku_http_input_drop(input);
-  if (status) { ku_http_connection_status(connection,server,503); return 1; }
+  if (status) { connection->failure=(KuHttpFailure){.reason=KU_HTTP_ERROR_TASK_LIMIT,.driver_status=status,.stage=1}; ku_http_connection_status(connection,server,503); return 1; }
   ku_http_count_admitted();
   connection->phase = KU_HTTP_IO_ASYNC;
   connection->async_deadline = ku_http_deadline_ms((uint32_t)server->handler_timeout_ms);
@@ -2290,6 +2464,9 @@ static int ku_http_async_observe(KuHttpConnection* connection, KuHttpServer* ser
   uint32_t status = ku_http_task_poll(ku_http_live_group->tasks,&connection->async_task,
       connection->async_cancelled,connection->async_cancelled ? connection->async_cleanup_deadline : connection->async_deadline,&response,&response_charge);
   if (status == 1u) return connection->phase == KU_HTTP_IO_ASYNC;
+  connection->failure=ku_http_failure_current;
+  connection->failure.stage=3;
+  if(status) { connection->failure.reason=KU_HTTP_ERROR_DRIVER; connection->failure.driver_status=status; }
   if (connection->async_cancelled) {
     ku_drop_struct___ku_http_response(&response);
     ku_http_buffer_refund(connection->budget,response_charge);
@@ -2304,6 +2481,24 @@ static int ku_http_async_observe(KuHttpConnection* connection, KuHttpServer* ser
 #else
   (void)connection; (void)server; return 0;
 #endif
+}
+/* Observe only a real readiness event while work owns the response. A FIN
+ * is a legal request write-half-close and pipeline bytes belong to the next
+ * request: neither means that this response is undeliverable. Pause that read
+ * interest after observing either, avoiding a level-triggered busy loop. A
+ * failed peek (for example ECONNRESET) is a concrete transport failure. The
+ * ordinary close path requests cancellation but retains the physical Task/job
+ * lease, buffers and active slot until actual retirement. */
+static void ku_http_connection_observe_peer(KuHttpConnection* connection) {
+  char byte;
+  int received=recv(connection->socket_value,&byte,1,MSG_PEEK);
+  if(received>=0) { connection->peer_read_paused=1; return; }
+  int error=ku_http_socket_last_error();
+  if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
+  connection->failure.reason=KU_HTTP_ERROR_PEER_RESET;
+  connection->failure.stage=5;
+  ku_http_record_failure(connection,0); /* No response can be delivered. */
+  ku_http_connection_close(connection);
 }
 static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* server) {
   KuHttpLoopGroup* group = ku_http_live_group;
@@ -2327,7 +2522,7 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
   if (metrics) {
     /* Fixed bound includes 32 owners and every counter at full uint64 width;
        it remains inside the reserved management channel's 64 KiB quota. */
-    char text[49152]; size_t used = 0;
+    char text[57344]; size_t used = 0;
     ku_http_mutex_lock(&group->lock);
     int n = snprintf(text,sizeof(text),"{\"loops\":[");
     if (n < 0) _Exit(79);
@@ -2367,6 +2562,31 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     }
     ku_http_mutex_unlock(&group->lock);
     text[used++]=']';
+    {
+      static const char* reasons[KU_HTTP_ERROR_COUNT]={"unknown","handler_result","handler_500","task_limit","task_closed","task_oom","driver_invariant","invalid_response","allocation","projection_budget","queue_admission","deadline","handler_exit","parser_invariant","peer_reset"};
+      n=snprintf(text+used,sizeof(text)-used,",\"errors\":{\"sample_limit\":8,\"request_id_encoding\":\"hex\",\"counts\":{");
+      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      ku_http_mutex_lock(&group->lock);
+      for(size_t i=0;i<KU_HTTP_ERROR_COUNT;i++) {
+        n=snprintf(text+used,sizeof(text)-used,"%s\"%s\":%llu",i?",":"",reasons[i],(unsigned long long)group->error_counts[i]);
+        if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      }
+      n=snprintf(text+used,sizeof(text)-used,"},\"sample_policy\":\"500_and_peer_reset_500_priority\",\"dropped_samples\":%llu,\"http_500_total\":%llu,\"unknown_500\":%llu,\"samples\":[",(unsigned long long)group->error_samples_dropped,(unsigned long long)group->http_500_total,(unsigned long long)group->unknown_500);
+      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      for(size_t i=0;i<group->error_sample_count;i++) {
+        char rid[97]; static const char hex[]="0123456789abcdef";
+        for(size_t j=0;j<group->error_samples[i].request_id_length;j++) {
+          unsigned char c=group->error_samples[i].request_id[j]; rid[j*2]=hex[c>>4]; rid[j*2+1]=hex[c&15];
+        }
+        rid[group->error_samples[i].request_id_length*2]=0;
+        KuHttpFailure* f=&group->error_samples[i].failure;
+        n=snprintf(text+used,sizeof(text)-used,"%s{\"reason\":\"%s\",\"owner\":%llu,\"request_id\":\"%s\",\"request_id_truncated\":%s,\"request_sequence\":%llu,\"connection_slot\":%llu,\"connection_generation\":%llu,\"task_slot\":%llu,\"task_generation\":%llu,\"function_id\":%llu,\"phase\":%d,\"stage\":%u,\"driver_status\":%u,\"http_status\":%d,\"at_ms\":%llu}",i?",":"",reasons[f->reason],(unsigned long long)group->error_samples[i].owner,rid,group->error_samples[i].request_id_truncated?"true":"false",(unsigned long long)group->error_samples[i].request_sequence,(unsigned long long)group->error_samples[i].connection_slot,(unsigned long long)group->error_samples[i].connection_generation,(unsigned long long)f->task_slot,(unsigned long long)f->task_generation,(unsigned long long)f->function_id,group->error_samples[i].phase,f->stage,f->driver_status,group->error_samples[i].status,(unsigned long long)group->error_samples[i].at_ms);
+        if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      }
+      ku_http_mutex_unlock(&group->lock);
+      n=snprintf(text+used,sizeof(text)-used,"]}");
+      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    }
     ku_http_mutex_lock(&group->server->buffer_budget->lock);
     n=snprintf(text+used,sizeof(text)-used,",\"buffer_bytes\":%llu,\"peak_buffer_bytes\":%llu,\"buffer_rejections\":%llu",
       (unsigned long long)group->server->buffer_budget->current,(unsigned long long)group->server->buffer_budget->peak,(unsigned long long)group->server->buffer_budget->rejected);
@@ -2453,25 +2673,33 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   int slot_count = owner->slots;
   int nworkers = owner->workers;
   KuHttpConnection* connections = (KuHttpConnection*)calloc((size_t)slot_count, sizeof(KuHttpConnection));
+  owner->connection_base=connections;
   size_t poll_capacity=(size_t)slot_count+3u;
 #if defined(KU_HTTP_HAS_TASK_NET)
   poll_capacity+=KU_TASK_NET_POLL_CAPACITY;
   KuTaskNetPollV1 net_interests[KU_TASK_NET_POLL_CAPACITY];
 #endif
   KuHttpPollFd* poll_items = (KuHttpPollFd*)calloc(poll_capacity,sizeof(KuHttpPollFd));
+  int* active_indices=(int*)calloc((size_t)slot_count,sizeof(int));
+  KuHttpPollConnection* poll_connections=(KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection));
+  KuHttpActiveSet active={connections,active_indices,0,slot_count,0,0};
   KuHttpPending pending = {0};
   pending.cap = max_pending;
   pending.items = (KuHttpPendingItem*)calloc((size_t)max_pending, sizeof(KuHttpPendingItem));
-  if (!connections || !poll_items || !pending.items) {
-    free(connections); free(poll_items); free(pending.items);
+  if (!connections || !poll_items || !pending.items || !active_indices || !poll_connections) {
+    free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections);
     return "reactor allocation failed";
   }
-  for (int index = 0; index < slot_count; index++) connections[index].socket_value = KU_HTTP_INVALID_SOCKET;
+  for (int index=0;index<slot_count;index++) {
+    connections[index].socket_value=KU_HTTP_INVALID_SOCKET;
+    connections[index].active_set=&active; connections[index].active_position=-1;
+    connections[index].free_next=index+1<slot_count ? index+1 : -1;
+  }
   KuHttpConnection rejection = {0};
   rejection.socket_value = KU_HTTP_INVALID_SOCKET;
   KuHttpWake wake;
   if (!ku_http_wake_init(&wake)) {
-    free(connections); free(poll_items); free(pending.items);
+    free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections);
     return "reactor wake initialization failed";
   }
   KuHttpQueue queue;
@@ -2479,7 +2707,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      original max_pending bound is not duplicated by another pending job pool. */
   if (!ku_http_queue_init(&queue, slot_count, &wake)) {
     ku_http_wake_close(&wake);
-    free(connections); free(poll_items); free(pending.items);
+    free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections);
     return "handler queue initialization failed";
   }
   KuHttpWorkerCtx ctx; ctx.server = server; ctx.queue = &queue;
@@ -2523,8 +2751,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     size_t queued = (size_t)queue.count, running = queue.running, resident = queue.resident;
     size_t queued_bytes=queue.queued_bytes, peak_queued_bytes=queue.peak_queued_bytes;
     ku_http_mutex_unlock(&queue.lock);
-    size_t occupied_connections = 0;
-    for (int i=0; i<slot_count; i++) if (connections[i].socket_value != KU_HTTP_INVALID_SOCKET) occupied_connections++;
+    size_t occupied_connections=active.sockets;
     uint64_t sampled_cpu_ns=0, sampled_cpu_ms=ku_http_now_ms();
     int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
     int cpu_sample_valid=cpu_sample_due && ku_http_thread_cpu_ns(&sampled_cpu_ns);
@@ -2556,7 +2783,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_queue_close(&queue, 0);
       ku_http_pending_close(&pending);
       ku_http_connection_close(&rejection);
-      for (int index = 0; index < slot_count; index++) {
+      for (int position=active.count;position-->0;) {
+        int index=active.indices[position];
         KuHttpConnection* connection = &connections[index];
         if (connection->phase == KU_HTTP_IO_JOB) {
           ku_http_mutex_lock(&connection->job->lock);
@@ -2573,7 +2801,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     if (pumped > 1u && !listen_failure) listen_failure = "HTTP Task event loop failed";
 #endif
     unsigned long long now = ku_http_now_ms();
-    for (int index = 0; index < slot_count; index++) {
+    /* Reverse traversal is intentional: swap-remove moves only a tail that
+       this pass already observed. Admission runs strictly between passes. */
+    for (int position=active.count;position-->0;) {
+      int index=active.indices[position];
       KuHttpConnection* connection = &connections[index];
       /* This is reuse admission at the response boundary. A keep-alive header
          already sent is a snapshot, not a promise to retain a pressured idle
@@ -2625,8 +2856,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_connection_close(&rejection);
     }
     if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
-    int occupied = rejection.phase != KU_HTTP_IO_FREE;
-    for (int index = 0; index < slot_count; index++) occupied |= connections[index].phase != KU_HTTP_IO_FREE;
+    int occupied = rejection.phase != KU_HTTP_IO_FREE || active.count;
     if (!listening && !occupied && !pending.count && !ku_http_queue_resident(&queue)) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
       ku_http_mutex_lock(&group->lock); owner->drained = 1; ku_http_mutex_unlock(&group->lock);
@@ -2651,20 +2881,26 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_poll_add(poll_items, &poll_count, srv, KU_HTTP_POLL_READ);
       }
     }
-    for (int index = 0; index < slot_count; index++) {
+    int connection_poll_base=poll_count,connection_poll_count=0;
+    for (int position=0;position<active.count;position++) {
+      int index=active.indices[position];
       KuHttpConnection* connection = &connections[index];
       connection->poll_index = -1;
       short events = 0;
       if (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) events = KU_HTTP_POLL_READ;
       else if (connection->phase == KU_HTTP_IO_WRITE) events = KU_HTTP_POLL_WRITE;
+      else if ((connection->phase == KU_HTTP_IO_ASYNC || connection->phase == KU_HTTP_IO_JOB)
+          && !connection->peer_read_paused) events=KU_HTTP_POLL_READ;
       if (connection->phase == KU_HTTP_IO_JOB && connection->job && connection->job->request_deadline < nearest)
         nearest = connection->job->request_deadline;
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
         nearest = connection->async_deadline;
       if (!events) continue;
       connection->poll_index = poll_count;
+      poll_connections[connection_poll_count++]=(KuHttpPollConnection){index,connection->connection_generation};
       ku_http_poll_add(poll_items, &poll_count, connection->socket_value, events);
-      if (connection->deadline < nearest) nearest = connection->deadline;
+      if ((connection->phase==KU_HTTP_IO_HEADER || connection->phase==KU_HTTP_IO_BODY || connection->phase==KU_HTTP_IO_WRITE)
+          && connection->deadline < nearest) nearest = connection->deadline;
     }
     rejection.poll_index = -1;
     if (rejection.phase == KU_HTTP_IO_REJECT || rejection.phase == KU_HTTP_IO_WRITE) {
@@ -2721,10 +2957,14 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     short wake_events = poll_items[wake_index].revents;
     if (wake_events & POLLNVAL) { fputs("http reactor wake socket invalid\n", stderr); exit(1); }
     if (wake_events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)) ku_http_wake_drain(&wake);
-    for (int index = 0; index < slot_count; index++) {
-      KuHttpConnection* connection = &connections[index];
-      if (connection->poll_index < 0) continue;
-      short events = poll_items[connection->poll_index].revents;
+    for (int selected_connection=0;selected_connection<connection_poll_count;selected_connection++) {
+      int poll_index=connection_poll_base+selected_connection;
+      /* Poll entries borrow this exact owner/slot/socket generation. Close
+         may swap the dense active tail, but never changes this snapshot map. */
+      KuHttpConnection* connection=ku_http_polled_connection(&active,
+          &poll_connections[selected_connection],poll_index,poll_items[poll_index].fd);
+      if(!connection) continue;
+      short events=poll_items[poll_index].revents;
       if (!events) continue;
       if (events & POLLNVAL) { ku_http_connection_close(connection); continue; }
       if (connection->phase == KU_HTTP_IO_HEADER && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
@@ -2733,6 +2973,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_read_body(connection, server, &queue, spawned);
       else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
         ku_http_connection_write(connection, server);
+      else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
+          && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection);
     }
     if (rejection.poll_index >= 0) {
       short events = poll_items[rejection.poll_index].revents;
@@ -2820,7 +3062,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   ku_http_queue_free(&queue);
   ku_http_mutex_lock(&group->lock); owner->wake = NULL; ku_http_mutex_unlock(&group->lock);
   ku_http_wake_close(&wake);
-  free(pending.items); free(poll_items); free(connections);
+  free(pending.items); free(poll_items); free(connections); free(active_indices); free(poll_connections);
   return listen_failure;
 }
 

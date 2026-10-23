@@ -3075,6 +3075,139 @@ fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
 }
 
 #[test]
+fn native_http_dense_slots_preserve_iteration_and_reject_stale_poll_snapshots() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let region = |start: &str, end: &str| {
+        format!(
+            "{start}{}",
+            runtime
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+        )
+    };
+    let active_type = region(
+        "typedef struct KuHttpActiveSet {",
+        "typedef struct KuHttpConnection {",
+    );
+    let functions = region(
+        "static void ku_http_active_begin(",
+        "enum {\n  KU_HTTP_CLOSE_IDLE_PRESSURE",
+    );
+    let poll_type = "typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;";
+    assert!(runtime.contains(poll_type));
+    let header = r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+typedef int KuHttpSocket;
+"#;
+    // These helpers read only the owner index metadata. The existing real HTTP
+    // tests exercise socket/job/Task retirement; no synthetic destructor or
+    // alternate completion algorithm is supplied by this index regression.
+    let connection = r#"
+typedef struct KuHttpConnection {
+  KuHttpActiveSet* active_set;
+  int active_position,free_next,poll_index,socket_value;
+  uint64_t connection_generation;
+} KuHttpConnection;
+"#;
+    let checks = r#"
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"dense slot line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+int main(void) {
+  enum {CAPACITY=4096};
+  KuHttpConnection* connections=(KuHttpConnection*)calloc(CAPACITY,sizeof(*connections));
+  int* indices=(int*)calloc(CAPACITY,sizeof(int));
+  CHECK(connections && indices);
+  KuHttpActiveSet active={connections,indices,0,CAPACITY,0,0};
+  for(int i=0;i<CAPACITY;i++) {
+    connections[i].active_set=&active; connections[i].active_position=-1;
+    connections[i].free_next=i+1<CAPACITY?i+1:-1;
+  }
+  for(int i=0;i<6;i++) {
+    CHECK(active.free_head==i); ku_http_active_begin(&connections[i]);
+    connections[i].connection_generation=10u+(uint64_t)i;
+    connections[i].socket_value=100+i; connections[i].poll_index=20+i;
+  }
+  CHECK(active.count==6 && active.free_head==6);
+  KuHttpPollConnection snapshot={1,11u};
+  CHECK(ku_http_polled_connection(&active,&snapshot,21,101)==&connections[1]);
+  CHECK(!ku_http_polled_connection(&active,&snapshot,20,101));
+  CHECK(!ku_http_polled_connection(&active,&snapshot,21,102));
+  ku_http_active_retire(&connections[1]);
+  CHECK(active.count==5 && active.indices[1]==5 && connections[5].active_position==1);
+  CHECK(!ku_http_polled_connection(&active,&snapshot,21,101));
+  CHECK(active.free_head==1); ku_http_active_begin(&connections[1]);
+  connections[1].connection_generation++;
+  CHECK(!ku_http_polled_connection(&active,&snapshot,21,101));
+  snapshot.generation++;
+  CHECK(ku_http_polled_connection(&active,&snapshot,21,101)==&connections[1]);
+  KuHttpPollConnection invalid={CAPACITY,0};
+  CHECK(!ku_http_polled_connection(&active,&invalid,0,0));
+  unsigned seen=0;
+  for(int position=active.count;position-->0;) {
+    int slot=active.indices[position];
+    CHECK(slot>=0 && slot<6 && !(seen&(1u<<slot)));
+    seen|=1u<<slot;
+    if(slot==1 || slot==3 || slot==0) ku_http_active_retire(&connections[slot]);
+  }
+  CHECK(seen==63u && active.count==3);
+  for(int position=active.count;position-->0;) ku_http_active_retire(&connections[active.indices[position]]);
+  CHECK(!active.count);
+  /* Reusing every slot visits each free entry once, including swapped holes. */
+  unsigned char* admitted=(unsigned char*)calloc(CAPACITY,1);
+  CHECK(admitted);
+  for(int i=0;i<CAPACITY;i++) {
+    int slot=active.free_head; CHECK(slot>=0 && slot<CAPACITY && !admitted[slot]);
+    admitted[slot]=1; ku_http_active_begin(&connections[slot]);
+  }
+  CHECK(active.count==CAPACITY && active.free_head==-1);
+  for(int position=active.count;position-->0;) ku_http_active_retire(&connections[active.indices[position]]);
+  CHECK(!active.count);
+  free(admitted);free(indices);free(connections);
+  puts("http-dense-slots-poll-generation-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-dense-slots");
+    let path = directory.path().join("dense.c");
+    fs::write(
+        &path,
+        format!("{header}{active_type}{connection}{poll_type}{functions}{checks}"),
+    )
+    .unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "dense")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-dense-slots-poll-generation-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
@@ -3103,7 +3236,7 @@ fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() 
     );
     let phases = region(
         "enum {\n  KU_HTTP_IO_FREE = 0",
-        "typedef struct {\n  KuHttpSocket socket_value;",
+        "typedef struct KuHttpActiveSet {",
     );
     let pressure = region(
         "      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&",
@@ -4039,6 +4172,8 @@ enum { KU_TASK_VALUE_EMPTY=0, KU_TASK_VALUE_LIVE=1, KU_TASK_VALUE_INLINE_FAILED=
 typedef size_t KuAtomicRefcount;
 typedef uint64_t KuTaskControlDeadlineV1;
 typedef struct { int payload; } KuStruct___ku_http_response;
+typedef struct { uint64_t task_slot,task_generation,function_id; uint32_t reason,driver_status,stage; } KuHttpFailure;
+static KuHttpFailure ku_http_failure_current;
 typedef struct KuTaskDriverV1 { void* event_context; } KuTaskDriverV1;
 typedef struct { KuTaskDriverV1* driver; size_t slot; uint64_t generation; } KuTaskDriverTicketV1;
 static int locks,unlocks,phase_reads,takes,drops,releases,adopts,refunds,outcome_drops;
@@ -4452,4 +4587,269 @@ fn main(): null! {{
             "{label}: {message}"
         );
     }
+}
+
+#[test]
+fn native_http_rejection_samples_cannot_exhaust_internal_failure_evidence() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import http from "std.http"
+async fn refusal(): HttpResponse! { return ok(http.text(503,"busy")) }
+async fn broken(): HttpResponse! { fail "deliberate diagnostic regression" }
+fn main(): null! {
+    app=http.server({max_active_requests:16,max_pending_requests:16,max_connections:64})
+    app.get("/refuse",refusal)
+    app.get("/broken",broken)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "sample-pressure",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_SERVICE_CONTROL_TOKEN", "sample-pressure"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for _ in 0..12 {
+        let response = http_response(
+            &address,
+            "GET /refuse HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 503 Service Unavailable");
+    }
+    let response=http_response(&address,"GET /broken HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: actual-500\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 500 Internal Server Error");
+    let metrics=http_response(&address,"GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: sample-pressure\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&metrics, "HTTP/1.1 200 OK");
+    assert!(metrics.contains("\"handler_result\":1"), "{metrics}");
+    assert!(metrics.contains("\"http_500_total\":1"), "{metrics}");
+    assert!(metrics.contains("\"unknown_500\":0"), "{metrics}");
+    assert!(
+        metrics.contains("\"sample_policy\":\"500_and_peer_reset_500_priority\""),
+        "{metrics}"
+    );
+    assert_eq!(
+        metrics.matches("\"reason\":\"handler_result\"").count(),
+        1,
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("61637475616c2d353030"),
+        "500 request identity lost: {metrics}"
+    );
+    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: sample-pressure\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_failures_have_bounded_private_reason_witnesses() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import { http } from "std"
+async fn broken(): HttpResponse! {
+    large=9223372036854775807
+    overflow=large+1
+    if(overflow==0) { return ok(http.text("unreachable")) }
+    return ok(http.text("unreachable"))
+}
+async fn healthy(): HttpResponse! { return ok(http.text("ready")) }
+fn main(): null! {
+    app=http.server({max_active_requests:16,max_pending_requests:16,max_connections:64})
+    app.get("/broken",broken)
+    app.get("/healthy",healthy)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "failure-witness",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_SERVICE_CONTROL_TOKEN", "failure-witness"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for i in 0..12 {
+        let response=http_response(&address,&format!("GET /broken HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: failure-{i}\r\nConnection: close\r\n\r\n"),Duration::from_secs(3));
+        assert_status(&response, "HTTP/1.1 500 Internal Server Error");
+        assert!(response.ends_with("Internal Server Error"), "{response}");
+        assert!(
+            !response.contains("handler_result"),
+            "internal reason leaked: {response}"
+        );
+    }
+    let denied = http_response(
+        &address,
+        "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&denied, "HTTP/1.1 403 Forbidden");
+    let metrics=http_response(&address,"GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: failure-witness\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&metrics, "HTTP/1.1 200 OK");
+    assert!(metrics.contains("\"handler_result\":12"), "{metrics}");
+    assert!(metrics.contains("\"unknown\":0"), "{metrics}");
+    assert!(metrics.contains("\"dropped_samples\":4"), "{metrics}");
+    assert_eq!(
+        metrics.matches("\"reason\":\"handler_result\"").count(),
+        8,
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("6661696c7572652d30"),
+        "request identity lost: {metrics}"
+    );
+    assert!(
+        !metrics.contains("\"task_generation\":0"),
+        "Task generation lost: {metrics}"
+    );
+    let healthy = http_response(
+        &address,
+        "GET /healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&healthy, "HTTP/1.1 200 OK");
+    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: failure-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_http_reset_retires_async_work_but_write_half_close_keeps_response() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import {http,time} from "std"
+async fn slow(): HttpResponse! { time.sleep(5000)? return ok(http.text("late")) }
+async fn brief(): HttpResponse! { time.sleep(20)? return ok(http.text("half-close-ok")) }
+fn main(): null! {
+    app=http.server({max_active_requests:16,max_pending_requests:16,max_connections:64,handler_timeout_ms:10000})
+    app.get("/slow",slow)
+    app.get("/short",brief)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "reset-vs-half-close",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "1"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_SERVICE_CONTROL_TOKEN", "reset-witness"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let metrics_request="GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nConnection: close\r\n\r\n";
+    // Wait for real startup using the existing bounded socket reader.
+    assert_status(
+        &http_response(&address, metrics_request, Duration::from_secs(3)),
+        "HTTP/1.1 200 OK",
+    );
+    let mut peer = TcpStream::connect(&address).unwrap();
+    peer.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = http_response(&address, metrics_request, Duration::from_secs(3));
+        let tasks = metrics
+            .split("\"tasks\":[")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        if tasks.contains("\"timers\":1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "request never reached timer: {metrics}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                peer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of_val(&linger) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    drop(peer); // A confirmed RST, not an ambiguous FIN or caller-side timer.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let metrics = http_response(&address, metrics_request, Duration::from_secs(3));
+        let tasks = metrics
+            .split("\"tasks\":[")
+            .nth(1)
+            .unwrap()
+            .split(']')
+            .next()
+            .unwrap();
+        if tasks.contains("\"resident\":0") && tasks.contains("\"timers\":0") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reset request kept its Task alive: {metrics}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let mut peer = TcpStream::connect(&address).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    peer.write_all(b"GET /short HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    peer.read_to_string(&mut response).unwrap();
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("half-close-ok"), "{response}");
+    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
 }

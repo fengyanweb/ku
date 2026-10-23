@@ -1678,6 +1678,9 @@ impl<'a> FunctionLowerer<'a> {
         if !declared_function && name == "ok" {
             return self.ok_expression(args, span, depth);
         }
+        if !declared_function && name == "str" {
+            return self.primitive_string_expression(args, span, depth);
+        }
         if !declared_function && (name == "println" || name == "print") {
             if args.len() != 1 {
                 return Err(unsupported("print with other than one argument", span));
@@ -1744,6 +1747,38 @@ impl<'a> FunctionLowerer<'a> {
             arguments,
         })?;
         Ok(destination)
+    }
+
+    // Existing builtin dispatch only, after normal checker/name resolution.
+    // Keep this construction out of the recursive expression stack frame.
+    #[inline(never)]
+    fn primitive_string_expression(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if args.len() != 1 {
+            return Err(unsupported("str with other than one argument", span));
+        }
+        let source = self.expression(&args[0], depth + 1)?;
+        if !matches!(
+            &self.function.slots[source.0].ty,
+            TaskSlotType::Value {
+                ty: IrType::Int | IrType::Bool | IrType::Null | IrType::Str,
+                borrowed: false
+            }
+        ) {
+            return Err(unsupported("str on this native Task value", args[0].span));
+        }
+        let dst = self.slot(value_slot(IrType::Str))?;
+        self.emit(TaskOp::PrimitiveString { dst, src: source })?;
+        if !matches!(&args[0].kind, ExprKind::Variable(_))
+            && owned_value(&self.function.slots[source.0].ty)
+        {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(dst)
     }
 
     // Result payload type construction stays outside recursive ordinary-call

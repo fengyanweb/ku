@@ -563,6 +563,116 @@ int main(void) {
 }
 
 #[test]
+fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries() {
+    let ast = checked(
+        "async fn Work(seed: int, divisor: int): int! { index=0; total=seed; while(index<5000) { total=(total*33+index+seed)%100000000; index=index+1 } total=total/divisor; return ok(total) } async fn main(): null! { return ok(null) }",
+    );
+    let tasks = task_lower::lower_program(&ast).unwrap();
+    let work = &tasks.tasks.functions[0];
+    let plan = ku::ir::task::verify_and_plan(&tasks.tasks, Default::default()).unwrap();
+    assert!(
+        plan.functions[0].cooperative_slots.len() < work.slots.len(),
+        "single-state arithmetic intermediates must not become persistent frame fields"
+    );
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    let begin = generated
+        .find("static uint32_t ku_task_frame_0_drive(")
+        .unwrap();
+    let end = begin
+        + generated[begin..]
+            .find("static uint32_t ku_task_frame_0_resume(")
+            .unwrap();
+    let mut drive = generated[begin..end].to_owned();
+    assert!(drive.contains("goto ku_task_scalar_check_"));
+    // Count executed *verified IR states*, including lexical empty drains and
+    // latches; do not count C branches or substitute a different work quantum.
+    for state in 0..work.states.len() {
+        let label = format!("ku_task_state_{state}:;");
+        assert_eq!(drive.matches(&label).count(), 1);
+        drive = drive.replacen(&label, &format!("{label}\n  fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+    }
+    let globals = "static size_t fixture_steps,fixture_cancel_at;\nstatic uint32_t fixture_cancel_result;\nstatic uint64_t fixture_deadline;\nstatic KuTaskControlLeaseV1* fixture_cancel_lease;\n";
+    generated.replace_range(begin..end, &(globals.to_owned() + &drive));
+    let expected = (0..5000).fold(3i64, |total, index| (total * 33 + index + 3) % 100000000);
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    ) + &format!("\n#define FIXTURE_EXPECTED INT64_C({expected})\n")
+        + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"scalar edges line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(size_t cancel_at,int overflow,int divide_zero) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  fixture_steps=0; fixture_cancel_at=cancel_at; fixture_cancel_result=UINT32_MAX;
+  fixture_deadline=ku_task_driver_now_ms()+2000u;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0),1u,fixture_deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  int64_t seed=overflow?INT64_MAX:3,divisor=divide_zero?0:1;
+  CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
+  fixture_cancel_lease=&task.owner.lease;
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  if(cancel_at) CHECK(fixture_steps==cancel_at && fixture_cancel_result==KU_TASK_CONTROL_OK);
+  else if(!overflow) CHECK(fixture_steps==64u && driver.polls==1u && driver.queued==1u);
+  for(size_t turn=0;turn<2000u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  if(cancel_at) CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  else {
+    KuTaskAdapterOutcomeV1 outcome={0};
+    CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==1u);
+    if(overflow || divide_zero) {
+      CHECK(!outcome.value.integer.ok);
+      KuString message=outcome.value.integer.error.message;
+      const char* expected=overflow?"integer overflow":"division by zero";
+      CHECK(message.len==strlen(expected) && !memcmp(message.ptr,expected,message.len));
+    } else CHECK(outcome.value.integer.ok && outcome.value.integer.value==FIXTURE_EXPECTED);
+    ku_task_outcome_drop(&outcome);
+  }
+  CHECK(ku_task_value_drop(&task,fixture_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,fixture_deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,fixture_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_case(0,0,0));
+  CHECK(!fixture_case(7u,0,0)); CHECK(!fixture_case(63u,0,0)); CHECK(!fixture_case(64u,0,0));
+  CHECK(!fixture_case(0,1,0)); CHECK(!fixture_case(0,0,1));
+  puts("task-scalar-exact-quantum-cancel-errors-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-scalar-edges");
+    let path = directory.path().join("scalar_edges.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "scalar_edges") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-scalar-exact-quantum-cancel-errors-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_segments_keep_quantum_limits_and_explicit_intent_boundaries() {
     let mut generated = native(
         "import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<5000) { index=index+1 } return ok(index) } async fn Touch(): int! { time.sleep(0)? index=0; while(index<5000) { index=index+1 } return ok(index) } async fn main(): null! { return ok(null) }",

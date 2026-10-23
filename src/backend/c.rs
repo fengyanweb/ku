@@ -6153,30 +6153,49 @@ static bool ku_json_write_string(
   if (!ku_json_write_byte(output, '"', error)) return false;
   const uint8_t* current = string.ptr ? string.ptr : (const uint8_t*)"";
   const uint8_t* end = current + string.len;
+  const uint8_t* span = current;
   while (current < end) {
-    size_t width = 0;
-    uint32_t scalar = 0;
-    if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
-      return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+    uint8_t byte = *current;
+    if (byte >= 0x20 && byte != '"' && byte != '\\') {
+      if (byte < 0x80) current++;
+      else {
+        size_t width = 0;
+        uint32_t scalar = 0;
+        if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
+          return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+        }
+        current += width;
+      }
+      /* Preserve the output bound before inspecting any following byte; a
+         long valid prefix cannot bypass the old size error with a later invalid
+         UTF-8 sequence. No borrowed bytes escape this synchronous writer. */
+      if ((size_t)(current-span) > KU_JSON_MAX_OUTPUT_BYTES-output->len)
+        return ku_json_fail(error, "stringify_error", "json.stringify output is too large");
+      continue;
     }
-    if (scalar == '"' || scalar == '\\') {
-      uint8_t escaped[2] = { '\\', (uint8_t)scalar };
+    if (current != span && !ku_json_buffer_append(output, span,
+          (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
+          "json.stringify output is too large")) return false;
+    if (byte == '"' || byte == '\\') {
+      uint8_t escaped[2] = { '\\', byte };
       if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
               error, "json.stringify output is too large")) return false;
-    } else if (scalar == '\n' || scalar == '\r' || scalar == '\t') {
-      uint8_t escaped[2] = { '\\', scalar == '\n' ? 'n' : (scalar == '\r' ? 'r' : 't') };
+    } else if (byte == '\n' || byte == '\r' || byte == '\t') {
+      uint8_t escaped[2] = { '\\', byte == '\n' ? 'n' : (byte == '\r' ? 'r' : 't') };
       if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
               error, "json.stringify output is too large")) return false;
-    } else if (scalar < 0x20) {
-      char escaped[7];
-      int len = snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)scalar);
-      if (len != 6 || !ku_json_write_bytes(output, escaped, 6, error)) return false;
-    } else if (!ku_json_buffer_append(output, current, width, KU_JSON_MAX_OUTPUT_BYTES,
-                   error, "json.stringify output is too large")) {
-      return false;
+    } else {
+      static const uint8_t hex[] = "0123456789abcdef";
+      uint8_t escaped[6] = { '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15] };
+      if (!ku_json_buffer_append(output, escaped, sizeof(escaped), KU_JSON_MAX_OUTPUT_BYTES,
+              error, "json.stringify output is too large")) return false;
     }
-    current += width;
+    current++;
+    span=current;
   }
+  if (current != span && !ku_json_buffer_append(output, span,
+        (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
+        "json.stringify output is too large")) return false;
   return ku_json_write_byte(output, '"', error);
 }
 

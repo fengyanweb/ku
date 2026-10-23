@@ -34,6 +34,109 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 }
 
 #[test]
+fn native_task_primitive_str_allocation_limit_failure_and_transfer_reconcile() {
+    let ast = Parser::new(Lexer::new("async fn Text(value: int): str! { return ok(str(value)) } async fn main(): null! { return ok(null) }").lex().unwrap()).parse_program().unwrap();
+    Checker::new().check(&ast).unwrap();
+    let lowered = task_lower::lower_program(&ast).unwrap();
+    let mut generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{ALLOCATION_HOOK}\nstatic int fixture_format_oom;\ntypedef struct KuString {{"),
+    );
+    let begin = generated
+        .find("static uint32_t ku_task_host_concat_string(")
+        .unwrap();
+    let end = begin
+        + generated[begin..]
+            .find("static uint32_t ku_task_host_allocate_array(")
+            .unwrap();
+    let mut host = generated[begin..end].to_owned();
+    host = replace_once(
+        host,
+        "uint8_t* bytes=(uint8_t*)malloc(capacity);",
+        "uint8_t* bytes=fixture_format_oom ? NULL : (uint8_t*)malloc(capacity);",
+    );
+    generated.replace_range(begin..end, &host);
+    generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unmodified_source_main(void) {",
+    );
+    generated.push_str(r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"primitive str line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int mode) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring),extra=mode==1?0u:32u;
+  uint64_t deadline=ku_task_driver_now_ms()+2000u,next=UINT64_MAX;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+extra,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 value={0}; int64_t input=INT64_MIN;
+  CHECK(ku_task_0_start_value(&driver,&input,&value)==KU_TASK_DRIVER_OK);
+  size_t before=ku_perf_live_bytes; CHECK(input==INT64_MIN);
+  fixture_format_oom=mode==2;
+  for(size_t turn=0;turn<16u && ku_task_control_status(&value.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  fixture_format_oom=0;
+  KuTaskAdapterOutcomeV1 result={0};
+  CHECK(ku_task_value_take(&value,NULL,&result)==KU_TASK_CONTROL_OK && result.result_kind==4u);
+  if(mode) {
+    CHECK(!result.value.string.ok && result.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+    KuString code=result.value.string.error.code;
+    const char* expected=mode==1?"memory_limit":"out_of_memory";
+    CHECK(code.len==strlen(expected) && !memcmp(code.ptr,expected,code.len));
+    CHECK(ku_perf_live_bytes==before);
+  } else {
+    CHECK(result.value.string.ok && result.exit_class==KU_TASK_EXIT_USER_RESULT);
+    KuString text=result.value.string.value;
+    CHECK(text.len==20u && text.capacity==20u && text.storage==KU_STRING_OWNED);
+    CHECK(!memcmp(text.ptr,"-9223372036854775808",20u));
+    CHECK(ku_perf_live_bytes==before+20u);
+  }
+  ku_task_outcome_drop(&result);
+  CHECK(ku_perf_live_bytes==before && driver.reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(ku_task_value_drop(&value,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  for(int mode=0;mode<3;mode++) CHECK(!fixture_case(mode));
+  puts("task-primitive-str-limit-oom-transfer-ok"); return 0;
+}
+"#);
+    let directory = TempDir::new("task-primitive-str-oom");
+    let path = directory.path().join("format.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "format") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-primitive-str-limit-oom-transfer-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_source_final_drain_cancel_tightens_all_receipts_and_drops_private_payload() {
     let ast = Parser::new(Lexer::new(SOURCE).lex().unwrap())
         .parse_program()

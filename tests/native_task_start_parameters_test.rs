@@ -90,6 +90,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::ArrayLen { dst, src }
                 | TaskOp::StringLen { dst, src, .. }
                 | TaskOp::StringClone { dst, src }
+                | TaskOp::PrimitiveString { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }

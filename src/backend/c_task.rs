@@ -113,13 +113,12 @@ pub(super) fn emit_frames(
         let mut emitter = FrameEmitter::new(function, frame)?;
         emitter.cooperative = cooperative;
         if cooperative {
-            // Dispatch is now a possible suspension boundary. Copy temporaries
-            // must survive it too; a borrowed temporary still never enters a
-            // frame, and prevents a yield until its explicit drop boundary.
-            for (index, slot) in function.slots.iter().enumerate() {
-                if !matches!(&slot.ty, TaskSlotType::Value { borrowed: true, .. }) {
-                    emitter.persistent.insert(index);
-                }
+            // The existing verifier computes liveness across every CFG edge.
+            // A quantum may stop before any state, but cannot stop halfway
+            // through that state's operations. Dead scalar intermediates can
+            // therefore stay in C locals, while owned storage remains hosted.
+            for slot in &frame.cooperative_slots {
+                emitter.persistent.insert(slot.0);
             }
         }
         emitter.emit(out)?;
@@ -844,6 +843,52 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
     }
 
+    // A verified scalar edge cannot call user code, allocate, publish a Task or
+    // touch an owned payload. Keep its control flow visible to the C optimizer
+    // instead of storing/reloading a state number through the shared switch.
+    // Finally regions and borrowed temporaries retain the general dispatcher.
+    fn scalar_direct_state(&self, index: usize) -> bool {
+        self.cooperative
+            && self.hosted
+            && self.finally.state_cleanup.is_empty()
+            && !self
+                .function
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }))
+            && self.scalar_charge_state(&self.function.states[index])
+    }
+
+    fn emit_transition(&self, out: &mut COutput, target: usize) {
+        if self.scalar_direct_state(target) {
+            out.push_str(&format!("  goto ku_task_scalar_check_{target};\n"));
+        } else {
+            out.push_str(&format!(
+                "  frame->header.state = {target}u;\n  goto ku_task_dispatch;\n"
+            ));
+        }
+    }
+
+    fn emit_scalar_checkpoint(&self, out: &mut COutput, state: usize) {
+        // Exactly the old phase-before-quantum ordering and one unit per IR
+        // state. Only externally observable exits materialize the state number.
+        // Cleanup still reads its clock on every original dispatch boundary.
+        out.push_str(&format!(
+            "ku_task_scalar_check_{state}:;\n\
+             if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
+             if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) {{\n\
+               frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
+               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
+             }}\n\
+             if (clock->host && !__ku_dispatch_budget--) {{\n\
+               frame->header.state={state}u;\n\
+               KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
+               ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
+               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
+             }}\n"
+        ));
+    }
+
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
@@ -906,6 +951,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         );
         for (index, state) in self.function.states.iter().enumerate() {
             out.check()?;
+            if self.scalar_direct_state(index) {
+                self.emit_scalar_checkpoint(out, index);
+            }
             out.push_str(&format!("ku_task_state_{index}:;\n"));
             if self.cooperative && !self.scalar_charge_state(state) {
                 out.push_str("  __ku_charge_unchanged=0;\n");
@@ -916,29 +964,26 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             match &state.terminator {
                 TaskTerminator::Jump { target } => {
-                    out.push_str(&format!(
-                        "  frame->header.state = {}u;\n  goto ku_task_dispatch;\n",
-                        target.0
-                    ));
+                    self.emit_transition(out, target.0);
                 }
                 TaskTerminator::Branch {
                     condition,
                     then_state,
                     else_state,
                 } => {
-                    out.push_str(&format!(
-                        "  frame->header.state = {} ? {}u : {}u;\n  goto ku_task_dispatch;\n",
-                        self.place(*condition),
-                        then_state.0,
-                        else_state.0
-                    ));
+                    out.push_str(&format!("  if ({}) {{\n", self.place(*condition)));
+                    self.emit_transition(out, then_state.0);
+                    out.push_str("  } else {\n");
+                    self.emit_transition(out, else_state.0);
+                    out.push_str("  }\n");
                 }
                 TaskTerminator::Suspend { resume, cleanup } => {
                     if self.cooperative {
                         /* Source-loop latches share the finite dispatch quantum.
                          * Timer/Await/Blocking terminators still publish genuine
                          * waits; raw frame fixtures preserve their old latch ABI. */
-                        out.push_str(&format!("  if (cleanup) goto ku_task_terminated;\n  frame->header.state={}u;\n  frame->header.cleanup_state={}u;\n  goto ku_task_dispatch;\n",resume.0,cleanup.0));
+                        out.push_str(&format!("  if (cleanup) goto ku_task_terminated;\n  frame->header.cleanup_state={}u;\n",cleanup.0));
+                        self.emit_transition(out, resume.0);
                         continue;
                     }
                     out.push_str(&format!(
@@ -951,7 +996,17 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         resume.0, cleanup.0
                     ));
                 }
-                TaskTerminator::ScopeDrain { scope, .. } => {
+                TaskTerminator::ScopeDrain { scope, ready, .. } => {
+                    if self.scalar_direct_state(index) {
+                        // The verified immutable descriptor has an empty Task
+                        // manifest. No owner/receipt/host operation can run here;
+                        // this is exactly scope_continue's successful witness.
+                        // Keep its status/cleanup facts but omit re-validating
+                        // the complete frame at every scalar loop iteration.
+                        out.push_str("  if (cleanup) goto ku_task_terminated;\n  frame->header.cleanup_state=UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_PENDING;\n");
+                        self.emit_transition(out, ready.0);
+                        continue;
+                    }
                     if self.cooperative && self.scopes[scope.0].task_mask == 0 {
                         /* A statically empty Task manifest has no receipt or
                          * asynchronous retirement to await. Use the same typed
@@ -1297,6 +1352,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     out,
                     *dst,
                     &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
+                    state,
                 )?,
             },
             TaskOp::Binary {
@@ -1323,6 +1379,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             self.place(*right),
                             self.place(*dst)
                         ),
+                        state,
                     )?;
                 } else {
                     let operator = match op {
@@ -1435,6 +1492,40 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{},&{});\n",self.place(*src),self.place(*dst)));
                 self.emit_string_allocation_check(out, "allocated")?;
                 out.push_str("  }\n");
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::PrimitiveString { dst, src } => {
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                match self.slot_type(*src)? {
+                    IrType::Int => {
+                        // int64 decimal needs at most 20 bytes plus NUL. The
+                        // existing concat host copies this bounded read view
+                        // before returning; the frame never stores its address.
+                        out.push_str(&format!("  {{ char formatted[21];\n  int length=snprintf(formatted,sizeof(formatted),\"%lld\",(long long){source});\n  if(length<0 || (size_t)length>=sizeof(formatted)) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  uint32_t allocated=ku_task_host_concat_string((KuTaskAdapterHostV1*)clock->host,(KuString){{(uint8_t*)formatted,(size_t)length,0,KU_STRING_STATIC}},(KuString){{0}},&{destination});\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str("  }\n");
+                    }
+                    IrType::Bool => out.push_str(&format!(
+                        "  {destination}={source} ? {} : {};\n",
+                        c_static_utf8_string("true"),
+                        c_static_utf8_string("false")
+                    )),
+                    IrType::Null => out.push_str(&format!(
+                        "  {destination}={};\n",
+                        c_static_utf8_string("null")
+                    )),
+                    IrType::Str => {
+                        out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source},&{destination});\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str("  }\n");
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "str() requires a supported primitive Task value",
+                        ))
+                    }
+                }
                 self.set_init(out, *dst, true);
             }
             TaskOp::StringConcat { dst, left, right } => {
@@ -1764,13 +1855,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         Ok(())
     }
 
-    fn emit_checked_integer(&self, out: &mut COutput, dst: SlotId, call: &str) -> KuResult<()> {
+    fn emit_checked_integer(
+        &self,
+        out: &mut COutput,
+        dst: SlotId,
+        call: &str,
+        state: usize,
+    ) -> KuResult<()> {
         // Inputs are already materialized Copy slots. The helper neither exits
         // nor writes the destination on failure; cleanup follows the same
         // outer-runtime-failure path as native Task output errors.
         out.push_str(&format!(
             "  {{ uint32_t arithmetic_status = {call};\n  if (arithmetic_status != KU_INT_OK) {{\n"
         ));
+        if self.scalar_direct_state(state) {
+            out.push_str(&format!("  frame->header.state={state}u;\n"));
+        }
         self.emit_runtime_error(out,
             "ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))")?;
         out.push_str("  } }\n");

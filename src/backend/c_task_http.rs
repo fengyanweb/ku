@@ -116,6 +116,7 @@ typedef struct KuHttpTaskHandle {
   KuTaskValueV1 value;
   KuTaskDriverTicketV1 retired;
   KuStruct___ku_http_response response;
+  KuHttpFailure failure;
   size_t retained_bytes,owner;
   uint32_t used,finishing,cancelled;
 } KuHttpTaskHandle;
@@ -243,6 +244,7 @@ static int ku_http_task_owner_exited(void* raw,size_t owner) {
 }
 static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t deadline,
     KuStruct___ku_http_response* output,size_t* response_charge) {
+  ku_http_failure_current=(KuHttpFailure){0};
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
   if(!runtime || !task || !*task || !output || !response_charge) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   *response_charge=0;
@@ -267,6 +269,10 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
       if(status!=KU_TASK_DRIVER_OK) return status;
       handle->finishing=1;
     } else {
+      handle->failure.task_slot=(uint64_t)handle->value.ticket.slot;
+      handle->failure.task_generation=handle->value.ticket.generation;
+      handle->failure.function_id=handle->value.function_id;
+      if(handle->value.tag==KU_TASK_VALUE_INLINE_FAILED) handle->failure.driver_status=handle->value.rejection_code;
       KuTaskAdapterOutcomeV1 outcome={0};
       uint32_t status;
       if(handle->value.tag==KU_TASK_VALUE_INLINE_FAILED) status=ku_task_value_take(&handle->value,NULL,&outcome);
@@ -289,6 +295,7 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
       if(status!=KU_TASK_CONTROL_OK) return status;
       if(outcome.result_kind!=8u) { ku_task_outcome_drop(&outcome); return KU_TASK_DRIVER_INTERNAL; }
       handle->response=ku_http_response_from_result(ku_result_move_struct___ku_http_response(&outcome.value.http_response));
+      handle->failure.reason=ku_http_failure_current.reason;
       ku_task_outcome_drop(&outcome);
       handle->retired=handle->value.ticket;
       if(handle->value.tag!=KU_TASK_VALUE_EMPTY) {
@@ -313,6 +320,7 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
   }
   if(handle->retained_bytes && ku_task_driver_scratch_refund(&runtime->driver,handle->retained_bytes)!=KU_TASK_DRIVER_OK)
     return KU_TASK_DRIVER_INTERNAL;
+  ku_http_failure_current=handle->failure;
   ku_http_task_handle_release(runtime,handle); *task=NULL; return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_http_task_runtime_close(void* raw,uint64_t deadline) {

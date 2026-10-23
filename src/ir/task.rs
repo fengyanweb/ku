@@ -189,6 +189,12 @@ pub enum TaskOp {
         dst: SlotId,
         src: SlotId,
     },
+    /// Existing str() primitive: read the source once without consuming it.
+    /// Integer output uses the allocation host; str output is an owned clone.
+    PrimitiveString {
+        dst: SlotId,
+        src: SlotId,
+    },
     /// Read both completed operands without consuming either input owner.
     StringConcat {
         dst: SlotId,
@@ -443,6 +449,9 @@ pub struct TaskFunctionFrame {
     pub scope_exits: TaskScopeExitPlan,
     /// Original dense SlotIds: parameters plus live values crossing suspension.
     pub slots: Vec<SlotId>,
+    /// Additional storage for cooperative yields at any verified state edge.
+    /// Scalar intermediates dead at every edge remain ordinary C locals.
+    pub cooperative_slots: Vec<SlotId>,
     pub suspensions: Vec<TaskSuspensionLive>,
     /// Verified reaching identities for each indirect Start, in source CFG order.
     pub indirect_calls: Vec<TaskIndirectCallPlan>,
@@ -569,6 +578,7 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
             | TaskOp::ErrorField { .. }
             | TaskOp::HttpMapGet { .. }
             | TaskOp::StringClone { .. }
+            | TaskOp::PrimitiveString { .. }
             | TaskOp::StringConcat { .. }
             | TaskOp::ArrayTryGet { .. }
     )
@@ -1082,6 +1092,19 @@ fn validate_shape(
                         if index == dst || borrowed || ty != &IrType::Int {
                             return Err(invalid("Bytes.get requires a distinct int index"));
                         }
+                    }
+                }
+                TaskOp::PrimitiveString { dst, src } => {
+                    has_error_projection |= requires_string_allocation_host(operation);
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    if dst == src
+                        || source_borrowed
+                        || destination_borrowed
+                        || !primitive(source)
+                        || destination != &IrType::Str
+                    {
+                        return Err(invalid("PrimitiveString requires a primitive source and distinct owned str destination"));
                     }
                 }
                 TaskOp::StringLen { dst, src, .. } | TaskOp::StringClone { dst, src } => {
@@ -1973,6 +1996,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::ArrayLen { dst, .. }
         | TaskOp::StringLen { dst, .. }
         | TaskOp::StringClone { dst, .. }
+        | TaskOp::PrimitiveString { dst, .. }
         | TaskOp::Bytes { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
@@ -2334,6 +2358,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::ArrayLen { dst, .. }
         | TaskOp::StringLen { dst, .. }
         | TaskOp::StringClone { dst, .. }
+        | TaskOp::PrimitiveString { dst, .. }
         | TaskOp::Bytes { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
@@ -2696,6 +2721,7 @@ fn live_states(
                     | TaskOp::ArrayLen { dst, src }
                     | TaskOp::StringLen { dst, src, .. }
                     | TaskOp::StringClone { dst, src }
+                    | TaskOp::PrimitiveString { dst, src }
                     | TaskOp::Move { dst, src }
                     | TaskOp::WrapOk { dst, src }
                     | TaskOp::WrapError { dst, src }
@@ -2807,10 +2833,12 @@ fn validate_ownership_and_plan(
         frame |= declared & !masks.borrowed;
     }
     let mut suspensions = Vec::new();
+    let mut cooperative = 0u64;
     for (id, block) in function.states.iter().enumerate() {
         let Some(mut state) = inputs[id] else {
             continue;
         };
+        cooperative |= live_out[id] & !masks.borrowed;
         if finally.state_cleanup.get(id).copied().flatten().is_some() {
             // A cancellation can return between any two states, including
             // states without a suspension. Preserve Copy values read there.
@@ -2826,6 +2854,7 @@ fn validate_ownership_and_plan(
                 | TaskOp::ArrayLen { src, .. }
                 | TaskOp::StringLen { src, .. }
                 | TaskOp::StringClone { src, .. }
+                | TaskOp::PrimitiveString { src, .. }
                 | TaskOp::Bytes { src, .. }
                 | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
@@ -3082,6 +3111,7 @@ fn validate_ownership_and_plan(
         scopes: scopes.descriptors,
         scope_exits: TaskScopeExitPlan::default(),
         slots: slots(frame),
+        cooperative_slots: slots(frame | cooperative),
         suspensions,
         indirect_calls: Vec::new(),
         callable_parameters: Vec::new(),
