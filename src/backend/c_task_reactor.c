@@ -246,10 +246,36 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
   size_t count=0;
   if(ku_task_blocking_lock(pool))return SIZE_MAX;
   if(owner>=KU_TASK_DRIVER_MAX_WORKERS) {ku_task_blocking_unlock(pool);return SIZE_MAX;}
-  if(!pool->net_waiting[owner]) {ku_task_blocking_unlock(pool);return 0;}
-  for(size_t i=0;i<pool->capacity;i++) {
+  size_t captured=pool->net_waiting[owner];
+  if(!captured) {
+    if(pool->net_head_plus_one[owner]) {pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+    ku_task_blocking_unlock(pool);return 0;
+  }
+  if(captured>pool->capacity) {pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+  /* Both production callers allocate exactly pool->capacity poll records.
+   * Snapshot every WAIT member, including PG waiters with no descriptor. A
+   * private undersized scratch buffer is an explicit limit, never a truncation.
+   * Compact real interests into already consumed snapshot positions below:
+   * count<=cursor, so an unlocked dispatch cannot invalidate a linked iterator
+   * or cause an arrival/reused generation to be visited twice in this pass. */
+  if(!items || captured>capacity) {pool->fault=KU_TASK_DRIVER_LIMIT;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+  uint32_t member=pool->net_head_plus_one[owner],previous=0;
+  for(size_t cursor=0;cursor<captured;cursor++) {
+    if(!member || member>pool->capacity) {pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+    KuTaskBlockingJobV1* snapshot_job=&pool->jobs[member-1u];
+    if(snapshot_job->state!=KU_TASK_BLOCKING_NET_WAIT || snapshot_job->net_owner!=owner+1u
+        || !snapshot_job->generation || snapshot_job->net_previous_plus_one!=previous) {
+      pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return SIZE_MAX;
+    }
+    items[cursor]=(KuTaskNetPollV1){0,member-1u,snapshot_job->generation,0};
+    previous=member;member=snapshot_job->net_next_plus_one;
+  }
+  if(member) {pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return SIZE_MAX;}
+  for(size_t cursor=0;cursor<captured;cursor++) {
+    KuTaskNetPollV1 snapshot=items[cursor];size_t i=snapshot.slot;
     KuTaskBlockingJobV1* job=&pool->jobs[i];
-    int active=job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u;
+    int active=job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u
+        && job->generation==snapshot.generation;
     if(!active)continue;
     uint64_t generation=job->generation;
 #if KU_TASK_BLOCKING_PG
@@ -267,7 +293,8 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
         if(ku_task_net_dispatch(pool,owner,i,generation,0u)>KU_TASK_DRIVER_PENDING)return SIZE_MAX;
         if(ku_task_blocking_lock(pool))return SIZE_MAX;
         job=&pool->jobs[i];
-        if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_WAIT)continue;
+        if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_WAIT
+            || job->net_owner!=owner+1u)continue;
         operation=job->pg_operation;
         immediate=ku_pg_async_interest(operation,&fd,&events,&next);
         if(operation->phase==KU_PG_ASYNC_DONE && !ku_pg_async_can_dispose(operation))next=job->net_deadline;
@@ -292,7 +319,8 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
       if(ku_task_blocking_lock(pool))return SIZE_MAX;
       job=&pool->jobs[i];
     }
-    if(job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u && job->net_client
+    if(job->generation==generation && job->state==KU_TASK_BLOCKING_NET_WAIT
+        && job->net_owner==owner+1u && job->net_client
         && job->net_client->socket_value!=KU_NET_INVALID_SOCKET) {
       if(job->net_deadline<*deadline)*deadline=job->net_deadline;
       if(count<capacity)items[count++]=(KuTaskNetPollV1){(uintptr_t)job->net_client->socket_value,i,job->generation,

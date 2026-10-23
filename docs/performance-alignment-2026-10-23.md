@@ -27,6 +27,10 @@ f7固定计算对Go的配对速度比为1.052587、95%区间[1.042989,1.060838]�
 
 该数据不能与257／b1跨时间、跨实现短窗相除当成单变量改善百分比，也不能冒填正式表A／B。原始目录为 `/opt/ku-bench/results/short-scenes-4ea1407-v1`；后续只补相关成本与有效对照。
 
+PG后续第一次诊断在100rps×30秒预热中出现31个`database_error:acquire_timeout`（2969/3000正确），尚未开始perf，因此没有可用栈；同期driver调度最大延迟570.8ms，不能唯一归因服务或宿主。保留该失败，不自动重跑或延长产品期限。
+
+为避免再次错过异常，第二次明确作为冷态、有采样开销的诊断，在第一条请求之前启用全服务cgroup软件cpu-clock 99Hz采样。2000rps×8秒16000/16000正确，p99 10.64ms；完整CPU2.042815秒（127.67594µs/正确，非正式收益），服务／driver／数据库均未节流。182个样本中，`ku_http_loop_run`有30个self样本，其中26个准确映射到内联`net_interests`整容量扫描的递增／读取job.state／比较NET_WAIT指令，约占全样本14.29%。实际ARM64槽跨度1200B，与原C的`i<pool->capacity`一致；这证明扫描是当前热点，粗粒度样本不能预测精确改善比例。其余包含网络、唤醒、driver提交等成本，self与children不相加。两owner贡献177样本、原blocking连接线程5样本，21线程均纳入同一域；自然静默2.27ms、活动账本归零、固定／reserved回到原基线、exit0、无强制退出且PID／FD及域均清理。原perf与C／ASM窗口保留在guest，未改变源、超时或正式合同。
+
 ## 2. 候选身份与测量合同
 
 | 身份 | 用途／状态 |
@@ -59,7 +63,7 @@ V5采用有界对数直方图、互斥终态及全量CSV对账。窗口、驱动
 | Task计算：`c_task.rs`／`c_task_driver.rs`／`c_task_control.rs` | 257 CPU HTTP每请求平均528000迭代、33002次poll；459个软件样本中drive self52.07%、vDSO时钟self16.56% | 直接热状态、Copy值与初始化位缓存、phase地址缓存、有界整数证明；每原状态phase acquire、64状态配额、32poll／1ms保持 | 最新源完整HTTP有效A/B；drive包含业务与记账，不能全算调度；children不可与self相加 |
 | 同步算术：`c.rs`／`c_sync.rs` | f7实际汇编中无期限仍有函数调用／TLS检查，空错误邮箱反复复制清零，checked整数有额外分支 | 69f小inline无期限入口＋原样慢体；空信号直接返回零成员，非空仍take/reset；4ea实际汇编已消除原无条件调用及空邮箱整块搬运 | 同期完整L1配对收益待验；不能删除可观察整数错误 |
 | JSON：旧writer／parser、`metadata.rs`／`ir/mod.rs`／解释器 | b1时读取req.body有副本，取data再形成一次owned子树后move；Rust移出子树、Go共享引用；Ku并非两次整树复制，http.json仅编码一次 | 普通字符串／ASCII片段、int64整数writer；d15接通旧parser同步只读调用，受审查的intrinsic／用户View可读取请求字段原存储，结果仍owned；旧泛化stdlib View保持原快照 | 请求正文副本已定向消除，子树复制仍在；完整HTTP收益未测；暂停的通用复制／释放不展开 |
-| 通知与网络：`c_http_runtime.c`／`c_task_reactor.c` | JSON kernel self约53%—57%、wake children约15%—18%；原net空集合两owner仍扫32768个job | HTTP活动表／free chain／代次映射，NET_WAIT owner计数空集合O(1)；POSIX非阻塞pipe＋pending，Windows原UDP | 各点syscall、分配、复制字节与端到端A/B；不能把包含比例相加或全说可删除 |
+| 通知与网络：`c_http_runtime.c`／`c_task_reactor.c` | JSON kernel self约53%—57%、wake children约15%—18%；原net空集合两owner仍扫32768个job；4ea PG采样确认非空owner整容量扫描26/182 self样本 | HTTP活动表／free chain／代次映射，NET_WAIT owner计数空集合O(1)；本轮补每owner WAIT双链及slot/generation快照；POSIX非阻塞pipe＋pending，Windows原UDP | 最新活动索引实际PG／A/B待验；增加16384×8+32×4=131200B固定预算，不能称没有空间代价；syscall等仍待分解 |
 | 固定存储／HTTP连接槽 | b1对象匿名内存差Rust约2.79MB，其中约2.52MB在预热前已存在；启动触写空槽约1.10MB | 保持calloc容量、稳定地址和全额预算，首次准入才初始化；复用及poll均核对high-water／owner／generation | 已测轻负载少驻留1.039MiB；剩余TLS／allocator／线程成本未全部归因，不能称泄漏或正式峰值达标 |
 | PG：`c_pg_async_runtime.c`及原池 | 旧同步有线程往返和DISCARD；分段getter约0.93µs、acquire约0.57µs，不支持二者主导差距；原async每行反复owner往返 | query／result／reset接入NET_WAIT，connect仍可能后台；4ea让已就绪结果在原32结果上限内继续，校验＋复制共享64KiB／64 cells预算，实际扩容仍让出 | 原150ms下大结果超时的独立耗时归因、Windows复验、normal／reset-equivalent正式性能 |
 
@@ -145,7 +149,7 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | Copy初始化位 O02 | 257→b1，Linux2核120rps，7对10秒，各1200/1200正确 | CPU比0.972507 [0.968957,0.976101]；稳态内存1.01953、峰值1.01073，无节省证据 | p99比1.04595 [0.99189,1.15457]，一次10.2ms，非劣证据不足；全部自然退出 |
 | checked add/sub、phase地址与范围证明 O02 | 425／838／6b→f7；内建adds/subs与便携回退，实际ASM、相关回归 | 静态指令3938→3684的独立phase变体仍14个ldar；范围证明实际收益未测 | 算术第4旧窗、phase与range旧control均失败，候选不能据此判快慢；详见失败表 |
 | 直接格式化／http.json O03/O05 | 公开API，direct／response／async／int各有输入身份 | 无正式完整调用收益 | 不删除用户async helper；http.json仅编码一次，相关API／资源／HTTP回归通过 |
-| 活动槽／空net／pipe O04 | 原→1b／838；37+1及后续41 HTTP回归，满pipe、交错清除、4producer／1000唤醒 | 由扫描总容量变为活动对象，空net O(1)；通知实际A/B待测 | ASan/UBSan／TSan相关通过；初UDP合并因EAGAIN不证明可读而弃用，Windows不合并 |
+| 活动槽／空net／pipe O04 | 原→1b／838及本轮owner WAIT索引；37+1及后续41 HTTP回归，满pipe、交错清除、4producer／1000唤醒 | HTTP活动对象与空net O(1)已有实现；最新非空net从整capacity改为本owner WAIT链快照，通知与索引实际A/B待测 | 原ASan/UBSan／TSan相关通过；本轮source22、PG11及Mac配置ASan/UBSan TCP2+PG11过，LSan关闭；初UDP合并方案弃用，Windows不合并 |
 | 槽首次准入初始化 O06 | 204→599，C除HTTP runtime逐字相同；Linux7对14代70/70正确 | 启动／少量请求后匿名驻留均少1089536B≈1.039MiB；启动比0.623889 [0.623762,0.624141]，后续0.646869 [0.646746,0.647115] | 21线程／12FD同，账本归基线／自然退出；是轻负载驻留，不是正式峰值／Rust80%目标 |
 | 旧JSON字符串writer O07 | 相同C仅writer不同，Mac7对×10000次，19边界回归 | 仅encode CPU比：对象0.619、数组1.006、转义0.558；完整链0.824／0.997／0.699 | 数组无明确改善；非HTTP结果；保留旧库、整数／浮点1e20／NUL／Unicode／深度／OOM规则 |
 | int64 writer／ASCII parser O07 | b1→838，分离变体；20字节整数缓冲、普通ASCII片段 | 实际完整HTTP A/B待验 | 不改旧JSON默认、错误或owned结果，相关边界回归通过 |
@@ -178,6 +182,8 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 
 ## 7. 正确性、CI与历史失败
 
+本轮owner WAIT索引补完后，现有source target22项与PG poll target11项通过，1个原有live opt-in未启用；独立只读复核未发现正常调用下的具体错误。严格Clippy（all-targets/all-features、-D warnings）、全workspace格式与debug CLI构建通过。Mac配置ASan/UBSan的TCP两项及PG11项通过，`detect_leaks=0`，不冒充Linux强制检测器。实际现有私库脚本再跑sync／async，两路均完成10000行、中文／NULL、原150ms超时、断连、确认丢失恰1行及原5秒恢复；exit0、远端连接0、cleanup为空，async unknown7／confirmed_cancel0／未确认回滚。该次CLI `40c2e42c1f8e86c4ce38896bc3a07f3af59adc09f7303994e6dc71650cbf37cc`，报告SHA `79d0c78d89b61659910fba6a7e929e46cdccae660ba2ab27262fee74594bb9f8`，是在86f基础加本轮dirty生产改动构建，不按HEAD冒称clean。
+
 最新本机实库使用独立sync／async私库／代理、debug native C、4 event loops、4池连接／8 waiter；原acquire100ms／query150ms／handler2000ms、180秒外层及故障恢复5秒不变。两lane均passed，10000行2列、Unicode／NULL、超时、新读恢复、断连、写确认丢失均有实际结果；丢失确认的写恰1行，原SQL未重放。两次自然退出0、cleanup_errors均空、退出连接最终0。本机PostgreSQL17.11结果不能替代Linux16或三平台CI。
 
 `pg_stat_activity`明确：async压力join后首次观察有5个远端session，其中4个仍在PgSleep、1个idle；原5秒窗口内观测为约0.207秒5个→0.739秒1个，非持续泄漏证明。压力观察与join共用原5秒，drain／进程退出／远端归零共用从drain请求开始的5秒，最多8次有界查询；不再要求close之后瞬间远端归零，也不延长窗口或确认回滚。该验收修改尚未提交，前一失败 `pg-async-connection-diagnostic.json` 保留。
@@ -197,6 +203,7 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | 9ce CI | push40006709264、PR40006719621必要项通过，push三平台包与asset-set成功；PR发布任务预期跳过 | 只覆盖该SHA／实际复用范围，不替代最新源码；测试C入口／Windows libpq目录夹具修正未改产品 |
 | 8ad CI | PR40010779946过，push40010773305 Windows慢查询unknown后首个新读acquire_timeout约110ms，随后JSONDecodeError | 验收复用原5秒／8次新只读合同，原查询／INSERT不重放；pending0和reserved上限不能证明idle／leased |
 | 39c CI四种新失败 | push Linux／Mac async压力远端5>4；PR Windows drain exit0后瞬时远端1≠0；push Windows async10000行172ms超原150ms返回unknown | 本机远端观察补证据、验收改共享有界退休窗口；4ea批量结果处理待平台实测，不称四类根因均已修 |
+| 86f push40024100907 | 三平台PG的sync／async步骤均success；Windows Caddy rolling资源快照spare41线程>33，cleanup采样PID1956仍存在 | spare为supervisor6＋launcher6＋两个直接子12／17线程；Toolhelp旧记录缺映像／创建时间，不能唯一判断两个Ku实例重叠或PID归属问题，不增加reserve掩盖；失败与PG性能分开 |
 
 39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最终4ea及后续必要CI／同源安装包仍待验；新增sanitizer workflow因OAuth无workflow权限尚不能上传，不绕过权限，普通Git推送另行执行。
 
@@ -208,7 +215,7 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 
 ## 8. 证据索引、缺口与交付边界
 
-证据原存项目外 `~/Downloads/Ku_性能对齐_2026-10-23/`，不是安装包内容。2026-10-23约21:00 UTC发现该宿主目录及Ku任务书被移出原位置；已询问用户，尚未确认新位置或恢复授权。Linux虚拟机 `/opt/ku-bench` 的冻结源和原始测量仍在；宿主独有回执的可访问性待恢复核对，不能写成全部交付完成。原入口：`profiles-analysis/{cpu-analysis.json,task-range/}`、`compiler/copy-init-linux-summary.json`、`json/`、`pg/`、`fixed-backing-readonly/highwater-residency/`、`l1-f7-formal/`、`phase-pointer-linux-30s-v2/analysis/`、`range-599-to-f7-30s-v1/`、`ci-{8ad7940,39c8975}/`、`current-validation/`。失败证据不因新通过删除；公开报告不得包含私库URI／凭证。
+证据存项目外 `~/Downloads/Ku_性能对齐_2026-10-23/`，不是安装包内容。宿主目录及任务书曾暂时不在原位置；用户告知恢复后已核对目录及任务书存在，PG双lane、相关回归与range失败analysis三个原件SHA均与先前记录完全一致。Linux虚拟机 `/opt/ku-bench` 的冻结源和原始测量也保留，两个本轮PG采样归档已传回宿主并逐项核对大小／SHA。原入口：`profiles-analysis/{cpu-analysis.json,task-range/}`、`compiler/copy-init-linux-summary.json`、`json/`、`pg/`、`pg-owner-cost/`、`fixed-backing-readonly/highwater-residency/`、`l1-f7-formal/`、`phase-pointer-linux-30s-v2/analysis/`、`range-599-to-f7-30s-v1/`、`ci-{8ad7940,39c8975,86f5948}/`、`current-validation/`。失败证据不因新通过删除；公开报告不得包含私库URI／凭证。
 
 | 证据 | SHA-256／适用范围 |
 | --- | --- |
@@ -218,6 +225,8 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | range旧control失败analysis | `c9d2e0a1011b31dfebc74b9cde94e4e62099247577543d51402132fa64de54ac`；raw9原件588091B逐项校验，3600CSV行无丢弃 |
 | 本机PG双lane最终报告 | `763880f2bf8484d1fd1e1aa6c1e8d95a1317d49ae48170d9bee1cdaf35413159`，debug CLI `9166c2f3e644d3261c7999f8b13c330ae8004ce2d71aaabb2e85b3e0adcdbd6b` |
 | 本机相关回归／detector receipt | `5299c1db797e258e463f03342cc6b7c7ec0f31d1202cd958dfde1922f6c26731`，含dirty源hash、原失败与Mac LSan限制 |
+| 4ea PG预热首次失败 | guest `profile-pg-4ea1407-v1.evidence.tar.gz`，28254B，`d33b8f8245699d09033de0d1b52ca26dca96b9259f8d8e01245a6fde6f5141d5`；无perf样本，不能用于热点比例 |
+| 4ea PG冷态有界热点诊断 | guest `profile-pg-4ea1407-cold-v2.evidence.tar.gz`，589464B，`8c5b00af34d2f3a2dcb6e92e823cc7e4e18546f985a54c5a13fc41c93b931d13`；182软件样本，含原perf／实际ASM／全部错误与回收记录 |
 | 8ad Windows失败外ZIP | `72e3c4caeae6d32aa4d73f2623f7ca2e89ad546ee10675a22aa7558975da7429`，API digest与下载匹配；不是release内包hash |
 
 尚需连续完成：最新候选实际Linux C／ASM成本闭环及有效单变量收益；不依赖失效窗口的正式A／B容量和同速率核心点；normal／reset、8192等待、600秒混合、真过载／恢复；最终三平台必要CI及同源CLI／native／实际安装包PG适用示例和hash验证。结果未跨门槛保持未验收，不能以测试数、包构建或其中一栈较快代替目标。

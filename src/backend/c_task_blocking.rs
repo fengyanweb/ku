@@ -104,6 +104,7 @@ typedef struct KuTaskBlockingJobV1 {
   size_t net_owner,net_offset,net_address_count,net_address_index;
   void* net_addresses;
   uint32_t net_plain,net_resolved;
+  uint32_t net_previous_plus_one,net_next_plus_one;
 #endif
 } KuTaskBlockingJobV1;
 typedef struct KuTaskBlockingWorkerV1 {
@@ -138,6 +139,7 @@ struct KuTaskBlockingPoolV1 {
   size_t* ring;
 #if KU_TASK_BLOCKING_NETWORK
   size_t net_waiting[KU_TASK_DRIVER_MAX_WORKERS];
+  uint32_t net_head_plus_one[KU_TASK_DRIVER_MAX_WORKERS];
 #endif
   KuTaskBlockingWorkerV1 workers[64u];
 };
@@ -161,22 +163,58 @@ static void ku_task_blocking_unlock(KuTaskBlockingPoolV1* pool) {
 }
 #if KU_TASK_BLOCKING_NETWORK
 /* Called only under the pool mutex. NET_STEP does not contribute interests;
- * ownership/generation remains protected until its bounded step returns. */
+ * ownership/generation remains protected until its bounded step returns.
+ * Zero means unlinked; the configured 16384-slot bound fits uint32_t indices.
+ * Validate every affected node before editing any link or count. The private
+ * pool is emitted with its callers in the same translation unit; this does not
+ * change the public driver/frame ABI or add a capacity-sized initialization. */
 static uint32_t ku_task_blocking_net_state_locked(KuTaskBlockingPoolV1* pool,
     KuTaskBlockingJobV1* job,uint32_t next) {
   int before=job->state==KU_TASK_BLOCKING_NET_WAIT;
   int after=next==KU_TASK_BLOCKING_NET_WAIT;
-  if(before!=after) {
-    if(!job->net_owner || job->net_owner>KU_TASK_DRIVER_MAX_WORKERS) {
-      pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
+  if(before || after) {
+    if(!pool->jobs || !pool->capacity || pool->capacity>KU_TASK_DRIVER_MAX_SLOTS
+        || !job->net_owner || job->net_owner>KU_TASK_DRIVER_MAX_WORKERS
+        || !job->generation)goto invalid;
+    uintptr_t address=(uintptr_t)job,base=(uintptr_t)pool->jobs;
+    if(address<base || (address-base)%sizeof(*job)
+        || (address-base)/sizeof(*job)>=pool->capacity)goto invalid;
+    uint32_t member=(uint32_t)((address-base)/sizeof(*job))+1u;
+    size_t owner=job->net_owner-1u,count=pool->net_waiting[owner];
+    uint32_t head=pool->net_head_plus_one[owner];
+    if(count>pool->capacity || ((count==0)!=(head==0)) || head>pool->capacity)goto invalid;
+    KuTaskBlockingJobV1* first=head ? &pool->jobs[head-1u]:NULL;
+    if(first && (first->state!=KU_TASK_BLOCKING_NET_WAIT || !first->generation
+        || first->net_owner!=job->net_owner || first->net_previous_plus_one))goto invalid;
+    if(before) {
+      uint32_t previous=job->net_previous_plus_one,following=job->net_next_plus_one;
+      if(!count || previous>pool->capacity || following>pool->capacity
+          || previous==member || following==member || (previous && previous==following)
+          || ((previous==0)!=(head==member))
+          || ((count==1)!=(previous==0 && following==0)))goto invalid;
+      KuTaskBlockingJobV1* left=previous ? &pool->jobs[previous-1u]:NULL;
+      KuTaskBlockingJobV1* right=following ? &pool->jobs[following-1u]:NULL;
+      if(left && (left->state!=KU_TASK_BLOCKING_NET_WAIT || !left->generation || left->net_owner!=job->net_owner
+          || left->net_next_plus_one!=member))goto invalid;
+      if(right && (right->state!=KU_TASK_BLOCKING_NET_WAIT || !right->generation || right->net_owner!=job->net_owner
+          || right->net_previous_plus_one!=member))goto invalid;
+      if(!after) {
+        if(left)left->net_next_plus_one=following;else pool->net_head_plus_one[owner]=following;
+        if(right)right->net_previous_plus_one=previous;
+        job->net_previous_plus_one=job->net_next_plus_one=0;
+        pool->net_waiting[owner]=count-1u;
+      }
+    } else {
+      if(count>=pool->capacity || job->net_previous_plus_one || job->net_next_plus_one
+          || head==member)goto invalid;
+      job->net_next_plus_one=head;
+      if(first)first->net_previous_plus_one=member;
+      pool->net_head_plus_one[owner]=member;pool->net_waiting[owner]=count+1u;
     }
-    size_t* count=&pool->net_waiting[job->net_owner-1u];
-    if((before && !*count) || (after && *count>=pool->capacity)) {
-      pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
-    }
-    if(before)(*count)--;else (*count)++;
   }
   job->state=next;return KU_TASK_DRIVER_OK;
+invalid:
+  pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
 }
 #endif
 static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {
