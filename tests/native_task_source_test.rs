@@ -811,8 +811,10 @@ async fn Work(value: str): str! {
 }
 async fn Child(value: str): str! { return ok(value) }
 async fn Parent(value: str): str! {
-    child=Child(value)
     i=0; total=3
+    while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
+    child=Child(value)
+    i=0
     while(i<1000) { total=(total*33+i+3)%100000000; i=i+1 }
     text=(await child)?
     text=text+"c"
@@ -863,11 +865,64 @@ async fn main(): null! { return ok(null) }
         .fold(0u64, |mask, (index, _)| mask | (1u64 << index));
     assert_ne!(child_mask, 0);
     let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    let frame_plan = ku::ir::task::verify_and_plan(&tasks.tasks, Default::default()).unwrap();
     generated = generated.replacen(
         "typedef struct KuString {",
-        "static size_t fixture_scans[6],fixture_skipped[6],fixture_pure_scans[6],fixture_mixed_scans[6],fixture_terminal_scans[6],fixture_child_scans;\ntypedef struct KuString {",
+        "static size_t fixture_scans[6],fixture_skipped[6],fixture_pure_scans[6],fixture_mixed_scans[6],fixture_terminal_scans[6],fixture_child_scans,fixture_copy_flushes[6],fixture_copy_returns[6];\ntypedef struct KuString {",
         1,
     );
+    for id in [0, 2, 3, 5] {
+        let function = &tasks.tasks.functions[id];
+        let frame = &frame_plan.functions[id];
+        let mask = frame
+            .cooperative_slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    function.slots[slot.0].ty,
+                    ku::ir::task::TaskSlotType::Value {
+                        ty: ku::ir::IrType::Int | ku::ir::IrType::Bool | ku::ir::IrType::Null,
+                        borrowed: false
+                    }
+                )
+            })
+            .fold(0u64, |mask, slot| mask | (1u64 << slot.0));
+        assert_ne!(mask, 0);
+        if id == 2 {
+            assert_eq!(mask & child_mask, 0);
+        }
+        let begin = generated
+            .find(&format!("static uint32_t ku_task_frame_{id}_drive("))
+            .unwrap();
+        let end = begin
+            + generated[begin..]
+                .find(&format!("static uint32_t ku_task_frame_{id}_resume("))
+                .unwrap();
+        let mut drive = generated[begin..end].to_owned();
+        let active = "  int __ku_copy_init_active=0;\n";
+        assert_eq!(drive.matches(active).count(), 1);
+        drive = drive.replacen(active, &format!("{active}  int fixture_copy_seen=0;\n"), 1);
+        let entered=format!("  if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n");
+        assert!(drive.contains(&entered));
+        drive = drive.replace(&entered, &format!("{entered}  fixture_copy_seen=1;\n"));
+        let flushed=format!("  if (__ku_copy_init_active) {{\n    frame->header.initialized=(frame->header.initialized & ~UINT64_C({mask})) | (__ku_copy_initialized & UINT64_C({mask}));\n    __ku_copy_init_active=0;\n  }}\n");
+        assert!(drive.contains(&flushed));
+        // This runs immediately before generic dispatch clock/_check helpers,
+        // non-pure host states and terminated cleanup inspect the real header.
+        let observed=format!("{flushed}  if (fixture_copy_seen) {{ if ((frame->header.initialized & UINT64_C({mask})) != (__ku_copy_initialized & UINT64_C({mask}))) abort(); fixture_copy_seen=0; fixture_copy_flushes[{id}]++; }}\n");
+        drive = drive.replace(&flushed, &observed);
+        generated.replace_range(begin..end, &drive);
+        let begin = generated
+            .find(&format!(
+                "static uint32_t ku_task_frame_{id}_spill_scalars("
+            ))
+            .unwrap();
+        let body = begin + generated[begin..].find(") {\n").unwrap() + 4;
+        let finish = body + generated[body..].find('\n').unwrap() + 1;
+        let merge = generated[body..finish].to_owned();
+        assert!(merge.contains("if (copy_active)"));
+        generated.replace_range(body..finish,&format!("  uint64_t fixture_owned_before=frame->header.initialized & ~UINT64_C({mask});\n{merge}  if ((frame->header.initialized & ~UINT64_C({mask}))!=fixture_owned_before) abort();\n  if (copy_active) {{ if ((frame->header.initialized & UINT64_C({mask}))!=(copy_initialized & UINT64_C({mask}))) abort(); fixture_copy_returns[{id}]++; }}\n"));
+    }
     for id in [0, 2, 3, 4, 5] {
         let reconcile = format!("static uint32_t ku_task_{id}_reconcile_charge(void* raw) {{");
         assert_eq!(generated.matches(&reconcile).count(), 1);
@@ -977,6 +1032,10 @@ int main(void) {
   CHECK(!fixture_case(5u,0));
   CHECK(fixture_pure_scans[3] && !fixture_skipped[3]);
   CHECK(fixture_pure_scans[4] && !fixture_skipped[4]);
+  CHECK(fixture_copy_flushes[0] && fixture_copy_flushes[2] && fixture_copy_flushes[5]);
+  /* Blocking is cancelled inside its pure loop: only the return boundary is reached. */
+  CHECK(!fixture_copy_flushes[3] && fixture_copy_returns[3]);
+  CHECK(fixture_copy_returns[0] && fixture_copy_returns[2] && fixture_copy_returns[3] && fixture_copy_returns[5]);
   puts("scalar-quantum-owned-child-cleanup-ok"); return 0;
 }
 "#;

@@ -217,6 +217,8 @@ struct FrameEmitter<'a> {
     finally: &'a TaskFinallyPlan,
     cooperative: bool,
     scalar_cache_active: Cell<bool>,
+    scalar_init_cache_active: Cell<bool>,
+    scalar_cache_mask: Cell<u64>,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -363,6 +365,8 @@ impl<'a> FrameEmitter<'a> {
             finally: &frame.finally,
             cooperative: false,
             scalar_cache_active: Cell::new(false),
+            scalar_init_cache_active: Cell::new(false),
+            scalar_cache_mask: Cell::new(0),
         })
     }
 
@@ -543,7 +547,9 @@ impl<'a> FrameEmitter<'a> {
     }
 
     fn bitmap(&self, slot: SlotId) -> &'static str {
-        if self.persistent.contains(&slot.0) {
+        if self.scalar_init_cache_active.get() && self.cached_scalar(slot) {
+            "__ku_copy_initialized"
+        } else if self.persistent.contains(&slot.0) {
             "frame->header.initialized"
         } else {
             "local_initialized"
@@ -979,6 +985,17 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         ));
     }
 
+    fn emit_scalar_init_flush(&self, out: &mut COutput) {
+        if self.scalar_cache_active.get() {
+            let mask = self.scalar_cache_mask.get();
+            // Merge only Copy bits. Owned/Task publications may have changed
+            // the other header bits since this pure segment began.
+            out.push_str(&format!(
+                "  if (__ku_copy_init_active) {{\n    frame->header.initialized=(frame->header.initialized & ~UINT64_C({mask})) | (__ku_copy_initialized & UINT64_C({mask}));\n    __ku_copy_init_active=0;\n  }}\n"
+            ));
+        }
+    }
+
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
         let slots = (0..self.function.slots.len())
             .map(SlotId)
@@ -998,13 +1015,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             return self.emit_drive_body(out);
         }
         // Only verified Copy scalars get a private invocation-local cache.
-        // Owning headers, initialization bits and control/lease storage stay
-        // in the original frame. A callback never receives this cache address
+        // Owning headers and control/lease storage stay in the original frame.
+        // Only pure segments cache Copy initialization bits; every observable
+        // exit/host boundary publishes them before other code can inspect them.
+        // A callback never receives this cache address
         // except for finite pure arithmetic output parameters.
         let mut body = COutput::new(out.remaining());
+        let scalar_mask = slots
+            .iter()
+            .fold(0u64, |mask, slot| mask | (1u64 << slot.0));
+        self.scalar_cache_mask.set(scalar_mask);
         self.scalar_cache_active.set(true);
         let emitted = self.emit_drive_body(&mut body);
         self.scalar_cache_active.set(false);
+        self.scalar_init_cache_active.set(false);
         emitted?;
         let body = body.finish()?;
         let helper = format!("{}_spill_scalars", self.prefix);
@@ -1019,7 +1043,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 slot.0
             ));
         }
-        out.push_str(", uint32_t result) {\n");
+        out.push_str(&format!(
+            ", uint64_t copy_initialized, int copy_active, uint32_t result) {{\n  if (copy_active) frame->header.initialized=(frame->header.initialized & ~UINT64_C({scalar_mask})) | (copy_initialized & UINT64_C({scalar_mask}));\n"
+        ));
         for slot in &slots {
             out.push_str(&format!("  frame->s_{}=cached_{};\n", slot.0, slot.0));
         }
@@ -1028,6 +1054,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         for slot in &slots {
             call.push_str(&format!(",cached_{}", slot.0));
         }
+        call.push_str(",__ku_copy_initialized,__ku_copy_init_active");
         emit_scalar_spill_returns(out, &body, &call)?;
         out.check()
     }
@@ -1039,6 +1066,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         ));
         if self.cooperative {
             out.push_str("  size_t __ku_dispatch_budget=64u;\n  int __ku_charge_unchanged=1;\n");
+        }
+        if self.scalar_cache_active.get() {
+            out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n");
         }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
@@ -1057,9 +1087,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
             }
         }
+        out.push_str("  goto ku_task_dispatch;\nku_task_dispatch:;\n");
+        // A general dispatcher may call a clock/check/host helper. Its view
+        // must include every prior Copy initialization before that call.
+        self.emit_scalar_init_flush(out);
         out.push_str(
-            "  goto ku_task_dispatch;\nku_task_dispatch:;\n\
-               if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
+            "  if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
                  frame->header.cleanup_timed_out = 1;\n\
                  goto ku_task_terminated;\n\
                }\n",
@@ -1098,10 +1131,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         );
         for (index, state) in self.function.states.iter().enumerate() {
             out.check()?;
+            let cached_init = self.scalar_cache_active.get() && self.scalar_direct_state(index);
+            self.scalar_init_cache_active.set(cached_init);
             if self.scalar_direct_state(index) {
                 self.emit_scalar_checkpoint(out, index);
             }
             out.push_str(&format!("ku_task_state_{index}:;\n"));
+            if cached_init {
+                let mask = self.scalar_cache_mask.get();
+                out.push_str(&format!(
+                    "  if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n"
+                ));
+            } else {
+                // Also guard direct label entry: future non-pure transitions
+                // must never expose a stale bitmap to a callback or _check.
+                self.emit_scalar_init_flush(out);
+            }
             if self.cooperative && !self.scalar_charge_state(state) {
                 out.push_str("  __ku_charge_unchanged=0;\n");
             }
@@ -1413,6 +1458,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 }
             }
         }
+        self.scalar_init_cache_active.set(false);
         if !self.finally.state_cleanup.is_empty() {
             out.push_str("ku_task_protected_failure:;\n  switch (frame->header.state) {\n");
             for (state, region) in self.finally.regions.iter().enumerate() {
@@ -1437,9 +1483,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             out.push_str("  default: goto ku_task_terminated;\n  }\n");
         }
-        out.push_str(
-            "ku_task_terminated:;\n  if (clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n",
-        );
+        out.push_str("ku_task_terminated:;\n");
+        self.emit_scalar_init_flush(out);
+        out.push_str("  if (clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n");
         self.emit_all_slot_drops(out, true)?;
         if !self.finally.state_cleanup.is_empty() {
             out.push_str(&format!("  if ((frame->header.status==KU_TASK_FRAME_CANCELLED || frame->header.status==KU_TASK_FRAME_TIMED_OUT) && frame->header.result_initialized) {{ frame->header.result_initialized=0; {} }}\n",drop_statement(&self.function.result,"frame->result")?));
