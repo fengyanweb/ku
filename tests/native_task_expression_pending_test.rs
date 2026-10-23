@@ -197,13 +197,29 @@ fn run_repeated_pending_expression(source: &str) {
     );
     // Native source emission also persists Copy temporaries because its finite
     // dispatch quantum can return before an IR liveness boundary.
-    let source_place = format!("frame->s_{}", frozen_source.0);
+    // Scalar caches are private to one drive invocation and spill on every
+    // return. Instrument the actual assignment, then keep all parked-frame,
+    // repeated-Pending and exactly-once checks below unchanged.
+    let drive_start = generated
+        .find("static uint32_t ku_task_frame_0_drive(")
+        .unwrap();
+    let drive = generated[drive_start..].split("\nstatic ").next().unwrap();
+    let scalar_place = |slot: task::SlotId| {
+        if drive.contains(&format!(" cached_{}=", slot.0)) {
+            format!("cached_{}", slot.0)
+        } else if drive.contains(&format!(" slot_{} = ", slot.0)) {
+            format!("slot_{}", slot.0)
+        } else {
+            format!("frame->s_{}", slot.0)
+        }
+    };
+    let source_place = scalar_place(frozen_source);
     let lhs_assignment = if concat {
         format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source_place},&frame->s_{});\n",lhs.0)
     } else if owned {
         format!("  frame->s_{} = ku_string_move(&{source_place});\n", lhs.0)
     } else {
-        format!("  frame->s_{} = {source_place};\n", lhs.0)
+        format!("  {} = {source_place};\n", scalar_place(lhs))
     };
     let mut generated = replace_once(
         generated,

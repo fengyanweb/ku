@@ -2092,6 +2092,9 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_OK;
 }
 static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,size_t index,uint64_t generation,uint32_t events) {"#, 1);
+    // include_str! preserves a Windows checkout's CRLF in the reactor C file.
+    // Normalize this fixture's injection text, without changing emitted logic.
+    generated = generated.replace("\r\n", "\n");
     let scan="    KuTaskBlockingJobV1* job=&pool->jobs[i];\n    int active=job->state==KU_TASK_BLOCKING_NET_WAIT";
     assert_eq!(generated.matches(scan).count(), 1);
     generated=generated.replacen(scan,"    fixture_net_scanned++;\n    KuTaskBlockingJobV1* job=&pool->jobs[i];\n    int active=job->state==KU_TASK_BLOCKING_NET_WAIT",1);
