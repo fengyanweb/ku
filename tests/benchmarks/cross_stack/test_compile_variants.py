@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import batch
+import compile_variants
 from compile_variants import profile_input, native_flags
+from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
 from build_linux import expand_ku_server
 
@@ -99,6 +101,108 @@ class BatchWindowTests(unittest.TestCase):
 
 
 class ProfileReceiptTests(unittest.TestCase):
+    def variant_fixture(self, root):
+        tools = root / 'tools'
+        manifest = {'candidate_base': 'a' * 40, 'source_root': str(root),
+                    'source_inventory_sha256': 'b' * 64,
+                    'stacks': {'ku': {'command': ['unchanged-ku']}}}
+        for stack, filename, compiler in [('go', 'pg_mode.go', 'go/bin/go'),
+                                          ('rust', 'src/pg_mode.rs', 'cargo/bin/rustc')]:
+            source = root / 'tests/benchmarks/cross_stack' / stack / filename
+            source.parent.mkdir(parents=True)
+            source.write_text('fixture source identity\n')
+            binary = root / (stack + '-normal')
+            binary.write_bytes(b'normal binary; never executed\n')
+            launcher = tools / compiler
+            launcher.parent.mkdir(parents=True)
+            launcher.write_bytes(b'compiler fixture; never executed\n')
+            manifest['stacks'][stack] = {'command': [str(binary)], 'env': {}, 'build': {
+                'binary_sha256': compile_variants.digest(binary),
+                'flags': 'normal flags only', 'pg_modes': ['normal', 'reset-equivalent'],
+                'source_files_sha256': {filename: compile_variants.digest(source)}}}
+        path = root / 'manifest.json'
+        path.write_text(json.dumps(manifest))
+        return path, tools
+
+    @staticmethod
+    def fake_compile(commands, label, command, cwd, env=None, timeout=900):
+        # The real variant manifest builder runs, but no compiler or workload does.
+        if label == 'go':
+            binary = Path(command[command.index('-o') + 1])
+        elif label == 'rust':
+            binary = Path(command[command.index('--target-dir') + 1]) / 'release/ku-cross-stack-rust'
+        else:
+            return 'fixture compiler version'
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b'new variant binary; never executed\n')
+        return ''
+
+    def test_tuned_pg_manifests_keep_verified_modes_and_new_binary_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, tools = self.variant_fixture(root)
+            before = original.read_bytes()
+            current = original
+            for stack in ('go', 'rust'):
+                output = root / (stack + '-variant')
+                with patch.object(compile_variants.Commands, 'run', new=self.fake_compile):
+                    receipt = compile_variants.build(current, output, tools, stack, 'normal')
+                self.assertTrue(receipt['passed'])
+                current = output / 'manifest.json'
+                derive(current, root / ('verified-' + stack), 'normal')
+                spec = json.loads(current.read_text())['stacks'][stack]
+                baseline = json.loads(before)['stacks'][stack]['build']
+                self.assertEqual(spec['build']['pg_modes'], baseline['pg_modes'])
+                self.assertEqual(spec['build']['source_files_sha256'], baseline['source_files_sha256'])
+                self.assertEqual(spec['build']['binary_sha256'], compile_variants.digest(spec['command'][0]))
+                self.assertNotEqual(spec['build']['binary_sha256'], baseline['binary_sha256'])
+                self.assertNotIn('flags', spec['build'])
+                self.assertEqual(spec['build']['normal_flags_reference'], baseline)
+            for mode in ('normal', 'reset-equivalent'):
+                result = json.loads(derive(current, root / ('pg-' + mode), mode).read_text())
+                for stack in ('go', 'rust'):
+                    self.assertEqual(result['stacks'][stack]['env']['BENCH_PG_MODE'], mode)
+            self.assertEqual(original.read_bytes(), before)
+
+    def test_tuned_pg_contract_rejects_changed_or_unattested_source(self):
+        for stack in ('go', 'rust'):
+            for change in ('source', 'inventory', 'modes'):
+                with self.subTest(stack=stack, change=change), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    original, tools = self.variant_fixture(root)
+                    manifest = json.loads(original.read_text())
+                    reference = manifest['stacks'][stack]['build']
+                    if change == 'source':
+                        filename = next(iter(reference['source_files_sha256']))
+                        (root / 'tests/benchmarks/cross_stack' / stack / filename).write_text('changed source\n')
+                    elif change == 'inventory':
+                        reference.pop('source_files_sha256')
+                    else:
+                        reference['pg_modes'] = ['normal']
+                    original.write_text(json.dumps(manifest))
+                    with patch.object(compile_variants.Commands, 'run') as compiler:
+                        with self.assertRaisesRegex(ValueError, 'PG mode source identity mismatch'):
+                            compile_variants.build(original, root / 'variant', tools, stack, 'normal')
+                    compiler.assert_not_called()
+                    self.assertFalse((root / 'variant/manifest.json').exists())
+
+    def test_legacy_variant_cannot_invent_pg_mode_support(self):
+        for stack in ('go', 'rust'):
+            with self.subTest(stack=stack), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original, tools = self.variant_fixture(root)
+                manifest = json.loads(original.read_text())
+                manifest['stacks'][stack]['build'].pop('pg_modes')
+                original.write_text(json.dumps(manifest))
+                output = root / 'variant'
+                with patch.object(compile_variants.Commands, 'run', new=self.fake_compile):
+                    receipt = compile_variants.build(original, output, tools, stack, 'normal')
+                self.assertTrue(receipt['passed'])
+                actual = json.loads((output / 'manifest.json').read_text())['stacks'][stack]['build']
+                self.assertNotIn('pg_modes', actual)
+                with self.assertRaisesRegex(ValueError, 'no attested'):
+                    derive(output / 'manifest.json', root / 'pg', 'reset-equivalent')
+
     def test_requires_complete_exit_matching_source_and_held_out_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory)/'profile.data'

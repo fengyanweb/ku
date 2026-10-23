@@ -125,6 +125,23 @@ def input_files(manifest, stack, tools):
     return result
 
 
+def verified_pg_identity(manifest, stack, inputs):
+    """Carry only the source-attested mode contract, never old artifact identity."""
+    if stack not in ('go', 'rust'):
+        return {}
+    reference = manifest['stacks'][stack].get('build', {})
+    if 'pg_modes' not in reference:
+        return {}
+    directory = Path(manifest['source_root'])/'tests/benchmarks/cross_stack'/stack
+    sources = {Path(path).relative_to(directory).as_posix(): value
+               for path, value in inputs.items()}
+    required = 'pg_mode.go' if stack == 'go' else 'src/pg_mode.rs'
+    if (reference['pg_modes'] != ['normal', 'reset-equivalent'] or required not in sources
+            or sources != reference.get('source_files_sha256')):
+        raise ValueError(stack+' PG mode source identity mismatch; rebuild the base manifest')
+    return {'pg_modes': list(reference['pg_modes']), 'source_files_sha256': sources}
+
+
 def native_flags(stack, variant, profile, profiles):
     flags = ['-O2' if variant == 'o2' or (stack == 'ku' and variant == 'normal') else '-O3']
     if stack == 'cpp':
@@ -149,6 +166,7 @@ def build(manifest_path, output, tools, stack, variant, training_receipt=None):
     commands = Commands(output/'logs', env)
     source = Path(manifest['source_root'])/'tests/benchmarks/cross_stack'
     inputs = input_files(manifest, stack, tools)
+    pg_identity = verified_pg_identity(manifest, stack, inputs)
     fingerprint = hashlib.sha256(json.dumps({'stack': stack, 'inputs': inputs,
         'production_inventory': manifest.get('source_inventory_sha256')}, sort_keys=True).encode()).hexdigest()
     profile = training = None
@@ -266,7 +284,7 @@ def build(manifest_path, output, tools, stack, variant, training_receipt=None):
                      for x in set(spec['command']+spec.get('batch_command', [])) if Path(x).is_file()}
         receipt['executable_artifacts'] = artifacts
         normal_reference = manifest['stacks'][stack].get('build', {})
-        actual_build = spec.get('build', {}) if stack == 'ku' else {}
+        actual_build = spec.get('build', {}) if stack == 'ku' else pg_identity
         spec['build'] = dict(actual_build, variant_receipt=str(output/'build.json'),
                              variant_artifacts=artifacts, variant_flags=receipt.get('flags'),
                              variant_environment=receipt.get('compiler_environment'),

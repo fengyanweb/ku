@@ -46,7 +46,8 @@ PG后续第一次诊断在100rps×30秒预热中出现31个`database_error:acqui
 | `69f70d9ebbcddcca0cb02b152e3e2ca2228c9dd8` | 同步空错误邮箱及无期限inline入口；相关本机检查已补，收益待验 |
 | `39c89756fb5d689cc633988c8c921b6eb4de3101` | 默认独立sync／async PG实库验收；两次CI均有实库失败，详见第7节 |
 | `d15dfbbdfda91534f2ff38c1241c0041d566b186` | JSON parse／decode／try_parse只读调用及受控请求字符串投影 |
-| `4ea1407e4c5f9690022f2fac1a8565c5f74ecf3f` | 当前产品HEAD：PG同一owner turn批量推进，保留共享预算；Linux已实编、三个独立短窗完成，配对收益未验 |
+| `4ea1407e4c5f9690022f2fac1a8565c5f74ecf3f` | PG同一owner turn批量推进，保留共享预算；Linux已实编、三个独立短窗及热点采样完成，配对收益未验 |
+| `b55e7ee62a13171fb070d172b54b09572771418b` | 当前产品源：每owner WAIT索引与代次快照；本机回归／私库通过，Linux重编、A/B及最新CI待验 |
 
 本机PG验收采用连接退休观察合同修正；该次构建时的dirty状态与源码／CLI哈希一并记录，不能仅用HEAD称为clean构建，更不能冒充三平台CI。Linux基准产物另由确切4ea归档构建。原主目录用户改动及本工作树预存的 `docs/multicore-capacity-acceptance.md` 修改不纳入本报告变更。
 
@@ -179,6 +180,8 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | O07 JSON | 旧默认、writer／parser局部处理、只读请求正文及边界回归 | 三语料组件A/B、最新完整调用／资源，类型化与动态分表 | 未验收 |
 | O08 PG | 原共享池owner状态机、同turn预算；本机sync／async均过 | 原Windows大结果150ms失败相关验证、最终三平台实库、normal／reset正式对照 | 未验收 |
 | O09 调优 | 旧源实编及训练留出闭环 | 最终源普通／调优有效表、flags／大小／编译时间及产物身份 | 未验收 |
+
+O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体后，原helper未保留PG模式及源码清单，`pg_variants.derive`正确拒绝该产物。本轮仅在实际输入与原完整源码清单一致、两个模式声明有效时继承这两项；ELF哈希仍取新产物，旧flags及产物只放normal参考。两模块17项单测通过，不把mock编译的单测当成实际调优构建。旧1b四栈业务源均已改变，旧调优产物／profile不能复用为最终源；旧batch训练输入又与普通L1相同，最终PGO需重新冻结代表性训练／留出，不能仅改标签称已验收。
 
 ## 7. 正确性、CI与历史失败
 
