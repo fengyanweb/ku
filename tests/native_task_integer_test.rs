@@ -199,6 +199,7 @@ fn generated_helpers() -> String {
         assert!(
             builtin.starts_with("__builtin_add_overflow")
                 || builtin.starts_with("__builtin_sub_overflow")
+                || builtin.starts_with("__builtin_mul_overflow")
         );
     }
     assert!(helpers.contains("#undef KU_INT_USE_OVERFLOW_BUILTINS"));
@@ -248,14 +249,21 @@ fn boundary_values() -> Vec<i64> {
         i64::MAX / 3 + 1,
         i64::MIN / 3,
         i64::MIN / 3 - 1,
+        // Constant-33 multiplication bounds used by the recurrence, both signs.
+        -33,
+        33,
+        i64::MAX / 33,
+        i64::MAX / 33 + 1,
+        i64::MIN / 33,
+        i64::MIN / 33 - 1,
     ];
-    assert_eq!(values.len(), 23);
+    assert_eq!(values.len(), 29);
     assert_eq!(
         values
             .iter()
             .collect::<std::collections::HashSet<_>>()
             .len(),
-        23
+        29
     );
     values
 }
@@ -372,8 +380,8 @@ fn native_task_integer_helpers_match_checked_i64_without_output_corruption_in_c(
             1,
         );
         let (binary_count, unary_count) = append_matrix(&mut source);
-        assert_eq!(binary_count, 2_651);
-        assert_eq!(unary_count, 23);
+        assert_eq!(binary_count, 4_211);
+        assert_eq!(unary_count, 29);
         source.push_str(C_MAIN);
         let directory = TempDir::new("task-checked-integer");
         let c_file = directory.path().join("checked-integer.c");
@@ -429,7 +437,7 @@ int main(void) {
   CHECK(KU_INT_OK==0u && KU_INT_OVERFLOW==1u && KU_INT_DIV_ZERO==2u);
   size_t binaries=sizeof(fixture_binary)/sizeof(fixture_binary[0]);
   size_t unaries=sizeof(fixture_unary)/sizeof(fixture_unary[0]);
-  CHECK(binaries==2651u && unaries==23u);
+  CHECK(binaries==4211u && unaries==29u);
   for (size_t i=0;i<binaries;i++) {
     fixture_case=i;
     const FixtureBinary* test=&fixture_binary[i];
@@ -445,7 +453,7 @@ int main(void) {
     CHECK(status==test->status);
     CHECK(guarded.before==before && guarded.after==after);
     CHECK(guarded.output==(status==KU_INT_OK ? test->value : sentinel));
-    if(test->operation<2u) {
+    if(test->operation<3u) {
       FixtureGuarded left_alias={before,left,after},right_alias={before,right,after};
       status=fixture_operations[test->operation](left_alias.output,right,&left_alias.output);
       CHECK(status==test->status && left_alias.before==before && left_alias.after==after);
