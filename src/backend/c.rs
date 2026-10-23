@@ -647,13 +647,22 @@ fn generate_c_source_with_frames_attempt(
          \x20 __ku_handler_cleanup_deadline = 0;\n\
          \x20 __ku_handler_deadline = (~0ULL - now < timeout_ms) ? ~0ULL : now + timeout_ms;\n\
          }\n\
-         static int __ku_handler_timeout_poll(void) {\n\
-         \x20 if (!__ku_handler_timed_out && __ku_handler_deadline == 0) return 0;\n\
+         #if defined(_MSC_VER)\n\
+         #define KU_HANDLER_NOINLINE __declspec(noinline)\n\
+         #elif defined(__GNUC__) || defined(__clang__)\n\
+         #define KU_HANDLER_NOINLINE __attribute__((noinline))\n\
+         #else\n#define KU_HANDLER_NOINLINE\n#endif\n\
+         static KU_HANDLER_NOINLINE int __ku_handler_timeout_poll_active(void) {\n\
          \x20 unsigned long long now = __ku_handler_now_ms();\n\
          \x20 if (!__ku_handler_timed_out && __ku_handler_deadline != 0 && now >= __ku_handler_deadline) __ku_handler_timed_out = 1;\n\
          \x20 if (!__ku_handler_timed_out) return 0;\n\
          \x20 if (__ku_handler_unwind_depth == 0) return 1;\n\
          \x20 return __ku_handler_cleanup_deadline != 0 && now >= __ku_handler_cleanup_deadline;\n\
+         }\n\
+         #undef KU_HANDLER_NOINLINE\n\
+         static inline int __ku_handler_timeout_poll(void) {\n\
+         \x20 if (!__ku_handler_timed_out && __ku_handler_deadline == 0) return 0;\n\
+         \x20 return __ku_handler_timeout_poll_active();\n\
          }\n\
          static void __ku_handler_timeout_enter(void) {\n\
          \x20 if (__ku_handler_cleanup_deadline == 0) {\n\

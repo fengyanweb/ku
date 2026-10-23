@@ -379,6 +379,9 @@ typedef struct KuSyncExitSignal {
 static KU_THREAD_LOCAL KuSyncExitSignal __ku_sync_return_signal;
 static void __ku_sync_reset(void) { __ku_sync_return_signal = (KuSyncExitSignal){0}; }
 static KuSyncExitSignal __ku_sync_take(void) {
+  /* Only reset/take or a nonempty publish write this mailbox. */
+  if (__ku_sync_return_signal.kind == KU_SYNC_EXIT_NONE)
+    return (KuSyncExitSignal){0};
   KuSyncExitSignal signal = __ku_sync_return_signal;
   __ku_sync_return_signal = (KuSyncExitSignal){0};
   return signal;
