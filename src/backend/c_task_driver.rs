@@ -2769,7 +2769,6 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     driver->polls=quanta>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+quanta;
     driver->running--; slot->executor_worker = 0;
     worker->polls=quanta>UINT64_MAX-worker->polls ? UINT64_MAX : worker->polls+quanta;
-    worker->progress_ms=ku_task_driver_now_ms();
     if (slot->owner_location == KU_TASK_DRIVER_OWNER_WORKER) {
       if (owner.lease.control) {
         slot->deferred_owner = owner; owner.lease.control = NULL;
