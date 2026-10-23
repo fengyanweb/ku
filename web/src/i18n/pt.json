@@ -87,7 +87,7 @@
   "projectTitle": "Um trabalho em andamento. Uma história para acompanhar.",
   "projectDescription": "Esta documentação descreve o escopo congelado da pré-versão experimental v{releasedVersion}. A publicação efetiva e os downloads estão registrados no GitHub Releases.",
   "github": "Explore no GitHub",
-  "license": "O código-fonte está disponível para consulta. Não foi concedida uma licença de código aberto.",
+  "license": "O código atual do Ku e a extensão do editor usam Apache-2.0. As licenças de terceiros e os materiais de licença originais dos arquivos de versões anteriores continuam aplicáveis.",
   "verified": "Verificado",
   "limitations": "Suporte e limites",
   "version": "Versão da documentação",

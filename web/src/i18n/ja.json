@@ -83,7 +83,7 @@
   "projectTitle": "開発は続く。歩みを見届けよう。",
   "projectDescription": "本書は実験的プレリリース v{releasedVersion} の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。",
   "github": "GitHub で見る",
-  "license": "ソースは公開閲覧可能です。オープンソースライセンスは許諾されていません。",
+  "license": "Ku の現在のソースとエディター拡張は Apache-2.0 です。第三者のライセンスと、過去の配布アーカイブに同梱された元のライセンス資料は引き続き適用されます。",
   "verified": "内容確認",
   "limitations": "対応範囲と制約",
   "version": "文書のバージョン",

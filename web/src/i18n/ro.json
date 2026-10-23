@@ -91,7 +91,7 @@
   "projectTitle": "O lucrare în curs. O poveste de urmărit.",
   "projectDescription": "Documentația descrie domeniul fixat al prelansării experimentale v{releasedVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",
   "github": "Explorează pe GitHub",
-  "license": "Sursa poate fi consultată. Nu a fost acordată o licență open source.",
+  "license": "Codul actual Ku și extensia editorului folosesc Apache-2.0. Licențele terților și materialele originale de licențiere din arhivele versiunilor mai vechi rămân aplicabile.",
   "verified": "Verificat",
   "limitations": "Suport și limite",
   "version": "Versiunea documentației",

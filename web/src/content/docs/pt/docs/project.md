@@ -17,9 +17,9 @@ Esta documentação descreve o escopo congelado da pré-versão experimental v0.
 
 ## Código-fonte e licença
 
-Consulte o [código no GitHub](https://github.com/fengyanweb/ku) e a [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). O código é visível publicamente, mas o código próprio do Ku **não tem concessão de licença de código aberto**. A extensão do editor está marcada como `UNLICENSED`. Publicar código ou binários não concede automaticamente uma licença de código aberto.
+O código próprio do Ku nos instantâneos de fontes que incluem o arquivo de licença, assim como a extensão atual do editor, são distribuídos sob [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); consulte [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) para as atribuições. Consulte o [código no GitHub](https://github.com/fengyanweb/ku) e a [página da versão](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Os componentes de terceiros mantêm suas próprias licenças.
 
-Os avisos de terceiros nos arquivos de versões aplicam-se somente aos respectivos componentes. Eles não estabelecem permissões para usar, modificar ou redistribuir o próprio Ku. Qualquer autorização necessária deve vir explicitamente do mantenedor; este site não cria novos compromissos de licença.
+Os arquivos de v0.0.18-r1 e de versões anteriores mantêm os materiais de licença originais que os acompanham; esta mudança de licença dos fontes não os reempacota. Usar o compilador Ku não exige publicar o código-fonte dos seus próprios programas. Ao distribuir programas que contêm código do runtime do Ku, cumpra os requisitos de licença e atribuição aplicáveis, incluindo os avisos de terceiros.
 
 ## Relate um problema
 

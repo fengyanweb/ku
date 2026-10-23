@@ -91,7 +91,7 @@
   "projectTitle": "A work in progress. A story to follow.",
   "projectDescription": "This documentation describes the frozen scope of the v{releasedVersion} experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases.",
   "github": "Explore on GitHub",
-  "license": "Source is available to view. No open-source license has been granted.",
+  "license": "Current Ku source and editor extension: Apache-2.0. Third-party licenses and the original license materials in older release archives remain applicable.",
   "verified": "Verified",
   "limitations": "Support & limitations",
   "version": "Documentation version",

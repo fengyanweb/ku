@@ -17,9 +17,9 @@ Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publ
 
 ## Sursă și licențiere
 
-Vezi [sursa GitHub](https://github.com/fengyanweb/ku) și [pagina versiunii](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Sursa poate fi văzută public, dar codul propriu Ku **nu are acordată o licență open source**. Extensia editorului este marcată `UNLICENSED`. Publicarea surselor sau binarelor nu acordă automat o licență open source.
+Codul propriu Ku din instantaneele sursei care includ fișierul de licență și extensia actuală a editorului sunt distribuite sub [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); vezi [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) pentru mențiunile de atribuire. Consultă [sursa GitHub](https://github.com/fengyanweb/ku) și [pagina versiunii](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Componentele terților își păstrează propriile licențe.
 
-Notificările terților din arhive se aplică doar componentelor respective. Nu stabilesc permisiuni de utilizare, modificare sau redistribuire pentru Ku în sine. Orice autorizare necesară trebuie să vină explicit de la responsabilul proiectului; site-ul nu creează noi angajamente de licențiere.
+Arhivele v0.0.18-r1 și ale versiunilor anterioare păstrează materialele originale de licențiere care le însoțesc; această schimbare a licenței sursei nu reîmpachetează acele arhive. Utilizarea compilatorului Ku nu impune publicarea codului sursă al propriilor programe. La distribuirea programelor care conțin cod din mediul de execuție Ku, respectă cerințele de licență și atribuire aplicabile, inclusiv notificările terților.
 
 ## Raportează o problemă
 

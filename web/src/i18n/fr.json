@@ -91,7 +91,7 @@
   "projectTitle": "Un projet en cours. Une histoire à suivre.",
   "projectDescription": "Cette documentation décrit le périmètre figé de la préversion expérimentale v{releasedVersion}. La publication effective et les téléchargements sont consignés dans GitHub Releases.",
   "github": "Explorer sur GitHub",
-  "license": "Les sources sont consultables. Aucune licence open source n'a été accordée.",
+  "license": "Le code actuel de Ku et son extension d’éditeur sont sous Apache-2.0. Les licences tierces et les documents de licence d’origine des anciennes archives restent applicables.",
   "verified": "Vérifié",
   "limitations": "Prise en charge et limites",
   "version": "Version de la documentation",

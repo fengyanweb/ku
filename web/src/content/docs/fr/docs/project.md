@@ -17,9 +17,9 @@ Cette documentation décrit le périmètre figé de la préversion expérimental
 
 ## Sources et licence
 
-Consultez les [sources sur GitHub](https://github.com/fengyanweb/ku) et la [page de version](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Les sources sont consultables publiquement, mais le code propre à Ku **ne bénéficie d'aucune concession de licence open source**. L'extension d'éditeur est marquée `UNLICENSED`. Publier des sources ou des binaires n'accorde pas automatiquement une licence open source.
+Le code propre à Ku dans les instantanés de sources contenant le fichier de licence, ainsi que l’extension d’éditeur actuelle, sont sous [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`) ; voir [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) pour les mentions d’attribution. Consultez les [sources sur GitHub](https://github.com/fengyanweb/ku) et la [page de publication](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Les composants tiers conservent leurs propres licences.
 
-Les mentions de tiers présentes dans les archives s'appliquent uniquement à leurs composants respectifs. Elles n'accordent pas de droits d'utilisation, de modification ou de redistribution de Ku lui-même. Toute autorisation nécessaire doit venir explicitement du mainteneur ; ce site ne crée aucun nouvel engagement de licence.
+Les archives de v0.0.18-r1 et des versions antérieures conservent les documents de licence d’origine qui les accompagnent ; ce changement de licence des sources ne les reconditionne pas. L’utilisation du compilateur Ku n’exige pas de publier le code source de vos propres programmes. Lors de la distribution de programmes contenant du code d’exécution de Ku, respectez les exigences de licence et d’attribution applicables, y compris les mentions tierces.
 
 ## Signaler un problème
 

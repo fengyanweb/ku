@@ -17,9 +17,9 @@ Questa documentazione descrive l’ambito fissato della versione preliminare spe
 
 ## Sorgenti e licenza
 
-Consulta il [codice su GitHub](https://github.com/fengyanweb/ku) e la [pagina della versione](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Il codice sorgente è visibile pubblicamente, ma al codice proprio di Ku **non è stata concessa una licenza open source**. L'estensione dell'editor è contrassegnata `UNLICENSED`. Pubblicare sorgenti o binari non concede automaticamente una licenza open source.
+Il codice proprio di Ku negli snapshot dei sorgenti che includono il file di licenza, e l’attuale estensione dell’editor, sono distribuiti con [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); per le attribuzioni, consulta [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Consulta i [sorgenti su GitHub](https://github.com/fengyanweb/ku) e la [pagina della versione](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). I componenti di terzi mantengono le proprie licenze.
 
-Gli avvisi di terze parti negli archivi delle versioni si applicano soltanto ai rispettivi componenti. Non stabiliscono permessi di uso, modifica o ridistribuzione di Ku stesso. Ogni autorizzazione necessaria deve provenire esplicitamente dal manutentore; questo sito non crea nuovi impegni di licenza.
+Gli archivi di v0.0.18-r1 e delle versioni precedenti conservano i materiali di licenza originali che li accompagnano; questa modifica della licenza dei sorgenti non ricrea tali archivi. Usare il compilatore Ku non richiede di pubblicare il codice sorgente dei propri programmi. Quando distribuisci programmi contenenti codice del runtime Ku, rispetta i requisiti di licenza e attribuzione applicabili, inclusi gli avvisi di terzi.
 
 ## Segnala un problema
 

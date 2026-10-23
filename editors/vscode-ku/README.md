@@ -28,7 +28,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Install From VSIX
 
-Use `ku-language-0.0.18.vsix` from the matching target bundle in [0.0.18 revision 1](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). For an existing 0.0.18 installation, reinstall from VSIX or use `code --install-extension ./ku-language-0.0.18.vsix --force`; the extension version is still 0.0.18. A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; this extension remains `UNLICENSED`.
+Use `ku-language-0.0.18.vsix` from the matching target bundle in [0.0.18 revision 1](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). For an existing 0.0.18 installation, reinstall from VSIX or use `code --install-extension ./ku-language-0.0.18.vsix --force`; the extension version is still 0.0.18. A CI `native_ci-*` artifact is a verification fixture, not the Ku CLI bundle. Ku remains experimental and not production-ready; the current extension source is licensed under [Apache-2.0](LICENSE.txt), with attribution in [NOTICE](NOTICE). Existing release archives, including v0.0.18-r1, retain their original accompanying license materials; this source change does not repackage them.
 
 To build the VSIX from the repository root instead:
 

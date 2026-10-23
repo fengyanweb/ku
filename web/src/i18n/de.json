@@ -87,7 +87,7 @@
   "projectTitle": "Ein laufendes Projekt. Eine Geschichte zum Verfolgen.",
   "projectDescription": "Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v{releasedVersion}. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases.",
   "github": "Auf GitHub erkunden",
-  "license": "Der Quelltext ist einsehbar. Es wurde keine Open-Source-Lizenz erteilt.",
+  "license": "Aktueller Ku-Quelltext und Editor-Erweiterung: Apache-2.0. Drittanbieterlizenzen und die ursprünglichen Lizenzunterlagen älterer Veröffentlichungsarchive gelten weiterhin.",
   "verified": "Geprüft",
   "limitations": "Unterstützung & Grenzen",
   "version": "Dokumentationsversion",
