@@ -377,21 +377,30 @@ fn main(): null! {
     assert!(Checker::new().check(&invalid).is_err());
     // Compile and link the actual bridge when development libpq is available;
     // this performs no connection and never runs the generated setup function.
-    let mut discovery = Command::new("pg_config");
-    discovery.arg("--libdir");
-    if let Ok(found) = run_bounded(&mut discovery, RUN_TIMEOUT, RUN_LIMITS) {
-        if found.status.success() {
-            let libdir = std::path::PathBuf::from(String::from_utf8(found.stdout).unwrap().trim());
-            let directory = TempDir::new("async-pg-bridge-link");
-            let path = directory.path().join("async-pg.c");
-            fs::write(&path, &generated).unwrap();
-            assert!(native_harness::compile_harness_with_libpq(
-                directory.path(),
-                &path,
-                "async-pg",
-                &libdir
-            )
-            .is_some());
-        }
+    let libdir = std::env::var_os("KU_PG_LIB")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut discovery = Command::new("pg_config");
+            discovery.arg("--libdir");
+            let found = run_bounded(&mut discovery, RUN_TIMEOUT, RUN_LIMITS).ok()?;
+            found
+                .status
+                .success()
+                .then(|| std::path::PathBuf::from(String::from_utf8(found.stdout).unwrap().trim()))
+        });
+    if let Some(libdir) = libdir {
+        // Use the same explicit directory as the real CLI/CI. A pg_config
+        // earlier on Windows PATH can describe a different installation.
+        assert!(libdir.is_dir(), "libpq fixture directory must exist");
+        let directory = TempDir::new("async-pg-bridge-link");
+        let path = directory.path().join("async-pg.c");
+        fs::write(&path, &generated).unwrap();
+        assert!(native_harness::compile_harness_with_libpq(
+            directory.path(),
+            &path,
+            "async-pg",
+            &libdir
+        )
+        .is_some());
     }
 }

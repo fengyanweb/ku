@@ -805,7 +805,7 @@ static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte)
   server.idle_timeout_ms = 1000;
   KuHttpConnection connection = {0};
   ku_http_atomic_store(&ku_http_active_conns, 1);
-  ku_http_connection_start(&connection, accepted, &server);
+  ku_http_connection_start(&connection, NULL, accepted, &server);
   connection.reused = 1;
   char* original_header = connection.header;
   const size_t original_capacity = connection.capacity;
@@ -977,7 +977,7 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   ku_http_fixture_recv_calls = 0;
   ku_http_fixture_would_block = now < 100;
   if (kind < 2) {
-    ku_http_connection_start(&connection, KU_HTTP_INVALID_SOCKET, &server);
+    ku_http_connection_start(&connection, NULL, KU_HTTP_INVALID_SOCKET, &server);
     if (!connection.header) {
       ku_http_queue_close(&queue, 0);
       ku_http_connection_close(&connection);
