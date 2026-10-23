@@ -189,6 +189,8 @@ c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增�
 
 O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体后，原helper未保留PG模式及源码清单，`pg_variants.derive`正确拒绝该产物。本轮仅在实际输入与原完整源码清单一致、两个模式声明有效时继承这两项；ELF哈希仍取新产物，旧flags及产物只放normal参考。两模块17项单测通过，不把mock编译的单测当成实际调优构建。旧1b四栈业务源均已改变，旧调优产物／profile不能复用为最终源；旧batch训练输入又与普通L1相同，最终PGO需重新冻结代表性训练／留出，不能仅改标签称已验收。
 
+checkedmul候选8f42已定向拒绝：compiler／portable各4211二元＋29取负、858实际同步边界及Task量子／取消／清理相关12回归通过；Mac与Linux均实际生成C／ASM。Linux旧乘法边界的4个MOV/MOVK消失，但取模魔数转成每轮4个MOV/MOVK，HTTP frame从15696增到17292B，fast region静态58对54指令、phase acquire与预算各4保持。在同一新boot、1核／1GiB、相同输入512000／seed3／repeat4096的两个短交错配对中，候选完整CPU比1.094985／1.095854，均正确／exit0／域回收。仅短R&D，不作正式区间；据此恢复旧c_int实现，不追加长测证明候选，保留扩展边界回归及8f42历史。该回退不撤销e919 PG等待交接修复。
+
 后台线程驻留归因已实际执行：冻结c1cc同一ELF、2 owner／2核／1GiB，仅总后台配置3对17，7组交错14代均通过、自然退出且域回收。启动及少量/ok后实际线程7对21、FD同12；七组配对中位整域差659456／663552B，匿名差237568B、kernel_stack差229376B。配置差约0.63MiB不能解释此前全部Ku/Rust驻留差，也不构成产品优化或正式内存目标通过。JSON同步fallback可能用足原线程，尚未据此更改线程默认或容量。184个快照／原smaps／generation已核验归档；host／guest临时控制器按SHA删除。
 
 数字解析的只读核对排除了另一种误归因：当前native/C整数直接从原字节累加uint64幅值并检查int64边界，没有逐整数临时字符串、strtoll／strtod或malloc。只有浮点token使用临时缓冲与strtod；三份语料分别34／257／1个整数、均0浮点。解释器的chars Vec与数字String不在本轮native链中。旧b1 array profile的parse_value self仅16/598，且包含所有类型构造，不是数字解析独立热点；因此没有据此继续修改数字解析。详见项目外 `evidence/json-numeric-cost-review/` 的源码身份与原profile索引。
@@ -236,6 +238,10 @@ d450 push的三平台PG原始artifact已下载核对API ZIP字节数及SHA：Win
 历史最早3个504仍是“证据不足，无法唯一还原”；后续历史7次及旧正式30分钟未通过仍保留其版本／夹具范围。当前短测与不同路径的通过不改写旧根因，不追加盲目历史长压测。
 
 ## 8. 证据索引、缺口与交付边界
+
+实际安装包PG入口已在本机执行：d450 push Mac ZIP／API digest相符，解包CLI `bc4de8917b290a8c089e68d9b4ab7641e4a26a1e327e390f349eaa6963026f64` 的版本／hello／JSON及真实sync／async均通过；postmaster0退出、进程树／session回收及临时根清理均确认。另将sync driver原180秒外层上限仅缩短至8秒，在实际HTTP readiness后受控停住，观察到期限终止并真实回收HTTP及PG，随后独立async lane通过。默认产品／SQL期限不变、没有重试。163项旧准备回归加同目录导入反例后，共164项（141过、23平台跳过）。实际还修复原runpy包装未设置script目录导致PG driver sibling import失败；未回收zombie在macOS的getsid/getpgid ESRCH已用真实子进程复现并由独立ps parent/group/Z核对处理。证据`evidence/installed-pg-gate-local-verification/verification.json` SHA `2b968da84686b31e3f8bc7514bcf4d2f925463b6a9d1065507c253a6d28e8350`。这验证门禁实现，**不是最新产品或三平台最终交付**；新增workflow尚需现有GitHub凭据的workflow scope，已向用户说明并等待，未绕过。
+
+隔离VM已在无负载时正常停私库，稀疏盘32→128GiB；实际文件系统132011507712B、可用约118104334336B，CPU8／4GiB不变。私库PG16.15的1024行／schema hash与原一致、无强制停止；新boot／DB域另记，旧freeze／manifest不覆写，不将跨重启差异称因果收益。新矩阵冻结另补Java classpath、.NET publish、Node NODE_PATH及复用证明逐文件覆盖；53个离线反例过，仍需新freeze实际重哈希。
 
 证据存项目外 `~/Downloads/Ku_性能对齐_2026-10-23/`，不是安装包内容。宿主目录及任务书曾暂时不在原位置；用户告知恢复后已核对目录及任务书存在，PG双lane、相关回归与range失败analysis三个原件SHA均与先前记录完全一致。Linux虚拟机 `/opt/ku-bench` 的冻结源和原始测量也保留，两个本轮PG采样归档已传回宿主并逐项核对大小／SHA。原入口：`profiles-analysis/{cpu-analysis.json,task-range/}`、`compiler/copy-init-linux-summary.json`、`json/`、`pg/`、`pg-owner-cost/`、`fixed-backing-readonly/highwater-residency/`、`l1-f7-formal/`、`phase-pointer-linux-30s-v2/analysis/`、`range-599-to-f7-30s-v1/`、`ci-{8ad7940,39c8975,86f5948}/`、`current-validation/`。失败证据不因新通过删除；公开报告不得包含私库URI／凭证。
 

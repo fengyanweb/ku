@@ -25,7 +25,7 @@ enum { KU_INT_OK = 0u, KU_INT_OVERFLOW = 1u, KU_INT_DIV_ZERO = 2u };
 /* Keep the portable path for MSVC and compilers without these exact builtins.
  * This private feature macro is undefined before any user code is emitted. */
 #if defined(__has_builtin)
-# if __has_builtin(__builtin_add_overflow) && __has_builtin(__builtin_sub_overflow) && __has_builtin(__builtin_mul_overflow)
+# if __has_builtin(__builtin_add_overflow) && __has_builtin(__builtin_sub_overflow)
 #  define KU_INT_USE_OVERFLOW_BUILTINS 1
 # endif
 #elif defined(__GNUC__) && __GNUC__ >= 5
@@ -68,13 +68,8 @@ static uint32_t ku_int_sub(int64_t left, int64_t right, int64_t* out) {
 #endif
   return KU_INT_OK;
 }
+#undef KU_INT_USE_OVERFLOW_BUILTINS
 static uint32_t ku_int_mul(int64_t left, int64_t right, int64_t* out) {
-#if KU_INT_USE_OVERFLOW_BUILTINS
-  /* Match add/sub: builtin overflow must not alter out or an aliased input. */
-  int64_t result;
-  if (__builtin_mul_overflow(left, right, &result)) return KU_INT_OVERFLOW;
-  *out = result;
-#else
   /* Every divisor below is nonzero. INT64_MIN is divided only by a
    * positive value; MAX/negative is always representable. In the final
    * branch, truncation toward zero gives ceil(MAX/right), the valid lower
@@ -93,10 +88,8 @@ static uint32_t ku_int_mul(int64_t left, int64_t right, int64_t* out) {
     }
   }
   *out = left * right;
-#endif
   return KU_INT_OK;
 }
-#undef KU_INT_USE_OVERFLOW_BUILTINS
 static uint32_t ku_int_div(int64_t left, int64_t right, int64_t* out) {
   if (right == 0) return KU_INT_DIV_ZERO;
   if (left == INT64_MIN && right == -1) return KU_INT_OVERFLOW;
