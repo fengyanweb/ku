@@ -28,6 +28,8 @@ mod task_driver;
 mod task_http;
 #[path = "c_task_mixed.rs"]
 mod task_mixed;
+#[path = "c_task_range.rs"]
+mod task_range;
 #[path = "c_task_root.rs"]
 mod task_root;
 
@@ -360,6 +362,23 @@ fn generate_c_source_bounded(
 }
 
 fn generate_c_source_with_frames_bounded(
+    program: &IrProgram,
+    options: &CBackendOptions,
+    byte_limit: usize,
+    frames: Option<(
+        &crate::ir::task::TaskProgram,
+        &crate::ir::task::TaskFramePlan,
+        Option<crate::ir::task::TaskFunctionId>,
+    )>,
+) -> KuResult<String> {
+    // Generation only builds source and rebuilds invocation-local symbol
+    // registries. An optional range candidate must not reduce output admission.
+    task_range::generate_with_fallback(|| {
+        generate_c_source_with_frames_attempt(program, options, byte_limit, frames)
+    })
+}
+
+fn generate_c_source_with_frames_attempt(
     program: &IrProgram,
     options: &CBackendOptions,
     byte_limit: usize,

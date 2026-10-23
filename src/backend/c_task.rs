@@ -199,6 +199,7 @@ pub(super) fn emit_frames(
         uses_postgres(tasks),
     )?;
     super::task_adapter::emit_host(out, tasks)?;
+    let mut range_work = super::task_range::WorkBudget::default();
     for function in &tasks.functions {
         out.check()?;
         let frame = plan
@@ -216,6 +217,17 @@ pub(super) fn emit_frames(
             for slot in &frame.cooperative_slots {
                 emitter.persistent.insert(slot.0);
             }
+        }
+        if super::task_range::enabled() {
+            emitter.range_plan = super::task_range::RangePlan::build(
+                function,
+                (0..function.states.len())
+                    .map(|state| emitter.scalar_direct_state(state))
+                    .collect(),
+                |slot| emitter.cached_scalar(SlotId(slot)),
+                |slot| !emitter.persistent.contains(&slot),
+                &mut range_work,
+            );
         }
         emitter.emit(out)?;
     }
@@ -240,6 +252,9 @@ struct FrameEmitter<'a> {
     scalar_cache_active: Cell<bool>,
     scalar_init_cache_active: Cell<bool>,
     scalar_cache_mask: Cell<u64>,
+    range_plan: Option<super::task_range::RangePlan>,
+    range_active: Cell<bool>,
+    range_fast: Cell<bool>,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -389,6 +404,9 @@ impl<'a> FrameEmitter<'a> {
             scalar_cache_active: Cell::new(false),
             scalar_init_cache_active: Cell::new(false),
             scalar_cache_mask: Cell::new(0),
+            range_plan: None,
+            range_active: Cell::new(false),
+            range_fast: Cell::new(false),
         })
     }
 
@@ -980,7 +998,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_transition(&self, out: &mut COutput, target: usize) {
         if self.scalar_direct_state(target) {
-            out.push_str(&format!("  goto ku_task_scalar_check_{target};\n"));
+            let label = if self.range_fast.get() {
+                "range"
+            } else {
+                "scalar"
+            };
+            out.push_str(&format!("  goto ku_task_{label}_check_{target};\n"));
         } else {
             out.push_str(&format!(
                 "  frame->header.state = {target}u;\n  goto ku_task_dispatch;\n"
@@ -1008,8 +1031,13 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 "if (clock->host && !__ku_dispatch_budget--)",
             )
         };
+        let label = if self.range_fast.get() {
+            "range"
+        } else {
+            "scalar"
+        };
         out.push_str(&format!(
-            "ku_task_scalar_check_{state}:;\n\
+            "ku_task_{label}_check_{state}:;\n\
              if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
              {phase} {{\n\
                frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
@@ -1026,6 +1054,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_scalar_init_flush(&self, out: &mut COutput) {
         if self.scalar_cache_active.get() {
+            if self.range_active.get() {
+                // A general/Owned/host/cleanup boundary ends the numeric
+                // proof. Never reselect within this drive invocation.
+                out.push_str("  __ku_range_fast=0;\n");
+            }
             let mask = self.scalar_cache_mask.get();
             out.push_str("  __ku_scalar_phase=NULL;\n");
             // Merge only Copy bits. Owned/Task publications may have changed
@@ -1067,16 +1100,56 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         self.scalar_cache_mask.set(scalar_mask);
         self.scalar_cache_active.set(true);
         let emitted = self.emit_drive_body(&mut body);
-        self.scalar_cache_active.set(false);
-        self.scalar_init_cache_active.set(false);
         emitted?;
         let body = body.finish()?;
+        let mut baseline = COutput::new(out.remaining());
+        self.emit_scalar_drive_artifact(&mut baseline, &slots, &body, scalar_mask)?;
+        let baseline = baseline.finish()?;
+        drop(body);
+        let mut chosen = None;
+        if self.range_plan.is_some() {
+            super::task_range::attempted();
+            self.range_active.set(true);
+            let limit = baseline
+                .len()
+                .saturating_add(super::task_range::MAX_EXTRA_SOURCE_BYTES)
+                .min(out.remaining());
+            let mut candidate_body = COutput::new(limit);
+            let candidate = self
+                .emit_drive_body(&mut candidate_body)
+                .and_then(|()| candidate_body.finish())
+                .and_then(|body| {
+                    let mut artifact = COutput::new(limit);
+                    self.emit_scalar_drive_artifact(&mut artifact, &slots, &body, scalar_mask)?;
+                    artifact.finish()
+                });
+            self.range_active.set(false);
+            if let Ok(candidate) = candidate {
+                if super::task_range::claim_extra(candidate.len().saturating_sub(baseline.len())) {
+                    chosen = Some(candidate);
+                }
+            }
+        }
+        self.scalar_cache_active.set(false);
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
+        out.push_str(chosen.as_deref().unwrap_or(&baseline));
+        out.check()
+    }
+
+    fn emit_scalar_drive_artifact(
+        &self,
+        out: &mut COutput,
+        slots: &[SlotId],
+        body: &str,
+        scalar_mask: u64,
+    ) -> KuResult<()> {
         let helper = format!("{}_spill_scalars", self.prefix);
         out.push_str(&format!(
             "static uint32_t {helper}({}* frame",
             self.frame_type
         ));
-        for slot in &slots {
+        for slot in slots {
             out.push_str(&format!(
                 ", {} cached_{}",
                 c_type(self.slot_type(*slot)?)?,
@@ -1086,16 +1159,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         out.push_str(&format!(
             ", uint64_t copy_initialized, int copy_active, uint32_t result) {{\n  if (copy_active) frame->header.initialized=(frame->header.initialized & ~UINT64_C({scalar_mask})) | (copy_initialized & UINT64_C({scalar_mask}));\n"
         ));
-        for slot in &slots {
+        for slot in slots {
             out.push_str(&format!("  frame->s_{}=cached_{};\n", slot.0, slot.0));
         }
         out.push_str("  return result;\n}\n");
         let mut call = format!("{helper}(frame");
-        for slot in &slots {
+        for slot in slots {
             call.push_str(&format!(",cached_{}", slot.0));
         }
         call.push_str(",__ku_copy_initialized,__ku_copy_init_active");
-        emit_scalar_spill_returns(out, &body, &call)?;
+        emit_scalar_spill_returns(out, body, &call)?;
         out.check()
     }
 
@@ -1109,6 +1182,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         if self.scalar_cache_active.get() {
             out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
+        }
+        if self.range_active.get() {
+            out.push_str("  int __ku_range_unselected=1;\n  int __ku_range_fast=0;\n");
         }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
@@ -1162,21 +1238,60 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     });
             out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
         }
+        if self.range_active.get() {
+            let guard = self
+                .range_plan
+                .as_ref()
+                .unwrap()
+                .guard_slots
+                .iter()
+                .map(|slot| format!("(cached_{slot}>=INT32_MIN && cached_{slot}<=INT32_MAX)"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            // This selector follows the original phase and budget checks. The
+            // selected initial body has ALREADY consumed one logical unit.
+            out.push_str(&format!("  if (__ku_range_unselected) {{ __ku_range_unselected=0; __ku_range_fast=!cleanup && ({guard}); }}\n"));
+        }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
-            out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
+            if self.range_active.get() && self.scalar_direct_state(index) {
+                out.push_str(&format!("  case {index}u: if (__ku_range_fast) goto ku_task_range_state_{index}; goto ku_task_state_{index};\n"));
+            } else {
+                out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
+            }
         }
         out.push_str(
             "  default: frame->header.running = 0; return KU_TASK_FRAME_INVALID_STATE;\n  }\n",
         );
-        for (index, state) in self.function.states.iter().enumerate() {
+        let states = self
+            .function
+            .states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| (index, state, false))
+            .chain(
+                self.function
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        self.range_active.get() && self.range_plan.as_ref().unwrap().states[*index]
+                    })
+                    .map(|(index, state)| (index, state, true)),
+            );
+        for (index, state, range_fast) in states {
             out.check()?;
+            self.range_fast.set(range_fast);
             let cached_init = self.scalar_cache_active.get() && self.scalar_direct_state(index);
             self.scalar_init_cache_active.set(cached_init);
             if self.scalar_direct_state(index) {
                 self.emit_scalar_checkpoint(out, index);
             }
-            out.push_str(&format!("ku_task_state_{index}:;\n"));
+            if range_fast {
+                out.push_str(&format!("ku_task_range_state_{index}:;\n"));
+            } else {
+                out.push_str(&format!("ku_task_state_{index}:;\n"));
+            }
             if cached_init {
                 let mask = self.scalar_cache_mask.get();
                 out.push_str(&format!(
@@ -1515,6 +1630,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
         }
         self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
         if !self.finally.state_cleanup.is_empty() {
             out.push_str("ku_task_protected_failure:;\n  switch (frame->header.state) {\n");
             for (state, region) in self.finally.regions.iter().enumerate() {
@@ -1597,12 +1713,29 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     ));
                     self.set_init(out, *dst, true);
                 }
-                TaskUnaryOp::Negate => self.emit_checked_integer(
-                    out,
-                    *dst,
-                    &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
-                    state,
-                )?,
+                TaskUnaryOp::Negate => {
+                    if self.range_fast.get()
+                        && self
+                            .range_plan
+                            .as_ref()
+                            .unwrap()
+                            .proves(state, operation_id)
+                    {
+                        out.push_str(&format!(
+                            "  {} = -{};\n",
+                            self.place(*dst),
+                            self.place(*src)
+                        ));
+                        self.set_init(out, *dst, true);
+                    } else {
+                        self.emit_checked_integer(
+                            out,
+                            *dst,
+                            &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
+                            state,
+                        )?;
+                    }
+                }
             },
             TaskOp::Binary {
                 dst,
@@ -1618,7 +1751,29 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     TaskBinaryOp::Remainder => Some("ku_int_rem"),
                     _ => None,
                 };
-                if let Some(helper) = helper {
+                if self.range_fast.get()
+                    && self
+                        .range_plan
+                        .as_ref()
+                        .unwrap()
+                        .proves(state, operation_id)
+                {
+                    let operator = match op {
+                        TaskBinaryOp::Add => "+",
+                        TaskBinaryOp::Subtract => "-",
+                        TaskBinaryOp::Multiply => "*",
+                        TaskBinaryOp::Divide => "/",
+                        TaskBinaryOp::Remainder => "%",
+                        _ => unreachable!(),
+                    };
+                    out.push_str(&format!(
+                        "  {} = ({} {operator} {});\n",
+                        self.place(*dst),
+                        self.place(*left),
+                        self.place(*right)
+                    ));
+                    self.set_init(out, *dst, true);
+                } else if let Some(helper) = helper {
                     self.emit_checked_integer(
                         out,
                         *dst,

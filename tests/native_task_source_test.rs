@@ -584,14 +584,25 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
             .unwrap();
     let mut drive = generated[begin..end].to_owned();
     assert!(drive.contains("goto ku_task_scalar_check_"));
+    assert!(drive.contains("goto ku_task_range_state_"));
+    assert!(drive.contains("__ku_range_fast=!cleanup && ("));
     // Count executed *verified IR states*, including lexical empty drains and
     // latches; do not count C branches or substitute a different work quantum.
     for state in 0..work.states.len() {
         let label = format!("ku_task_state_{state}:;");
         assert_eq!(drive.matches(&label).count(), 1);
         drive = drive.replacen(&label, &format!("{label}\n  fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+        let fast = format!("ku_task_range_state_{state}:;");
+        if drive.contains(&fast) {
+            assert_eq!(drive.matches(&fast).count(), 1);
+            drive = drive.replacen(&fast, &format!("{fast}\n  fixture_fast_steps++; fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+        }
     }
-    let globals = "static size_t fixture_steps,fixture_cancel_at;\nstatic uint32_t fixture_cancel_result;\nstatic uint64_t fixture_deadline;\nstatic KuTaskControlLeaseV1* fixture_cancel_lease;\n";
+    drive = drive.replace(
+        "__ku_range_fast=!cleanup && (",
+        "__ku_range_fast=!fixture_force_slow && !cleanup && (",
+    );
+    let globals = "static size_t fixture_steps,fixture_fast_steps,fixture_cancel_at;\nstatic int fixture_force_slow;\nstatic uint32_t fixture_cancel_result;\nstatic uint64_t fixture_deadline;\nstatic KuTaskControlLeaseV1* fixture_cancel_lease;\n";
     generated.replace_range(begin..end, &(globals.to_owned() + &drive));
     let expected = (0..5000).fold(3i64, |total, index| (total * 33 + index + 3) % 100000000);
     let source = generated.replacen(
@@ -602,20 +613,24 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
         + r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"scalar edges line %d: %s\n",__LINE__,#c); return 1; } } while (0)
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
-static int fixture_case(size_t cancel_at,int overflow,int divide_zero) {
+static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_slow) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
-  fixture_steps=0; fixture_cancel_at=cancel_at; fixture_cancel_result=UINT32_MAX;
+  fixture_steps=fixture_fast_steps=0; fixture_force_slow=force_slow;
+  fixture_cancel_at=cancel_at; fixture_cancel_result=UINT32_MAX;
   fixture_deadline=ku_task_driver_now_ms()+2000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0),1u,fixture_deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
-  int64_t seed=overflow?INT64_MAX:3,divisor=divide_zero?0:1;
+  int64_t seed=overflow==2?INT64_MIN:overflow?INT64_MAX:3,divisor=divide_zero?0:1;
   CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
   fixture_cancel_lease=&task.owner.lease;
   CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
   if(cancel_at) CHECK(fixture_steps==cancel_at && fixture_cancel_result==KU_TASK_CONTROL_OK);
   else if(!overflow) CHECK(fixture_steps==64u && driver.polls==1u && driver.queued==1u);
+  if(force_slow) CHECK(!fixture_fast_steps);
+  else if(!overflow) CHECK(fixture_fast_steps>0);
+  if(overflow) CHECK(!fixture_fast_steps);
   for(size_t turn=0;turn<2000u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
     CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
   if(cancel_at) CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
@@ -641,11 +656,16 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero) {
   return 0;
 }
 int main(void) {
-  CHECK(!fixture_case(0,0,0));
-  /* Publish at every original state position, including the last state in
-   * the quantum. A cached phase VALUE would incorrectly execute past it. */
-  for(size_t cancel_at=1u;cancel_at<=64u;cancel_at++) CHECK(!fixture_case(cancel_at,0,0));
-  CHECK(!fixture_case(0,1,0)); CHECK(!fixture_case(0,0,1));
+  for(int force_slow=0;force_slow<2;force_slow++) {
+    CHECK(!fixture_case(0,0,0,force_slow));
+    /* Publish at every original state position in both emitted paths. The
+     * initial fast body has already been charged by general dispatch. */
+    for(size_t cancel_at=1u;cancel_at<=64u;cancel_at++)
+      CHECK(!fixture_case(cancel_at,0,0,force_slow));
+    CHECK(!fixture_case(0,1,0,force_slow));
+    CHECK(!fixture_case(0,2,0,force_slow));
+    CHECK(!fixture_case(0,0,1,force_slow));
+  }
   puts("task-scalar-exact-quantum-cancel-errors-ok"); return 0;
 }
 "#;
@@ -670,6 +690,142 @@ int main(void) {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "task-scalar-exact-quantum-cancel-errors-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_guarded_ranges_keep_growth_failures_and_original_error_order() {
+    let ast = checked(
+        r#"
+async fn Square(value:int):int! {
+    total=value; i=0
+    while(i<3) { total=total*total; i=i+1 }
+    return ok(total)
+}
+async fn Remainder(divisor:int):int! {
+    total=0; i=0
+    while(i<3) {
+        minimum= -9223372036854775807 - 1
+        total=minimum%divisor
+        total=total/0
+        i=i+1
+    }
+    return ok(total)
+}
+async fn main():null! { return ok(null) }
+"#,
+    );
+    let tasks = task_lower::lower_program(&ast).unwrap();
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    let first = generated
+        .find("static uint32_t ku_task_frame_0_drive(")
+        .unwrap();
+    generated.insert_str(
+        first,
+        "static size_t fixture_range_steps;\nstatic int fixture_range_slow;\n",
+    );
+    generated = generated.replace(
+        "__ku_range_fast=!cleanup && (",
+        "__ku_range_fast=!fixture_range_slow && !cleanup && (",
+    );
+    for function in &tasks.tasks.functions[..2] {
+        let begin = generated
+            .find(&format!(
+                "static uint32_t ku_task_frame_{}_drive(",
+                function.id.0
+            ))
+            .unwrap();
+        let end = begin
+            + generated[begin..]
+                .find(&format!(
+                    "static uint32_t ku_task_frame_{}_resume(",
+                    function.id.0
+                ))
+                .unwrap();
+        let mut drive = generated[begin..end].to_owned();
+        assert!(drive.contains("ku_task_range_state_"));
+        let fast = drive.find("ku_task_range_check_").unwrap();
+        if function.id.0 == 0 {
+            assert!(
+                drive[fast..].contains("ku_int_mul("),
+                "later squares must retain overflow checks"
+            );
+        } else {
+            assert!(drive[fast..].contains("ku_int_rem("));
+            assert!(drive[fast..].contains("ku_int_div("));
+        }
+        for state in 0..function.states.len() {
+            let label = format!("ku_task_range_state_{state}:;");
+            drive = drive.replace(&label, &format!("{label}\n  fixture_range_steps++;\n"));
+        }
+        generated.replace_range(begin..end, &drive);
+    }
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    ) + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"guarded range line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int variant,int slow) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
+  uint64_t deadline=ku_task_driver_now_ms()+2000u;
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  fixture_range_steps=0; fixture_range_slow=slow;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),1u,
+    deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  int64_t value=variant==0?INT32_MAX:variant==1?-1:variant==2?0:2;
+  CHECK((variant==0?ku_task_0_start_value(&driver,&value,&task)
+    :ku_task_1_start_value(&driver,&value,&task))==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<64u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&task.owner.lease)!=KU_TASK_CONTROL_PENDING);
+  if(slow) CHECK(!fixture_range_steps); else CHECK(fixture_range_steps>0);
+  KuTaskAdapterOutcomeV1 outcome={0};
+  CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.result_kind==1u && !outcome.value.integer.ok);
+  KuString message=outcome.value.integer.error.message;
+  const char* expected=variant<2?"integer overflow":"division by zero";
+  CHECK(message.len==strlen(expected) && !memcmp(message.ptr,expected,message.len));
+  ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+int main(void) {
+  for(int slow=0;slow<2;slow++) for(int variant=0;variant<4;variant++) CHECK(!fixture_case(variant,slow));
+  puts("task-guarded-range-growth-error-order-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-guarded-range");
+    let path = directory.path().join("guarded_range.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "guarded_range") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must run guarded ranges"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-guarded-range-growth-error-order-ok\n"
     );
     assert!(output.stderr.is_empty());
 }

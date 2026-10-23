@@ -194,3 +194,9 @@ Java 原黄金请求均正确，但 SIGTERM 后退出 143 没有有序关闭证�
 204dc3b 的三平台 workspace CI 暴露真实边界退化：无 async handler 的普通程序也走 mixed lowering，绕过了旧 async 函数类型拒绝。当前复用原检查器恢复该边界，9 项既有 native async boundary 回归通过；未扩展广泛 AST 分析。另同步 PG capture/async 退休新增的两条同一 finalizer 路径断言，原 source guard 通过；Windows 测试夹具改链接实际 libpq.lib，避免 -lpq 在 MSVC 目标错误查找 pq.lib，待 Windows 新 SHA 实跑确认。
 
 phase 地址单变量 30 秒 v1 由编排器错误重复查询已冻结的旧服务而停止，候选未开始；旧窗口 3600/3600 正确，编排错误和原记录保留。修正后的 v2 第一旧 control 窗口出现 1656/3600 正确、1944 次读取响应头超时，候选仍未开始，因此立即停止。服务最终成功计数与 Task polls 表明 3600 个计算均执行完；完整服务 CPU 65.04 秒，驱动后仍有 5.47 秒 CPU 成本，约 3 秒后物理责任归零。该失败不能作为候选加速或回归的证据；当前也不能唯一归因于宿主机。正式七轮未完成，目标状态继续为未验收。
+
+## 有界 Task 整数范围候选
+
+只对已验证的纯 Copy 标量 Task IR 状态做 `(state, remaining≤64)` 有限区间传播；同一操作在所有可达上下文都成立，才在一套额外 fast labels 中省去对应整数检查。每次 drive 重新检查已安全加载的整数是否在 int32 范围，实际计算仍为 int64；范围外及未证明操作保留旧 checked helper。平方增长反例不能凭一次入口检查被整段放行。跨一般/Owned/host/cleanup 边界后本次 drive 不再选快路径；不改变用户 Task、frame ABI、每 state 的 phase acquire、64 state 配额、32 poll/1ms 或首错与 spill。
+
+全程序证明最多 1,000,000 work，额外生成 C 合计最多 256KiB。证明/额外源码预算耗尽放弃优化；候选挤占后续 HTTP/root glue 导致生成失败时，仅关闭该优化重新完整生成原代码，旧合法程序仍可编译。7 项私有单测和 24 项既有/扩展集成通过，包括独立 checked_i64 oracle、MIN/MAX guard 外实际执行、除零/MIN%-1、逐位置取消、共享预算及 whole-file 精确限制时字节相同回落。相关实际 C/整数矩阵 ASan/UBSan 5 项、TSan 5 项通过，严格 all-target Clippy 通过，LSan 未启用。小夹具 C 增加 7,935B；重复发射与证明也有编译成本，尚无实际 CPU 收益结论。
