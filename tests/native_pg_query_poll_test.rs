@@ -694,6 +694,60 @@ fn native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_p
     );
 }
 
+fn run_async_acquire_waiter_handoff(kind: u8) {
+    let name = match kind {
+        0 => "async-query-acquire-handoff-expired",
+        1 => "async-query-acquire-handoff-cancel",
+        2 => "async-query-acquire-handoff-success",
+        _ => panic!("unknown PG acquisition handoff case"),
+    };
+    let directory = TempDir::new(name);
+    let harness = query_stub_harness(&directory).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    ) + &ASYNC_QUERY_SUITE.replace(
+        "int main(void) {",
+        "static int ku_async_sequential_tests(void) {",
+    ) + &format!("\n#define KU_TEST_HANDOFF_KIND {kind}\n")
+        + ASYNC_ACQUIRE_HANDOFF_SUITE;
+    let source = directory.path().join("async-query-acquire-handoff.c");
+    fs::write(&source, harness).expect("write PG acquisition handoff harness");
+    let Some(executable) =
+        compile_harness(directory.path(), &source, "async-query-acquire-handoff")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| panic!("PG acquisition handoff test exceeded bounds: {error}"));
+    assert!(
+        output.status.success(),
+        "PG acquisition handoff (kind={kind}) failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async waiter handoff closed loop\n"
+    );
+}
+
+#[test]
+fn native_pg_async_expired_waiter_hands_idle_lease_to_later_waiter() {
+    run_async_acquire_waiter_handoff(0);
+}
+
+#[test]
+fn native_pg_async_cancelled_waiter_hands_idle_lease_to_later_waiter() {
+    run_async_acquire_waiter_handoff(1);
+}
+
+#[test]
+fn native_pg_async_successful_waiter_hands_remaining_idle_lease_to_later_waiter() {
+    run_async_acquire_waiter_handoff(2);
+}
+
 #[test]
 fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
     let directory = TempDir::new("async-query-notification-pin");
@@ -2300,6 +2354,120 @@ int main(void) {
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
   CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
   puts("pg async pump closed loop");return 0;
+}
+"#;
+
+const ASYNC_ACQUIRE_HANDOFF_SUITE: &str = r#"
+#define KU_TEST_HANDOFF_CANCEL (KU_TEST_HANDOFF_KIND==1)
+#define KU_TEST_HANDOFF_SUCCESS (KU_TEST_HANDOFF_KIND==2)
+typedef struct HandoffWake { KuPgAsyncOp* op; AsyncBudget* budget; } HandoffWake;
+static void handoff_wake(void* context) {
+  HandoffWake* wake=(HandoffWake*)context;
+  /* The notification owns its callback pin and publishes outside the PG lock. */
+  if(ku_test_pg_pool_lock_depth || !wake->op->waiter.in_flight)abort();
+  async_wake(wake->budget);
+}
+static size_t handoff_idle_leases(KuPgClient* p) {
+  size_t idle=0;
+  for(size_t i=0;i<p->size;i++)if(p->conns[i] && !p->in_use[i])idle++;
+  return idle;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
+  track_runtime_allocations=1;
+  int before_connects=starts,before_user_sends=user_sends,before_resets=reset_sends;
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),KU_TEST_HANDOFF_SUCCESS?2:1,8,1000,250,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;
+  CHECK(live_runtime_allocations>0 && runtime_bytes>0 && runtime_peak_bytes>0);
+  AsyncBudget held_budget={0},held_second_budget={0},a_budget={0},b_budget={0};
+  KuPgAsyncOp* held=async_create(p,&held_budget);
+  CHECK(!ku_pg_async_step(held,0,clock_ms,0));
+  CHECK(held->sent && held->phase==KU_PG_ASYNC_READ && held->interest==1u && p->active==1);
+  KuPgAsyncOp* held_second=NULL;
+  if(KU_TEST_HANDOFF_SUCCESS) {
+    held_second=async_create(p,&held_second_budget);
+    CHECK(!ku_pg_async_step(held_second,0,clock_ms,0));
+    CHECK(held_second->phase==KU_PG_ASYNC_CONNECT && held_second->connecting && !held_second->connect_ready);
+    ku_pg_async_connect_run(held_second,0);
+    CHECK(!ku_pg_async_step(held_second,0,clock_ms,0));
+    CHECK(held_second->sent && held_second->phase==KU_PG_ASYNC_READ && held_second->interest==1u);
+    CHECK(p->active==2 && !p->connect_in_flight && starts==before_connects+2);
+  }
+  KuPgAsyncOp* a=async_create(p,&a_budget);HandoffWake a_wake={a,&a_budget};
+  a->waiter.wake=handoff_wake;a->waiter.context=&a_wake;
+  CHECK(!ku_pg_async_step(a,0,clock_ms,0));
+  CHECK(a->waiting && !a->waiter.notified && a->acquire_deadline==1250u && p->waiters==1);
+  /* Supply held responses at 1249ms. Follow normal result/terminal-NULL/
+   * DISCARD ALL paths; never force leases free while libpq still has results. */
+  clock_ms=a->acquire_deadline-1u;held->conn->mode=T_OK;mode_on_send=T_OK;
+  CHECK(async_finish(held,0) && held->output.ok);
+  CHECK(a_budget.wakes==1 && a->waiter.notified && !a->waiter.in_flight);
+  async_drop_output(held,&held_budget,1);
+  if(KU_TEST_HANDOFF_SUCCESS) {
+    CHECK(p->active==1 && handoff_idle_leases(p)==1);
+    held_second->conn->mode=T_OK;
+    CHECK(async_finish(held_second,0) && held_second->output.ok);
+    async_drop_output(held_second,&held_second_budget,1);
+  }
+  CHECK(p->active==0 && p->waiters==1 && handoff_idle_leases(p)==(KU_TEST_HANDOFF_SUCCESS?2u:1u));
+  CHECK(reset_sends==before_resets+(KU_TEST_HANDOFF_SUCCESS?2:1) && a_budget.wakes==1);
+  /* B cannot barge past A, even though A has not taken the available lease. */
+  KuPgAsyncOp* b=async_create(p,&b_budget);HandoffWake b_wake={b,&b_budget};
+  b->waiter.wake=handoff_wake;b->waiter.context=&b_wake;
+  unsigned long long b_deadline=b->acquire_deadline;
+  CHECK(b_deadline==1499u && !ku_pg_async_step(b,0,clock_ms,0));
+  CHECK(b->waiting && !b->waiter.notified && !b_budget.wakes && p->waiters==2);
+  int fd=-2;unsigned int events=99u;unsigned long long deadline=0;
+  CHECK(!ku_pg_async_interest(b,&fd,&events,&deadline));
+  CHECK(fd==-1 && !events && deadline==b_deadline && !b->sent);
+  if(KU_TEST_HANDOFF_SUCCESS) {
+    /* A claims only one lease and remains blocked in its own query. B must be
+     * notified for the other idle lease before A can release its lease. */
+    mode_on_send=T_READ_TIMEOUT;
+    CHECK(!ku_pg_async_step(a,0,clock_ms,0));
+    CHECK(a->sent && a->phase==KU_PG_ASYNC_READ && !a->waiting && !a->waiter.linked);
+    CHECK(p->active==1 && p->waiters==1 && handoff_idle_leases(p)==1);
+    CHECK(user_sends==before_user_sends+3 && reset_sends==before_resets+2);
+  } else {
+    if(!KU_TEST_HANDOFF_CANCEL)clock_ms=a->acquire_deadline;
+    CHECK(ku_pg_async_step(a,0,clock_ms,KU_TEST_HANDOFF_CANCEL));
+    CHECK(!a->output.ok && !a->sent && !a->waiting && !a->waiter.linked);
+    CHECK(ku_string_equal(a->output.error.code,ku_string_static((const uint8_t*)
+        (KU_TEST_HANDOFF_CANCEL?"cancelled":"acquire_timeout"),KU_TEST_HANDOFF_CANCEL?9u:15u)));
+    CHECK(p->active==0 && p->waiters==1 && handoff_idle_leases(p)==1);
+    CHECK(user_sends==before_user_sends+1);
+  }
+  CHECK(clock_ms<b_deadline && b->acquire_deadline==b_deadline);
+  /* Readiness is the regression witness. Do not manually step an unnotified B:
+   * the real reactor would have no descriptor/event before B's own deadline. */
+  CHECK(ku_pg_async_interest(b,&fd,&events,&deadline));
+  CHECK(fd==-1 && !events && deadline==b_deadline && b->waiter.notified && b_budget.wakes==1);
+  CHECK(!b->waiter.in_flight);
+  if(!KU_TEST_HANDOFF_SUCCESS) {
+    CHECK(ku_pg_async_can_dispose(a) && ku_pg_async_can_dispose(a));
+    async_drop_output(a,&a_budget,0);
+  }
+  CHECK(a_budget.wakes==1 && b_budget.wakes==1);
+  CHECK(ku_pg_async_interest(b,&fd,&events,&deadline));
+  mode_on_send=T_OK;
+  CHECK(async_finish(b,0) && b->output.ok && b->sent && clock_ms<b_deadline);
+  CHECK(!b->waiter.linked && !b->waiter.in_flight && b_budget.wakes==1);
+  async_drop_output(b,&b_budget,1);
+  if(KU_TEST_HANDOFF_SUCCESS) {
+    CHECK(p->active==1 && a->sent && a->phase==KU_PG_ASYNC_READ);
+    a->conn->mode=T_OK;CHECK(async_finish(a,0) && a->output.ok);
+    async_drop_output(a,&a_budget,1);
+  }
+  int expected_queries=KU_TEST_HANDOFF_SUCCESS?4:2;
+  CHECK(user_sends==before_user_sends+expected_queries && reset_sends==before_resets+expected_queries);
+  CHECK(starts==before_connects+(KU_TEST_HANDOFF_SUCCESS?2:1));
+  CHECK(p->active==0 && p->waiters==0 && p->async_operations==0);
+  CHECK(!held_budget.bytes && !held_second_budget.bytes && !a_budget.bytes && !b_budget.bytes);
+  ku_pg_client_close_owned(p);
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  CHECK(starts==finishes && runtime_peak_bytes>0 && !ku_test_pg_pool_lock_depth && !ku_test_pg_finishes_while_pool_locked);
+  track_runtime_allocations=0;
+  puts("pg async waiter handoff closed loop");return 0;
 }
 "#;
 

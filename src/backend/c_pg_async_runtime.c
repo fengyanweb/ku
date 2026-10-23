@@ -60,7 +60,14 @@ static void ku_pg_async_unlink_locked(KuPgAsyncOp* op) {
   if (op->waiter.next) op->waiter.next->previous=op->waiter.previous;
   else p->async_tail=op->waiter.previous;
   op->waiter.next=op->waiter.previous=NULL;op->waiter.linked=0;
-  if (op->waiting) { p->waiters--;op->waiting=0; }
+  if (op->waiting) {
+    p->waiters--;op->waiting=0;
+    /* A later arrival cannot barge past an already notified waiter. After
+     * withdrawal or a successful claim, hand off any resource still available.
+     * The claimed slot is already in_use, so the shared helper cannot offer it
+     * again. It pins callbacks and drops this mutex before publishing wakes. */
+    if (!p->closing) ku_pg_client_handoff_available_locked(p);
+  }
 }
 static void ku_pg_async_drop_table(KuPgAsyncOp* op,KuPgResult** result) {
   size_t bytes=0; (void)ku_pg_result_owned_bytes(*result,&bytes);

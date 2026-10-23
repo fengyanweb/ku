@@ -17,6 +17,8 @@ CPU HTTP 的完整服务成本差距明显；独立计算与不同JSON语料的�
 
 f7固定计算对Go的配对速度比为1.052587、95%区间[1.042989,1.060838]；CPU成本比0.951783 [0.944136,0.961433]，未达到≤0.90。对Rust的速度比0.946893 [0.911149,1.008926]，不能证明追平；CPU成本比1.066449 [1.005567,1.104857]，同样未达标。最新JSON／PG及同步快路径改动不在这批冻结结果中。
 
+最新c1cc单核正式七轮已完成：49个计算窗口、49个独立启动观察均通过，32768×512000迭代／窗、checksum22944003；所有进程exit0、98个资源域移除，无OOM／超时／清理错误。完整进程CPU／正确计算的中位数为Ku2.246322、Go2.434886、Rust2.046793、Node9.188046、Java2.365531、.NET2.239488、C++2.107894ms。Ku／Go配对CPU几何比0.912797 [0.862131,0.955457]，速度1.101869 [1.041212,1.188580]；Ku／Rust CPU1.091199 [1.047786,1.139591]，速度0.913488 [0.868744,0.957167]。沿用整轮配对、20000次bootstrap、seed20261023，Go round4等漂移全部保留。CPU上界≤0.90对两者均未达、Rust速度下界≥1未达。本批没有跨版本配对，不能将相对f7的变化归因于某项优化。
+
 最新4ea已实编并完成三个独立短窗，均driver合格、自然回收、5秒夹具通过、cleanup为空：
 
 | 4ea独立窗口，2核1GiB | 正确／计划 | 完整CPU／正确 | p99 | 范围 |
@@ -27,7 +29,7 @@ f7固定计算对Go的配对速度比为1.052587、95%区间[1.042989,1.060838]�
 
 该数据不能与257／b1跨时间、跨实现短窗相除当成单变量改善百分比，也不能冒填正式表A／B。原始目录为 `/opt/ku-bench/results/short-scenes-4ea1407-v1`；后续只补相关成本与有效对照。
 
-PG后续第一次诊断在100rps×30秒预热中出现31个`database_error:acquire_timeout`（2969/3000正确），尚未开始perf，因此没有可用栈；同期driver调度最大延迟570.8ms，不能唯一归因服务或宿主。保留该失败，不自动重跑或延长产品期限。
+PG后续第一次诊断在100rps×30秒预热中出现31个HTTP500（2969/3000正确），保留的24个响应体均为`database_error:acquire_timeout`，另外7个体未保留，不能补写其原因。尚未开始perf，因此没有可用栈；同期driver调度最大延迟570.8ms，不能唯一归因服务或宿主。保留该失败，不自动重跑或延长产品期限。
 
 为避免再次错过异常，第二次明确作为冷态、有采样开销的诊断，在第一条请求之前启用全服务cgroup软件cpu-clock 99Hz采样。2000rps×8秒16000/16000正确，p99 10.64ms；完整CPU2.042815秒（127.67594µs/正确，非正式收益），服务／driver／数据库均未节流。182个样本中，`ku_http_loop_run`有30个self样本，其中26个准确映射到内联`net_interests`整容量扫描的递增／读取job.state／比较NET_WAIT指令，约占全样本14.29%。实际ARM64槽跨度1200B，与原C的`i<pool->capacity`一致；这证明扫描是当前热点，粗粒度样本不能预测精确改善比例。其余包含网络、唤醒、driver提交等成本，self与children不相加。两owner贡献177样本、原blocking连接线程5样本，21线程均纳入同一域；自然静默2.27ms、活动账本归零、固定／reserved回到原基线、exit0、无强制退出且PID／FD及域均清理。原perf与C／ASM窗口保留在guest，未改变源、超时或正式合同。
 
@@ -47,7 +49,9 @@ PG后续第一次诊断在100rps×30秒预热中出现31个`database_error:acqui
 | `39c89756fb5d689cc633988c8c921b6eb4de3101` | 默认独立sync／async PG实库验收；两次CI均有实库失败，详见第7节 |
 | `d15dfbbdfda91534f2ff38c1241c0041d566b186` | JSON parse／decode／try_parse只读调用及受控请求字符串投影 |
 | `4ea1407e4c5f9690022f2fac1a8565c5f74ecf3f` | PG同一owner turn批量推进，保留共享预算；Linux已实编、三个独立短窗及热点采样完成，配对收益未验 |
-| `b55e7ee62a13171fb070d172b54b09572771418b` | 当前产品源：每owner WAIT索引与代次快照；本机回归／私库通过，Linux重编、A/B及最新CI待验 |
+| `b55e7ee62a13171fb070d172b54b09572771418b` | 当前产品源：每owner WAIT索引与代次快照；本机回归／私库通过，Linux按下行源实际重编；A/B首异常停止，无收益结论 |
+| `c1cc3dc96a478cf799f9bb9815920e0a73108f06` | b55产品＋O09身份helper；Linux实际CLI／native构建170.715秒，manifest完整；batch C／ELF与4ea逐字相同，server已切换活跃链，原容量扫描消除 |
+| `d450b3e3ada4a5c35741301df790bc4777785266` | 仅Windows验收身份记录及报告后续；src／基准输入／锁与c1cc相同。已推送，push40027977065／PR40027992019必要检查均成功；push三平台实际包及资产集合检查成功。分支发布步骤按原规则跳过，不算发布通过；包内CLI的PG链仍是独立缺口 |
 
 本机PG验收采用连接退休观察合同修正；该次构建时的dirty状态与源码／CLI哈希一并记录，不能仅用HEAD称为clean构建，更不能冒充三平台CI。Linux基准产物另由确切4ea归档构建。原主目录用户改动及本工作树预存的 `docs/multicore-capacity-acceptance.md` 修改不纳入本报告变更。
 
@@ -75,6 +79,8 @@ V5采用有界对数直方图、互斥终态及全量CSV对账。窗口、驱动
 f7同步batch实际ELF排除了“每轮整数组复制”和“对照用了32位整数”：`ku_array_push_reuse_int`按容量增长；三栈64位标量，乘33均移位加，取余均无SDIV，此递推没有SIMD。Go／Rust在内部计时前预留结果容量，Ku增长在内部计时内；全进程CPU均计入，不能把源码容量序列当实测分配次数。
 
 PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400个含预热样本：排队wall28.57µs、worker CPU68.86／wall250.19µs、acquire CPU0.57／wall4.00µs、三getter CPU0.93µs、JSON CPU1.82µs、reset CPU22.84／wall83.01µs；send／wait／prepare／reset包含关系不能相加。normal与同lease DISCARD的reset-equivalent表分开；Go／Rust各2项清理／取消回归已过，不等于正式性能通过。
+
+c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增量`128+8*capacity`；16384槽是131200B，本轮HTTP夹具实际2048槽则为16512B，不能混用。实际server ASM沿owner head／next构造快照，slot／generation及原位输出均存在。CPU frame2的C函数相同；整ELF函数仍3924指令／25 LDAR，但99条地址立即数导致170机器字节不同，不能称整函数字节相同。232字节核心计算块确实逐字相同，仍4 phase acquire与4预算检查。
 
 ## 4. 表A—C：正式比较
 
@@ -170,7 +176,7 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | F01 500原因／终态 | 8个有界受保护样本、RID前48字节hex，优先500；根未启动InlineFailed准入及独立拒绝计数修正 | 最终源原CPU触发点的全原因与物理退休；不将139旧LIMIT追溯归成纯槽不足 | 未验收 |
 | F02 完整生命周期 | FIN／RST区分、唯一完成、CLOSED_JOB／ASYNC等物理退休；失败尾部CPU保留 | 最终取消／超时／断开／后台对账与可归因无用CPU；新请求恢复独立验 | 未验收 |
 | F03 容量／过载 | V5／控制服务／有界编排；11680/11680控制请求正确 | 核心可靠容量低／中／临界／越界、真饱和及恢复；非单调旧失败未唯一解释 | 未验收 |
-| F04 样本／身份 | 7轮／30秒、尾样本门槛与混合比例；f7 L1 49窗有效 | 最新源各核心点／原轮次／失败与区间；产物不能按版本号或改名冒充同源 | 未验收 |
+| F04 样本／身份 | 7轮／30秒、尾样本门槛与混合比例；f7及c1cc各49个L1窗有效 | 最新源各核心点／原轮次／失败与区间；产物不能按版本号或改名冒充同源 | 未验收 |
 | O01 成本分解 | CPU／JSON／PG／基础驻留及实际C／ASM；软件perf | 硬件计数不可用，全域alloc／复制字节／syscall计数未齐；按热点补缺口 | 部分完成 |
 | O02 C计算热路径 | 直接状态、Copy缓存、有限范围、同步快路径；相关回归 | 最新Linux实际C／ASM与有效CPU HTTP A/B、公平性及正式目标点 | 未验收 |
 | O03 helper／布局 | 公开直接原语、frame收紧，不删除可观察Task | 原helper与正常API分别比较完整成本 | 未验收 |
@@ -178,18 +184,26 @@ PG分段仪器本身使CPU比control增16.37%，不能当生产精确值。10400
 | O05 HTTP | 活动路由／已有gather、json MIME与唯一响应责任 | 同语义完整吞吐、写回syscall／复制、partial-write／断开及资源 | 未验收 |
 | O06 资源 | 容量／固定账本、lazy触页；轻负载少1.039MiB | 同速率整服务稳态／峰值、8192等待与收尾保留量 | 未验收 |
 | O07 JSON | 旧默认、writer／parser局部处理、只读请求正文及边界回归 | 三语料组件A/B、最新完整调用／资源，类型化与动态分表 | 未验收 |
-| O08 PG | 原共享池owner状态机、同turn预算；本机sync／async均过 | 原Windows大结果150ms失败相关验证、最终三平台实库、normal／reset正式对照 | 未验收 |
+| O08 PG | 原共享池owner状态机、同turn预算；等待者交接3个反例修复、14回归及本机sync／async实库过 | 偶发acquire_timeout仍缺现场因果证据；normal／reset正式对照、最新三平台CI及实际安装包PG链 | 未验收 |
 | O09 调优 | 旧源实编及训练留出闭环 | 最终源普通／调优有效表、flags／大小／编译时间及产物身份 | 未验收 |
 
 O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体后，原helper未保留PG模式及源码清单，`pg_variants.derive`正确拒绝该产物。本轮仅在实际输入与原完整源码清单一致、两个模式声明有效时继承这两项；ELF哈希仍取新产物，旧flags及产物只放normal参考。两模块17项单测通过，不把mock编译的单测当成实际调优构建。旧1b四栈业务源均已改变，旧调优产物／profile不能复用为最终源；旧batch训练输入又与普通L1相同，最终PGO需重新冻结代表性训练／留出，不能仅改标签称已验收。
 
+后台线程驻留归因已实际执行：冻结c1cc同一ELF、2 owner／2核／1GiB，仅总后台配置3对17，7组交错14代均通过、自然退出且域回收。启动及少量/ok后实际线程7对21、FD同12；七组配对中位整域差659456／663552B，匿名差237568B、kernel_stack差229376B。配置差约0.63MiB不能解释此前全部Ku/Rust驻留差，也不构成产品优化或正式内存目标通过。JSON同步fallback可能用足原线程，尚未据此更改线程默认或容量。184个快照／原smaps／generation已核验归档；host／guest临时控制器按SHA删除。
+
+数字解析的只读核对排除了另一种误归因：当前native/C整数直接从原字节累加uint64幅值并检查int64边界，没有逐整数临时字符串、strtoll／strtod或malloc。只有浮点token使用临时缓冲与strtod；三份语料分别34／257／1个整数、均0浮点。解释器的chars Vec与数字String不在本轮native链中。旧b1 array profile的parse_value self仅16/598，且包含所有类型构造，不是数字解析独立热点；因此没有据此继续修改数字解析。详见项目外 `evidence/json-numeric-cost-review/` 的源码身份与原profile索引。
+
 ## 7. 正确性、CI与历史失败
+
+本次另确定一个独立的PG异步等待交接缺陷。A已被通知但未运行时，B为保持先后顺序而排队；A超时／取消后，原unlink没有将仍可用的idle连接通知给B。双连接池中，A成功取得一个连接、另一个仍idle时也能触发，所以修复不能仅限slot<0分支。最小修改位于`ku_pg_async_unlink_locked`：实际等待成员退出后复用原handoff helper；原helper对回调持有pin并在pool锁外唤醒。连接、查询、期限、SQL及自动重试规则不变。
+
+三个永久反例在修复前全部失败于B没有readiness，修复后整个PG target14项通过、原live opt-in1项未启用；配置Mac ASan/UBSan同14项、TSan关闭／回调交错1项、strict Clippy和debug CLI构建通过。该CLI SHA `4f60900361270705a41038584827d7fe7d2aa4743f0e920793595967b5be136d` 在d450＋本次PG修改构建，尚非clean提交产物。真实PG17.11 sync／async两lane均过：10000行、Unicode／NULL、原100ms acquire／150ms query／2000ms handler、5秒恢复不变；丢失确认写恰1行且未重放、exit0、远端连接0、cleanup空。第一轮因本机不存在独立libpq公式路径而未启动native服务，两个私库清理正常；随后通过pg_config定位已安装PG17库验证成功，没有安装新依赖。以上确定性反例尚不能证明历史压测acquire_timeout由同一缺陷导致。
 
 本轮owner WAIT索引补完后，现有source target22项与PG poll target11项通过，1个原有live opt-in未启用；独立只读复核未发现正常调用下的具体错误。严格Clippy（all-targets/all-features、-D warnings）、全workspace格式与debug CLI构建通过。Mac配置ASan/UBSan的TCP两项及PG11项通过，`detect_leaks=0`，不冒充Linux强制检测器。实际现有私库脚本再跑sync／async，两路均完成10000行、中文／NULL、原150ms超时、断连、确认丢失恰1行及原5秒恢复；exit0、远端连接0、cleanup为空，async unknown7／confirmed_cancel0／未确认回滚。该次CLI `40c2e42c1f8e86c4ce38896bc3a07f3af59adc09f7303994e6dc71650cbf37cc`，报告SHA `79d0c78d89b61659910fba6a7e929e46cdccae660ba2ab27262fee74594bb9f8`，是在86f基础加本轮dirty生产改动构建，不按HEAD冒称clean。
 
 最新本机实库使用独立sync／async私库／代理、debug native C、4 event loops、4池连接／8 waiter；原acquire100ms／query150ms／handler2000ms、180秒外层及故障恢复5秒不变。两lane均passed，10000行2列、Unicode／NULL、超时、新读恢复、断连、写确认丢失均有实际结果；丢失确认的写恰1行，原SQL未重放。两次自然退出0、cleanup_errors均空、退出连接最终0。本机PostgreSQL17.11结果不能替代Linux16或三平台CI。
 
-`pg_stat_activity`明确：async压力join后首次观察有5个远端session，其中4个仍在PgSleep、1个idle；原5秒窗口内观测为约0.207秒5个→0.739秒1个，非持续泄漏证明。压力观察与join共用原5秒，drain／进程退出／远端归零共用从drain请求开始的5秒，最多8次有界查询；不再要求close之后瞬间远端归零，也不延长窗口或确认回滚。该验收修改尚未提交，前一失败 `pg-async-connection-diagnostic.json` 保留。
+`pg_stat_activity`明确：async压力join后首次观察有5个远端session，其中4个仍在PgSleep、1个idle；原5秒窗口内观测为约0.207秒5个→0.739秒1个，非持续泄漏证明。压力观察与join共用原5秒，drain／进程退出／远端归零共用从drain请求开始的5秒，最多8次有界查询；不再要求close之后瞬间远端归零，也不延长窗口或确认回滚。该验收修改已提交86f并取得两次CI三平台12路实库通过，前一失败 `pg-async-connection-diagnostic.json` 保留。
 
 同一批源码本机定向native／借用／同步回归49通过、1个原live opt-in ignored；strict all-target Clippy与fmt通过；借用及PG实际C ASan/UBSan合计6项、TSan4项通过。Mac `detect_leaks=0`，不称LSan或全Runtime竞态审计通过。首次分配夹具因旧string.trim native不支持失败，改用已有string.replace保持快照对照后通过；原失败日志保留。receipt记录HEAD39c＋当时dirty源码哈希，产品修改随后提交d15／4ea，不能仅凭HEAD把此验证写成clean4ea完整CI。
 
@@ -207,12 +221,15 @@ O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体�
 | 8ad CI | PR40010779946过，push40010773305 Windows慢查询unknown后首个新读acquire_timeout约110ms，随后JSONDecodeError | 验收复用原5秒／8次新只读合同，原查询／INSERT不重放；pending0和reserved上限不能证明idle／leased |
 | 39c CI四种新失败 | push Linux／Mac async压力远端5>4；PR Windows drain exit0后瞬时远端1≠0；push Windows async10000行172ms超原150ms返回unknown | 本机远端观察补证据、验收改共享有界退休窗口；4ea批量结果处理待平台实测，不称四类根因均已修 |
 | 86f push40024100907／PR40024106559 | push唯一失败为Windows Caddy rolling资源快照spare41线程>33，cleanup采样PID1956仍存在；PR全部必要项过。两次CI三平台PG sync／async共12路均实际passed | spare为supervisor6＋launcher6＋两个直接子12／17线程，总105<133；旧记录缺映像／创建时间，不能唯一判断两Ku实例重叠或PID归属。PR同检查通过、无遗留，不能覆盖push失败；不增加reserve |
+| WAIT索引4ea→c1cc配对 | 首个control正式30秒60000/60000，fullCPU117.774117µs／正确、p99 7.48ms、5秒静止过；candidate首次100rps／30秒预热2999/3000，1个acquire_timeout即停止，未进入candidate正式窗 | 0个完整配对，不计算收益／bootstrap。RID0964695060001391计划13.910s、首发13.921261s、完成14.186446s，不能将客户总耗时当内部排队。各域0节流，现场lease／queue／线程未采，不能唯一定因；两代exit0／无强杀／域删除，candidate事后5秒账本静止未采 |
 
-39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最终4ea及后续必要CI／同源安装包仍待验；新增sanitizer workflow因OAuth无workflow权限尚不能上传，不绕过权限，普通Git推送另行执行。
+39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最新d450 push40027977065／PR40027992019必要CI均成功；push三平台实际包及资产集合检查成功，分支发布步骤按规则跳过，不作为发布通过。实际安装包PG仍待独立验收；新增sanitizer及安装包PG workflow因OAuth无workflow权限尚不能上传，不绕过权限，普通Git推送已完成。
 
 另一个有序退出修正限Java基准：同4.5秒绝对预算依次HTTP drain／在途0／CPU executor／PG pool／Vertx，严格匹配实际SIGTERM、PID／listeners、阶段／计数、无OOM／强制终止和cgroup清理才接受143；其他栈要求exit0。19项驱动回归及真实PG／timer在途退出通过，不把任意非零退出放宽。
 
-86f Windows Caddy失败仅补现有夹具身份记录：Toolhelp映像名、选中及cleanup采样PID的实际映像路径和创建FILETIME；查询失败保留unknown，句柄finally关闭。不改变归属、资源门槛、清理策略，不新增HTTP轮询。既有Python测试23通过／1平台跳过，新增字段尚待真实Windows CI，未将未知原因写成已修复。Mac配置TSan又通过TCP两项及真实HTTP多owner TCP一项；这不替代Linux必要gate。
+86f Windows Caddy失败仅补现有夹具身份记录：Toolhelp映像名、选中及cleanup采样PID的实际映像路径和创建FILETIME；查询失败保留unknown，句柄finally关闭。不改变归属、资源门槛、清理策略，不新增HTTP轮询。既有Python测试23通过／1平台跳过；d450两次真实Windows CI相关检查成功，但未再次触发原异常，未将未知原因写成已修复。Mac配置TSan又通过TCP两项及真实HTTP多owner TCP一项；这不替代Linux必要gate。
+
+d450 push的三平台PG原始artifact已下载核对API ZIP字节数及SHA：Windows 69597B、macOS 45684B、Linux 45258B，均匹配。每个平台原始报告的sync／async两lane均为passed、cleanup为空，共6路；CLI来自该CI的Cargo构建目录，不写成安装包PG通过。回执 `ci-d450b3e/push-pg-artifact-check.json`。
 
 唯一后续599有界8秒诊断960/960正确、最大计划到完成29.74ms，未捕获所选异常；全局环覆盖1196条早期记录，不称trace整体完整。collector错用 `/proc/TID/stat` 的线程user/system拆分已剔除，仅独立schedstat可用于运行／就绪等待；未借此归因平台。诊断开销不入正式比值，服务／驱动／perf正常回收，临时C／ELF／脚本已清理。
 
@@ -232,6 +249,11 @@ O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体�
 | 本机相关回归／detector receipt | `5299c1db797e258e463f03342cc6b7c7ec0f31d1202cd958dfde1922f6c26731`，含dirty源hash、原失败与Mac LSan限制 |
 | 4ea PG预热首次失败 | guest `profile-pg-4ea1407-v1.evidence.tar.gz`，28254B，`d33b8f8245699d09033de0d1b52ca26dca96b9259f8d8e01245a6fde6f5141d5`；无perf样本，不能用于热点比例 |
 | 4ea PG冷态有界热点诊断 | guest `profile-pg-4ea1407-cold-v2.evidence.tar.gz`，589464B，`8c5b00af34d2f3a2dcb6e92e823cc7e4e18546f985a54c5a13fc41c93b931d13`；182软件样本，含原perf／实际ASM／全部错误与回收记录 |
+| c1cc Linux实际构建 | manifest `dbcf33a256182a7a720e4adf4fd3a72a13dca40433601ea5a1d08d4359100a62`；CLI `2e2f17ea9ccb6a9ef5bf910ab766c9f74e73bf6683645eb9aebb519434b3ffaa`；server ELF `b434f9ea178852fa5a756b1910162eabcd3f644edf5f12653d37edd0fdf64e8e`；raw20成员归档 `611806f8a41f03024ed3859cc322c8646e9ebc0d603b128363639a279fc461dd` |
+| c1cc正式单核七轮 | `l1-c1cc-formal/summary.json` 40097628B，`d4d199706820503ed709c564110b50adc799cfee7b28d4cffe7bc4276cbd3444`；配对原件 `945124e0fdc7b08fe42402ebe166e5aa1d3196b70f6d1ac974b01aa13973559d`；传回核对 `4b263054b2506a7b640c68a4768ceeeb66a42423ddf28b23a93d85e1df463f4d` |
+| PG等待交接修复 | `current-validation/pg-handoff-verification.json`，`9efd25010f510c36de22ab55189579402988177dd8f90d07b8796b14566a8555`；前后3反例、14回归、配置检测器、真实双lane与源码／CLI hash；不是历史错误定因 |
+| WAIT索引A/B首次失败 | `net-active-index-ab/evidence.tar.gz`，1590581B，27项，`1e3da9710ba95c6afcd7b761f387b88e19665a4e22161a6aea91f22f47ccc203`；0完整配对，所有失败／全周期保留，临时控制器已删 |
+| d450 push三平台PG原始artifact核对 | `ci-d450b3e/push-pg-artifact-check.json`，`f1c55fce46941da867a3cf3fe06c8e7e00cdb3af701f027eac99139ebe877fde`；3个ZIP外层digest／大小匹配，sync／async共6路passed且cleanup为空，范围为Cargo CLI |
 | 8ad Windows失败外ZIP | `72e3c4caeae6d32aa4d73f2623f7ca2e89ad546ee10675a22aa7558975da7429`，API digest与下载匹配；不是release内包hash |
 
 尚需连续完成：最新候选实际Linux C／ASM成本闭环及有效单变量收益；不依赖失效窗口的正式A／B容量和同速率核心点；normal／reset、8192等待、600秒混合、真过载／恢复；最终三平台必要CI及同源CLI／native／实际安装包PG适用示例和hash验证。结果未跨门槛保持未验收，不能以测试数、包构建或其中一栈较快代替目标。
