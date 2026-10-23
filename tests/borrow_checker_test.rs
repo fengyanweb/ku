@@ -268,6 +268,28 @@ fn main(): null! {
 }
 
 #[test]
+fn borrow_checker_json_parser_aliases_accept_readonly_forwarding() {
+    accepts(
+        r#"
+struct Input { text: str }
+fn Decode(&text: str): str! { value = json.decode(text)? return json.encode(value) }
+fn Parse(&text: str): str! { value = json.parse(text)? return json.encode(value) }
+fn TryParse(&text: str): str! { value = json.try_parse(text)? return json.encode(value) }
+fn Forward(&input: Input): str! { return Decode(input.text) }
+fn Body(&req: HttpRequest): str! { value = json.decode(req.body)? return json.encode(value) }
+fn main(): null! {
+    input = Input { text: "{\"text\":\"中文😀\"}" }
+    if (Forward(input)? != Parse(input.text)? || Decode(input.text)? != TryParse(input.text)?) {
+        panic("JSON parser aliases disagree")
+    }
+    println(input.text)
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
 fn borrow_checker_consuming_iteration_match_destructure_result_boundaries() {
     rejects(
         "fn Read(&values: [str]) { for value in values { println(value) } } fn main() {}",

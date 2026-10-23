@@ -2799,12 +2799,27 @@ impl<'a> FunctionLowerer<'a> {
         expr: &Expr,
         expected: Option<&IrType>,
         deferred_safepoint: &mut bool,
+        allow_request_string_projection: bool,
     ) -> KuResult<IrExpr> {
         self.budget.borrow_mut().spend(1, expr.span)?;
         match &expr.kind {
-            ExprKind::Field { target, name } if matches!(self.borrow_projection_type(target), Some(IrType::Named(ref n)) if self.layouts.structs.iter().any(|s| &s.name == n)) =>
+            ExprKind::Field { target, name }
+                if matches!(self.borrow_projection_type(target), Some(IrType::Named(ref n))
+                    if self.layouts.structs.iter().any(|s| &s.name == n)
+                        || (allow_request_string_projection
+                            && n == HTTP_REQUEST_TYPE
+                            && matches!(name.as_str(), "method" | "path" | "body"))) =>
             {
-                let mut target = self.lower_borrow_argument(target, None, deferred_safepoint)?;
+                // These synthetic request strings are real C fields, just as
+                // user-struct projections are. A View argument may read their
+                // existing storage; dynamic request maps retain their lookup
+                // and snapshot paths.
+                let mut target = self.lower_borrow_argument(
+                    target,
+                    None,
+                    deferred_safepoint,
+                    allow_request_string_projection,
+                )?;
                 if !ir_expr_is_place(&target) && !ir_expr_is_borrowed(&target) {
                     target = self.emit_temp(target)?;
                 }
@@ -2821,7 +2836,12 @@ impl<'a> FunctionLowerer<'a> {
                 if matches!(self.borrow_projection_type(target), Some(IrType::Array(_)))
                     && is_pure_append_argument(index, "") =>
             {
-                let mut target = self.lower_borrow_argument(target, None, deferred_safepoint)?;
+                let mut target = self.lower_borrow_argument(
+                    target,
+                    None,
+                    deferred_safepoint,
+                    allow_request_string_projection,
+                )?;
                 if !ir_expr_is_place(&target) && !ir_expr_is_borrowed(&target) {
                     target = self.emit_temp(target)?;
                 }
@@ -2852,6 +2872,7 @@ impl<'a> FunctionLowerer<'a> {
         expected: Option<&[IrType]>,
         modes: Option<&[ParamMode]>,
         callee_has_effects: bool,
+        allow_request_string_projection: bool,
     ) -> KuResult<Vec<IrExpr>> {
         // Refuse wide argument staging before allocating the parallel vectors.
         self.budget.borrow_mut().spend(args.len(), self.span)?;
@@ -2871,6 +2892,7 @@ impl<'a> FunctionLowerer<'a> {
                     arg,
                     expected.and_then(|params| params.get(index)),
                     &mut deferred_safepoint,
+                    allow_request_string_projection,
                 )?
             } else {
                 self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?
@@ -3277,6 +3299,7 @@ impl<'a> FunctionLowerer<'a> {
                             None,
                             Some(&modes),
                             false,
+                            true,
                         )?);
                         return self.finish_borrowing_call(
                             IrExpr {
@@ -3448,6 +3471,13 @@ impl<'a> FunctionLowerer<'a> {
                     },
                 };
                 let first_argument_temp = self.next_temp_id;
+                // Only audited intrinsic loans and user-declared View calls
+                // may bypass a request-field snapshot. Legacy stdlib View
+                // metadata alone does not establish call-scoped loans.
+                let allow_request_string_projection = match &probe_kind {
+                    IrCallKind::Intrinsic(name) => metadata::supports_borrowed_call(name),
+                    IrCallKind::Direct(_) | IrCallKind::Indirect => true,
+                };
                 let lowered_args = self.lower_call_arguments(
                     args,
                     expected_param_types.as_deref(),
@@ -3470,6 +3500,7 @@ impl<'a> FunctionLowerer<'a> {
                     }
                     .as_deref(),
                     false,
+                    allow_request_string_projection,
                 )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant

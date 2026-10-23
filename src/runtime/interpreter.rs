@@ -4633,6 +4633,9 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("string", "ends_with") => "string.ends_with",
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
+        ("json", "parse") => "json.parse",
+        ("json", "decode") => "json.decode",
+        ("json", "try_parse") => "json.try_parse",
         ("json", "stringify") => "json.stringify",
         ("json", "encode") => "json.encode",
         _ => return None,
@@ -4687,8 +4690,10 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
         if let Some(method) = name.strip_prefix("array.") {
             return stdlib::array::eval(method, std::slice::from_ref(first), span);
         }
-        if matches!(name, "json.stringify" | "json.encode") {
-            return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
+        if let Some(method) = name.strip_prefix("json.") {
+            // The old parser and writer read synchronously and return their
+            // own storage. Hold the existing loan only through that call.
+            return stdlib::json::eval(method, std::slice::from_ref(first), span);
         }
         if name == "print" {
             print!("{first}");
@@ -7833,6 +7838,9 @@ mod collection_tests {
                 "contains",
                 "starts_with",
                 "ends_with",
+                "parse",
+                "decode",
+                "try_parse",
                 "stringify",
                 "encode",
                 "push",

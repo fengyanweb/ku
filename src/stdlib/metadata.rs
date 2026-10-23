@@ -192,6 +192,9 @@ pub(crate) fn supports_borrowed_call(name: &str) -> bool {
             | "string.ends_with"
             | "array.len"
             | "array.is_empty"
+            | "json.parse"
+            | "json.decode"
+            | "json.try_parse"
             | "json.stringify"
             | "json.encode"
     )
@@ -750,7 +753,10 @@ mod borrow_tests {
                 &["len", "byte_len", "contains", "starts_with", "ends_with"][..],
             ),
             ("array", &["len", "is_empty"][..]),
-            ("json", &["stringify", "encode"][..]),
+            (
+                "json",
+                &["parse", "decode", "try_parse", "stringify", "encode"][..],
+            ),
         ] {
             for function in functions {
                 let signature = dotted_signature(module, function).unwrap();

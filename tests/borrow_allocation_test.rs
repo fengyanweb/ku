@@ -205,6 +205,141 @@ fn borrow_native_nested_reads_allocate_nothing_and_temporaries_drop_after_call()
     eprint!("{stdout}");
 }
 
+#[test]
+fn borrow_native_json_reads_request_storage_without_input_copies() {
+    let directory = TempDir::new("borrow-json-request");
+    let generated = emit_c(
+        directory.path(),
+        r#"
+fn DecodeBody(&req: HttpRequest): int! { value = json.decode(req.body)? return value.as_int() }
+fn ParseBody(&req: HttpRequest): int! { value = json.parse(req.body)? return value.as_int() }
+fn TryParseBody(&req: HttpRequest): int! { value = json.try_parse(req.body)? return value.as_int() }
+fn DecodeOwnedBody(req: HttpRequest): int! { value = json.decode(req.body)? return value.as_int() }
+fn MakeRequest(req: HttpRequest): HttpRequest { return req }
+fn DecodeTemporaryBody(req: HttpRequest): int! { value = json.decode(MakeRequest(req).body)? return value.as_int() }
+fn ReadRequestFields(&req: HttpRequest): int { return req.method.byte_len() + req.path.byte_len() + req.body.byte_len() }
+fn DecodeText(&text: str): str! { value = json.decode(text)? return value.as_str() }
+fn LegacyInput(req: HttpRequest): str { return string.replace(req.body, "x", "y") }
+fn main() {}
+"#,
+    );
+    let legacy = generated
+        .split("KuString LegacyInput(KuStruct___ku_http_request req) {")
+        .nth(1)
+        .expect("legacy stdlib input definition")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(legacy.contains("ku_string_clone"), "{legacy}");
+    let mut harness = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        );
+    harness.push_str(
+        r#"
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
+#define CHECK(value) do { if (!(value)) { fprintf(stderr, "JSON borrow check failed at %d: %s\n", __LINE__, #value); return 1; } } while (0)
+int main(void) {
+  const size_t bytes = 65536;
+  KuStruct___ku_http_request request = {0};
+  request.method = ku_string_static((const uint8_t*)"POST", 4);
+  request.path = ku_string_static((const uint8_t*)"/json", 5);
+  request.body = (KuString){ (uint8_t*)ku_perf_malloc(bytes), bytes, bytes, KU_STRING_OWNED };
+  CHECK(request.body.ptr);
+  memset(request.body.ptr, ' ', bytes);
+  memcpy(request.body.ptr + bytes - 3, "123", 3);
+  uint8_t* original = request.body.ptr;
+  const size_t baseline_live = ku_perf_live_allocations, baseline_bytes = ku_perf_live_bytes;
+  ku_perf_calls = 0;
+  for (size_t round = 0; round < 64; round++) {
+    KuResult_int decoded = DecodeBody(&request);
+    KuResult_int parsed = ParseBody(&request);
+    KuResult_int tried = TryParseBody(&request);
+    CHECK(decoded.ok && parsed.ok && tried.ok);
+    CHECK(decoded.value == 123 && parsed.value == 123 && tried.value == 123);
+    CHECK(ReadRequestFields(&request) == (int64_t)(bytes + 9));
+  }
+  CHECK(!ku_perf_calls && !ku_perf_overflow);
+  CHECK(ku_perf_live_allocations == baseline_live && ku_perf_live_bytes == baseline_bytes);
+  CHECK(request.body.ptr == original && request.body.len == bytes && request.body.ptr[0] == ' ');
+  CHECK(!memcmp(request.body.ptr + bytes - 3, "123", 3));
+
+  /* The ordinary owning handler must also borrow its body for the parser,
+     then release the request once at the normal owner boundary. */
+  KuResult_int (*owning_readers[2])(KuStruct___ku_http_request) = { DecodeOwnedBody, DecodeTemporaryBody };
+  for (size_t index = 0; index < 2; index++) {
+    KuStruct___ku_http_request owned = request;
+    owned.body = ku_string_clone(request.body);
+    CHECK(owned.body.ptr != original && ku_perf_live_allocations > baseline_live);
+    ku_perf_calls = 0;
+    KuResult_int decoded_owned = owning_readers[index](owned);
+    CHECK(decoded_owned.ok && decoded_owned.value == 123 && !ku_perf_calls);
+    owned = (KuStruct___ku_http_request){0};
+    CHECK(ku_perf_live_allocations == baseline_live && ku_perf_live_bytes == baseline_bytes);
+  }
+
+  const char* bad = "{\"a\":[\"owned\",]}";
+  memset(request.body.ptr, ' ', bytes);
+  memcpy(request.body.ptr + bytes - strlen(bad), bad, strlen(bad));
+  for (size_t round = 0; round < 64; round++) {
+    KuResult_int rejected[3] = { DecodeBody(&request), ParseBody(&request), TryParseBody(&request) };
+    for (size_t index = 0; index < 3; index++) {
+      CHECK(!rejected[index].ok);
+      CHECK(rejected[index].error.domain.len == 4 && !memcmp(rejected[index].error.domain.ptr, "json", 4));
+      CHECK(rejected[index].error.code.len == 11 && !memcmp(rejected[index].error.code.ptr, "parse_error", 11));
+      ku_error_drop(&rejected[index].error);
+    }
+    CHECK(request.body.ptr == original && request.body.len == bytes);
+    CHECK(ku_perf_live_allocations == baseline_live && ku_perf_live_bytes == baseline_bytes);
+  }
+  ku_drop_struct___ku_http_request(&request);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes);
+
+  const char* encoded = "\"owned\\u0000tail\"";
+  KuString input = ku_string_clone(ku_string_static((const uint8_t*)encoded, strlen(encoded)));
+  KuResult_str text = DecodeText(&input);
+  CHECK(text.ok && text.value.len == 10 && text.value.ptr != input.ptr);
+  ku_string_drop(&input);
+  CHECK(!memcmp(text.value.ptr, "owned\0tail", 10));
+  ku_string_drop(&text.value);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("JSON borrowed input copies=0; parser outputs and error cleanup verified");
+  return 0;
+}
+"#,
+    );
+    let source = directory.path().join("borrow-json-request.c");
+    fs::write(&source, harness).expect("write JSON borrowed request fixture");
+    let Some(executable) = compile_harness(directory.path(), &source, "borrow-json-request") else {
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("JSON borrowed request fixture must finish within its deadline");
+    assert!(
+        output.status.success(),
+        "JSON borrow allocation gate failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("JSON borrowed input copies=0"));
+    assert!(output.stderr.is_empty());
+}
+
 const JSON_FAILURE_HOOK: &str = r#"
 static size_t ku_borrow_json_allocation_calls = 0, ku_borrow_fail_json_allocation = 0;
 static size_t ku_borrow_abort_baseline_live = 0, ku_borrow_abort_baseline_bytes = 0;

@@ -86,6 +86,36 @@ fn borrow_interpreter_json_stringify_and_sync_borrow_inside_async() {
 }
 
 #[test]
+fn borrow_interpreter_json_parser_aliases_return_owned_values_and_release_error_loans() {
+    ku::cli::run_source(
+        "borrow_json_parse.ku",
+        r#"
+        struct Input { text: str }
+        fn decode(&text: str): str! { value = json.decode(text)? return value.as_str() }
+        fn parse(&text: str): str! { value = json.parse(text)? return value.as_str() }
+        fn try_parse(&text: str): str! { value = json.try_parse(text)? return value.as_str() }
+        fn main(): null! {
+            input = Input { text: "\"" + "中文😀\\u0000tail\"" }
+            decoded = decode(input.text)?
+            if (parse(input.text)? != decoded || try_parse(input.text)? != decoded) { panic("parser aliases") }
+            input.text = "changed"
+            if (decoded.byte_len() != 15 || !decoded.starts_with("中文😀")) { panic("decoded storage") }
+            bad = "{\"a\":[\"owned\",]}"
+            caught = 0
+            finalized = 0
+            try { decode(bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { caught++ } } finally { finalized++ }
+            try { parse(bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { caught++ } } finally { finalized++ }
+            try { try_parse(bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { caught++ } } finally { finalized++ }
+            bad = "\"recovered\""
+            if (caught != 3 || finalized != 3 || decode(bad)? != "recovered") { panic("parser loan cleanup") }
+            return ok(null)
+        }
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
 fn borrow_interpreter_readonly_stdlib_and_copy_enum_payload() {
     run_unchecked(
         r#"
