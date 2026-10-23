@@ -491,6 +491,68 @@ class Sampler:
                                      'error': self.error, 'interval_seconds': self.interval})
         return self.samples
 
+JAVA_SHUTDOWN_PREFIX = b'BENCH_SHUTDOWN '
+JAVA_SHUTDOWN_STAGES = ['http_drained', 'in_flight_completed', 'cpu_terminated', 'pool_closed', 'vertx_closed']
+
+
+def java_shutdown_receipt(path):
+    """Read only a bounded log tail; incomplete output is never a close receipt."""
+    try:
+        with Path(path).open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 8192))
+            tail = stream.read(8192)
+    except OSError:
+        return {'status': 'missing'}
+    lines = [line for line in tail.splitlines() if line.startswith(JAVA_SHUTDOWN_PREFIX)]
+    if len(lines) != 1:
+        return {'status': 'missing' if not lines else 'duplicate'}
+    if not tail.endswith(b'\n'):
+        return {'status': 'truncated'}
+    if len(lines[0]) > 2048:
+        return {'status': 'oversized'}
+    try:
+        receipt = json.loads(lines[0][len(JAVA_SHUTDOWN_PREFIX):])
+    except (UnicodeError, ValueError):
+        return {'status': 'invalid'}
+    return {'status': 'recorded', 'receipt': receipt}
+
+
+def service_termination_succeeded(stack, termination):
+    """Preserve exit-zero gates; classify only a proven Java SIGTERM hook."""
+    if termination.get('forced') is not False or termination.get('cgroup_removed') is not True:
+        return False
+    if stack != 'java':
+        return termination.get('exit_code') == 0
+    if (termination.get('exit_code') != 143 or termination.get('requested_signal') != signal.SIGTERM
+            or any(type(termination.get('after', {}).get(name)) is not int or termination['after'][name] != 0
+                   for name in ('process_count', 'threads', 'fd'))):
+        return False
+    for name in ('oom', 'oom_kill', 'oom_group_kill'):
+        before = termination.get('before', {}).get('memory_events', {}).get(name)
+        after = termination.get('after', {}).get('memory_events', {}).get(name)
+        if type(before) is not int or type(after) is not int or before != 0 or after != 0:
+            return False
+    evidence = termination.get('java_shutdown', {})
+    receipt = evidence.get('receipt')
+    if evidence.get('status') != 'recorded' or not isinstance(receipt, dict):
+        return False
+    if (receipt.get('schema') != 'ku-java-shutdown-v1' or receipt.get('complete') is not True
+            or receipt.get('deadline_expired') is not False or 'error' in receipt
+            or receipt.get('completed_stages') != JAVA_SHUTDOWN_STAGES):
+        return False
+    for name, expected in (('pid', termination.get('process_id')),
+                           ('listeners', termination.get('expected_listeners')),
+                           ('expected_listeners', termination.get('expected_listeners'))):
+        if type(expected) is not int or expected <= 0 or type(receipt.get(name)) is not int or receipt[name] != expected:
+            return False
+    if type(receipt.get('elapsed_ns')) is not int or not 0 <= receipt['elapsed_ns'] < 4_500_000_000:
+        return False
+    return all(type(receipt.get(name)) is int and receipt[name] == 0
+               for name in ('active', 'waiting_timer', 'actual_cpu_jobs', 'database_pending'))
+
+
 @dataclasses.dataclass
 class Service:
     harness: object
@@ -525,6 +587,7 @@ class Service:
             self.freeze(False)
         before = self.domain.snapshot()
         drain = None
+        requested_signal = None
         if self.stack == 'ku' and self.process.poll() is None:
             try:
                 status, body = request(self.management_address, '/__ku/drain', method='POST',
@@ -534,7 +597,9 @@ class Service:
                 drain = {'error': repr(error)}
         else:
             try:
-                self.process.terminate()
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    requested_signal = signal.SIGTERM
             except ProcessLookupError:
                 pass
         forced = False
@@ -571,6 +636,13 @@ class Service:
                     runtime_cleanup.append(str(path))
         result = {'exit_code': self.process.returncode, 'forced': forced, 'drain': drain,
                   'before': before, 'after': after, 'cgroup_removed': removed,'removed_runtime_files':runtime_cleanup}
+        result.update(requested_signal=requested_signal, process_id=self.process.pid,
+                      expected_listeners=self.startup['cores'])
+        if self.stack == 'java':
+            result['java_shutdown'] = java_shutdown_receipt(self.cwd.parent / 'service.log')
+        succeeded = service_termination_succeeded(self.stack, result)
+        result['graceful_signal'] = self.stack == 'java' and succeeded
+        result['termination_kind'] = ('graceful_signal' if result['graceful_signal'] else 'normal_exit') if succeeded else 'failed'
         self.startup['cleanup'] = result
         write_json(self.cwd.parent / 'service.json', self.startup)
         return result

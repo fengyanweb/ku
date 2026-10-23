@@ -1718,7 +1718,7 @@ enum {
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
   int* indices;
-  int count,capacity,free_head;
+  int count,capacity,free_head,high_water;
   size_t sockets;
 } KuHttpActiveSet;
 typedef struct KuHttpConnection {
@@ -1746,15 +1746,35 @@ typedef struct KuHttpConnection {
 typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
 /* Owner-thread-only indices borrow fixed connection storage. Neither the
    dense table nor the free chain owns a socket, Task, job, or lease. */
-static void ku_http_active_begin(KuHttpConnection* connection) {
-  KuHttpActiveSet* active=connection->active_set;
+static int ku_http_free_slot(const KuHttpActiveSet* active) {
+  if(active->free_head>=0) return active->free_head;
+  return active->high_water<active->capacity ? active->high_water : -1;
+}
+static void ku_http_active_begin(KuHttpActiveSet* active,KuHttpConnection* connection) {
   if(!active) return; /* Dedicated management/rejection storage. */
-  int slot=(int)(connection-active->connections);
-  if(slot<0 || slot>=active->capacity || active->free_head!=slot
-      || connection->active_position!=-1 || active->count>=active->capacity) {
+  uintptr_t first=(uintptr_t)active->connections,at=(uintptr_t)connection;
+  if(at<first || at-first>=(size_t)active->capacity*sizeof(*connection)
+      || (at-first)%sizeof(*connection) || active->count>=active->capacity) {
     fputs("http active-slot admission invariant failed\n",stderr); exit(1);
   }
-  active->free_head=connection->free_next;
+  int slot=(int)((at-first)/sizeof(*connection));
+  if(active->free_head>=0) {
+    if(slot!=active->free_head || slot>=active->high_water
+        || connection->active_set!=active || connection->active_position!=-1) {
+      fputs("http recycled-slot admission invariant failed\n",stderr); exit(1);
+    }
+    active->free_head=connection->free_next;
+  } else {
+    if(slot!=active->high_water) {
+      fputs("http fresh-slot admission invariant failed\n",stderr); exit(1);
+    }
+    /* calloc reserves the same stable full-capacity backing and budget. Only
+       admitted slots are written: untouched entries never own a descriptor,
+       job or Task and are never included in drain/poll traversal. */
+    connection->socket_value=KU_HTTP_INVALID_SOCKET;
+    connection->active_set=active; connection->free_next=-1;
+    active->high_water++;
+  }
   connection->active_position=active->count;
   active->indices[active->count++]=slot;
   active->sockets++;
@@ -1777,9 +1797,9 @@ static void ku_http_active_retire(KuHttpConnection* connection) {
 }
 static KuHttpConnection* ku_http_polled_connection(KuHttpActiveSet* active,
     const KuHttpPollConnection* interest,int poll_index,KuHttpSocket socket_value) {
-  if(interest->slot<0 || interest->slot>=active->capacity) return NULL;
+  if(interest->slot<0 || interest->slot>=active->high_water) return NULL;
   KuHttpConnection* connection=&active->connections[interest->slot];
-  if(connection->active_position<0 || connection->connection_generation!=interest->generation
+  if(connection->active_set!=active || connection->active_position<0 || connection->connection_generation!=interest->generation
       || connection->poll_index!=poll_index || connection->socket_value!=socket_value) return NULL;
   return connection;
 }
@@ -1895,9 +1915,8 @@ static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer
   if(!connection->failure.reason && (status==504 || status==408)) connection->failure.reason=KU_HTTP_ERROR_DEADLINE;
   ku_http_connection_response(connection, server, ku_http_status_response(status, ku_http_status_text(status)), 0, 0);
 }
-static void ku_http_connection_start(KuHttpConnection* connection, KuHttpSocket socket_value, KuHttpServer* server) {
-  ku_http_active_begin(connection);
-  KuHttpActiveSet* active=connection->active_set;
+static void ku_http_connection_start(KuHttpConnection* connection, KuHttpActiveSet* active, KuHttpSocket socket_value, KuHttpServer* server) {
+  ku_http_active_begin(active,connection);
   int position=connection->active_position;
   memset(connection, 0, sizeof(*connection));
   connection->active_set=active; connection->active_position=position;
@@ -2176,24 +2195,19 @@ static void ku_http_reject_read(KuHttpConnection* connection, KuHttpServer* serv
     if (done) { ku_http_connection_status(connection, server, 503); return; }
   }
 }
-static int ku_http_free_slot(KuHttpConnection* connections, int count) {
-  if(count>0 && connections[0].active_set) return connections[0].active_set->free_head;
-  for (int index = 0; index < count; index++) if (connections[index].phase == KU_HTTP_IO_FREE) return index;
-  return -1;
-}
 /* Pending sockets carry permits, but no input allocation, job, or worker. */
 typedef struct { KuHttpSocket socket_value; unsigned long long deadline; } KuHttpPendingItem;
 typedef struct { KuHttpPendingItem* items; int cap; int head; int tail; int count; } KuHttpPending;
-static void ku_http_pending_activate(KuHttpPending* pending, KuHttpConnection* connections, int count, KuHttpServer* server) {
+static void ku_http_pending_activate(KuHttpPending* pending, KuHttpActiveSet* active, KuHttpServer* server) {
   while (pending->count) {
-    int slot = ku_http_free_slot(connections, count);
+    int slot = ku_http_free_slot(active);
     if (slot < 0) break;
     KuHttpPendingItem item = pending->items[pending->head];
     KuHttpSocket socket_value = item.socket_value;
     pending->head = (pending->head + 1) % pending->cap;
     pending->count--;
-    ku_http_connection_start(&connections[slot], socket_value, server);
-    connections[slot].request_deadline = item.deadline;
+    ku_http_connection_start(&active->connections[slot], active, socket_value, server);
+    active->connections[slot].request_deadline = item.deadline;
   }
 }
 static void ku_http_pending_close(KuHttpPending* pending) {
@@ -2765,7 +2779,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
 #endif
-  KuHttpActiveSet active={connections,active_indices,0,slot_count,0,0};
+  KuHttpActiveSet active={connections,active_indices,0,slot_count,-1,0,0};
   KuHttpPending pending={0};pending.cap=max_pending;
   pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));
   if(!connections || !poll_items || !pending.items || !active_indices || !poll_connections || (net_bytes && !net_storage)) {
@@ -2774,11 +2788,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
     return "reactor allocation failed";
-  }
-  for (int index=0;index<slot_count;index++) {
-    connections[index].socket_value=KU_HTTP_INVALID_SOCKET;
-    connections[index].active_set=&active; connections[index].active_position=-1;
-    connections[index].free_next=index+1<slot_count ? index+1 : -1;
   }
   KuHttpConnection rejection = {0};
   rejection.socket_value = KU_HTTP_INVALID_SOCKET;
@@ -2946,7 +2955,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_count_transport_close(&rejection,KU_HTTP_CLOSE_WRITE_DEADLINE);
       ku_http_connection_close(&rejection);
     }
-    if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
+    if (!listen_failure) ku_http_pending_activate(&pending, &active, server);
     int occupied = rejection.phase != KU_HTTP_IO_FREE || active.count;
     if (!listening && !occupied && !pending.count && !ku_http_queue_resident(&queue)) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
@@ -3076,7 +3085,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_write(&rejection, server);
     }
     /* Existing pending connections always acquire newly free slots first. */
-    if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
+    if (!listen_failure) ku_http_pending_activate(&pending, &active, server);
     if (listener_index < 0 || !poll_items[listener_index].revents) continue;
     if (poll_items[listener_index].revents & POLLNVAL) { listen_failure = "listener descriptor invalid"; continue; }
     for (int turn = 0; turn < 32 && listening && rejection.phase == KU_HTTP_IO_FREE; turn++) {
@@ -3122,9 +3131,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       }
 
       long live = ku_http_atomic_increment(&ku_http_active_conns);
-      int slot = ku_http_free_slot(connections, slot_count);
+      int slot = ku_http_free_slot(&active);
       if (live > max_conn) ku_http_reject_start(&rejection, cli);
-      else if (slot >= 0 && !pending.count) ku_http_connection_start(&connections[slot], cli, server);
+      else if (slot >= 0 && !pending.count) ku_http_connection_start(&connections[slot], &active, cli, server);
       else if (pending.count < pending.cap) {
         pending.items[pending.tail] = (KuHttpPendingItem){cli,ku_http_deadline_ms(server->request_timeout_ms)};
         pending.tail = (pending.tail + 1) % pending.cap;
@@ -3461,7 +3470,7 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
         if (client!=KU_HTTP_INVALID_SOCKET) {
           if (!ku_http_socket_nonblocking(client) || ku_http_socket_suppress_sigpipe(client)) ku_http_socket_close(client);
           else {
-            ku_http_connection_start(&management,client,&management_server);
+            ku_http_connection_start(&management,NULL,client,&management_server);
             management.management=1;
           }
         }

@@ -1,5 +1,8 @@
 """Clock and recovery counterexamples for the permanent comparison runner."""
 import unittest
+import copy
+import json
+import signal
 import csv
 import gzip
 import tempfile
@@ -12,7 +15,8 @@ from linux_harness import (arrival_cpu, business_send_end, measurement_clock,
                            histogram_bucket, paired_interval, interleaved_orders,
                            overload_boundary, full_lifecycle_cost, Case, write_json, read_json,
                            paired_capacity_goodput, declared_case_stacks, sustained_case,
-                           benchmark_limits, cases, GIB, MIB)
+                           benchmark_limits, cases, GIB, MIB, java_shutdown_receipt,
+                           service_termination_succeeded, JAVA_SHUTDOWN_PREFIX, JAVA_SHUTDOWN_STAGES)
 
 
 def clock(origin=100_000_000_000, uncertainty=1000):
@@ -263,6 +267,74 @@ class MeasurementRulesTest(unittest.TestCase):
         self.assertGreater(cost['post_driver_cpu_seconds'], 5)
         self.assertLess(len(cost['settle_observation']['samples']), 128)
         service.stop.assert_not_called()
+
+
+class ServiceTerminationTest(unittest.TestCase):
+    def complete(self):
+        return {'exit_code':143, 'requested_signal':signal.SIGTERM, 'process_id':123,
+                'expected_listeners':4, 'forced':False, 'cgroup_removed':True,
+                'before':{'memory_events':{'oom':0,'oom_kill':0,'oom_group_kill':0}},
+                'after':{'process_count':0, 'threads':0, 'fd':0, 'memory_events':{'oom':0,'oom_kill':0,'oom_group_kill':0}},
+                'java_shutdown':{'status':'recorded', 'receipt':{
+                    'schema':'ku-java-shutdown-v1','pid':123,'expected_listeners':4,'listeners':4,
+                    'complete':True,'completed_stages':list(JAVA_SHUTDOWN_STAGES),
+                    'elapsed_ns':20_000_000,'deadline_expired':False,
+                    'active':0,'waiting_timer':0,'actual_cpu_jobs':0,'database_pending':0}}}
+
+    def test_only_expected_java_signal_and_complete_real_close_receipt_pass(self):
+        value = self.complete()
+        self.assertTrue(service_termination_succeeded('java', value))
+        for stack in ('ku','go','rust','node','dotnet','cpp'):
+            self.assertFalse(service_termination_succeeded(stack, value))
+            self.assertTrue(service_termination_succeeded(stack, dict(value, exit_code=0)))
+        for field, wrong in (('exit_code',0),('exit_code',-signal.SIGTERM),('exit_code',1),
+                             ('exit_code',137),('requested_signal',None),('requested_signal',signal.SIGINT),
+                             ('forced',True),('cgroup_removed',False),('process_id',124),('expected_listeners',1)):
+            with self.subTest(field=field,wrong=wrong):
+                changed=copy.deepcopy(value); changed[field]=wrong
+                self.assertFalse(service_termination_succeeded('java',changed))
+        for name in ('oom','oom_kill','oom_group_kill'):
+            for where in ('before','after'):
+                changed=copy.deepcopy(value); changed[where]['memory_events'][name]=1
+                self.assertFalse(service_termination_succeeded('java',changed))
+        for name in ('process_count','threads','fd'):
+            changed=copy.deepcopy(value); changed['after'][name]=1
+            self.assertFalse(service_termination_succeeded('java',changed))
+            del changed['after'][name]
+            self.assertFalse(service_termination_succeeded('java',changed))
+        changed=copy.deepcopy(value); del changed['before']['memory_events']
+        self.assertFalse(service_termination_succeeded('java',changed))
+
+    def test_missing_failed_truncated_or_mismatched_receipt_cannot_pass(self):
+        value=self.complete()
+        for evidence in ({},{'status':'missing'},{'status':'invalid'},{'status':'truncated'},
+                         {'status':'duplicate'},{'status':'oversized'},{'status':'recorded','receipt':[]}):
+            self.assertFalse(service_termination_succeeded('java',dict(value,java_shutdown=evidence)))
+        receipt=value['java_shutdown']['receipt']
+        for field,wrong in (('complete',False),('complete',1),('deadline_expired',True),
+                            ('elapsed_ns',4_500_000_000),('elapsed_ns',-1),('elapsed_ns',True),
+                            ('schema','other'),('pid',999),('listeners',3),('expected_listeners',3),
+                            ('active',1),('waiting_timer',1),('actual_cpu_jobs',1),('database_pending',1),
+                            ('active',False),('completed_stages',JAVA_SHUTDOWN_STAGES[:-1]),
+                            ('completed_stages',list(reversed(JAVA_SHUTDOWN_STAGES))),('error','TimeoutException')):
+            with self.subTest(field=field,wrong=wrong):
+                changed=dict(receipt); changed[field]=wrong
+                evidence={'status':'recorded','receipt':changed}
+                self.assertFalse(service_termination_succeeded('java',dict(value,java_shutdown=evidence)))
+
+    def test_receipt_log_read_is_bounded_and_requires_one_complete_line(self):
+        receipt=self.complete()['java_shutdown']['receipt']
+        encoded=JAVA_SHUTDOWN_PREFIX+json.dumps(receipt).encode()+b'\n'
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'service.log'
+            self.assertEqual(java_shutdown_receipt(path)['status'],'missing')
+            path.write_bytes(b'ready\n'+encoded)
+            self.assertEqual(java_shutdown_receipt(path),{'status':'recorded','receipt':receipt})
+            for body,status in ((encoded[:-1],'truncated'),(JAVA_SHUTDOWN_PREFIX+b'{bad}\n','invalid'),
+                                (encoded+encoded,'duplicate'),(JAVA_SHUTDOWN_PREFIX+b'x'*2048+b'\n','oversized'),
+                                (b'ready\n','missing'),(encoded+b'x'*9000+b'\n','missing')):
+                path.write_bytes(body)
+                self.assertEqual(java_shutdown_receipt(path)['status'],status)
 
 
 if __name__ == '__main__':

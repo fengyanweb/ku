@@ -138,7 +138,26 @@ fn native_http_early_loop_startup_failures_retire_on_the_original_thread() {
         assert_eq!(original.matches(needle).count(), 1, "fault site {name}");
         let directory = TempDir::new(&format!("http-startup-{name}"));
         let source = directory.path().join("startup.c");
-        fs::write(&source, original.replacen(needle, replacement, 1)).unwrap();
+        let injected = original.replacen(needle, replacement, 1).replacen(
+            "int main(void) {",
+            "static int fixture_original_main(void) {",
+            1,
+        );
+        // Owner startup failure must never close zero-filled, unadmitted
+        // connection entries. Descriptor zero may already belong to stdin.
+        let input_descriptor = r#"
+int main(void) {
+#if !defined(_WIN32)
+  int input_flags=fcntl(0,F_GETFD,0);
+#endif
+  int status=fixture_original_main();
+#if !defined(_WIN32)
+  if(input_flags>=0 && fcntl(0,F_GETFD,0)<0) return 94;
+#endif
+  return status;
+}
+"#;
+        fs::write(&source, injected + input_descriptor).unwrap();
         let Some(executable) = compile_harness(directory.path(), &source, "startup") else {
             return;
         };
@@ -204,6 +223,31 @@ int main(void) {
   CHECK(ku_http_task_runtime_close(runtime,deadline)==KU_TASK_DRIVER_OK);
   uint64_t next=UINT64_MAX;CHECK(ku_http_task_pump(runtime,0u,64u,&next)<=KU_TASK_DRIVER_PENDING);
   CHECK(ku_http_task_runtime_free(runtime,deadline)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  /* Exercise the actual admission/close functions with an owned fd zero,
+     while every other calloc slot remains uninitialized and unowned. */
+  int saved_input=dup(0),pair[2];CHECK(socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0);
+  CHECK(dup2(pair[0],0)==0);if(pair[0]!=0)CHECK(close(pair[0])==0);
+  KuHttpConnection* connections=(KuHttpConnection*)calloc(16u,sizeof(*connections));
+  int indices[16]={0};CHECK(connections);
+  KuHttpActiveSet active={connections,indices,0,16,-1,0,0};
+  KuHttpBufferBudget http_budget={0};http_budget.limit=4096u;CHECK(ku_http_mutex_init(&http_budget.lock));
+  KuHttpServer server={0};server.buffer_budget=&http_budget;server.request_timeout_ms=1000;
+  KuHttpPollConnection empty={0,0};CHECK(!ku_http_polled_connection(&active,&empty,0,0));
+  ku_http_atomic_store(&ku_http_active_conns,1);
+  ku_http_connection_start(&connections[0],&active,0,&server);
+  CHECK(active.count==1 && active.high_water==1 && connections[0].socket_value==0);
+  ku_http_connection_close(&connections[0]);
+  CHECK(!active.count && !active.sockets && active.high_water==1 && !http_budget.current);
+  CHECK(fcntl(0,F_GETFD,0)<0 && errno==EBADF);
+  for(size_t i=1;i<16u;i++) {
+    const unsigned char* bytes=(const unsigned char*)&connections[i];
+    for(size_t j=0;j<sizeof(*connections);j++)CHECK(!bytes[j]);
+  }
+  CHECK(close(pair[1])==0);
+  if(saved_input>=0){CHECK(dup2(saved_input,0)==0);CHECK(close(saved_input)==0);}
+  ku_http_mutex_destroy(&http_budget.lock);free(connections);
+#endif
   puts("http-root-admission-ok");return 0;
 }
 "#;

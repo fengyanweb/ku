@@ -3094,7 +3094,7 @@ fn native_http_dense_slots_preserve_iteration_and_reject_stale_poll_snapshots() 
         "typedef struct KuHttpConnection {",
     );
     let functions = region(
-        "static void ku_http_active_begin(",
+        "static int ku_http_free_slot(",
         "enum {\n  KU_HTTP_CLOSE_IDLE_PRESSURE",
     );
     let poll_type = "typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;";
@@ -3104,7 +3104,9 @@ fn native_http_dense_slots_preserve_iteration_and_reject_stale_poll_snapshots() 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <string.h>
 typedef int KuHttpSocket;
+#define KU_HTTP_INVALID_SOCKET (-1)
 "#;
     // These helpers read only the owner index metadata. The existing real HTTP
     // tests exercise socket/job/Task retirement; no synthetic destructor or
@@ -3118,22 +3120,47 @@ typedef struct KuHttpConnection {
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"dense slot line %d: %s\n",__LINE__,#c);return 1;}}while(0)
-int main(void) {
+static int fixture_zero(const void* raw,size_t length) {
+  const unsigned char* bytes=(const unsigned char*)raw;
+  for(size_t i=0;i<length;i++) if(bytes[i]) return 0;
+  return 1;
+}
+int main(int argc,char** argv) {
   enum {CAPACITY=4096};
   KuHttpConnection* connections=(KuHttpConnection*)calloc(CAPACITY,sizeof(*connections));
   int* indices=(int*)calloc(CAPACITY,sizeof(int));
   CHECK(connections && indices);
-  KuHttpActiveSet active={connections,indices,0,CAPACITY,0,0};
-  for(int i=0;i<CAPACITY;i++) {
-    connections[i].active_set=&active; connections[i].active_position=-1;
-    connections[i].free_next=i+1<CAPACITY?i+1:-1;
+  KuHttpActiveSet active={connections,indices,0,CAPACITY,-1,0,0};
+  CHECK(fixture_zero(connections,CAPACITY*sizeof(*connections)));
+  CHECK(!active.count && !active.high_water && active.free_head==-1);
+  KuHttpPollConnection untouched={0,0};
+  CHECK(!ku_http_polled_connection(&active,&untouched,0,0));
+  CHECK(ku_http_free_slot(&active)==0 && !active.high_water);
+  if(argc>1 && !strcmp(argv[1],"wrong-owner")) {
+    KuHttpConnection foreign={0};
+    ku_http_active_begin(&active,&foreign);return 94;
+  }
+  if(argc>1 && !strcmp(argv[1],"skip-fresh-slot")) {
+    ku_http_active_begin(&active,&connections[1]);return 94;
   }
   for(int i=0;i<6;i++) {
-    CHECK(active.free_head==i); ku_http_active_begin(&connections[i]);
+    CHECK(ku_http_free_slot(&active)==i); ku_http_active_begin(&active,&connections[i]);
+    CHECK(connections[i].socket_value==KU_HTTP_INVALID_SOCKET);
     connections[i].connection_generation=10u+(uint64_t)i;
     connections[i].socket_value=100+i; connections[i].poll_index=20+i;
   }
-  CHECK(active.count==6 && active.free_head==6);
+  CHECK(active.count==6 && active.free_head==-1 && active.high_water==6);
+  CHECK(fixture_zero(connections+6,(CAPACITY-6)*sizeof(*connections)));
+  if(argc>1 && !strcmp(argv[1],"duplicate-admission")) {
+    ku_http_active_begin(&active,&connections[0]);return 94;
+  }
+  /* Descriptor zero is legal once this slot is admitted. Untouched zeroed
+     entries remain outside every active/poll/drain traversal. */
+  connections[0].socket_value=0;
+  KuHttpPollConnection zero_descriptor={0,10u};
+  CHECK(ku_http_polled_connection(&active,&zero_descriptor,20,0)==&connections[0]);
+  KuHttpPollConnection never_admitted={6,0};
+  CHECK(!ku_http_polled_connection(&active,&never_admitted,0,0));
   KuHttpPollConnection snapshot={1,11u};
   CHECK(ku_http_polled_connection(&active,&snapshot,21,101)==&connections[1]);
   CHECK(!ku_http_polled_connection(&active,&snapshot,20,101));
@@ -3141,11 +3168,16 @@ int main(void) {
   ku_http_active_retire(&connections[1]);
   CHECK(active.count==5 && active.indices[1]==5 && connections[5].active_position==1);
   CHECK(!ku_http_polled_connection(&active,&snapshot,21,101));
-  CHECK(active.free_head==1); ku_http_active_begin(&connections[1]);
+  CHECK(active.free_head==1 && ku_http_free_slot(&active)==1);
+  ku_http_active_begin(&active,&connections[1]);
   connections[1].connection_generation++;
   CHECK(!ku_http_polled_connection(&active,&snapshot,21,101));
   snapshot.generation++;
   CHECK(ku_http_polled_connection(&active,&snapshot,21,101)==&connections[1]);
+  KuHttpActiveSet foreign_owner={0};
+  connections[1].active_set=&foreign_owner;
+  CHECK(!ku_http_polled_connection(&active,&snapshot,21,101));
+  connections[1].active_set=&active;
   KuHttpPollConnection invalid={CAPACITY,0};
   CHECK(!ku_http_polled_connection(&active,&invalid,0,0));
   unsigned seen=0;
@@ -3157,15 +3189,16 @@ int main(void) {
   }
   CHECK(seen==63u && active.count==3);
   for(int position=active.count;position-->0;) ku_http_active_retire(&connections[active.indices[position]]);
-  CHECK(!active.count);
+  CHECK(!active.count && active.high_water==6);
   /* Reusing every slot visits each free entry once, including swapped holes. */
   unsigned char* admitted=(unsigned char*)calloc(CAPACITY,1);
   CHECK(admitted);
   for(int i=0;i<CAPACITY;i++) {
-    int slot=active.free_head; CHECK(slot>=0 && slot<CAPACITY && !admitted[slot]);
-    admitted[slot]=1; ku_http_active_begin(&connections[slot]);
+    int slot=ku_http_free_slot(&active); CHECK(slot>=0 && slot<CAPACITY && !admitted[slot]);
+    admitted[slot]=1; ku_http_active_begin(&active,&connections[slot]);
   }
-  CHECK(active.count==CAPACITY && active.free_head==-1);
+  CHECK(active.count==CAPACITY && active.free_head==-1 && active.high_water==CAPACITY);
+  CHECK(ku_http_free_slot(&active)==-1);
   for(int position=active.count;position-->0;) ku_http_active_retire(&connections[active.indices[position]]);
   CHECK(!active.count);
   free(admitted);free(indices);free(connections);
@@ -3188,6 +3221,19 @@ int main(void) {
         return;
     };
     fs::remove_file(path).unwrap();
+    for scenario in ["wrong-owner", "skip-fresh-slot", "duplicate-admission"] {
+        let output = run_bounded(
+            Command::new(&executable).arg(scenario),
+            RUN_TIMEOUT,
+            RUN_OUTPUT_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{scenario}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("admission invariant failed"),
+            "{scenario}: {output:?}"
+        );
+    }
     let output = run_bounded(
         &mut Command::new(executable),
         RUN_TIMEOUT,

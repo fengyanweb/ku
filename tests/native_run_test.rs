@@ -1242,6 +1242,9 @@ fn main(): null! {
         "int connect_expired = ku_pg_now_ms() >= deadline",
         "if (p->closing || connect_expired)",
         "static int ku_pg_client_take_dispose_locked",
+        "p->async_operations != 0 || p->capture_pins != 0",
+        "p->capture_pins--;int dispose=ku_pg_client_take_dispose_locked(p)",
+        "p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p)",
         "PostgreSQL client waiter limit reached",
         "p->waiters >= p->max_waiters",
         "timed out waiting for a PostgreSQL client connection",
@@ -1258,8 +1261,8 @@ fn main(): null! {
     }
     assert_eq!(
         c.matches("ku_pg_client_take_dispose_locked(p)").count(),
-        5,
-        "every PG close/release/acquire rollback path must use the one-finalizer arbiter"
+        7,
+        "PG close/release/acquire rollback, capture and async retirement must share the one-finalizer arbiter"
     );
     assert_eq!(
         c.matches("return ku_pg_finish_query(conn, result, deadline, broken)")

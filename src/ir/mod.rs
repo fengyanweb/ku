@@ -413,6 +413,15 @@ pub fn lower_mixed_http_setup(program: &Program) -> KuResult<(IrProgram, Vec<Mix
         Some(handlers.clone()),
     )?;
     let handlers = std::mem::take(&mut *handlers.borrow_mut());
+    if handlers.is_empty() {
+        // The mixed path may erase only real async HTTP declarations. Without
+        // one, retain the ordinary lowering contract, including async function
+        // types in otherwise synchronous signatures and layouts.
+        crate::ast::reject_compiled_async(
+            program,
+            "async/await is not supported by IR/native lowering yet",
+        )?;
+    }
     Ok((lowered, handlers))
 }
 
