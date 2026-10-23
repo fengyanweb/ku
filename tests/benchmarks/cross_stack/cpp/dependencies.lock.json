@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "sources": {
+    "drogon": {
+      "version": "1.9.14",
+      "commit": "3aae769cc405cf5abb9d477675c6430924f02c7c",
+      "archive_url": "https://api.github.com/repos/drogonframework/drogon/tarball/3aae769cc405cf5abb9d477675c6430924f02c7c",
+      "archive_sha256": "78bcd38b14f4d381620361b099ee69237219521ab6c3fee84c9b10bcf1073042"
+    },
+    "trantor": {
+      "commit": "78e480f5e138acdc05f76c55a2716718cd846364",
+      "archive_url": "https://api.github.com/repos/an-tao/trantor/tarball/78e480f5e138acdc05f76c55a2716718cd846364",
+      "archive_sha256": "aefae41d4040a90f6cc4c0bf81fa0cf97fc22e20917dd9244ae1064726aab557"
+    }
+  },
+  "system_json": {"library": "JsonCpp", "version": "1.9.5", "ubuntu_package": "libjsoncpp-dev=1.9.5-6build1"},
+  "upstream_checked": "2026-10-23",
+  "version_source": "https://github.com/drogonframework/drogon/releases/tag/v1.9.14"
+}

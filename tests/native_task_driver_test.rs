@@ -1153,7 +1153,7 @@ static void fixture_init_and_default_capacity_bounds(void) {
   memset(&driver, 0, sizeof(driver)); memset(&slot, 0, sizeof(slot));
   size_t fixed = sizeof(driver) + sizeof(slot) + sizeof(ring);
   uint64_t startup_deadline = fixture_driver_one_second();
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 11u);
   for (uint32_t old = 0; old < KU_TASK_DRIVER_ABI_VERSION; old++)
     CHECK(ku_task_driver_init(&driver, sizeof(driver), old, &slot, 1, &ring, 1, fixed, 1, startup_deadline) == KU_TASK_DRIVER_ABI_MISMATCH);
   CHECK(ku_task_driver_init(&driver, sizeof(driver), DRIVER_ABI, &slot, 0, &ring, 0, fixed, 1, startup_deadline) == KU_TASK_DRIVER_LIMIT);
@@ -2442,7 +2442,7 @@ static void fixture_service_wait_acks(FixtureDriver* runtime, KuTaskDriverCleanu
   CHECK(ku_task_driver_unlock(runtime->driver) == 0);
 }
 int main(void) {
-  CHECK(DRIVER_ABI == 10u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
+  CHECK(DRIVER_ABI == 11u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
   fixture_service_controller = fixture_service_thread_id();
   for (size_t i = 0; i < SERVICE_TASKS; i++) fixture_witness_init(&fixture_service_probes[i].witness);
   FixtureDriver runtime = {0};
@@ -2741,7 +2741,7 @@ static void fixture_cf_assert_fault_locked(KuTaskDriverV1* driver) {
   CHECK(driver->shutdown_deadline == 0 && driver->worker_target == 2 && driver->workers_created == 2);
 }
 int main(void) {
-  CHECK(DRIVER_ABI == 10u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
+  CHECK(DRIVER_ABI == 11u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
   ku_task_control_atomic_init(&fixture_cf_bad_lane, 0);
   ku_task_control_atomic_init(&fixture_cf_bad_read, 0);
   FixtureDriver runtime = {0};
@@ -3049,7 +3049,7 @@ static int fixture_numeric_shutdown(void* raw) {
 
 const SHUTDOWN_NUMERIC_MAIN: &str = r#"
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u && KU_TASK_FRAME_ABI_VERSION==5u
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==11u && KU_TASK_FRAME_ABI_VERSION==5u
       && KU_TASK_CONTROL_ABI_VERSION==2u);
   CHECK(ku_test_event_init(&fixture_numeric_wait_entered));
   const uint64_t startup_deadline=fixture_shutdown_checked_now()+1000u;
@@ -3388,7 +3388,7 @@ static void fixture_local_wait_acks(const KuTaskDriverCleanupReceiptV1* receipts
   CHECK(ku_task_driver_unlock(driver) == 0);
 }
 static int fixture_local_steal_case(void) {
-  CHECK(DRIVER_ABI == 10u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
+  CHECK(DRIVER_ABI == 11u && FRAME_ABI == 5u && CONTROL_ABI == 2u);
   fixture_local_controller = fixture_local_thread_id();
   for (size_t i = 0; i < 2; i++) fixture_witness_init(&fixture_local_probes[i].witness);
   CHECK(ku_test_event_init(&fixture_local_timer_fired));

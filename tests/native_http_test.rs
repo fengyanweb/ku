@@ -2531,11 +2531,11 @@ fn main(): null! {
             r#"import "std.http"
 fn main(): null! {
     app = http.service()
-    app.max_connections = 4097
+    app.max_connections = 32769
     app.listen("127.0.0.1:0")?
     return ok(null)
 }"#,
-            "4096",
+            "32768",
         ),
     ] {
         let Some(output) = native_run_output(name, source) else {
@@ -3822,10 +3822,12 @@ fn main(): null! {
 fn native_http_fixed_loops_share_limits_authenticate_control_and_drain() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"
-import "std.http"
+import { http, json } from "std"
 fn main(): null! {
-    app = http.server({max_active_requests: 16, max_pending_requests: 16,
-        max_connections: 64, max_buffer_bytes: 1048576})
+    config=json.decode("{\"max_active_requests\":8256,\"max_pending_requests\":128,\"max_connections\":8320}")?
+    app = http.server({max_active_requests: config["max_active_requests"]?.as_int()?,
+        max_pending_requests: config["max_pending_requests"]?.as_int()?,
+        max_connections: config["max_connections"]?.as_int()?, max_buffer_bytes: 1048576})
     app.get("/ok", fn() { return http.text("ready") })
     app.listen("__ADDRESS__")?
     return ok(null)
@@ -3864,6 +3866,7 @@ fn main(): null! {
         let metrics = http_response(&address,
             "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
         assert_status(&metrics, "HTTP/1.1 200 OK");
+        assert!(metrics.contains("\"limits\":{\"max_active_requests\":8256,\"max_connections\":8320,\"max_pending_requests\":128}"),"{metrics}");
         for index in 0..count {
             assert!(metrics.contains(&format!("\"id\":{index},")), "{metrics}");
         }
@@ -4206,7 +4209,7 @@ static KuStruct___ku_http_response ku_http_response_from_result(KuStruct___ku_ht
 static KuStruct___ku_http_response ku_move_struct___ku_http_response(KuStruct___ku_http_response* r) { return ku_result_move_struct___ku_http_response(r); }
 static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* r) { (void)r; outcome_drops++; }
 static void ku_drop_struct___ku_http_response(KuStruct___ku_http_response* r) { r->payload=0; }
-static size_t ku_http_task_response_admit(void* d,KuStruct___ku_http_response* r) { (void)d; (void)r; adopts++; return 17; }
+static size_t ku_http_task_response_admit(void* d,KuStruct___ku_http_response* r,KuHttpFailure* f) { (void)d; (void)r; (void)f; adopts++; return 17; }
 static uint32_t ku_task_driver_scratch_refund(KuTaskDriverV1* d,size_t n) { (void)d; refunds+=(int)n; return 0; }
 static void ku_http_task_handle_release(KuHttpTaskRuntime* r,KuHttpTaskHandle* h) { (void)r; releases++; h->used=0; }
 "#;
@@ -4415,7 +4418,7 @@ async fn timeout(): HttpResponse! {{
     return ok(http.text(code))
 }}
 fn main(): null! {{
-    app=http.server({{max_active_requests:64,max_pending_requests:64,max_connections:128,
+    app=http.server({{max_active_requests:8320,max_pending_requests:64,max_connections:16640,
       max_buffer_bytes:4194304,handler_timeout_ms:4000}})
     app.get("/network",network)
     app.get("/timeout",timeout)
@@ -4436,6 +4439,11 @@ fn main(): null! {{
             ("KU_EVENT_LOOPS", "2"),
             ("KU_BLOCKING_THREADS", "3"),
             ("KU_SERVICE_CONTROL_TOKEN", "net-regression"),
+            ("KU_TASK_MAX_BYTES", "67108864"),
+            // Capacity includes 8192 held requests plus a live probe margin.
+            // This smoke checks allocation/cleanup and stack bounds; the full
+            // 8192 simultaneous network waiting acceptance runs separately.
+            ("KU_THREAD_STACK_BYTES", "262144"),
         ],
     ) else {
         return;
@@ -4848,6 +4856,125 @@ fn main(): null! {
     assert!(response.ends_with("half-close-ok"), "{response}");
     let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
     assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_json_dynamic_values_have_json_mime_and_exact_body() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"import { http, json } from "std"
+fn encode(req: HttpRequest): HttpResponse! {
+    value = json.decode(req.body)?
+    return ok(http.json(201, value))
+}
+fn quoted(): HttpResponse { return http.json("quoted\n") }
+fn bad_status(): HttpResponse { return http.json(99, "invalid") }
+fn bad_writer(): HttpResponse {
+    try { return http.json(ok("unsupported")) }
+    catch (err) { return http.text("unexpected-catch") }
+    return http.text("unreachable")
+}
+fn main(): null! {
+    app = http.server()
+    app.post("/json", encode)
+    app.get("/quoted", quoted)
+    app.get("/bad-status", bad_status)
+    app.get("/bad-writer", bad_writer)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_finite_native_server("json-mime", source, &address, 4) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let body = r#"{"label":"中文🙂\u0000","items":[1,true,null]}"#;
+    let response = http_response(&address, &format!(
+        "POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body), Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 201 Created");
+    let (headers, encoded) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP JSON header/body boundary");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: application/json; charset=utf-8"),
+        "{headers}"
+    );
+    assert_eq!(encoded, r#"{"items":[1,true,null],"label":"中文🙂\u0000"}"#);
+    for path in ["/bad-status", "/bad-writer"] {
+        let response = http_response(
+            &address,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 500 Internal Server Error");
+        assert!(!response.contains("unexpected-catch"), "{response}");
+    }
+    let response = http_response(
+        &address,
+        "GET /quoted HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(
+        response.ends_with("\"quoted\\n\""),
+        "string must be JSON encoded exactly once: {response}"
+    );
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_direct_cpu_formatting_uses_fixed64_frame_and_exact_eight_digits() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let original = include_str!("benchmarks/cross_stack/ku/server.ku");
+    let marker = "    return (await work_response(req, total))";
+    assert_eq!(original.matches(marker).count(), 1);
+    let expanded = original.replace("__PEER_PORT__", "19191").replace(
+        marker,
+        r#"    text = str(total)
+    while (text.len() < 8) { text = "0" + text }
+    return ok(http.text(req.query.rid + ":" + text))"#,
+    );
+    // Keep the actual whole work function and all other function declarations.
+    // Replace only unrelated DB/setup main with the existing finite HTTP fixture.
+    let handlers = expanded.split_once("fn main(): null! {").unwrap().0;
+    let source = format!(
+        r#"{handlers}
+fn main(): null! {{
+    app=http.server()
+    app.get("/ok",ready)
+    app.post("/json",encode)
+    app.get("/work",work)
+    app.get("/timer",timer)
+    app.get("/wait",waiting)
+    app.get("/tcp",network)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}}
+"#
+    );
+    let address = unused_local_address();
+    let Some(mut server) = spawn_finite_native_server("direct-cpu64", &source, &address, 2) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (work, seed, expected) in [(512usize, 3usize, 22944003i64), (2, 5, 7129005)] {
+        let response = http_response(&address, &format!(
+            "GET /work?rid=proof&work={}&seed={} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", "x".repeat(work), "s".repeat(seed)), Duration::from_secs(5));
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(
+            response.ends_with(&format!("proof:{expected:08}")),
+            "{response}"
+        );
+    }
     assert!(watchdog
         .wait_for_natural_exit(Duration::from_secs(5))
         .success());

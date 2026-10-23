@@ -44,12 +44,12 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram, entry: TaskFunctionId
     }
     out.push_str(
         &ROOT_BODY
-            .replace("@NETWORK_FIXED@",if network {" + sizeof(ku_task_root_net)"} else {""})
+            .replace("@NETWORK_FIXED@",if network {" + ku_task_net_root_fixed_bytes(ku_task_root_worker_count(),KU_TASK_ROOT_CAPACITY)"} else {""})
             .replace("@NETWORK_INIT@",if network {"  status=ku_task_driver_scratch_reserve(&ku_task_root_driver,sizeof(ku_task_root_net));\n  if(status==KU_TASK_DRIVER_OK) {\n    status=ku_task_net_root_attach(&ku_task_root_net,&ku_task_root_driver,&ku_task_root_blocking);\n    if(status==KU_TASK_DRIVER_OK)ku_task_root_net.reserved=1;\n    else (void)ku_task_driver_scratch_refund(&ku_task_root_driver,sizeof(ku_task_root_net));\n  }\n  if(status!=KU_TASK_DRIVER_OK) { (void)ku_task_root_finish(startup_deadline); return 1; }"} else {""})
             .replace(
                 "@BLOCKING_FIXED@",
                 if blocking {
-                    " + sizeof(ku_task_root_blocking)"
+                    " + ku_task_blocking_fixed_bytes(KU_TASK_ROOT_CAPACITY)"
                 } else {
                     ""
                 },
@@ -70,9 +70,11 @@ const ROOT_PREFIX: &str = r#"
  * remainder; allocation rejects before a file operation when it is exhausted.
  * This is not an OS RSS limit, a libc FILE-buffer or an OS-stack budget.
  * Static storage survives a diagnosed quarantine until process termination. */
+/* CLI defaults remain bounded at 1024; HTTP capacity is explicit. */
+#define KU_TASK_ROOT_CAPACITY ((size_t)1024u)
 static KuTaskDriverV1 ku_task_root_driver;
-static KuTaskDriverSlotV1 ku_task_root_slots[KU_TASK_DRIVER_MAX_SLOTS];
-static size_t ku_task_root_ring[KU_TASK_DRIVER_MAX_SLOTS];
+static KuTaskDriverSlotV1 ku_task_root_slots[KU_TASK_ROOT_CAPACITY];
+static size_t ku_task_root_ring[KU_TASK_ROOT_CAPACITY];
 @BLOCKING_STORAGE@
 @NETWORK_STORAGE@
 /* Query the execution target, never the compiler host. This bounded default
@@ -128,8 +130,8 @@ const NETWORK_REFUND: &str = r#"
       else {
         /* EXITED is every worker's last storage access. Close the actual
          * channels before refunding; reaping itself requires zero receipts. */
-        ku_task_net_root_destroy(&ku_task_root_net);
-        joined=ku_task_driver_scratch_refund(&ku_task_root_driver,sizeof(ku_task_root_net));
+        joined=ku_task_net_root_destroy(&ku_task_root_net);
+        if(joined==KU_TASK_DRIVER_OK)joined=ku_task_driver_scratch_refund(&ku_task_root_driver,sizeof(ku_task_root_net));
         if(joined==KU_TASK_DRIVER_OK)ku_task_root_net.reserved=0;
       }
     }
@@ -138,13 +140,13 @@ const NETWORK_REFUND: &str = r#"
 
 const ROOT_BODY: &str = r#"
   size_t fixed = sizeof(ku_task_root_driver) + sizeof(ku_task_root_slots) + sizeof(ku_task_root_ring)@BLOCKING_FIXED@@NETWORK_FIXED@;
-  if (maximum_instance > (SIZE_MAX - fixed) / KU_TASK_DRIVER_MAX_SLOTS) {
+  if (maximum_instance > (SIZE_MAX - fixed) / KU_TASK_ROOT_CAPACITY) {
     fputs("native Task storage exceeds its bounded layout\n", stderr); return 1;
   }
   uint64_t startup_deadline = ku_task_root_deadline(UINT64_MAX);
   uint32_t status = ku_task_driver_init(&ku_task_root_driver, sizeof(ku_task_root_driver),
-      KU_TASK_DRIVER_ABI_VERSION, ku_task_root_slots, KU_TASK_DRIVER_MAX_SLOTS,
-      ku_task_root_ring, KU_TASK_DRIVER_MAX_SLOTS, fixed + maximum_instance * KU_TASK_DRIVER_MAX_SLOTS,
+      KU_TASK_DRIVER_ABI_VERSION, ku_task_root_slots, KU_TASK_ROOT_CAPACITY,
+      ku_task_root_ring, KU_TASK_ROOT_CAPACITY, fixed + maximum_instance * KU_TASK_ROOT_CAPACITY,
       ku_task_root_worker_count(), startup_deadline);
   if (status != KU_TASK_DRIVER_OK) {
     fputs("native Task runtime initialization failed\n", stderr);
@@ -200,11 +202,12 @@ const ROOT_BODY: &str = r#"
 "#;
 
 const BLOCKING_INIT: &str = r#"
-  status=ku_task_blocking_init(&ku_task_root_blocking,KU_TASK_DRIVER_MAX_SLOTS,
+  status=ku_task_blocking_init(&ku_task_root_blocking,KU_TASK_ROOT_CAPACITY,
       ku_runtime_blocking_count(),startup_deadline);
   if (status==KU_TASK_DRIVER_OK)
     status=ku_task_driver_attach_blocking(&ku_task_root_driver,&ku_task_root_blocking,
-        sizeof(ku_task_root_blocking),ku_task_blocking_close,ku_task_blocking_ready);
+        sizeof(ku_task_root_blocking),ku_task_blocking_close,ku_task_blocking_ready,
+        ku_task_root_blocking.storage,ku_task_root_blocking.storage_bytes);
   if (status!=KU_TASK_DRIVER_OK) {
     fputs("native blocking pool initialization failed\n",stderr);
     (void)ku_task_root_finish(startup_deadline);

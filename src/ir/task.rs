@@ -3689,3 +3689,394 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
     validate_start_graph(program, &ids, &functions, &mut budget)?;
     Ok(TaskFramePlan { functions })
 }
+
+/// Source logical temporaries are not the physical64-slot runtime ABI. This
+/// compiler-only bound precedes the unchanged raw Task IR verifier.
+pub(crate) const MAX_SOURCE_LOGICAL_SLOTS: usize = 512;
+
+fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) {
+    match operation {
+        TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => visit(dst),
+        TaskOp::CloneCallable { dst, src }
+        | TaskOp::ArrayClone { dst, src }
+        | TaskOp::ArrayLen { dst, src }
+        | TaskOp::StringLen { dst, src, .. }
+        | TaskOp::StringClone { dst, src }
+        | TaskOp::PrimitiveString { dst, src }
+        | TaskOp::Copy { dst, src }
+        | TaskOp::Move { dst, src }
+        | TaskOp::Unary { dst, src, .. }
+        | TaskOp::WrapOk { dst, src }
+        | TaskOp::WrapError { dst, src }
+        | TaskOp::ErrorField { dst, src, .. }
+        | TaskOp::MakeError { dst, message: src } => {
+            visit(dst);
+            visit(src);
+        }
+        TaskOp::ArrayMake { dst, elements }
+        | TaskOp::Start {
+            dst,
+            arguments: elements,
+            ..
+        } => {
+            visit(dst);
+            for slot in elements {
+                visit(slot);
+            }
+        }
+        TaskOp::StartIndirect {
+            dst,
+            callee,
+            arguments,
+        } => {
+            visit(dst);
+            visit(callee);
+            for slot in arguments {
+                visit(slot);
+            }
+        }
+        TaskOp::Bytes {
+            dst, src, index, ..
+        } => {
+            visit(dst);
+            visit(src);
+            if let Some(slot) = index {
+                visit(slot);
+            }
+        }
+        TaskOp::Binary {
+            dst, left, right, ..
+        }
+        | TaskOp::StringConcat { dst, left, right }
+        | TaskOp::ArrayTryGet {
+            dst,
+            array: left,
+            index: right,
+        }
+        | TaskOp::ArrayTake {
+            dst,
+            array: left,
+            index: right,
+        }
+        | TaskOp::HttpMapGet {
+            dst,
+            request: left,
+            key: right,
+            ..
+        } => {
+            visit(dst);
+            visit(left);
+            visit(right);
+        }
+        TaskOp::HttpResponse {
+            dst, body, status, ..
+        } => {
+            visit(dst);
+            if let Some(slot) = body {
+                visit(slot);
+            }
+            if let Some(slot) = status {
+                visit(slot);
+            }
+        }
+        TaskOp::Read { slot }
+        | TaskOp::CheckForLimit { slot }
+        | TaskOp::Drop { slot }
+        | TaskOp::DropIfInit { slot }
+        | TaskOp::Print { value: slot, .. } => visit(slot),
+        TaskOp::ScopeEnter { tasks, .. } => {
+            for slot in tasks {
+                visit(slot);
+            }
+        }
+        TaskOp::FinallyEnter { .. }
+        | TaskOp::FinallyLeave { .. }
+        | TaskOp::FinallyUnwindBegin
+        | TaskOp::FinallyUnwindEnd
+        | TaskOp::ScopeExitBegin { .. }
+        | TaskOp::ScopeExitEnd { .. } => {}
+    }
+}
+
+fn source_term_slots(term: &mut TaskTerminator, visit: &mut impl FnMut(&mut SlotId)) {
+    match term {
+        TaskTerminator::Branch { condition, .. } => visit(condition),
+        TaskTerminator::Await { task, dst, .. } => {
+            visit(task);
+            visit(dst);
+        }
+        TaskTerminator::Timer { millis, dst, .. } => {
+            visit(millis);
+            visit(dst);
+        }
+        TaskTerminator::BlockingWrite {
+            path, content, dst, ..
+        } => {
+            visit(path);
+            visit(content);
+            visit(dst);
+        }
+        TaskTerminator::BlockingRead { path, dst, .. }
+        | TaskTerminator::BlockingReadDir { path, dst, .. }
+        | TaskTerminator::BlockingExists { path, dst, .. } => {
+            visit(path);
+            visit(dst);
+        }
+        TaskTerminator::BlockingNet { inputs, dst, .. } => {
+            for slot in inputs.iter_mut().flatten() {
+                visit(slot);
+            }
+            visit(dst);
+        }
+        TaskTerminator::TryResult {
+            src,
+            ok_value,
+            err_result,
+            ..
+        } => {
+            visit(src);
+            visit(ok_value);
+            visit(err_result);
+        }
+        TaskTerminator::Complete { value } | TaskTerminator::Exit { value } => visit(value),
+        TaskTerminator::ScopeDrain { .. }
+        | TaskTerminator::Jump { .. }
+        | TaskTerminator::Suspend { .. }
+        | TaskTerminator::Terminate => {}
+    }
+}
+
+/// Reuse only Copy temporaries from checked source lowering. Owners, parameters,
+/// named bindings, borrowed values and every terminator-defined slot remain
+/// distinct. No value operation, drop, Task or suspension is removed. The
+/// ordinary64-bit verifier runs over the final graph, not an enlarged ABI.
+pub(crate) fn compact_source_scalar_slots(
+    function: &mut TaskFunction,
+    stable: &[bool],
+    spend: &mut impl FnMut(usize) -> KuResult<()>,
+) -> KuResult<()> {
+    let count = function.slots.len();
+    if count <= TaskLimits::default().max_slots {
+        return Ok(());
+    }
+    if count > MAX_SOURCE_LOGICAL_SLOTS || stable.len() != count {
+        return Err(invalid("source logical slot/provenance limit exceeded"));
+    }
+    spend(count)?;
+    let mut candidate: Vec<bool> = function
+        .slots
+        .iter()
+        .zip(stable)
+        .map(|(slot, stable)| {
+            !stable && matches!(&slot.ty,TaskSlotType::Value {ty,borrowed:false} if copy_type(ty))
+        })
+        .collect();
+    for slot in &function.parameters {
+        candidate[slot.0] = false;
+    }
+    // Finally has implicit edges at every dispatch boundary. Until those edges
+    // have an independently verified logical-slot plan, keep its old limit.
+    if function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| {
+            matches!(
+                op,
+                TaskOp::FinallyEnter { .. }
+                    | TaskOp::FinallyLeave { .. }
+                    | TaskOp::FinallyUnwindBegin
+                    | TaskOp::FinallyUnwindEnd
+            )
+        })
+    {
+        return Err(invalid(
+            "more than64 physical Task slots; Copy temporary reuse across finally is not enabled",
+        ));
+    }
+    for state in &function.states {
+        for op in &state.operations {
+            if let TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } = op {
+                candidate[slot.0] = false;
+            }
+        }
+        match state.terminator {
+            TaskTerminator::Await { dst, .. }
+            | TaskTerminator::Timer { dst, .. }
+            | TaskTerminator::BlockingRead { dst, .. }
+            | TaskTerminator::BlockingReadDir { dst, .. }
+            | TaskTerminator::BlockingExists { dst, .. }
+            | TaskTerminator::BlockingWrite { dst, .. }
+            | TaskTerminator::BlockingNet { dst, .. } => candidate[dst.0] = false,
+            TaskTerminator::TryResult {
+                ok_value,
+                err_result,
+                ..
+            } => {
+                candidate[ok_value.0] = false;
+                candidate[err_result.0] = false;
+            }
+            _ => {}
+        }
+    }
+    let words = count.div_ceil(64);
+    spend(count * words + function.states.len() * words)?;
+    let mut operations = Vec::with_capacity(function.states.len());
+    let mut terms = Vec::with_capacity(function.states.len());
+    for state in &function.states {
+        let mut uses = Vec::with_capacity(state.operations.len());
+        for op in &state.operations {
+            let mut all = Vec::new();
+            let mut copy = op.clone();
+            source_op_slots(&mut copy, &mut |slot| all.push(slot.0));
+            spend(all.len() + words)?;
+            if all.iter().any(|&slot| slot >= count) {
+                return Err(invalid("unknown source logical slot"));
+            }
+            uses.push((operation_destination(op).map(|slot| slot.0), all));
+        }
+        let mut all = Vec::new();
+        let mut copy = state.terminator.clone();
+        source_term_slots(&mut copy, &mut |slot| all.push(slot.0));
+        spend(all.len() + words)?;
+        if all.iter().any(|&slot| slot >= count) {
+            return Err(invalid("unknown source logical terminator slot"));
+        }
+        operations.push(uses);
+        terms.push(all);
+    }
+    let set = |bits: &mut [u64], slot: usize| bits[slot / 64] |= 1u64 << (slot % 64);
+    let mut live_in = vec![vec![0u64; words]; function.states.len()];
+    let mut live_out = live_in.clone();
+    loop {
+        let mut changed = false;
+        for (index, state) in function.states.iter().enumerate().rev() {
+            spend(words)?;
+            let mut live = vec![0u64; words];
+            for next in successors(&state.terminator).into_iter().flatten() {
+                if next.0 >= function.states.len() {
+                    return Err(invalid("unknown source logical successor"));
+                }
+                spend(words)?;
+                for (word, input) in live.iter_mut().zip(&live_in[next.0]) {
+                    *word |= input;
+                }
+            }
+            live_out[index] = live.clone();
+            for &slot in &terms[index] {
+                if candidate[slot] {
+                    set(&mut live, slot);
+                }
+            }
+            for (destination, all) in operations[index].iter().rev() {
+                spend(words + all.len())?;
+                if let Some(dst) = destination.filter(|&dst| candidate[dst]) {
+                    live[dst / 64] &= !(1u64 << (dst % 64));
+                }
+                for &slot in all {
+                    if Some(slot) != *destination && candidate[slot] {
+                        set(&mut live, slot);
+                    }
+                }
+            }
+            changed |= live != live_in[index];
+            live_in[index] = live;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut edges = vec![vec![0u64; words]; count];
+    let mut connect = |a: usize, b: usize| {
+        if a != b && candidate[a] && candidate[b] {
+            set(&mut edges[a], b);
+            set(&mut edges[b], a);
+        }
+    };
+    for (index, _) in function.states.iter().enumerate() {
+        let mut live = live_out[index].clone();
+        for &slot in &terms[index] {
+            if candidate[slot] {
+                set(&mut live, slot);
+            }
+        }
+        for (destination, all) in operations[index].iter().rev() {
+            spend(words + all.len() * all.len())?;
+            // The raw IR requires distinct destinations and sources even when
+            // a source dies at this instruction. Preserve that stronger rule.
+            for &a in all {
+                for &b in all {
+                    connect(a, b);
+                }
+            }
+            if let Some(dst) = destination.filter(|&dst| candidate[dst]) {
+                for (word, bits) in live.iter().enumerate() {
+                    let mut pending = *bits;
+                    while pending != 0 {
+                        let b = word * 64 + pending.trailing_zeros() as usize;
+                        connect(dst, b);
+                        pending &= pending - 1;
+                    }
+                }
+                live[dst / 64] &= !(1u64 << (dst % 64));
+            }
+            for &slot in all {
+                if Some(slot) != *destination && candidate[slot] {
+                    set(&mut live, slot);
+                }
+            }
+        }
+    }
+    let mut mapping = vec![usize::MAX; count];
+    let mut physical = Vec::new();
+    for (index, slot) in function.slots.iter().enumerate() {
+        if !candidate[index] {
+            mapping[index] = physical.len();
+            physical.push(slot.clone());
+        }
+    }
+    let first_temporary = physical.len();
+    let mut order: Vec<usize> = (0..count).filter(|&slot| candidate[slot]).collect();
+    order.sort_by_key(|&slot| {
+        (
+            std::cmp::Reverse(edges[slot].iter().map(|w| w.count_ones()).sum::<u32>()),
+            slot,
+        )
+    });
+    for slot in order {
+        spend(count)?;
+        let mut selected = None;
+        for (target, physical_slot) in physical.iter().enumerate().skip(first_temporary) {
+            spend(count)?;
+            if physical_slot.ty != function.slots[slot].ty {
+                continue;
+            }
+            if !(0..count).any(|other| {
+                mapping[other] == target && edges[slot][other / 64] & (1u64 << (other % 64)) != 0
+            }) {
+                selected = Some(target);
+                break;
+            }
+        }
+        mapping[slot] = selected.unwrap_or_else(|| {
+            physical.push(function.slots[slot].clone());
+            physical.len() - 1
+        });
+    }
+    if physical.len() > TaskLimits::default().max_slots {
+        return Err(invalid(
+            "more than64 physical Task slots after Copy temporary compaction",
+        ));
+    }
+    for slot in &mut function.parameters {
+        slot.0 = mapping[slot.0];
+    }
+    for state in &mut function.states {
+        for op in &mut state.operations {
+            source_op_slots(op, &mut |slot| slot.0 = mapping[slot.0]);
+        }
+        source_term_slots(&mut state.terminator, &mut |slot| slot.0 = mapping[slot.0]);
+    }
+    function.slots = physical;
+    Ok(())
+}

@@ -34,6 +34,10 @@ impl COutput {
         }
     }
 
+    pub(super) fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.text.len())
+    }
+
     pub(super) fn push_str(&mut self, text: &str) {
         if self.failed() {
             return;

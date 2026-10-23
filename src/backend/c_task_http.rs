@@ -19,11 +19,11 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
                 },
             )
             .replace(
-                "@BLOCKING_BYTES@",
+                "@BLOCKING_PREFLIGHT@",
                 if blocking {
-                    "sizeof(KuTaskBlockingPoolV1)"
+                    " + ku_task_blocking_fixed_bytes(task_capacity)"
                 } else {
-                    "0u"
+                    ""
                 },
             )
             .replace(
@@ -55,6 +55,10 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     );
     if task::uses_blocking_net(tasks) {
         out.push_str(r#"
+static size_t ku_http_task_net_capacity(void* raw) {
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
+  return runtime && runtime->blocking ? runtime->blocking->capacity:0u;
+}
 static size_t ku_http_task_net_interests(void* raw,size_t owner,KuTaskNetPollV1* items,size_t capacity,uint64_t* deadline) {
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
   return runtime ? ku_task_net_interests(runtime->blocking,owner,items,capacity,deadline):0u;
@@ -100,6 +104,16 @@ static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,
   ku_task_driver_entry_owner=previous;
   ku_drop_struct___ku_http_request(req);
   if(status!=KU_TASK_DRIVER_OK) {{ ku_http_task_handle_release(runtime,handle); return status; }}
+  /* Language Task construction represents a never-started rejection as an
+   * inline Result. HTTP admission must return that original rejection before
+   * publishing an execution handle. A LIVE root's later child error continues
+   * through the normal Result path and is never reclassified or replayed. */
+  if(handle->value.tag==KU_TASK_VALUE_INLINE_FAILED) {{
+    uint32_t rejected=handle->value.rejection_code;
+    uint32_t dropped=ku_task_value_drop(&handle->value,0u);
+    ku_http_task_handle_release(runtime,handle);
+    return dropped==KU_TASK_DRIVER_OK ? rejected : dropped;
+  }}
   *output=handle; return KU_TASK_DRIVER_OK;
 }}
 "#
@@ -112,6 +126,10 @@ static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,
 }
 
 const BRIDGE: &str = r#"
+static uint32_t ku_http_task_start_failure_reason(uint32_t status) {
+  return status==KU_TASK_DRIVER_LIMIT ? KU_HTTP_ERROR_TASK_LIMIT :
+    status==KU_TASK_DRIVER_CLOSED ? KU_HTTP_ERROR_TASK_CLOSED : KU_HTTP_ERROR_DRIVER;
+}
 typedef struct KuHttpTaskHandle {
   KuTaskValueV1 value;
   KuTaskDriverTicketV1 retired;
@@ -158,17 +176,24 @@ static void ku_http_task_handle_release(KuHttpTaskRuntime* runtime,KuHttpTaskHan
 static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_limit,
     void* event_context,void(*event_wake)(void*,size_t),uint64_t startup_deadline) {
   if(!capacity || capacity>KU_TASK_DRIVER_MAX_SLOTS) return NULL;
+  size_t task_capacity=capacity>KU_TASK_DRIVER_MAX_SLOTS/2u ? KU_TASK_DRIVER_MAX_SLOTS : capacity*2u;
+  if(task_capacity<1024u)task_capacity=1024u;
+  /* Exclusive setup: reject known fixed storage before any backing allocation.
+     attach_blocking and each reactor still take their actual budget receipts. */
+  size_t startup_fixed=sizeof(KuHttpTaskRuntime)+task_capacity*(sizeof(KuTaskDriverSlotV1)+sizeof(size_t))
+      +capacity*sizeof(KuHttpTaskHandle)@BLOCKING_PREFLIGHT@;
+  if(startup_fixed>byte_limit)return NULL;
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)calloc(1,sizeof(*runtime));
   if(!runtime) return NULL;
   runtime->capacity=capacity;
-  runtime->slots=(KuTaskDriverSlotV1*)calloc(KU_TASK_DRIVER_MAX_SLOTS,sizeof(*runtime->slots));
-  runtime->ring=(size_t*)calloc(KU_TASK_DRIVER_MAX_SLOTS,sizeof(*runtime->ring));
+  runtime->slots=(KuTaskDriverSlotV1*)calloc(task_capacity,sizeof(*runtime->slots));
+  runtime->ring=(size_t*)calloc(task_capacity,sizeof(*runtime->ring));
   runtime->handles=(KuHttpTaskHandle*)calloc(capacity,sizeof(*runtime->handles));
   if(!runtime->slots || !runtime->ring || !runtime->handles) goto ku_http_task_init_failed;
   /* attach_blocking accounts its own fixed storage exactly once. */
   runtime->extra_fixed=sizeof(*runtime)-sizeof(runtime->driver)+capacity*sizeof(*runtime->handles);
   uint32_t status=ku_task_driver_init_external(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots,KU_TASK_DRIVER_MAX_SLOTS,runtime->ring,KU_TASK_DRIVER_MAX_SLOTS,
+      runtime->slots,task_capacity,runtime->ring,task_capacity,
       byte_limit,loops,startup_deadline,event_context,event_wake);
   if(status!=KU_TASK_DRIVER_OK) goto ku_http_task_init_failed;
   status=ku_task_driver_scratch_reserve(&runtime->driver,runtime->extra_fixed);
@@ -197,6 +222,25 @@ ku_http_task_init_failed:
     if(ku_task_driver_destroy(&runtime->driver)!=KU_TASK_DRIVER_OK) return NULL; /* Quarantine. */
   } else if(runtime->driver.initialized!=KU_TASK_DRIVER_STORAGE_ZERO) return NULL;
   free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return NULL;
+}
+/* Token-authenticated management reads this bounded snapshot without the
+ * HTTP group mutex; driver callbacks take the group mutex in the other order. */
+static void ku_http_task_driver_budget(void* raw,uint64_t output[9]) {
+  memset(output,0,9u*sizeof(*output));
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)raw;
+  if(!runtime || ku_task_driver_lock(&runtime->driver))return;
+  KuTaskDriverV1* driver=&runtime->driver;
+  output[0]=driver->capacity;output[1]=driver->resident;output[2]=driver->peak_resident;
+  output[3]=driver->fixed_bytes;output[4]=driver->reserved_bytes;
+  output[5]=driver->peak_reserved_bytes;output[6]=driver->byte_limit;
+  output[7]=driver->admission_slot_rejections;output[8]=driver->admission_byte_rejections;
+  ku_task_driver_unlock(driver);
+}
+static uint32_t ku_http_task_fixed_reserve(void* raw,size_t bytes) {
+  return ku_task_driver_scratch_reserve(&((KuHttpTaskRuntime*)raw)->driver,bytes);
+}
+static uint32_t ku_http_task_fixed_refund(void* raw,size_t bytes) {
+  return ku_task_driver_scratch_refund(&((KuHttpTaskRuntime*)raw)->driver,bytes);
 }
 static uint32_t ku_http_task_pump(void* raw,size_t owner,size_t batch,uint64_t* next_deadline) {
   if(!raw) return KU_TASK_DRIVER_INVALID_ARGUMENT;
@@ -315,7 +359,7 @@ static uint32_t ku_http_task_poll(void* raw,void** task,int cancel,uint64_t dead
   else {
     /* The HTTP buffer budget adopts the response before its Task receipt is
      * refunded, so ownership transfer never opens an uncharged window. */
-    *response_charge=ku_http_task_response_admit(runtime->driver.event_context,&handle->response);
+    *response_charge=ku_http_task_response_admit(runtime->driver.event_context,&handle->response,&handle->failure);
     *output=ku_move_struct___ku_http_response(&handle->response);
   }
   if(handle->retained_bytes && ku_task_driver_scratch_refund(&runtime->driver,handle->retained_bytes)!=KU_TASK_DRIVER_OK)
@@ -353,7 +397,7 @@ static uint32_t ku_http_task_runtime_free(void* raw,uint64_t deadline) {
 const BLOCKING_INIT: &str = r#"
   runtime->blocking=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*runtime->blocking));
   if(!runtime->blocking) goto ku_http_task_init_failed;
-  status=ku_task_blocking_init(runtime->blocking,KU_TASK_DRIVER_MAX_SLOTS,1u,startup_deadline);
+  status=ku_task_blocking_init(runtime->blocking,runtime->driver.capacity,1u,startup_deadline);
   if(status==KU_TASK_DRIVER_OK) {
     if(ku_task_blocking_lock(runtime->blocking)) return NULL;
     runtime->blocking->retirement_context=runtime;
@@ -361,7 +405,8 @@ const BLOCKING_INIT: &str = r#"
     ku_task_blocking_unlock(runtime->blocking);
   }
   if(status==KU_TASK_DRIVER_OK) status=ku_task_driver_attach_blocking(&runtime->driver,runtime->blocking,
-      sizeof(*runtime->blocking),ku_task_blocking_close,ku_task_blocking_ready);
+      sizeof(*runtime->blocking),ku_task_blocking_close,ku_task_blocking_ready,
+      runtime->blocking->storage,runtime->blocking->storage_bytes);
   if(status!=KU_TASK_DRIVER_OK) {
     (void)ku_task_blocking_finish(runtime->blocking,startup_deadline);
     if(runtime->blocking->initialized!=KU_TASK_DRIVER_STORAGE_ZERO) return NULL;

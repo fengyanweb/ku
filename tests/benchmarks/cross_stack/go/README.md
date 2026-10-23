@@ -50,3 +50,8 @@ Functional smoke timings are not performance results.
 
 `repeat=0` is supported for separate fresh-process startup observations. Its
 empty-array result and startup time are never subtracted from `repeat=64` runs.
+
+`BENCH_PG_MODE=reset-equivalent` selects a separately named same-lease session
+reset comparison. The unset/normal path keeps the behavior and deadlines above.
+See [the two PG comparison contracts](../pg-comparison.md) for source identities,
+absolute deadlines, cancellation/eviction rules and the private-fixture tests.

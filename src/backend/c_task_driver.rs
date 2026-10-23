@@ -12,7 +12,7 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
 }
 
 const DRIVER_ABI: &str = r#"
-/* Internal driver ABI 10, not a public Task API, netpoll, or complete M:N scheduler.
+/* Internal driver ABI 11, not a public Task API, netpoll, or complete M:N scheduler.
  * Private V1 type spellings are retained, not their old binary layout/version.
  * Caller-owned zero-filled driver/slot/ring storage remains live until destroy
  * succeeds. Every API caller protects that storage. Init, join and destroy are
@@ -171,9 +171,9 @@ const DRIVER_ABI: &str = r#"
  * and keep healthy workers for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 10u
+#define KU_TASK_DRIVER_ABI_VERSION 11u
 #define KU_TASK_DRIVER_GLOBAL_BURST ((size_t)8u)
-#define KU_TASK_DRIVER_MAX_SLOTS ((size_t)1024u)
+#define KU_TASK_DRIVER_MAX_SLOTS ((size_t)16384u)
 #define KU_TASK_DRIVER_MAX_WORKERS ((size_t)32u)
 enum {
   KU_TASK_DRIVER_OK = 0u, KU_TASK_DRIVER_PENDING = 1u,
@@ -327,6 +327,7 @@ typedef struct KuTaskDriverSnapshotV1 {
   size_t resident, building, queued, running, parked, retiring, terminal_held;
   size_t reserved_bytes, fixed_bytes, byte_limit;
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
+  uint64_t admission_slot_rejections,admission_byte_rejections;
   size_t timers, peak_timers, timer_limit;
   uint64_t polls, wakes, waits;
   size_t worker_target, workers_created, workers_waiting, workers_exited, workers_joined;
@@ -346,6 +347,7 @@ struct KuTaskDriverV1 {
   size_t storage_size, capacity, head, global_queued, queued, running, resident, building;
   size_t reserved_bytes, fixed_bytes, byte_limit;
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
+  uint64_t admission_slot_rejections,admission_byte_rejections;
   size_t timers, peak_timers;
   uint64_t polls, wakes, waits, shutdown_deadline, next_deadline;
   /* Private opt-in diagnostics, fixed storage; all counters are mutex-owned.
@@ -358,6 +360,7 @@ struct KuTaskDriverV1 {
   /* Immutable while LIVE; close/ready callbacks are called without mutex. */
   void* blocking_pool;
   size_t blocking_pool_bytes;
+  void* blocking_storage; size_t blocking_storage_bytes;
   uint32_t (*blocking_close)(void*);
   uint32_t (*blocking_ready)(void*);
   KuTaskDriverSlotV1* slots;
@@ -626,26 +629,34 @@ static int ku_task_driver_external_storage(
       && !ku_task_frame_ranges_overlap(pointer, size, driver->ring,
                                        driver->capacity * sizeof(*driver->ring))
       && (!driver->blocking_pool || !ku_task_frame_ranges_overlap(pointer,size,
-          driver->blocking_pool,driver->blocking_pool_bytes));
+          driver->blocking_pool,driver->blocking_pool_bytes))
+      && (!driver->blocking_storage || !ku_task_frame_ranges_overlap(pointer,size,
+          driver->blocking_storage,driver->blocking_storage_bytes));
 }
 /* Exclusive setup, before the first admission. Fixed pool storage remains
  * protected through the driver's final destroy, including a timed-out close. */
 static uint32_t ku_task_driver_attach_blocking(KuTaskDriverV1* driver,
-    void* pool, size_t bytes, uint32_t (*close)(void*), uint32_t (*ready)(void*)) {
+    void* pool, size_t bytes, uint32_t (*close)(void*), uint32_t (*ready)(void*),
+    void* storage,size_t storage_bytes) {
   uint32_t checked=ku_task_driver_check(driver);
   if (checked!=KU_TASK_DRIVER_OK) return checked;
   if (!pool || !bytes || !close || !ready
-      || !ku_task_driver_external_storage(driver,pool,bytes,1)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+      || !storage || !storage_bytes || storage_bytes>SIZE_MAX-bytes
+      || !ku_task_driver_external_storage(driver,pool,bytes,1)
+      || !ku_task_driver_external_storage(driver,storage,storage_bytes,1)
+      || ku_task_frame_ranges_overlap(pool,bytes,storage,storage_bytes)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t total=bytes+storage_bytes;
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
   uint32_t status=driver->blocking_pool || driver->resident || driver->building || driver->closing
       ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
   if (status==KU_TASK_DRIVER_OK && (driver->fixed_bytes>driver->byte_limit
       || driver->reserved_bytes>driver->byte_limit-driver->fixed_bytes
-      || bytes>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes)) status=KU_TASK_DRIVER_LIMIT;
+      || total>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes)) status=KU_TASK_DRIVER_LIMIT;
   if (status==KU_TASK_DRIVER_OK) {
     driver->blocking_pool=pool; driver->blocking_pool_bytes=bytes;
+    driver->blocking_storage=storage; driver->blocking_storage_bytes=storage_bytes;
     driver->blocking_close=close; driver->blocking_ready=ready;
-    driver->fixed_bytes+=bytes;
+    driver->fixed_bytes+=total;
   }
   ku_task_driver_unlock(driver);
   return status;
@@ -2331,8 +2342,10 @@ static uint32_t ku_task_driver_reserve_impl(
   KuTaskDriverSlotV1* parent = NULL;
   uint32_t result = source ? ku_task_driver_start_parent_locked(driver, source, &parent)
       : KU_TASK_DRIVER_OK;
-  if (result == KU_TASK_DRIVER_OK && source && source->owned_bytes > SIZE_MAX - task_bytes)
+  if (result == KU_TASK_DRIVER_OK && source && source->owned_bytes > SIZE_MAX - task_bytes) {
+    if(driver->admission_byte_rejections!=UINT64_MAX)driver->admission_byte_rejections++;
     result = KU_TASK_DRIVER_LIMIT;
+  }
   if (result == KU_TASK_DRIVER_OK) {
     if (driver->closing || driver->workers_created != driver->worker_target
         || !driver->workers_created || driver->workers_exited) result = KU_TASK_DRIVER_CLOSED;
@@ -2340,9 +2353,13 @@ static uint32_t ku_task_driver_reserve_impl(
     else if (driver->fixed_bytes > driver->byte_limit
         || driver->reserved_bytes > driver->byte_limit - driver->fixed_bytes) {
       driver->fault = KU_TASK_DRIVER_INTERNAL; result = KU_TASK_DRIVER_INTERNAL;
-    } else if (driver->resident >= driver->capacity
-        || task_bytes > driver->byte_limit - driver->fixed_bytes - driver->reserved_bytes)
+    } else if (driver->resident >= driver->capacity) {
+      if(driver->admission_slot_rejections!=UINT64_MAX)driver->admission_slot_rejections++;
       result = KU_TASK_DRIVER_LIMIT;
+    } else if (task_bytes > driver->byte_limit - driver->fixed_bytes - driver->reserved_bytes) {
+      if(driver->admission_byte_rejections!=UINT64_MAX)driver->admission_byte_rejections++;
+      result = KU_TASK_DRIVER_LIMIT;
+    }
   }
   if (result == KU_TASK_DRIVER_OK) {
     result = KU_TASK_DRIVER_LIMIT;
@@ -2372,6 +2389,9 @@ static uint32_t ku_task_driver_reserve_impl(
       *output = (KuTaskDriverTicketV1){ driver, i, generation };
       result = KU_TASK_DRIVER_OK; break;
     }
+    /* Capacity may contain exhausted generations with no reusable FREE slot. */
+    if(result==KU_TASK_DRIVER_LIMIT && driver->admission_slot_rejections!=UINT64_MAX)
+      driver->admission_slot_rejections++;
   }
   ku_task_driver_unlock(driver);
   return result;
@@ -2592,6 +2612,8 @@ static void ku_task_driver_snapshot_locked(KuTaskDriverV1* driver, KuTaskDriverS
   output->byte_limit = driver->byte_limit;
   output->peak_resident = driver->peak_resident; output->peak_queued = driver->peak_queued;
   output->peak_running = driver->peak_running; output->peak_reserved_bytes = driver->peak_reserved_bytes;
+  output->admission_slot_rejections=driver->admission_slot_rejections;
+  output->admission_byte_rejections=driver->admission_byte_rejections;
   output->timers = driver->timers; output->peak_timers = driver->peak_timers; output->timer_limit = driver->capacity;
   output->polls = driver->polls; output->wakes = driver->wakes; output->waits = driver->waits;
   output->worker_target = driver->worker_target; output->workers_created = driver->workers_created;

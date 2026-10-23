@@ -4091,7 +4091,10 @@ impl Checker {
             }
             Type::Native(native)
                 if native == metadata::PG_RESULT
-                    && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+                    && matches!(
+                        name.as_str(),
+                        "rows" | "cols" | "value" | "value_int" | "is_null"
+                    ) =>
             {
                 "pg_result"
             }

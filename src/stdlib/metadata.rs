@@ -134,6 +134,7 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "pg_result.rows"
             | "pg_result.cols"
             | "pg_result.value"
+            | "pg_result.value_int"
             | "pg_result.is_null"
             | "mysql.client"
             | "mysql.query"
@@ -281,7 +282,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
         ],
         ("pg_result", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
-        ("pg_result", "value" | "is_null") => vec![
+        ("pg_result", "value" | "value_int" | "is_null") => vec![
             ArgRule::Is(TypePattern::Native(PG_RESULT)),
             int_arg(),
             int_arg(),
@@ -354,6 +355,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("pg_client", "query") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT))),
         ("pg_result", "rows" | "cols") => TypePattern::Int,
         ("pg_result", "value") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("pg_result", "value_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("pg_result", "is_null") => TypePattern::ResultOf(Box::new(TypePattern::Bool)),
         ("pg_client", "close") => TypePattern::Null,
         ("mysql", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CLIENT))),
@@ -568,7 +570,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
         | ("pg_client", "query")
-        | ("pg_result", "value" | "is_null")
+        | ("pg_result", "value" | "value_int" | "is_null")
         | ("mysql", "client")
         | ("redis", "client")
         | ("bytes", "from_str" | "from_array")

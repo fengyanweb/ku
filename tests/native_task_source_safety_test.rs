@@ -602,7 +602,7 @@ static void fixture_scope_timeout(void) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==11u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_hold,0);
   ku_task_control_atomic_init(&fixture_cleanup_calls,0);
@@ -970,7 +970,7 @@ static void fixture_raw_external(int one_byte_short) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==11u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
   ku_task_control_atomic_init(&fixture_calloc_failure,0);
   ku_task_control_atomic_init(&fixture_calloc_attempts,0);
   fixture_rejection(0); fixture_rejection(1); fixture_rejection(2);

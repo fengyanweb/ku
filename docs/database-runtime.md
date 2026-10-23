@@ -11,6 +11,21 @@
 
 libpq 允许连接在不同线程之间先后交接，禁止同一个连接同时被多个线程操作；MySQL 也需要独占连接及正确的线程初始化。这里使用已有 client 的锁与 lease；不将一个 raw handle 同时交给多个事件循环。native Task 的数据库调用仍按实际编译支持诊断，不能把同步 handler 的数据库覆盖扩大成所有 async Task 均支持。
 
+## PostgreSQL 整数字段
+
+`result.value_int(row, col): int!` 直接读取独立结果表，不复制字段字符串，也不调用 JSON 解析器。它借用结果，读取后仍可继续使用 `result`；成功返回的整数独立于结果和连接的生命周期。原有 `value()` 仍返回拥有型字符串。
+
+输入必须是规范 JSON 整数 token：`-?(0|[1-9][0-9]*)`，范围为有符号 64 位，`-0` 返回 `0`。不接受外围空白、`+`、前导零、小数、指数或内嵌 NUL；这比允许外围空白的 `json.decode(...).as_int()` 更严格。NULL 返回 `pg/null_value`；越界或无效结果存储返回 `pg/value_error`；格式非法或溢出返回 `pg/integer_value_error`。PostgreSQL 原生整数列的规范文本可直接使用：
+
+```ku
+result = client.query("SELECT id,label,score FROM items WHERE id=$1", ["1"])?
+id = result.value_int(0, 0)?
+label = result.value(0, 1)?
+score = result.value_int(0, 2)?
+```
+
+该方法沿用 PG 的 native C 支持边界，不新增解释器、LLVM 或 native Task 数据库执行路径；会话清理与 SQL 不自动重试的规则不变。
+
 ## 实例总额
 
 `src/backend/c_database_budget.c` 为 PG、MySQL 和 Redis 共同发出一份进程账本，循环数不放大它。环境在第一次创建 client 时读取一次，运行中修改不生效；非法设置导致 client 准入失败。

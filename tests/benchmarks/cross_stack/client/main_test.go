@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,9 @@ func TestSharedPoolReusesAcrossWorkersAtLowArrivalRate(t *testing.T) {
 	c.concurrency, c.queue, c.idle = 256, 65536, 500*time.Millisecond
 	addresses := make(chan string, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Request-ID") != r.URL.Query().Get("rid") {
+			t.Error("missing correlated request ID")
+		}
 		addresses <- r.RemoteAddr
 		_, _ = io.WriteString(w, "ok:"+r.URL.Query().Get("rid"))
 	}))
@@ -174,7 +178,7 @@ func TestSharedPoolReusesAcrossWorkersAtLowArrivalRate(t *testing.T) {
 		t.Fatal(err)
 	}
 	resources := report["resources"].(map[string]any)
-	if report["schema"] != "ku-cross-stack-client-v4" || report["valid_driver"] != true || resources["dials"] != uint64(1) || resources["connections_after_cleanup"] != uint64(0) || resources["active_after_cleanup"] != uint64(0) {
+	if report["schema"] != "ku-cross-stack-client-v5" || report["valid_driver"] != true || resources["dials"] != uint64(1) || resources["connections_after_cleanup"] != uint64(0) || resources["active_after_cleanup"] != uint64(0) {
 		t.Fatalf("run path did not share/close idle connections: %#v", report)
 	}
 }
@@ -640,13 +644,49 @@ func TestDriverQueueLossHistogramAndEventOverflowAreExplicit(t *testing.T) {
 	h := histogram{}
 	budget := histogramBudget{keys: maxHistogramKeys}
 	h.add(time.Second, &budget)
-	if !budget.overflow || h.count != 0 {
-		t.Fatal("histogram budget silently lost sample")
+	if budget.overflow || h.count != 1 {
+		t.Fatal("fixed histogram lost a sample after historical sparse-key bound")
 	}
 	w := eventWriter{queue: make(chan event, 1)}
 	w.offer(event{})
 	w.offer(event{})
 	if w.dropped != 1 {
 		t.Fatal("event overflow silently blocked/lost record")
+	}
+}
+
+func TestFixedHistogramPreservesOverMillionDistinctDurations(t *testing.T) {
+	h := histogram{}
+	budget := histogramBudget{}
+	for i := 0; i < 1200000; i++ {
+		h.add(time.Duration(i)*time.Microsecond*10, &budget)
+	}
+	h.add(time.Duration(math.MaxInt64), &budget)
+	h.add(-time.Second, &budget)
+	var sum uint64
+	for _, n := range h.bins {
+		sum += n
+	}
+	if h.count != 1200002 || sum != h.count || budget.overflow || len(h.bins) != maxHistogramKeys {
+		t.Fatalf("lost counts or unbounded cells: %d %d %d", h.count, sum, len(h.bins))
+	}
+	for _, n := range []int64{0, 1, 9999, 10000, 2559999, 2560000, 100000000, 3000000000, math.MaxInt64} {
+		index := histogramIndex(n)
+		if index < 0 || index >= maxHistogramKeys || histogramUpper(index) < n {
+			t.Fatalf("duration not conservatively represented: %d %d %d", n, index, histogramUpper(index))
+		}
+	}
+}
+func TestTailSamplesAndIdleDiagnosticCounters(t *testing.T) {
+	for _, count := range []int{0, 99, 100, 999, 1000} {
+		h := histogram{}
+		budget := histogramBudget{}
+		for i := 0; i < count; i++ {
+			h.add(time.Millisecond, &budget)
+		}
+		v := h.value()
+		if (v["p99_ms"] != nil) != (count >= 100) || (v["p999_ms"] != nil) != (count >= 1000) {
+			t.Fatal(count, v)
+		}
 	}
 }

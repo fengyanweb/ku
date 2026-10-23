@@ -745,7 +745,8 @@ static int ku_task_adapter_string_overlaps_runtime(KuString value, KuTaskDriverV
   return ku_task_adapter_string_overlaps(value, driver, sizeof(*driver))
       || ku_task_adapter_string_overlaps(value, driver->slots, driver->capacity * sizeof(*driver->slots))
       || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring))
-      || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes));
+      || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes))
+      || (driver->blocking_storage && ku_task_adapter_string_overlaps(value,driver->blocking_storage,driver->blocking_storage_bytes));
 }
 /* Bounded flat arrays retain the 64-element literal limit in verified IR.
  * Runtime directory outputs may carry up to 10000 entries. */

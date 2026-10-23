@@ -396,6 +396,14 @@ def normalized_metrics(raw, kind):
                 active=sum(int(row.get("resident", 0)) for row in tasks),
                 task_waiting=sum(int(row.get("waiting", 0)) for row in tasks))
 
+def observed_admission_limits(raw):
+    limits=raw.get("limits",{}) if isinstance(raw,dict) else {}
+    fields=("max_active_requests","max_connections","max_pending_requests")
+    if not isinstance(limits,dict) or not all(type(limits.get(k)) is int and limits[k]>0 for k in fields):
+        return {"available":False,"reason":"protected HTTP admission limits unavailable"}
+    return {"available":True,**{key:limits[key] for key in fields},
+            "source":"protected server metrics limits, not environment or Task driver capacity"}
+
 
 class Observer:
     """Bounded periodic sampler and probes, independent of socket pumping."""
@@ -480,6 +488,7 @@ def one_level(harness, stack, kind, target, output, cores=4, memory=1073741824,
     ids, service, cohort, observer, stop_result = IDs(), None, None, None, None
     begin, held_begin, held_end, recovery, failure = time.monotonic(), None, None, None, None
     baseline, final_resources, final_metrics = None, None, None
+    actual_limits={"available":False,"reason":"service not started"}
     old_affinity, driver_affinity = None, None
     selected_port = peer_port if peer_port is not None else int(harness.manifest.get("peer_port", 19091))
     peer_context = NetworkPeer(target, selected_port) if kind == "tcp" else contextlib.nullcontext(None)
@@ -490,6 +499,11 @@ def one_level(harness, stack, kind, target, output, cores=4, memory=1073741824,
                        KU_HTTP_REQUEST_TIMEOUT_MS="45000")
             service = harness.start(stack, cores=cores, memory=memory, output=output,
                                     extra_env=env, peer_port=selected_port)
+            if stack=="ku":
+                actual_limits=observed_admission_limits(service.metrics())
+                if not actual_limits["available"] or any(actual_limits[k]!=v for k,v in
+                        {"max_active_requests":target+64,"max_connections":target+128,"max_pending_requests":128}.items()):
+                    raise RuntimeError("actual protected Ku admission limits differ from requested target and probe reserve")
             warmup = harness.client(service, 'timer', 32, 30, output/'warmup',
                                     concurrency=32, events=False)
             if (not warmup.get('valid_driver') or
@@ -588,6 +602,8 @@ def one_level(harness, stack, kind, target, output, cores=4, memory=1073741824,
                                                 for name in ("correct", "rejected", "wrong_response", "transport_or_protocol")},
                                    observed_max_ms=max(correct) if correct else None,
                                    p99_ms=correct[max(0, math.ceil(len(correct) * .99)-1)] if len(correct) >= 100 else None,
+                                   p999_ms=correct[max(0, math.ceil(len(correct) * .999)-1)] if len(correct) >= 1000 else None,
+                                   core_tail_conclusion_eligible=len(correct)>=1000,
                                    quantile_note="insufficient p99 tail sample below 100; observed max used as conservative gate")
     full_hold = held_begin is not None and held_end is not None and held_end - held_begin >= observation_seconds
     all_responses = ledger is not None and ledger["counts"].get("correct", 0) == target and ledger["ledger_reconciled"]
@@ -650,8 +666,9 @@ def one_level(harness, stack, kind, target, output, cores=4, memory=1073741824,
                   seconds=time.monotonic()-begin,
                   admission=dict(requested_active=target+64, ordinary_reserve=64,
                                  requested_connections=target+128,
-                                 Ku_actual_active_limit=1024 if stack == "ku" else None,
-                                 limits_note="other runtimes use public BENCH_* parameters; Ku retains actual fixed 1024 active/Task bound"),
+                                 Ku_actual_active_limit=actual_limits.get("max_active_requests") if stack == "ku" else None,
+                                 observed_limits=actual_limits if stack=="ku" else None,
+                                 limits_note="requested configuration is distinct from observed protected limits; Task driver capacity is not the HTTP active limit"),
                   checks=dict(full_simultaneous_hold=full_hold, complete_correct_responses=all_responses,
                               sampled_wait_evidence=samples_ok, ordinary_probes=probes_ok,
                               wait_records_retired=all_zero, controlled_peer=tcp_ok,
@@ -678,11 +695,6 @@ def run_waiting(harness, output, stacks=("ku", "go", "rust", "node"), levels=LEV
                 if boundary:
                     results.append(dict(stack=stack, kind=kind, target=target, executed=False,
                                         reason="higher_than_observed_boundary", boundary=boundary))
-                    continue
-                if stack == "ku" and target + 64 > 1024:
-                    boundary = dict(target=target, reason="documented_Ku_active_Task_limit_1024_with_64_probe_reserve")
-                    results.append(dict(stack=stack, kind=kind, target=target, executed=False,
-                                        reason=boundary["reason"], qualified=False))
                     continue
                 row = one_level(harness, stack, kind, target, Path(output)/stack/kind/str(target),
                                 cores, memory, observation_seconds)
@@ -727,6 +739,10 @@ def self_test():
             raw=dict(tasks=[dict(timers=16,waiting=16,resident=16),dict(timers=16,waiting=16,resident=16)],task_blocking=dict(net_wait=32))
             self.assertEqual(normalized_metrics(raw,"timer")["waiting"],32)
             self.assertEqual(normalized_metrics(raw,"tcp")["waiting"],32)
+            self.assertFalse(observed_admission_limits({"task_driver":{"capacity":16384}})["available"])
+            limits=observed_admission_limits({"limits":{"max_active_requests":8256,"max_connections":8320,"max_pending_requests":128}})
+            self.assertTrue(limits["available"])
+            self.assertEqual(limits["max_active_requests"],8256)
 
         def test_peer_holds_then_releases_only_K(self):
             with NetworkPeer(2,0) as peer:

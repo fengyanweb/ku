@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the frozen four-stack benchmark on its disposable Linux ARM64 guest.
+"""Build the frozen seven-stack benchmark on its disposable Linux ARM64 guest.
 
 Run as the benchmark user, never as root. Outputs/caches/dependencies belong to
 ROOT/build, not the source tree. This prepares measured programs, not a Release.
@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -52,8 +53,51 @@ def identities(root):
     return result
 
 
+def benchmark_stack_sources(directory):
+    return {path.relative_to(directory).as_posix(): digest(path)
+            for path in sorted(directory.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+            and not {"target", "node_modules", "__pycache__", ".git"}.intersection(path.relative_to(directory).parts)}
+
+
+def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="value"):
+    if mode not in ("helpers", "direct"):
+        raise ValueError("unknown Ku formatting mode")
+    if json_mode not in ("text", "response"):
+        raise ValueError("unknown Ku JSON response mode")
+    if pg_read not in ("value", "int"):
+        raise ValueError("unknown Ku PG result read mode")
+    if text.count("__PEER_PORT__") != 1:
+        raise RuntimeError("expected exactly one fixed peer substitution in Ku source")
+    original = "    return (await work_response(req, total))"
+    if text.count(original) != 1:
+        raise RuntimeError("expected exactly one original helper formatting return")
+    text = text.replace("__PEER_PORT__", str(peer_port))
+    if mode == "direct":
+        text = text.replace(original, '''    text = str(total)
+    while (text.len() < 8) { text = "0" + text }
+    return ok(http.text(req.query.rid + ":" + text))''')
+    if json_mode == "response":
+        original_json = '''    body = json.encode({id: req.query.rid.clone(), counter: counter + 1, data: data})?
+    return ok(http.text(body))'''
+        if text.count(original_json) != 1:
+            raise RuntimeError("expected exactly one original JSON handler encode/response")
+        text = text.replace(original_json, "    return ok(http.json({id: req.query.rid.clone(), counter: counter + 1, data: data}))")
+    if pg_read == "int":
+        for original_read, replacement in (
+            ("            key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?",
+             "            key = result.value_int(0, 0)?"),
+            ("            score_value = json.decode(result.value(0, 2)?)?\n            score = score_value.as_int()?",
+             "            score = result.value_int(0, 2)?"),
+        ):
+            if text.count(original_read) != 1:
+                raise RuntimeError("expected exactly one original PG numeric result conversion")
+            text = text.replace(original_read, replacement)
+    return text
+
+
 class Builder:
-    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE):
+    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE, ku_format="helpers", ku_json="text", ku_pg_read="value"):
         if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
             raise RuntimeError("build helper requires the actual ARM64 Linux benchmark guest")
         if os.geteuid() != uid or os.getegid() != gid:
@@ -94,6 +138,7 @@ class Builder:
         self.built = set()
         self.initial_hashes = identities(self.source)
         self.candidate, self.uid, self.gid = candidate, uid, gid
+        self.ku_format, self.ku_json, self.ku_pg_read = ku_format, ku_json, ku_pg_read
         self.manifest_path = self.root / "manifest.json"
         self.manifest = json.loads(self.manifest_path.read_text()) if self.manifest_path.exists() else {}
         previous = self.manifest.get("candidate_base")
@@ -171,10 +216,8 @@ class Builder:
         work.mkdir(exist_ok=True)
         source = self.benchmark / "ku/server.ku"
         text = source.read_text(encoding="utf-8")
-        if text.count("__PEER_PORT__") != 1:
-            raise RuntimeError("expected exactly one fixed peer substitution in Ku source")
         expanded = work / "server.ku"
-        expanded.write_text(text.replace("__PEER_PORT__", str(self.peer_port)), encoding="utf-8")
+        expanded.write_text(expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read), encoding="utf-8")
         batch = work / "batch.ku"
         shutil.copyfile(self.benchmark / "ku/batch.ku", batch)
         outputs = {}
@@ -217,6 +260,14 @@ class Builder:
                                                batch_command=[str(self.bin / "ku-batch")], cwd="{workdir}",
                                                runtime_layout=dict(binary_dir="bin", fs_base_dir="ku-native"),
                                                env={}, build=dict(cli=str(ku), cli_sha256=digest(ku),
+                                                                  formatting_mode=self.ku_format,
+                                                                  json_response_mode=self.ku_json,
+                                                                  pg_read_mode=self.ku_pg_read,
+                                                                  pg_read_semantics="value preserves original string plus JSON numeric decode; int uses checked owned-result span getter for id/score only; SQL, label, DISCARD and JSON/text response unchanged",
+                                                                  json_response_semantics="text preserves original encode plus text response; response uses public http.json, decoded input and Result propagation unchanged; database route remains original text API",
+                                                                  original_server_source_sha256=digest(source),
+                                                                  expanded_server_source_sha256=digest(expanded),
+                                                                  formatting_semantics="helpers preserves original three formatting tasks; direct uses public str(int), same explicit eight-digit zero padding; user Task semantics unchanged",
                                                                   native=outputs, generated_c=generated,
                                                                   libpq_source=str(libpq), libpq_sha256=digest(libpq),
                                                                   libpq_private_sha256=digest(private / "libpq.so"),
@@ -235,10 +286,17 @@ class Builder:
             self.manifest["client"] = dict(command=[str(binary)], cwd=str(self.root), env=dict(GOMAXPROCS="3"),
                                            sha256=digest(binary), source_sha256=digest(directory / "main.go"))
             self.built.add("client")
+            control = self.bin / "control-server"
+            self.command("go-control", [self.go, "build", "-trimpath", "-mod=readonly", "-o", control, "./control"], cwd=directory)
+            self.manifest["stacks"]["control"] = dict(command=[str(control), "--address", "{address}"], cwd="{workdir}", env=dict(GOMAXPROCS="{cores}"),
+                build=dict(binary_sha256=digest(control), flags="normal net/http control; not a seven-stack ranked implementation"))
+            self.built.add("control")
         else:
             self.manifest["stacks"]["go"] = dict(command=[str(binary)], batch_command=[str(binary), "--batch"],
                                                    cwd="{workdir}", env=dict(GOMAXPROCS="{cores}"),
-                                                   build=dict(binary_sha256=digest(binary), flags="-trimpath -mod=readonly; normal GC"))
+                                                   build=dict(binary_sha256=digest(binary), flags="-trimpath -mod=readonly; normal GC",
+                                                              source_files_sha256=benchmark_stack_sources(directory),
+                                                              pg_modes=["normal", "reset-equivalent"]))
             self.built.add("go")
 
     def rust(self):
@@ -250,7 +308,9 @@ class Builder:
         binary = target / "release/ku-cross-stack-rust"
         self.manifest["stacks"]["rust"] = dict(command=[str(binary)], batch_command=[str(binary), "--batch", "{batch_input}"],
                                                  cwd="{workdir}", env={}, build=dict(binary_sha256=digest(binary),
-                                                                                  flags="cargo +1.89.0 build --locked --release -j2"))
+                                                                                  flags="cargo +1.89.0 build --locked --release -j2",
+                                                                                  source_files_sha256=benchmark_stack_sources(directory),
+                                                                                  pg_modes=["normal", "reset-equivalent"]))
         self.built.add("rust")
 
     def node_build(self):
@@ -272,6 +332,81 @@ class Builder:
                                                             flags="normal node:http/cluster; normal GC; no NODE_OPTIONS"))
         self.built.add("node")
 
+    def java_build(self):
+        java = self.root / "tools/jdk/bin/java"
+        if not java.exists():
+            java = Path("/usr/lib/jvm/java-25-openjdk-arm64/bin/java")
+        self.version("java", [java, "--version"], "25.0.4.1")
+        self.version("maven", ["mvn", "--version"])
+        work = self.build / "java"
+        work.mkdir(exist_ok=True)
+        shutil.copyfile(self.benchmark / "java/pom.xml", work / "pom.xml")
+        shutil.copytree(self.benchmark / "java/src", work / "src", dirs_exist_ok=True)
+        log = self.command("java-compile", ["mvn", "--batch-mode", "--no-transfer-progress", "-X", "-Dmaven.repo.local=" + str(self.root / "tools/maven"), "compile"], cwd=work,
+                     environment={"JAVA_HOME": str(java.parent.parent)}, timeout=600)
+        # compiler-plugin resolves the actual Maven dependency closure already;
+        # avoid bootstrapping a report plugin merely to copy these same JARs.
+        matches = re.findall(r"\(f\) compilePath = \[(.*?)\]", log)
+        if len(matches) != 1:
+            raise RuntimeError("fixed compiler plugin did not expose exactly one resolved classpath")
+        jars = [Path(p.strip()) for p in matches[0].split(",") if p.strip().endswith(".jar")]
+        if not jars or len({p.name for p in jars}) != len(jars):
+            raise RuntimeError("empty or ambiguous Java runtime dependency names")
+        dependencies = work / "target/dependency"
+        dependencies.mkdir(exist_ok=True)
+        for stale in dependencies.glob("*.jar"):
+            stale.unlink()
+        for artifact in jars:
+            shutil.copyfile(artifact, dependencies / artifact.name)
+        artifacts = {p.name: digest(p) for p in sorted(dependencies.glob("*.jar"))}
+        expected = json.loads((self.benchmark / "java/dependencies.lock.json").read_text())
+        if artifacts != expected["artifacts_sha256"]:
+            raise RuntimeError("Java resolved artifacts differ from frozen dependency lock")
+        classpath = str(work / "target/classes") + ":" + str(work / "target/dependency/*")
+        command = [str(java), "-XX:ActiveProcessorCount={cores}", "-XX:MaxRAMPercentage=65", "-XX:InitialRAMPercentage=5", "-cp", classpath, "ku.bench.Main"]
+        self.manifest["stacks"]["java"] = dict(command=command, batch_command=command + ["--batch", "{batch_input}"], cwd="{workdir}", env={},
+            build=dict(java_binary_sha256=digest(java), artifact_sha256=artifacts, class_files_sha256={str(p.relative_to(work)): digest(p) for p in (work / "target/classes").rglob("*.class")},
+                flags="Java25 normal tiered JIT/G1; heap max65% whole cgroup limit; service tree separately constrained", pool_total=16))
+        self.built.add("java")
+
+    def dotnet_build(self):
+        dotnet = self.root / "tools/dotnet/dotnet"
+        self.version("dotnet", [dotnet, "--info"], "10.0.402")
+        work = self.build / "dotnet"
+        work.mkdir(exist_ok=True)
+        for name in ("global.json", "Ku.CrossStack.csproj", "Program.cs", "packages.lock.json"):
+            shutil.copyfile(self.benchmark / "dotnet" / name, work / name)
+        env = {"DOTNET_ROOT": str(dotnet.parent), "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1", "NUGET_PACKAGES": str(self.root / "tools/nuget")}
+        self.command("dotnet-restore", [dotnet, "restore", "Ku.CrossStack.csproj", "--locked-mode"], cwd=work, environment=env, timeout=300)
+        self.command("dotnet-publish", [dotnet, "publish", "Ku.CrossStack.csproj", "-c", "Release", "--no-restore", "--no-self-contained", "-o", work / "publish"], cwd=work, environment=env, timeout=300)
+        command = [str(dotnet), str(work / "publish/Ku.CrossStack.dll")]
+        self.manifest["stacks"]["dotnet"] = dict(command=command, batch_command=command + ["--batch", "{batch_input}"], cwd="{workdir}",
+            env=dict(DOTNET_ROOT=str(dotnet.parent), DOTNET_PROCESSOR_COUNT="{cores}", DOTNET_GCHeapHardLimitPercent="41", DOTNET_CLI_TELEMETRY_OPTOUT="1"),
+            build=dict(sdk_binary_sha256=digest(dotnet), publish_files_sha256={p.name: digest(p) for p in (work / "publish").iterdir() if p.is_file()},
+                flags="Release normal tiered JIT/server GC; GC heap max65% (hex41), not total process cap; service cgroup constrained", pool_total=16))
+        self.built.add("dotnet")
+
+    def cpp_build(self):
+        self.version("cc", ["clang-18", "--version"], "18.")
+        self.version("cmake", ["cmake", "--version"])
+        dependency_lock = json.loads((self.benchmark / "cpp/dependencies.lock.json").read_text())
+        receipt = json.loads((self.root / "tools/drogon-build.json").read_text())
+        self.version("jsoncpp", ["pkg-config", "--modversion", "jsoncpp"], dependency_lock["system_json"]["version"])
+        self.version("jsoncpp-package", ["dpkg-query", "-W", "-f=${Package}=${Version}", "libjsoncpp-dev"], dependency_lock["system_json"]["ubuntu_package"])
+        if receipt["sources"] != dependency_lock["sources"]:
+            raise RuntimeError("Drogon/Trantor source identities differ from frozen lock")
+        if "-O3 -DNDEBUG" not in receipt.get("flags", ""):
+            raise RuntimeError("normal C++ requires full framework Release O3; retain old O2 proof and prepare a new O3 prefix before using this build")
+        target = self.build / "cpp"
+        self.command("cpp-configure", ["cmake", "-S", self.benchmark / "cpp", "-B", target,
+            "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX_COMPILER=clang++-18", "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG", "-DCMAKE_PREFIX_PATH=" + str(self.root / "tools/drogon")], timeout=120)
+        self.command("cpp-build", ["cmake", "--build", target, "-j2"], timeout=300)
+        binary = target / "cpp-server"
+        self.manifest["stacks"]["cpp"] = dict(command=[str(binary)], batch_command=[str(binary), "--batch", "{batch_input}"], cwd="{workdir}",
+            env=dict(LD_LIBRARY_PATH=str(self.root / "tools/drogon/lib")),
+            build=dict(binary_sha256=digest(binary), dependencies=receipt, installed_library_sha256={str(p.relative_to(self.root / "tools/drogon")): digest(p) for p in (self.root / "tools/drogon/lib").rglob("*") if p.is_file()}, flags="clang18 C++17 -O3 -DNDEBUG; Drogon normal async HTTP/PG, JsonCpp dynamic tree", pool_total=16))
+        self.built.add("cpp")
+
     def finish(self, failed=None):
         current = identities(self.source)
         if current != self.initial_hashes:
@@ -279,7 +414,8 @@ class Builder:
         lockfiles = {}
         for path in (self.source / "Cargo.lock", self.benchmark / "go/go.sum", self.benchmark / "go/go.mod",
                      self.benchmark / "rust/Cargo.lock", self.benchmark / "node/package-lock.json",
-                     self.benchmark / "client/go.mod"):
+                     self.benchmark / "client/go.mod", self.benchmark / "java/dependencies.lock.json",
+                     self.benchmark / "dotnet/packages.lock.json", self.benchmark / "cpp/dependencies.lock.json"):
             lockfiles[str(path.relative_to(self.source))] = digest(path)
         receipt = dict(schema="ku-cross-stack-build-v1", candidate_base=self.candidate,
                        package_version="0.0.18", source_files=self.initial_hashes, lockfiles=lockfiles,
@@ -306,7 +442,7 @@ class Builder:
             merged.update(build_receipt=str(self.logs / "build.json"),
                           versions=dict(latest.get("versions", {}), **self.versions),
                           source_inventory_sha256=receipt["source_inventory_sha256"], lockfiles=lockfiles)
-            required = {"ku", "go", "rust", "node"}
+            required = {"ku", "go", "rust", "node", "java", "dotnet", "cpp"}
             merged["build_complete"] = required <= merged["stacks"].keys() and "client" in merged
             write_json(self.manifest_path, merged)
             self.manifest = merged
@@ -321,15 +457,22 @@ def main():
     parser.add_argument("--gid", type=int, default=1000)
     parser.add_argument("--peer-port", type=int, default=19191)
     parser.add_argument("--candidate", default=CANDIDATE)
-    parser.add_argument("--only", nargs="+", choices=("ku", "go", "rust", "node", "client"),
-                        default=["ku", "go", "rust", "node", "client"])
+    parser.add_argument("--ku-format", choices=("helpers", "direct"), default="helpers",
+                        help="helpers preserves legacy benchmark; direct requires a candidate CLI with public str(int), records separate source identity")
+    parser.add_argument("--ku-json", choices=("text", "response"), default="text",
+                        help="text preserves original JSON handler bytes; response uses public http.json, separately identified; database route remains text")
+    parser.add_argument("--ku-pg-read", choices=("value", "int"), default="value",
+                        help="value preserves original numeric JSON conversions; int uses checked result.value_int for id/score only, separately identified")
+    parser.add_argument("--only", nargs="+", choices=("ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"),
+                        default=["ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"])
     args = parser.parse_args()
-    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate)
+    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate, args.ku_format, args.ku_json, args.ku_pg_read)
     try:
         for item in args.only:
             print(f"building {item}", flush=True)
             {"ku": builder.ku, "go": builder.go_build, "rust": builder.rust,
-             "node": builder.node_build, "client": lambda: builder.go_build(True)}[item]()
+             "node": builder.node_build, "java": builder.java_build, "dotnet": builder.dotnet_build,
+             "cpp": builder.cpp_build, "client": lambda: builder.go_build(True)}[item]()
     except Exception as error:
         builder.finish(str(error))
         raise

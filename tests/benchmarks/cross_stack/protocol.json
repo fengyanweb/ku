@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "status": "frozen_before_measurement",
-  "candidate_base": "8210e5200c466d9041807d04a68c1844ba9cbd6f",
+  "status": "v5_new_protocol_requires_new_frozen_results_do_not_mix_v4",
+  "candidate_base": "cac47df6b1db6a3bbd4eebf470306221ca4ef13c",
   "service": "HTTP/1.1 keep-alive, no compression/TLS/proxy",
   "endpoints": {
     "ok": {
@@ -168,7 +168,8 @@
     "Ku_HTTP_pending": 128,
     "Ku_HTTP_connections": 4096,
     "Ku_task_bytes": 67108864,
-    "unmatched_admission_controls": "record actual native framework semantics; no artificial slow layer"
+    "unmatched_admission_controls": "record actual native framework semantics; no artificial slow layer",
+    "waiting_admission": "Harness writes ordinary config max_active_requests=target+64, max_connections=target+128, max_pending_requests=128 for dedicated wait instances. Ku reads same config; actual protected limits must match, not inferred from Task driver capacity."
   },
   "SLO": {
     "success_fraction_planned": 0.999,
@@ -190,7 +191,7 @@
     "warmup_seconds": 30,
     "maximum_warmup_seconds": 120,
     "formal_seconds": 30,
-    "formal_repeats": 5,
+    "formal_repeats": 7,
     "capacity_explore_seconds": 5,
     "maximum_boundary_refinements": 3,
     "waiting_counts": [
@@ -204,19 +205,33 @@
     "waiting_stop": "confirmed hard limit/SLO/resource failure; no higher fake capacity",
     "wait_observation_seconds": 30,
     "sustained_seconds": 600,
-    "sustained_rate": "60% of minimum nonzero five-round verified mixed capacity; mark partial-stack comparison if any stack has no verified qualified point; never use provisional short-window capacity",
-    "overload_multiple": 5,
+    "sustained_rate": "60% of minimum nonzero seven-round verified mixed point; point is a lower bound, not exact capacity",
     "overload_seconds": 30,
-    "max_hotspots": 2,
-    "max_candidates_per_hotspot": 2,
     "warmup_policy": "30 seconds once for every stack and CPU/memory/workload case; native services retained between interleaved rounds only after all actual jobs are drained",
     "resume_prime_seconds": 3,
     "inactive_services": "whole idle service cgroup frozen between interleaved rounds, freeze/resume history retained; 3s prime excluded uniformly",
     "vm_memory_fallback": "if whole guest available memory falls below 800MiB while retaining idle services, restart every stack for that case and repeat uniform 30s warmup; record fallback",
-    "waiting_warmup": "all stacks: 30s at32rps of ordinary25ms timer before the held cohort; complete all responses before baseline"
+    "waiting_warmup": "all stacks: 30s at32rps of ordinary25ms timer before the held cohort; complete all responses before baseline",
+    "formal_seconds_rule": "at least30s, extend uniformly to reach>=1000 pooled correct samples per required type without changing70/20/9/1 mix; actual failures may still leave insufficient tails",
+    "overload_multiples": [
+      1.5,
+      2,
+      5
+    ],
+    "maximum_additional_overload_multiples": [
+      10,
+      20,
+      40
+    ],
+    "overload_escalation_stop": "after5x, stop on valid observed service boundary, driver/measurement censoring, unexplained service fault, or frozen rate ceiling; below boundary cannot pass true-overload recovery",
+    "small_memory_workloads": [
+      "json_object",
+      "mixed"
+    ],
+    "seven_stack_scope": "Ku/Go/Rust/Node original matrix; Java/.NET/C++ four-core ok/json_object/mixed, including256MiB json_object and600s mixed. Select --case and --stacks explicitly; no extra JSON workload requirement for the added three.",
+    "sustained_case": "--case selects its own CPU/memory/workload formal basis, includingc4-m268435456-mixed; no reuse of1GiB capacity for256MiB"
   },
   "measurement": {
-    "histogram_resolution_us": 10,
     "all_outcomes": "mutually exclusive; failed results never excluded from denominators",
     "times": [
       "scheduled_at",
@@ -226,15 +241,42 @@
     "late": "associated event, not second terminal count",
     "events": "bounded streaming compressed CSV allowed; output overflow invalidates run",
     "no_retry": true,
-    "small_tail_samples": "fewer than 100 correct observations has no p99; do not claim SLO compliance. Five formal round distributions are merged, never average percentiles",
+    "small_tail_samples": "p99 null below100 correct,p999 null below1000; below100 check observed maximum only; core pooled p99 claim requires>=1000 per type and>=7 seeded interleaved windows; merge same identity/config only",
     "capacity_search_ceiling_rps": 100000,
     "driver_headroom": "driver invalidity or CPU saturation censors server capacity; it is not a server capacity failure",
     "planned_window_tail": "stop creating plans at the frozen window end; already planned requests may start and complete until their original scheduled+absolute deadline. Do not discard at window cutoff, renew deadlines, replay, or credit completion-tail throughput to the window",
-    "client_schema": "ku-cross-stack-client-v4",
+    "client_schema": "ku-cross-stack-client-v5",
     "overload_recovery_origins": "primary: planned arrival cutoff+5s unchanged; secondary: separately report last actual business sent+5s and continued-offering tail; secondary never rescues failed primary",
-    "connection_reuse": "shared bounded LIFO idle connection pool across workers; exclusive one request per borrowed socket; 500ms idle expiry; all error/Connection:close sockets discarded, never replayed; report actual dials and requests/dial",
+    "connection_reuse": "bounded shared LIFO; default500ms idle expiry unchanged; report dial attempts/idle expirations/cold and reused latency/scheduled-to-attempt/dial duration. Separate three-point diagnostic uses500vs0 expiry; no mixing of policies in formal distributions.",
     "cross_process_clock": "Linux CLOCK_MONOTONIC anchor with recorded <=1ms uncertainty; resource and recovery correlation never uses realtime/Unix arithmetic. Combined anchors conservatively bound new-probe timing; missing or uncertain clocks censor measurement, not server capacity.",
-    "driver_average_cpu_saturation_fraction": 0.9
+    "driver_average_cpu_saturation_fraction": 0.9,
+    "histogram_representation": "v5-fixed-log128:256 linear10us cells below2.56ms then128cells/doubling;5760cells/distribution covers int64 ns; all counts retained; upper-edge quantiles",
+    "histogram_maximum_relative_bucket_width": 0.0078125,
+    "paired_statistics": {
+      "seed": 20261023,
+      "bootstrap_resamples": 20000,
+      "minimum_windows": 7,
+      "unit": "paired interleaved window, not individual request",
+      "estimand": "geometric mean per-window ratio",
+      "interval": "percentile95% bootstrap; dependence/stationarity assumption disclosed; no target claim when service/measurement gates fail",
+      "comparison_views": {
+        "common": "same arrival rate: lifecycle CPU, steady/peak memory, p99 and delivered goodput; not maximum throughput capacity",
+        "own_capacity": "Ku/Go and Ku/Rust separate qualified own-point seven-window goodput ratios with paired CI; credible upper exploration evidence required for capacity target, otherwise censored"
+      }
+    },
+    "resource_cost_scopes": [
+      "arrival window CPU interpolation with uncertainty and current-memory middle60% median/observed peak",
+      "driver lifetime including client tail",
+      "full lifecycle through actual quiescence or forced termination; forced exit fails natural reclamation",
+      "post-driver CPU distinct from provable useless-work CPU; unavailable attribution is null"
+    ],
+    "physical_settle_observation": {
+      "fixture_gate_seconds": 5,
+      "maximum_observation_seconds_after_driver": 45,
+      "runtime_deadlines_changed": false,
+      "meaning": "keep5s fixture result; await real responsibility quiescence within frozen runtime contract then record physical end or forced termination"
+    },
+    "histogram_minimum_resolution_us": 10
   },
   "known_capability_differences": {
     "json_response_mime": {
@@ -244,5 +286,5 @@
     },
     "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts."
   },
-  "revision": 4
+  "revision": 5
 }

@@ -2560,6 +2560,13 @@ impl<'a> FunctionLowerer<'a> {
         if struct_name == HTTP_REQUEST_TYPE && matches!(field_name, "method" | "path" | "body") {
             return IrType::Str;
         }
+        if struct_name == HTTP_RESPONSE_TYPE {
+            return match field_name {
+                "status" => IrType::Int,
+                "body" => IrType::Str,
+                _ => IrType::Unknown,
+            };
+        }
         // Stage 8b: `req.params` / `req.query` / `req.headers` are dynamic string
         // maps backed by the native `KuObject` ABI. Typing them as `__ku_object`
         // lets `req.query.get_or(...)` dispatch and marks the program as using the
@@ -2963,7 +2970,10 @@ impl<'a> FunctionLowerer<'a> {
             }
             IrType::Named(n)
                 if n == "__ku_pg_result"
-                    && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+                    && matches!(
+                        name.as_str(),
+                        "rows" | "cols" | "value" | "value_int" | "is_null"
+                    ) =>
             {
                 "pg_result"
             }
@@ -3430,6 +3440,47 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     call_kind_and_type(callee, &lowered_args, self.signatures)
                 };
+                if matches!(&kind, IrCallKind::Intrinsic(name) if name == "http.json") {
+                    // The interpreter reports invalid status/serialization as a
+                    // runtime error, not a user Result. Preserve that fatal edge
+                    // through the existing synchronous return mailbox. All
+                    // arguments were staged above, before status validation.
+                    let (status, value) = match lowered_args.as_slice() {
+                        [value] => (
+                            IrExpr {
+                                kind: IrExprKind::Literal("200".to_string()),
+                                ty: IrType::Int,
+                            },
+                            value.clone(),
+                        ),
+                        [status, value] if status.ty == IrType::Int => {
+                            let checked = self.emit_temp(intrinsic_expr(
+                                "__ku_http_json_status",
+                                vec![status.clone()],
+                                IrType::Int,
+                            ))?;
+                            (checked, value.clone())
+                        }
+                        _ => {
+                            return Err(KuError::runtime(
+                                "native http.json expects value or (int status, value)",
+                                expr.span,
+                            ));
+                        }
+                    };
+                    // Reuse the JSON writer once. It reads the already evaluated
+                    // input; only the encoded string is moved into the response.
+                    let encoded = self.emit_temp(intrinsic_expr(
+                        "json.stringify",
+                        vec![value],
+                        IrType::Result(Box::new(IrType::Str)),
+                    ))?;
+                    return self.finish_borrowing_call(
+                        intrinsic_expr("__ku_http_json_response", vec![status, encoded], ty),
+                        first_argument_temp,
+                        deferred_safepoint,
+                    );
+                }
                 // For intrinsics the backend dispatches by name and ignores the
                 // callee, so avoid lowering a dotted callee (e.g. `time.millis`)
                 // into an unknown-typed Field temp — use a Function placeholder.
@@ -4978,6 +5029,11 @@ impl<'a> FunctionLowerer<'a> {
 /// return mailbox has been consumed. This classifies only typed i64 arithmetic;
 /// float/mixed/dynamic expressions retain their separate existing semantics.
 pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
+    if matches!(&expr.kind, IrExprKind::Call { kind: IrCallKind::Intrinsic(name), .. }
+        if matches!(name.as_str(), "__ku_http_json_status" | "__ku_http_json_response"))
+    {
+        return true;
+    }
     if ir_expr_needs_post_call_safepoint(expr) {
         return true;
     }
@@ -5371,7 +5427,7 @@ fn call_kind_and_type(
 /// `http.server()`/`http.service()` and consumed by `app.get/listen`.
 const HTTP_SERVER_TYPE: &str = "__ku_http_server";
 /// Stage 8a: the synthetic IR type of an HTTP response produced by the response
-/// helpers (`http.text`/`html`/`empty`/`redirect`).
+/// helpers (`http.text`/`html`/`json`/`empty`/`redirect`).
 const HTTP_RESPONSE_TYPE: &str = "__ku_http_response";
 /// Stage 8a: the synthetic IR type of the request struct passed to `fn(req)`
 /// route handlers (fields `method`/`path`/`body`).
@@ -5397,7 +5453,7 @@ fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option
 fn http_builtin_ir_type(module: &str, function: &str) -> Option<IrType> {
     match (module, function) {
         ("http", "server" | "service") => Some(IrType::Named(HTTP_SERVER_TYPE.to_string())),
-        ("http", "text" | "html" | "empty" | "redirect") => {
+        ("http", "text" | "html" | "json" | "empty" | "redirect") => {
             Some(IrType::Named(HTTP_RESPONSE_TYPE.to_string()))
         }
         _ => None,

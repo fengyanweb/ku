@@ -5,7 +5,7 @@
 //! Hosted frames use generated child Start/Await and adapter-owned scope drain.
 //! User cleanup remains finite and cannot await; source admission stays separate.
 
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet};
 
 use crate::error::KuResult;
 use crate::ir::task::{
@@ -20,6 +20,81 @@ use super::{
     c_drop_value, c_move_value, c_static_utf8_string, c_type, c_type_suffix, c_zero_initializer,
     unsupported,
 };
+
+// Copy the complete bounded drive text while changing only actual return
+// statements. Source string literals may themselves contain C-looking text.
+// Unknown future return forms fail code generation instead of missing a spill.
+fn emit_scalar_spill_returns(out: &mut COutput, body: &str, call: &str) -> KuResult<()> {
+    let bytes = body.as_bytes();
+    let mut cursor = 0;
+    let mut copied = 0;
+    while cursor < bytes.len() {
+        out.check()?;
+        if bytes[cursor] == b'"' || bytes[cursor] == b'\'' {
+            let quote = bytes[cursor];
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'\\' {
+                    cursor = (cursor + 2).min(bytes.len());
+                } else if bytes[cursor] == quote {
+                    cursor += 1;
+                    break;
+                } else {
+                    cursor += 1;
+                }
+            }
+        } else if bytes[cursor..].starts_with(b"//") {
+            cursor += 2;
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+        } else if bytes[cursor..].starts_with(b"/*") {
+            cursor += 2;
+            while cursor + 1 < bytes.len() && &bytes[cursor..cursor + 2] != b"*/" {
+                cursor += 1;
+            }
+            cursor = (cursor + 2).min(bytes.len());
+        } else if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            if &body[start..cursor] != "return" {
+                continue;
+            }
+            let end = body[cursor..]
+                .find(';')
+                .map(|offset| cursor + offset)
+                .ok_or_else(|| unsupported("unterminated generated Task return"))?;
+            let value = body[cursor..end].trim();
+            if !matches!(
+                value,
+                "KU_TASK_FRAME_PENDING"
+                    | "KU_TASK_FRAME_INVALID_STATE"
+                    | "KU_TASK_FRAME_READY"
+                    | "KU_TASK_FRAME_EXIT_STAGED"
+                    | "KU_TASK_FRAME_SCOPE_REQUEST"
+                    | "frame->header.status"
+                    | "continued"
+            ) {
+                return Err(unsupported(
+                    "unrecognized generated Task scalar-cache return",
+                ));
+            }
+            out.push_str(&body[copied..cursor]);
+            out.push_str(&format!(" {call},{value})"));
+            cursor = end;
+            copied = end;
+        } else {
+            cursor += 1;
+        }
+    }
+    out.push_str(&body[copied..]);
+    out.check()
+}
 
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
@@ -141,6 +216,7 @@ struct FrameEmitter<'a> {
     callable_parameters: &'a [crate::ir::task::TaskCallableParameterPlan],
     finally: &'a TaskFinallyPlan,
     cooperative: bool,
+    scalar_cache_active: Cell<bool>,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -286,6 +362,7 @@ impl<'a> FrameEmitter<'a> {
             callable_parameters: &frame.callable_parameters,
             finally: &frame.finally,
             cooperative: false,
+            scalar_cache_active: Cell::new(false),
         })
     }
 
@@ -444,8 +521,21 @@ impl<'a> FrameEmitter<'a> {
         self.task_mask & (1u64 << slot.0) != 0
     }
 
+    fn cached_scalar(&self, slot: SlotId) -> bool {
+        self.persistent.contains(&slot.0)
+            && matches!(
+                self.function.slots[slot.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Int | IrType::Bool | IrType::Null,
+                    borrowed: false
+                }
+            )
+    }
+
     fn place(&self, slot: SlotId) -> String {
-        if self.persistent.contains(&slot.0) {
+        if self.scalar_cache_active.get() && self.cached_scalar(slot) {
+            format!("cached_{}", slot.0)
+        } else if self.persistent.contains(&slot.0) {
             format!("frame->s_{}", slot.0)
         } else {
             format!("slot_{}", slot.0)
@@ -890,6 +980,59 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
+        let slots = (0..self.function.slots.len())
+            .map(SlotId)
+            .filter(|slot| self.cached_scalar(*slot))
+            .collect::<Vec<_>>();
+        let enabled = self.cooperative
+            && self.hosted
+            && !slots.is_empty()
+            && self.finally.state_cleanup.is_empty()
+            && !self
+                .function
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }))
+            && (0..self.function.states.len()).any(|state| self.scalar_direct_state(state));
+        if !enabled {
+            return self.emit_drive_body(out);
+        }
+        // Only verified Copy scalars get a private invocation-local cache.
+        // Owning headers, initialization bits and control/lease storage stay
+        // in the original frame. A callback never receives this cache address
+        // except for finite pure arithmetic output parameters.
+        let mut body = COutput::new(out.remaining());
+        self.scalar_cache_active.set(true);
+        let emitted = self.emit_drive_body(&mut body);
+        self.scalar_cache_active.set(false);
+        emitted?;
+        let body = body.finish()?;
+        let helper = format!("{}_spill_scalars", self.prefix);
+        out.push_str(&format!(
+            "static uint32_t {helper}({}* frame",
+            self.frame_type
+        ));
+        for slot in &slots {
+            out.push_str(&format!(
+                ", {} cached_{}",
+                c_type(self.slot_type(*slot)?)?,
+                slot.0
+            ));
+        }
+        out.push_str(", uint32_t result) {\n");
+        for slot in &slots {
+            out.push_str(&format!("  frame->s_{}=cached_{};\n", slot.0, slot.0));
+        }
+        out.push_str("  return result;\n}\n");
+        let mut call = format!("{helper}(frame");
+        for slot in &slots {
+            call.push_str(&format!(",cached_{}", slot.0));
+        }
+        emit_scalar_spill_returns(out, &body, &call)?;
+        out.check()
+    }
+
+    fn emit_drive_body(&self, out: &mut COutput) -> KuResult<()> {
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
             self.prefix, self.frame_type
@@ -899,7 +1042,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
-            if !self.persistent.contains(&index) {
+            if self.scalar_cache_active.get() && self.cached_scalar(SlotId(index)) {
+                out.push_str(&format!(
+                    "  {} cached_{index}=(frame->header.initialized & (UINT64_C(1)<<{index})) ? frame->s_{index} : {};\n",
+                    c_type(self.slot_type(SlotId(index))?)?, c_zero_initializer(self.slot_type(SlotId(index))?)?));
+            } else if !self.persistent.contains(&index) {
                 let TaskSlotType::Value { ty, .. } = &slot.ty else {
                     return Err(unsupported("Task slots must be persistent"));
                 };
@@ -2372,3 +2519,37 @@ static int ku_task_frame_is_terminal(uint32_t status) {
       || status == KU_TASK_FRAME_TIMED_OUT;
 }
 "#;
+
+#[cfg(test)]
+mod scalar_spill_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_spill_rewrites_code_and_preserves_quoted_data_comments_and_bounds() {
+        let input = r#"const char* text="return KU_TASK_FRAME_READY;";
+char quote='\\'; /* return KU_TASK_FRAME_PENDING; */
+// return frame->header.status;
+if (ready) return KU_TASK_FRAME_READY;
+return frame->header.status;
+"#;
+        let mut out = COutput::new(4096);
+        emit_scalar_spill_returns(&mut out, input, "spill(frame,cached_1").unwrap();
+        let text = out.finish().unwrap();
+        assert!(text.contains("if (ready) return spill(frame,cached_1,KU_TASK_FRAME_READY);"));
+        assert!(text.contains("return spill(frame,cached_1,frame->header.status);"));
+        assert!(text.contains("\"return KU_TASK_FRAME_READY;\""));
+        assert!(text.contains("/* return KU_TASK_FRAME_PENDING; */"));
+        assert!(text.contains("// return frame->header.status;"));
+        let mut unknown = COutput::new(4096);
+        assert!(
+            emit_scalar_spill_returns(&mut unknown, "return unexpected;", "spill(frame").is_err()
+        );
+        let mut bounded = COutput::new(1);
+        assert!(emit_scalar_spill_returns(
+            &mut bounded,
+            "return KU_TASK_FRAME_READY;",
+            "spill(frame"
+        )
+        .is_err());
+    }
+}

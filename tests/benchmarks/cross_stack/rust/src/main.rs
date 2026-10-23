@@ -1,3 +1,5 @@
+mod pg_mode;
+
 use axum::{
     body::to_bytes,
     extract::{DefaultBodyLimit, Request, State},
@@ -82,6 +84,7 @@ struct App {
     cpu_pending: Arc<Semaphore>,
     counters: Counters,
     db: Option<Pool>,
+    pg_mode: pg_mode::Mode,
     peer: u16,
 }
 fn bounded(name: &str, default: usize, low: usize, high: usize) -> usize {
@@ -157,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(serve(cpu_workers))
 }
 async fn serve(cpu_workers: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
     let active = bounded("BENCH_MAX_ACTIVE", 1024, 1, 65536);
     let pending = bounded("BENCH_MAX_PENDING", 128, 1, 65536);
     let db_slots = bounded("BENCH_DB_POOL", 16, 1, 1024);
@@ -185,6 +189,7 @@ async fn serve(cpu_workers: usize) -> Result<(), Box<dyn std::error::Error>> {
         cpu: Arc::new(Semaphore::new(cpu_workers)),
         cpu_pending: Arc::new(Semaphore::new(pending)),
         counters: Counters::new(),
+        pg_mode,
         db,
         peer: bounded("BENCH_PEER_PORT", 1, 1, 65535) as u16,
     });
@@ -392,28 +397,35 @@ async fn execute(app: Arc<App>, request: Request) -> Result<Response, Failure> {
                 .as_ref()
                 .ok_or_else(|| failure("BENCH_DB_URL is required"))?;
             let _count = Count::new(&app.counters.waiting_db);
-            let client = db.get().await.map_err(|e| failure(e.to_string()))?;
-            let rows = timeout(
-                Duration::from_secs(1),
-                client.query_typed(
-                    "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
-                    &[(&key, Type::INT4)],
-                ),
-            )
-            .await
-            .map_err(|_| failure("query deadline"))?
-            .map_err(|e| failure(e.to_string()))?;
-            if rows.len() != 1 {
-                return Err(failure("incorrect database row count"));
+            if app.pg_mode == pg_mode::Mode::ResetEquivalent {
+                let (id, label, score) = pg_mode::query_reset_equivalent(db, key)
+                    .await
+                    .map_err(failure)?;
+                encoded(json!({"id":id,"label":label,"score":score,"rid":rid}))
+            } else {
+                let client = db.get().await.map_err(|e| failure(e.to_string()))?;
+                let rows = timeout(
+                    Duration::from_secs(1),
+                    client.query_typed(
+                        "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
+                        &[(&key, Type::INT4)],
+                    ),
+                )
+                .await
+                .map_err(|_| failure("query deadline"))?
+                .map_err(|e| failure(e.to_string()))?;
+                if rows.len() != 1 {
+                    return Err(failure("incorrect database row count"));
+                }
+                let id: i32 = rows[0].try_get("id").map_err(|e| failure(e.to_string()))?;
+                let label: String = rows[0]
+                    .try_get("label")
+                    .map_err(|e| failure(e.to_string()))?;
+                let score: i32 = rows[0]
+                    .try_get("score")
+                    .map_err(|e| failure(e.to_string()))?;
+                encoded(json!({"id":id,"label":label,"score":score,"rid":rid}))
             }
-            let id: i32 = rows[0].try_get("id").map_err(|e| failure(e.to_string()))?;
-            let label: String = rows[0]
-                .try_get("label")
-                .map_err(|e| failure(e.to_string()))?;
-            let score: i32 = rows[0]
-                .try_get("score")
-                .map_err(|e| failure(e.to_string()))?;
-            encoded(json!({"id":id,"label":label,"score":score,"rid":rid}))
         }
         _ => text(StatusCode::NOT_FOUND, "not found"),
     })

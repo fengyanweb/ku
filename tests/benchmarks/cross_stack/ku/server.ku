@@ -81,10 +81,13 @@ fn main(): null! {
     config = json.decode(fs.read("config.json")?)?
     address = config["addr"]?.as_str()?
     db_url = config["db_url"]?.as_str()?
+    active_limit = config["max_active_requests"]?.as_int()?
+    connection_limit = config["max_connections"]?.as_int()?
+    pending_limit = config["max_pending_requests"]?.as_int()?
     client = pg.client({conninfo: db_url, max_connections: 16, max_waiters: 128,
         connect_timeout_ms: 2000, acquire_timeout_ms: 250, query_timeout_ms: 2000})?
-    app = http.server({max_connections: 4096, max_active_requests: 1024,
-        max_pending_requests: 128, max_buffer_bytes: 67108864,
+    app = http.server({max_connections: connection_limit, max_active_requests: active_limit,
+        max_pending_requests: pending_limit, max_buffer_bytes: 67108864,
         max_header_bytes: 4096, max_body_bytes: 65536,
         handler_timeout_ms: 45000, idle_timeout_ms: 5000,
         read_header_timeout_ms: 3000, read_body_timeout_ms: 3000,

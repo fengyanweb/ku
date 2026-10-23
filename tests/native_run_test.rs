@@ -5684,6 +5684,209 @@ fn native_json_stringify_typed_primitive_arrays() {
 }
 
 #[test]
+fn native_http_json_uses_existing_writer_in_bare_and_result_functions() {
+    let dir = unique_temp_dir("http-json-owned-result");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import { http, json } from "std"
+fn bare(): HttpResponse { return http.json({text:"owned"}) }
+fn created(): HttpResponse! {
+    decoded = json.decode("{\"text\":\"中文🙂\\u0000\",\"items\":[1,true,null]}")?
+    return ok(http.json(201, decoded))
+}
+fn main(): null! {
+    response = created()?
+    println(response.status)
+    println(response.body)
+    quoted = http.json("quote\"\\\n")
+    println(quoted.body)
+    response = bare()
+    println(response.body)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write native HTTP JSON Result source");
+    let generated = native_emit_c(&dir, "main.ku");
+    assert!(generated.contains("application/json; charset=utf-8"));
+    assert!(generated.contains("ku_http_json_response"));
+    let Some(exe) = native_build(&dir, "main.ku", "httpjsonresult") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(
+        stdout.replace('\r', ""),
+        concat!(
+            "201\n{\"items\":[1,true,null],\"text\":\"中文🙂\\u0000\"}\n",
+            "\"quote\\\"\\\\\\n\"\n{\"text\":\"owned\"}\n"
+        )
+    );
+    assert_eq!(code, Some(0));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_errors_match_interpreter_and_do_not_enter_catch() {
+    let dir = unique_temp_dir("http-json-fatal");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    for (name, expression, expected_prefix, message) in [
+        (
+            "status",
+            "http.json(status(), value())",
+            "status\nvalue\n",
+            "http status must be between 100 and 599",
+        ),
+        (
+            "writer",
+            "http.json(ok(\"owned\" + \" result\"))",
+            "",
+            "json.stringify does not support result",
+        ),
+    ] {
+        let source = format!(
+            r#"import http from "std.http"
+fn status(): int {{ println("status") return 99 }}
+fn value(): str {{ println("value") return "evaluated" }}
+fn response(): HttpResponse {{
+    try {{ return {expression} }}
+    catch (err) {{ println("unexpected-catch") return http.text("caught") }}
+    return http.text("unreachable")
+}}
+fn main(): null! {{
+    result = response()
+    println("unexpected-continuation")
+    return ok(null)
+}}
+"#
+        );
+        fs::write(dir.join("main.ku"), source).unwrap();
+        let mut interpreter = Command::new(ku_binary());
+        interpreter.current_dir(&dir).args(["run", "main.ku"]);
+        let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded interpreter HTTP JSON failure");
+        assert!(!interpreted.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert!(String::from_utf8_lossy(&interpreted.stderr).contains(message));
+        let Some(exe) = native_build(&dir, "main.ku", &format!("httpjson{name}")) else {
+            return;
+        };
+        let mut command = Command::new(exe);
+        command.current_dir(&dir);
+        let native = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded native HTTP JSON failure");
+        assert_eq!(native.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stderr).replace('\r', ""),
+            format!("{message}\n")
+        );
+    }
+}
+
+#[test]
+fn native_http_json_keeps_existing_consumed_input_rule() {
+    let dir = unique_temp_dir("http-json-contract");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    value={text:"owned"}
+    response=http.json(value)
+    println(value.text)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write consumed native HTTP JSON source");
+    let output = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(&dir)
+            .args(["check", "main.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .expect("bounded HTTP JSON ownership check");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use of moved value 'value'"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_mailbox_has_no_owner_and_releases_writer_inputs() {
+    let dir = unique_temp_dir("http-json-fatal-owners");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn Failure(): HttpResponse { return http.json(ok("owned" + " input")) }
+fn main(): null! { response=Failure() return ok(null) }
+"#,
+    )
+    .unwrap();
+    let generated = native_emit_c(&dir, "main.ku");
+    run_array_capacity_c_harness(
+        &dir,
+        &generated,
+        "httpjsonfatalowners",
+        r#"
+int main(void) {
+  for (unsigned round=0; round<16; ++round) {
+    __ku_sync_reset();
+    KuStruct___ku_http_response failed=Failure();
+    KuSyncExitSignal signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json.stringify does not support result"));
+    CHECK(__ku_sync_error_message_length(signal)==strlen("json.stringify does not support result"));
+    CHECK(!failed.body.ptr && !failed.content_type.ptr && !__ku_call_depth);
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(NO_LIVE_ALLOCATIONS());
+    // A future writer with an owning error must fall back before dropping it.
+    KuError owned=ku_error_make(
+      ku_string_concat(ku_string_static((const uint8_t*)"j",1),ku_string_static((const uint8_t*)"son",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"c",1),ku_string_static((const uint8_t*)"ode",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"owned",5),ku_string_static((const uint8_t*)" message",8)));
+    CHECK(ku_perf_live_allocations==3);
+    failed=ku_http_json_response(200,(KuResult_str){false,(KuString){0},owned});
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json stringify failed"));
+    CHECK(NO_LIVE_ALLOCATIONS());
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(ku_http_json_status(99)==0);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"http status must be between 100 and 599"));
+    KuString body=ku_string_concat(ku_string_static((const uint8_t*)"[",1),ku_string_static((const uint8_t*)"]",1));
+    uint8_t* original=body.ptr;
+    KuStruct___ku_http_response good=ku_http_json_response(201,(KuResult_str){true,ku_string_move(&body),{0}});
+    CHECK(good.status==201 && good.body.ptr==original && !body.ptr);
+    CHECK(ku_perf_live_allocations==1 && __ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+    ku_drop_struct___ku_http_response(&good);
+    CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  return 0;
+}
+"#,
+    );
+}
+
+struct HttpJsonFixture(PathBuf);
+impl Drop for HttpJsonFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
 fn native_json_stringify_nested_user_struct_and_arrays() {
     let dir = unique_temp_dir("json-nested-user-struct");
     fs::write(

@@ -169,7 +169,9 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_WAIT || job->net_owner!=owner+1u) {
     ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_OK;
   }
-  job->state=KU_TASK_BLOCKING_NET_STEP;
+  if(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_STEP)!=KU_TASK_DRIVER_OK) {
+    ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
+  }
   int cancelled=job->cancelled || pool->closing;
   ku_task_blocking_unlock(pool);
   int done=ku_task_net_step(pool,job,events,cancelled);
@@ -184,7 +186,11 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   }
   if(done) {ku_task_blocking_free(job->net_write.ptr);job->net_write=(KuBytes){0};}
   if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
-  job->state=done?KU_TASK_BLOCKING_DONE:KU_TASK_BLOCKING_NET_WAIT;
+  job=&pool->jobs[index];
+  if(job->generation!=generation || job->state!=KU_TASK_BLOCKING_NET_STEP || job->net_owner!=owner+1u
+      || ku_task_blocking_net_state_locked(pool,job,done?KU_TASK_BLOCKING_DONE:KU_TASK_BLOCKING_NET_WAIT)!=KU_TASK_DRIVER_OK) {
+    pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
+  }
   if(done) {
     if(pool->finished!=UINT64_MAX)pool->finished++;
     uint32_t status=ku_task_driver_wake(&job->ticket);
@@ -197,6 +203,8 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
   if(!pool)return 0;
   size_t count=0;
   if(ku_task_blocking_lock(pool))return SIZE_MAX;
+  if(owner>=KU_TASK_DRIVER_MAX_WORKERS) {ku_task_blocking_unlock(pool);return SIZE_MAX;}
+  if(!pool->net_waiting[owner]) {ku_task_blocking_unlock(pool);return 0;}
   for(size_t i=0;i<pool->capacity;i++) {
     KuTaskBlockingJobV1* job=&pool->jobs[i];
     int active=job->state==KU_TASK_BLOCKING_NET_WAIT && job->net_owner==owner+1u;
@@ -226,7 +234,23 @@ static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTa
 }
 
 typedef struct KuTaskNetWakeV1 { KuNetSocket reader,writer; } KuTaskNetWakeV1;
-typedef struct KuTaskNetRootV1 { KuTaskBlockingPoolV1* pool;size_t count;uint32_t reserved;KuNetAtomicFlag wake_fault;KuTaskNetWakeV1 wakes[KU_TASK_DRIVER_MAX_WORKERS]; } KuTaskNetRootV1;
+#if defined(_WIN32)
+typedef WSAPOLLFD KuTaskNetOsPollV1;
+#else
+typedef struct pollfd KuTaskNetOsPollV1;
+#endif
+typedef struct KuTaskNetRootV1 {
+  KuTaskBlockingPoolV1* pool; KuTaskDriverV1* driver;
+  size_t count,capacity,scratch_bytes,stride; void* scratch;
+  uint32_t reserved,scratch_reserved;KuNetAtomicFlag wake_fault;
+  KuTaskNetWakeV1 wakes[KU_TASK_DRIVER_MAX_WORKERS];
+} KuTaskNetRootV1;
+static size_t ku_task_net_root_fixed_bytes(size_t owners,size_t capacity) {
+  if(!owners || owners>KU_TASK_DRIVER_MAX_WORKERS || !capacity || capacity>KU_TASK_NET_POLL_CAPACITY)return SIZE_MAX;
+  size_t stride=capacity*sizeof(KuTaskNetPollV1)+(capacity+1u)*sizeof(KuTaskNetOsPollV1);
+  if(owners>(SIZE_MAX-sizeof(KuTaskNetRootV1))/stride)return SIZE_MAX;
+  return sizeof(KuTaskNetRootV1)+owners*stride;
+}
 static int ku_task_net_wake_init(KuTaskNetWakeV1* wake) {
   wake->reader=wake->writer=KU_NET_INVALID_SOCKET;
   if(ku_net_socket_startup())return -1;
@@ -270,15 +294,12 @@ static void ku_task_net_root_wake(void* raw,size_t owner) {
 static int ku_task_net_root_wait(void* raw,size_t owner,uint64_t deadline) {
   KuTaskNetRootV1* root=(KuTaskNetRootV1*)raw;
   if(ku_net_atomic_flag_load(&root->wake_fault))return -1;
-  KuTaskNetPollV1 interests[KU_TASK_NET_POLL_CAPACITY];
+  if(owner>=root->count || !root->scratch)return -1;
+  KuTaskNetPollV1* interests=(KuTaskNetPollV1*)((uint8_t*)root->scratch+owner*root->stride);
   uint64_t next=deadline;
-  size_t count=ku_task_net_interests(root->pool,owner,interests,KU_TASK_NET_POLL_CAPACITY,&next);
-  if(count>KU_TASK_NET_POLL_CAPACITY)return -1;
-#if defined(_WIN32)
-  WSAPOLLFD fds[KU_TASK_NET_POLL_CAPACITY+1u];
-#else
-  struct pollfd fds[KU_TASK_NET_POLL_CAPACITY+1u];
-#endif
+  size_t count=ku_task_net_interests(root->pool,owner,interests,root->capacity,&next);
+  if(count>root->capacity)return -1;
+  KuTaskNetOsPollV1* fds=(KuTaskNetOsPollV1*)((uint8_t*)interests+root->capacity*sizeof(*interests));
   memset(fds,0,(count+1u)*sizeof(*fds));fds[0].fd=root->wakes[owner].reader;fds[0].events=KU_TASK_NET_OS_READ;
   for(size_t i=0;i<count;i++) {fds[i+1].fd=(KuNetSocket)interests[i].socket_value;fds[i+1].events=(interests[i].events&KU_TASK_NET_READ)?KU_TASK_NET_OS_READ:KU_TASK_NET_OS_WRITE;}
   uint64_t now=ku_net_now_ms();int timeout=next==UINT64_MAX?-1:next<=now?0:next-now>(uint64_t)INT_MAX?INT_MAX:(int)(next-now);
@@ -299,18 +320,39 @@ static int ku_task_net_root_wait(void* raw,size_t owner,uint64_t deadline) {
   return 0;
 }
 static uint32_t ku_task_net_root_attach(KuTaskNetRootV1* root,KuTaskDriverV1* driver,KuTaskBlockingPoolV1* pool) {
-  memset(root,0,sizeof(*root));ku_net_atomic_flag_init(&root->wake_fault);root->pool=pool;
+  memset(root,0,sizeof(*root));ku_net_atomic_flag_init(&root->wake_fault);root->pool=pool;root->driver=driver;
+  size_t fixed=ku_task_net_root_fixed_bytes(driver->workers_created,pool->capacity);
+  if(fixed==SIZE_MAX)return KU_TASK_DRIVER_LIMIT;
+  root->capacity=pool->capacity;
+  root->scratch_bytes=fixed-sizeof(*root);root->stride=root->scratch_bytes/driver->workers_created;
+  uint32_t reserved=ku_task_driver_scratch_reserve(driver,root->scratch_bytes);
+  if(reserved!=KU_TASK_DRIVER_OK)return reserved;
+  root->scratch_reserved=1;
+  root->scratch=calloc(1,root->scratch_bytes);
+  if(!root->scratch) {
+    uint32_t refunded=ku_task_driver_scratch_refund(driver,root->scratch_bytes);root->scratch_reserved=0;
+    return refunded==KU_TASK_DRIVER_OK?KU_TASK_BLOCKING_OUT_OF_MEMORY:refunded;
+  }
   for(;root->count<driver->workers_created;root->count++)
     if(ku_task_net_wake_init(&root->wakes[root->count])) {
       for(size_t i=0;i<root->count;i++) {ku_net_socket_close(root->wakes[i].reader);ku_net_socket_close(root->wakes[i].writer);}
-      root->count=0;return KU_TASK_DRIVER_INTERNAL;
+      root->count=0;free(root->scratch);root->scratch=NULL;
+      uint32_t refunded=ku_task_driver_scratch_refund(driver,root->scratch_bytes);root->scratch_reserved=0;
+      return refunded==KU_TASK_DRIVER_OK?KU_TASK_DRIVER_INTERNAL:refunded;
     }
   if(ku_task_driver_lock(driver))return KU_TASK_DRIVER_INTERNAL;
   driver->io_context=root;driver->io_wait=ku_task_net_root_wait;
   driver->event_context=root;driver->event_wake=ku_task_net_root_wake;
   ku_task_driver_signal_work(driver);ku_task_driver_unlock(driver);return KU_TASK_DRIVER_OK;
 }
-static void ku_task_net_root_destroy(KuTaskNetRootV1* root) {
+static uint32_t ku_task_net_root_destroy(KuTaskNetRootV1* root) {
   for(size_t i=0;i<root->count;i++) {ku_net_socket_close(root->wakes[i].reader);ku_net_socket_close(root->wakes[i].writer);}
   root->count=0;
+  free(root->scratch);root->scratch=NULL;
+  if(root->scratch_reserved) {
+    uint32_t status=ku_task_driver_scratch_refund(root->driver,root->scratch_bytes);
+    if(status!=KU_TASK_DRIVER_OK)return status;
+    root->scratch_reserved=0;
+  }
+  return KU_TASK_DRIVER_OK;
 }

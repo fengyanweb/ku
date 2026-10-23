@@ -63,3 +63,8 @@ Official references checked 2026-10-22:
 
 Do not commit the Cargo target directory or one-time probes. The benchmark source,
 locked dependency graph, configuration and compact evidence are permanent.
+
+`BENCH_PG_MODE=reset-equivalent` selects a separately named same-lease session
+reset comparison. The unset/normal path keeps the behavior and deadlines above.
+See [the two PG comparison contracts](../pg-comparison.md) for source identities,
+absolute deadlines, cancellation/eviction rules and the private-fixture tests.

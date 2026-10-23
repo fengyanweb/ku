@@ -54,6 +54,16 @@ fn AggregateHandleComparisons(fail_array: bool, fail_result: bool): bool! {
 fn NextRow(): int {
     return 0
 }
+fn ReadTyped(): int! {
+    client = pg.client({ conninfo: "hostaddr=127.0.0.1", max_connections: 1 })?
+    result = client.query("SELECT 3", [])?
+    client.close()
+    integer = result.value_int(NextRow(), NextRow())?
+    original = result.value(0, 0)?
+    if (original != "3") { panic("integer read consumed the original table") }
+    again = result.value_int(0, 0)?
+    return ok(integer + again)
+}
 fn main(): null! {
     client = pg.client({ conninfo: "hostaddr=127.0.0.1", max_connections: 1 })?
     result = client.query("SELECT $1::text", ["value"])?
@@ -65,6 +75,28 @@ fn main(): null! {
     return ok(null)
 }
 "#
+}
+
+#[test]
+fn native_pg_integer_receiver_checks_arity_types_and_result_propagation() {
+    ku::cli::check_source("pg-integer.ku", fixture()).expect("typed getter public receiver checks");
+    for invalid in [
+        "result.value_int(0)",
+        "result.value_int(0, 0, 0)",
+        "result.value_int(\"zero\", 0)",
+        "result.value_int(0, false)",
+    ] {
+        let source = fixture().replacen("result.value_int(NextRow(), NextRow())", invalid, 1);
+        ku::cli::check_source("pg-integer-invalid.ku", &source)
+            .expect_err("getter rejects invalid arguments");
+    }
+    let missing_propagation = fixture().replacen(
+        "return ok(integer + again)",
+        "return ok(result.value_int(0, 0) + again)",
+        1,
+    );
+    ku::cli::check_source("pg-integer-result.ku", &missing_propagation)
+        .expect_err("integer getter remains a Result until explicitly unwrapped");
 }
 
 #[test]
@@ -545,12 +577,14 @@ static void ku_test_pg_free(void*);
 static int ku_test_pg_pool_lock_depth = 0;
 static int ku_test_pg_finishes_while_pool_locked = 0;
 static int ku_test_pg_acquire_calls = 0;
+static int ku_test_pg_index_calls = 0;
 #define malloc ku_test_pg_malloc
 #define calloc ku_test_pg_calloc
 #define realloc ku_test_pg_realloc
 #define free ku_test_pg_free
 "#;
     let mut harness = generated
+        .replacen("int64_t NextRow(void) {", "int64_t NextRow(void) { ku_test_pg_index_calls++;", 1)
         .replacen(
             "typedef struct pg_conn PGconn;",
             &format!("{hook}\ntypedef struct pg_conn PGconn;"),
@@ -1380,7 +1414,71 @@ static PGconn* open_connection(void) {
 }
 static void close_connection(PGconn** connection) { if (connection && *connection) { PQfinish(*connection); *connection = 0; } }
 
+static int integer_value_cases(void) {
+  const struct {const char* text;size_t length;int ok;int64_t value;} cases[]={
+    {"0",1,1,0},{"-0",2,1,0},{"1",1,1,1},{"-1",2,1,-1},
+    {"2147483647",10,1,INT64_C(2147483647)},{"-2147483648",11,1,-INT64_C(2147483648)},
+    {"9223372036854775807",19,1,INT64_MAX},{"-9223372036854775808",20,1,INT64_MIN},
+    {"",0,0,0},{"-",1,0,0},{"+1",2,0,0},{" 1",2,0,0},{"1 ",2,0,0},
+    {"00",2,0,0},{"01",2,0,0},{"-00",3,0,0},{"1.0",3,0,0},{"1e0",3,0,0},
+    {"1\0x",3,0,0},{"\0",1,0,0},{"null",4,0,0},{"true",4,0,0},{"\xe4\xb8\xad",3,0,0},
+    {"9223372036854775808",19,0,0},{"-9223372036854775809",20,0,0},
+    {"18446744073709551615",20,0,0},{"100000000000000000000",21,0,0}
+  };
+  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+    track_runtime_allocations=1;
+    KuPgResult* owned=(KuPgResult*)ku_test_pg_malloc(sizeof(*owned));CHECK(owned);
+    *owned=(KuPgResult){0};owned->rows=owned->cols=owned->cell_capacity=1;
+    owned->bytes_len=cases[i].length;owned->bytes_capacity=cases[i].length?cases[i].length:1;
+    owned->cells=(KuPgCell*)ku_test_pg_calloc(1,sizeof(*owned->cells));
+    owned->bytes=(uint8_t*)ku_test_pg_malloc(owned->bytes_capacity);CHECK(owned->cells && owned->bytes);
+    if(cases[i].length)memcpy(owned->bytes,cases[i].text,cases[i].length);
+    owned->cells[0]=(KuPgCell){0,(uint32_t)cases[i].length};
+    KuPgResult before=*owned;KuPgCell cell=owned->cells[0];
+    size_t bytes=runtime_bytes;int allocations=live_runtime_allocations,failures=injected_allocation_failures;
+    fail_runtime_allocation_after=1;
+    KuResult_int parsed=ku_pg_value_int(owned,0,0);
+    CHECK(parsed.ok==cases[i].ok && (!parsed.ok || parsed.value==cases[i].value));
+    if(!parsed.ok)CHECK(equals(parsed.error.domain,"pg") && equals(parsed.error.code,"integer_value_error"));
+    ku_error_drop(&parsed.error);
+    CHECK(fail_runtime_allocation_after==1 && injected_allocation_failures==failures
+        && allocations==live_runtime_allocations && runtime_bytes==bytes);
+    CHECK(!memcmp(&before,owned,sizeof(before)) && !memcmp(&cell,owned->cells,sizeof(cell))
+        && (!cases[i].length || !memcmp(owned->bytes,cases[i].text,cases[i].length)));
+    fail_runtime_allocation_after=0;
+    ku_drop_pg_result(&owned);CHECK(!owned && !live_runtime_allocations && !runtime_bytes);
+    if(parsed.ok)CHECK(parsed.value==cases[i].value); /* Copy value survives the result owner. */
+    parsed=ku_pg_value_int(owned,0,0);
+    CHECK(!parsed.ok && equals(parsed.error.code,"value_error"));ku_error_drop(&parsed.error);
+    track_runtime_allocations=0;
+  }
+  uint8_t digit='7';KuPgCell cell={0,1};
+  for(unsigned bad=0;bad<11u;bad++) {
+    KuPgResult table={1,1,1,1,1,&cell,&digit};cell=(KuPgCell){0,1};
+    int64_t row=0,col=0;
+    switch(bad) {
+      case 0:row=-1;break;case 1:col=-1;break;case 2:row=1;break;case 3:col=INT64_MAX;break;
+      case 4:table.cells=NULL;break;case 5:table.cell_capacity=0;break;
+      case 6:table.bytes=NULL;break;case 7:table.bytes_len=2;break;
+      case 8:cell.offset=UINT32_MAX;break;case 9:cell.len=2;break;
+      default:table.rows=3;table.cols=SIZE_MAX;row=2;break;
+    }
+    fail_runtime_allocation_after=1;
+    KuResult_int parsed=ku_pg_value_int(&table,row,col);
+    CHECK(!parsed.ok && equals(parsed.error.code,"value_error") && fail_runtime_allocation_after==1);
+    ku_error_drop(&parsed.error);fail_runtime_allocation_after=0;
+  }
+  KuPgResult table={1,1,1,0,0,&cell,NULL};cell=(KuPgCell){UINT32_MAX,KU_PG_NULL_CELL};
+  fail_runtime_allocation_after=1;
+  KuResult_int null=ku_pg_value_int(&table,0,0);
+  CHECK(!null.ok && equals(null.error.code,"null_value") && fail_runtime_allocation_after==1);
+  ku_error_drop(&null.error);fail_runtime_allocation_after=0;
+  cell=(KuPgCell){0,0};KuResult_int empty=ku_pg_value_int(&table,0,0);
+  CHECK(!empty.ok && equals(empty.error.code,"integer_value_error"));ku_error_drop(&empty.error);
+  return 0;
+}
 int main(void) {
+  CHECK(integer_value_cases()==0);
   int comparison_starts = starts, comparison_finishes = finishes;
   KuResult_bool comparison = HandleComparisons();
   CHECK(comparison.ok && comparison.value);
@@ -1973,6 +2071,10 @@ int main(void) {
   }
   cancellation_mode=0;
 
+  mode_on_send=T_MULTI;reset_mode_on_send=T_RESTORE;
+  KuResult_int typed=ReadTyped();
+  CHECK(typed.ok && typed.value==6 && ku_test_pg_index_calls==2
+      && !live_connections && !live_results && starts==finishes);
   CHECK(ku_test_pg_pool_lock_depth == 0 && ku_test_pg_finishes_while_pool_locked == 0);
   CHECK(bad_calls == 0);
   CHECK(shutdowns > 0 && poisoned_consumes >= 2 && single_row_calls > 0 && read_ahead_calls == 0);

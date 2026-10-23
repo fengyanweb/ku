@@ -352,7 +352,7 @@ static KuTaskDriverSnapshotV1 fixture_source_idle(KuTaskDriverV1* driver,uint64_
   CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created); return snapshot;
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==11u);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   CHECK(ku_test_event_init(&fixture_two_polls) && ku_test_event_init(&fixture_release));
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
@@ -460,7 +460,7 @@ static KuTaskDriverSnapshotV1 fixture_idle(KuTaskDriverV1* driver,uint64_t deadl
   CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created); return snapshot;
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==11u);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   CHECK(ku_test_event_init(&fixture_second_start) && ku_test_event_init(&fixture_release));
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));

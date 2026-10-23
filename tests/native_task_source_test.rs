@@ -1938,7 +1938,11 @@ async fn main(): null! {{
         stream.shutdown(Shutdown::Write).unwrap();
     });
     let output = run_bounded(
-        Command::new(executable).current_dir(directory.path()),
+        Command::new(executable)
+            .current_dir(directory.path())
+            // The reactor scratch must live on the heap even with the minimum
+            // supported thread stack; no capacity-sized poll arrays on stack.
+            .env("KU_THREAD_STACK_BYTES", "262144"),
         RUN_TIMEOUT,
         RUN_LIMITS,
     )
@@ -2038,7 +2042,7 @@ async fn main(): null! {
     generated = generated.replacen(
         lock,
         r#"
-static KU_THREAD_LOCAL size_t fixture_locks,fixture_depth,fixture_fail_after;
+static KU_THREAD_LOCAL size_t fixture_locks,fixture_depth,fixture_fail_after,fixture_net_scanned;
 static int fixture_mode,fixture_bad_dispatch;
 static int fixture_original_lock(KuTaskBlockingPoolV1* pool);
 static int ku_task_blocking_lock(KuTaskBlockingPoolV1* pool) {
@@ -2078,11 +2082,19 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   if(fixture_mode==1) {
     job->generation=generation+1u;job->cancelled=0;
     job->net_client=&fixture_clients[1];job->net_deadline+=100u;
-  } else if(fixture_mode==2)job->state=KU_TASK_BLOCKING_DONE;
-  else if(fixture_mode==3)job->net_owner=owner+2u;
+  } else if(fixture_mode==2) {
+    if(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE))abort();
+  } else if(fixture_mode==3) {
+    if(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_STEP))abort();
+    job->net_owner=owner+2u;
+    if(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT))abort();
+  }
   ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_OK;
 }
 static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,size_t index,uint64_t generation,uint32_t events) {"#, 1);
+    let scan="    KuTaskBlockingJobV1* job=&pool->jobs[i];\n    int active=job->state==KU_TASK_BLOCKING_NET_WAIT";
+    assert_eq!(generated.matches(scan).count(), 1);
+    generated=generated.replacen(scan,"    fixture_net_scanned++;\n    KuTaskBlockingJobV1* job=&pool->jobs[i];\n    int active=job->state==KU_TASK_BLOCKING_NET_WAIT",1);
     let source = format!(
         "{generated}\n{}",
         r#"
@@ -2098,6 +2110,7 @@ int main(void) {
   CHECK(ku_task_net_interests(NULL,0u,interests,2u,&next)==0u && fixture_locks==before);
   CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==0u);
   CHECK(fixture_locks-before==1u && !fixture_depth && next==UINT64_MAX);
+  CHECK(!fixture_net_scanned && !pool->net_waiting[0]);
   fixture_fail_after=1u;
   CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==SIZE_MAX && !fixture_depth);
   CHECK(!ku_net_socket_startup());
@@ -2106,9 +2119,11 @@ int main(void) {
     CHECK(fixture_clients[i].socket_value!=KU_NET_INVALID_SOCKET);
   }
   CHECK(!ku_task_blocking_lock(pool));
-  KuTaskBlockingJobV1* job=&pool->jobs[0];job->generation=2u;job->state=KU_TASK_BLOCKING_NET_WAIT;
+  KuTaskBlockingJobV1* job=&pool->jobs[0];job->generation=2u;
   job->net_owner=1u;job->kind=6u;job->net_requested=17;job->net_deadline=deadline;
   job->net_client=&fixture_clients[0];
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+  CHECK(pool->net_waiting[0]==1u);
   ku_task_blocking_unlock(pool);
   CHECK(ku_task_net_dispatch(pool,0u,0u,1u,KU_TASK_NET_READ|KU_TASK_NET_ERROR)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_net_dispatch(pool,1u,0u,2u,KU_TASK_NET_READ)==KU_TASK_DRIVER_OK);
@@ -2118,20 +2133,25 @@ int main(void) {
   before=fixture_locks;next=UINT64_MAX;
   CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==1u);
   CHECK(fixture_locks-before==1u && !fixture_depth && next==deadline);
+  CHECK(fixture_net_scanned==pool->capacity);
   CHECK(interests[0].generation==2u && interests[0].slot==0u
     && interests[0].socket_value==(uintptr_t)fixture_clients[0].socket_value
     && interests[0].events==KU_TASK_NET_READ);
   before=fixture_locks;next=UINT64_MAX;
   CHECK(ku_task_net_interests(pool,1u,interests,2u,&next)==0u);
   CHECK(fixture_locks-before==1u && !fixture_depth && next==UINT64_MAX);
+  CHECK(fixture_net_scanned==pool->capacity);
   CHECK(ku_task_net_interests(pool,0u,NULL,0u,&next)==SIZE_MAX && !fixture_depth);
   CHECK(!ku_task_blocking_lock(pool));CHECK(pool->fault==KU_TASK_DRIVER_LIMIT);pool->fault=0;
   ku_task_blocking_unlock(pool);
   for(int mode=1;mode<=5;mode++) {
     CHECK(!ku_task_blocking_lock(pool));
-    job->generation=10u+(uint64_t)mode;job->state=KU_TASK_BLOCKING_NET_WAIT;
+    CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+    job->generation=10u+(uint64_t)mode;
     job->net_owner=1u;job->kind=6u;job->cancelled=1;
     job->net_client=&fixture_clients[0];job->net_deadline=deadline;
+    CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+    CHECK(pool->net_waiting[0]==1u && !pool->net_waiting[1]);
     ku_task_blocking_unlock(pool);
     fixture_mode=mode;next=UINT64_MAX;before=fixture_locks;
     size_t count=ku_task_net_interests(pool,0u,interests,2u,&next);
@@ -2141,10 +2161,19 @@ int main(void) {
       CHECK(interests[0].socket_value==(uintptr_t)fixture_clients[1].socket_value);
     } else if(mode==2 || mode==3)CHECK(count==0u && next==UINT64_MAX);
     else CHECK(count==SIZE_MAX);
+    CHECK(pool->net_waiting[0]==(mode==2 || mode==3 ? 0u:1u));
+    CHECK(pool->net_waiting[1]==(mode==3 ? 1u:0u));
     CHECK(fixture_locks-before==(mode<=3 ? 3u : 1u));
     fixture_mode=0;
   }
-  CHECK(!ku_task_blocking_lock(pool));memset(job,0,sizeof(*job));ku_task_blocking_unlock(pool);
+  CHECK(!ku_task_blocking_lock(pool));
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_STEP)==KU_TASK_DRIVER_OK);
+  CHECK(!pool->net_waiting[0]);
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+  CHECK(pool->net_waiting[0]==1u);
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  for(size_t i=0;i<KU_TASK_DRIVER_MAX_WORKERS;i++)CHECK(!pool->net_waiting[i]);
+  memset(job,0,sizeof(*job));ku_task_blocking_unlock(pool);
   for(size_t i=0;i<2u;i++)ku_net_socket_close(fixture_clients[i].socket_value);
   CHECK(ku_task_blocking_finish(pool,deadline)==KU_TASK_DRIVER_OK);
   CHECK(pool->initialized==KU_TASK_DRIVER_STORAGE_ZERO && !pool->resources

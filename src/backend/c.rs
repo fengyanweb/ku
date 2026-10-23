@@ -2932,7 +2932,7 @@ fn emit_terminator(
             // Take once before a finally/helper can run. An old frame-local
             // suppressed failure must not poison healthy cleanup calls.
             out.push_str(&format!(
-                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
+                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL || __ku_observed.kind == KU_SYNC_EXIT_HTTP_JSON_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
                 cleanup_block.0, continue_block.0,
             ));
             out.check()
@@ -3736,6 +3736,7 @@ fn emit_result_abi_phase(
         // accessors, even when the source only calls the legacy `value` helper.
         forced.push(IrType::Str);
         forced.push(IrType::Bool);
+        forced.push(IrType::Int);
     }
     if program_uses_pg_client(program) {
         forced.push(IrType::Named("__ku_pg_client".to_string()));
@@ -14763,6 +14764,41 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
         "  memcpy(copied, r->bytes + cell.offset, (size_t)cell.len);\n",
         "  return (KuResult_str){ true, (KuString){ copied, (size_t)cell.len, (size_t)cell.len, KU_STRING_OWNED }, (KuError){0} };\n",
         "}\n",
+        r#"/* Canonical JSON integer token only, with no surrounding whitespace.
+ * Read the independent owned table; no string owner or JSON value is created. */
+static KuResult_int ku_pg_value_int(KuPgResult* r, int64_t row, int64_t col) {
+  if (!ku_pg_cell_in_bounds(r,row,col) || !r->cells
+      || (size_t)row > (SIZE_MAX-(size_t)col)/r->cols)
+    return (KuResult_int){false,0,ku_pg_value_error()};
+  size_t index=(size_t)row*r->cols+(size_t)col;
+  if(index>=r->cell_capacity)return (KuResult_int){false,0,ku_pg_value_error()};
+  KuPgCell cell=r->cells[index];
+  if(cell.len==KU_PG_NULL_CELL)return (KuResult_int){false,0,ku_pg_static_error(
+      "null_value",sizeof("null_value")-1,"PostgreSQL NULL must be checked with is_null()",sizeof("PostgreSQL NULL must be checked with is_null()")-1)};
+  if(r->bytes_len>r->bytes_capacity || (size_t)cell.offset>r->bytes_len
+      || (size_t)cell.len>r->bytes_len-(size_t)cell.offset || (cell.len && !r->bytes))
+    return (KuResult_int){false,0,ku_pg_value_error()};
+  /* Canonical int64 text is at most 20 bytes, including its minus sign. */
+  if(!cell.len || cell.len>20u)goto invalid_integer;
+  const uint8_t* text=r->bytes+cell.offset;
+  size_t at=0;int negative=text[0]=='-';
+  if(negative && ++at==(size_t)cell.len)goto invalid_integer;
+  if(text[at]=='0' && at+1u!=(size_t)cell.len)goto invalid_integer;
+  uint64_t limit=(uint64_t)INT64_MAX+(negative?UINT64_C(1):UINT64_C(0)),value=0;
+  for(;at<(size_t)cell.len;at++) {
+    uint8_t digit=text[at];
+    if(digit<'0' || digit>'9')goto invalid_integer;
+    uint64_t next=(uint64_t)(digit-'0');
+    if(value>(limit-next)/UINT64_C(10))goto invalid_integer;
+    value=value*UINT64_C(10)+next;
+  }
+  int64_t parsed=negative ? value==(uint64_t)INT64_MAX+UINT64_C(1)?INT64_MIN:-(int64_t)value : (int64_t)value;
+  return (KuResult_int){true,parsed,{0}};
+invalid_integer:
+  return (KuResult_int){false,0,ku_pg_static_error("integer_value_error",sizeof("integer_value_error")-1,
+      "PostgreSQL value is not a canonical int64 integer",sizeof("PostgreSQL value is not a canonical int64 integer")-1)};
+}
+"#,
         "static KuResult_bool ku_pg_is_null(KuPgResult* r, int64_t row, int64_t col) {\n",
         "  if (!ku_pg_cell_in_bounds(r, row, col)) return (KuResult_bool){ false, false, ku_pg_value_error() };\n",
         "  return (KuResult_bool){ true, r->cells[(size_t)row * r->cols + (size_t)col].len == KU_PG_NULL_CELL, (KuError){0} };\n",
@@ -15115,6 +15151,37 @@ fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
         return Ok(());
     }
     out.push_str(include_str!("c_http_runtime.c"));
+    if program_uses_intrinsic(program, "__ku_http_json_response") {
+        out.push_str(
+            r#"
+static int64_t ku_http_json_status(int64_t status) {
+  if (status >= 100 && status <= 599) return status;
+  static const uint8_t message[] = "http status must be between 100 and 599";
+  __ku_sync_raise_http_json(message, sizeof(message) - 1);
+  return 0;
+}
+/* Consume the writer Result once. Its errors currently contain static literals;
+ * guard that provenance before dropping the full error and publishing a view. */
+static KuStruct___ku_http_response ku_http_json_response(int64_t status, KuResult_str encoded) {
+  if (!encoded.ok) {
+    static const uint8_t fallback[] = "json stringify failed";
+    const uint8_t* message = fallback;
+    size_t message_len = sizeof(fallback) - 1;
+    if (encoded.error.message.storage == KU_STRING_STATIC && encoded.error.message.ptr) {
+      message = encoded.error.message.ptr;
+      message_len = encoded.error.message.len;
+    }
+    ku_error_drop(&encoded.error);
+    __ku_sync_raise_http_json(message, message_len);
+    return (KuStruct___ku_http_response){0};
+  }
+  return (KuStruct___ku_http_response){ status,
+    ku_string_static((const uint8_t*)"application/json; charset=utf-8", 31),
+    ku_string_move(&encoded.value), (KuString){0} };
+}
+"#,
+        );
+    }
     Ok(())
 }
 
@@ -15521,7 +15588,7 @@ fn emit_main_wrapper(
     }
     out.push_str(mysql_shutdown);
     out.push_str(&format!(
-        "  const char* message = __ku_sync_error_message(signal); ku_output_stream_write(stderr, message, strlen(message)); ku_output_stream_write(stderr, \"\\n\", 1); return {};\n  }}\n", exit("1")
+        "  const char* message = __ku_sync_error_message(signal); ku_output_stream_write(stderr, message, __ku_sync_error_message_length(signal)); ku_output_stream_write(stderr, \"\\n\", 1); return {};\n  }}\n", exit("1")
     ));
     match &function.return_type {
         IrType::Void => {
@@ -15628,6 +15695,26 @@ fn c_str_literal_static(value: &str) -> KuResult<String> {
 /// an HTTP intrinsic, `None` otherwise so the generic dispatch continues.
 fn c_http_intrinsic_expr(name: &str, args: &[IrExpr]) -> KuResult<Option<String>> {
     let resp_ty = "KuStruct___ku_http_response";
+    if name == "__ku_http_json_status" {
+        let [status] = args else {
+            return Err(unsupported("native HTTP JSON status expects one argument"));
+        };
+        let status = c_expr(status)?;
+        // IR has already staged this argument before later argument effects.
+        return Ok(Some(format!("ku_http_json_status({status})")));
+    }
+    if name == "__ku_http_json_response" {
+        let [status, body] = args else {
+            return Err(unsupported(
+                "native HTTP JSON response expects status and encoded body",
+            ));
+        };
+        return Ok(Some(format!(
+            "ku_http_json_response({}, {})",
+            c_expr(status)?,
+            c_value_expr(body)?
+        )));
+    }
     // http.server() / http.service(): a fresh empty route table. Stage 8d: when a
     // config object is passed, read its admission-control limits (max_connections,
     // max_active_requests, max_pending_requests, handler_timeout_ms) into the
@@ -15771,6 +15858,12 @@ fn c_pg_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
         "cols" => Ok(format!("ku_pg_cols({})", c_expr(arg(0)?)?)),
         "value" => Ok(format!(
             "ku_pg_value({}, {}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?,
+            c_expr(arg(2)?)?
+        )),
+        "value_int" => Ok(format!(
+            "ku_pg_value_int({}, {}, {})",
             c_expr(arg(0)?)?,
             c_expr(arg(1)?)?,
             c_expr(arg(2)?)?

@@ -255,7 +255,7 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_byt
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(startup_deadline!=UINT64_MAX);
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==11u);
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
       runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   fixture_idle(runtime);

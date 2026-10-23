@@ -347,13 +347,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             .len(),
         64
     );
-    let error = task_lower::lower_program(&budget_ast(63, false)).unwrap_err();
+    let compacted = task_lower::lower_program(&budget_ast(63, false)).unwrap();
     assert!(
-        error
-            .message
-            .contains("more than 64 generated Task frame slots"),
-        "{error}"
+        compacted.tasks.functions[0].slots.len() < 64,
+        "dead Copy temporaries beyond logical64 must reuse physical slots"
     );
+    task::verify_and_plan(&compacted.tasks, task::TaskLimits::default()).unwrap();
     let error = task_lower::lower_program(&budget_ast(64, true)).unwrap_err();
     assert!(
         error

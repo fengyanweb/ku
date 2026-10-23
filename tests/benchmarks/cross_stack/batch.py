@@ -21,13 +21,16 @@ import sys
 import threading
 import time
 
-from linux_harness import Domain, GIB, Harness, Sampler, STACKS, read_json, template, write_json
+from linux_harness import Domain, GIB, Harness, Sampler, interleaved_orders, read_json, template, write_json
+
+STACKS = ("ku", "go", "rust", "node", "java", "dotnet", "cpp")
+ORDER_SEED = 20261023
 
 ITERATIONS = 512000
 SEED = 3
 REPEAT = 64
 EXPECTED = 22944003
-ROUNDS = 5
+ROUNDS = 7
 PROCESS_DEADLINE_SECONDS = 60
 STREAM_LIMIT = 65536
 
@@ -134,6 +137,7 @@ def run_group(harness, stack, cores, repeat, round_index, output):
         'protocol_sha256': digest(harness.protocol),
         'driver_sha256': digest(__file__),
         'stack': stack, 'cores': cores, 'repeat': repeat, 'round': round_index,
+        'order_seed': ORDER_SEED, 'expected_paired_rounds': ROUNDS,
         'iterations': ITERATIONS, 'seed': SEED, 'processes': cores,
     }
     if report_path.exists():
@@ -156,7 +160,8 @@ def run_group(harness, stack, cores, repeat, round_index, output):
         'startup_subtracted': False,
         'timing': 'process-wall starts at shared frozen-domain release and ends at last child exit; internal compute is separate',
         'memory_scope': 'whole service cgroup, including all independent processes; kernel memory.peak retained',
-        'internal_timer': 'Ku monotonic API has 1ms resolution; Go/Rust/Node use their high-resolution monotonic APIs, actual precision is not inferred from printed decimals',
+        'internal_timer': 'Ku monotonic API has 1ms resolution; other stacks use their monotonic high-resolution API; printed decimals do not establish actual precision; intervals below20ms are not precise ratio evidence',
+        'jit_gc_warmup': {'mode':'fresh process, no in-process prewarm on any stack', 'scope':'whole-process startup/JIT/GC remain included; internal compute includes JIT/GC occurring during computation, so this is not a claim of steady JIT code-generation speed', 'gc':'normal defaults except the published heap fraction; whole cgroup accounts GC/helper threads', 'per_process_gc_or_jit_events':'unavailable in these batch CLI outputs, not zero'},
         'page_cache': 'fresh process, not a claim of cold filesystem page cache; no cache dropping',
         'coordinator_clock_resolution_seconds': time.get_clock_info('monotonic').resolution,
     }
@@ -180,7 +185,7 @@ def run_group(harness, stack, cores, repeat, round_index, output):
             cwd.mkdir()
             os.chown(cwd, harness.uid, harness.gid)
             workdirs.append(cwd)
-            replacements = {'root': harness.root, 'cores': cores, 'workers': 1,
+            replacements = {'root': harness.root, 'cores': 1, 'group_cores': cores, 'workers': 1,
                             'memory': GIB, 'workdir': cwd}
             input_path, replacements, original_command, command, placement = prepare_runtime(
                 cwd, spec, replacements, harness.uid, harness.gid)
@@ -194,14 +199,14 @@ def run_group(harness, stack, cores, repeat, round_index, output):
                         for key, value in spec.get('env', {}).items()})
             # Each process computes serially; all four processes share the same
             # four-core domain. OS/GC helper threads are still fully accounted.
-            env.update(BENCH_WORKERS='1', BENCH_CPU_WORKERS='1', GOMAXPROCS='1')
+            env.update(BENCH_WORKERS='1', BENCH_CPU_WORKERS='1', GOMAXPROCS='1', DOTNET_PROCESSOR_COUNT='1')
             stdout_path, stderr_path = child_dir / 'stdout.json', child_dir / 'stderr.log'
             observed_env = {key: value for key, value in env.items()
                             if ((key.startswith('BENCH_') or key.startswith('KU_')
-                                 or key.startswith('TOKIO_'))
+                                 or key.startswith(('TOKIO_', 'JAVA', 'DOTNET_')))
                                 and key not in ('BENCH_DB_URL', 'KU_SERVICE_CONTROL_TOKEN'))
                             or key in ('GOGC', 'GOMEMLIMIT', 'GODEBUG', 'GOMAXPROCS',
-                                       'NODE_OPTIONS', 'UV_THREADPOOL_SIZE')}
+                                       'NODE_OPTIONS', 'UV_THREADPOOL_SIZE', 'LD_LIBRARY_PATH')}
             entry = {'index': index, 'command': command,
                      'original_command': original_command, 'runtime_layout': placement,
                      'input_sha256': digest(input_path),
@@ -344,10 +349,10 @@ def run_group(harness, stack, cores, repeat, round_index, output):
     return result
 
 
-def summary(rows):
+def summary(rows, stacks=STACKS, core_points=(1,)):
     result = []
-    for cores in (1, 4):
-        for stack in STACKS:
+    for cores in core_points:
+        for stack in stacks:
             formal = [row for row in rows if row.get('identity', {}).get('cores') == cores
                       and row.get('identity', {}).get('stack') == stack
                       and row.get('identity', {}).get('repeat') == REPEAT]
@@ -375,22 +380,21 @@ def summary(rows):
     return result
 
 
-def run(harness, output=None):
+def run(harness, output=None, stacks=STACKS, core_points=(1,)):
     output = Path(output or harness.output / 'batch')
     output.mkdir(parents=True, exist_ok=True)
     if expected_checksum() != EXPECTED:
         raise RuntimeError('independent checksum oracle disagrees with frozen expected value')
     rows, stopped = [], {}
     report = {'schema': 1, 'kind': 'independent_process_cpu_not_HTTP',
-              'warmup': 'fresh processes are intentional; repeat0 is reported separately without subtraction; Node JIT work belongs to each fresh process',
-              'matrix': {'cores': [1, 4], 'stacks': list(STACKS), 'rounds': ROUNDS,
+              'warmup': 'fresh processes are intentional; repeat0 is a separate observation without subtraction; Java/.NET/Node JIT and normal GC work belongs to each fresh process; this table is not prewarmed JIT peak speed',
+              'matrix': {'cores': list(core_points), 'stacks': list(stacks), 'rounds': ROUNDS, 'order_seed': ORDER_SEED, 'order_by_round': interleaved_orders(stacks,ROUNDS,ORDER_SEED),
                          'iterations': ITERATIONS, 'seed': SEED, 'repeat': REPEAT,
-                         'memory_bytes_total_per_group': GIB, 'order': 'rotate stack order each round',
+                         'memory_bytes_total_per_group': GIB, 'order': 'frozen seeded random interleaving; same seven paired windows per stack',
                          'processes_per_group': 'equal to cores; all share one total resource domain'},
               'rows': rows, 'skipped': [], 'passed': False}
-    for cores in (1, 4):
-        for round_index in range(ROUNDS):
-            order = STACKS[round_index % len(STACKS):] + STACKS[:round_index % len(STACKS)]
+    for cores in core_points:
+        for round_index, order in enumerate(interleaved_orders(stacks,ROUNDS,ORDER_SEED)):
             for stack in order:
                 if stack in stopped:
                     report['skipped'].append({'stack': stack, 'cores': cores, 'round': round_index,
@@ -401,13 +405,13 @@ def run(harness, output=None):
                     row = run_group(harness, stack, cores, repeat, round_index, path)
                     row['report_path'] = str(path / 'batch.json')
                     rows.append(row)
-                    report['summaries'] = summary(rows)
+                    report['summaries'] = summary(rows,stacks,core_points)
                     write_json(output / 'summary.json', report)
                     if not row['passed']:
                         stopped[stack] = 'first invalid independent-process batch; preserve evidence and diagnose before more repeats'
                         break
-    report['summaries'] = summary(rows)
-    report['passed'] = len(rows) == 2 * ROUNDS * len(STACKS) * 2 and all(row['passed'] for row in rows)
+    report['summaries'] = summary(rows,stacks,core_points)
+    report['passed'] = len(rows) == len(core_points) * ROUNDS * len(stacks) * 2 and all(row['passed'] for row in rows)
     write_json(output / 'summary.json', report)
     return report
 
@@ -416,10 +420,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, help='directory containing manifest.json')
     parser.add_argument('--output', required=True)
+    parser.add_argument('--stacks', nargs='+', choices=STACKS, default=list(STACKS))
+    parser.add_argument('--cores', nargs='+', type=int, choices=(1,4), default=[1], help='single-core is the common seven-stack main table; four-core means four independent serial processes')
     args = parser.parse_args()
+    if len(set(args.stacks)) != len(args.stacks) or len(set(args.cores)) != len(args.cores):
+        parser.error('duplicate stacks/cores are not paired independent windows')
     harness = Harness(args.root, args.output)
     try:
-        result = run(harness)
+        result = run(harness,stacks=tuple(args.stacks),core_points=tuple(args.cores))
         print(json.dumps({'passed': result['passed'], 'summary': str(Path(args.output) / 'batch' / 'summary.json')}))
     finally:
         harness.close()

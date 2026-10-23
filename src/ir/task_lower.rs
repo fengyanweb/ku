@@ -468,7 +468,8 @@ struct FunctionLowerer<'a> {
     locals: Vec<HashMap<String, SlotId>>,
     // ROOT is None. Slots never change their lexical birth scope; Task moves
     // across these owners are deliberately outside this first scoped subset.
-    slot_owners: [Option<TaskScopeId>; 64],
+    slot_owners: Vec<Option<TaskScopeId>>,
+    stable_slots: Vec<bool>,
     scopes: Vec<TaskScopeId>,
     next_scope: usize,
     loops: Vec<LoopContext>,
@@ -556,7 +557,8 @@ impl<'a> FunctionLowerer<'a> {
                 result: signature.result.clone(),
             },
             locals: vec![HashMap::new()],
-            slot_owners: [None; 64],
+            slot_owners: Vec::new(),
+            stable_slots: Vec::new(),
             scopes: Vec::new(),
             next_scope: 0,
             loops: Vec::new(),
@@ -581,6 +583,7 @@ impl<'a> FunctionLowerer<'a> {
                 lowerer.budget.analysis(parameters.len(), parameter.span)?;
             }
             let slot = lowerer.slot(ty.clone())?;
+            lowerer.stable_slots[slot.0] = true;
             if lowerer.locals[0]
                 .insert(parameter.name.clone(), slot)
                 .is_some()
@@ -593,15 +596,16 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn slot(&mut self, ty: TaskSlotType) -> KuResult<SlotId> {
-        if self.function.slots.len() >= TaskLimits::default().max_slots {
+        if self.function.slots.len() >= task::MAX_SOURCE_LOGICAL_SLOTS {
             return Err(unsupported(
-                "more than 64 generated Task frame slots",
+                "more than 512 logical Task slots before physical frame allocation",
                 self.span,
             ));
         }
         let slot = SlotId(self.function.slots.len());
         self.budget.analysis(1, self.span)?;
-        self.slot_owners[slot.0] = self.scopes.last().copied();
+        self.slot_owners.push(self.scopes.last().copied());
+        self.stable_slots.push(false);
         self.function.slots.push(TaskSlot { ty });
         Ok(slot)
     }
@@ -2379,6 +2383,7 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
         let destination = self.copy_or_move(source)?;
+        self.stable_slots[destination.0] = true;
         self.locals
             .last_mut()
             .expect("ROOT scope exists")
@@ -3184,6 +3189,7 @@ impl<'a> FunctionLowerer<'a> {
         if let Some((name, source)) = binding {
             self.budget.text(name.len(), self.span)?;
             let destination = self.copy_or_move(source)?;
+            self.stable_slots[destination.0] = true;
             self.locals
                 .last_mut()
                 .expect("body scope exists")
@@ -3246,6 +3252,10 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
         }
+        let span = self.span;
+        task::compact_source_scalar_slots(&mut self.function, &self.stable_slots, &mut |units| {
+            self.budget.analysis(units, span)
+        })?;
         Ok(self.function)
     }
 }

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/metrics"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -81,6 +82,7 @@ func batch() error {
 
 type service struct {
 	db            *pgxpool.Pool
+	pgMode        pgMode
 	peer          string
 	cpu           chan cpuJob
 	waitingTimer  atomic.Int64
@@ -258,15 +260,14 @@ func (s *service) serve(w http.ResponseWriter, r *http.Request) {
 			text(w, 400, "invalid_database_key")
 			return
 		}
-		var row struct {
-			ID    int    `json:"id"`
-			Label string `json:"label"`
-			Score int    `json:"score"`
-			RID   string `json:"rid"`
-		}
+		var row pgResult
 		row.RID = rid
 		// Extended protocol parameters, no statement cache and no query retry.
-		err = s.db.QueryRow(ctx, "SELECT id,label,score FROM cross_stack_items WHERE id=$1", key).Scan(&row.ID, &row.Label, &row.Score)
+		if s.pgMode == pgResetEquivalent {
+			err = queryResetEquivalent(ctx, s.db, key, &row)
+		} else {
+			err = s.db.QueryRow(ctx, "SELECT id,label,score FROM cross_stack_items WHERE id=$1", key).Scan(&row.ID, &row.Label, &row.Score)
+		}
 		if err != nil {
 			text(w, 500, "database_query_error")
 			return
@@ -283,15 +284,32 @@ func (s *service) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Training-only explicit file; ordinary builds do not profile requests.
+	// No HTTP profiling route, implicit default.pgo or production endpoint.
+	if name := os.Getenv("BENCH_CPU_PROFILE"); name != "" {
+		file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			log.Fatal("cannot create explicit benchmark CPU profile")
+		}
+		if err := pprof.StartCPUProfile(file); err != nil {
+			_ = file.Close()
+			log.Fatal("cannot start explicit benchmark CPU profile")
+		}
+		defer func() { pprof.StopCPUProfile(); _ = file.Close() }()
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--batch" {
 		if err := batch(); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
+	mode, err := parsePGMode(os.Getenv("BENCH_PG_MODE"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	workers := envInt("BENCH_WORKERS", 1)
 	runtime.GOMAXPROCS(workers)
-	s := &service{peer: net.JoinHostPort("127.0.0.1", strconv.Itoa(envInt("BENCH_PEER_PORT", 19091))), cpu: make(chan cpuJob, 128)}
+	s := &service{pgMode: mode, peer: net.JoinHostPort("127.0.0.1", strconv.Itoa(envInt("BENCH_PEER_PORT", 19091))), cpu: make(chan cpuJob, 128)}
 	for range envInt("BENCH_CPU_WORKERS", workers) {
 		go s.cpuWorker()
 	}

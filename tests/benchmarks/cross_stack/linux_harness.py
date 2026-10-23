@@ -16,6 +16,7 @@ import json
 import math
 import os
 import resource
+import random
 from pathlib import Path
 import secrets
 import signal
@@ -111,7 +112,7 @@ def quiet_metrics(stack, value):
     if stack != 'ku':
         if not zero(value,('active','waiting_timer','waiting_tcp','actual_cpu_jobs')):
             return False
-        return all(type(value[k]) is int and value[k]==0 for k in ('waiting_cpu','waiting_db') if k in value)
+        return all(type(value[k]) is int and value[k]==0 for k in ('waiting_cpu','waiting_db','database_pending') if k in value)
     for key, fields in (('loops',('queued','running','resident','pending','connections')),
                         ('tasks',('ready','waiting','running','resident','timers'))):
         rows=value.get(key)
@@ -137,22 +138,128 @@ def guest_memory():
             result[key+'_bytes']=int(value.strip().split()[0])*1024
     return result
 
-def aggregate_rounds(reports, workload):
-    bins, keys, overflow = {}, 0, False
+def histogram_bucket(n):
+    """Same bounded representation as V5 Go driver, integer upper edge in ns."""
+    q=max(0,n)//10000
+    if q<256:
+        return (q+1)*10000
+    shift=q.bit_length()-8
+    return min((q//(1<<shift)+1)*(1<<shift)*10000,(1<<63)-1)
+
+def paired_interval(numerators, denominators, seed=20261023, resamples=20000, minimum=7):
+    """Resample entire paired windows, never individual requests.
+
+    The estimand is exp(mean(log(per-window ratio))). The percentile bootstrap
+    is descriptive at n=7; its assumptions and all window ratios remain visible.
+    """
+    if len(numerators)!=len(denominators):
+        raise ValueError('paired windows differ in count')
+    pairs=list(zip(numerators,denominators))
+    if any(type(v) not in (int,float) or not math.isfinite(v) or v<=0 for p in pairs for v in p):
+        return {'status':'unavailable_nonpositive_or_missing_window','pairs':pairs}
+    ratios=[a/b for a,b in pairs]
+    if len(pairs)<minimum:
+        return {'status':'insufficient_paired_windows','minimum':minimum,'ratios':ratios}
+    logs=[math.log(v) for v in ratios]
+    rng=random.Random(seed)
+    values=sorted(math.exp(statistics.mean(rng.choices(logs,k=len(logs)))) for _ in range(resamples))
+    return {'status':'estimated','unit':'paired interleaved window','pairs':pairs,'ratios':ratios,
+            'estimate':math.exp(statistics.mean(logs)),
+            'lower95':values[math.floor(.025*(resamples-1))],
+            'upper95':values[math.ceil(.975*(resamples-1))],
+            'seed':seed,'resamples':resamples,'method':'paired-window percentile bootstrap of geometric mean ratio',
+            'assumption':'windows approximate independent stationary replicates; serial dependence or common drift can invalidate coverage'}
+
+def interleaved_orders(stacks, repeats=7, seed=20261023):
+    rng=random.Random(seed)
+    result=[]
+    for _ in range(repeats):
+        order=list(stacks)
+        rng.shuffle(order)
+        result.append(order)
+    return result
+
+def paired_capacity_goodput(summaries, state, references=('go','rust'), seed=20261023):
+    """Compare each stack's qualified own point, never common-rate goodput."""
+    result={}
+    own=summaries.get('own_capacity',{})
+    for reference in references:
+        if 'ku' not in own or reference not in own:
+            continue
+        selected=('ku',reference)
+        ku_windows=own['ku'].get('round_goodput_rps',[])
+        reference_windows=own[reference].get('round_goodput_rps',[])
+        interval=(paired_interval(ku_windows,reference_windows,seed) if len(ku_windows)==len(reference_windows)
+                  else {'status':'unavailable_unpaired_windows','ku_windows':len(ku_windows),
+                        'reference_windows':len(reference_windows),'minimum':7})
+        qualified=all(own[s].get('qualified') is True for s in selected) and interval['status']=='estimated'
+        bounds={}
+        for stack in selected:
+            capacity=state.get('capacity',{}).get(stack,{})
+            point=capacity.get('upper_bound_point') or {}
+            reasons=point.get('qualification',{}).get('reasons',[])
+            credible=(capacity.get('upper_bound_censored') is False and
+                      point.get('gate_kind')=='service_or_slo_failure' and
+                      not any(r in ('http_500','wrong_body','service_exited') for r in reasons))
+            bounds[stack]={'qualified_rate':capacity.get('candidate_rate'),
+                           'upper_rate':point.get('rate'), 'credible_upper_boundary':credible,
+                           'upper_bound_kind':capacity.get('upper_bound_kind'),
+                           'upper_point':point}
+        credible=all(v['credible_upper_boundary'] for v in bounds.values())
+        result[reference]={'goodput_rps_ratio':interval,
+            'eligible_for_operating_point_comparison':qualified,
+            'eligible_for_capacity_target_claim':qualified and credible,
+            'throughput_target_lower95_minimum':1.0,
+            'throughput_target_passed':qualified and credible and interval.get('lower95',0)>=1.0,
+            'capacity_brackets':bounds,
+            'scope':'Ku/reference goodput at separate seven-round qualified own offered-rate points under identical SLOs; upper exploration boundaries and censoring retained. Not the common equal-arrival goodput ratio, nor an exact continuous maximum capacity.',
+            'status':'qualified_operating_points_with_observed_upper_boundaries' if qualified and credible else
+                ('qualified_operating_points_capacity_upper_censored' if qualified else 'own_points_not_formally_qualified')}
+    return result
+
+def benchmark_limits(env):
+    mapping={'max_active_requests':('BENCH_MAX_ACTIVE',1024),
+             'max_connections':('BENCH_MAX_CONNECTIONS',4096),
+             'max_pending_requests':('BENCH_MAX_PENDING',128)}
+    values={name:int(env.get(key,default)) for name,(key,default) in mapping.items()}
+    if any(value<=0 for value in values.values()):
+        raise ValueError('benchmark admission limits must be positive integers')
+    return values
+
+def declared_case_stacks(stacks, cores, memory, workload):
+    return tuple(s for s in stacks if s in STACKS or s=='control' or
+                 cores==4 and workload in ('ok','json_object','mixed') and
+                 (memory==GIB or memory==256*MIB and workload in ('json_object','mixed')))
+
+def sustained_case(args):
+    if not args.case:
+        return (4,GIB,'mixed')
+    for case in cases(args):
+        if args.case==f'c{case[0]}-m{case[1]}-{case[2]}' and case[0]==4 and case[2]=='mixed':
+            return case
+    raise ValueError('sustained --case must be a declared four-core mixed case (1GiB or256MiB)')
+
+def aggregate_rounds(reports, workload, minimum_core_samples=1000, minimum_rounds=7):
+    bins, overflow = {}, False
+    # Only merge one target point and one frozen driver/protocol/service build.
+    signatures=[(r.get('schema'),json.dumps({k:r.get('configuration',{}).get(k) for k in
+        ('protocol_sha256','corpora_sha256','workload','duration_seconds','rate','concurrency','timeout_seconds','keepalive_idle_ms')},sort_keys=True),
+        json.dumps(r.get('measurement_identity',{}).get('service'),sort_keys=True)) for r in reports]
+    if signatures and any(v!=signatures[0] for v in signatures):
+        raise ValueError('cannot merge different driver, protocol, load or service identity')
     for report in reports:
+        counts={}
         with gzip.open(report['events']['path'], 'rt', newline='') as source:
             for row in csv.DictReader(source):
                 if row['terminal'] != 'correct':
                     continue
-                bucket = max(0,int(row['completed_ns'])-int(row['scheduled_ns']))//10000
+                upper=histogram_bucket(int(row['completed_ns'])-int(row['scheduled_ns']))
                 kind = row['type']
                 current = bins.setdefault(kind,{})
-                if bucket not in current:
-                    if keys >= 1000000:
-                        overflow = True
-                        continue
-                    keys += 1
-                current[bucket] = current.get(bucket,0)+1
+                current[upper] = current.get(upper,0)+1
+                counts[kind]=counts.get(kind,0)+1
+        if sum(counts.values())!=report['ledger'].get('correct_total'):
+            raise ValueError('raw correct event count differs from terminal ledger')
     pooled = {}
     for kind,current in bins.items():
         count = sum(current.values())
@@ -161,27 +268,80 @@ def aggregate_rounds(reports, workload):
             value = None
             if count >= minimum:
                 rank,acc = math.ceil(count*fraction),0
-                for bucket,n in sorted(current.items()):
+                for upper,n in sorted(current.items()):
                     acc += n
                     if acc >= rank:
-                        value=(bucket+1)/100
+                        value=upper/1e6
                         break
             quantiles[name]=value
-        pooled[kind]={'correct_samples':count,'resolution_us':10,**quantiles}
+        pooled[kind]={'correct_samples':count,'representation':'v5-fixed-log128',**quantiles}
     limits={'ok':100,'json_object':100,'json_array':100,'json_escape':100,'cpu':1000,'db':250,'timer':100}
     required=('json_object','db','timer','cpu') if workload=='mixed' else (workload,)
-    tails_sufficient=all(pooled.get(k,{}).get('p99_ms') is not None for k in required)
+    tails_sufficient=all(pooled.get(k,{}).get('correct_samples',0)>=minimum_core_samples for k in required)
     pooled_pass=tails_sufficient and all(pooled[k]['p99_ms']<=limits[k] for k in required)
-    eligible=all(qualification(r,workload)['eligible_for_formal_candidate'] for r in reports)
+    eligible=bool(reports) and all(qualification(r,workload)['eligible_for_formal_candidate'] for r in reports)
+    rounds_sufficient=len(reports)>=minimum_rounds
+    physical_complete=all(r.get('service_cost',{}).get('full_lifecycle',{}).get('available') is True and r['service_cost']['full_lifecycle'].get('natural_reclamation_passed') is True for r in reports)
+    qualified=eligible and pooled_pass and rounds_sufficient and physical_complete and not overflow
     return {'pooled_correct_scheduled_to_complete':pooled,'pooled_tail_sufficient':tails_sufficient,
-            'all_per_round_eligible':eligible,'histogram_overflow':overflow,
-            'qualified':eligible and pooled_pass and not overflow,
-            'status':'qualified' if eligible and pooled_pass and not overflow else ('indeterminate_tail_sample_size' if eligible and not tails_sufficient else 'failed'),
+            'core_p99_minimum_samples_per_type':minimum_core_samples,'minimum_paired_rounds':minimum_rounds,
+            'rounds_sufficient':rounds_sufficient,'all_physical_reclamation_passed':physical_complete,'all_per_round_eligible':eligible,'histogram_overflow':overflow,
+            'qualified':qualified,
+            'status':'qualified' if qualified else ('indeterminate_tail_sample_size' if eligible and not tails_sufficient else
+                ('insufficient_paired_windows' if eligible and not rounds_sufficient else ('physical_reclamation_failed_or_unmeasured' if eligible and not physical_complete else 'failed'))),
             'round_goodput_rps':[r['ledger']['goodput_rps'] for r in reports],
-            'median_goodput_rps':statistics.median(r['ledger']['goodput_rps'] for r in reports),
+            'median_goodput_rps':statistics.median(r['ledger']['goodput_rps'] for r in reports) if reports else None,
             'round_failure_fraction_planned':[r['ledger']['failure_fraction_planned'] for r in reports],
             'round_service_cpu_seconds_per_correct':[r['service_cost']['cpu_seconds_per_correct'] for r in reports],
-            'per_round_p99_note':'each round retained separately; pooled quantiles recomputed from all raw events, never average p99'}
+            'per_round_p99_note':'below100 use conservative observed max; core pooled claim requires1000; never average p99'}
+
+def error_reason_delta(before, after):
+    left=before.get('errors',{}).get('counts') if isinstance(before,dict) else None
+    right=after.get('errors',{}).get('counts') if isinstance(after,dict) else None
+    if not isinstance(left,dict) or not isinstance(right,dict):
+        return {'available':False,'reason':'protected internal error counters unavailable for this stack'}
+    if set(left)!=set(right) or any(type(v) is not int or type(left.get(k)) is not int or v<left[k] for k,v in right.items()):
+        return {'available':False,'reason':'counter reset or invalid protected metrics'}
+    return {'available':True,'counts':{k:v-left.get(k,0) for k,v in right.items()},
+            'scope':'protected management metric deltas; external HTTP status is retained separately'}
+
+def full_lifecycle_cost(report, physical_end, quiet, termination, final_metrics):
+    cost=report['service_cost']
+    before,driver_end=cost['before'],cost['after']
+    begin_cpu=before['cpu_stat'].get('usage_usec',0)
+    end_cpu=physical_end['cpu_stat'].get('usage_usec',0)
+    total=max(0,end_cpu-begin_cpu)/1e6
+    tail=max(0,end_cpu-driver_end['cpu_stat'].get('usage_usec',0))/1e6
+    correct=report['ledger']['correct_total']
+    return {'available':quiet or bool(termination and physical_end.get('process_count')==0 and termination.get('cgroup_removed')),'cpu_seconds':total,'cpu_seconds_per_correct':total/correct if correct else None,
+        'post_driver_cpu_seconds':tail,'physical_end':physical_end,'final_metrics':final_metrics,
+        'physically_quiet_before_freeze':quiet,'forced_termination':bool(termination and termination.get('forced')),
+        'termination':termination,'natural_reclamation_passed':quiet and not bool(termination and termination.get('forced')),
+        'scope':'whole service domain from driver launch until observable physical quiescence or completed forced termination; includes expensive failed generations',
+        'internal_error_reason_delta':error_reason_delta(cost.get('runtime_before',{}),final_metrics),
+        'useless_work_cpu_seconds':None,'useless_work_note':'not inferable from cgroup total: needs per-request undeliverable/cancellable responsibility; post-driver CPU is not automatically useless work'}
+
+def throttle_delta(before, after):
+    keys=('nr_periods','nr_throttled','throttled_usec','usage_usec')
+    return {key:max(0,after.get('cpu_stat',{}).get(key,0)-before.get('cpu_stat',{}).get(key,0)) for key in keys}
+
+def overload_boundary(report, workload):
+    """Only an actual observable service boundary, with valid generation."""
+    gate=qualification(report,workload)
+    censored=any(reason in gate['reasons'] for reason in ('invalid_driver_or_not_started','unreconciled_plan','driver_cpu_saturated','resource_endpoints_missing','resource_observation_invalid','measurement_monotonic_clock_unavailable','measurement_monotonic_clock_uncertain'))
+    results=report['ledger'].get('results',{})
+    evidence=[]
+    if results.get('rejected_503',0) or results.get('rejected_429',0):
+        evidence.append('explicit_service_rejection')
+    if any('_p99_over_slo' in reason for reason in gate['reasons']):
+        evidence.append('observed_tail_slo_exceeded')
+    if any(reason in gate['reasons'] for reason in ('oom','oom_kill')):
+        evidence.append('service_memory_limit')
+    fault=any(reason in gate['reasons'] for reason in ('http_500','wrong_body','service_exited'))
+    return {'status':'measurement_invalid_censored' if censored else ('service_fault_without_capacity_attribution' if fault else ('boundary_observed' if evidence else 'pressure_below_observed_boundary')),
+            'boundary_observed':bool(evidence) and not censored and not fault,'evidence':evidence,'qualification':gate,
+            'http_500_count':report['ledger'].get('http_500_total',report['ledger'].get('transport_counts',{}).get('status:500',0)),
+            'note':'unknown500 is a defect observation, never expected503; no claim of true overload without boundary evidence'}
 
 class Domain:
     def __init__(self, harness, label, cores, memory, cpus):
@@ -214,11 +374,31 @@ class Domain:
             pids = []
         result.update(process_count=len(pids), threads=0, fd=0, sum_rss_bytes=0,
                       sum_pss_bytes=0, rss_scope='sum of process RSS; shared pages may repeat',
-                      pss_scope='sum of process proportional resident pages')
+                      pss_scope='sum of process proportional resident pages',
+                      voluntary_context_switches_live_threads=0,nonvoluntary_context_switches_live_threads=0,
+                      migrations_live_threads=0,last_cpu_thread_counts={},scheduler_threads_observed=0,
+                      scheduler_scope='live-thread cumulative counters; terminated threads disappear, never treat a negative delta as zero-cost')
         for pid in pids:
             proc = Path('/proc') / str(pid)
             try:
-                result['threads'] += len(list((proc / 'task').iterdir()))
+                tasks=list((proc / 'task').iterdir())
+                result['threads'] += len(tasks)
+                for task in tasks[:4096]:
+                    try:
+                        status_thread=(task/'status').read_text()
+                        for line in status_thread.splitlines():
+                            if line.startswith('voluntary_ctxt_switches:'):
+                                result['voluntary_context_switches_live_threads']+=int(line.split()[1])
+                            elif line.startswith('nonvoluntary_ctxt_switches:'):
+                                result['nonvoluntary_context_switches_live_threads']+=int(line.split()[1])
+                        for line in (task/'sched').read_text().splitlines():
+                            if line.lstrip().startswith('se.nr_migrations'):
+                                result['migrations_live_threads']+=int(line.rsplit(':',1)[1])
+                        cpu=(task/'stat').read_text().rsplit(')',1)[1].split()[36]
+                        result['last_cpu_thread_counts'][cpu]=result['last_cpu_thread_counts'].get(cpu,0)+1
+                        result['scheduler_threads_observed']+=1
+                    except (OSError,ValueError,IndexError):
+                        pass
                 result['fd'] += len(list((proc / 'fd').iterdir()))
                 status = (proc / 'status').read_text()
                 for line in status.splitlines():
@@ -374,6 +554,9 @@ class Service:
         if remaining:
             forced = True
             self.domain.kill()
+            deadline=time.monotonic()+3
+            while time.monotonic()<deadline and (self.domain.path/'cgroup.procs').read_text().strip():
+                time.sleep(.01)
         after = self.domain.snapshot()
         removed = self.domain.remove()
         runtime_cleanup=[]
@@ -417,7 +600,8 @@ class Harness:
         self.db_domain = ExternalDomain(self.manifest['db_cgroup']) if self.manifest.get('db_cgroup') else None
         self.protocol = Path(self.manifest.get('protocol', Path(__file__).with_name('protocol.json')))
         self.identity={'manifest_sha256':hashlib.sha256((self.root/'manifest.json').read_bytes()).hexdigest(),
-                       'protocol_sha256':hashlib.sha256(self.protocol.read_bytes()).hexdigest()}
+                       'protocol_sha256':hashlib.sha256(self.protocol.read_bytes()).hexdigest(),
+                       'harness_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         identity_path=self.output/'identity.json'
         if identity_path.exists() and read_json(identity_path)!=self.identity:
             raise RuntimeError('candidate/driver/config identity changed; preserve prior output and use a new root')
@@ -489,25 +673,27 @@ class Harness:
         if stack == 'ku':
             env.update(KU_SERVICE_PROBE_ADDR=management, KU_SERVICE_CONTROL_TOKEN=token)
         config = config_directory / 'config.json'
+        admission=benchmark_limits(env)
         config.write_text(json.dumps({'addr': address, 'db_url': env.get('BENCH_DB_URL', ''),
-                                      'workers': cores, 'metrics_file': str(cwd / 'metrics.json')}))
+                                      'workers': cores, 'metrics_file': str(cwd / 'metrics.json'),**admission}))
         config.chmod(0o600)
         os.chown(config, self.uid, self.gid)
         domain = Domain(self, 'service-' + stack, cores, memory, '0' if cores == 1 else f'0-{cores-1}')
         startup = {'stack': stack, 'cores': cores, 'memory': memory, 'command': command,
                    'cgroup': str(domain.path), 'limits': domain.settings, 'address': address,
                    'environment': {k: v for k, v in env.items()
-                                   if (k.startswith(('BENCH_', 'KU_')) or
-                                       k in ('GOMAXPROCS','GOGC','GOMEMLIMIT','GODEBUG','NODE_OPTIONS','UV_THREADPOOL_SIZE'))
+                                   if (k.startswith(('BENCH_', 'KU_', 'JAVA', 'DOTNET_')) or
+                                       k in ('GOMAXPROCS','GOGC','GOMEMLIMIT','GODEBUG','NODE_OPTIONS','UV_THREADPOOL_SIZE','LD_LIBRARY_PATH'))
                                    and k not in ('BENCH_DB_URL','KU_SERVICE_CONTROL_TOKEN')},
                    'db_url_sha256': hashlib.sha256(env.get('BENCH_DB_URL', '').encode()).hexdigest(),
                    'started_wall_time_ns': time.time_ns(), 'reuse': 'same instance within case; frozen outside its turn'}
         startup['source_command']=source_command
+        startup['configured_admission_limits']=admission
         if runtime_layout:
             startup['runtime_layout']=runtime_layout
         startup['identity']={'stack':stack,'cores':cores,'memory':memory,
                              'command':[x.replace(address,'<address>').replace(str(cwd),'<workdir>') for x in command],
-                             'environment':{k:('<address>' if k=='BENCH_ADDR' else v) for k,v in startup['environment'].items()},
+                             'environment':{k:v.replace(address,'<address>').replace(management,'<management>').replace(str(cwd),'<workdir>') for k,v in startup['environment'].items()},
                              'db_url_sha256':startup['db_url_sha256'],**self.identity}
         process = self.launch(command, cwd, env, domain, output / 'service.log')
         service = Service(self, stack, address, domain, cwd, process, startup, management, token)
@@ -531,12 +717,13 @@ class Harness:
         except BaseException:
             service.stop()
             raise
-    def client(self, service, workload, rate, duration, output, concurrency=256, timeout=3, events=True, runtime_metrics=False):
+    def client(self, service, workload, rate, duration, output, concurrency=256, timeout=3, events=True, runtime_metrics=False, idle_ms=500):
         output = Path(output)
         output.mkdir(parents=True, exist_ok=True)
         report = output / 'client.json'
         measurement_identity={'service':service.startup['identity'],'workload':workload,'rate':rate,
-                              'duration':duration,'concurrency':concurrency,'timeout':timeout,'events':events}
+                              'duration':duration,'concurrency':concurrency,'timeout':timeout,'events':events,
+                              'protocol_sha256':self.identity['protocol_sha256'],'driver_manifest_sha256':self.identity['manifest_sha256'],'harness_revision':5,'keepalive_idle_ms':idle_ms}
         if report.exists():
             previous = read_json(report)
             if 'service_cost' in previous:
@@ -554,7 +741,7 @@ class Harness:
         command = [template(x, replacements) for x in spec['command']]
         command += ['--address', service.address, '--workload', workload, '--protocol', str(self.protocol),
                     '--duration', str(duration), '--rate', str(rate), '--concurrency', str(concurrency),
-                    '--queue', '65536', '--timeout', str(timeout), '--output', str(report)]
+                    '--queue', '65536', '--timeout', str(timeout), '--keepalive-idle-ms',str(idle_ms),'--output', str(report)]
         if events:
             command += ['--events', str(output / 'events.csv.gz')]
         env = os.environ.copy()
@@ -578,6 +765,10 @@ class Harness:
             runtime_thread.start()
         observer_before = resource.getrusage(resource.RUSAGE_SELF)
         before = service.domain.snapshot()
+        try:
+            runtime_before=service.metrics()
+        except Exception as error:
+            runtime_before={'observation_error':repr(error)}
         process = self.launch(command, Path(spec.get('cwd', self.root)), env, domain, output / 'client.log')
         try:
             code = process.wait(timeout=duration + timeout + 15)
@@ -601,10 +792,10 @@ class Harness:
         observer_after = resource.getrusage(resource.RUSAGE_SELF)
         cpu = max(0, after['cpu_stat'].get('usage_usec', 0) - before['cpu_stat'].get('usage_usec', 0)) / 1e6
         correct = result['ledger']['correct_total']
-        result['service_cost'] = {'lifetime_cpu_seconds': cpu, 'cpu_seconds_per_correct': cpu / correct if correct else None,
+        result['service_cost'] = {'lifetime_cpu_seconds': cpu, 'driver_lifetime_cpu_seconds':cpu, 'complete_lifecycle_accounted':False, 'cpu_seconds_per_correct': cpu / correct if correct else None,
                                   'correct_per_cpu_second': correct / cpu if cpu else None,
-                                  'scope': 'entire service cgroup over driver lifetime, including rejection and completion tail',
-                                  'before': before, 'after': after, 'samples_path': str(output / 'resources.json'),
+                                  'scope': 'entire service cgroup over driver lifetime only; post-driver work is separate full_lifecycle cost',
+                                  'runtime_before':runtime_before, 'throttling':throttle_delta(before,after), 'before': before, 'after': after, 'samples_path': str(output / 'resources.json'),
                                   'arrival_window_interpolation': 'see 1Hz samples and client origin; do not claim exact subsecond accounting',
                                   'driver_after': driver_after, 'driver_cgroup_removed': removed,
                                   'sampler_overflow': sampler.overflow, 'sampler_error': sampler.error,
@@ -635,6 +826,19 @@ class Harness:
         else:
             estimate={'available':False,'reason':clock['reason']}
         result['service_cost']['arrival_window_cpu_estimate']=estimate
+        rows=[d for sample in samples for d in sample['domains'] if d['label']==service.domain.label
+              and clock['available'] and start<=d['monotonic_ns']<=start+int(duration*1e9)]
+        result['service_cost']['arrival_window_memory']={
+            'steady_median_bytes':statistics.median(d['memory_current'] for d in rows[len(rows)//5:len(rows)*4//5]) if len(rows)>=5 else None,
+            'observed_peak_bytes':max((d['memory_current'] for d in rows),default=None),
+            'sample_count':len(rows),'scope':'whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater'}
+        per_interval=[]
+        for label in [d.label for d in domains]:
+            observations=[d for sample in samples for d in sample['domains'] if d['label']==label]
+            deltas=[throttle_delta(a,b) for a,b in zip(observations,observations[1:])]
+            per_interval.append({'label':label,'total':throttle_delta(observations[0],observations[-1]) if observations else None,
+                'maximum_interval_throttled_usec':max((d['throttled_usec'] for d in deltas),default=None)})
+        result['service_cost']['all_domain_throttling']=per_interval
         write_json(report, result)
         return result
     def close(self):
@@ -660,6 +864,8 @@ def qualification(result, workload):
         reasons.append('unreconciled_plan')
     if ledger.get('failure_fraction_planned') is None or ledger['failure_fraction_planned'] > .001:
         reasons.append('correct_fraction_below_99.9_percent')
+    if ledger.get('http_500_total',ledger.get('transport_counts',{}).get('status:500',0)):
+        reasons.append('http_500')
     if ledger.get('results', {}).get('body_error', 0):
         reasons.append('wrong_body')
     if result.get('service_cost', {}).get('service_exited'):
@@ -700,27 +906,27 @@ def qualification(result, workload):
     return {'eligible_for_formal_candidate': not reasons, 'qualified': not reasons and not tail_insufficient,
             'tail_insufficient': tail_insufficient, 'reasons': reasons}
 
-def derive_verified_rates(state, summaries):
-    """Only five-round formal gates may select subsequent load rates."""
+def derive_verified_rates(state, summaries, stacks=STACKS):
+    """Only seven-round formal gates may select subsequent load rates."""
     verified={}
-    for stack in STACKS:
+    for stack in stacks:
         own=summaries.get('own_capacity',{}).get(stack,{})
         common=summaries.get('common',{}).get(stack,{})
         candidate=state.get('capacity',{}).get(stack,{}).get('candidate_rate',0)
         common_rate=state.get('common_rate')
         rate,basis=None,None
         if own.get('qualified') is True and candidate>0:
-            rate,basis=candidate,'five_round_own_capacity'
+            rate,basis=candidate,'seven_round_own_capacity'
         elif common.get('qualified') is True and common_rate is not None and common_rate>0:
-            rate,basis=common_rate,'five_round_common_point_fallback'
+            rate,basis=common_rate,'seven_round_common_point_fallback'
         verified[stack]={'verified_rate':rate,'basis':basis,
                          'own_formal_status':own.get('status','not_executed'),
                          'common_formal_status':common.get('status','not_executed')}
-    included=[s for s in STACKS if verified[s]['verified_rate'] is not None]
+    included=[s for s in stacks if verified[s]['verified_rate'] is not None]
     minimum=min(verified[s]['verified_rate'] for s in included) if included else None
     sustained=math.floor(.6*minimum) if minimum is not None else None
-    return {'verified_capacity':verified,'verified_rates':{s:verified[s]['verified_rate'] for s in STACKS},
-            'verified_partial_stacks':included,'unverified_stacks':[s for s in STACKS if s not in included],
+    return {'verified_capacity':verified,'verified_rates':{s:verified[s]['verified_rate'] for s in stacks},
+            'verified_partial_stacks':included,'unverified_stacks':[s for s in stacks if s not in included],
             'derived_minimum_verified_rate':minimum,
             'derived_sustained_rate':sustained if sustained is not None and sustained>0 else None,
             'derived_common_absolute_overload_rate':5*minimum if minimum is not None else None,
@@ -801,6 +1007,9 @@ def recovery_probe_views(rows, probe_origin, starts, uncertainty_ns=0):
 class Case:
     def __init__(self, harness, cores, memory, workload, args):
         self.h, self.cores, self.memory, self.workload, self.args = harness, cores, memory, workload, args
+        self.stacks=declared_case_stacks(getattr(args,'stacks',STACKS),cores,memory,workload)
+        if not self.stacks:
+            raise RuntimeError('no selected stack belongs to this declared case matrix')
         self.path = harness.output / f'c{cores}-m{memory}-{workload}'
         self.path.mkdir(parents=True, exist_ok=True)
         self.instances = {}
@@ -812,7 +1021,7 @@ class Case:
         self.state['mode'] = self.mode
         write_json(self.state_path, self.state)
     def apply_verified(self, summaries):
-        derived=derive_verified_rates(self.state,summaries)
+        derived=derive_verified_rates(self.state,summaries,self.stacks)
         self.state.update(derived)
         self.state['verified_summary_sha256']=hashlib.sha256((self.path/'formal-summary.json').read_bytes()).hexdigest()
         self.save()
@@ -865,37 +1074,69 @@ class Case:
             self.check_memory()
             warm_rate = 10 if self.workload == 'cpu' else 100
             self.h.client(service, self.workload, warm_rate, self.args.warmup,
-                          self.path / 'warmups' / f'{stack}-{generation:03d}', events=False)
+                          self.path / 'warmups' / f'{stack}-{generation:03d}', events=False,idle_ms=self.args.keepalive_idle_ms)
         service = self.instances[stack]
         if service.domain.frozen:
             service.freeze(False)
         return service
-    def idle(self, stack):
+    def idle(self, stack, report_path=None):
         service = self.instances.get(stack)
         if service and not service.stopped:
             # Each client closed all its connections; snapshot the remaining
             # runtime bookkeeping before freeze without inventing equivalent
             # native metrics layouts.
-            deadline = time.monotonic() + 5
-            value = None
+            settle_start=time.monotonic()
+            deadline=settle_start+self.args.physical_settle_seconds
+            value=None
+            settle_samples=[]
+            fixture_sample=None
+            last_sample=settle_start-1
             while time.monotonic() < deadline:
                 try:
                     value = service.metrics()
                 except Exception as error:
                     value = {'observation_error': repr(error)}
                     break
+                now=time.monotonic()
+                if now-last_sample>=.5 and len(settle_samples)<128:
+                    settle_samples.append({'seconds_after_driver':now-settle_start,'resources':service.domain.snapshot(),'metrics':value})
+                    last_sample=now
+                if now-settle_start>=5 and fixture_sample is None:
+                    fixture_sample={'seconds_after_driver':now-settle_start,'resources':service.domain.snapshot(),'metrics':value}
                 if quiet_metrics(stack, value):
                     break
                 time.sleep(.05)
             self.state['history'].append({'event': 'before_freeze', 'stack': stack,
                                           'wall_time_ns': time.time_ns(), 'metrics': value})
+            settle={'fixture5s_passed':time.monotonic()-settle_start<=5 and quiet_metrics(stack,value),
+                    'observation_allowance_seconds_after_driver':self.args.physical_settle_seconds,
+                    'actual_observation_seconds':time.monotonic()-settle_start,
+                    'fixture5s_sample':fixture_sample,'samples':settle_samples,'sample_limit':128,
+                    'contract':'5s is fixture quiescence gate only; additional bounded observation does not change runtime request30s/handler45s deadlines, DB lease or refund responsibility',
+                    'runtime_deadline_environment':{k:v for k,v in service.startup.get('environment',{}).items() if 'TIMEOUT' in k or 'DEADLINE' in k}}
+
             if 'observation_error' in value or not quiet_metrics(stack,value):
-                service.stop()
+                termination=service.stop()
+                if report_path and Path(report_path).exists():
+                    report=read_json(report_path)
+                    report['service_cost']['full_lifecycle']=full_lifecycle_cost(report,termination['after'],False,termination,value)
+                    report['service_cost']['full_lifecycle']['settle_observation']=settle
+                    report['service_cost']['complete_lifecycle_accounted']=True
+                    write_json(report_path,report)
                 self.save()
-                raise RuntimeError(f'{stack} did not reach observable quiescence before freeze; see case history')
+                raise RuntimeError(f'{stack} did not reach physical quiescence within unchanged-runtime observation allowance; see retained lifecycle cost')
+            end=service.domain.snapshot()
+            termination=None
             if self.mode == 'restart_each_formal_turn':
-                service.stop()
-            else:
+                termination=service.stop()
+                end=termination['after']
+            if report_path and Path(report_path).exists():
+                report=read_json(report_path)
+                report['service_cost']['full_lifecycle']=full_lifecycle_cost(report,end,True,termination,value)
+                report['service_cost']['full_lifecycle']['settle_observation']=settle
+                report['service_cost']['complete_lifecycle_accounted']=True
+                write_json(report_path,report)
+            if self.mode != 'restart_each_formal_turn':
                 service.freeze(True)
             self.save()
             self.check_memory()
@@ -905,26 +1146,28 @@ class Case:
         if report.exists() and 'service_cost' in read_json(report):
             previous=read_json(report)
             configuration=previous.get('configuration',{})
+            if previous.get('schema')!='ku-cross-stack-client-v5' or previous.get('measurement_identity',{}).get('harness_revision')!=5:
+                raise RuntimeError('completed window belongs to another driver/harness version; preserve it and choose new results root')
             if configuration.get('workload')!=self.workload or configuration.get('rate')!=rate or configuration.get('duration_seconds')!=duration:
                 raise RuntimeError(f'completed window load differs from current frozen formal basis: {report}')
             return previous
         service = self.activate(stack)
         if prime:
             self.h.client(service, self.workload, max(1, min(rate, 100)), self.args.prime,
-                          directory / 'prime', events=False)
+                          directory / 'prime', events=False,idle_ms=self.args.keepalive_idle_ms)
         print(json.dumps({'event': 'window', 'case': self.path.name, 'stack': stack,
                           'name': name, 'rate': rate, 'seconds': duration}), flush=True)
         try:
             result = self.h.client(service, self.workload, rate, duration, directory, events=events,
-                                   runtime_metrics=name == 'sustained')
+                                   runtime_metrics=name == 'sustained',idle_ms=self.args.keepalive_idle_ms)
             result['qualification'] = qualification(result, self.workload)
             write_json(report, result)
             return result
         finally:
             if idle_after:
-                self.idle(stack)
+                self.idle(stack,report)
     def explore(self):
-        for stack in STACKS:
+        for stack in self.stacks:
             if stack in self.state['capacity']:
                 continue
             start = 4 if self.workload == 'cpu' else 16
@@ -969,14 +1212,14 @@ class Case:
                         high_history.append(high_record)
             self.state['capacity'][stack] = {'candidate_rate': low, 'next_failed_or_invalid_rate': high,
                                              'observations': observations, 'refinements': refinements,
-                                             'claim': 'short-window candidate; formal five-round and tail checks still required',
+                                             'claim': 'short-window candidate; formal seven-round and tail checks still required',
                                              'upper_bound_kind': high_record['gate_kind'] if high_record else 'censored_no_failed_or_invalid_upper_point',
                                              'upper_bound_censored':high_record['censored'] if high_record else True,
                                              'upper_bound_point':high_record,'upper_bound_history':high_history}
             self.save()
         if 'common_rate' not in self.state:
             self.state['common_rate'] = max(1, math.floor(.6 * min(v['candidate_rate'] for v in self.state['capacity'].values() if v['candidate_rate'] > 0))) if any(v['candidate_rate'] > 0 for v in self.state['capacity'].values()) else None
-        self.state['partial_stacks'] = [s for s in STACKS if self.state['capacity'][s]['candidate_rate'] > 0]
+        self.state['partial_stacks'] = [s for s in self.stacks if self.state['capacity'][s]['candidate_rate'] > 0]
         self.save()
         # Uniform fallback is decided before formal rounds. Do not quietly
         # change only one stack's warmup/history if total resident memory rises.
@@ -984,43 +1227,100 @@ class Case:
         self.check_memory()
         self.save()
         return self.state
+    def diagnose(self):
+        if not self.args.diagnostic_rates:
+            raise RuntimeError('diagnose requires exactly3 predeclared low/mid/high --diagnostic-rates')
+        for idle_ms in (500,0):
+            for rate in self.args.diagnostic_rates:
+                for stack in self.stacks:
+                    service=self.activate(stack)
+                    directory=self.path/f'diagnose-idle{idle_ms}-rate{rate}'/stack
+                    try:
+                        result=self.h.client(service,self.workload,rate,self.args.explore_seconds,directory,idle_ms=idle_ms)
+                        result['qualification']=qualification(result,self.workload)
+                        result['diagnostic_scope']='three predeclared points and explicit idle-policy A/B; not a formal capacity/causality conclusion'
+                        write_json(directory/'client.json',result)
+                        if not result['qualification']['eligible_for_formal_candidate']:
+                            raise RuntimeError('first control diagnostic anomaly retained; stop and analyze before more collection')
+                    finally:
+                        self.idle(stack,directory/'client.json')
+
     def formal(self):
         self.explore()
         common = self.state['common_rate']
         if common is None:
             self.state['formal_status'] = 'no_nonzero_eligible_candidate'
-            summaries={view:{s:{'qualified':False,'status':'not_executed_no_nonzero_short_candidate'} for s in STACKS}
+            summaries={view:{s:{'qualified':False,'status':'not_executed_no_nonzero_short_candidate'} for s in self.stacks}
                        for view in ('common','own_capacity')}
+            summaries['paired_capacity_goodput']=paired_capacity_goodput(summaries,self.state,seed=self.args.random_seed)
             write_json(self.path/'formal-summary.json',summaries)
             self.apply_verified(summaries)
             return
         for viewpoint in ('common', 'own_capacity'):
-            for repeat in range(5):
-                # Rotate order, including all successful and failed rounds.
-                order = STACKS[repeat % 4:] + STACKS[:repeat % 4]
+            # Extend every stack uniformly for rare1% mixed CPU tails. No mixture change.
+            rates=[common] if viewpoint=='common' else [v['candidate_rate'] for v in self.state['capacity'].values() if v['candidate_rate']>0]
+            share=.01 if self.workload=='mixed' else 1
+            formal_duration=max(30,self.args.formal_seconds,math.ceil(1000/(min(rates)*share*self.args.formal_repeats)))
+            if formal_duration*max(rates)>10000000:
+                raise RuntimeError('frozen uniform formal window exceeds10million driver plans; split separately declared capacity points without merging driver versions')
+            if formal_duration>3600:
+                raise RuntimeError('1000 core tail samples require >3600s/window; point remains unmeasured, choose a predeclared higher valid common rate')
+            self.state.setdefault('formal_design',{}).update({'repeats':self.args.formal_repeats,'seed':self.args.random_seed,'orders':interleaved_orders(self.stacks,self.args.formal_repeats,self.args.random_seed),'minimum_core_samples':1000})
+            self.state['formal_design'][viewpoint+'_seconds']=formal_duration
+            self.save()
+            for repeat,order in enumerate(interleaved_orders(self.stacks,self.args.formal_repeats,self.args.random_seed)):
                 for stack in order:
                     rate = common if viewpoint == 'common' else self.state['capacity'][stack]['candidate_rate']
                     if rate <= 0:
                         continue
-                    self.observe(stack, rate, self.args.formal_seconds, f'formal-{viewpoint}-{repeat:02d}')
+                    self.observe(stack, rate, formal_duration, f'formal-{viewpoint}-{repeat:02d}')
         self.check_memory()
         summaries={}
         for viewpoint in ('common','own_capacity'):
             summaries[viewpoint]={}
-            for stack in STACKS:
-                paths=[self.path/f'formal-{viewpoint}-{i:02d}'/stack/'client.json' for i in range(5)]
+            for stack in self.stacks:
+                paths=[self.path/f'formal-{viewpoint}-{i:02d}'/stack/'client.json' for i in range(self.args.formal_repeats)]
                 if not all(path.exists() for path in paths):
                     summaries[viewpoint][stack]={'qualified':False,'status':'not_executed_no_nonzero_short_candidate'}
                 else:
                     summaries[viewpoint][stack]=aggregate_rounds([read_json(path) for path in paths],self.workload)
+        paired={}
+        for reference in ('go','rust'):
+            if 'ku' not in self.stacks or reference not in self.stacks:
+                continue
+            reports={stack:[read_json(self.path/f'formal-common-{i:02d}'/stack/'client.json') for i in range(self.args.formal_repeats)] for stack in ('ku',reference)}
+            pairs={}
+            for metric in ('goodput_rps','cpu_seconds_per_correct','steady_median_bytes','observed_peak_bytes'):
+                def values(stack):
+                    if metric=='goodput_rps': return [r['ledger'][metric] for r in reports[stack]]
+                    if metric=='cpu_seconds_per_correct': return [r['service_cost'].get('full_lifecycle',{}).get(metric) for r in reports[stack]]
+                    return [r['service_cost'].get('arrival_window_memory',{}).get(metric) for r in reports[stack]]
+                pairs[metric]=paired_interval(values('ku'),values(reference),self.args.random_seed)
+            kinds=('json_object','db','timer','cpu') if self.workload=='mixed' else (self.workload,)
+            for kind in kinds:
+                def tails(stack):
+                    return [(r['by_type'].get(kind,{}) if self.workload=='mixed' else r['ledger']).get('correct_scheduled_to_complete',{}).get('p99_ms') for r in reports[stack]]
+                pairs['p99_ratio_'+kind]=paired_interval(tails('ku'),tails(reference),self.args.random_seed)
+            pairs['targets']={'common_goodput_ratio_lower95_minimum':1.0,'lifecycle_cpu_cost_ratio_upper95_maximum':.9,
+                'steady_and_peak_memory_ratio_upper95_maximum':.8,'p99_ratio_upper95_noninferiority_maximum':1.05,
+                'quantile_resolution_note':'upper-edge buckets10us minimum/<=1/128 relative; differences within quantified bucket/clock error cannot establish a precise ranking'}
+            pairs['eligible_for_target_claim']=all(summaries['common'][stack]['qualified'] for stack in ('ku',reference)) and all(r['service_cost'].get('full_lifecycle',{}).get('natural_reclamation_passed') is True for stack in ('ku',reference) for r in reports[stack])
+            pairs['note']='common-rate ratios only; capacity ratio requires separately credible curves. Any failed gate remains visible and prevents target claim.'
+            paired[reference]=pairs
+        summaries['paired_common_costs']=paired
+        summaries['paired_capacity_goodput']=paired_capacity_goodput(summaries,self.state,seed=self.args.random_seed)
         write_json(self.path/'formal-summary.json',summaries)
         self.state['formal_status'] = 'all_planned_windows_recorded; see per-window gates'
         self.apply_verified(summaries)
     def sustained(self):
+        if self.args.sustained_seconds<600:
+            raise RuntimeError('formal sustained windows require at least600seconds; no short diagnostic substitute')
         derived=self.require_verified()
         rate = derived['derived_sustained_rate']
         self.state['sustained_scope']={'included':derived['verified_partial_stacks'],
                                       'excluded':derived['unverified_stacks'],'rate':rate,
+                                      'cores':self.cores,'memory':self.memory,'workload':self.workload,
+                                      'duration_seconds':self.args.sustained_seconds,
                                       'basis_summary_sha256':self.state['verified_summary_sha256']}
         self.save()
         if not rate:
@@ -1039,11 +1339,14 @@ class Case:
             self.state['overload_status']='not_executed_no_formally_verified_nonzero_capacity'
             self.save()
             return
-        for kind in ('relative', 'common_absolute'):
+        for kind,multiple in (('relative-1.5',1.5),('relative-2',2),('relative-5',5),('relative-10',10),('relative-20',20),('relative-40',40),('common_absolute',None)):
             for stack in derived['verified_partial_stacks']:
+                prior=self.state.setdefault('overload_escalation',{}).get(stack)
+                if multiple and multiple>5 and (prior is None or prior['boundary_observed'] or prior['status'] in ('measurement_invalid_censored','service_fault_without_capacity_attribution') or prior.get('rate_was_capped')):
+                    continue
                 directory = self.path / ('overload-' + kind) / stack
                 own = derived['verified_rates'][stack]
-                wanted = 5*own if kind=='relative' else derived['derived_common_absolute_overload_rate']
+                wanted = math.ceil(multiple*own) if multiple else derived['derived_common_absolute_overload_rate']
                 rate = min(self.args.maximum_rate, wanted)
                 basis={'verified_rate':own,'formal_summary_sha256':self.state['verified_summary_sha256'],
                        'kind':kind,'actual_arrival_rate':rate}
@@ -1065,6 +1368,10 @@ class Case:
                 try:
                     result = self.h.client(service,self.workload,rate,self.args.formal_seconds,directory)
                     result['qualification']=qualification(result,self.workload)
+                    boundary=overload_boundary(result,self.workload)
+                    boundary['rate_was_capped']=rate!=wanted
+                    self.state['overload_escalation'][stack]=boundary
+                    self.save()
                     write_json(directory/'client.json',result)
                     thread.join(timeout=self.args.formal_seconds+15)
                     if thread.is_alive():
@@ -1090,7 +1397,7 @@ class Case:
                         'origin_monotonic_ns':None,'deadline_seconds':5,'recovered':None,'first_complete_new_probe':None})
                     actual['role']='additional view only; never replaces or widens the planned-cutoff5s gate'
                     tail=(sent_end['monotonic_ns']-cutoff)/1e9 if cutoff is not None and sent_end['monotonic_ns'] is not None else None
-                    write_json(directory/'recovery.json',{'recovered':primary['recovered'],'first_complete_new_probe':primary['first_complete_new_probe'],
+                    write_json(directory/'recovery.json',{'overload_boundary':boundary, 'recovery_after_genuine_overload_passed':boundary['boundary_observed'] and primary['recovered'] is True and probes['valid_driver'], 'recovered':primary['recovered'],'first_complete_new_probe':primary['first_complete_new_probe'],
                         'origin':'business arrival cutoff = Linux CLOCK_MONOTONIC origin + frozen duration; anchor uncertainty conservatively included',
                         'business_cutoff_monotonic_ns':cutoff,'deadline_seconds':5,'probe_phases':primary['probe_phases'],
                         'clock_scope':'all recovery gates and resource correlation use CLOCK_MONOTONIC; Unix values are display-only and may step',
@@ -1110,8 +1417,8 @@ class Case:
                         'all_probe_failures_retained':True})
                 finally:
                     thread.join(timeout=self.args.formal_seconds+15)
-                    self.idle(stack)
-        self.state['overload_status']='recorded against formally verified rates; all business and independent probe outcomes retained'
+                    self.idle(stack,directory/'client.json')
+        self.state['overload_status']='1.5x/2x/5x and bounded10x/20x/40x escalation; only observed valid saturation earns genuine-overload recovery claim; all outcomes retained'
         self.save()
     def close(self):
         for service in self.instances.values():
@@ -1126,6 +1433,7 @@ def cases(args):
         yield 1, GIB, workload
     yield 2, GIB, 'cpu'
     yield 4, 256 * MIB, 'json_object'
+    yield 4, 256 * MIB, 'mixed'
 
 class UniformRestart(RuntimeError):
     """A single bounded, whole-case policy transition; original data retained."""
@@ -1156,7 +1464,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--phase', choices=('smoke','explore','formal','waiting','batch','overload','sustained','all'), default='smoke')
+    parser.add_argument('--phase', choices=('smoke','diagnose','explore','formal','waiting','batch','overload','sustained','all'), default='smoke')
     parser.add_argument('--case', help='optional exact c4-m1073741824-json_object name')
     parser.add_argument('--warmup', type=float, default=30)
     parser.add_argument('--prime', type=float, default=3)
@@ -1164,13 +1472,36 @@ def main():
     parser.add_argument('--formal-seconds', type=float, default=30)
     parser.add_argument('--sustained-seconds', type=float, default=600)
     parser.add_argument('--maximum-rate', type=int, default=100000)
+    parser.add_argument('--formal-repeats',type=int,default=7)
+    parser.add_argument('--random-seed',type=int,default=20261023)
+    parser.add_argument('--diagnostic-rates',type=int,nargs=3)
+    parser.add_argument('--keepalive-idle-ms',type=int,default=500)
+    parser.add_argument('--physical-settle-seconds',type=float,default=45,help='bounded observation after driver exit; does not alter service deadlines; fixture5s gate remains separate')
+    parser.add_argument('--stacks',nargs='+',choices=(*STACKS,'java','dotnet','cpp','control'),default=list(STACKS))
     args = parser.parse_args()
+    if args.phase=='sustained':
+        try:
+            sustained_case(args)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.phase in ('sustained','all') and args.sustained_seconds<600:
+        parser.error('formal sustained windows require at least600seconds')
+    if 'control' in args.stacks and args.case not in ('c1-m1073741824-ok','c4-m1073741824-ok'):
+        parser.error('control diagnosis requires an explicit supported /ok case')
+    if args.phase!='diagnose' and 'control' in args.stacks:
+        parser.error('control is diagnosis only, never included in language rankings')
+    if not 5<=args.physical_settle_seconds<=120:
+        parser.error('physical observation must be5..120seconds; no runtime deadline change')
+    if not 0<=args.keepalive_idle_ms<=60000 or (args.diagnostic_rates and (min(args.diagnostic_rates)<=0 or sorted(set(args.diagnostic_rates))!=args.diagnostic_rates)):
+        parser.error('idle timeout out of range or diagnostic rates not3 increasing positive points')
+    if args.formal_repeats<7 or len(set(args.stacks))!=len(args.stacks):
+        parser.error('at least7 paired windows and unique stack names required')
     if min(args.warmup,args.prime,args.explore_seconds,args.formal_seconds,args.sustained_seconds) <= 0:
         parser.error('durations must be positive; deviations must be marked diagnostic')
     harness = Harness(args.root, args.output)
     configuration = {'phase': args.phase, 'arguments': vars(args), 'manifest_sha256': hashlib.sha256((args.root/'manifest.json').read_bytes()).hexdigest(),
                      'protocol_sha256': hashlib.sha256(harness.protocol.read_bytes()).hexdigest(),
-                     'formal_rules': 'five rounds x30s, 30s initial warmup and3s resumed prime; deviations diagnostic',
+                     'formal_rules': 'at least7 seeded interleaved paired windows; >=30s and1000 pooled core samples/type; 30s warmup/3s prime',
                      'coordinator': {'pid': os.getpid(), 'inside_service_domain': False},
                      'rlimit_nofile': list(resource.getrlimit(resource.RLIMIT_NOFILE)),
                      'identity': {'uname': list(os.uname()), 'cpu_online': Path('/sys/devices/system/cpu/online').read_text().strip(),
@@ -1178,7 +1509,8 @@ def main():
     configuration['arguments'] = {k: str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     freeze={'manifest_sha256':configuration['manifest_sha256'],'protocol_sha256':configuration['protocol_sha256'],
             'warmup':args.warmup,'prime':args.prime,'formal_seconds':args.formal_seconds,
-            'explore_seconds':args.explore_seconds,'sustained_seconds':args.sustained_seconds,'maximum_rate':args.maximum_rate}
+            'explore_seconds':args.explore_seconds,'sustained_seconds':args.sustained_seconds,'maximum_rate':args.maximum_rate,
+            'formal_repeats':args.formal_repeats,'random_seed':args.random_seed,'stacks':args.stacks,'keepalive_idle_ms':args.keepalive_idle_ms,'diagnostic_rates':args.diagnostic_rates,'physical_settle_seconds':args.physical_settle_seconds}
     freeze_path=args.output/'freeze.json'
     if freeze_path.exists() and read_json(freeze_path)!=freeze:
         raise RuntimeError('resume identity/configuration changed; choose a new output directory and preserve prior data')
@@ -1187,7 +1519,7 @@ def main():
     write_json(args.output/'invocations'/f'{time.time_ns()}-{args.phase}.json',configuration)
     try:
         if args.phase == 'smoke':
-            for stack in STACKS:
+            for stack in args.stacks:
                 service = harness.start(stack, output=args.output/'smoke'/stack/'service')
                 try:
                     for workload in ('ok','json_object','json_array','json_escape','cpu','timer','db'):
@@ -1196,18 +1528,22 @@ def main():
                             raise RuntimeError(f'golden failure {stack}/{workload}')
                 finally:
                     service.stop()
-        if args.phase in ('explore','formal','overload','all'):
+        if args.phase in ('diagnose','explore','formal','overload','all'):
             for cores,memory,workload in cases(args):
                 name = f'c{cores}-m{memory}-{workload}'
                 if args.phase=='overload' and (cores!=4 or memory!=GIB or workload!='mixed'):
                     continue
                 if args.case and args.case != name:
                     continue
+                if not declared_case_stacks(args.stacks,cores,memory,workload):
+                    continue
                 case = Case(harness,cores,memory,workload,args)
                 try:
                     for attempt in range(2):
                         try:
-                            if args.phase == 'explore':
+                            if args.phase == 'diagnose':
+                                case.diagnose()
+                            elif args.phase == 'explore':
                                 case.explore()
                             elif args.phase=='overload':
                                 case.overload()
@@ -1225,7 +1561,7 @@ def main():
                 finally:
                     case.close()
         if args.phase == 'sustained':
-            case = Case(harness,4,GIB,'mixed',args)
+            case = Case(harness,*sustained_case(args),args)
             try:
                 for attempt in range(2):
                     try:

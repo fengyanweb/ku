@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,7 +28,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,7 +36,9 @@ import (
 
 const maxHeader = 32768
 const maxBody = 65536
-const maxHistogramKeys = 1000000 // Shared hard bound, not per histogram.
+
+// Fixed cells cover every nonnegative int64 duration without dropping counts.
+const maxHistogramKeys = 256 + 43*128
 const maxEvents = 1073741824
 const histogramNS = int64(10000) // 10 microseconds; quantiles are upper bounds.
 
@@ -81,13 +83,15 @@ type job struct {
 }
 type result struct {
 	category, stage, detail               string
+	reused                                bool
+	dialTime                              time.Duration
 	status                                int
 	sent, completed                       time.Time
 	bytesWritten, bytesRead               int64
 	writeComplete, responseComplete, late bool
 }
 type histogram struct {
-	bins  map[int64]uint64
+	bins  []uint64
 	count uint64
 	maxNS int64
 	sum   float64
@@ -97,17 +101,36 @@ type histogramBudget struct {
 	overflow bool
 }
 
+// Linear 10us cells below 2.56ms; 128 cells per doubling afterwards.
+// The conservative upper edge has <=1/128 relative width above 2.56ms.
+// A maximum-duration window allocates at most (3600+8*9)*5760*8 bytes
+// of cells, independent of request count (normally only 30 seconds).
+func histogramIndex(n int64) int {
+	q := max(n, 0) / histogramNS
+	if q < 256 {
+		return int(q)
+	}
+	shift := bits.Len64(uint64(q)) - 8
+	return 256 + (shift-1)*128 + int((q-(int64(1)<<(shift+7)))>>shift)
+}
+func histogramUpper(index int) int64 {
+	if index < 256 {
+		return int64(index+1) * histogramNS
+	}
+	shift, offset := (index-256)/128+1, (index-256)%128
+	units := uint64(129+offset) << shift
+	if units > uint64(math.MaxInt64/histogramNS) {
+		return math.MaxInt64
+	}
+	return int64(units) * histogramNS
+}
 func (h *histogram) add(d time.Duration, b *histogramBudget) {
 	n := max(int64(d), 0)
-	bucket := n / histogramNS
+	bucket := histogramIndex(n)
 	if h.bins == nil {
-		h.bins = make(map[int64]uint64)
+		h.bins = make([]uint64, maxHistogramKeys)
 	}
-	if _, ok := h.bins[bucket]; !ok {
-		if b.keys >= maxHistogramKeys {
-			b.overflow = true
-			return
-		}
+	if h.bins[bucket] == 0 {
 		b.keys++
 	}
 	h.bins[bucket]++
@@ -116,57 +139,59 @@ func (h *histogram) add(d time.Duration, b *histogramBudget) {
 	h.maxNS = max(h.maxNS, n)
 }
 func (h *histogram) value() map[string]any {
-	v := map[string]any{"count": h.count, "resolution_us": 10, "max_ms": float64(h.maxNS) / 1e6, "quantiles": "upper bucket edge; not averaged across rounds"}
-	if h.count == 0 {
-		v["p50_ms"] = nil
-		v["p95_ms"] = nil
-		v["p99_ms"] = nil
-		v["p999_ms"] = nil
-		return v
-	}
-	keys := make([]int64, 0, len(h.bins))
-	for k := range h.bins {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	v := map[string]any{"count": h.count, "minimum_resolution_us": 10, "maximum_relative_bucket_width": 1.0 / 128, "max_ms": float64(h.maxNS) / 1e6, "representation": "v5-fixed-log128", "quantiles": "conservative upper bucket edge; never averaged across rounds"}
 	for _, q := range []struct {
 		name     string
 		fraction float64
 		minimum  uint64
 	}{{"p50_ms", .5, 1}, {"p95_ms", .95, 20}, {"p99_ms", .99, 100}, {"p999_ms", .999, 1000}} {
+		v[q.name] = nil
 		if h.count < q.minimum {
-			v[q.name] = nil
 			continue
 		}
 		target := uint64(math.Ceil(float64(h.count) * q.fraction))
 		var total uint64
-		for _, k := range keys {
-			total += h.bins[k]
+		for k, count := range h.bins {
+			total += count
 			if total >= target {
-				v[q.name] = float64((k+1)*histogramNS) / 1e6
+				v[q.name] = float64(histogramUpper(k)) / 1e6
 				break
 			}
 		}
 	}
-	v["mean_ms"] = h.sum / float64(h.count) / 1e6
+	if h.count > 0 {
+		v["mean_ms"] = h.sum / float64(h.count) / 1e6
+	}
 	return v
 }
 
 type stats struct {
-	Planned                                          uint64            `json:"planned"`
-	Attempted                                        uint64            `json:"attempted"`
-	Sent                                             uint64            `json:"sent"`
-	Results                                          map[string]uint64 `json:"results"`
-	CorrectWindow                                    uint64            `json:"correct_in_window"`
-	Late                                             uint64            `json:"late_response_events"`
-	SLOFailed                                        uint64            `json:"correct_over_slo"`
-	Written                                          int64             `json:"request_bytes_written"`
-	Read                                             int64             `json:"response_bytes_read"`
-	correctScheduled, correctSent, allScheduled, lag histogram
-	sentErrors                                       uint64
+	Planned                                           uint64            `json:"planned"`
+	Attempted                                         uint64            `json:"attempted"`
+	Sent                                              uint64            `json:"sent"`
+	Results                                           map[string]uint64 `json:"results"`
+	CorrectWindow                                     uint64            `json:"correct_in_window"`
+	Late                                              uint64            `json:"late_response_events"`
+	SLOFailed                                         uint64            `json:"correct_over_slo"`
+	Written                                           int64             `json:"request_bytes_written"`
+	Read                                              int64             `json:"response_bytes_read"`
+	correctScheduled, correctSent, allScheduled, lag  histogram
+	queueDelay, dialDelay, coldLatency, reusedLatency histogram
+	transportCounts                                   map[string]uint64
+	sentErrors                                        uint64
+	http500                                           uint64
 }
 
-func newStats() *stats { return &stats{Results: map[string]uint64{}} }
+func newStats() *stats {
+	return &stats{Results: map[string]uint64{}, transportCounts: map[string]uint64{}}
+}
+func incrementTransport(counts map[string]uint64, key string) {
+	if _, known := counts[key]; known || len(counts) < 128 {
+		counts[key]++
+	} else {
+		counts["other_transport_key"]++
+	}
+}
 func (s *stats) view(duration float64) map[string]any {
 	terminal := uint64(0)
 	for _, n := range s.Results {
@@ -180,7 +205,7 @@ func (s *stats) view(duration float64) map[string]any {
 	if s.Sent > 0 {
 		failureSent = float64(s.sentErrors) / float64(s.Sent)
 	}
-	return map[string]any{"planned": s.Planned, "attempted": s.Attempted, "sent": s.Sent, "terminal": terminal, "results": s.Results, "planned_reconciled": terminal == s.Planned, "correct_in_window": s.CorrectWindow, "goodput_rps": float64(s.CorrectWindow) / duration, "correct_total": correct, "failure_fraction_planned": failurePlanned, "failure_fraction_sent": failureSent, "correct_over_slo": s.SLOFailed, "late_response_events": s.Late, "request_bytes_written": s.Written, "response_bytes_read": s.Read, "correct_scheduled_to_complete": s.correctScheduled.value(), "correct_sent_to_complete": s.correctSent.value(), "all_scheduled_to_terminal": s.allScheduled.value(), "scheduled_to_sent": s.lag.value()}
+	return map[string]any{"planned": s.Planned, "attempted": s.Attempted, "sent": s.Sent, "terminal": terminal, "results": s.Results, "planned_reconciled": terminal == s.Planned, "correct_in_window": s.CorrectWindow, "goodput_rps": float64(s.CorrectWindow) / duration, "correct_total": correct, "failure_fraction_planned": failurePlanned, "failure_fraction_sent": failureSent, "correct_over_slo": s.SLOFailed, "http_500_total": s.http500, "late_response_events": s.Late, "request_bytes_written": s.Written, "response_bytes_read": s.Read, "correct_scheduled_to_complete": s.correctScheduled.value(), "correct_sent_to_complete": s.correctSent.value(), "all_scheduled_to_terminal": s.allScheduled.value(), "scheduled_to_sent": s.lag.value(), "scheduled_to_attempt": s.queueDelay.value(), "dial_duration": s.dialDelay.value(), "cold_connection_scheduled_to_complete": s.coldLatency.value(), "reused_connection_scheduled_to_complete": s.reusedLatency.value(), "transport_counts": s.transportCounts}
 }
 
 type secondStats struct {
@@ -192,17 +217,17 @@ type secondStats struct {
 	completedKinds                    map[string]uint64
 }
 type ledger struct {
-	mu                                                        sync.Mutex
-	all                                                       *stats
-	types                                                     map[string]*stats
-	seconds                                                   []secondStats
-	budget                                                    histogramBudget
-	origin, cutoff                                            time.Time
-	lastActualSent, lastActualCompleted, lastCompleteResponse time.Time
-	lastActualSentRID, lastActualCompletedRID                 string
-	active, peakActive, live, peakLive, dials, peakQueue      uint64
-	samples                                                   []map[string]any
-	events                                                    *eventWriter
+	mu                                                                sync.Mutex
+	all                                                               *stats
+	types                                                             map[string]*stats
+	seconds                                                           []secondStats
+	budget                                                            histogramBudget
+	origin, cutoff                                                    time.Time
+	lastActualSent, lastActualCompleted, lastCompleteResponse         time.Time
+	lastActualSentRID, lastActualCompletedRID                         string
+	active, peakActive, live, peakLive, dials, peakQueue, poolExpired uint64
+	samples                                                           []map[string]any
+	events                                                            *eventWriter
 }
 
 func (l *ledger) typed(kind string) *stats {
@@ -272,6 +297,24 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	}
 	for _, s := range []*stats{l.all, l.typed(j.kind)} {
 		s.Results[r.category]++
+		if r.status == 500 {
+			s.http500++
+		}
+		if attempted {
+			s.queueDelay.add(began.Sub(j.scheduled), &l.budget)
+		}
+		incrementTransport(s.transportCounts, "stage:"+r.stage)
+		if r.status > 0 {
+			incrementTransport(s.transportCounts, "status:"+strconv.Itoa(r.status))
+		}
+		if r.reused {
+			s.transportCounts["reused_connection"]++
+		} else if attempted {
+			s.transportCounts["cold_connection"]++
+		}
+		if r.dialTime > 0 {
+			s.dialDelay.add(r.dialTime, &l.budget)
+		}
 		if attempted {
 			s.Attempted++
 		}
@@ -290,6 +333,11 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 		s.allScheduled.add(r.completed.Sub(j.scheduled), &l.budget)
 		if r.category == "correct" {
 			s.correctScheduled.add(r.completed.Sub(j.scheduled), &l.budget)
+			if r.reused {
+				s.reusedLatency.add(r.completed.Sub(j.scheduled), &l.budget)
+			} else {
+				s.coldLatency.add(r.completed.Sub(j.scheduled), &l.budget)
+			}
 			if sent {
 				s.correctSent.add(r.completed.Sub(r.sent), &l.budget)
 			}
@@ -332,7 +380,7 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 		}
 	}
 	if r.category != "correct" && len(l.samples) < 24 {
-		l.samples = append(l.samples, map[string]any{"rid": j.rid, "index": j.index, "type": j.kind, "terminal": r.category, "status": r.status, "stage": r.stage, "detail": truncate(r.detail), "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "completed_ns": r.completed.Sub(l.origin).Nanoseconds(), "bytes_written": r.bytesWritten, "bytes_read": r.bytesRead})
+		l.samples = append(l.samples, map[string]any{"rid": j.rid, "index": j.index, "type": j.kind, "terminal": r.category, "status": r.status, "stage": r.stage, "detail": truncate(r.detail), "reused_connection": r.reused, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "completed_ns": r.completed.Sub(l.origin).Nanoseconds(), "bytes_written": r.bytesWritten, "bytes_read": r.bytesRead})
 	}
 	if l.events != nil {
 		l.events.offer(event{j: j, began: began, result: r, origin: l.origin})
@@ -379,9 +427,9 @@ func openEvents(path string) (*eventWriter, error) {
 	w := &eventWriter{queue: make(chan event, 8192), done: make(chan struct{}), path: path}
 	go func() {
 		defer close(w.done)
-		z := gzip.NewWriter(f)
+		z, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
 		csvw := csv.NewWriter(z)
-		err := csvw.Write([]string{"rid", "type", "index", "scheduled_ns", "sent_ns", "completed_ns", "attempt_started_ns", "terminal", "status", "request_bytes_written", "response_bytes_read", "late_response"})
+		err := csvw.Write([]string{"rid", "type", "index", "scheduled_ns", "sent_ns", "completed_ns", "attempt_started_ns", "terminal", "status", "request_bytes_written", "response_bytes_read", "late_response", "reused_connection", "dial_duration_ns", "stage"})
 		var total int64
 		for row := range w.queue {
 			if err != nil {
@@ -393,7 +441,7 @@ func openEvents(path string) (*eventWriter, error) {
 				}
 				return strconv.FormatInt(t.Sub(row.origin).Nanoseconds(), 10)
 			}
-			record := []string{row.j.rid, row.j.kind, strconv.FormatUint(row.j.index, 10), format(row.j.scheduled), format(row.result.sent), format(row.result.completed), format(row.began), row.result.category, strconv.Itoa(row.result.status), strconv.FormatInt(row.result.bytesWritten, 10), strconv.FormatInt(row.result.bytesRead, 10), strconv.FormatBool(row.result.late)}
+			record := []string{row.j.rid, row.j.kind, strconv.FormatUint(row.j.index, 10), format(row.j.scheduled), format(row.result.sent), format(row.result.completed), format(row.began), row.result.category, strconv.Itoa(row.result.status), strconv.FormatInt(row.result.bytesWritten, 10), strconv.FormatInt(row.result.bytesRead, 10), strconv.FormatBool(row.result.late), strconv.FormatBool(row.result.reused), strconv.FormatInt(row.result.dialTime.Nanoseconds(), 10), row.result.stage}
 			for _, v := range record {
 				total += int64(len(v) + 1)
 			}
@@ -494,6 +542,9 @@ func (p *connectionPool) take() (*idleConnection, bool) {
 		p.idle = p.idle[:index]
 		p.mu.Unlock()
 		if p.timeout > 0 && time.Since(connection.last) >= p.timeout {
+			p.l.mu.Lock()
+			p.l.poolExpired++
+			p.l.mu.Unlock()
 			p.discard(connection)
 			continue
 		}
@@ -639,12 +690,15 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		r.category, r.stage = "timeout", "before_dial_deadline"
 		return
 	}
+	r.reused = lease != nil
 	if lease == nil {
 		w.l.mu.Lock()
 		w.l.dials++
 		w.l.mu.Unlock()
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		dialStart := time.Now()
 		conn, e := (&net.Dialer{FallbackDelay: -1}).DialContext(ctx, "tcp", w.c.address)
+		r.dialTime = time.Since(dialStart)
 		cancel()
 		if e != nil {
 			fail("dial", e)
@@ -665,7 +719,7 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		return
 	}
 	method, path, body := requestSpec(w.c, j)
-	headers := http.Header{"Connection": {"keep-alive"}, "Accept-Encoding": {"identity"}, "X-Cross-Stack-Request": {j.rid}}
+	headers := http.Header{"Connection": {"keep-alive"}, "Accept-Encoding": {"identity"}, "X-Cross-Stack-Request": {j.rid}, "X-Request-ID": {j.rid}}
 	if body != nil {
 		headers.Set("Content-Type", "application/json")
 	}
@@ -985,7 +1039,7 @@ func run(c config) (map[string]any, error) {
 	for name, data := range c.corpora {
 		hashes[name] = data.hash
 	}
-	out := map[string]any{"schema": "ku-cross-stack-client-v4", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_bucket_limit": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_resolution_us": 10, "validation_in_driver_cost": true}}
+	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "pool_idle_expirations": l.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(l.dials, 1)), "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
 	clocks["planned_cutoff_offset_ns"] = c.duration.Nanoseconds()
