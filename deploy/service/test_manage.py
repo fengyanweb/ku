@@ -16,6 +16,74 @@ SPEC = importlib.util.spec_from_file_location("manage", Path(__file__).with_name
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 
+VERIFY_SPEC = importlib.util.spec_from_file_location("verify", Path(__file__).with_name("verify.py"))
+V = importlib.util.module_from_spec(VERIFY_SPEC)
+VERIFY_SPEC.loader.exec_module(V)
+
+
+class ResourceIdentityDiagnostics(unittest.TestCase):
+    def test_selected_windows_identity_retains_creation_time_and_closes_handle(self):
+        kernel = Mock()
+        kernel.OpenProcess.return_value = 501
+        kernel.CloseHandle.return_value = True
+
+        def times(_process, created, _exited, _system, _user):
+            created._obj.dwHighDateTime = 7
+            created._obj.dwLowDateTime = 11
+            return True
+
+        def image(_process, _flags, value, size):
+            value.value = r"C:\fixture\new.exe"
+            size._obj.value = len(value.value)
+            return True
+
+        kernel.GetProcessTimes.side_effect = times
+        kernel.QueryFullProcessImageNameW.side_effect = image
+        with patch("ctypes.WinDLL", create=True, return_value=kernel):
+            identity = V.windows_process_identity(6592)
+        self.assertEqual(identity["identity_status"], "observed")
+        self.assertEqual(identity["creation_time_100ns"], (7 << 32) | 11)
+        self.assertEqual(identity["image_path"], r"C:\fixture\new.exe")
+        kernel.OpenProcess.assert_called_once_with(0x1000, False, 6592)
+        kernel.CloseHandle.assert_called_once_with(501)
+
+    def test_failed_identity_query_is_unknown_and_still_closes_opened_handle(self):
+        kernel = Mock()
+        kernel.OpenProcess.return_value = 501
+        kernel.GetProcessTimes.return_value = False
+        kernel.CloseHandle.return_value = True
+        with patch("ctypes.WinDLL", create=True, return_value=kernel), \
+                patch("ctypes.get_last_error", create=True, return_value=5):
+            identity = V.windows_process_identity(1956)
+        self.assertEqual(identity["identity_status"], "unknown")
+        self.assertIn("GetProcessTimes", identity["identity_error"])
+        self.assertNotIn("image_path", identity)
+        kernel.CloseHandle.assert_called_once_with(501)
+
+    def test_identity_diagnostics_preserve_both_same_parent_candidates_and_gate(self):
+        snapshot = {"processes": [
+            {"pid": 9296, "ppid": 3816, "threads": 6, "rss_bytes": 1},
+            {"pid": 9068, "ppid": 9296, "threads": 6, "rss_bytes": 1},
+            {"pid": 6592, "ppid": 9068, "threads": 12, "rss_bytes": 1,
+             "image_name": "new.exe", "identity_status": "observed", "creation_time_100ns": 20},
+            {"pid": 1956, "ppid": 9068, "threads": 17, "rss_bytes": 1,
+             "image_name": "unknown.exe", "identity_status": "unknown"},
+            {"pid": 3816, "ppid": 1, "threads": 9, "rss_bytes": 1},
+            {"pid": 8204, "ppid": 3816, "threads": 7, "rss_bytes": 1}],
+            "thread_count": 57, "sum_rss_bytes": 6}
+        V.annotate_resource_roles(snapshot, {9296: "spare"}, 3816, 8204)
+        natives = [row for row in snapshot["processes"] if row["role"] == "native"]
+        self.assertEqual({row["pid"] for row in natives}, {1956, 6592})
+        config = {"slots": [{"name": "spare"}], "deployment_budget": {
+            "management_threads": 34, "management_memory_bytes": 100,
+            "total_threads": 133, "reserved_memory_bytes": 100,
+            "per_instance": {"total_threads": 33, "reserved_memory_bytes": 100}}}
+        with patch.object(V.os, "getpid", return_value=3816):
+            with self.assertRaisesRegex(RuntimeError, "slot spare threads 41 > 33"):
+                V.validate_caddy_resources(snapshot, config, 8204)
+        self.assertEqual(natives[0]["image_name"], "new.exe")
+        self.assertEqual(natives[1]["identity_status"], "unknown")
+
 
 class DeploymentContracts(unittest.TestCase):
     def setUp(self):

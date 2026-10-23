@@ -206,11 +206,13 @@ O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体�
 | 9ce CI | push40006709264、PR40006719621必要项通过，push三平台包与asset-set成功；PR发布任务预期跳过 | 只覆盖该SHA／实际复用范围，不替代最新源码；测试C入口／Windows libpq目录夹具修正未改产品 |
 | 8ad CI | PR40010779946过，push40010773305 Windows慢查询unknown后首个新读acquire_timeout约110ms，随后JSONDecodeError | 验收复用原5秒／8次新只读合同，原查询／INSERT不重放；pending0和reserved上限不能证明idle／leased |
 | 39c CI四种新失败 | push Linux／Mac async压力远端5>4；PR Windows drain exit0后瞬时远端1≠0；push Windows async10000行172ms超原150ms返回unknown | 本机远端观察补证据、验收改共享有界退休窗口；4ea批量结果处理待平台实测，不称四类根因均已修 |
-| 86f push40024100907 | 三平台PG的sync／async步骤均success；Windows Caddy rolling资源快照spare41线程>33，cleanup采样PID1956仍存在 | spare为supervisor6＋launcher6＋两个直接子12／17线程；Toolhelp旧记录缺映像／创建时间，不能唯一判断两个Ku实例重叠或PID归属问题，不增加reserve掩盖；失败与PG性能分开 |
+| 86f push40024100907／PR40024106559 | push唯一失败为Windows Caddy rolling资源快照spare41线程>33，cleanup采样PID1956仍存在；PR全部必要项过。两次CI三平台PG sync／async共12路均实际passed | spare为supervisor6＋launcher6＋两个直接子12／17线程，总105<133；旧记录缺映像／创建时间，不能唯一判断两Ku实例重叠或PID归属。PR同检查通过、无遗留，不能覆盖push失败；不增加reserve |
 
 39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最终4ea及后续必要CI／同源安装包仍待验；新增sanitizer workflow因OAuth无workflow权限尚不能上传，不绕过权限，普通Git推送另行执行。
 
 另一个有序退出修正限Java基准：同4.5秒绝对预算依次HTTP drain／在途0／CPU executor／PG pool／Vertx，严格匹配实际SIGTERM、PID／listeners、阶段／计数、无OOM／强制终止和cgroup清理才接受143；其他栈要求exit0。19项驱动回归及真实PG／timer在途退出通过，不把任意非零退出放宽。
+
+86f Windows Caddy失败仅补现有夹具身份记录：Toolhelp映像名、选中及cleanup采样PID的实际映像路径和创建FILETIME；查询失败保留unknown，句柄finally关闭。不改变归属、资源门槛、清理策略，不新增HTTP轮询。既有Python测试23通过／1平台跳过，新增字段尚待真实Windows CI，未将未知原因写成已修复。Mac配置TSan又通过TCP两项及真实HTTP多owner TCP一项；这不替代Linux必要gate。
 
 唯一后续599有界8秒诊断960/960正确、最大计划到完成29.74ms，未捕获所选异常；全局环覆盖1196条早期记录，不称trace整体完整。collector错用 `/proc/TID/stat` 的线程user/system拆分已剔除，仅独立schedstat可用于运行／就绪等待；未借此归因平台。诊断开销不入正式比值，服务／驱动／perf正常回收，临时C／ELF／脚本已清理。
 

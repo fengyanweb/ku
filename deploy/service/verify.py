@@ -643,7 +643,8 @@ def windows_process_records():
         while more:
             if len(rows) >= 16384:
                 raise RuntimeError("process snapshot exceeds fixed 16384-record bound")
-            rows[int(entry.th32ProcessID)] = {"ppid": int(entry.th32ParentProcessID)}
+            rows[int(entry.th32ProcessID)] = {"ppid": int(entry.th32ParentProcessID),
+                                            "image_name": str(entry.szExeFile)[:260]}
             entry.dwSize = ctypes.sizeof(entry)
             more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
         if ctypes.get_last_error() != 18:
@@ -652,6 +653,54 @@ def windows_process_records():
     finally:
         if not kernel.CloseHandle(snapshot):
             raise OSError(ctypes.get_last_error(), "CloseHandle(process snapshot)")
+
+
+def windows_process_identity(pid):
+    """Add bounded identity evidence only; failed queries never imply absence.
+
+    A Toolhelp parent PID can outlive that parent. Keep the image and creation
+    time so a later review can distinguish descendants from reused PID ancestry;
+    this diagnostic does not change resource attribution or cleanup decisions.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    result = {"identity_status": "unknown"}
+    process = None
+
+    def check(ok, operation):
+        if not ok:
+            raise OSError(ctypes.get_last_error(), operation)
+
+    try:
+        process = kernel.OpenProcess(0x1000, False, int(pid))
+        check(process, "OpenProcess(identity)")
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        check(kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(system), ctypes.byref(user)), "GetProcessTimes(identity)")
+        result["creation_time_100ns"] = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        size = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        check(kernel.QueryFullProcessImageNameW(process, 0, image, ctypes.byref(size)),
+              "QueryFullProcessImageNameW(identity)")
+        result.update(identity_status="observed", image_path=image.value[:4096],
+                      image_path_truncated=len(image.value) > 4096)
+    except OSError as error:
+        result["identity_error"] = str(error)[:256]
+    finally:
+        if process and not kernel.CloseHandle(process):
+            result["identity_close_error"] = ctypes.get_last_error()
+    return result
 
 
 def resource_snapshot(proxy, include_roles=False):
@@ -681,7 +730,8 @@ def resource_snapshot(proxy, include_roles=False):
                 raise RuntimeError(f"owned process {pid} missing from resource snapshot")
             continue
         if os.name == "nt":
-            rows.append({"pid": pid, **records[pid], **samples.windows_process_sample(pid)})
+            rows.append({"pid": pid, **records[pid], **samples.windows_process_sample(pid),
+                         **windows_process_identity(pid)})
             continue
         option = "-M" if os.uname().sysname == "Darwin" else "-T"
         result = subprocess.run(["ps", option, "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=2, check=True)
@@ -1105,7 +1155,8 @@ def main():
                 try:
                     remaining = windows_process_records()
                     diagnostic["sampled_processes_after_cleanup"] = [
-                        {"pid": pid, **remaining[pid]} for pid in sorted(sampled_pids) if pid in remaining]
+                        {"pid": pid, **remaining[pid], **windows_process_identity(pid)}
+                        for pid in sorted(sampled_pids) if pid in remaining]
                     if diagnostic["sampled_processes_after_cleanup"]:
                         cleanup_errors.append("sampled fixture process IDs remain after cleanup")
                         report["passed"] = False
