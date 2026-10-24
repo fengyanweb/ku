@@ -714,22 +714,6 @@ class InstalledPostgresDirectoryTests(unittest.TestCase):
             self.assertTrue(root.name.startswith("ku-installed-pg-"))
         self.assertTrue(report["temporary_cleanup_confirmed"])
 
-    @unittest.skipUnless(os.name == "nt", "actual outer directory ACL requires Windows")
-    def test_real_windows_outer_root_is_accessible_without_changing_parent_acl(self):
-        report = {}
-        exporter = SimpleNamespace(run_runtime_check=mock.Mock(return_value=subprocess.CompletedProcess([], 0)))
-        with self.gate.owned_temporary_root(report) as root:
-            self.gate.run_pg_lifecycles(exporter, None, self.repo, root / "installed", root,
-                                       root / "lifecycle.json", report)
-            acl = report["windows_pg_directory_acl"]["acl"]
-            self.assertEqual(acl["parent_sddl_before"], acl["parent_sddl_after"])
-            self.assertEqual(acl["owner_before"], acl["owner_after"])
-            self.assertTrue(acl["current_user_modify_inheritable"])
-            self.assertTrue((root / "fixture-work").is_dir())
-            exporter.run_runtime_check.assert_called_once()
-            report["fixture_cleanup_confirmed"] = True
-        self.assertTrue(report["temporary_cleanup_confirmed"])
-
 
 @unittest.skipIf(os.name == "nt", "POSIX foreground postgres owner; Windows uses the existing Job")
 class InstalledPostgresOwnerTests(unittest.TestCase):

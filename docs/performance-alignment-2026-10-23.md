@@ -243,9 +243,11 @@ d450 push的三平台PG原始artifact已下载核对API ZIP字节数及SHA：Win
 
 后续官方设备授权已完成，实际API确认同账号的workflow scope，门禁提交f2b668d正常推送。e1ca的push40042849739及PR40042854151必要CI已通过；f2b668d push40046655519的Linux／macOS实际安装包sync／async四路也通过，包及CLI身份、进程回收均有原始报告。两个作业随后败在import-library目录清理：POSIX生成点号前缀，清理只接受横线前缀。Windows则在initdb前失败，内层目录的用户SID规则已正确设置，但新增外层临时目录仍只有保护ACL，PG降权后无法遍历。本次仅跟进目录前缀及新建Windows私有外层目录的已有权限处理；不更改产品或放宽系统父目录。原ZIP大小／API digest和失败日志保留于`ci-f2b668d/`；后续修订仍须实际三平台门禁，不能把四路通过写成整个作业或全矩阵通过。
 
+d3b0c00 push40048521049在Windows bundle的新增独立live ACL单测中失败：原powershell.exe调用超过20秒，尚未分清启动／Get-Acl／Set-Acl阶段；三平台installed PG matrix因此整体跳过，不能当通过。该独立实测与必跑安装包实库门禁重复，本次仅删除AI新加的这一方法，4个契约回归及真实门禁每次外层ACL→initdb→SQL→回收路径保留，helper／20秒／expected outcomes均不改。168项离线回归145过、23平台跳过；这不是修好PowerShell超时的证据，后续必须以实际门禁结果为准。原日志和清理说明在`ci-d3b0c00/`。
+
 e1ca O09训练／留出及短观察的原始819成员归档SHA `fda4d35fc5ec6b25a30701513b579fbccbe4f32964628d86d01107ceb41674a1`。Ku normal／O3／PGO实际batch热路径约34／33／25条静态指令；PGO减少界限构造和栈加载，原溢出及期限规则仍在，但静态条数不是CPU成本占比。两个短配对的Ku纯PGO相对O3方向不一致，不能由此改变默认flags。Rust训练800次中6次读头超时，未形成合格use；后续13窗与外部浏览器交互可能区间相交，第一轮也有数秒采样空窗，均保留且不补测或当正式收益。独占重复构建缓存831044227B和一次性控制器已清理，22个执行文件SHA前后相同。详见项目外`o09-e1ca225/结论.md`。
 
-正式矩阵新v3冻结实际Node入口同目录的5份源文件及成员，补上v2未登记的compute.cjs；40项离线检查通过，旧freeze不改写。旧c1cc L1保持原提交／boot下的观察：Ku batch源／C／ELF逐字相同，其他依赖的旧build proof181项与当前相同，但旧执行期未逐项记录实际Node worker路径及.NET共享runtime，未自动将整组改写为新矩阵。新golden共10项，9项通过；Ku normal在先ok200、JSON200后的mixed200中199正确、1个PG acquire_timeout，RID `2679895060000176`。本轮acquire为250ms，从操作创建起且包含后台建连；HTTP发送至返回277.423ms不等于内部等池耗时。各域未节流、无OOM、服务正常退出并回收；尚无PG阶段／owner线程现场，不能归为旧handoff缺陷。相关正式main矩阵尚未开始，保留失败，不增加超时或预热DB掩盖问题。
+正式矩阵新v3冻结实际Node入口同目录的5份源文件及成员，补上v2未登记的compute.cjs；40项离线检查通过，旧freeze不改写。旧c1cc L1保持原提交／boot下的观察：Ku batch源／C／ELF逐字相同，其他依赖的旧build proof181项与当前相同，但旧执行期未逐项记录实际Node worker路径及.NET共享runtime，未自动将整组改写为新矩阵。新golden共10项，9项通过；Ku normal在先ok200、JSON200后的mixed200中199正确、1个PG acquire_timeout，RID `2679895060000176`。本轮acquire为250ms，从操作创建起且包含后台建连；HTTP发送至返回277.423ms不等于内部等池耗时。各域未节流、无OOM、服务正常退出并回收；尚无PG阶段／owner线程现场，不能归为旧handoff缺陷。相关正式main矩阵尚未开始，保留失败，不增加超时或预热DB掩盖问题。 随后独立诊断C保留原ok→JSON→mixed顺序，5代mixed1000/1000（PG200/200）均正确；首代覆盖后台建连3次／waiter通知2次，创建到首次step最大0.358ms、到SQL发送最大18.706ms，无事件丢失。703次进程采样没有异常样本或用户态栈，不能解释原失败。5代自然exit0、域回收；探针／诊断C与ELF／控制器已删除，原C／ELF复核不变。
 
 隔离VM已在无负载时正常停私库，稀疏盘32→128GiB；实际文件系统132011507712B、可用约118104334336B，CPU8／4GiB不变。私库PG16.15的1024行／schema hash与原一致、无强制停止；新boot／DB域另记，旧freeze／manifest不覆写，不将跨重启差异称因果收益。新矩阵冻结另补Java classpath、.NET publish、Node NODE_PATH及复用证明逐文件覆盖；53个离线反例过，仍需新freeze实际重哈希。
 
