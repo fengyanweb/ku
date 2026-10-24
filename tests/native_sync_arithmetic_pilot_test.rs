@@ -498,3 +498,74 @@ fn native_sync_cleanup_preserves_first_division_error_after_later_overflow() {
         "",
     );
 }
+
+#[test]
+fn native_sync_known_empty_math_guard_keeps_pending_errors_branches_and_loops() {
+    let source = r#"
+fn Echo(value:int):int { return value }
+fn AfterCall(value:int):int { first=Echo(value) return first+1 }
+fn Chain(value:int,divisor:int):int { first=value+1 second=first*3 return second/divisor }
+fn Choose(value:int,flag:bool):int {
+    base=value
+    if(flag) { base=base+1 } else { base=base*2 }
+    return base+3
+}
+fn Loop(count:int,step:int):int {
+    i=0; total=1
+    while(i<count) { total=total+step; i=i+1 }
+    return total+1
+}
+fn main() {}
+"#;
+    let generated = generate(source);
+    assert!(generated.contains("if (__ku_status == KU_INT_OK) goto block"));
+    let generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unused_source_main(void) {",
+    );
+    // Model a real unknown native caller that publishes a failure before it
+    // returns. Its caller must take that signal before any later math shortcut.
+    let generated = replace_once(
+        generated,
+        "int64_t Echo(int64_t value) {",
+        "int64_t Echo(int64_t value) {\n  __ku_sync_raise_math(KU_INT_DIV_ZERO);",
+    );
+    execute(
+        "native-sync-known-empty-guard",
+        generated,
+        r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"known-empty guard line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+int main(void) {
+  for(size_t repeat=0;repeat<16u;repeat++) {
+    __ku_sync_reset();
+    CHECK(Chain(1,2)==3);
+    CHECK(Choose(4,true)==8 && Choose(4,false)==11 && Loop(3,2)==8);
+    CHECK(__ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+    KuSyncExitSignal pending={0}; pending.kind=KU_SYNC_EXIT_ARITHMETIC_FATAL;
+    pending.arithmetic_status=KU_INT_DIV_ZERO; __ku_sync_publish(pending);
+    (void)Chain(1,2);
+    KuSyncExitSignal signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_ARITHMETIC_FATAL && signal.arithmetic_status==KU_INT_DIV_ZERO);
+    (void)AfterCall(1);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_ARITHMETIC_FATAL && signal.arithmetic_status==KU_INT_DIV_ZERO);
+    (void)Chain(INT64_MAX,0); // first overflow must win over later division
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_ARITHMETIC_FATAL && signal.arithmetic_status==KU_INT_OVERFLOW);
+    (void)Chain(1,0);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_ARITHMETIC_FATAL && signal.arithmetic_status==KU_INT_DIV_ZERO);
+    (void)Loop(3,INT64_MAX);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_ARITHMETIC_FATAL && signal.arithmetic_status==KU_INT_OVERFLOW);
+    CHECK(!__ku_call_depth && !__ku_handler_unwind_depth && __ku_handler_timeout_finish()==0);
+    CHECK(__ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+  }
+  puts("known-empty-math-guard-ok"); return 0;
+}
+"#,
+        "known-empty-math-guard-ok\n",
+        "",
+    );
+}

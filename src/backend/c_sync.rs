@@ -1,6 +1,8 @@
 //! Private same-thread fatal return mailbox for synchronous native frames.
 //! No allocation, user Result, new deadline, or Task outcome is introduced here.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use crate::ir::BlockId;
 
 use super::{
     c_expr, c_ident, c_symbol, c_zero_value, emit_owned_cleanup, expr_children, is_c_owned_type,
@@ -39,6 +41,244 @@ pub(super) fn uses_checked_integer(program: &IrProgram) -> bool {
             })
         })
     })
+}
+
+/// Optional fact over already verified IR, never a function-entry assumption.
+/// A real SyncGuard empties the TLS mailbox on both explicit successor edges.
+/// Only callback-free Copy operations can preserve that fact. A deadline poll,
+/// arithmetic operation, call or unknown operation kills it. A successful pure
+/// math helper in a proven-empty block can then bypass its redundant TLS read.
+#[derive(Default)]
+pub(super) struct MathGuardPlan {
+    blocks: HashSet<BlockId>,
+}
+
+impl MathGuardPlan {
+    pub(super) fn new(function: &IrFunction) -> Self {
+        Self::try_new(function).unwrap_or_default()
+    }
+
+    pub(super) fn contains(&self, block: BlockId) -> bool {
+        self.blocks.contains(&block)
+    }
+
+    fn try_new(function: &IrFunction) -> Option<Self> {
+        // Strictly optional: large/unknown graphs keep the original emitter.
+        // Each block can become Empty once; loops never receive an optimistic
+        // initial fact. Node/expression/edge visits share this finite budget.
+        const MAX_BLOCKS: usize = 16_384;
+        let count = function.blocks.len();
+        if count == 0 || count > MAX_BLOCKS || function.blocks[0].id != BlockId(0) {
+            return None;
+        }
+        let mut work = 1_000_000usize;
+        work = work.checked_sub(count)?;
+        work = work.checked_sub(function.params.len())?;
+        let index = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect::<HashMap<_, _>>();
+        if index.len() != count {
+            return None;
+        }
+        let mut locals = function
+            .params
+            .iter()
+            .map(|p| (p.name.as_str(), &p.ty))
+            .collect::<HashMap<_, _>>();
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                work = work.checked_sub(1)?;
+                if let IrInst::Let { name, ty, .. } = inst {
+                    if locals.insert(name, ty).is_some_and(|old| old != ty) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut predecessors = vec![0usize; count];
+        let mut unknown = vec![0usize; count];
+        let mut propagate = vec![Vec::new(); count];
+        let mut forced_unknown = vec![false; count];
+        forced_unknown[0] = true;
+        let mut math = vec![false; count];
+        for (i, block) in function.blocks.iter().enumerate() {
+            work = work.checked_sub(1)?;
+            let mut pure_prefix = true;
+            for (position, inst) in block.instructions.iter().enumerate() {
+                if position + 1 == block.instructions.len()
+                    && matches!(&block.terminator, IrTerminator::SyncGuard { .. })
+                    && matches!(inst, IrInst::Temp { value, .. } if checked_helper(value).is_some())
+                {
+                    math[i] = pure_prefix;
+                }
+                pure_prefix &= preserves_empty_mailbox(inst, &locals, &mut work)?;
+            }
+            let (targets, constant_empty, transparent) = match &block.terminator {
+                IrTerminator::SyncGuard {
+                    continue_block,
+                    cleanup_block,
+                } => (vec![*continue_block, *cleanup_block], true, false),
+                IrTerminator::Jump(target) => (vec![*target], false, pure_prefix),
+                IrTerminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } => (
+                    vec![*then_block, *else_block],
+                    false,
+                    pure_prefix && pure_copy_expr(condition, &mut work)?,
+                ),
+                // Polling may publish a deadline failure. Neither edge is an
+                // empty-mailbox witness, even with no timeout in a benchmark.
+                IrTerminator::Safepoint {
+                    continue_block,
+                    timeout_block,
+                } => (vec![*continue_block, *timeout_block], false, false),
+                IrTerminator::ForEach {
+                    body_block,
+                    after_block,
+                    ..
+                } => {
+                    forced_unknown[*index.get(after_block)?] = true; // implicit element cleanup
+                    (vec![*body_block, *after_block], false, false)
+                }
+                IrTerminator::ResultBranch {
+                    ok_block,
+                    err_block,
+                    ..
+                } => (vec![*ok_block, *err_block], false, false),
+                IrTerminator::JumpErr { target, .. } => {
+                    let mut targets = vec![*target];
+                    if let Some(next) = function.blocks.get(i + 1) {
+                        targets.push(next.id);
+                    }
+                    (targets, false, false)
+                }
+                IrTerminator::Next => (
+                    function
+                        .blocks
+                        .get(i + 1)
+                        .map(|next| vec![next.id])
+                        .unwrap_or_default(),
+                    false,
+                    false,
+                ),
+                IrTerminator::Return(_)
+                | IrTerminator::PropagateErr(_)
+                | IrTerminator::Unreachable => (Vec::new(), false, false),
+            };
+            for target in targets {
+                work = work.checked_sub(1)?;
+                let target = *index.get(&target)?;
+                predecessors[target] += 1;
+                if !constant_empty {
+                    unknown[target] += 1;
+                    if transparent {
+                        propagate[i].push(target);
+                    }
+                }
+            }
+        }
+        let mut queue = (0..count)
+            .filter(|&i| predecessors[i] != 0 && unknown[i] == 0 && !forced_unknown[i])
+            .collect::<VecDeque<_>>();
+        let mut empty = vec![false; count];
+        while let Some(i) = queue.pop_front() {
+            work = work.checked_sub(1)?;
+            if empty[i] || forced_unknown[i] {
+                continue;
+            }
+            empty[i] = true;
+            for &target in &propagate[i] {
+                work = work.checked_sub(1)?;
+                unknown[target] = unknown[target].checked_sub(1)?;
+                if unknown[target] == 0 && !forced_unknown[target] {
+                    queue.push_back(target);
+                }
+            }
+        }
+        Some(Self {
+            blocks: function
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, block)| (math[i] && empty[i]).then_some(block.id))
+                .collect(),
+        })
+    }
+}
+
+fn copy_scalar(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Float | IrType::Bool | IrType::Null
+    )
+}
+
+fn pure_copy_expr(expr: &IrExpr, work: &mut usize) -> Option<bool> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        *work = work.checked_sub(1)?;
+        if !copy_scalar(&expr.ty) {
+            return Some(false);
+        }
+        match &expr.kind {
+            IrExprKind::Literal(_)
+            | IrExprKind::Local(_)
+            | IrExprKind::Temp(_)
+            | IrExprKind::BorrowedParam(_)
+            | IrExprKind::BorrowedTemp(_) => {}
+            IrExprKind::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => pending.push(expr),
+            IrExprKind::Binary { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOp::Equal
+                        | BinaryOp::NotEqual
+                        | BinaryOp::Less
+                        | BinaryOp::LessEqual
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEqual
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) =>
+            {
+                pending.push(left);
+                pending.push(right);
+            }
+            _ => return Some(false),
+        }
+    }
+    Some(true)
+}
+
+fn preserves_empty_mailbox(
+    inst: &IrInst,
+    locals: &HashMap<&str, &IrType>,
+    work: &mut usize,
+) -> Option<bool> {
+    *work = work.checked_sub(1)?;
+    match inst {
+        IrInst::Temp { ty, value, .. } | IrInst::Let { ty, value, .. } if copy_scalar(ty) => {
+            pure_copy_expr(value, work)
+        }
+        IrInst::Store {
+            target: IrLValue::Local(name),
+            value,
+        } if locals
+            .get(name.as_str())
+            .is_some_and(|ty| copy_scalar(ty) && **ty == value.ty) =>
+        {
+            pure_copy_expr(value, work)
+        }
+        IrInst::Expr(value) => pure_copy_expr(value, work),
+        _ => Some(false),
+    }
 }
 
 fn validate_expr(expr: &IrExpr, allow_guarded_root: bool) -> KuResult<()> {
@@ -333,6 +573,28 @@ pub(super) fn emit_math_temp(
     Ok(true)
 }
 
+/// Open a private status scope; emit_block closes it after the unchanged
+/// SyncGuard. Only a MathGuardPlan witness may use the success shortcut. A
+/// failure still publishes and consumes the original first-error mailbox.
+pub(super) fn emit_fast_math_temp(
+    out: &mut COutput,
+    id: crate::ir::TempId,
+    value: &IrExpr,
+    continue_block: BlockId,
+) -> KuResult<()> {
+    let helper = checked_helper(value).ok_or_else(|| unsupported("missing checked math helper"))?;
+    let arguments = match &value.kind {
+        IrExprKind::Unary { expr, .. } => c_expr(expr)?,
+        IrExprKind::Binary { left, right, .. } => format!("{}, {}", c_expr(left)?, c_expr(right)?),
+        _ => return Err(unsupported("invalid checked math expression")),
+    };
+    out.push_str(&format!(
+        "  int64_t t{0};\n  {{ uint32_t __ku_status = {helper}({arguments}, &t{0}); __ku_sync_raise_math(__ku_status);\n  if (__ku_status == KU_INT_OK) goto block{1};\n",
+        id.0, continue_block.0,
+    ));
+    out.check()
+}
+
 pub(super) fn emit_return_guard(out: &mut COutput) -> KuResult<()> {
     out.check()?;
     out.push_str("  if (__ku_sync_deferred.kind != KU_SYNC_EXIT_NONE) goto __ku_sync_epilogue;\n");
@@ -438,6 +700,53 @@ mod tests {
             .unwrap();
         crate::checker::Checker::new().check(&ast).unwrap();
         crate::ir::lower_program(&ast).unwrap()
+    }
+
+    #[test]
+    fn native_sync_empty_mailbox_facts_require_all_incoming_guards() {
+        let program = lower(
+            "fn Chain(a:int,d:int):int { first=a+1 second=first+d return second*3 } fn main() {}",
+        );
+        let function = &program.functions[0];
+        let math = function.blocks.iter().filter(|block| matches!(block.instructions.last(), Some(IrInst::Temp { value, .. }) if checked_helper(value).is_some())).collect::<Vec<_>>();
+        assert_eq!(math.len(), 3);
+        let plan = MathGuardPlan::new(function);
+        assert!(
+            !plan.contains(math[0].id),
+            "function entry may have a pending error"
+        );
+        assert!(plan.contains(math[1].id) && plan.contains(math[2].id));
+
+        let mixed = lower("fn Choose(a:int,flag:bool):int { if(flag) { println(a) } else { value=a+1 } return a+2 } fn main() {}");
+        let function = &mixed.functions[0];
+        let last = function.blocks.iter().find(|block| matches!(block.instructions.last(), Some(IrInst::Temp { value: IrExpr { kind: IrExprKind::Binary { right, .. }, .. }, .. }) if matches!(&right.kind, IrExprKind::Literal(v) if v=="2"))).unwrap();
+        assert!(
+            !MathGuardPlan::new(function).contains(last.id),
+            "one unproven branch must defeat the merge"
+        );
+
+        let loops =
+            lower("fn Loop(a:int,n:int):int { i=0 while(i<n) { i=i+1 } return a+2 } fn main() {}");
+        let function = &loops.functions[0];
+        assert!(
+            MathGuardPlan::new(function).blocks.is_empty(),
+            "a deadline poll never proves an empty mailbox"
+        );
+
+        // Even malformed external IR must not let a successful final operation
+        // hide an earlier producer in the same block. Public validation rejects
+        // this layout too, before it can reach C generation.
+        let mut invalid = program.functions[0].clone();
+        let earlier = math[0].instructions.last().unwrap().clone();
+        let target = math[1].id;
+        invalid
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == target)
+            .unwrap()
+            .instructions
+            .insert(0, earlier);
+        assert!(!MathGuardPlan::new(&invalid).contains(target));
     }
 
     #[test]

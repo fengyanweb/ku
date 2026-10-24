@@ -2332,6 +2332,7 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
             c_zero_initializer(&local.ty)?
         ));
     }
+    let math_guards = sync::MathGuardPlan::new(function);
     for block in &function.blocks {
         emit_block(
             out,
@@ -2339,6 +2340,7 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
             &function.return_type,
             &owned_locals,
             &for_each_states,
+            &math_guards,
         )?;
     }
     if function.return_type == IrType::Void {
@@ -2359,6 +2361,7 @@ fn emit_block(
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
     for_each_states: &[ForEachState],
+    math_guards: &sync::MathGuardPlan,
 ) -> KuResult<()> {
     out.check()?;
     if block.id.0 != 0 {
@@ -2370,7 +2373,19 @@ fn emit_block(
     {
         emit_for_each_cleanup(out, state)?;
     }
-    for inst in &block.instructions {
+    let mut fast_math = false;
+    for (position, inst) in block.instructions.iter().enumerate() {
+        if math_guards.contains(block.id) && position + 1 == block.instructions.len() {
+            if let (
+                IrInst::Temp { id, value, .. },
+                IrTerminator::SyncGuard { continue_block, .. },
+            ) = (inst, &block.terminator)
+            {
+                sync::emit_fast_math_temp(out, *id, value, *continue_block)?;
+                fast_math = true;
+                continue;
+            }
+        }
         emit_inst(out, inst, return_type, owned_locals)?;
     }
     if block.terminator == IrTerminator::Unreachable
@@ -2381,7 +2396,11 @@ fn emit_block(
     {
         return Ok(());
     }
-    emit_terminator(out, block.id, &block.terminator, return_type, owned_locals)
+    emit_terminator(out, block.id, &block.terminator, return_type, owned_locals)?;
+    if fast_math {
+        out.push_str("  }\n");
+    }
+    out.check()
 }
 
 fn emit_inst(
