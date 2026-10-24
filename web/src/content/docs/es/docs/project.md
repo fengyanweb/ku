@@ -17,9 +17,9 @@ Esta documentación describe el alcance fijado de la versión preliminar experim
 
 ## Código fuente y licencia
 
-El código propio de Ku en las instantáneas que incluyen el archivo de licencia, así como la extensión actual del editor, se distribuyen bajo [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); consulta [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) para la atribución. Consulta el [código en GitHub](https://github.com/fengyanweb/ku) y la [página de la versión](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Los componentes de terceros conservan sus propias licencias.
+Consulta el [código en GitHub](https://github.com/fengyanweb/ku) y la [página de la versión](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). El código es visible públicamente, pero el código propio de Ku **no tiene una concesión de licencia de código abierto**. La extensión del editor está marcada como `UNLICENSED`. Publicar código o binarios no concede automáticamente una licencia de código abierto.
 
-Los archivos de v0.0.18-r1 y versiones anteriores conservan los materiales de licencia originales que los acompañan; este cambio de licencia del código fuente no vuelve a empaquetarlos. Usar el compilador de Ku no exige publicar el código fuente de tus propios programas. Al distribuir programas que contienen código del entorno de ejecución de Ku, cumple los requisitos de licencia y atribución aplicables, incluidos los avisos de terceros.
+Los avisos de terceros incluidos en los archivos de versiones solo se aplican a sus respectivos componentes. No conceden permisos de uso, modificación ni redistribución de Ku. Cualquier autorización necesaria debe proceder expresamente del mantenedor; este sitio web no crea nuevos compromisos de licencia.
 
 ## Informa de un problema
 

@@ -17,9 +17,9 @@ Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vora
 
 ## Quelltext und Lizenzierung
 
-Kus eigener Code in Quelltext-Snapshots mit Lizenzdatei und die aktuelle Editor-Erweiterung stehen unter der [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); Angaben zur Urheberschaft stehen in [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Siehe den [GitHub-Quelltext](https://github.com/fengyanweb/ku) und die [Veröffentlichungsseite](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Drittanbieterkomponenten behalten ihre jeweiligen Lizenzen.
+Sehen Sie sich den [Quelltext auf GitHub](https://github.com/fengyanweb/ku) und die [Veröffentlichungsseite](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) an. Der Quelltext ist öffentlich einsehbar, aber für Kus eigenen Code wurde **keine Open-Source-Lizenz erteilt**. Die Editor-Erweiterung ist als `UNLICENSED` gekennzeichnet. Die Veröffentlichung von Quelltext oder Binärdateien gewährt nicht automatisch eine Open-Source-Lizenz.
 
-Die Archive von v0.0.18-r1 und früheren Veröffentlichungen behalten ihre mitgelieferten ursprünglichen Lizenzunterlagen; diese Lizenzänderung am Quelltext packt jene Archive nicht neu. Die Nutzung des Ku-Compilers verpflichtet Sie nicht, den Quelltext eigener Programme offenzulegen. Beim Vertrieb von Programmen mit Ku-Laufzeitcode sind die geltenden Lizenz- und Urhebervermerke einschließlich der Drittanbieterhinweise einzuhalten.
+Drittanbieterhinweise in Veröffentlichungsarchiven gelten nur für die jeweiligen Komponenten. Sie gewähren keine Rechte zur Nutzung, Änderung oder Weitergabe von Ku selbst. Jede erforderliche Genehmigung muss ausdrücklich vom Maintainer kommen; diese Website begründet keine neue Lizenzzusage.
 
 ## Ein Problem melden
 

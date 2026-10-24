@@ -87,7 +87,7 @@
   "projectTitle": "Un lavoro in corso. Una storia da seguire.",
   "projectDescription": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{releasedVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",
   "github": "Esplora su GitHub",
-  "license": "Il codice attuale di Ku e l’estensione dell’editor adottano Apache-2.0. Restano valide le licenze di terzi e i materiali di licenza originali degli archivi delle versioni precedenti.",
+  "license": "Il codice sorgente è consultabile. Non è stata concessa una licenza open source.",
   "verified": "Verificato",
   "limitations": "Supporto e limiti",
   "version": "Versione della documentazione",

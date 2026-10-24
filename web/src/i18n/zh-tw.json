@@ -79,7 +79,7 @@
   "projectTitle": "認真構建，也坦誠記錄。",
   "projectDescription": "本文檔對應 v{releasedVersion} 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。",
   "github": "在 GitHub 查看專案",
-  "license": "Ku 目前原始碼與編輯器擴充套件採用 Apache-2.0；第三方保留各自授權，舊發行封存檔保留隨附的原授權材料。",
+  "license": "原始碼公開可查看，目前尚未授予開放原始碼授權條款。",
   "verified": "內容覈實",
   "limitations": "支援範圍與限制",
   "version": "文件版本",

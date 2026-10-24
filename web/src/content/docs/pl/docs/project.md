@@ -17,9 +17,9 @@ Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0
 
 ## Źródła i licencjonowanie
 
-Własny kod Ku w migawkach źródeł zawierających plik licencji oraz aktualne rozszerzenie edytora są udostępniane na [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE) (`Apache-2.0`); informacje o autorstwie znajdują się w [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Zobacz [źródła na GitHubie](https://github.com/fengyanweb/ku) i [stronę wydania](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Komponenty stron trzecich zachowują własne licencje.
+Zobacz [źródła GitHub](https://github.com/fengyanweb/ku) i [stronę wydania](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Źródła można publicznie przeglądać, lecz własny kod Ku **nie został objęty udzieloną licencją open source**. Rozszerzenie edytora ma oznaczenie `UNLICENSED`. Publikacja kodu lub plików binarnych nie udziela takiej licencji automatycznie.
 
-Archiwa v0.0.18-r1 i wcześniejszych wydań zachowują dołączone oryginalne materiały licencyjne; ta zmiana licencji źródeł nie powoduje ponownego pakowania tych archiwów. Używanie kompilatora Ku nie wymaga publikowania kodu źródłowego własnych programów. Przy rozpowszechnianiu programów zawierających kod środowiska uruchomieniowego Ku należy spełnić obowiązujące wymagania licencyjne i dotyczące autorstwa, w tym zachować informacje o komponentach stron trzecich.
+Informacje o komponentach zewnętrznych w archiwach dotyczą tylko odpowiednich komponentów. Nie ustanawiają uprawnień do używania, modyfikowania ani rozpowszechniania samego Ku. Wymagane upoważnienia muszą pochodzić wyraźnie od opiekuna; witryna nie tworzy nowych zobowiązań licencyjnych.
 
 ## Zgłoś problem
 

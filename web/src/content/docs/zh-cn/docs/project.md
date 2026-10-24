@@ -17,9 +17,9 @@ sources:
 
 ## 源码与许可
 
-包含许可文件的源码快照中，Ku 自有代码与当前编辑器扩展采用 [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE)（`Apache-2.0`），归属说明见 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)。可查看 [GitHub 源码](https://github.com/fengyanweb/ku)与[发行页面](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)；第三方组件保留各自许可。
+[查看 GitHub 源码](https://github.com/fengyanweb/ku)与[发行页面](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)。源码公开可查看，但 Ku 自身代码**未授予开源许可证**，编辑器扩展标记为 `UNLICENSED`。公开源码和二进制发布不自动授予开源许可。
 
-v0.0.18-r1 及更早发行归档保留其随附的原许可材料，本次源码许可变更不重新打包这些归档。使用 Ku 编译器不要求公开自己的程序源码；分发包含 Ku 运行时代码的程序时，应遵守适用的许可与归属要求，包括第三方声明。
+发行归档中的第三方许可只适用于相应第三方组件，不能据此推断 Ku 本身的使用、修改或再分发授权。需要相关授权时应由项目维护方明确说明；本站不添加新的许可承诺。
 
 ## 提交问题
 

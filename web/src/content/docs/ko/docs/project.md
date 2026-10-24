@@ -17,9 +17,9 @@ sources:
 
 ## 소스 및 라이선스
 
-라이선스 파일이 포함된 소스 스냅샷의 Ku 자체 코드와 현재 편집기 확장은 [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE)(`Apache-2.0`)을 따릅니다. 저작자 표시 정보는 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)를 참조하세요. [GitHub 소스](https://github.com/fengyanweb/ku)와 [릴리스 페이지](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)도 확인할 수 있습니다. 타사 구성 요소에는 각자의 라이선스가 계속 적용됩니다.
+[GitHub 소스](https://github.com/fengyanweb/ku)와 [릴리스 페이지](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)를 확인하세요. 소스는 공개적으로 볼 수 있지만 Ku 자체 코드에는 **오픈 소스 라이선스가 부여되지 않았습니다**. 편집기 확장은 `UNLICENSED`로 표시됩니다. 소스나 바이너리를 공개해도 자동으로 오픈 소스 라이선스가 부여되지는 않습니다.
 
-v0.0.18-r1 및 이전 릴리스 아카이브에는 동봉된 원래 라이선스 자료가 유지되며, 이번 소스 라이선스 변경으로 해당 아카이브를 다시 패키징하지 않습니다. Ku 컴파일러를 사용한다고 자신의 프로그램 소스를 공개해야 하는 것은 아닙니다. Ku 런타임 코드를 포함하는 프로그램을 배포할 때는 타사 고지를 포함해 적용되는 라이선스와 저작자 표시 요구 사항을 준수해야 합니다.
+릴리스 압축 파일의 제삼자 고지는 해당 구성 요소에만 적용됩니다. Ku 자체의 사용, 수정, 재배포 권한을 부여하지 않습니다. 필요한 허가는 유지 관리자가 명시적으로 제공해야 합니다. 이 웹사이트는 새로운 라이선스 약속을 만들지 않습니다.
 
 ## 문제 보고
 

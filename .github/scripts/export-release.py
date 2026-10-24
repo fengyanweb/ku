@@ -375,7 +375,7 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
         plain(manifest)
         root = manifest.parent
         if package["id"] in workspace:
-            # Ku's own license is included separately; these are third-party records.
+            # No source-license grant is inferred for Ku's workspace packages.
             continue
         identity = f"{name}-{version}"
         if identity.casefold() in seen:
@@ -435,7 +435,7 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
     return {
         "format": "ku-third-party-v1",
         "scope": "Non-dev dependency closure of workspace roots from caller-supplied cargo metadata --filter-platform TARGET. Includes build dependencies as a conservative superset, not a minimal linked-dependency list.",
-        "ku_license": "Apache-2.0",
+        "ku_license": "No open-source license grant for Ku's own code is included in this release.",
         "cargo": records,
         "rust": {"required_toolchain": "1.89.0", "materials": rust_paths},
     }
@@ -521,7 +521,7 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         raise ExportError("release output already exists; refusing overwrite")
     release = {"format": "ku-release-v1", "version": version, "target": target, "commit": commit,
                "rust_toolchain": "1.89.0", "status": "experimental",
-               "ku_license": "Apache-2.0"}
+               "ku_license": "UNLICENSED; no open-source license grant is included for Ku's own code."}
     with tempfile.TemporaryDirectory(prefix="ku-export-") as temporary:
         temporary = Path(temporary).resolve()
         staging = temporary / "staging"
@@ -542,11 +542,6 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
             raise ExportError("bundle contains an unexpected file")
         if executable == "ku" and stage.files[executable]["mode"] != 0o755:
             raise ExportError("Unix ku executable does not have its executable mode")
-        for name in ("LICENSE", "NOTICE"):
-            material = read_bounded(repo / name, MAX_LICENSE)
-            if not material.strip():
-                raise ExportError(f"empty Ku license material: {name}")
-            stage.add(name, data=material)
         stage.add("THIRD_PARTY.json", data=json_bytes(collect_licenses(stage, metadata, repo, rust_sysroot)))
         stage.add("RELEASE.json", data=json_bytes(release))
         instructions = f"""# Ku {version} ({target})
@@ -575,11 +570,9 @@ asset manifest also covers SHA256SUMS and the complete compressed archive.
 THIRD_PARTY.json records original Cargo/Rust license and copyright materials.
 The VSIX uses Node/VS Code APIs; its npm build tools are not distributed.
 
-Ku's own code is licensed under Apache-2.0; see LICENSE and NOTICE.
-Third-party components retain their own licenses and attribution requirements.
-Using Ku does not require you to publish your own program's source code.
-When distributing programs that include Ku runtime code, retain the applicable
-license, attribution and third-party materials required by those licenses.
+Ku's own code remains UNLICENSED. Publishing source or binaries here does not
+grant an open-source license. Third-party licenses apply only to their respective
+components. No additional license grant for Ku is implied by this archive.
 """
         stage.add("README-INSTALL.md", data=instructions.encode("utf-8"))
         sums = "".join(f"{spec['sha256']}  {name}\n" for name, spec in sorted(stage.files.items()))

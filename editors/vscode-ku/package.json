@@ -4,7 +4,7 @@
   "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
   "version": "0.0.18",
   "publisher": "ku-lang",
-  "license": "Apache-2.0",
+  "license": "UNLICENSED",
   "repository": {
     "type": "git",
     "url": "https://github.com/fengyanweb/ku.git",

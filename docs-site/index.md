@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个小型编程语言和解释器，当前版本为 0.0.18。简单好写、稳定、低占用和高性能是设计目标；项目仍处于实验阶段，不可用于生产。当前含 LICENSE 的 Ku 自有源码及编辑器扩展采用 [Apache-2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE)，归属见 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)。第三方保留各自许可；历史发行归档仍应核对其随附原许可材料。
+Ku 是一个小型编程语言和解释器，当前版本为 0.0.18。简单好写、稳定、低占用和高性能是设计目标；项目仍处于实验阶段，不可用于生产。目前未授予开源许可证。
 
 ## 快速入口
 

@@ -83,7 +83,7 @@
   "projectTitle": "认真构建，也坦诚记录。",
   "projectDescription": "本文档对应 v{releasedVersion} 实验预发行版的冻结范围；实际公开状态与下载资产以 GitHub Release 为准。",
   "github": "在 GitHub 查看项目",
-  "license": "Ku 当前源码与编辑器扩展采用 Apache-2.0；第三方保留各自许可，旧发行归档保留随附的原许可材料。",
+  "license": "源码公开可查看，目前尚未授予开源许可证。",
   "verified": "内容核实",
   "limitations": "支持范围与限制",
   "version": "文档版本",
