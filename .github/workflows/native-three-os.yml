@@ -850,6 +850,136 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  installed-pg:
+    name: ${{ matrix.target }} actual installed CLI PostgreSQL lifecycle
+    if: github.event_name == 'push'
+    needs: [release-bundle]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out the exact archive source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare the existing PostgreSQL fixture tools on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libpq-dev postgresql
+          source_lib="$(pg_config --libdir)/libpq.so"
+          test -e "$source_lib"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link.XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.so"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+          pg_config --version
+
+      - name: Prepare the existing PostgreSQL fixture tools on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install libpq postgresql@17
+          source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
+          test -e "$source_lib"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link.XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.dylib"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+          printf '%s\n' "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix postgresql@17)/bin/pg_config" --version
+
+      - name: Prepare the existing PostgreSQL fixture tools on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or
+              -not [IO.Path]::IsPathFullyQualified($env:PGROOT)) {
+            throw 'The Windows runner did not provide an absolute PGROOT'
+          }
+          $selected = (Resolve-Path -LiteralPath $env:PGROOT).Path
+          $importLibrary = Join-Path $selected 'lib\libpq.lib'
+          $runtimeDirectory = Join-Path $selected 'bin'
+          foreach ($tool in @('pg_config.exe', 'initdb.exe', 'pg_ctl.exe', 'psql.exe', 'libpq.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $runtimeDirectory $tool) -PathType Leaf)) {
+              throw "The selected PostgreSQL install is missing $tool"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+            throw 'The selected PostgreSQL install is missing libpq.lib'
+          }
+          $privateLib = Join-Path $env:RUNNER_TEMP ('ku-installed-pg-link-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $privateLib | Out-Null
+          Copy-Item -LiteralPath $importLibrary -Destination (Join-Path $privateLib 'libpq.lib')
+          "KU_PG_LIB=$privateLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KU_PG_RUNTIME_DIR=$runtimeDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $runtimeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $runtimeDirectory 'pg_config.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
+
+      - name: Verify current-run artifact bytes and installed sync/async PG lifecycles
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
+          & ${{ matrix.python }} -B .github/scripts/verify-installed-pg.py `
+            --repo $env:GITHUB_WORKSPACE --version $version `
+            --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
+
+      - name: Retain bounded installed-archive PG evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installed-pg-${{ matrix.target }}
+          path: ${{ runner.temp }}/ku-installed-pg*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove the owned PostgreSQL import-library link directory
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:KU_PG_LIB)) {
+            $parent = [IO.Path]::GetFullPath((Split-Path -Path $env:KU_PG_LIB -Parent))
+            $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $leaf = Split-Path -Path $env:KU_PG_LIB -Leaf
+            if ($parent -ne $expected -or $leaf -notlike 'ku-installed-pg-link-*') {
+              throw 'Refusing to clean an unowned PostgreSQL import-library path'
+            }
+            Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force
+          }
+
   verify-release:
     name: Verify the complete release asset set
     if: github.event_name == 'push'
@@ -882,7 +1012,7 @@ jobs:
   publish-release:
     name: Publish all verified release bundles together
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release]
+    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release, installed-pg]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

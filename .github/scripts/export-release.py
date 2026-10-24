@@ -133,21 +133,28 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
     return receipt
 
 
-def run_runtime_check(arguments: list[str], repo: Path, working: Path) -> subprocess.CompletedProcess:
+def run_runtime_check(arguments: list[str], repo: Path, working: Path,
+                      timeout_seconds: float = 180) -> subprocess.CompletedProcess:
     """Reuse the existing suspended Windows Job/POSIX session owner and bounds."""
+    if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 180:
+        raise ExportError("runtime verification may only shorten the existing 180-second execution cap")
     runner_path = Path(__file__).with_name("verify-native-three-os.py")
     spec = importlib.util.spec_from_file_location("ku_release_runtime_runner", runner_path)
     if spec is None or spec.loader is None:
         raise ExportError("cannot load existing native process owner")
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
-    runner.COMMAND_TIMEOUT_SECONDS = 180
+    runner.COMMAND_TIMEOUT_SECONDS = timeout_seconds
     runner.MAX_CAPTURE_BYTES = 1024 * 1024
     # Run the unchanged driver in this same contained Python process after
     # directing all of its TemporaryDirectories into our outer owned root.
+    # run_path does not set sys.path[0] for a source file; restore normal Python
+    # script sibling imports instead of retaining the -c working-directory entry.
     wrapper = ("import os,runpy,sys; root=sys.argv.pop(1); "
                "os.environ.update({name:root for name in ('TMPDIR','TMP','TEMP')}); "
-               "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+               "sys.argv=sys.argv[1:]; "
+               "sys.path[0]=os.path.dirname(os.path.realpath(sys.argv[0])); "
+               "runpy.run_path(sys.argv[0],run_name='__main__')")
     command = [arguments[0], "-B", "-c", wrapper, str(working), *arguments[2:]]
     return runner.run_bounded(command, repo, "installed runtime smoke")
 

@@ -19,6 +19,7 @@ from pathlib import Path
 import select
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -383,7 +384,7 @@ def cleanup_fixture(report, output, service, proxy, data, stop_database, started
             clean("proxy", proxy.close)
         # pg_ctl may have created a server before its launching tool failed.
         # Only this fixture's private data path is inspected or stopped.
-        if started or (Path(data) / "postmaster.pid").is_file():
+        if stop_database is not None and (started or (Path(data) / "postmaster.pid").is_file()):
             clean("postgres", stop_database)
     finally:
         report["cleanup_errors"] = errors
@@ -585,10 +586,56 @@ def parse_args(argv=None):
     parser.add_argument("--profile", choices=["debug", "release"], default="debug")
     parser.add_argument("--lane", choices=["both", "sync", "async"], default="both",
                         help="Run independent sync and/or named async HTTP -> PostgreSQL lifecycles")
+    parser.add_argument("--database-owner-config", type=Path,
+                        help="Private installed-archive verifier only; parent retains the direct postgres child")
     args = parser.parse_args(argv)
     if args.performance_seconds and not 3 <= args.performance_seconds <= 60:
         parser.error("performance-seconds must be 3..60")
     return args
+
+
+def installed_database_owner(args, lane, tools):
+    """Only the direct parent verifier's new POSIX cluster, never a db.conn."""
+    configured = getattr(args, "database_owner_config", None)
+    if configured is None:
+        return None
+    if os.name == "nt" or configured.is_symlink():
+        raise ValueError("external private database owner is POSIX-only")
+    root = configured.parent.resolve()
+    info = root.stat()
+    if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700
+            or configured.name != "owner.json"):
+        raise ValueError("private database owner directory differs")
+    if configured.absolute() != configured.resolve():
+        raise ValueError("private database owner record must not traverse links")
+    with configured.open("rb") as incoming:
+        raw = incoming.read(4097)
+    if len(raw) > 4096:
+        raise ValueError("private database owner record exceeds limit")
+    spec = json.loads(raw)
+    required = {"format", "lane", "root", "data", "tools", "port", "pid", "owner_pid", "root_device", "root_inode"}
+    if (not isinstance(spec, dict) or set(spec) != required
+            or spec["format"] != "ku-installed-private-pg-owner-v1" or spec["lane"] != lane
+            or spec["owner_pid"] != os.getppid() or spec["root"] != str(root)
+            or spec["data"] != str(root / "data") or spec["tools"] != str(tools.resolve())
+            or spec["root_device"] != info.st_dev or spec["root_inode"] != info.st_ino
+            or type(spec["port"]) is not int or not 1024 <= spec["port"] <= 65535
+            or type(spec["pid"]) is not int or spec["pid"] <= 0):
+        raise ValueError("private database owner identity differs")
+    data = root / "data"
+    pid_file = data / "postmaster.pid"
+    if data.is_symlink() or pid_file.is_symlink():
+        raise ValueError("private database owner paths must be plain")
+    with pid_file.open("rb") as incoming:
+        pid_bytes = incoming.read(8193)
+    if len(pid_bytes) > 8192:
+        raise ValueError("private database pid record exceeds bound")
+    lines = pid_bytes.decode("utf-8").splitlines()
+    if (len(lines) < 8 or lines[0] != str(spec["pid"]) or lines[1] != str(data)
+            or lines[3] != str(spec["port"]) or lines[7].strip() != "ready"
+            or os.getpgid(spec["pid"]) != spec["pid"] or os.getsid(spec["pid"]) != spec["pid"]):
+        raise ValueError("private database owner is not the expected ready session")
+    return spec
 
 
 def run_lane(args, lane, on_checkpoint=None):
@@ -631,10 +678,16 @@ def run_lane(args, lane, on_checkpoint=None):
     for name in ["initdb", "pg_ctl", "psql"]:
         if not (tools / (name + suffix)).is_file():
             raise RuntimeError(f"missing PostgreSQL server tool: {name}")
+    external_owner = installed_database_owner(args, lane, tools)
+    report["database_process_owner"] = ("outer installed-archive verifier" if external_owner else "this fixture")
+    if external_owner:
+        report["database_owner_pid"] = external_owner["pid"]
     with tempfile.TemporaryDirectory(prefix="ku-http-pg-acceptance-") as temporary:
         root = Path(temporary)
         database_port, http_port = port(), port()
-        data = root / "data"
+        data = Path(external_owner["data"]) if external_owner else root / "data"
+        if external_owner:
+            database_port = external_owner["port"]
         service = None
         request = None
         proxy = None
@@ -665,13 +718,14 @@ def run_lane(args, lane, on_checkpoint=None):
                 environment["KU_PG_LIB"] = str(private_lib)
             environment["PGCLIENTENCODING"] = "UTF8"
             environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
-            execute([tools / "initdb", "-D", data, "-U", "ku_accept", "--auth-local=trust",
-                 "--auth-host=trust", "--encoding=UTF8", "--locale=C", "--no-instructions"])
-            options = f"-h 127.0.0.1 -p {database_port} -c max_connections=24 -c shared_buffers=16MB"
-            if os.name != "nt":
-                options += f' -k "{root}"'
-            execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
-            started = True
+            if external_owner is None:
+                execute([tools / "initdb", "-D", data, "-U", "ku_accept", "--auth-local=trust",
+                     "--auth-host=trust", "--encoding=UTF8", "--locale=C", "--no-instructions"])
+                options = f"-h 127.0.0.1 -p {database_port} -c max_connections=24 -c shared_buffers=16MB"
+                if os.name != "nt":
+                    options += f' -k "{root}"'
+                execute([tools / "pg_ctl", "-D", data, "-l", root / "postgres.log", "-w", "-t", "20", "start", "-o", options])
+                started = True
 
             def sql(statement, deadline=None):
                 budget = {}
@@ -1029,7 +1083,7 @@ def run_lane(args, lane, on_checkpoint=None):
             raise
         finally:
             cleanup_fixture(report, args.output, service, proxy, data,
-                lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"]), started,
+                (None if external_owner else lambda: execute([tools / "pg_ctl", "-D", data, "-w", "-t", "15", "stop", "-m", "immediate"])), started,
                 on_checkpoint=on_checkpoint)
     report["status"] = "passed"
     progress("fixture:finished")

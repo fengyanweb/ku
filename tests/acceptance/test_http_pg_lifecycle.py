@@ -950,5 +950,69 @@ class FreshReadRecoveryContracts(unittest.TestCase):
         self.assertAlmostEqual(scenario.recovery["elapsed_seconds"], 0.2)
 
 
+
+@unittest.skipIf(os.name == "nt", "Parent-owned foreground PostgreSQL is POSIX-only")
+class InstalledDatabaseOwnerContracts(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="ku-parent-db-unit-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        self.config = self.root / "owner.json"
+        info = self.root.stat()
+        self.spec = {"format": "ku-installed-private-pg-owner-v1", "lane": "sync",
+                     "root": str(self.root), "data": str(self.data), "tools": str(self.tools),
+                     "port": 19192, "pid": 190101, "owner_pid": 190100,
+                     "root_device": info.st_dev, "root_inode": info.st_ino}
+        self.config.write_text(json.dumps(self.spec))
+        self.pid = self.data / "postmaster.pid"
+        self.pid.write_text(f"190101\n{self.data}\n1700000000\n19192\n\n\n\nready\n")
+        self.args = SimpleNamespace(database_owner_config=self.config)
+
+    def owner(self):
+        with patch.object(fixture.os, "getppid", return_value=190100), \
+             patch.object(fixture.os, "getpgid", return_value=190101), \
+             patch.object(fixture.os, "getsid", return_value=190101):
+            return fixture.installed_database_owner(self.args, "sync", self.tools)
+
+    def test_only_exact_parent_owned_ready_cluster_is_accepted_and_default_is_unchanged(self):
+        self.assertEqual(self.owner(), self.spec)
+        self.assertIsNone(fixture.installed_database_owner(SimpleNamespace(), "sync", self.tools))
+
+    def test_mismatched_owner_lane_root_data_tools_inode_port_and_extra_fields_are_rejected(self):
+        for key, value in (("owner_pid", 190999), ("lane", "async"), ("root", "/unrelated"),
+                           ("data", "/unrelated/data"), ("tools", "/unrelated/tools"),
+                           ("root_inode", 0), ("port", 0), ("unexpected", True)):
+            with self.subTest(key=key):
+                self.config.write_text(json.dumps(self.spec | {key: value}))
+                with self.assertRaises(ValueError): self.owner()
+        self.config.write_text(json.dumps(self.spec))
+
+    def test_pid_record_nonready_other_pid_port_and_links_are_rejected(self):
+        original = self.pid.read_text()
+        for raw in (original.replace("190101\n", "190999\n", 1),
+                    original.replace("19192\n", "19193\n", 1), original.replace("ready", "starting")):
+            with self.subTest(raw=raw[:40]):
+                self.pid.write_text(raw)
+                with self.assertRaises(ValueError): self.owner()
+        self.pid.write_text(original)
+        other = self.root / "other-pid"
+        self.pid.rename(other)
+        self.pid.symlink_to(other)
+        with self.assertRaises(ValueError): self.owner()
+
+    def test_delegated_cleanup_does_not_stop_or_delete_parent_database(self):
+        report = {}
+        output = self.root / "report.json"
+        with redirect_stdout(io.StringIO()):
+            fixture.cleanup_fixture(report, output, None, None, self.data, None, False)
+        self.assertEqual(report["cleanup_errors"], [])
+        self.assertTrue(self.pid.is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
