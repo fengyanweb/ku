@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -22,6 +23,308 @@ VERIFY_SPEC.loader.exec_module(V)
 
 
 class ResourceIdentityDiagnostics(unittest.TestCase):
+    def windows_resource_fixture(self, extra_created=134373228594974156):
+        # The Caddy CI failure: an old compiler process retained PPID 8904,
+        # which Windows had since assigned to this fixture's new native child.
+        records = {
+            2504: {"ppid": 3304, "image_name": "ku.exe"},
+            3044: {"ppid": 2504, "image_name": "ku.exe"},
+            8904: {"ppid": 3044, "image_name": "previous.exe"},
+            2528: {"ppid": 8904, "image_name": "vctip.exe"},
+            3304: {"ppid": 8980, "image_name": "python.exe"},
+            7116: {"ppid": 3304, "image_name": "caddy.exe"},
+        }
+        created = {2504: 134373241869561700, 3044: 134373241912654862,
+                   8904: 134373241912754210, 2528: extra_created,
+                   3304: 134373241809413413, 7116: 134373241829426148}
+        identities = {pid: {"identity_status": "observed", "creation_time_100ns": stamp,
+                            "image_path": "C:\\fixture\\" + records[pid]["image_name"]}
+                      for pid, stamp in created.items()}
+        threads = {2504: 6, 3044: 6, 8904: 12, 2528: 15, 3304: 9, 7116: 6}
+        samples = Mock()
+        samples.windows_process_sample.side_effect = lambda pid: {
+            "threads": threads[pid], "rss_bytes": 1}
+        supervisor = Mock(pid=2504)
+        supervisor.poll.return_value = None
+        return records, identities, samples, supervisor
+
+    def resource_fixture_snapshot(self, records, identities, samples, supervisor, birth_order=None):
+        birth_order = birth_order or (lambda _pid, created: {
+            "identity_status": "observed", "creation_time_100ns": created,
+            "create_interrupt_time_100ns": created, "boot_id": 7})
+        with patch.object(V.os, "name", "nt"), \
+                patch.object(V.os, "getpid", return_value=3304), \
+                patch.object(V.M, "OWNED_SUPERVISORS", {"a": supervisor}), \
+                patch.object(V, "windows_process_records", return_value=records), \
+                patch.object(V, "windows_process_identity", side_effect=lambda pid, **_kwargs: identities[pid].copy()), \
+                patch.object(V, "windows_process_birth_order", side_effect=birth_order), \
+                patch.object(V.importlib.util, "spec_from_file_location", return_value=Mock()), \
+                patch.object(V.importlib.util, "module_from_spec", return_value=samples):
+            return V.resource_snapshot(Mock(pid=7116), include_roles=True)
+
+    def test_windows_snapshot_rejects_stale_ppid_before_resource_attribution(self):
+        snapshot = self.resource_fixture_snapshot(*self.windows_resource_fixture())
+        slot = [row for row in snapshot["processes"] if row.get("slot") == "a"]
+        self.assertEqual(sum(row["threads"] for row in slot), 24)
+        self.assertEqual({row["pid"] for row in slot}, {2504, 3044, 8904})
+        excluded = snapshot.get("excluded_processes", [])
+        edge = next(row for row in excluded if row.get("pid") == 2528)
+        self.assertEqual(edge["ppid"], 8904)
+        self.assertEqual(edge["reason"], "parent_pid_reused")
+        self.assertEqual(edge["creation_time_100ns"], 134373228594974156)
+        self.assertEqual(edge["parent_creation_time_100ns"], 134373241912754210)
+
+    def test_windows_snapshot_counts_true_descendant_and_preserves_thread_gate(self):
+        config = {"slots": [{"name": "a"}], "deployment_budget": {
+            "management_threads": 34, "management_memory_bytes": 100,
+            "total_threads": 133, "reserved_memory_bytes": 100,
+            "per_instance": {"total_threads": 33, "reserved_memory_bytes": 100}}}
+        for clock_reversed in (False, True):
+            with self.subTest(clock_reversed=clock_reversed):
+                birth_order = (lambda pid, created: {"identity_status": "observed",
+                    "creation_time_100ns": created, "boot_id": 7,
+                    "create_interrupt_time_100ns": 201 if pid == 2528 else 200}) if clock_reversed else \
+                    Mock(side_effect=AssertionError("normal resource ancestry must not query cold telemetry"))
+                snapshot = self.resource_fixture_snapshot(*self.windows_resource_fixture(
+                    extra_created=134373228594974156 if clock_reversed else 134373241912754211),
+                    birth_order=birth_order)
+                slot = [row for row in snapshot["processes"] if row.get("slot") == "a"]
+                self.assertEqual(sum(row["threads"] for row in slot), 39)
+                self.assertEqual({row["pid"] for row in slot}, {2504, 3044, 8904, 2528})
+                with patch.object(V.os, "getpid", return_value=3304):
+                    with self.assertRaisesRegex(RuntimeError, "slot a threads 39 > 33"):
+                        V.validate_caddy_resources(snapshot, config, 7116)
+
+    def test_windows_snapshot_reversed_clock_without_birth_order_is_unverified(self):
+        with self.assertRaisesRegex(RuntimeError, "birth order unknown"):
+            self.resource_fixture_snapshot(*self.windows_resource_fixture(),
+                birth_order=Mock(side_effect=RuntimeError("birth order unknown")))
+
+    def test_windows_stale_edge_evidence_has_a_fixed_bound(self):
+        records = {1: {"ppid": 0}, **{pid: {"ppid": 1} for pid in range(100, 140)}}
+        identity = lambda pid: {"identity_status": "observed",
+                               "creation_time_100ns": 100 if pid == 1 else 50}
+        with patch.object(V, "windows_process_birth_order", side_effect=lambda _pid, created: {
+                "identity_status": "observed", "creation_time_100ns": created,
+                "create_interrupt_time_100ns": created, "boot_id": 7}):
+            selected = V.windows_owned_processes(records, {1}, identity_reader=identity)
+        self.assertEqual(set(selected["processes"]), {1})
+        self.assertEqual(selected["excluded_process_count"], 40)
+        self.assertEqual(len(selected["excluded_processes"]), 32)
+        self.assertTrue(selected["excluded_processes_truncated"])
+
+    def test_windows_snapshot_unknown_candidate_is_not_silently_excluded(self):
+        records, identities, samples, supervisor = self.windows_resource_fixture()
+        identities[2528] = {"identity_status": "unknown", "identity_error": "access denied"}
+        with self.assertRaisesRegex(RuntimeError, "identity unknown"):
+            self.resource_fixture_snapshot(records, identities, samples, supervisor)
+
+    def test_windows_snapshot_rejects_identity_change_during_sampling(self):
+        records, identities, samples, supervisor = self.windows_resource_fixture()
+
+        def sample(pid):
+            if pid == 8904:
+                identities[pid]["creation_time_100ns"] += 1
+            return {"threads": 1, "rss_bytes": 1}
+
+        samples.windows_process_sample.side_effect = sample
+        with self.assertRaisesRegex(RuntimeError, "identity.*changed|changed.*identity"):
+            self.resource_fixture_snapshot(records, identities, samples, supervisor)
+
+    def test_windows_snapshot_rejects_parent_change_between_snapshots(self):
+        records, identities, samples, supervisor = self.windows_resource_fixture()
+        changed = {pid: row.copy() for pid, row in records.items()}
+        changed[8904]["ppid"] = 7116
+        with patch.object(V.os, "name", "nt"), \
+                patch.object(V.os, "getpid", return_value=3304), \
+                patch.object(V.M, "OWNED_SUPERVISORS", {"a": supervisor}), \
+                patch.object(V, "windows_process_records", side_effect=[records, changed, changed]), \
+                patch.object(V, "windows_process_identity", side_effect=lambda pid, **_kwargs: identities[pid].copy()), \
+                patch.object(V, "windows_process_birth_order", side_effect=lambda _pid, created: {
+                    "identity_status": "observed", "creation_time_100ns": created,
+                    "create_interrupt_time_100ns": created, "boot_id": 7}), \
+                patch.object(V.importlib.util, "spec_from_file_location", return_value=Mock()), \
+                patch.object(V.importlib.util, "module_from_spec", return_value=samples):
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                V.resource_snapshot(Mock(pid=7116), include_roles=True)
+
+    def test_windows_native_child_rejects_stale_direct_ppid(self):
+        records, identities, _samples, _supervisor = self.windows_resource_fixture()
+        records[2528]["ppid"] = 3044
+        with patch.object(V.os, "name", "nt"), \
+                patch.object(V, "windows_process_records", return_value=records), \
+                patch.object(V, "windows_process_identity", side_effect=lambda pid: identities[pid].copy()), \
+                patch.object(V, "windows_process_birth_order", side_effect=lambda _pid, created: {
+                    "identity_status": "observed", "creation_time_100ns": created,
+                    "create_interrupt_time_100ns": created, "boot_id": 7}):
+            self.assertEqual(V.native_child(3044), 8904)
+            pid, identity = V.native_child(3044, return_identity=True)
+            with self.assertRaisesRegex(RuntimeError, "launcher 3044 identity changed"):
+                V.native_child(3044, expected_parent_creation_time_100ns=1)
+        self.assertEqual(pid, 8904)
+        self.assertEqual(identity["creation_time_100ns"], identities[8904]["creation_time_100ns"])
+
+    def test_windows_native_child_unknown_candidate_cannot_be_ignored(self):
+        records, identities, _samples, _supervisor = self.windows_resource_fixture()
+        records[2528]["ppid"] = 3044
+        identities[2528] = {"identity_status": "unknown"}
+        with patch.object(V.os, "name", "nt"), \
+                patch.object(V, "windows_process_records", return_value=records), \
+                patch.object(V, "windows_process_identity", side_effect=lambda pid: identities[pid].copy()), \
+                patch.object(V, "windows_process_birth_order", side_effect=lambda _pid, created: {
+                    "identity_status": "observed", "creation_time_100ns": created,
+                    "create_interrupt_time_100ns": created, "boot_id": 7}):
+            with self.assertRaisesRegex(RuntimeError, "identity unknown"):
+                V.native_child(3044)
+
+    def test_windows_native_child_checks_birth_order_even_when_utc_looks_valid(self):
+        records, identities, _samples, _supervisor = self.windows_resource_fixture(
+            extra_created=134373241912754211)
+        records[2528]["ppid"] = 3044
+        for unknown_order in (False, True):
+            with self.subTest(unknown_order=unknown_order):
+                def birth_order(pid, created):
+                    if unknown_order:
+                        raise RuntimeError("birth order unknown")
+                    return {"identity_status": "observed", "creation_time_100ns": created,
+                            "create_interrupt_time_100ns": 1 if pid == 2528 else created, "boot_id": 7}
+
+                with patch.object(V.os, "name", "nt"), \
+                        patch.object(V, "windows_process_records", return_value=records), \
+                        patch.object(V, "windows_process_identity", side_effect=lambda pid: identities[pid].copy()), \
+                        patch.object(V, "windows_process_birth_order", side_effect=birth_order):
+                    if unknown_order:
+                        with self.assertRaisesRegex(RuntimeError, "birth order unknown"):
+                            V.native_child(3044)
+                    else:
+                        self.assertEqual(V.native_child(3044), 8904)
+
+    def test_windows_birth_order_validates_fixed_native_header_and_unknown_api(self):
+        import ctypes
+
+        cases = ("valid", "api_missing", "status", "short_return", "oversize_return",
+                 "short_header", "oversize_header", "pid_mismatch", "creation_mismatch",
+                 "missing_interrupt", "held_identity_mismatch")
+        for case in cases:
+            with self.subTest(case=case):
+                kernel, query = Mock(), Mock()
+                kernel.OpenProcess.return_value = 501
+                kernel.CloseHandle.return_value = True
+
+                def times(_process, created, _exited, _system, _user):
+                    created._obj.dwLowDateTime = 101 if case == "held_identity_mismatch" else 100
+                    return True
+
+                def telemetry(process, information_class, buffer, capacity, returned):
+                    self.assertEqual((process, information_class, capacity), (501, 64, 65536))
+                    # The wire header has fixed 32/64-bit fields and trailing
+                    # padding, independent of the host C unsigned-long size.
+                    header = bytearray(96)
+                    struct.pack_into("<IIQQQQQQII", header, 0,
+                        95 if case == "short_header" else 97 if case == "oversize_header" else 96,
+                        8905 if case == "pid_mismatch" else 8904, 19,
+                        101 if case == "creation_mismatch" else 100,
+                        0 if case == "missing_interrupt" else 200, 180, 1, 50, 3, 7)
+                    ctypes.memmove(buffer, bytes(header), len(header))
+                    returned._obj.value = 95 if case == "short_return" else \
+                        65537 if case == "oversize_return" else 96
+                    return 0xc0000003 if case == "status" else 0
+
+                kernel.GetProcessTimes.side_effect = times
+                query.side_effect = telemetry
+                ntdll = object() if case == "api_missing" else Mock(NtQueryInformationProcess=query)
+                with patch("ctypes.WinDLL", create=True,
+                           side_effect=lambda name, **_kwargs: kernel if name == "kernel32" else ntdll), \
+                        patch("ctypes.get_last_error", create=True, return_value=5):
+                    if case == "valid":
+                        order = V.windows_process_birth_order(8904, 100)
+                        self.assertEqual(order, {"identity_status": "observed", "creation_time_100ns": 100,
+                            "create_interrupt_time_100ns": 200, "boot_id": 7,
+                            "telemetry_header_size": 96, "telemetry_return_length": 96})
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "birth order unknown"):
+                            V.windows_process_birth_order(8904, 100)
+                if case == "api_missing":
+                    kernel.OpenProcess.assert_not_called()
+                    kernel.CloseHandle.assert_not_called()
+                else:
+                    kernel.CloseHandle.assert_called_once_with(501)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires the real Windows process API")
+    def test_windows_current_process_birth_order_native_api(self):
+        pid = V.os.getpid()
+        identity = V.windows_process_identity(pid)
+        created = V.windows_creation_time(pid, identity)
+        order = V.windows_process_birth_order(pid, created)
+        self.assertEqual(order["identity_status"], "observed")
+        self.assertEqual(order["creation_time_100ns"], created)
+        self.assertGreater(order["create_interrupt_time_100ns"], 0)
+        self.assertIs(type(order["boot_id"]), int)
+        self.assertGreaterEqual(order["telemetry_header_size"], 96)
+        self.assertGreaterEqual(order["telemetry_return_length"], order["telemetry_header_size"])
+        self.assertLessEqual(order["telemetry_return_length"], 65536)
+
+    def test_windows_cleanup_distinguishes_same_instance_and_reused_pid(self):
+        expected = {(8904, 100): {"pid": 8904, "creation_time_100ns": 100}}
+        records = {8904: {"ppid": 3044, "image_name": "previous.exe"}}
+        for current_start in (100, 101):
+            with self.subTest(current_start=current_start):
+                receipt = V.windows_cleanup_receipt(expected, records=records,
+                    identity_reader=lambda _pid: {"identity_status": "observed",
+                                                  "creation_time_100ns": current_start})
+                self.assertEqual([row["pid"] for row in receipt["remaining"]],
+                                 [8904] if current_start == 100 else [])
+                self.assertEqual([row["pid"] for row in receipt["reused"]],
+                                 [8904] if current_start == 101 else [])
+                self.assertEqual(receipt["unverified"], [])
+
+    def test_windows_cleanup_unknown_identity_is_not_a_retirement_receipt(self):
+        expected = {(8904, 100): {"pid": 8904, "creation_time_100ns": 100}}
+        receipt = V.windows_cleanup_receipt(expected,
+            records={8904: {"ppid": 3044, "image_name": "previous.exe"}},
+            identity_reader=lambda _pid: {"identity_status": "unknown", "identity_error": "access denied"})
+        self.assertEqual([row["pid"] for row in receipt["unverified"]], [8904])
+        self.assertEqual(receipt["reused"], [])
+
+    def test_windows_cleanup_absent_pid_has_no_remaining_instance(self):
+        receipt = V.windows_cleanup_receipt(
+            {(8904, 100): {"pid": 8904, "creation_time_100ns": 100}}, records={},
+            identity_reader=Mock(side_effect=AssertionError("absent PID must not be reopened")))
+        self.assertEqual(receipt["remaining"], [])
+        self.assertEqual(receipt["reused"], [])
+        self.assertEqual(receipt["unverified"], [])
+
+    def test_windows_fault_injection_checks_creation_on_the_termination_handle(self):
+        for current_start in (100, 101, None):
+            with self.subTest(current_start=current_start):
+                kernel = Mock()
+                kernel.OpenProcess.return_value = 501
+                kernel.CloseHandle.return_value = True
+                kernel.TerminateProcess.return_value = True
+
+                def times(_process, created, _exited, _system, _user):
+                    if current_start is None:
+                        return False
+                    created._obj.dwHighDateTime = current_start >> 32
+                    created._obj.dwLowDateTime = current_start & 0xffffffff
+                    return True
+
+                kernel.GetProcessTimes.side_effect = times
+                with patch("ctypes.WinDLL", create=True, return_value=kernel), \
+                        patch("ctypes.get_last_error", create=True, return_value=5):
+                    if current_start == 100:
+                        V.windows_terminate_process(8904, 100)
+                    else:
+                        with self.assertRaises((RuntimeError, OSError)):
+                            V.windows_terminate_process(8904, 100)
+                kernel.OpenProcess.assert_called_once_with(0x1001, False, 8904)
+                if current_start == 100:
+                    self.assertEqual(kernel.TerminateProcess.call_count, 1)
+                    self.assertEqual(kernel.TerminateProcess.call_args.args[0], 501)
+                else:
+                    kernel.TerminateProcess.assert_not_called()
+                kernel.CloseHandle.assert_called_once_with(501)
+
     def test_selected_windows_identity_retains_creation_time_and_closes_handle(self):
         kernel = Mock()
         kernel.OpenProcess.return_value = 501
@@ -59,6 +362,29 @@ class ResourceIdentityDiagnostics(unittest.TestCase):
         self.assertIn("GetProcessTimes", identity["identity_error"])
         self.assertNotIn("image_path", identity)
         kernel.CloseHandle.assert_called_once_with(501)
+
+    def test_borrowed_supervisor_identity_never_closes_the_owned_handle(self):
+        for readable in (True, False):
+            with self.subTest(readable=readable):
+                kernel = Mock()
+
+                def times(_process, created, _exited, _system, _user):
+                    created._obj.dwLowDateTime = 100
+                    return readable
+
+                def image(_process, _flags, value, size):
+                    value.value = r"C:\fixture\ku.exe"
+                    size._obj.value = len(value.value)
+                    return True
+
+                kernel.GetProcessTimes.side_effect = times
+                kernel.QueryFullProcessImageNameW.side_effect = image
+                with patch("ctypes.WinDLL", create=True, return_value=kernel), \
+                        patch("ctypes.get_last_error", create=True, return_value=5):
+                    identity = V.windows_process_identity(2504, process_handle=501)
+                self.assertEqual(identity["identity_status"], "observed" if readable else "unknown")
+                kernel.OpenProcess.assert_not_called()
+                kernel.CloseHandle.assert_not_called()
 
     def test_identity_diagnostics_preserve_both_same_parent_candidates_and_gate(self):
         snapshot = {"processes": [

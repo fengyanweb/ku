@@ -597,11 +597,18 @@ def address():
             return value
 
 
-def native_child(leader):
+def native_child(leader, return_identity=False, expected_parent_creation_time_100ns=None):
     # The actual native service is the launcher's single direct child. Match
-    # PPID, without treating an arbitrary name/prefix as ownership evidence.
+    # process instances, without treating a name/prefix as ownership evidence.
     if os.name == "nt":
-        matches = [pid for pid, row in windows_process_records().items()
+        selected = windows_owned_processes(windows_process_records(), {int(leader)}, confirm_birth_order=True)
+        windows_same_processes(selected["processes"],
+            windows_owned_processes(windows_process_records(), {int(leader)}, confirm_birth_order=True)["processes"])
+        parent = selected["processes"][int(leader)]
+        if (expected_parent_creation_time_100ns is not None
+                and parent["creation_time_100ns"] != expected_parent_creation_time_100ns):
+            raise RuntimeError(f"launcher {leader} identity changed before fault selection")
+        matches = [pid for pid, row in selected["processes"].items()
                    if row["ppid"] == int(leader) and pid != int(leader)]
     else:
         result = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True, capture_output=True, timeout=3, check=True)
@@ -609,7 +616,8 @@ def native_child(leader):
                    if len(parts := line.split()) == 2 and int(parts[1]) == leader]
     if len(matches) != 1:
         raise RuntimeError(f"expected one native child of launcher {leader}, got {matches}")
-    return matches[0]
+    pid = matches[0]
+    return (pid, selected["processes"][pid]) if return_identity and os.name == "nt" else pid
 
 
 def windows_process_records():
@@ -655,13 +663,8 @@ def windows_process_records():
             raise OSError(ctypes.get_last_error(), "CloseHandle(process snapshot)")
 
 
-def windows_process_identity(pid):
-    """Add bounded identity evidence only; failed queries never imply absence.
-
-    A Toolhelp parent PID can outlive that parent. Keep the image and creation
-    time so a later review can distinguish descendants from reused PID ancestry;
-    this diagnostic does not change resource attribution or cleanup decisions.
-    """
+def windows_process_identity(pid, process_handle=None):
+    """Read a process instance; a borrowed Popen handle stays with its owner."""
     import ctypes
     from ctypes import wintypes
 
@@ -683,7 +686,7 @@ def windows_process_identity(pid):
             raise OSError(ctypes.get_last_error(), operation)
 
     try:
-        process = kernel.OpenProcess(0x1000, False, int(pid))
+        process = process_handle if process_handle is not None else kernel.OpenProcess(0x1000, False, int(pid))
         check(process, "OpenProcess(identity)")
         created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
         check(kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
@@ -698,9 +701,212 @@ def windows_process_identity(pid):
     except OSError as error:
         result["identity_error"] = str(error)[:256]
     finally:
-        if process and not kernel.CloseHandle(process):
+        if process and process_handle is None and not kernel.CloseHandle(process):
             result["identity_close_error"] = ctypes.get_last_error()
     return result
+
+
+def windows_creation_time(pid, identity):
+    created = identity.get("creation_time_100ns")
+    if (identity.get("identity_status") != "observed" or type(created) is not int
+            or created <= 0 or "identity_close_error" in identity):
+        raise RuntimeError(f"process {pid} identity unknown; resource ownership is unverified")
+    return created
+
+
+def windows_process_birth_order(pid, expected_creation_time_100ns):
+    """Cold UTC-reversal check; copy fixed telemetry fields, never payload strings.
+
+    Class 64 and its header are documented by Microsoft; unlike CreateTime,
+    CreateInterruptTime is unaffected by time-service/user clock adjustments.
+    Unsupported or changed native metadata leaves ownership unverified.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class TelemetryHeader(ctypes.Structure):
+        _fields_ = [("HeaderSize", ctypes.c_uint32), ("ProcessId", ctypes.c_uint32)] + [
+            (name, ctypes.c_uint64) for name in ("ProcessStartKey", "CreateTime",
+                "CreateInterruptTime", "CreateUnbiasedInterruptTime", "ProcessSequenceNumber",
+                "SessionCreateTime")] + [(name, ctypes.c_uint32) for name in (
+                    "SessionId", "BootId", "ImageChecksum", "ImageTimeDateStamp", "UserSidOffset",
+                    "ImagePathOffset", "PackageNameOffset", "RelativeAppNameOffset", "CommandLineOffset")]
+
+    def unknown(reason):
+        return RuntimeError(f"process {pid} birth order unknown: {reason}")
+
+    process = None
+    kernel = None
+    try:
+        if type(expected_creation_time_100ns) is not int or expected_creation_time_100ns <= 0:
+            raise unknown("invalid expected creation time")
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        query = ctypes.WinDLL("ntdll", use_last_error=True).NtQueryInformationProcess
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        query.argtypes = [wintypes.HANDLE, ctypes.c_uint32, ctypes.c_void_p,
+                          ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        query.restype = ctypes.c_int32
+        process = kernel.OpenProcess(0x1000, False, int(pid))
+        if not process:
+            raise unknown(f"OpenProcess failed ({ctypes.get_last_error()})")
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise unknown(f"GetProcessTimes failed ({ctypes.get_last_error()})")
+        actual = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if actual != expected_creation_time_100ns:
+            raise unknown("held process identity changed")
+        buffer = ctypes.create_string_buffer(65536)
+        returned = ctypes.c_uint32()
+        status = query(process, 64, buffer, len(buffer), ctypes.byref(returned))
+        if ctypes.c_int32(status).value < 0:
+            raise unknown(f"NtQueryInformationProcess status 0x{status & 0xffffffff:08x}")
+        if not ctypes.sizeof(TelemetryHeader) <= returned.value <= len(buffer):
+            raise unknown("telemetry return length is outside the fixed buffer/header")
+        header = TelemetryHeader.from_buffer(buffer)
+        if not ctypes.sizeof(TelemetryHeader) <= header.HeaderSize <= returned.value:
+            raise unknown("telemetry header size is outside returned bytes")
+        if header.ProcessId != int(pid) or header.CreateTime != expected_creation_time_100ns:
+            raise unknown("telemetry process identity changed")
+        if header.CreateInterruptTime == 0:
+            raise unknown("missing interrupt creation time")
+        return {"identity_status": "observed", "creation_time_100ns": int(header.CreateTime),
+                "create_interrupt_time_100ns": int(header.CreateInterruptTime),
+                "boot_id": int(header.BootId), "telemetry_header_size": int(header.HeaderSize),
+                "telemetry_return_length": int(returned.value)}
+    except (OSError, AttributeError) as error:
+        raise unknown(f"native telemetry unavailable ({type(error).__name__})") from error
+    finally:
+        if process and not kernel.CloseHandle(process):
+            raise unknown(f"CloseHandle failed ({ctypes.get_last_error()})")
+
+
+def windows_owned_processes(records, owners, identity_reader=None, confirm_birth_order=False):
+    """Reject provably stale PPID edges, never silently omit unknown identities."""
+    identity_reader = identity_reader or windows_process_identity
+    children = {}
+    for pid, row in records.items():
+        children.setdefault(row["ppid"], []).append(pid)
+    selected, excluded, excluded_count, birth_orders = {}, [], 0, {}
+
+    def read(pid):
+        if pid not in records:
+            raise RuntimeError(f"owned process {pid} missing from resource snapshot")
+        identity = identity_reader(pid)
+        windows_creation_time(pid, identity)
+        return {"pid": pid, **records[pid], **identity}
+
+    def birth_order(row):
+        pid = row["pid"]
+        if pid not in birth_orders:
+            observed = windows_process_birth_order(pid, row["creation_time_100ns"])
+            interrupt = observed.get("create_interrupt_time_100ns")
+            boot = observed.get("boot_id")
+            if (observed.get("identity_status") != "observed"
+                    or observed.get("creation_time_100ns") != row["creation_time_100ns"]
+                    or type(interrupt) is not int or interrupt <= 0
+                    or type(boot) is not int or not 0 <= boot <= 0xffffffff):
+                raise RuntimeError(f"process {pid} birth order unknown: invalid telemetry identity/order")
+            birth_orders[pid] = observed
+        return birth_orders[pid]
+
+    pending = []
+    for pid in owners:
+        selected[pid] = read(pid)
+        pending.append(pid)
+    while pending:
+        parent = pending.pop()
+        for pid in children.get(parent, []):
+            if pid in selected:
+                continue
+            child = read(pid)
+            if confirm_birth_order or child["creation_time_100ns"] < selected[parent]["creation_time_100ns"]:
+                parent_order, child_order = birth_order(selected[parent]), birth_order(child)
+                if parent_order["boot_id"] != child_order["boot_id"]:
+                    raise RuntimeError(f"process {pid} birth order unknown: incomparable boot IDs")
+                if child_order["create_interrupt_time_100ns"] < parent_order["create_interrupt_time_100ns"]:
+                    excluded_count += 1
+                    if len(excluded) < 32:
+                        excluded.append({"pid": pid, "ppid": parent, "reason": "parent_pid_reused",
+                            "creation_time_100ns": child["creation_time_100ns"],
+                            "parent_creation_time_100ns": selected[parent]["creation_time_100ns"],
+                            "create_interrupt_time_100ns": child_order["create_interrupt_time_100ns"],
+                            "parent_create_interrupt_time_100ns": parent_order["create_interrupt_time_100ns"],
+                            "boot_id": child_order["boot_id"]})
+                    continue
+            selected[pid] = child
+            pending.append(pid)
+    return {"processes": selected, "excluded_processes": excluded,
+            "excluded_process_count": excluded_count,
+            "excluded_processes_truncated": excluded_count > len(excluded)}
+
+
+def windows_same_processes(expected, actual):
+    if set(expected) != set(actual) or any(
+            (row["creation_time_100ns"], row["ppid"]) !=
+            (actual[pid]["creation_time_100ns"], actual[pid]["ppid"])
+            for pid, row in expected.items()):
+        raise RuntimeError("Windows process identity changed or ancestry changed during resource snapshot")
+
+
+def windows_cleanup_receipt(expected, records=None, identity_reader=None):
+    """A reused PID is not the sampled instance; unknown remains unverified."""
+    records = windows_process_records() if records is None else records
+    identity_reader = identity_reader or windows_process_identity
+    result = {"remaining": [], "reused": [], "unverified": []}
+    for pid, created in sorted(expected):
+        if pid not in records:
+            continue
+        current = {"pid": pid, **records[pid], **identity_reader(pid)}
+        try:
+            now_created = windows_creation_time(pid, current)
+        except RuntimeError:
+            current["expected_creation_time_100ns"] = created
+            result["unverified"].append(current)
+            continue
+        if now_created == created:
+            result["remaining"].append(current)
+        else:
+            current["expected_creation_time_100ns"] = created
+            result["reused"].append(current)
+    return result
+
+
+def windows_terminate_process(pid, expected_creation_time_100ns):
+    """Validate and terminate one held instance, never reopen a validated PID."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    process = kernel.OpenProcess(0x1001, False, int(pid))
+    if not process:
+        raise OSError(ctypes.get_last_error(), "OpenProcess(fault target)")
+    try:
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise OSError(ctypes.get_last_error(), "GetProcessTimes(fault target)")
+        actual = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if (type(expected_creation_time_100ns) is not int or expected_creation_time_100ns <= 0
+                or actual != expected_creation_time_100ns):
+            raise RuntimeError(f"process {pid} identity changed before fault termination")
+        if not kernel.TerminateProcess(process, 1):
+            raise OSError(ctypes.get_last_error(), "TerminateProcess(fault target)")
+    finally:
+        if not kernel.CloseHandle(process):
+            raise OSError(ctypes.get_last_error(), "CloseHandle(fault target)")
 
 
 def resource_snapshot(proxy, include_roles=False):
@@ -713,16 +919,46 @@ def resource_snapshot(proxy, include_roles=False):
         listing = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True, timeout=3, check=True)
         records = {int(parts[0]): {"ppid": int(parts[1]), "rss_bytes": int(parts[2]) * 1024}
                    for line in listing.stdout.splitlines() if len(parts := line.split()) == 3}
+    owner_processes = {process.pid: process for process in M.OWNED_SUPERVISORS.values()
+                       if process.poll() is None}
     owner_slots = {process.pid: name for name, process in M.OWNED_SUPERVISORS.items()
-                   if process.poll() is None}
+                   if process.pid in owner_processes}
     owners = set(owner_slots)
-    processes = set(owners)
-    while True:
-        descendants = {pid for pid, record in records.items() if record["ppid"] in processes}
-        if descendants <= processes:
-            break
-        processes.update(descendants)
-    processes.update([os.getpid(), proxy.pid])
+    if os.name == "nt":
+        # Popen retains the exact supervisor/proxy process handle across PID reuse.
+        handles = {pid: process._handle for pid, process in owner_processes.items()}
+        handles[proxy.pid] = proxy._handle
+
+        def identity(pid):
+            if pid in handles:
+                held = windows_process_identity(pid, process_handle=handles[pid])
+                current = windows_process_identity(pid)
+                if windows_creation_time(pid, held) != windows_creation_time(pid, current):
+                    raise RuntimeError(f"process {pid} identity changed from its owned handle")
+                return held
+            return windows_process_identity(pid)
+
+        def selected_tree(current):
+            tree = windows_owned_processes(current, owners, identity)
+            for pid in (os.getpid(), proxy.pid):
+                if pid not in current:
+                    raise RuntimeError(f"owned process {pid} missing from resource snapshot")
+                observed = identity(pid)
+                windows_creation_time(pid, observed)
+                tree["processes"][pid] = {"pid": pid, **current[pid], **observed}
+            return tree
+
+        tree = selected_tree(records)
+        windows_same_processes(tree["processes"], selected_tree(windows_process_records())["processes"])
+        processes = set(tree["processes"])
+    else:
+        processes = set(owners)
+        while True:
+            descendants = {pid for pid, record in records.items() if record["ppid"] in processes}
+            if descendants <= processes:
+                break
+            processes.update(descendants)
+        processes.update([os.getpid(), proxy.pid])
     rows = []
     for pid in sorted(processes):
         if pid not in records:
@@ -730,8 +966,7 @@ def resource_snapshot(proxy, include_roles=False):
                 raise RuntimeError(f"owned process {pid} missing from resource snapshot")
             continue
         if os.name == "nt":
-            rows.append({"pid": pid, **records[pid], **samples.windows_process_sample(pid),
-                         **windows_process_identity(pid)})
+            rows.append({**tree["processes"][pid], **samples.windows_process_sample(pid)})
             continue
         option = "-M" if os.uname().sysname == "Darwin" else "-T"
         result = subprocess.run(["ps", option, "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=2, check=True)
@@ -741,6 +976,11 @@ def resource_snapshot(proxy, include_roles=False):
     snapshot = {"processes": rows, "process_count": len(rows), "thread_count": sum(row["threads"] for row in rows),
                 "sum_rss_bytes": sum(row["rss_bytes"] for row in rows),
                 "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"}
+    if os.name == "nt":
+        windows_same_processes(tree["processes"], selected_tree(windows_process_records())["processes"])
+        snapshot.update(excluded_processes=tree["excluded_processes"],
+                        excluded_process_count=tree["excluded_process_count"],
+                        excluded_processes_truncated=tree["excluded_processes_truncated"])
     if include_roles:
         annotate_resource_roles(snapshot, owner_slots, os.getpid(), proxy.pid)
     return snapshot
@@ -861,7 +1101,15 @@ def main():
     report["diagnostic"] = diagnostic
     known_owned = {}
     supervisor_errors = {}
-    sampled_pids = set()
+    sampled_processes = {}
+
+    def remember_sample(snapshot):
+        if os.name == "nt":
+            for row in snapshot["processes"]:
+                if row["pid"] != os.getpid():
+                    created = windows_creation_time(row["pid"], row)
+                    sampled_processes[(row["pid"], created)] = {"pid": row["pid"],
+                                                               "creation_time_100ns": created}
 
     def bounded_text(value, limit=256):
         text = str(value)
@@ -1020,22 +1268,32 @@ def main():
             report["results"]["normal_proxy"] = "passed"
             stage("steady_resource_snapshot")
             report["steady_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
-            sampled_pids.update(row["pid"] for row in report["steady_resource_snapshot"]["processes"]
-                                if row["pid"] != os.getpid())
+            remember_sample(report["steady_resource_snapshot"])
             if args.caddy:
                 validate_caddy_resources(report["steady_resource_snapshot"], config, proxy.pid)
             stage("native_exit_initial_a_status")
             initial = slot_status(a)
             failure_started = time.monotonic()
             stage("native_exit_resolve_target")
-            target_pid = native_child(initial["pid"])
-            sampled_pids.add(target_pid)
+            target_identity = None
+            if os.name == "nt":
+                launcher = next((row for row in report["steady_resource_snapshot"]["processes"]
+                                 if row["pid"] == initial["pid"]), None)
+                if launcher is None:
+                    raise RuntimeError("launcher identity missing from the verified resource snapshot")
+                target_pid, target_identity = native_child(initial["pid"], return_identity=True,
+                    expected_parent_creation_time_100ns=launcher["creation_time_100ns"])
+                remember_sample({"processes": [target_identity]})
+            else:
+                target_pid = native_child(initial["pid"])
             diagnostic["fault_target"] = {"slot": "a", "launcher_pid": initial["pid"],
                                           "native_pid": target_pid, "generation": initial["generation"]}
             stage("native_exit_terminate_process" if os.name == "nt" else "native_exit_send_sigkill")
-            # Windows os.kill(SIGTERM) uses TerminateProcess on this exact PID;
-            # do not terminate the launcher or send a console-group event.
-            os.kill(target_pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+            if os.name == "nt":
+                diagnostic["fault_target"]["creation_time_100ns"] = target_identity["creation_time_100ns"]
+                windows_terminate_process(target_pid, target_identity["creation_time_100ns"])
+            else:
+                os.kill(target_pid, signal.SIGKILL)
             ordinary = []
             for index in range(10):
                 stage(f"native_exit_surviving_b_request_{index+1}")
@@ -1063,8 +1321,7 @@ def main():
             def capture_coexist():
                 stage("rolling_resource_snapshot")
                 report["rolling_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
-                sampled_pids.update(row["pid"] for row in report["rolling_resource_snapshot"]["processes"]
-                                    if row["pid"] != os.getpid())
+                remember_sample(report["rolling_resource_snapshot"])
                 if args.caddy:
                     validate_caddy_resources(report["rolling_resource_snapshot"], config, proxy.pid)
                 stage("rolling_after_resource_snapshot")
@@ -1089,8 +1346,7 @@ def main():
             if os.name == "nt":
                 stage("final_resource_snapshot")
                 report["final_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
-                sampled_pids.update(row["pid"] for row in report["final_resource_snapshot"]["processes"]
-                                    if row["pid"] != os.getpid())
+                remember_sample(report["final_resource_snapshot"])
                 validate_caddy_resources(report["final_resource_snapshot"], config, proxy.pid)
             stage("completed_checks")
             report["passed"] = True
@@ -1153,12 +1409,15 @@ def main():
                     report["passed"] = False
             if os.name == "nt":
                 try:
-                    remaining = windows_process_records()
-                    diagnostic["sampled_processes_after_cleanup"] = [
-                        {"pid": pid, **remaining[pid], **windows_process_identity(pid)}
-                        for pid in sorted(sampled_pids) if pid in remaining]
+                    receipt = windows_cleanup_receipt(sampled_processes)
+                    diagnostic["sampled_processes_after_cleanup"] = receipt["remaining"]
+                    diagnostic["sampled_process_ids_reused_after_cleanup"] = receipt["reused"]
+                    diagnostic["sampled_processes_unverified_after_cleanup"] = receipt["unverified"]
                     if diagnostic["sampled_processes_after_cleanup"]:
-                        cleanup_errors.append("sampled fixture process IDs remain after cleanup")
+                        cleanup_errors.append("sampled fixture process instances remain after cleanup")
+                        report["passed"] = False
+                    if receipt["unverified"]:
+                        cleanup_errors.append("sampled fixture process cleanup identity remains unverified")
                         report["passed"] = False
                 except (OSError, RuntimeError) as error:
                     cleanup_errors.append(bounded_text(f"process cleanup receipt: {error}"))

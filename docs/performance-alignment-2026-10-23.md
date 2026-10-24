@@ -1,5 +1,13 @@
 # Ku 性能与资源对齐：实施及验收记录
 
+## 2026-10-24：Windows 验证程序进程归属修复
+
+`c19506e` 的PR必要12作业通过；push为18过、Windows Caddy作业1失败，旧失败保留。该机编译器进程2528被残留PPID误挂到新native 8904，误加15线程，将slot实际24计为39而超过33；cleanup再把同一无关PID报为残留。本机受控反例复现39!=24。没有提高限额或结束无关编译器，也没有据此修改Ku运行时。
+
+定向调整`deploy/service/verify.py`及现有回归：按进程实例核对父子边；资源采样期间身份或树变化、查询失败均不作为通过；清理区分同实例残留、PID复用和未确认。UTC创建时间倒序时，另以同句柄的中断创建计数复核；故障注入始终用该次序验证，并在持有的目标句柄上核对实例后终止。查询采用固定64KiB上限，未知ABI/长度/身份均失败，不读取变长命令行。33线程、总预算、恢复期限和产品执行路径保持。
+
+Windows进程句柄与PID生命周期见[官方说明](https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers)；UTC可调整，中断计数次序依据[进程元数据结构](https://learn.microsoft.com/en-us/windows/win32/devnotes/process_telemetry_id_information_type)和[动态查询接口class64](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntqueryinformationprocess)。接口不支持时明确未验证，不能静默漏计。该修复是必要验收工具的归属纠正，不代表性能目标达成。
+
 ## 2026-10-24：定向修复，性能目标仍未验收
 
 默认实现本批保留：方法 receiver 只检查一次（旧代码把 `Make(text).len()` 等嵌套调用误判为二次 move）；JSON 的显式 `KuValue.take(key)`；小对象编码排序 scratch；PG 取得池锁后重核原获取期限；有界失败现场及 HTTP Task 身份关联；互斥 blocking-job Result 联合存储；未注册 async HTTP handler 不再引用未生成的 thunk。OOM与获取期限同时发生时，诊断遵循原OOM优先级，不再误记为超时。没有增加期限、重试 SQL、替换 JSON 底层、修改通用 Value／AST 暂停项。
