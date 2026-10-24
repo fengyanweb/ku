@@ -620,7 +620,7 @@ fn main() {}
     let mut harness = generated
         .replacen(
             "typedef struct KuString {",
-            &format!("{ALLOCATION_HOOK}\n{JSON_FAILURE_HOOK}\nstatic size_t ku_fixture_clone_copy_bytes;\ntypedef struct KuString {{"),
+            &format!("{ALLOCATION_HOOK}\n{JSON_FAILURE_HOOK}\nstatic size_t ku_fixture_clone_copy_bytes, ku_fixture_json_append_calls;\ntypedef struct KuString {{"),
             1,
         )
         .replacen(
@@ -634,6 +634,11 @@ fn main() {}
     let counted_clone = harness[clone_start..].replacen("if (value.len) memcpy(data, value.ptr, value.len);", "if (value.len) { memcpy(data, value.ptr, value.len); ku_fixture_clone_copy_bytes += value.len; }", 1);
     harness.truncate(clone_start);
     harness.push_str(&counted_clone);
+    harness = harness.replacen(
+        "  if (buffer->len > limit || len > limit - buffer->len) {",
+        "  ku_fixture_json_append_calls++;\n  if (buffer->len > limit || len > limit - buffer->len) {",
+        1,
+    );
     harness.push_str(r#"
 #undef malloc
 #undef calloc
@@ -682,6 +687,53 @@ int main(void) {
     const char* code=mode==0?"missing_key":mode==1?"out_of_memory":"type_unsupported";
     CHECK(ku_string_equal(missing.error.code,fixture_text(code)));ku_result_drop_kuvalue(&missing);ku_result_drop_kuvalue(&value);
     CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes);
+  }
+  /* One ordinary span may mix ASCII and validated UTF-8. Owned output must
+     outlive its input; invalid suffixes keep their old byte positions and an
+     earlier prefix allocation failure still wins over a later syntax error. */
+  const char unit[]="a你😀Z";const size_t repeats=257,unit_len=sizeof(unit)-1;
+  const size_t prefix_len=repeats*unit_len;
+  char* ordinary=(char*)malloc(prefix_len+4);CHECK(ordinary);
+  ordinary[0]='"';for(size_t i=0;i<repeats;i++)memcpy(ordinary+1+i*unit_len,unit,unit_len);
+  ordinary[1+prefix_len]='"';
+  ku_fixture_json_append_calls=0;ku_borrow_json_allocation_calls=0;
+  KuResult_kuvalue span=ku_json_parse(ku_string_static((const uint8_t*)ordinary,prefix_len+2));
+  CHECK(span.ok && span.value.tag==KU_STR && span.value.as.s.len==prefix_len);
+  printf("JSON ordinary UTF8 append_calls=%zu allocation_calls=%zu bytes=%zu\n",ku_fixture_json_append_calls,ku_borrow_json_allocation_calls,prefix_len);fflush(stdout);
+  CHECK(ku_fixture_json_append_calls==1 && ku_borrow_json_allocation_calls==1);
+  CHECK(span.value.as.s.ptr!=(const uint8_t*)ordinary+1);
+  free(ordinary);ordinary=NULL;
+  for(size_t i=0;i<repeats;i++)CHECK(!memcmp(span.value.as.s.ptr+i*unit_len,unit,unit_len));
+  ku_result_drop_kuvalue(&span);CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes);
+  for(size_t mode=0;mode<9;mode++) {
+    char* bad=(char*)malloc(prefix_len+8);CHECK(bad);
+    bad[0]='"';for(size_t i=0;i<repeats;i++)memcpy(bad+1+i*unit_len,unit,unit_len);
+    size_t len=prefix_len+1,position=len;
+    const char* message="unterminated json string";
+    if(mode==0){bad[len++]=(char)0xff;bad[len++]='"';message="invalid utf-8 in json string";}
+    if(mode==1){bad[len++]='\n';bad[len++]='"';position++;message="control character in json string";}
+    if(mode==2){bad[len++]='\\';bad[len++]='x';position+=2;message="invalid json escape";}
+    if(mode>=4) {
+      static const uint8_t suffixes[5][4]={{0xe4,'A',0,0},{0xf0,0x9f,0,0},{0xc0,0xaf,0,0},{0xed,0xa0,0x80,0},{0xf4,0x90,0x80,0x80}};
+      static const size_t widths[5]={2,2,2,3,4};
+      memcpy(bad+len,suffixes[mode-4],widths[mode-4]);len+=widths[mode-4];
+      message="invalid utf-8 in json string";
+    }
+    ku_borrow_json_allocation_calls=0;
+    KuResult_kuvalue invalid=ku_json_parse(ku_string_static((const uint8_t*)bad,len));
+    CHECK(!invalid.ok && ku_string_equal(invalid.error.code,fixture_text("parse_error")));
+    char expected[128];int n=snprintf(expected,sizeof(expected),"%s at byte %zu",message,position);
+    CHECK(n>0 && (size_t)n<sizeof(expected) && ku_string_equal(invalid.error.message,fixture_text(expected)));
+    size_t failure_sites=ku_borrow_json_allocation_calls;CHECK(failure_sites>0 && failure_sites<=16);
+    ku_result_drop_kuvalue(&invalid);CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes);
+    for(size_t fail=1;fail<=failure_sites;fail++) {
+      ku_borrow_json_allocation_calls=0;ku_borrow_fail_json_allocation=fail;
+      KuResult_kuvalue rejected=ku_json_parse(ku_string_static((const uint8_t*)bad,len));
+      ku_borrow_fail_json_allocation=0;
+      CHECK(!rejected.ok && ku_string_equal(rejected.error.code,fixture_text("out_of_memory")));
+      ku_result_drop_kuvalue(&rejected);CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes);
+    }
+    free(bad);
   }
   const char* objects[]={"{\"b\":1,\"a\":2}","{\"h\":1,\"g\":2,\"f\":3,\"e\":4,\"d\":5,\"c\":6,\"b\":7,\"a\":8}","{\"i\":0,\"h\":1,\"g\":2,\"f\":3,\"e\":4,\"d\":5,\"c\":6,\"b\":7,\"a\":8}","{\"b\":{\"d\":1,\"c\":2},\"a\":{\"f\":3,\"e\":4}}"};
   for(size_t i=0;i<4;i++) {

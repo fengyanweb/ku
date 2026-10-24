@@ -82,11 +82,11 @@ def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read=
     while (text.len() < 8) { text = "0" + text }
     return ok(http.text(req.query.rid + ":" + text))''')
     if json_mode == "response":
-        original_json = '''    body = json.encode({id: req.query.rid.clone(), counter: counter + 1, data: data})?
+        original_json = '''    body = json.encode({id: req.query.rid, counter: counter + 1, data: data})?
     return ok(http.text(body))'''
         if text.count(original_json) != 1:
             raise RuntimeError("expected exactly one original JSON handler encode/response")
-        text = text.replace(original_json, "    return ok(http.json({id: req.query.rid.clone(), counter: counter + 1, data: data}))")
+        text = text.replace(original_json, "    return ok(http.json({id: req.query.rid, counter: counter + 1, data: data}))")
     original_pg = "    async fn database(req: HttpRequest): HttpResponse! {"
     if text.count(original_pg) != 1:
         raise RuntimeError("expected exactly one public async PG handler")

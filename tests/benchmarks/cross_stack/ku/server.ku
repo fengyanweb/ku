@@ -28,7 +28,7 @@ fn encode(req: HttpRequest): HttpResponse! {
     // Explicitly consume the decoded root after the counter read. The selected
     // subtree moves to the response; ordinary indexed reads still return copies.
     data = decoded.take("data")?
-    body = json.encode({id: req.query.rid.clone(), counter: counter + 1, data: data})?
+    body = json.encode({id: req.query.rid, counter: counter + 1, data: data})?
     return ok(http.text(body))
 }
 
@@ -107,12 +107,12 @@ fn main(): null! {
         status = 500
         try {
             result = client.query("SELECT id,label,score FROM cross_stack_items WHERE id=$1",
-                [req.query.key.clone()])?
+                [req.query.key])?
             if (result.rows() != 1) { fail "database key missing" }
             key = result.value_int(0, 0)?
             label = result.value(0, 1)?
             score = result.value_int(0, 2)?
-            body = json.encode({id: key, label: label, score: score, rid: req.query.rid.clone()})?
+            body = json.encode({id: key, label: label, score: score, rid: req.query.rid})?
             status = 200
         } catch (error) { body = "database_error:" + error.code.clone() }
         return ok(http.text(status, body))

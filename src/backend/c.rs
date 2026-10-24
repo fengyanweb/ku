@@ -5864,35 +5864,39 @@ static bool ku_json_parse_string(
       ku_json_buffer_drop(&buffer);
       return ku_json_fail(error, "parse_error", "control character in json string");
     }
-    if (byte < 0x80) {
-      /* Copy one ordinary ASCII run. Quotes, escapes, C0 and non-ASCII still
-         enter their original validation paths at the same input byte. */
-      const uint8_t* start = parser->current - 1;
-      while (parser->current < parser->end) {
-        uint8_t next = *parser->current;
-        if (next < 0x20 || next >= 0x80 || next == '"' || next == '\\') break;
-        parser->current++;
-      }
-      if (!ku_json_buffer_append(&buffer, start, (size_t)(parser->current - start),
-              KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
-        ku_json_buffer_drop(&buffer);
-        return false;
-      }
-      continue;
-    }
+    /* Copy one ordinary span, validating each UTF-8 scalar before extending
+       it. Quotes, escapes and C0 retain their original per-byte paths. */
     parser->current--;
-    size_t width = 0;
-    uint32_t scalar = 0;
-    if (!ku_json_utf8_scalar(parser->current, parser->end, &width, &scalar)) {
-      ku_json_buffer_drop(&buffer);
-      return ku_json_fail(error, "parse_error", "invalid utf-8 in json string");
+    const uint8_t* start = parser->current;
+    const uint8_t* end = parser->end;
+    while (parser->current < end) {
+      uint8_t next = *parser->current;
+      if (next < 0x20 || next == '"' || next == '\\') break;
+      if (next < 0x80) {
+        parser->current++;
+        continue;
+      }
+      size_t width = 0;
+      uint32_t scalar = 0;
+      if (!ku_json_utf8_scalar(parser->current, end, &width, &scalar)) {
+        /* An allocation failure in the earlier valid prefix must still win
+           over this later syntax error, whose byte position stays unchanged. */
+        if (parser->current != start && !ku_json_buffer_append(&buffer, start,
+                (size_t)(parser->current - start), KU_JSON_MAX_INPUT_BYTES,
+                error, "json string is too large")) {
+          ku_json_buffer_drop(&buffer);
+          return false;
+        }
+        ku_json_buffer_drop(&buffer);
+        return ku_json_fail(error, "parse_error", "invalid utf-8 in json string");
+      }
+      parser->current += width;
     }
-    if (!ku_json_buffer_append(&buffer, parser->current, width,
+    if (!ku_json_buffer_append(&buffer, start, (size_t)(parser->current - start),
             KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
       ku_json_buffer_drop(&buffer);
       return false;
     }
-    parser->current += width;
   }
   ku_json_buffer_drop(&buffer);
   return ku_json_fail(error, "parse_error", "unterminated json string");
