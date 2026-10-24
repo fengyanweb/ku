@@ -324,7 +324,9 @@ static void fixture_no_scope_budget(KuTaskInstance_0* parent) {
   CHECK(!parent->drain_started && !parent->drain_deadline && !parent->drain_failure);
   CHECK(!parent->drain_deadline_published && !parent->drain_published_deadline);
   CHECK(!parent->has_cleanup_deadline && !parent->cleanup_deadline);
+#if FIXTURE_ROOT_TASK
   CHECK(ku_task_driver_scope_receipt_empty(&parent->receipts[0]));
+#endif
   KuTaskDriverV1* driver=parent->ticket.driver;
   CHECK(!ku_task_driver_lock(driver));
   KuTaskDriverSlotV1* slot=ku_task_driver_find(&parent->ticket);
@@ -374,7 +376,10 @@ static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1* ti
   CHECK(!fixture_parent->scope_mode && !fixture_parent->scope_token.driver);
   CHECK(fixture_parent->frame.header.status==KU_TASK_FRAME_EXIT_STAGED
       && fixture_parent->frame.header.result_initialized && !fixture_frees[0] && !fixture_frees[1]);
-  CHECK(receipt==&fixture_parent->receipts[0] && deadline!=UINT64_MAX);
+  CHECK(deadline!=UINT64_MAX);
+#if FIXTURE_ROOT_TASK
+  CHECK(receipt==&fixture_parent->receipts[0]);
+#endif
   uint32_t status=fixture_real_owner_drop_receipt(ticket,owner,deadline,receipt);
   CHECK(status==KU_TASK_DRIVER_OK && !owner->lease.control);
   fixture_child_receipt=*receipt; fixture_child_deadline=deadline; fixture_handoffs=1u;

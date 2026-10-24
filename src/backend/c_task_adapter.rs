@@ -641,6 +641,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             task_count += 1;
         }
     }
+    // A function with no child Task slots cannot issue a cleanup receipt.
+    // Keep its wait/timer and empty-scope state, but omit the unused span and
+    // every C expression that would refer to it (including zero-trip loops).
+    let has_children = task_count != 0;
     let source = ADAPTER_FUNCTION
         .replace("@BLOCKING_CANCEL@", if blocking { "  if (instance->blocking.pool && ku_task_blocking_cancel(&instance->ticket,&instance->blocking)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;" } else { "" })
         .replace("@BLOCKING_FIELD@", if blocking { "  KuTaskBlockingTokenV1 blocking;" } else { "" })
@@ -661,13 +665,19 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@SCOPE_SELECT@", if scoped { SCOPE_SELECT } else { "" })
         .replace("@SCOPE_PREFLIGHT@", &scope_preflight)
         .replace("@SCOPE_REGISTER@", if scoped { SCOPE_REGISTER } else { "" })
+        .replace("@SCOPE_RECEIPT_REGISTER@", if has_children { SCOPE_RECEIPT_REGISTER } else { "" })
         .replace("@SCOPE_RESUME_HELPER@", if scoped { SCOPE_RESUME_HELPER } else { "" })
+        .replace("@RESET_RECEIPTS@", if has_children { "  memset(instance->receipts,0,sizeof(instance->receipts));" } else { "" })
         .replace("@SCOPE_RESUME@", if scoped { SCOPE_RESUME } else { "" })
         .replace("@EXIT_DEADLINE@", &exit_deadline)
         .replace("@FINALLY_FINISH@", if finally { FINALLY_FINISH } else { "" })
         .replace("@CLEANUP_CLOCK@", if finally { "ku_task_adapter_finally_now" } else { "ku_task_adapter_now" })
         .replace("@EXIT_EMPTY_STARTED@", empty_started)
         .replace("@DRAIN_HAS_OWNERS@", if scoped { "scope_live_mask || instance->receipt_mask" } else { "(instance->frame.header.initialized & UINT64_C(@TASK_MASK@)) || instance->receipt_mask" })
+        .replace("@RECEIPT_FIELD@", if has_children { "  KuTaskDriverCleanupReceiptV1 receipts[@TASK_COUNT@];" } else { "" })
+        .replace("@CANCEL_RECEIPTS@", if has_children { CANCEL_RECEIPTS } else { "" })
+        .replace("@READ_RECEIPTS@", if has_children { READ_RECEIPTS } else { "" })
+        .replace("@WAIT_RECEIPTS@", if has_children { WAIT_RECEIPTS } else { "" })
         .replace("@ID@", &id)
         .replace("@RESULT@", &result_type)
         .replace("@SUFFIX@", &c_type_suffix(inner)?)
@@ -689,7 +699,6 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@KIND@", &host::kind(&function.result)?.to_string())
         .replace("@TASK_MASK@", &task_mask.to_string())
         .replace("@TASK_COUNT@", &task_count.to_string())
-        .replace("@RECEIPT_SIZE@", &task_count.max(1).to_string())
         .replace("@TRANSFERS@", &transfers)
         .replace("@PAYLOAD_ALIASES@", &payload_aliases)
         .replace("@REQUEST_ALIASES@", &request_aliases)
@@ -917,12 +926,7 @@ const SCOPE_SELECT: &str = r#"
 @SCOPE_PREFLIGHT@
 "#;
 const SCOPE_REGISTER: &str = r#"
-  if (normal_scope && !instance->scope_mode && scope_live_mask) {
-    uint32_t status=ku_task_driver_scope_begin(&instance->ticket,normal_scope->scope_id,
-        instance->receipts,@TASK_COUNT@u,scope_live_mask,instance->drain_deadline,&instance->scope_token);
-    if (status!=KU_TASK_DRIVER_OK) return status;
-    instance->scope_mode=1u; instance->scope_expected_mask=scope_live_mask;
-  } else if (!normal_scope && instance->scope_mode) {
+  @SCOPE_RECEIPT_REGISTER@if (!normal_scope && instance->scope_mode) {
     /* Explicitly re-min even after a sticky timeout: ordinary driver refresh
      * then returns early. The real promotion preserves ACK and wait epochs. */
     uint64_t effective=UINT64_MAX;
@@ -933,6 +937,12 @@ const SCOPE_REGISTER: &str = r#"
     instance->scope_mode=2u; instance->drain_deadline=effective;
   }
 "#;
+const SCOPE_RECEIPT_REGISTER: &str = r#"if (normal_scope && !instance->scope_mode && scope_live_mask) {
+    uint32_t status=ku_task_driver_scope_begin(&instance->ticket,normal_scope->scope_id,
+        instance->receipts,@TASK_COUNT@u,scope_live_mask,instance->drain_deadline,&instance->scope_token);
+    if (status!=KU_TASK_DRIVER_OK) return status;
+    instance->scope_mode=1u; instance->scope_expected_mask=scope_live_mask;
+  } else "#;
 // A multi-scope exit owns a single absolute budget in private frame storage.
 // Session close still retires its receipts normally. The next session imports
 // this same (possibly tightened) D; even an empty scope cannot renew it.
@@ -1019,7 +1029,7 @@ static uint32_t ku_task_@ID@_scope_resume(KuTaskInstance_@ID@* instance) {
   instance->drain_started=0; instance->drain_deadline=0; instance->drain_failure=0;
   instance->drain_deadline_published=0; instance->drain_published_deadline=0;
   instance->receipt_mask=0;
-  memset(instance->receipts,0,sizeof(instance->receipts));
+@RESET_RECEIPTS@
   if (ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)!=KU_TASK_DRIVER_OK) return KU_TASK_FRAME_INVALID_STATE;
   return KU_TASK_FRAME_PENDING;
 }
@@ -1071,6 +1081,23 @@ static uint32_t ku_task_adapter_http_map_charge(KuObject* map,size_t* bytes) {
 }
 "#;
 
+const CANCEL_RECEIPTS: &str = r#"    for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+      uint32_t status=ku_task_driver_cancel_receipt(&instance->receipts[i],instance->drain_deadline);
+      if (status==KU_TASK_DRIVER_CLEANUP_ACK) instance->receipt_mask &= ~(UINT64_C(1)<<i);
+      else if (status!=KU_TASK_DRIVER_OK) { instance->drain_failure=status; return status; }
+    }"#;
+const READ_RECEIPTS: &str = r#"  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+    uint32_t status=ku_task_driver_cleanup_receipt_read(&instance->receipts[i]);
+    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
+    if (status!=KU_TASK_DRIVER_PENDING) { instance->drain_failure=status; return status; }
+  }"#;
+const WAIT_RECEIPTS: &str = r#"  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+    uint32_t status=ku_task_driver_cleanup_wait_arm(&instance->ticket,&instance->receipts[i],instance->drain_deadline,&instance->wait);
+    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
+    if (status==KU_TASK_DRIVER_PENDING) return status;
+    instance->drain_failure=status; return status;
+  }"#;
+
 const ADAPTER_FUNCTION: &str = r#"
 typedef struct KuTaskInstance_@ID@ {
   KuTaskControlV1 control;
@@ -1084,7 +1111,7 @@ typedef struct KuTaskInstance_@ID@ {
   uint64_t drain_deadline, receipt_mask;
   uint32_t drain_deadline_published;
   uint64_t drain_published_deadline;
-  KuTaskDriverCleanupReceiptV1 receipts[@RECEIPT_SIZE@];
+@RECEIPT_FIELD@
   KuTaskDriverWaitTokenV1 wait;
   KuTaskDriverTimerTokenV1 timer;
 @BLOCKING_FIELD@
@@ -1170,11 +1197,7 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
     /* A later ancestor cancellation can tighten an already-transferred scope.
      * Receipts protect logical identity, and the driver uses its live registry
      * lease: never reconstruct a child owner or renew its original reason. */
-    for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
-      uint32_t status=ku_task_driver_cancel_receipt(&instance->receipts[i],instance->drain_deadline);
-      if (status==KU_TASK_DRIVER_CLEANUP_ACK) instance->receipt_mask &= ~(UINT64_C(1)<<i);
-      else if (status!=KU_TASK_DRIVER_OK) { instance->drain_failure=status; return status; }
-    }
+@CANCEL_RECEIPTS@
     instance->drain_published_deadline=instance->drain_deadline;
     instance->drain_deadline_published=1;
   }
@@ -1210,18 +1233,9 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
   }
   if (instance->drain_failure) return instance->drain_failure;
   /* Bounded by declared Task slots; no repeated polling or recursive child drive. */
-  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
-    uint32_t status=ku_task_driver_cleanup_receipt_read(&instance->receipts[i]);
-    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
-    if (status!=KU_TASK_DRIVER_PENDING) { instance->drain_failure=status; return status; }
-  }
+@READ_RECEIPTS@
   if (!instance->receipt_mask) return KU_TASK_DRIVER_OK;
-  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
-    uint32_t status=ku_task_driver_cleanup_wait_arm(&instance->ticket,&instance->receipts[i],instance->drain_deadline,&instance->wait);
-    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
-    if (status==KU_TASK_DRIVER_PENDING) return status;
-    instance->drain_failure=status; return status;
-  }
+@WAIT_RECEIPTS@
   return KU_TASK_DRIVER_OK;
 }
 @SCOPE_RESUME_HELPER@

@@ -2,7 +2,9 @@
 
 对应《Ku_Go_Rust性能对齐与资源领先_完整实施任务书_2026-10-23.md》。本轮仍在实施：已取得一组有效的七栈单核计算结果，尚未完成全部业务、容量及资源目标。**实现完成、测量有效、目标达成、安装交付分别判定。** 本文按结论与证据组织，历史失败不覆盖，未测项不填推测值。
 
-最新推送为`3b4e724`：[push40049602257](https://github.com/fengyanweb/ku/actions/runs/40049602257)的常规检查、三平台包及Linux／macOS安装包实库调用成功，Windows安装包实库失败；PR40049607059成功但安装包门禁按事件跳过，不能替代push结果。v4容量探索发现准备窗未检查仍放行的缺陷，已停止并回收，尚无新七轮正式HTTP结果。本次定向修复准备窗放行及工具树未确认退出时的lane隔离，未改产品期限、JSON默认或两个暂停模块。
+已验证交付基线为`f833ae508770ef6ad42bfd2c41de67a1db088f2e`：[push40052428315](https://github.com/fengyanweb/ku/actions/runs/40052428315)的19个必要作业、[PR40052433089](https://github.com/fengyanweb/ku/actions/runs/40052433089)的12个必要作业通过。push三平台实际安装包、资产集合及包内CLI的sync／async PG共6路均实际执行成功；发布步骤按分支规则跳过，没有公开Release。该基线修复准备窗异常仍放行及工具树未确认退出时的lane隔离；此前3b／d3失败保留，不能据新通过改写其未知原因。CI只覆盖该提交，不覆盖之后的本地产品修改。
+
+v4等待组已结束，8192目标未通过；v5已按独立业务源／执行器身份冻结，但未启动负载。用户确认没有独立Linux测试机，本轮先完成其余本地工作，不继续在当前换页条件下追加正式压测；完整HTTP性能和资源目标仍未验收。
 
 ## 1. 当前结论：哪里慢，已有多大证据
 
@@ -58,7 +60,8 @@ PG后续第一次诊断在100rps×30秒预热中出现31个HTTP500（2969/3000�
 | `d450b3e3ada4a5c35741301df790bc4777785266` | 仅Windows验收身份记录及报告后续；src／基准输入／锁与c1cc相同。已推送，push40027977065／PR40027992019必要检查均成功；push三平台实际包及资产集合检查成功。分支发布步骤按原规则跳过，不算发布通过；包内CLI的PG链仍是独立缺口 |
 | `e919a408` | 已复现的PG后继等待者通知修复；三个反例前失败后通过，不等于后续偶发acquire_timeout已经定因 |
 | `8f42e2cf` → `e1ca2259dde09822bb85de9e015d060461c91695` | checkedmul候选短配对CPU回退，已定向恢复旧实现并保留边界回归；当前Linux性能产物来自e1ca，后续目录／门禁提交未改产品源码 |
-| `f2b668d`／`d3b0c00`／`3b4e724719f33e445bdde516cf9b7214a731141c` | 安装包实库门禁、私有目录处理及重复单测清理；实际Windows实库仍失败，不能称最终三平台交付 |
+| `f2b668d`／`d3b0c00`／`3b4e724719f33e445bdde516cf9b7214a731141c` | 安装包实库门禁、私有目录处理及重复单测清理；这些历史运行存在失败或跳过，原结果见第8节 |
+| `f833ae508770ef6ad42bfd2c41de67a1db088f2e` | 已验证交付基线；准备窗及工具终止后lane隔离修复，push19／PR12必要作业及三平台实际安装包PG共6路通过，不代表完整性能目标通过 |
 
 本机PG验收采用连接退休观察合同修正；该次构建时的dirty状态与源码／CLI哈希一并记录，不能仅用HEAD称为clean构建，更不能冒充三平台CI。Linux基准产物另由确切4ea归档构建。原主目录用户改动及本工作树预存的 `docs/multicore-capacity-acceptance.md` 修改不纳入本报告变更。
 
@@ -148,11 +151,13 @@ c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增�
 
 | 项目 | 共同配置／栈 | 必要结果 | 状态 |
 | --- | --- | --- | --- |
-| timer／受控TCP分别等待 | Ku／Go／Rust／Node，1／4核1GiB，各32／128／512／2048／8192，真实持有30秒 | 实际同时等待数、完整返回、总内存／每等待增量、空闲CPU、普通探针、公平／恢复／自然退出待验 | 未验收 |
+| timer／受控TCP分别等待 | Ku／Go／Rust／Node，1／4核1GiB，各32／128／512／2048／8192，真实持有30秒 | v4四核40档已结束：13通过、8未通过、19前置阻塞；一核及8192目标、完整资源对照仍待验 | 未验收 |
 | 持续混合 | 七栈，4核1GiB，各600秒，同一可承担速率，70/20/9/1 | 按类型正确性／p99、稳态／峰值、任务／连接／队列字节趋势及回收待验 | 未验收 |
 | 真过载／恢复 | 原四栈必验，新增三栈混合补验，4核1GiB | 真实饱和、各终态、同绝对压力与各自容量1.5／2倍（必要5倍）、撤压后新请求≤5秒、完整收尾成本待验 | 未验收 |
 
 公开上限已接入16384 active／32768 connections及16384 Task／network，基准经普通config.json配置并核对管理limits。本机小组通过不等于Linux8192通过。CLI普通根默认1024、Task预算默认16MiB；正式等待使用64MiB Task账本且整进程1GiB域，另计HTTP缓冲、系统栈与外部库。8320 active／16640 connections、2owner／16384 Tasks的Mac固定backing35473944B，不是整进程峰值。
+
+v4四核本轮最高通过档（timer／TCP）为Ku32／32、Go128／32、Rust2048／128、Node32／32，仅代表已满足30秒保持及探针门槛的档位，不是容量极限或语言排名。Rust timer8192在预热阶段失败，目标组未启动；其余失败阶段及探针原样保留。21个实际执行服务均exit0、无强制终止且进程／线程／FD归零、cgroup移除；这不覆盖未通过的业务级TCP释放检查，例如Node TCP128。探针最多约56个样本，不据此发布p99／p999排名。主机换页与各异常尚无逐请求因果证据，不能将环境观察写成根因。
 
 ## 5. 表D：Ku优化前后
 
@@ -168,7 +173,7 @@ c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增�
 | 旧JSON字符串writer O07 | 相同C仅writer不同，Mac7对×10000次，19边界回归 | 仅encode CPU比：对象0.619、数组1.006、转义0.558；完整链0.824／0.997／0.699 | 数组无明确改善；非HTTP结果；保留旧库、整数／浮点1e20／NUL／Unicode／深度／OOM规则 |
 | int64 writer／ASCII parser O07 | b1→838，分离变体；20字节整数缓冲、普通ASCII片段 | 实际完整HTTP A/B待验 | 不改旧JSON默认、错误或owned结果，相关边界回归通过 |
 | JSON请求正文只读 O07 | 39→d15，metadata／IR／解释器及4类借用回归 | 消除受控调用的请求正文副本，时间／内存收益待验 | 只读输入不消费，结果独立owned；泛化旧View不暗改，子树owned复制未删 |
-| PG getter与owner query/reset O08 | 257同步→838；有限25/25、RST、GUC reset、Go／Rust同lease清理 | getter去字符串/JSON树；正式normal／reset表待验 | 物理job结束才退款，unknown不推断回滚；sync／async最新本机实库均过，三平台待验 |
+| PG getter与owner query/reset O08 | 257同步→838；有限25/25、RST、GUC reset、Go／Rust同lease清理 | getter去字符串/JSON树；正式normal／reset表待验 | 物理job结束才退款，unknown不推断回滚；本机及f833三平台实际安装包sync／async共6路实库通过，后续修改另验 |
 | PG同turn批量结果 O08 | 39→4ea；每行额外往返由C证实，4项实际C回归 | 在原byte／cell／32结果边界内连续推进，收益待Linux／Windows实测 | 实际growth仍让出；共享校验／复制预算，不延150ms产品期限 |
 | unused progress时钟 O01/O02 | 9ce→8ad，全产品无读取者，字段布局保留 | 通常完整32poll段driver读钟35→34，未测收益 | 实际出队／公平／期限／重排队时钟保留，旧私有诊断证据不改写 |
 | 同步空邮箱／无期限helper O02 | 8ad→69f，包含于4ea；首错／清理／空成员相关检查 | 实际完整调用收益待验，不能由少调用推断比例 | 无期限0读钟，非空take/reset、真实期限与清理慢体保持 |
@@ -191,8 +196,14 @@ c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增�
 | O05 HTTP | 活动路由／已有gather、json MIME与唯一响应责任 | 同语义完整吞吐、写回syscall／复制、partial-write／断开及资源 | 未验收 |
 | O06 资源 | 容量／固定账本、lazy触页；轻负载少1.039MiB | 同速率整服务稳态／峰值、8192等待与收尾保留量 | 未验收 |
 | O07 JSON | 旧默认、writer／parser局部处理、只读请求正文及边界回归 | 三语料组件A/B、最新完整调用／资源，类型化与动态分表 | 未验收 |
-| O08 PG | 原共享池owner状态机、同turn预算；等待者交接3个反例修复、14回归及本机sync／async实库过 | 偶发acquire_timeout仍缺现场因果证据；normal／reset正式对照、最新三平台CI及实际安装包PG链 | 未验收 |
+| O08 PG | 原共享池owner状态机、同turn预算；等待交接3个反例修复、14回归、本机实库及f833三平台实际安装包PG共6路通过 | 偶发acquire_timeout仍缺现场因果证据；normal／reset正式对照及f833之后修改的必要检查 | 未验收 |
 | O09 调优 | e1ca实际13个新变体、3个完整训练／use、9个独立正确性留出；26个短观察原样保留 | Rust训练失败，2个use位置未执行；短窗非平稳且后13窗可能受外部交互影响，正式normal／tuned配对尚缺 | 未验收 |
+
+### 独立机器缺失后的本地收口
+
+本轮定向处理两处有源码依据的冗余。HTTP完整头首次验证同时累计无符号Content-Length，去掉从headers map查回并再次验证的步骤；纯数字溢出仍在原位置返回400，保留Expect、目标长度和metadata准入的错误优先级。只扩充原HTTP边界用例，不改公开headers、队列、超时或响应协议。无子Task函数则不再生成从未使用的receipt占位及零次循环；wait、timer、空scope期限／取消／清理保持，有子Task的布局保持。没有改Task的四次phase检查和清理状态写入，因为现有逐状态取消与清理合同依赖它们。
+
+本机65项既有HTTP／Task回归、全workspace格式、all-targets／all-features严格Clippy和debug CLI构建通过。相同基准输入的8个真实编译实例中，7个无子Task实例各少32B：timer／waiting为1760→1728B，TCP为3632→3600B；有子Task的2712B实例不变，frame定义逐字相同。配置Mac ASan／UBSan的修改前后1740组头解释对照中，状态／正文长度／公开headers指纹／预算及回收均相同；Mac未启用LSan。以上是代码、尺寸与行为验证，没有测得端到端CPU、RSS或吞吐收益，不填入正式领先表，也不解释历史偶发超时。一次性C／可执行文件和调试副本用完删除，精简结果及源身份保留在项目外`current-validation/local-closeout/`。本轮生产改动仍须自己的提交CI，不能借用f833通过记录。
 
 O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体后，原helper未保留PG模式及源码清单，`pg_variants.derive`正确拒绝该产物。本轮仅在实际输入与原完整源码清单一致、两个模式声明有效时继承这两项；ELF哈希仍取新产物，旧flags及产物只放normal参考。两模块17项单测通过，不把mock编译的单测当成实际调优构建。旧1b四栈业务源均已改变，旧调优产物／profile不能复用为最终源；旧batch训练输入又与普通L1相同，最终PGO需重新冻结代表性训练／留出，不能仅改标签称已验收。
 
@@ -254,7 +265,11 @@ d3b0c00 push40048521049在Windows bundle的新增独立live ACL单测中失败�
 
 3b push40049602257最终18个作业成功、1失败、发布跳过；Windows外层和两个内层ACL实际通过，owner和父SDDL不变。sync在编译超过原60秒后直接child已reap；async普通写入返回`execution_unknown`，不能推断回滚或重试。最终Job drained／进程树／临时目录清理通过，但没有中间编译后代快照，不能声称它们造成了未知写。发现独立源码缺陷：仅HTTP／PG清理成功就放行下一lane，未涵盖工具强制终止后的未确认后代；新增反例旧代码错误启动async，现以原异常上的类型标记和明确报告阻止下一lane，交由原外层owner先回收。编译增加已有`--verbose`，原60／5／20秒不改。对应三组171项：148过、23平台跳过。Linux／macOS两份小ZIP另经API字节及SHA核对，sync／async四路和cleanup均通过；原件及摘要见`ci-3b4e724/`。
 
-v4补齐五项Ku独立检查均200/200，原mixed失败继续保留。容量探索Ku512点2560/2560正确但p99越界；前100rps×3秒prime已203/300超100ms、计划发送p99约2.89秒，不能把480rps当可靠容量。Go32768点事件丢16099、87982未发出且driver节流，是无效测量。HTTP／JSON对象标needs_analysis，数组有序中断；全部测量服务域回收，仅私库保留。修复后warmup／prime复用原qualification，失败保存原报告并由原Service.stop回收，抛PreparationWindowFailure，目标窗口不启动；policy1进入身份、缓存和聚合，旧窗不续拼。三个反例旧失败、新harness24项通过；driver仍v5、算法／期限不变。新编排尚须独立冻结后执行。
+已验证交付基线f833的push／PR必要作业均成功，push三平台实际安装包PG共6路passed，正常退出0、远端连接最终0且cleanup_errors为空。三份实库证据ZIP为Windows24800B、Linux36390B、macOS35927B，已核对API digest／大小、提交／目标／包／CLI身份；Windows外层及两lane内层ACL均通过，原owner与父SDDL不变，Job及临时根回收确认。证据`ci-f833ae5/summary.json`。这些结果不解释3b编译延迟或普通写unknown，也不证明d3的PowerShell超时根因已修复；发布仍按分支规则跳过，f833之后的修改不自动继承CI通过。
+
+v4补齐五项Ku独立检查均200/200，原mixed失败继续保留。容量探索Ku512点2560/2560正确但p99越界；前100rps×3秒prime已203/300超100ms、计划发送p99约2.89秒，不能把480rps当可靠容量。Go32768点事件丢16099、87982未发出且driver节流，是无效测量。HTTP／JSON对象标needs_analysis，数组有序中断；全部测量服务域回收，仅私库保留。修复后warmup／prime复用原qualification，失败保存原报告并由原Service.stop回收，抛PreparationWindowFailure，目标窗口不启动；policy1进入身份、缓存和聚合，旧窗不续拼。三个反例旧失败、新harness24项通过；driver仍v5、算法／期限不变。
+
+v5实际冻结已完成：产品候选仍为e1ca，431项业务输入与59项执行器文件分别记录身份，执行policy1；47条独立资格记录保留原出处和mixed失败，正式窗口导入0条。`verification.json`明确`freeze_completed=true`、`load_started=false`，冻结准备不冒称测量执行或性能通过。v4等待组原始168份文件留在guest，项目外只保存原汇总、逐档核对及路径／大小／SHA清单。用户确认没有独立Linux测试机，先完成本地代码与交付工作；当前不追加正式负载，不用无效窗口填表。
 
 两项有界静态候选均未采用。仅拆算术错误冷路径使正常静态指令34→43、栈读3→3，未测速；普通Ku checksum函数封装使静态路径34→27、栈读3→0，但同布局两轮短配对CPU比0.992437／1.011216，无一致收益，不追加长测。候选首次输入布局误配在计算前退出，失败保留；后用相同相对布局重新生成，四窗各4096正确、自然退出／域回收。此为不同基准源码的诊断，不是编译器提速证明，未覆盖原正式表。证据见`current-validation/{coldmath-static-once,checksum-function-static-once}.json`及独立short-v1／v2原结果。
 
@@ -281,8 +296,11 @@ e1ca O09训练／留出及短观察的原始819成员归档SHA `fda4d35fc5ec6b25
 | PG等待交接修复 | `current-validation/pg-handoff-verification.json`，`9efd25010f510c36de22ab55189579402988177dd8f90d07b8796b14566a8555`；前后3反例、14回归、配置检测器、真实双lane与源码／CLI hash；不是历史错误定因 |
 | WAIT索引A/B首次失败 | `net-active-index-ab/evidence.tar.gz`，1590581B，27项，`1e3da9710ba95c6afcd7b761f387b88e19665a4e22161a6aea91f22f47ccc203`；0完整配对，所有失败／全周期保留，临时控制器已删 |
 | d450 push三平台PG原始artifact核对 | `ci-d450b3e/push-pg-artifact-check.json`，`f1c55fce46941da867a3cf3fe06c8e7e00cdb3af701f027eac99139ebe877fde`；3个ZIP外层digest／大小匹配，sync／async共6路passed且cleanup为空，范围为Cargo CLI |
+| f833已验证交付基线 | `ci-f833ae5/summary.json`，`124ff372c494f8097bbb4c42373e48dca576baa37f2b01dc7ecf13beef68ec6e`；push19／PR12必要作业成功，三平台实际包PG共6路通过，不覆盖后续修改 |
+| v4四核等待组核对 | `current-validation/waiting-c4-verification.json`，`d5ced21add66edf94cfed8f50f5c597ef6610856e63442aa4cbddcb7617443ad`；40档13过／8未过／19阻塞，8192未验收，原始文件清单独立保留 |
+| v5实际冻结核对 | `evidence/matrix-runner-v5-preparation-policy/verified-freeze/verification.json`，`ae1521a81415056b67ba0140313bb7123239d2f908601b4054cbe6f21c2eb98f`；独立业务／执行器身份，未启动负载、未导入正式窗 |
 | 8ad Windows失败外ZIP | `72e3c4caeae6d32aa4d73f2623f7ca2e89ad546ee10675a22aa7558975da7429`，API digest与下载匹配；不是release内包hash |
 
-尚需连续完成：最新候选实际Linux C／ASM成本闭环及有效单变量收益；不依赖失效窗口的正式A／B容量和同速率核心点；normal／reset、8192等待、600秒混合、真过载／恢复；最终三平台必要CI及同源CLI／native／实际安装包PG适用示例和hash验证。结果未跨门槛保持未验收，不能以测试数、包构建或其中一栈较快代替目标。
+尚需完成：最新候选实际Linux C／ASM成本闭环及有效单变量收益；不依赖失效窗口的正式A／B容量和同速率核心点；normal／reset、8192等待、600秒混合、真过载／恢复。f833已完成三平台必要CI与同源实际安装包PG验证；之后的本地产品修改必须单独验证，不能套用该基线结果。用户选择先完成其余本地工作，环境条件未解决前不追加正式压测；结果未跨门槛保持未验收，不能以测试数、包构建或其中一栈较快代替目标。
 
 JSON保持旧默认；暂停的通用值复制／释放后续分析与广泛AST分析不展开；无关36次进程内存验证不重跑。本轮没有部署官网、修改旧r1标签／资产、合并或公开Release，未操作真实业务库。保留用户dirty、原源码／测试／历史证据；自己的临时探针、脚本、构建副本及进程用完清理，必要永久回归／基准保留。

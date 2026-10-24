@@ -1844,6 +1844,40 @@ fn native_http_error_statuses_match_interpreter() {
     );
     assert_status(&overflow, "HTTP/1.1 400 Bad Request");
 
+    for (length, expected) in [
+        ("18446744073709551615", "HTTP/1.1 413 Content Too Large"),
+        ("18446744073709551616", "HTTP/1.1 400 Bad Request"),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, expected);
+    }
+
+    let padded_length = http_response(
+        &address,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\ncOnTeNt-LeNgTh:\t000000000000000000000004 \t\r\nConnection: close\r\n\r\nsame",
+        Duration::from_secs(3),
+    );
+    assert_status(&padded_length, "HTTP/1.1 200 OK");
+    assert!(padded_length.ends_with("\r\n\r\nsame"));
+
+    // Numeric overflow is reported after the complete field validation, while
+    // an invalid digit is rejected as soon as its field is encountered.
+    for (length, expected) in [
+        ("18446744073709551616", "HTTP/1.1 417 Expectation Failed"),
+        ("18446744073709551616x", "HTTP/1.1 400 Bad Request"),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\nExpect: 100-continue\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, expected);
+    }
+
     let negative = http_response(
         &address,
         "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: -5\r\nConnection: close\r\n\r\n",
@@ -2336,6 +2370,20 @@ fn native_http_long_request_target_is_bounded_not_truncated() {
         Duration::from_secs(3),
     );
     assert_status(&too_long, "HTTP/1.1 414 URI Too Long");
+
+    // Preserve target/field error precedence when length parsing shares the
+    // first validation pass: pure overflow remains later than target length.
+    for (length, expected) in [
+        ("18446744073709551616", "HTTP/1.1 414 URI Too Long"),
+        ("18446744073709551616x", "HTTP/1.1 400 Bad Request"),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("POST /{over} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, expected);
+    }
 
     // An over-long target must never truncate down onto an existing short route.
     let padded = "c".repeat(9000);

@@ -913,6 +913,8 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
     return 400;
   }
   int host_count = 0, content_length_count = 0;
+  unsigned long long content_length = 0;
+  int content_length_overflow = 0;
   size_t header_fields=0;
   input->keep_alive = 1;
   { size_t i = (fl_end < hlen) ? fl_end + 2 : hlen;
@@ -956,7 +958,15 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
         } else if (ku_http_name_eq(hdr + ls, colon - ls, "content-length")) {
           content_length_count++;
           if (content_length_count != 1 || vs == ve) { return 400; }
-          for (size_t k = vs; k < ve; k++) if (hdr[k] < '0' || hdr[k] > '9') { return 400; }
+          for (size_t k = vs; k < ve; k++) {
+            unsigned char byte = (unsigned char)hdr[k];
+            if (byte < '0' || byte > '9') { return 400; }
+            if (!content_length_overflow) {
+              unsigned long long digit = (unsigned long long)(byte - '0');
+              if (content_length > (~0ULL - digit) / 10ULL) content_length_overflow = 1;
+              else content_length = content_length * 10ULL + digit;
+            }
+          }
         }
       }
       if (le >= hlen) break;
@@ -981,8 +991,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   if (!target) return 500;
   input->target = target;
   memcpy(target, hdr + target_start, target_len); target[target_len] = '\0';
-  /* Header map (lowercased names, trimmed values) matching the interpreter, plus a
-     strict content-length parse: present-but-non-numeric -> 400. */
+  /* Header map (lowercased names, trimmed values) matching the interpreter. */
   KuObject* headers = ku_http_parse_headers(hdr,(int)hlen,header_capacity);
   input->headers = headers;
   size_t metadata_bytes = target_len+1+sizeof(KuObject)+headers->cap*sizeof(KuEntry);
@@ -996,29 +1005,11 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   if (metadata_bytes > input->metadata_charge) { return 500; }
   ku_http_buffer_refund(input->budget, input->metadata_charge-metadata_bytes);
   input->metadata_charge=metadata_bytes;
-  /* Content-Length is strict RFC decimal: one or more digits, no sign. Duplicate
-     fields and Transfer-Encoding were rejected before the map was built.
-
-     The accumulator is unsigned WITH an explicit overflow guard. A signed
-     accumulator wraps on a huge value (undefined behaviour), and the wrapped
-     negative result would then slip past the 413 check and reach the handler with
-     an empty body and a 200 -- where the interpreter answers 400. */
-  unsigned long long content_length = 0;
-  { KuValue* cv = ku_object_get(headers, ku_string_static((const uint8_t*)"content-length", 14));
-    if (cv && cv->tag == KU_STR) {
-      KuString s = cv->as.s;
-      unsigned long long v = 0; int ok = 1; size_t k = 0;
-      if (s.len == 0) ok = 0;
-      for (; ok && k < s.len; k++) {
-        uint8_t d = ((uint8_t*)s.ptr)[k];
-        if (d < '0' || d > '9') { ok = 0; break; }
-        if (v > (~0ULL - (unsigned long long)(d - '0')) / 10ULL) { ok = 0; break; }
-        v = v * 10ULL + (unsigned long long)(d - '0');
-      }
-      if (!ok) { return 400; }
-      content_length = v;
-    }
-  }
+  /* The first validation pass already accumulated the strict decimal value.
+     Report numeric overflow here, retaining the original precedence of field,
+     target-length and metadata-admission errors before it. Do not hash the
+     public header map and validate the same bytes a second time. */
+  if (content_length_overflow) { return 400; }
   if (content_length > (unsigned long long)max_body) { return 413; }
   char* qmark = strchr(target, '?');
   size_t path_len = qmark ? (size_t)(qmark - target) : strlen(target);
