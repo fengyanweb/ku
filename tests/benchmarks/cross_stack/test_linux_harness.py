@@ -13,7 +13,7 @@ from unittest import mock
 from linux_harness import (arrival_cpu, business_send_end, measurement_clock,
                            qualification, recovery_probe_views, upper_point, aggregate_rounds,
                            histogram_bucket, paired_interval, interleaved_orders,
-                           overload_boundary, full_lifecycle_cost, Case, write_json, read_json,
+                           overload_boundary, full_lifecycle_cost, Case, Harness, write_json, read_json,
                            paired_capacity_goodput, declared_case_stacks, sustained_case,
                            benchmark_limits, cases, GIB, MIB, java_shutdown_receipt,
                            service_termination_succeeded, JAVA_SHUTDOWN_PREFIX, JAVA_SHUTDOWN_STAGES)
@@ -128,6 +128,127 @@ class MeasurementRulesTest(unittest.TestCase):
                 'service_cost': {'before': {'cpu_stat': {'usage_usec': 100}, 'memory_events': {}},
                                  'after': {'cpu_stat': {'usage_usec': 200}, 'memory_events': {}},
                                  'cpu_seconds_per_correct': .001,'full_lifecycle':{'available':True,'natural_reclamation_passed':True}}}
+
+    def preparation_case(self, folder, stage, bad=True, forced=False):
+        case=Case.__new__(Case)
+        case.path=Path(folder)/'case'; case.path.mkdir()
+        case.workload='ok'; case.cores=4; case.memory=GIB
+        case.args=types.SimpleNamespace(warmup=30,prime=3,keepalive_idle_ms=500)
+        case.state={'history':[]}; case.save=mock.Mock(); case.check_memory=mock.Mock(); case.idle=mock.Mock()
+        count=3000 if stage=='warmup' else 300
+        report=self.report(count); report['ledger'].update(planned=count,http_500_total=0)
+        report['ledger']['correct_scheduled_to_complete'].update(p99_ms=2928.64 if bad else 5,max_ms=2996.18 if bad else 6)
+        ending={'exit_code':0,'forced':forced,'cgroup_removed':True,
+                'after':{'process_count':0,'threads':0,'fd':0,'cpu_stat':{'usage_usec':300}}}
+        service=types.SimpleNamespace(stopped=False,domain=types.SimpleNamespace(frozen=False),metrics=mock.Mock(return_value={}))
+        def stop():
+            service.stopped=True
+            return ending
+        service.stop=mock.Mock(side_effect=stop)
+        def client(service,workload,rate,duration,output,**kwargs):
+            result=copy.deepcopy(report); count=int(rate*duration)
+            result['configuration'].update(workload=workload,rate=rate,duration_seconds=duration)
+            result['ledger'].update(planned=count,correct_total=count,results={'correct':count})
+            result['ledger']['correct_scheduled_to_complete']['count']=count
+            write_json(Path(output)/'client.json',result)
+            return result
+        case.h=types.SimpleNamespace(start=mock.Mock(return_value=service),client=mock.Mock(side_effect=client))
+        case.instances={} if stage=='warmup' else {'ku':service}
+        return case,service,report
+
+    def test_unqualified_prime_stops_before_target_window(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case,service,original=self.preparation_case(folder,'prime')
+            case.activate=mock.Mock(return_value=service)
+            with self.assertRaisesRegex(RuntimeError,'preparation') as raised:
+                case.observe('ku',512,5,'explore-05')
+            self.assertEqual(type(raised.exception).__name__,'PreparationWindowFailure')
+            self.assertEqual(case.h.client.call_count,1)
+            self.assertEqual(case.h.client.call_args.args[2:4],(100,3))
+            self.assertFalse((case.path/'explore-05/ku/client.json').exists())
+            service.stop.assert_called_once(); case.idle.assert_not_called()
+            receipt=read_json(case.path/'preparation-failure.json')
+            self.assertEqual(receipt['stage'],'prime')
+            self.assertEqual(receipt['preparation_gate_revision'],1)
+            self.assertFalse(receipt['target_window_started'])
+            self.assertTrue(receipt['cleanup']['natural_exit_verified'])
+            preserved=read_json(case.path/'explore-05/ku/prime/client.json')
+            self.assertEqual(preserved['ledger'],original['ledger'])
+            self.assertFalse(preserved['preparation_gate']['qualification']['eligible_for_formal_candidate'])
+
+    def test_unqualified_warmup_does_not_activate_candidate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case,service,original=self.preparation_case(folder,'warmup')
+            with self.assertRaisesRegex(RuntimeError,'preparation'):
+                case.activate('ku')
+            self.assertEqual(case.h.client.call_count,1)
+            self.assertEqual(case.h.client.call_args.args[2:4],(100,30))
+            service.stop.assert_called_once()
+            receipt=read_json(case.path/'preparation-failure.json')
+            self.assertEqual(receipt['stage'],'warmup')
+            self.assertEqual(receipt['cleanup']['termination']['exit_code'],0)
+            self.assertEqual(read_json(case.path/'warmups/ku-001/client.json')['ledger'],original['ledger'])
+
+    def test_target_cache_without_preparation_policy_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case,service,_=self.preparation_case(folder,'prime',bad=False)
+            case.activate=mock.Mock(side_effect=AssertionError('old result must be rejected before any new request'))
+            report=self.report(300)
+            report.update(configuration={'workload':'ok','rate':512,'duration_seconds':5},measurement_identity={'harness_revision':5})
+            write_json(case.path/'formal-common-00/ku/client.json',report)
+            with self.assertRaisesRegex(RuntimeError,'preparation'):
+                case.observe('ku',512,5,'formal-common-00')
+            case.h.client.assert_not_called()
+
+    def test_preparation_normal_path_and_cleanup_failure_remain_distinct(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case,service,_=self.preparation_case(folder,'warmup',bad=False)
+            self.assertIs(case.activate('ku'),service)
+            service.stop.assert_not_called()
+            self.assertEqual(read_json(case.path/'warmups/ku-001/client.json')['preparation_gate']['status'],'passed')
+            case.h.client.reset_mock(); case.activate=mock.Mock(return_value=service)
+            case.observe('ku',512,5,'explore-05')
+            self.assertEqual([call.args[2:4] for call in case.h.client.call_args_list],[(100,3),(512,5)])
+            case.idle.assert_called_once(); service.stop.assert_not_called()
+        for scenario in ('forced_stop','client_error_without_report'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as folder:
+                case,service,_=self.preparation_case(folder,'prime',forced=scenario=='forced_stop')
+                case.activate=mock.Mock(return_value=service)
+                if scenario=='client_error_without_report':
+                    case.h.client.side_effect=RuntimeError('driver failed before a report')
+                with self.assertRaisesRegex(RuntimeError,'preparation'):
+                    case.observe('ku',512,5,'explore-05')
+                service.stop.assert_called_once(); case.idle.assert_not_called()
+                receipt=read_json(case.path/'preparation-failure.json')
+                self.assertEqual(receipt['status'],'failed')
+                self.assertIn('Case.prepare owns',receipt['stop_responsibility'])
+                if scenario=='forced_stop':
+                    self.assertFalse(receipt['cleanup']['natural_exit_verified'])
+                else:
+                    self.assertTrue(receipt['cleanup']['natural_exit_verified'])
+                    self.assertFalse((case.path/'explore-05/ku/prime/client.json').exists())
+                self.assertFalse((case.path/'explore-05/ku/client.json').exists())
+
+    def test_client_cache_and_round_aggregation_include_preparation_policy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            harness=Harness.__new__(Harness); harness.identity={'protocol_sha256':'protocol','manifest_sha256':'manifest'}
+            service=types.SimpleNamespace(startup={'identity':{'stack':'ku'}})
+            identity={'service':service.startup['identity'],'workload':'ok','rate':100,'duration':3,
+                      'concurrency':256,'timeout':3,'events':True,'protocol_sha256':'protocol',
+                      'driver_manifest_sha256':'manifest','harness_revision':5,'keepalive_idle_ms':500}
+            output=Path(folder)/'cached'
+            write_json(output/'client.json',{'service_cost':{},'measurement_identity':identity})
+            with self.assertRaisesRegex(RuntimeError,'identity differs'):
+                harness.client(service,'ok',100,3,output)
+            identity['preparation_gate_revision']=1
+            write_json(output/'client.json',{'service_cost':{},'measurement_identity':identity})
+            self.assertEqual(harness.client(service,'ok',100,3,output)['measurement_identity'],identity)
+            reports=self.aggregate(folder,150)
+            for report in reports: report['measurement_identity']={'preparation_gate_revision':1}
+            self.assertTrue(aggregate_rounds(reports,'ok')['qualified'])
+            reports[-1]['measurement_identity']['preparation_gate_revision']=0
+            with self.assertRaisesRegex(ValueError,'different driver'):
+                aggregate_rounds(reports,'ok')
 
     def test_seeded_window_pairs_not_requests(self):
         orders = interleaved_orders(('ku', 'go', 'rust', 'node'))

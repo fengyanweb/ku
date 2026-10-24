@@ -119,12 +119,33 @@ class FixtureProcessContracts(unittest.TestCase):
         child = Mock(pid=123, returncode=1)
         child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 60), 1]
         phases = []
-        with patch.object(fixture.subprocess, "Popen", return_value=child), self.assertRaises(RuntimeError):
+        with patch.object(fixture.subprocess, "Popen", return_value=child), self.assertRaises(RuntimeError) as raised:
             fixture.run(["fixture-tool"], progress=lambda phase, **details: phases.append((phase, details)))
         self.assertEqual(child.wait.call_args_list, [unittest.mock.call(timeout=60), unittest.mock.call(timeout=5)])
         child.kill.assert_called_once()
         child.communicate.assert_not_called()
         self.assertEqual(phases[-1][0], "fixture-tool:timeout")
+        self.assertIs(raised.exception.fixture_tool_tree_cleanup, fixture.ToolTreeCleanup.UNCONFIRMED)
+
+    def test_failed_or_interrupted_direct_cleanup_never_confirms_tool_tree(self):
+        for failure in (OSError("kill failed"), fixture.subprocess.TimeoutExpired("fixture-tool", 5), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                child = Mock(pid=123, returncode=None)
+                child.poll.return_value = None
+                child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 60), 1]
+                if isinstance(failure, fixture.subprocess.TimeoutExpired):
+                    child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 60), failure]
+                else:
+                    child.kill.side_effect = failure
+                expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else RuntimeError
+                with patch.object(fixture.subprocess, "Popen", return_value=child), \
+                        self.assertRaises(expected) as raised:
+                    fixture.run(["fixture-tool"], progress=Mock())
+                self.assertIs(raised.exception.fixture_tool_tree_cleanup, fixture.ToolTreeCleanup.UNCONFIRMED)
+                child.kill.assert_called_once()
+                child.communicate.assert_not_called()
+                if isinstance(failure, KeyboardInterrupt):
+                    self.assertIs(raised.exception, failure)
 
     def test_background_descendant_holding_stdout_does_not_delay_tool_output(self):
         with tempfile.TemporaryDirectory(prefix="ku-pg-tool-contract-") as temporary:
@@ -262,12 +283,13 @@ class FixtureAbsoluteDeadlineContracts(unittest.TestCase):
         child.wait.side_effect = [fixture.subprocess.TimeoutExpired("fixture-tool", 5), 1]
         with patch.object(fixture, "time", SimpleNamespace(monotonic=lambda: 100.0)), \
                 patch.object(fixture.subprocess, "Popen", return_value=child), \
-                self.assertRaises(TimeoutError):
+                self.assertRaises(TimeoutError) as raised:
             fixture.run(["fixture-tool"], deadline=105.0, progress=Mock())
         self.assertEqual(child.wait.call_args_list,
                          [unittest.mock.call(timeout=5.0), unittest.mock.call(timeout=5)])
         child.kill.assert_called_once()
         child.communicate.assert_not_called()
+        self.assertIs(raised.exception.fixture_tool_tree_cleanup, fixture.ToolTreeCleanup.UNCONFIRMED)
 
     def test_running_checkpoint_failure_still_kills_and_reaps_child(self):
         child = Mock(pid=123, returncode=None)
@@ -489,7 +511,7 @@ class RemoteSessionRetirementContracts(unittest.TestCase):
 
 class LaneOrchestrationContracts(unittest.TestCase):
     def exercise(self, *, failure_lane=None, cleanup_errors=None, lane="both",
-                 performance_seconds=0):
+                 performance_seconds=0, tool_tree_cleanup_confirmed=None):
         with tempfile.TemporaryDirectory(prefix="ku-pg-lane-contract-") as temporary:
             root = Path(temporary)
             ku = root / "ku"
@@ -518,6 +540,8 @@ class LaneOrchestrationContracts(unittest.TestCase):
                 snapshots.append(current)
                 raw["status"] = "failed" if selected == failure_lane else "passed"
                 raw["cleanup_errors"] = cleanup_errors if selected == failure_lane and cleanup_errors else []
+                if selected == failure_lane and tool_tree_cleanup_confirmed is not None:
+                    raw["tool_tree_cleanup_confirmed"] = tool_tree_cleanup_confirmed
                 if performance_seconds:
                     raw["throughput"] = {"requests_per_second": 100 if selected == "sync" else 200}
                 fixture.checkpoint(raw, arguments.output, "fixture:finished")
@@ -568,6 +592,69 @@ class LaneOrchestrationContracts(unittest.TestCase):
         self.assertEqual(invoked, ["sync"])
         self.assertEqual(report["lanes"]["async"]["status"], "blocked")
         self.assertIn("cleanup is not confirmed", report["lanes"]["async"]["reason"])
+
+    def test_unconfirmed_tool_tree_blocks_next_lane_even_after_http_pg_cleanup(self):
+        report, invoked, _ = self.exercise(failure_lane="sync", tool_tree_cleanup_confirmed=False)
+        self.assertEqual(report["lanes"]["sync"]["report"]["cleanup_errors"], [])
+        self.assertIs(report["lanes"]["sync"]["report"]["tool_tree_cleanup_confirmed"], False)
+        self.assertEqual(invoked, ["sync"])
+        self.assertEqual(report["lanes"]["async"]["status"], "blocked")
+        self.assertIn("tool process tree cleanup is unconfirmed", report["lanes"]["async"]["reason"])
+
+    def test_real_compile_failure_marker_blocks_next_lane_after_http_pg_cleanup(self):
+        actual_run = fixture.run
+        for mode in ("timeout", "kill-failed", "wait-interrupted", "launch-interrupted"):
+            with self.subTest(mode=mode), \
+                    tempfile.TemporaryDirectory(prefix="ku-pg-lane-contract-") as temporary:
+                root = Path(temporary)
+                ku = root / "ku"
+                ku.write_bytes(b"fixture CLI identity, never executed")
+                tools = root / "tools"
+                tools.mkdir()
+                for name in ("initdb", "pg_ctl", "psql"):
+                    (tools / (name + (".exe" if os.name == "nt" else ""))).touch()
+                output = root / "lifecycle.json"
+                args = fixture.parse_args(["--ku", str(ku), "--output", str(output)])
+                child = Mock(pid=123, returncode=None)
+                child.poll.return_value = None
+                interrupted = mode in ("wait-interrupted", "launch-interrupted")
+                primary = KeyboardInterrupt() if interrupted else fixture.subprocess.TimeoutExpired("fixture-tool", 60)
+                child.wait.side_effect = [primary, 1]
+                if mode == "kill-failed":
+                    child.kill.side_effect = OSError("direct child kill failed")
+                expected = KeyboardInterrupt if interrupted else RuntimeError
+                commands = []
+                def tool(arguments, **kwargs):
+                    commands.append(arguments)
+                    if "build" in arguments:
+                        return actual_run(arguments, **kwargs)
+                    return str(tools) if "--bindir" in arguments else ""
+                # Exercise actual run_lanes -> run_lane -> execute -> run at
+                # compile, including normal HTTP/PG cleanup. DB setup and the
+                # OS child are inert; no database, compiler or HTTP starts.
+                with patch.object(fixture.subprocess, "Popen", return_value=child,
+                                  side_effect=primary if mode == "launch-interrupted" else None) as launch, \
+                        patch.object(fixture, "run", side_effect=tool), \
+                        patch.object(fixture, "prepare_windows_pg_directory"), \
+                        patch.object(fixture, "port", return_value=19195), \
+                        patch.object(fixture, "DatabaseProxy", return_value=SimpleNamespace(port=19196, close=Mock())), \
+                        patch.dict(fixture.os.environ, {"KU_PG_LIB": str(tools)}), \
+                        redirect_stdout(io.StringIO()), self.assertRaises(expected) as raised:
+                    fixture.run_lanes(args)
+                self.assertEqual(launch.call_count, 1)
+                build = launch.call_args.args[0]
+                self.assertEqual(build[:7], [ku.resolve(), "build", "--verbose", "--backend", "c", "--profile", args.profile])
+                self.assertEqual(Path(build[-3]).name, "service.ku")
+                self.assertEqual(build[-2], "-o")
+                self.assertTrue(any("stop" in command for command in commands))
+                report = json.loads(output.read_text())
+                self.assertIs(report["lanes"]["sync"]["tool_tree_cleanup_confirmed"], False)
+                self.assertEqual(report["lanes"]["sync"]["report"]["cleanup_errors"], [])
+                self.assertEqual(report["lanes"]["async"]["status"], "blocked")
+                self.assertFalse(Path(report["lanes"]["async"]["report_file"]).exists())
+                self.assertIs(report["database_retry"], False)
+                if interrupted:
+                    self.assertIs(raised.exception, primary)
 
     def test_missing_cleanup_evidence_blocks_next_cluster(self):
         with tempfile.TemporaryDirectory(prefix="ku-pg-lane-contract-") as temporary:

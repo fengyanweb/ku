@@ -32,6 +32,7 @@ import urllib.parse
 STACKS = ('ku', 'go', 'rust', 'node')
 GIB = 1 << 30
 MIB = 1 << 20
+PREPARATION_GATE_REVISION = 1
 
 def write_json(path, value):
     path = Path(path)
@@ -242,7 +243,7 @@ def sustained_case(args):
 def aggregate_rounds(reports, workload, minimum_core_samples=1000, minimum_rounds=7):
     bins, overflow = {}, False
     # Only merge one target point and one frozen driver/protocol/service build.
-    signatures=[(r.get('schema'),json.dumps({k:r.get('configuration',{}).get(k) for k in
+    signatures=[(r.get('schema'),r.get('measurement_identity',{}).get('preparation_gate_revision'),json.dumps({k:r.get('configuration',{}).get(k) for k in
         ('protocol_sha256','corpora_sha256','workload','duration_seconds','rate','concurrency','timeout_seconds','keepalive_idle_ms')},sort_keys=True),
         json.dumps(r.get('measurement_identity',{}).get('service'),sort_keys=True)) for r in reports]
     if signatures and any(v!=signatures[0] for v in signatures):
@@ -795,7 +796,7 @@ class Harness:
         report = output / 'client.json'
         measurement_identity={'service':service.startup['identity'],'workload':workload,'rate':rate,
                               'duration':duration,'concurrency':concurrency,'timeout':timeout,'events':events,
-                              'protocol_sha256':self.identity['protocol_sha256'],'driver_manifest_sha256':self.identity['manifest_sha256'],'harness_revision':5,'keepalive_idle_ms':idle_ms}
+                              'protocol_sha256':self.identity['protocol_sha256'],'driver_manifest_sha256':self.identity['manifest_sha256'],'harness_revision':5,'preparation_gate_revision':PREPARATION_GATE_REVISION,'keepalive_idle_ms':idle_ms}
         if report.exists():
             previous = read_json(report)
             if 'service_cost' in previous:
@@ -1076,6 +1077,12 @@ def recovery_probe_views(rows, probe_origin, starts, uncertainty_ns=0):
                 ('not_recovered_within5s' if covered else 'unknown_incomplete_probe_window'))
     return views
 
+class PreparationWindowFailure(RuntimeError):
+    """A failed preparation is never a service capacity point or retry request."""
+    def __init__(self, receipt_path):
+        self.receipt_path=str(receipt_path)
+        super().__init__('preparation window failed; stop measurements and retain '+self.receipt_path)
+
 class Case:
     def __init__(self, harness, cores, memory, workload, args):
         self.h, self.cores, self.memory, self.workload, self.args = harness, cores, memory, workload, args
@@ -1132,6 +1139,48 @@ class Case:
                                       'reason':'guest available below800MiB; re-run whole case uniformly with fresh30s warmup'})
         self.save()
         raise UniformRestart('case switched uniformly to fresh instances after measured guest memory pressure')
+    def prepare(self, stack, service, rate, duration, directory, stage):
+        report_path=Path(directory)/'client.json'; result=None
+        try:
+            result=self.h.client(service,self.workload,rate,duration,directory,events=False,idle_ms=self.args.keepalive_idle_ms)
+            gate=qualification(result,self.workload)
+        except Exception as error:
+            gate={'eligible_for_formal_candidate':False,'reasons':['preparation_client_or_report_failed'],'error':str(error)}
+            if result is None and report_path.is_file():
+                try: result=read_json(report_path)
+                except Exception: pass
+        receipt={'preparation_gate_revision':PREPARATION_GATE_REVISION,'stage':stage,'report':str(report_path),
+                 'rate':rate,'duration_seconds':duration,'qualification':gate,
+                 'status':'passed' if gate['eligible_for_formal_candidate'] else 'failed','target_window_started':False}
+        self.state['preparation_gate_revision']=PREPARATION_GATE_REVISION
+        if receipt['status']=='passed':
+            result['preparation_gate']=receipt; write_json(report_path,result)
+            return result
+        marker=self.path/'preparation-failure.json'
+        receipt['stop_responsibility']='Case.prepare owns the original Service.stop before raising; target report may not exist; outer finalizers retain Harness cleanup responsibility; no retry'
+        if isinstance(result,dict):
+            result['preparation_gate']=receipt; write_json(report_path,result)
+        write_json(marker,receipt)
+        try: metrics=service.metrics()
+        except Exception as error: metrics={'observation_error':str(error)}
+        try:
+            termination=service.stop(); after=termination.get('after',{})
+            natural=(service_termination_succeeded(stack,termination) and termination.get('cgroup_removed') is True
+                     and all(type(after.get(key)) is int and after[key]==0 for key in ('process_count','threads','fd')))
+            receipt['cleanup']={'termination':termination,'service_termination_succeeded':service_termination_succeeded(stack,termination),
+                                'natural_exit_verified':natural}
+            if isinstance(result,dict) and result.get('service_cost',{}).get('before') and 'ledger' in result:
+                try:
+                    result['service_cost']['full_lifecycle']=full_lifecycle_cost(result,after,False,termination,metrics)
+                    result['service_cost']['complete_lifecycle_accounted']=True
+                except Exception as error: receipt['lifecycle_accounting_error']=str(error)
+        except Exception as error:
+            receipt['cleanup']={'natural_exit_verified':False,'error':str(error)}
+        if isinstance(result,dict):
+            result['preparation_gate']=receipt; write_json(report_path,result)
+        write_json(marker,receipt)
+        raise PreparationWindowFailure(marker)
+
     def activate(self, stack):
         self.check_memory()
         for name, service in self.instances.items():
@@ -1145,8 +1194,8 @@ class Case:
             self.save()
             self.check_memory()
             warm_rate = 10 if self.workload == 'cpu' else 100
-            self.h.client(service, self.workload, warm_rate, self.args.warmup,
-                          self.path / 'warmups' / f'{stack}-{generation:03d}', events=False,idle_ms=self.args.keepalive_idle_ms)
+            self.prepare(stack,service,warm_rate,self.args.warmup,
+                         self.path/'warmups'/f'{stack}-{generation:03d}','warmup')
         service = self.instances[stack]
         if service.domain.frozen:
             service.freeze(False)
@@ -1218,6 +1267,8 @@ class Case:
         if report.exists() and 'service_cost' in read_json(report):
             previous=read_json(report)
             configuration=previous.get('configuration',{})
+            if previous.get('measurement_identity',{}).get('preparation_gate_revision')!=PREPARATION_GATE_REVISION:
+                raise RuntimeError('completed window has a different preparation policy; preserve it and use a new results root')
             if previous.get('schema')!='ku-cross-stack-client-v5' or previous.get('measurement_identity',{}).get('harness_revision')!=5:
                 raise RuntimeError('completed window belongs to another driver/harness version; preserve it and choose new results root')
             if configuration.get('workload')!=self.workload or configuration.get('rate')!=rate or configuration.get('duration_seconds')!=duration:
@@ -1225,8 +1276,7 @@ class Case:
             return previous
         service = self.activate(stack)
         if prime:
-            self.h.client(service, self.workload, max(1, min(rate, 100)), self.args.prime,
-                          directory / 'prime', events=False,idle_ms=self.args.keepalive_idle_ms)
+            self.prepare(stack,service,max(1,min(rate,100)),self.args.prime,directory/'prime','prime')
         print(json.dumps({'event': 'window', 'case': self.path.name, 'stack': stack,
                           'name': name, 'rate': rate, 'seconds': duration}), flush=True)
         try:
@@ -1572,7 +1622,7 @@ def main():
     if min(args.warmup,args.prime,args.explore_seconds,args.formal_seconds,args.sustained_seconds) <= 0:
         parser.error('durations must be positive; deviations must be marked diagnostic')
     harness = Harness(args.root, args.output)
-    configuration = {'phase': args.phase, 'arguments': vars(args), 'manifest_sha256': hashlib.sha256((args.root/'manifest.json').read_bytes()).hexdigest(),
+    configuration = {'phase': args.phase, 'preparation_gate_revision':PREPARATION_GATE_REVISION,'arguments': vars(args), 'manifest_sha256': hashlib.sha256((args.root/'manifest.json').read_bytes()).hexdigest(),
                      'protocol_sha256': hashlib.sha256(harness.protocol.read_bytes()).hexdigest(),
                      'formal_rules': 'at least7 seeded interleaved paired windows; >=30s and1000 pooled core samples/type; 30s warmup/3s prime',
                      'coordinator': {'pid': os.getpid(), 'inside_service_domain': False},
@@ -1580,7 +1630,7 @@ def main():
                      'identity': {'uname': list(os.uname()), 'cpu_online': Path('/sys/devices/system/cpu/online').read_text().strip(),
                                   'cpuinfo': Path('/proc/cpuinfo').read_text(), 'kernel_commandline': Path('/proc/cmdline').read_text().strip()}}
     configuration['arguments'] = {k: str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
-    freeze={'manifest_sha256':configuration['manifest_sha256'],'protocol_sha256':configuration['protocol_sha256'],
+    freeze={'preparation_gate_revision':PREPARATION_GATE_REVISION,'manifest_sha256':configuration['manifest_sha256'],'protocol_sha256':configuration['protocol_sha256'],
             'warmup':args.warmup,'prime':args.prime,'formal_seconds':args.formal_seconds,
             'explore_seconds':args.explore_seconds,'sustained_seconds':args.sustained_seconds,'maximum_rate':args.maximum_rate,
             'formal_repeats':args.formal_repeats,'random_seed':args.random_seed,'stacks':args.stacks,'keepalive_idle_ms':args.keepalive_idle_ms,'diagnostic_rates':args.diagnostic_rates,'physical_settle_seconds':args.physical_settle_seconds}

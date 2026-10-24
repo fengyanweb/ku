@@ -11,6 +11,7 @@ the current phase, so the existing CI artifact retains either lane's failure.
 
 import argparse
 import concurrent.futures
+from enum import Enum
 import hashlib
 import http.client
 import json
@@ -276,6 +277,10 @@ def checkpoint(report, output, phase, **details):
     print(json.dumps({"phase": phase, **details}, ensure_ascii=False), flush=True)
 
 
+class ToolTreeCleanup(Enum):
+    UNCONFIRMED = "unconfirmed"
+
+
 def run(args, progress=None, timeout_seconds=60, deadline=None, **kwargs):
     """Wait for the tool, not EOF from an intentionally backgrounded server.
 
@@ -310,50 +315,73 @@ def run(args, progress=None, timeout_seconds=60, deadline=None, **kwargs):
     wait_budget()  # Do not launch another tool after an expired window.
     mark("starting", timeout_seconds=timeout_seconds)
     began = time.monotonic()
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        child = None
-        timed_out = False
-        cleanup_error = None
-        try:
-            wait_budget()  # Checkpoints, file setup and Popen consume the window.
-            child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
-            mark("running", pid=child.pid, timeout_seconds=timeout_seconds)
+    tool_tree_unconfirmed = False
+    try:
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            child = None
+            launch_attempted = False
+            timed_out = False
+            cleanup_error = None
             try:
-                child.wait(timeout=wait_budget())
-                wait_budget()  # Process creation and a late exit count too.
-            except (subprocess.TimeoutExpired, TimeoutError):
-                timed_out = True
-        finally:
-            # Also reap this direct child if a checkpoint raises or execution
-            # is interrupted. The outer owner still contains the fixture tree.
-            if child is not None and (timed_out or child.poll() is None):
+                wait_budget()  # Checkpoints, file setup and Popen consume the window.
+                launch_attempted = True
+                child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, **kwargs)
+                mark("running", pid=child.pid, timeout_seconds=timeout_seconds)
                 try:
-                    child.kill()
-                    child.wait(timeout=5)
-                except (OSError, subprocess.TimeoutExpired) as error:
-                    cleanup_error = f"{type(error).__name__}: {error}"
-        captured = []
-        sizes = []
-        for stream in (stdout, stderr):
-            sizes.append(stream.seek(0, os.SEEK_END))
-            stream.seek(max(0, sizes[-1] - 65536))
-            captured.append(stream.read(65536).decode("utf-8", errors="replace"))
-        out, err = captured
-        mark("timeout" if timed_out else "finished", pid=child.pid, exit_code=child.returncode,
-             elapsed_seconds=time.monotonic() - began, stdout_bytes=sizes[0], stderr_bytes=sizes[1],
-             stdout_tail=out[-2000:], stderr_tail=err[-4000:], direct_child_cleanup_error=cleanup_error)
-        if deadline is not None and time.monotonic() >= deadline:
-            timed_out = True  # Output capture and its checkpoint share the cap.
-        if timed_out:
-            message = f"{tool} exceeded {timeout_seconds:g} seconds; direct-child cleanup: {cleanup_error or 'reaped'}"
-            if deadline is not None:
-                raise TimeoutError(message)
-            raise RuntimeError(message)
-        if any(size > 65536 for size in sizes):
-            raise RuntimeError(f"{tool} exceeded the fixture's 65536-byte per-stream output limit")
-        if child.returncode:
-            raise RuntimeError(f"{tool} failed: {err[-4000:]}")
-        return out.strip()
+                    child.wait(timeout=wait_budget())
+                    wait_budget()  # Process creation and a late exit count too.
+                except (subprocess.TimeoutExpired, TimeoutError):
+                    timed_out = True
+            except BaseException as error:
+                # Preserve the original exception, including interruptions. A
+                # directly reaped launcher cannot certify its descendants.
+                tool_tree_unconfirmed = (
+                    child is not None
+                    or (launch_attempted and not isinstance(error, Exception)))
+                raise
+            finally:
+                if child is not None:
+                    try:
+                        must_stop = timed_out or child.poll() is None
+                    except BaseException:
+                        tool_tree_unconfirmed = True
+                        raise
+                    if must_stop:
+                        tool_tree_unconfirmed = True
+                        try:
+                            child.kill()
+                            child.wait(timeout=5)
+                        except (OSError, subprocess.TimeoutExpired) as error:
+                            cleanup_error = f"{type(error).__name__}: {error}"
+            captured = []
+            sizes = []
+            for stream in (stdout, stderr):
+                sizes.append(stream.seek(0, os.SEEK_END))
+                stream.seek(max(0, sizes[-1] - 65536))
+                captured.append(stream.read(65536).decode("utf-8", errors="replace"))
+            out, err = captured
+            mark("timeout" if timed_out else "finished", pid=child.pid, exit_code=child.returncode,
+                 elapsed_seconds=time.monotonic() - began, stdout_bytes=sizes[0], stderr_bytes=sizes[1],
+                 stdout_tail=out[-2000:], stderr_tail=err[-4000:], direct_child_cleanup_error=cleanup_error)
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True  # Output capture and its checkpoint share the cap.
+            if timed_out:
+                tool_tree_unconfirmed = True
+                message = f"{tool} exceeded {timeout_seconds:g} seconds; direct-child cleanup: {cleanup_error or 'reaped'}"
+                if deadline is not None:
+                    raise TimeoutError(message)
+                raise RuntimeError(message)
+            if tool_tree_unconfirmed:
+                raise RuntimeError(f"{tool} required forced termination; direct-child cleanup: {cleanup_error or 'reaped'}")
+            if any(size > 65536 for size in sizes):
+                raise RuntimeError(f"{tool} exceeded the fixture's 65536-byte per-stream output limit")
+            if child.returncode:
+                raise RuntimeError(f"{tool} failed: {err[-4000:]}")
+            return out.strip()
+    except BaseException as error:
+        if tool_tree_unconfirmed:
+            error.fixture_tool_tree_cleanup = ToolTreeCleanup.UNCONFIRMED
+        raise
 
 
 def cleanup_fixture(report, output, service, proxy, data, stop_database, started,
@@ -669,7 +697,12 @@ def run_lane(args, lane, on_checkpoint=None):
             on_checkpoint(report)
 
     def execute(arguments, **kwargs):
-        return run(arguments, progress=progress, **kwargs)
+        try:
+            return run(arguments, progress=progress, **kwargs)
+        except BaseException as error:
+            if getattr(error, "fixture_tool_tree_cleanup", None) is ToolTreeCleanup.UNCONFIRMED:
+                report["tool_tree_cleanup_confirmed"] = False
+            raise
 
     progress("fixture:starting")
     pg_config = shutil.which("pg_config") or "pg_config"
@@ -775,7 +808,7 @@ def run_lane(args, lane, on_checkpoint=None):
             shutil.copyfile(source, local_source)
             executable = root / ("service.exe" if os.name == "nt" else "service")
             build_start = time.monotonic()
-            execute([ku, "build", "--backend", "c", "--profile", args.profile, local_source, "-o", executable], cwd=root, env=environment)
+            execute([ku, "build", "--verbose", "--backend", "c", "--profile", args.profile, local_source, "-o", executable], cwd=root, env=environment)
             report["build_seconds"] = time.monotonic() - build_start
             with logs.open("wb") as log:
                 service = subprocess.Popen([executable], cwd=root, env=environment, stdout=log, stderr=log)
@@ -1138,6 +1171,8 @@ def run_lanes(args):
             run_lane(lane_args, lane, mirror)
         except BaseException as failure:
             error = failure
+            if getattr(failure, "fixture_tool_tree_cleanup", None) is ToolTreeCleanup.UNCONFIRMED:
+                entry["tool_tree_cleanup_confirmed"] = False
             if not isinstance(failure, Exception):
                 interruption = failure
         finally:
@@ -1168,6 +1203,10 @@ def run_lanes(args):
                     entry["report_sha256"] = hashlib.sha256(raw_output.read_bytes()).hexdigest()
             if not cleanup_confirmed:
                 blocked = f"{lane} lane cleanup is not confirmed; no further fixture may start"
+            if (entry.get("tool_tree_cleanup_confirmed") is False
+                    or raw.get("tool_tree_cleanup_confirmed") is False):
+                entry["tool_tree_cleanup_confirmed"] = False
+                blocked = f"{lane} lane tool process tree cleanup is unconfirmed; the outer owner must reclaim it before another fixture may start"
             if interruption is not None:
                 blocked = f"{lane} lane interrupted; no further fixture may start"
             if entry["status"] != "passed":
