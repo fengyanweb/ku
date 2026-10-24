@@ -2585,8 +2585,14 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     /* Fixed bound includes 32 owners and every counter at full uint64 width;
        it remains inside the reserved management channel's 64 KiB quota. */
     char text[57344]; size_t used = 0;
+    size_t management_capacity=sizeof(text);
+#if defined(KU_PG_DIAGNOSTICS)
+    /* Preserve an explicit truncated PG witness even when other metrics fill
+     * their allowed output. This reserve does not enlarge the 64 KiB channel. */
+    management_capacity-=64u;
+#endif
     ku_http_mutex_lock(&group->lock);
-    int n = snprintf(text,sizeof(text),"{\"limits\":{\"max_active_requests\":%lld,\"max_connections\":%lld,\"max_pending_requests\":%lld},\"loops\":[",
+    int n = snprintf(text,management_capacity,"{\"limits\":{\"max_active_requests\":%lld,\"max_connections\":%lld,\"max_pending_requests\":%lld},\"loops\":[",
       (long long)server->max_active_requests,(long long)server->max_connections,(long long)server->max_pending_requests);
     if (n < 0) _Exit(79);
     used = (size_t)n;
@@ -2594,48 +2600,48 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
       KuHttpLoopOwner* owner = &group->loops[i];
       uint64_t sampled_now=ku_http_now_ms();
       uint64_t sample_age=sampled_now>=owner->cpu_sample_ms ? sampled_now-owner->cpu_sample_ms : 0;
-      n = snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
+      n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
         i?",":"",i,owner->accepted,owner->requests,(unsigned long long)owner->queued,(unsigned long long)owner->running,(unsigned long long)owner->resident,(unsigned long long)owner->connections,(unsigned long long)owner->pending_count,
         (unsigned long long)owner->cpu_ns,(unsigned long long)owner->cpu_sample_ms,(unsigned long long)sample_age,(unsigned long long)owner->cpu_clock_errors);
-      if (n<0 || (size_t)n>=sizeof(text)-used) _Exit(79);
+      if (n<0 || (size_t)n>=management_capacity-used) _Exit(79);
       used+=(size_t)n;
     }
-    n=snprintf(text+used,sizeof(text)-used,"],\"accepted\":%llu,\"draining\":%s",group->accepted,group->draining?"true":"false");
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    n=snprintf(text+used,management_capacity-used,"],\"accepted\":%llu,\"draining\":%s",group->accepted,group->draining?"true":"false");
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     ku_http_mutex_unlock(&group->lock);
-    n=snprintf(text+used,sizeof(text)-used,",\"outcomes\":[");
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    n=snprintf(text+used,management_capacity-used,",\"outcomes\":[");
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     ku_http_mutex_lock(&group->lock);
     for (int i=0;i<group->created;i++) {
       KuHttpLoopOwner* owner=&group->loops[i];
-      n=snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
+      n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
         owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes);
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     }
     ku_http_mutex_unlock(&group->lock);
     text[used++]=']';
-    n=snprintf(text+used,sizeof(text)-used,",\"transport_closes\":[");
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    n=snprintf(text+used,management_capacity-used,",\"transport_closes\":[");
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     ku_http_mutex_lock(&group->lock);
     for (int i=0;i<group->created;i++) {
       unsigned long long* counts=group->loops[i].transport_closes;
-      n=snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"idle_pressure\":%llu,\"response_policy\":%llu,\"write_deadline\":%llu,\"peer_write_error\":%llu,\"queue_not_admitted\":%llu,\"drain_idle\":%llu}",
+      n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"idle_pressure\":%llu,\"response_policy\":%llu,\"write_deadline\":%llu,\"peer_write_error\":%llu,\"queue_not_admitted\":%llu,\"drain_idle\":%llu}",
           i?",":"",i,counts[0],counts[1],counts[2],counts[3],counts[4],counts[5]);
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     }
     ku_http_mutex_unlock(&group->lock);
     text[used++]=']';
     {
       static const char* reasons[KU_HTTP_ERROR_COUNT]={"unknown","handler_result","handler_500","task_limit","task_closed","task_oom","driver_invariant","invalid_response","allocation","projection_budget","queue_admission","deadline","handler_exit","parser_invariant","peer_reset"};
-      n=snprintf(text+used,sizeof(text)-used,",\"errors\":{\"sample_limit\":8,\"request_id_encoding\":\"hex\",\"counts\":{");
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      n=snprintf(text+used,management_capacity-used,",\"errors\":{\"sample_limit\":8,\"request_id_encoding\":\"hex\",\"counts\":{");
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
       ku_http_mutex_lock(&group->lock);
       for(size_t i=0;i<KU_HTTP_ERROR_COUNT;i++) {
-        n=snprintf(text+used,sizeof(text)-used,"%s\"%s\":%llu",i?",":"",reasons[i],(unsigned long long)group->error_counts[i]);
-        if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+        n=snprintf(text+used,management_capacity-used,"%s\"%s\":%llu",i?",":"",reasons[i],(unsigned long long)group->error_counts[i]);
+        if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
       }
-      n=snprintf(text+used,sizeof(text)-used,"},\"sample_policy\":\"500_and_peer_reset_500_priority\",\"dropped_samples\":%llu,\"http_500_total\":%llu,\"unknown_500\":%llu,\"samples\":[",(unsigned long long)group->error_samples_dropped,(unsigned long long)group->http_500_total,(unsigned long long)group->unknown_500);
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      n=snprintf(text+used,management_capacity-used,"},\"sample_policy\":\"500_and_peer_reset_500_priority\",\"dropped_samples\":%llu,\"http_500_total\":%llu,\"unknown_500\":%llu,\"samples\":[",(unsigned long long)group->error_samples_dropped,(unsigned long long)group->http_500_total,(unsigned long long)group->unknown_500);
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
       for(size_t i=0;i<group->error_sample_count;i++) {
         char rid[97]; static const char hex[]="0123456789abcdef";
         for(size_t j=0;j<group->error_samples[i].request_id_length;j++) {
@@ -2643,73 +2649,86 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
         }
         rid[group->error_samples[i].request_id_length*2]=0;
         KuHttpFailure* f=&group->error_samples[i].failure;
-        n=snprintf(text+used,sizeof(text)-used,"%s{\"reason\":\"%s\",\"owner\":%llu,\"request_id\":\"%s\",\"request_id_truncated\":%s,\"request_sequence\":%llu,\"connection_slot\":%llu,\"connection_generation\":%llu,\"task_slot\":%llu,\"task_generation\":%llu,\"function_id\":%llu,\"phase\":%d,\"stage\":%u,\"driver_status\":%u,\"http_status\":%d,\"at_ms\":%llu}",i?",":"",reasons[f->reason],(unsigned long long)group->error_samples[i].owner,rid,group->error_samples[i].request_id_truncated?"true":"false",(unsigned long long)group->error_samples[i].request_sequence,(unsigned long long)group->error_samples[i].connection_slot,(unsigned long long)group->error_samples[i].connection_generation,(unsigned long long)f->task_slot,(unsigned long long)f->task_generation,(unsigned long long)f->function_id,group->error_samples[i].phase,f->stage,f->driver_status,group->error_samples[i].status,(unsigned long long)group->error_samples[i].at_ms);
-        if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+        n=snprintf(text+used,management_capacity-used,"%s{\"reason\":\"%s\",\"owner\":%llu,\"request_id\":\"%s\",\"request_id_truncated\":%s,\"request_sequence\":%llu,\"connection_slot\":%llu,\"connection_generation\":%llu,\"task_slot\":%llu,\"task_generation\":%llu,\"function_id\":%llu,\"phase\":%d,\"stage\":%u,\"driver_status\":%u,\"http_status\":%d,\"at_ms\":%llu}",i?",":"",reasons[f->reason],(unsigned long long)group->error_samples[i].owner,rid,group->error_samples[i].request_id_truncated?"true":"false",(unsigned long long)group->error_samples[i].request_sequence,(unsigned long long)group->error_samples[i].connection_slot,(unsigned long long)group->error_samples[i].connection_generation,(unsigned long long)f->task_slot,(unsigned long long)f->task_generation,(unsigned long long)f->function_id,group->error_samples[i].phase,f->stage,f->driver_status,group->error_samples[i].status,(unsigned long long)group->error_samples[i].at_ms);
+        if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
       }
       ku_http_mutex_unlock(&group->lock);
-      n=snprintf(text+used,sizeof(text)-used,"]}");
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      n=snprintf(text+used,management_capacity-used,"]}");
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     }
     ku_http_mutex_lock(&group->server->buffer_budget->lock);
-    n=snprintf(text+used,sizeof(text)-used,",\"buffer_bytes\":%llu,\"peak_buffer_bytes\":%llu,\"buffer_rejections\":%llu",
+    n=snprintf(text+used,management_capacity-used,",\"buffer_bytes\":%llu,\"peak_buffer_bytes\":%llu,\"buffer_rejections\":%llu",
       (unsigned long long)group->server->buffer_budget->current,(unsigned long long)group->server->buffer_budget->peak,(unsigned long long)group->server->buffer_budget->rejected);
     ku_http_mutex_unlock(&group->server->buffer_budget->lock);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
 
 #if defined(KU_FEATURE_DATABASE_BUDGET)
     KuDatabaseBudgetSnapshot db = ku_database_budget_snapshot();
-    n=snprintf(text+used,sizeof(text)-used,",\"database\":{\"reserved_connections\":%llu,\"reserved_waiters\":%llu,\"pending_operations\":%llu,\"pending_bytes\":%llu,\"peak_pending_bytes\":%llu,\"rejections\":%llu,\"unknown_results\":%llu,\"confirmed_cancellations\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"database\":{\"reserved_connections\":%llu,\"reserved_waiters\":%llu,\"pending_operations\":%llu,\"pending_bytes\":%llu,\"peak_pending_bytes\":%llu,\"rejections\":%llu,\"unknown_results\":%llu,\"confirmed_cancellations\":%llu}",
       (unsigned long long)db.reserved_connections,(unsigned long long)db.reserved_waiters,
       (unsigned long long)db.pending_operations,(unsigned long long)db.pending_bytes,(unsigned long long)db.peak_pending_bytes,
       (unsigned long long)db.rejections,(unsigned long long)db.unknown_results,(unsigned long long)db.confirmed_cancellations);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
 #endif
 #if defined(KU_FEATURE_SERVICE_OUTPUT)
     KuServiceOutputSnapshot output=ku_service_output_snapshot();
-    n=snprintf(text+used,sizeof(text)-used,",\"output\":{\"queued_records\":%llu,\"queued_bytes\":%llu,\"peak_bytes\":%llu,\"dropped_records\":%llu,\"dropped_bytes\":%llu,\"failures\":%llu,\"written_bytes\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"output\":{\"queued_records\":%llu,\"queued_bytes\":%llu,\"peak_bytes\":%llu,\"dropped_records\":%llu,\"dropped_bytes\":%llu,\"failures\":%llu,\"written_bytes\":%llu}",
       (unsigned long long)output.queued_records,(unsigned long long)output.queued_bytes,(unsigned long long)output.peak_bytes,
       (unsigned long long)output.dropped_records,(unsigned long long)output.dropped_bytes,(unsigned long long)output.failures,(unsigned long long)output.written_bytes);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
 #endif
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-    n=snprintf(text+used,sizeof(text)-used,",\"tasks\":[");
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    n=snprintf(text+used,management_capacity-used,",\"tasks\":[");
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     for (int i=0; i<group->count; i++) {
       uint64_t states[8]={0};
       /* Never hold group->lock across a driver API: driver publications call
          event_wake while holding their own mutex. */
       ku_http_task_metrics(group->tasks,(size_t)i,states);
-      n=snprintf(text+used,sizeof(text)-used,"%s{\"id\":%d,\"ready\":%llu,\"waiting\":%llu,\"running\":%llu,\"resident\":%llu,\"timers\":%llu,\"polls\":%llu,\"peak_ready_delay_ms\":%llu,\"exited\":%llu}",i?",":"",i,
+      n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"ready\":%llu,\"waiting\":%llu,\"running\":%llu,\"resident\":%llu,\"timers\":%llu,\"polls\":%llu,\"peak_ready_delay_ms\":%llu,\"exited\":%llu}",i?",":"",i,
         (unsigned long long)states[0],(unsigned long long)states[1],(unsigned long long)states[2],(unsigned long long)states[3],
         (unsigned long long)states[4],(unsigned long long)states[5],(unsigned long long)states[6],(unsigned long long)states[7]);
-      if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+      if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     }
     text[used++]=']';
     uint64_t driver_budget[9]={0};
     ku_http_task_driver_budget(group->tasks,driver_budget);
-    n=snprintf(text+used,sizeof(text)-used,",\"task_driver\":{\"capacity\":%llu,\"resident\":%llu,\"peak_resident\":%llu,\"fixed_bytes\":%llu,\"reserved_bytes\":%llu,\"peak_reserved_bytes\":%llu,\"byte_limit\":%llu,\"admission_slot_rejections\":%llu,\"admission_byte_rejections\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"task_driver\":{\"capacity\":%llu,\"resident\":%llu,\"peak_resident\":%llu,\"fixed_bytes\":%llu,\"reserved_bytes\":%llu,\"peak_reserved_bytes\":%llu,\"byte_limit\":%llu,\"admission_slot_rejections\":%llu,\"admission_byte_rejections\":%llu}",
       (unsigned long long)driver_budget[0],(unsigned long long)driver_budget[1],(unsigned long long)driver_budget[2],
       (unsigned long long)driver_budget[3],(unsigned long long)driver_budget[4],(unsigned long long)driver_budget[5],
       (unsigned long long)driver_budget[6],(unsigned long long)driver_budget[7],(unsigned long long)driver_budget[8]);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     uint64_t driver_timing[10]={0};
     ku_http_task_driver_timing(group->tasks,driver_timing);
-    n=snprintf(text+used,sizeof(text)-used,",\"task_driver_timing\":{\"enabled\":%s,\"lock_count\":%llu,\"lock_wait_ns\":%llu,\"max_lock_wait_ns\":%llu,\"lock_hold_ns\":%llu,\"max_lock_hold_ns\":%llu,\"condition_count\":%llu,\"condition_sleep_reacquire_ns\":%llu,\"max_condition_sleep_reacquire_ns\":%llu,\"clock_errors\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"task_driver_timing\":{\"enabled\":%s,\"lock_count\":%llu,\"lock_wait_ns\":%llu,\"max_lock_wait_ns\":%llu,\"lock_hold_ns\":%llu,\"max_lock_hold_ns\":%llu,\"condition_count\":%llu,\"condition_sleep_reacquire_ns\":%llu,\"max_condition_sleep_reacquire_ns\":%llu,\"clock_errors\":%llu}",
       driver_timing[0]?"true":"false",(unsigned long long)driver_timing[1],
       (unsigned long long)driver_timing[2],(unsigned long long)driver_timing[3],
       (unsigned long long)driver_timing[4],(unsigned long long)driver_timing[5],
       (unsigned long long)driver_timing[6],(unsigned long long)driver_timing[7],
       (unsigned long long)driver_timing[8],(unsigned long long)driver_timing[9]);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     uint64_t blocking_states[16]={0};
     ku_http_task_blocking_metrics(group->tasks,blocking_states);
-    n=snprintf(text+used,sizeof(text)-used,",\"task_blocking\":{\"resident\":%llu,\"queued\":%llu,\"running\":%llu,\"peak_resident\":%llu,\"peak_queued\":%llu,\"peak_running\":%llu,\"accepted\":%llu,\"rejected\":%llu,\"finished\":%llu,\"output_charge_bytes\":%llu,\"workers_created\":%llu,\"workers_exited\":%llu,\"cancelled_still_running\":%llu,\"net_wait\":%llu,\"net_step\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"task_blocking\":{\"resident\":%llu,\"queued\":%llu,\"running\":%llu,\"peak_resident\":%llu,\"peak_queued\":%llu,\"peak_running\":%llu,\"accepted\":%llu,\"rejected\":%llu,\"finished\":%llu,\"output_charge_bytes\":%llu,\"workers_created\":%llu,\"workers_exited\":%llu,\"cancelled_still_running\":%llu,\"net_wait\":%llu,\"net_step\":%llu}",
       (unsigned long long)blocking_states[0],(unsigned long long)blocking_states[1],(unsigned long long)blocking_states[2],
       (unsigned long long)blocking_states[3],(unsigned long long)blocking_states[4],(unsigned long long)blocking_states[5],
       (unsigned long long)blocking_states[6],(unsigned long long)blocking_states[7],(unsigned long long)blocking_states[8],
       (unsigned long long)blocking_states[9],(unsigned long long)blocking_states[10],(unsigned long long)blocking_states[11],
       (unsigned long long)blocking_states[12],(unsigned long long)blocking_states[13],(unsigned long long)blocking_states[14]);
-    if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79); used+=(size_t)n;
+    if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
+#endif
+#if defined(KU_PG_DIAGNOSTICS)
+    /* PG failures are published once into fixed storage. Export only through
+     * this existing authenticated management request; ordinary HTTP never
+     * formats or writes diagnostics. Reserve the final JSON delimiter/NUL. */
+    {
+      size_t pg_bytes=ku_pg_diagnostics_json(text+used+1u,sizeof(text)-used-2u);
+      if(pg_bytes) {text[used++]=',';used+=pg_bytes;}
+      else {
+        n=snprintf(text+used,sizeof(text)-used,",\"pg_acquire_failures\":{\"truncated\":true}");
+        if(n<0 || (size_t)n>=sizeof(text)-used) _Exit(79);used+=(size_t)n;
+      }
+    }
 #endif
     text[used++]='}'; text[used]=0;
     KuStruct___ku_http_response response = ku_http_status_response(200,"");

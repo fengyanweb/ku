@@ -5182,6 +5182,10 @@ fn native_http_direct_cpu_formatting_uses_fixed64_frame_and_exact_eight_digits()
     let handlers = expanded.split_once("fn main(): null! {").unwrap().0;
     let source = format!(
         r#"{handlers}
+// An unused handler must not create a factory reference to an absent thunk.
+async fn unregistered(req: HttpRequest): HttpResponse! {{
+    return ok(http.text("unused"))
+}}
 fn main(): null! {{
     app=http.server()
     app.get("/ok",ready)

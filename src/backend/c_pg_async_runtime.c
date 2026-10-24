@@ -29,10 +29,102 @@ typedef struct KuPgAsyncOp {
   char* params;
   size_t sql_bytes,values_bytes,param_bytes,input_charge,operation_charge;
   unsigned long long deadline,acquire_deadline,connect_deadline;
+  unsigned long long started_ms,observed_ms;
+  uint64_t diagnostic_steps,diagnostic_events;
+  void* task_phase_context;
+  uint64_t (*task_phase)(void*);
   int phase,slot,count,partial,columns,sent,reset_ok,reset_sent,reset_partial;
-  int connecting,connect_ready,waiting,broken,taken;
+  int connecting,connect_ready,waiting,broken,taken,diagnostic_progress,diagnostic_sync;
+  int diagnostic_libpq_status,diagnostic_libpq_status_present;
   unsigned int interest;
 } KuPgAsyncOp;
+static void ku_pg_async_set_phase(KuPgAsyncOp* op,int phase) {
+  op->phase=phase;
+  ku_pg_diag_store(&op->waiter.diagnostic.phase,(uint64_t)phase);
+  op->diagnostic_progress=1;
+}
+/* Caller owns p->lock. Diagnostic generations are witnesses, not permission
+ * to reuse a lease; saturation is reported rather than wrapping identity. */
+static void ku_pg_async_claim_locked(KuPgAsyncOp* op,unsigned long long now) {
+  KuPgClient* p=op->pool;size_t slot=(size_t)op->slot;
+  if(p->lease_generations[slot]!=UINT64_MAX)p->lease_generations[slot]++;
+  p->async_owners[slot]=&op->waiter;op->waiter.diagnostic.acquired_ms=now;
+}
+static void ku_pg_async_diagnostic_member(KuPgDiagnosticMember* out,KuPgAsyncWaiter* waiter) {
+  if(!waiter)return;
+  KuPgDiagnosticLease* d=&waiter->diagnostic;
+  out->task_slot=d->task_slot;out->task_generation=d->task_generation;
+  out->http_task_slot=d->http_task_slot;out->http_task_generation=d->http_task_generation;
+  out->owner=d->owner;out->phase=ku_pg_diag_load(&d->phase);out->last_progress_ms=ku_pg_diag_load(&d->last_progress_ms);
+  out->acquired_ms=d->acquired_ms;out->published=d->published;out->consumed=d->consumed;
+  out->notified=(uint64_t)waiter->notified;out->in_flight=(uint64_t)waiter->in_flight;
+  out->progress_events=ku_pg_diag_load(&d->progress_events);
+}
+/* Capture before unlink/reservation rollback: those actions can wake a new
+ * borrower and erase precisely the queue/lease state that needs explaining.
+ * No callbacks, allocation, driver lock or libpq access on other leases. */
+static void ku_pg_async_capture_acquire_locked(KuPgAsyncOp* op,unsigned long long now) {
+  KuPgClient* p=op->pool;uint64_t sequence=ku_pg_diag_increment(&ku_pg_diagnostics.failures);
+  if(!ku_pg_diag_try_lock()) {ku_pg_diag_increment(&ku_pg_diagnostics.contention_drops);return;}
+  KuPgDiagnosticSnapshot* s=&ku_pg_diagnostics.samples[ku_pg_diagnostics.next];memset(s,0,sizeof(*s));
+  s->sequence=sequence;s->observed_ms=now;s->started_ms=op->started_ms;
+  s->last_progress_ms=ku_pg_diag_load(&op->waiter.diagnostic.last_progress_ms);
+  s->deadline_ms=op->deadline;s->acquire_deadline_ms=op->acquire_deadline;s->connect_deadline_ms=op->connect_deadline;
+  s->remaining_ms=op->deadline>now?op->deadline-now:0;s->phase=(uint64_t)op->phase;
+  KuPgDiagnosticLease* d=&op->waiter.diagnostic;
+  s->task_slot=d->task_slot;s->task_generation=d->task_generation;s->http_task_slot=d->http_task_slot;s->http_task_generation=d->http_task_generation;
+  s->owner=d->owner;s->job_generation=d->job_generation;s->parent_depth=d->parent_depth;s->parent_chain_missing=d->parent_chain_missing;
+  s->task_phase_missing=op->task_phase==NULL;if(op->task_phase)s->task_phase=op->task_phase(op->task_phase_context);
+  s->sync_identity_missing=(uint64_t)op->diagnostic_sync;
+  s->interest=op->interest;s->events=op->diagnostic_events;s->steps=op->diagnostic_steps;s->sent=(uint64_t)op->sent;
+  s->progress_events=ku_pg_diag_load(&d->progress_events);
+  s->published=d->published;s->consumed=d->consumed;s->acquired_ms=d->acquired_ms;
+  s->lease_slot=op->slot<0?UINT64_MAX:(uint64_t)op->slot;
+  if(op->slot>=0)s->lease_generation=p->lease_generations[op->slot];
+  s->pool_size=p->size;s->active=p->active;s->waiters=p->waiters;s->async_operations=p->async_operations;
+  s->connecting=(uint64_t)p->connect_in_flight;s->leased=p->active>s->connecting?p->active-s->connecting:0;s->connect_ready=(uint64_t)op->connect_ready;
+  s->reconnect_not_before_ms=p->reconnect_not_before_ms;s->connect_failures=p->consecutive_connect_failures;s->closing=(uint64_t)p->closing;
+  /* Copied by the sole executor before entering the PG mutex. No libpq call
+   * or other lease's connection is inspected while recording a failure. */
+  s->libpq_status_missing=!op->diagnostic_libpq_status_present;
+  if(op->diagnostic_libpq_status_present)s->libpq_status=(uint64_t)op->diagnostic_libpq_status;
+  for(size_t i=0;i<p->size;i++) {
+    KuPgAsyncWaiter* owner=p->async_owners[i];
+    if(p->conns[i] && !p->in_use[i])s->idle++;
+    if(!p->conns[i] && !p->in_use[i])s->empty++;
+    if(p->in_use[i] && !owner)s->owner_missing++;
+    if(owner) {uint64_t phase=ku_pg_diag_load(&owner->diagnostic.phase);if(phase>=KU_PG_ASYNC_RESET_SEND && phase<=KU_PG_ASYNC_RESET_READ)s->reset++;}
+    if(p->lease_generations[i]==UINT64_MAX)s->lease_generation_saturated=1;
+    if(s->slot_samples<8u) {
+      KuPgDiagnosticMember* m=&s->slots[s->slot_samples++];m->index=i;m->connection=p->conns[i]!=NULL;m->in_use=(uint64_t)p->in_use[i];m->generation=p->lease_generations[i];
+      ku_pg_async_diagnostic_member(m,owner);
+    }
+  }
+  s->reset_unknown=s->owner_missing;
+  s->slots_truncated=p->size>s->slot_samples;
+  for(KuPgAsyncWaiter* node=p->async_head;node && s->waiter_samples<8u;node=node->next) {
+    KuPgDiagnosticMember* m=&s->queue[s->waiter_samples];m->index=s->waiter_samples++;
+    ku_pg_async_diagnostic_member(m,node);
+  }
+  s->waiters_truncated=p->waiters>s->waiter_samples;
+  if(p->async_head) {s->queue_head_task_slot=p->async_head->diagnostic.task_slot;s->queue_head_task_generation=p->async_head->diagnostic.task_generation;s->queue_head_notified=(uint64_t)p->async_head->notified;}
+  if(ku_pg_diagnostics.count<8u)ku_pg_diagnostics.count++;else if(ku_pg_diagnostics.overwritten!=UINT64_MAX)ku_pg_diagnostics.overwritten++;
+  ku_pg_diagnostics.next=(ku_pg_diagnostics.next+1u)%8u;ku_pg_diag_unlock();
+}
+/* The synchronous path has no registered Task identity. Its cold witness is
+ * the same shape, with missing identity/owner explicit rather than invented.
+ * The supplied libpq handle is either NULL or exclusively owned by this caller. */
+static void ku_pg_diagnostics_sync_acquire_locked(KuPgClient* p,unsigned long long started,
+    unsigned long long acquire_deadline,unsigned long long operation_deadline,
+    unsigned long long connect_deadline,int slot,unsigned long long now,PGconn* connection) {
+  KuPgAsyncOp op={0};op.pool=p;op.slot=slot;op.conn=connection;
+  op.started_ms=started;op.observed_ms=now;op.diagnostic_sync=1;
+  op.deadline=operation_deadline?operation_deadline:acquire_deadline;op.acquire_deadline=acquire_deadline;op.connect_deadline=connect_deadline;
+  op.phase=slot<0?KU_PG_ASYNC_ACQUIRE:KU_PG_ASYNC_CONNECT;op.waiter.diagnostic.parent_chain_missing=1;
+  ku_pg_diag_store(&op.waiter.diagnostic.phase,(uint64_t)op.phase);
+  ku_pg_diag_store(&op.waiter.diagnostic.last_progress_ms,started);ku_pg_diag_store(&op.waiter.diagnostic.progress_events,0);
+  ku_pg_async_capture_acquire_locked(&op,now);
+}
 static int ku_pg_result_owned_bytes(KuPgResult* result,size_t* bytes) {
   if (!bytes) return 0;
   *bytes=0; if (!result) return 1;
@@ -89,7 +181,7 @@ static void ku_pg_async_release(KuPgAsyncOp* op,int broken) {
   if ((broken || p->closing) && p->conns[op->slot]) {
     discard=p->conns[op->slot];p->conns[op->slot]=NULL;
   }
-  p->in_use[op->slot]=0;p->active--;op->slot=-1;op->conn=NULL;
+  p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;op->slot=-1;op->conn=NULL;
   ku_pg_client_signal_locked(p,p->closing);
   ku_pg_mutex_unlock(&p->lock);
   if (discard) PQfinish(discard);
@@ -110,7 +202,7 @@ static void ku_pg_async_finish(KuPgAsyncOp* op,KuError error,int broken) {
   ku_pg_async_drop_query(op);
   op->output=(KuResult_pg_result){false,NULL,error};op->broken=broken;
   if (broken) ku_pg_async_shutdown(op);
-  ku_pg_async_release(op,broken);op->phase=KU_PG_ASYNC_DONE;op->interest=0;
+  ku_pg_async_release(op,broken);ku_pg_async_set_phase(op,KU_PG_ASYNC_DONE);op->interest=0;
 }
 static void ku_pg_async_failure(KuPgAsyncOp* op) {
   int completed=(op->query.terminal && (PQresultStatus(op->query.terminal)==KU_PGRES_COMMAND_OK
@@ -159,6 +251,11 @@ static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str pa
   op->pool=p;op->budget=budget;op->sql=copied_sql;op->values=values;op->params=storage;
   op->sql_bytes=sql_bytes;op->values_bytes=values_bytes;op->param_bytes=storage_bytes;
   op->input_charge=charge;op->operation_charge=operation_charge;op->count=(int)params.len;
+  op->started_ms=op->observed_ms=now;
+  op->waiter.diagnostic.parent_chain_missing=1;
+  ku_pg_diag_store(&op->waiter.diagnostic.phase,KU_PG_ASYNC_ACQUIRE);
+  ku_pg_diag_store(&op->waiter.diagnostic.last_progress_ms,now);
+  ku_pg_diag_store(&op->waiter.diagnostic.progress_events,0);
   op->slot=-1;op->phase=KU_PG_ASYNC_ACQUIRE;op->query=(KuPgQuery){true,0,0,1,{0}};
   op->deadline=deadline;op->acquire_deadline=ku_pg_client_saturating_add_ms(now,p->acquire_timeout_ms);
   if (deadline<op->acquire_deadline) op->acquire_deadline=deadline;
@@ -173,15 +270,19 @@ static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str pa
 static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
   KuPgClient* p=op->pool;KuError error={0};int make=-1;
   ku_pg_mutex_lock(&p->lock);
+  /* Waiting for the pool mutex consumes the same absolute acquire budget.
+   * The owner's pre-lock time sample cannot authorize a later lease. */
+  now=ku_pg_now_ms();op->observed_ms=now;
+  if(op->waiting && op->waiter.notified && op->waiter.diagnostic.consumed!=UINT64_MAX)op->waiter.diagnostic.consumed++;
   if(p->closing) error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);
-  else if(now>=op->acquire_deadline) error=ku_pg_client_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);
+  else if(now>=op->acquire_deadline) {ku_pg_async_capture_acquire_locked(op,now);error=ku_pg_client_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);}
   if(error.code.len) {ku_pg_async_unlink_locked(op);ku_pg_mutex_unlock(&p->lock);ku_pg_async_finish(op,error,0);return -1;}
   int can_claim=op->waiting || p->waiters==0;
   if(can_claim) for(size_t i=0;i<p->size;i++) if(p->conns[i] && !p->in_use[i]) {
-    p->in_use[i]=1;p->active++;op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_unlink_locked(op);op->phase=KU_PG_ASYNC_PREPARE;break;
+    p->in_use[i]=1;p->active++;op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_claim_locked(op,now);ku_pg_async_unlink_locked(op);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);break;
   }
   if(op->slot<0 && can_claim && !p->connect_in_flight && now>=p->reconnect_not_before_ms)
-    for(size_t i=0;i<p->size;i++) if(!p->conns[i] && !p->in_use[i]) {make=(int)i;p->in_use[i]=1;p->active++;p->connect_in_flight=1;op->slot=make;op->connecting=1;op->phase=KU_PG_ASYNC_CONNECT;ku_pg_async_unlink_locked(op);break;}
+    for(size_t i=0;i<p->size;i++) if(!p->conns[i] && !p->in_use[i]) {make=(int)i;p->in_use[i]=1;p->active++;p->connect_in_flight=1;op->slot=make;op->connecting=1;ku_pg_async_claim_locked(op,now);ku_pg_async_set_phase(op,KU_PG_ASYNC_CONNECT);ku_pg_async_unlink_locked(op);break;}
   if(op->slot<0 && !op->waiting) {
     if(p->waiters>=p->max_waiters) error=ku_pg_client_error("pool_busy",sizeof("pool_busy")-1,"PostgreSQL client waiter limit reached",sizeof("PostgreSQL client waiter limit reached")-1);
     else {op->waiting=1;p->waiters++;op->waiter.linked=1;op->waiter.notified=0;
@@ -197,15 +298,24 @@ static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
 static void ku_pg_async_connect_run(KuPgAsyncOp* op,int cancelled) {
   if(cancelled) op->connected=(KuPgConnectAttempt){NULL,KU_PG_CONNECT_TIMED_OUT};
   else op->connected=ku_pg_connect_until(op->pool->conninfo,op->connect_deadline);
+  ku_pg_diag_store(&op->waiter.diagnostic.last_progress_ms,ku_pg_now_ms());
+  (void)ku_pg_diag_increment(&op->waiter.diagnostic.progress_events);
   op->connect_ready=1;
 }
 static void ku_pg_async_connected(KuPgAsyncOp* op,unsigned long long now,int cancelled) {
-  KuPgClient* p=op->pool;PGconn* connection=op->connected.conn;op->connected.conn=NULL;
-  ku_pg_mutex_lock(&p->lock);p->connect_in_flight=0;op->connecting=0;
+  KuPgClient* p=op->pool;PGconn* connection=op->connected.conn;
+  if(connection) {op->diagnostic_libpq_status=PQstatus(connection);op->diagnostic_libpq_status_present=1;}
+  ku_pg_mutex_lock(&p->lock);
+  now=ku_pg_now_ms();op->observed_ms=now;
   int closed=p->closing;
+  /* Keep the witness aligned with the public failure priority below: an OOM
+   * remains OOM even when waiting for the pool mutex also consumes acquire D. */
+  if(!closed && !cancelled && op->connected.outcome!=KU_PG_CONNECT_OUT_OF_MEMORY
+      && now>=op->acquire_deadline)ku_pg_async_capture_acquire_locked(op,now);
+  op->connected.conn=NULL;p->connect_in_flight=0;op->connecting=0;
   if(connection && !closed && !cancelled && now<op->acquire_deadline) {
-    p->conns[op->slot]=connection;op->conn=connection;ku_pg_client_record_connect_success_locked(p);op->phase=KU_PG_ASYNC_PREPARE;
-  } else {if(!connection)ku_pg_client_record_connect_failure_locked(p,now);p->in_use[op->slot]=0;p->active--;op->slot=-1;}
+    p->conns[op->slot]=connection;op->conn=connection;ku_pg_client_record_connect_success_locked(p);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);
+  } else {if(!connection)ku_pg_client_record_connect_failure_locked(p,now);p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;op->slot=-1;}
   ku_pg_client_signal_locked(p,closed);ku_pg_mutex_unlock(&p->lock);
   if(op->slot>=0)return;
   if(connection)PQfinish(connection);
@@ -303,8 +413,10 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
   }
   op->query.value->rows=op->row_next_rows;return 1;
 }
-static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long long now,int cancelled) {
+static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned long long now,int cancelled) {
   if(op->phase==KU_PG_ASYNC_DONE)return 1;
+  op->observed_ms=now;if(op->diagnostic_steps!=UINT64_MAX)op->diagnostic_steps++;
+  if(events && op->diagnostic_events!=UINT64_MAX)op->diagnostic_events++;
   if(op->phase==KU_PG_ASYNC_CONNECT) {
     if(!op->connect_ready)return 0;
     ku_pg_async_connected(op,now,cancelled);if(op->phase==KU_PG_ASYNC_DONE)return 1;
@@ -312,7 +424,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
   if(cancelled || now>=op->deadline) {
     /* A fully detached user result remains valid even if its mandatory reset
      * times out. Evict the lease; never send its statement again. */
-    if(op->phase>=KU_PG_ASYNC_RESET_SEND) {ku_pg_async_shutdown(op);ku_pg_async_release(op,1);op->phase=KU_PG_ASYNC_DONE;return 1;}
+    if(op->phase>=KU_PG_ASYNC_RESET_SEND) {ku_pg_async_shutdown(op);ku_pg_async_release(op,1);ku_pg_async_set_phase(op,KU_PG_ASYNC_DONE);return 1;}
     ku_pg_async_finish(op,op->sent ? ku_pg_execution_unknown_error() : cancelled
         ? ku_pg_client_error("cancelled",sizeof("cancelled")-1,"PostgreSQL query was cancelled before it was sent",sizeof("PostgreSQL query was cancelled before it was sent")-1)
         : ku_pg_query_timeout_error(),1);return 1;
@@ -329,7 +441,9 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
     }
     op->interest=0;
     if(op->row) {
+      size_t before_bytes=turn.bytes,before_cells=turn.cells;
       int appended=ku_pg_async_materialize(op,&turn);
+      if(turn.bytes!=before_bytes || turn.cells!=before_cells || appended==1)op->diagnostic_progress=1;
       if(!appended)return 0;
       if(appended==-2 || appended==-3) {ku_pg_async_failure(op);return 1;}
       if(appended!=1) {ku_pg_async_drop_table(op,&op->query.value);op->query.validation=appended;}
@@ -343,7 +457,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
       int tx=PQtransactionStatus(op->conn);
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || tx!=KU_PQTRANS_IDLE || PQsetnonblocking(op->conn,1)!=0
           || !PQconsumeInput(op->conn) || !ku_pg_connection_is_utf8(op->conn)) {ku_pg_async_failure(op);return 1;}
-      op->phase=KU_PG_ASYNC_SEND;
+      ku_pg_async_set_phase(op,KU_PG_ASYNC_SEND);
     }
     if(op->phase==KU_PG_ASYNC_SEND) {
       /* Set sent before entering libpq: a failed send can already have placed
@@ -351,12 +465,12 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
       op->sent=1;
       if(!PQsendQueryParams(op->conn,op->sql,op->count,NULL,op->values,NULL,NULL,0)
           || !PQsetSingleRowMode(op->conn)) {ku_pg_async_failure(op);return 1;}
-      op->phase=KU_PG_ASYNC_FLUSH;
+      ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn)
           || !PQsendQueryParams(op->conn,"DISCARD ALL",0,NULL,NULL,NULL,NULL,0) || !PQsetSingleRowMode(op->conn))goto reset_failed;
-      op->reset_sent=1;op->phase=KU_PG_ASYNC_RESET_FLUSH;
+      op->reset_sent=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_FLUSH);
     }
     int reset=op->phase>=KU_PG_ASYNC_RESET_FLUSH;
     if(op->phase==KU_PG_ASYNC_FLUSH || op->phase==KU_PG_ASYNC_RESET_FLUSH) {
@@ -366,17 +480,18 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
         if((events&1u) && !PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
         op->interest=3u;return 0;
       }
-      op->phase=reset ? KU_PG_ASYNC_RESET_READ:KU_PG_ASYNC_READ;
+      ku_pg_async_set_phase(op,reset ? KU_PG_ASYNC_RESET_READ:KU_PG_ASYNC_READ);
     }
     if(PQisBusy(op->conn)) {
       if(!PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
       if(PQisBusy(op->conn)) {op->interest=1u;return 0;}
     }
     PGresult* next=PQgetResult(op->conn);
+    if(next)op->diagnostic_progress=1;
     if(reset) {
       if(!next) {
         if(!op->reset_ok || PQstatus(op->conn)!=KU_PG_CONNECTION_OK || PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn))goto reset_failed;
-        ku_pg_async_release(op,0);op->phase=KU_PG_ASYNC_DONE;return 1;
+        ku_pg_async_release(op,0);ku_pg_async_set_phase(op,KU_PG_ASYNC_DONE);return 1;
       }
       int status=PQresultStatus(next);op->reset_ok=status==KU_PGRES_COMMAND_OK;PQclear(next);
       if(!op->reset_ok)goto reset_failed;
@@ -394,7 +509,7 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
       } else {op->output=(KuResult_pg_result){true,op->query.value,{0}};op->query.value=NULL;}
       ku_pg_async_drop_query(op);
       if(PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn))goto reset_failed;
-      op->phase=KU_PG_ASYNC_RESET_SEND;continue;
+      ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_SEND);continue;
     }
     int status=PQresultStatus(next);
     if(status==KU_PGRES_SINGLE_TUPLE || status==KU_PGRES_TUPLES_OK) {
@@ -420,7 +535,19 @@ static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long lo
   /* Buffered protocol data needs another bounded turn, not fresh socket I/O. */
   op->interest=0;return 0;
 reset_failed:
-  ku_pg_async_shutdown(op);ku_pg_async_release(op,1);op->phase=KU_PG_ASYNC_DONE;op->interest=0;return 1;
+  ku_pg_async_shutdown(op);ku_pg_async_release(op,1);ku_pg_async_set_phase(op,KU_PG_ASYNC_DONE);op->interest=0;return 1;
+}
+static int ku_pg_async_step(KuPgAsyncOp* op,unsigned int events,unsigned long long now,int cancelled) {
+  op->diagnostic_progress=0;
+  int done=ku_pg_async_step_inner(op,events,now,cancelled);
+  /* One timestamp per turn with actual protocol/materialization advancement,
+   * including a long result that remains in READ across multiple turns.
+   * A spurious readiness or an unchanged waiting phase does not refresh it. */
+  if(op->diagnostic_progress) {
+    ku_pg_diag_store(&op->waiter.diagnostic.last_progress_ms,ku_pg_now_ms());
+    (void)ku_pg_diag_increment(&op->waiter.diagnostic.progress_events);
+  }
+  return done;
 }
 static int ku_pg_async_interest(KuPgAsyncOp* op,int* fd,unsigned int* events,unsigned long long* deadline) {
   *fd=-1;*events=0;*deadline=op->deadline;

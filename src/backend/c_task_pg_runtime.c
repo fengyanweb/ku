@@ -25,6 +25,11 @@ static void ku_task_pg_wake(void* raw) {
 static void ku_task_pg_connect_run(KuTaskBlockingJobV1* job,int cancelled) {
   ku_pg_async_connect_run(job->pg_operation,cancelled);
 }
+/* The operation's physical registration retains this control until retirement.
+ * Failure capture may read its atomic phase without taking a driver/job lock. */
+static uint64_t ku_task_pg_diagnostic_phase(void* raw) {
+  return (uint64_t)ku_task_control_atomic_load(&((KuTaskControlV1*)raw)->phase);
+}
 static uint32_t ku_task_blocking_take_pg(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token,KuResult_pg_result* output) {
   return ku_task_blocking_take(ticket,token,0,9u,NULL,output);
@@ -74,6 +79,27 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
     if(ku_task_driver_lock(ticket->driver)) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
     KuTaskDriverSlotV1* owner=ku_task_driver_find(ticket);
     if(owner)job->net_owner=owner->owner_worker;
+    KuPgDiagnosticLease* diagnostic=&operation->waiter.diagnostic;
+    diagnostic->task_slot=ticket->slot;diagnostic->task_generation=ticket->generation;
+    diagnostic->http_task_slot=ticket->slot;diagnostic->http_task_generation=ticket->generation;
+    diagnostic->owner=job->net_owner;diagnostic->job_generation=job->generation;
+    diagnostic->parent_chain_missing=owner==NULL;
+    /* Existing wait edges carry IDs, not references. Sample at most eight
+     * coherent edges while already holding the driver lock, before the PG
+     * operation becomes visible to another owner. HTTP joins the candidate
+     * identity against its own generation-checked failure sample; a detached
+     * child with no HTTP ancestor simply has no matching request record. */
+    KuTaskDriverSlotV1* ancestor=owner;size_t child_slot=ticket->slot;
+    for(size_t depth=0;ancestor && ancestor->waiter_parent_generation;depth++) {
+      if(depth==8u || ancestor->waiter_parent_slot>=ticket->driver->capacity) {diagnostic->parent_chain_missing=1;break;}
+      size_t parent_slot=ancestor->waiter_parent_slot;
+      KuTaskDriverSlotV1* parent=&ticket->driver->slots[parent_slot];
+      if(parent->generation!=ancestor->waiter_parent_generation || parent->wait_child_slot!=child_slot
+          || parent->wait_child_generation!=ancestor->generation) {diagnostic->parent_chain_missing=1;break;}
+      diagnostic->http_task_slot=parent_slot;diagnostic->http_task_generation=parent->generation;
+      diagnostic->parent_depth++;child_slot=parent_slot;ancestor=parent;
+    }
+    operation->task_phase_context=control;operation->task_phase=ku_task_pg_diagnostic_phase;
     int attached=job->net_owner && (ticket->driver->external_loops || ticket->driver->io_wait);
     ku_task_driver_unlock(ticket->driver);
     if(attached) {

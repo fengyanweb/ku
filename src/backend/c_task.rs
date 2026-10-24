@@ -1036,13 +1036,6 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         } else {
             "scalar"
         };
-        let exhausted = if self.task_mask == 0 {
-            format!("  frame->header.state={state}u; goto ku_task_scalar_quantum_boundary;\n")
-        } else {
-            format!(
-                "  frame->header.state={state}u;\n  KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n  ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n  frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n"
-            )
-        };
         out.push_str(&format!(
             "ku_task_{label}_check_{state}:;\n\
              if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
@@ -1051,7 +1044,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
              }}\n\
              {budget} {{\n\
-             {exhausted}\
+               frame->header.state={state}u;\n\
+               KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
+               ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
+               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
              }}\n"
         ));
     }
@@ -1071,34 +1067,6 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 "  if (__ku_copy_init_active) {{\n    frame->header.initialized=(frame->header.initialized & ~UINT64_C({mask})) | (__ku_copy_initialized & UINT64_C({mask}));\n    __ku_copy_init_active=0;\n  }}\n"
             ));
         }
-    }
-
-    fn emit_scalar_quantum_boundary(&self, out: &mut COutput) {
-        if self.task_mask != 0
-            || !(0..self.function.states.len()).any(|state| self.scalar_direct_state(state))
-        {
-            return;
-        }
-        // Keep this once-per-slice work out of every scalar/range checkpoint.
-        // The shared selector costs one state materialization/Copy-bit flush,
-        // but persistent scalar values stay in C locals: no frame spill or
-        // control/adapter/frame reentry is needed for an authorized slice.
-        out.push_str("ku_task_scalar_quantum_boundary:;\n  {\n  KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n  if (__ku_charge_unchanged && !yield_host->blocking && (!yield_host->wait || !yield_host->wait->driver)\n    && ku_task_driver_continue_scalar_quantum(yield_host->ticket,yield_host->control)) {\n    __ku_dispatch_budget=64u; local_initialized=0;\n");
-        for (index, slot) in self.function.slots.iter().enumerate() {
-            if !self.persistent.contains(&index) {
-                if let TaskSlotType::Value { ty, .. } = &slot.ty {
-                    if matches!(ty, IrType::Int | IrType::Bool | IrType::Null) {
-                        out.push_str(&format!("    slot_{index}=0;\n"));
-                    }
-                }
-            }
-        }
-        if self.range_active.get() {
-            // A numeric proof covers exactly 64 states. The original selector
-            // must re-guard updated inputs before the next logical slice.
-            out.push_str("    __ku_range_unselected=1;\n");
-        }
-        out.push_str("    goto ku_task_dispatch;\n  }\n  ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n  frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }\n");
     }
 
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
@@ -1663,7 +1631,6 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         self.scalar_init_cache_active.set(false);
         self.range_fast.set(false);
-        self.emit_scalar_quantum_boundary(out);
         if !self.finally.state_cleanup.is_empty() {
             out.push_str("ku_task_protected_failure:;\n  switch (frame->header.state) {\n");
             for (state, region) in self.finally.regions.iter().enumerate() {

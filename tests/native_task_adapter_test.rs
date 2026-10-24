@@ -1701,6 +1701,9 @@ async fn main(): null! { return ok(null) }
         String::from_utf8_lossy(&output.stdout).trim(),
         "blocking-write-ledger-ok"
     );
+    let layout = String::from_utf8_lossy(&output.stderr);
+    assert!(layout.contains("file-job-layout job="), "{layout}");
+    eprint!("{layout}");
 }
 
 const BLOCKING_FIXTURE_HOOKS: &str = r#"
@@ -2348,6 +2351,12 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
   KuTaskBlockingPoolV1 pool={0};
   CHECK(KU_TASK_DRIVER_MAX_SLOTS>=16384u);
   CHECK(ku_task_blocking_fixed_bytes(SIZE_MAX)==SIZE_MAX);
+  KuTaskBlockingJobV1 layout={0};
+  CHECK((void*)&layout.result==(void*)&layout.read_result);
+  CHECK((void*)&layout.result==(void*)&layout.directory_result);
+  fprintf(stderr,"file-job-layout job=%zu result_members_sum=%zu fixed_1024=%zu fixed_16384=%zu\n",
+      sizeof(layout),sizeof(layout.result)+sizeof(layout.read_result)+sizeof(layout.directory_result),
+      ku_task_blocking_fixed_bytes(1024u),ku_task_blocking_fixed_bytes(16384u));
   CHECK(ku_task_blocking_init(&pool,16385u,1u,blocking_observation_deadline())==KU_TASK_DRIVER_INVALID_ARGUMENT);
   CHECK(!fixture_ledger().bytes && !pool.initialized);
   /* Allocation failure leaves a retryable, explicitly reapable partial pool. */
@@ -4027,6 +4036,9 @@ async fn main(): null! { return ok(null) }
         String::from_utf8_lossy(&output.stdout).trim(),
         "net-job-owners-ok"
     );
+    let layout = String::from_utf8_lossy(&output.stderr);
+    assert!(layout.contains("network-job-layout job="), "{layout}");
+    eprint!("{layout}");
 }
 
 const NET_OWNER_HOOKS: &str = r#"
@@ -4083,6 +4095,43 @@ static FixtureLedger net_work_ledger(void) {
 static uint64_t net_deadline(void) {uint64_t now=ku_task_driver_now_ms();CHECK(now!=UINT64_MAX);return now+2000u;}
 static KuTaskDriverSnapshotV1 net_snapshot(void) {
   KuTaskDriverSnapshotV1 snapshot={0};CHECK(ku_task_driver_snapshot(&net_driver,&snapshot)==KU_TASK_DRIVER_OK);return snapshot;
+}
+/* Reuse one physical record across all network kinds, with non-empty owned
+ * payloads/errors. Calling a drop for an inactive Result variant would free
+ * the wrong payload or read an error at the wrong offset. */
+static void net_result_storage_reuse(void) {
+  KuTaskBlockingJobV1 job={0};
+  CHECK((void*)&job.result==(void*)&job.read_result);
+  CHECK((void*)&job.result==(void*)&job.net_connect_result);
+  CHECK((void*)&job.result==(void*)&job.net_read_result);
+  size_t separate=sizeof(job.result)+sizeof(job.read_result)+sizeof(job.net_connect_result)+sizeof(job.net_read_result);
+  size_t largest=sizeof(job.net_read_result);
+  if(sizeof(job.read_result)>largest)largest=sizeof(job.read_result);
+  if(sizeof(job.net_connect_result)>largest)largest=sizeof(job.net_connect_result);
+  if(sizeof(job.result)>largest)largest=sizeof(job.result);
+  fprintf(stderr,"network-job-layout job=%zu result_members_sum=%zu shared_result_max=%zu fixed_1024=%zu fixed_16384=%zu\n",
+      sizeof(job),separate,largest,ku_task_blocking_fixed_bytes(1024u),ku_task_blocking_fixed_bytes(16384u));
+  for(size_t round=0;round<3u;round++)for(uint32_t kind=5u;kind<=8u;kind++)for(int ok=0;ok<2;ok++) {
+    uint64_t generation=job.generation+1u;memset(&job,0,sizeof(job));job.kind=kind;job.generation=generation;
+    FixtureLedger before=fixture_ledger();
+    if(!ok) {
+      KuString domain=ku_string_concat(ku_string_static((const uint8_t*)"do",2u),ku_string_static((const uint8_t*)"main",4u));
+      KuString code=ku_string_concat(ku_string_static((const uint8_t*)"er",2u),ku_string_static((const uint8_t*)"ror",3u));
+      KuString message=ku_string_concat(ku_string_static((const uint8_t*)"owned",5u),ku_string_static((const uint8_t*)" error",6u));
+      KuError error=ku_error_make(domain,code,message);
+      if(kind==5u)job.net_connect_result=(KuResult_net_client){false,NULL,error};
+      else if(kind==6u)job.net_read_result=(KuResult_bytes){false,{0},error};
+      else job.result=(KuResult_null){false,0,error};
+    } else if(kind==5u) {
+      job.net_connect_result=ku_net_client_with_allocator(NULL,NULL);CHECK(job.net_connect_result.ok);
+    } else if(kind==6u) {
+      uint8_t* bytes=(uint8_t*)malloc(3u);CHECK(bytes);memcpy(bytes,"A\0B",3u);
+      job.net_read_result=(KuResult_bytes){true,{bytes,3u,3u,KU_BYTES_OWNED},{0}};
+    } else job.result=(KuResult_null){true,0,{0}};
+    ku_task_blocking_net_drop_result(&job);
+    FixtureLedger after=fixture_ledger();CHECK(before.allocations==after.allocations&&before.bytes==after.bytes&&!after.overflow);
+    CHECK(job.kind==kind&&job.generation==generation);
+  }
 }
 static void net_case(int write,int cancel,int limited) {
   memset(&net_driver,0,sizeof(net_driver));memset(net_slots,0,sizeof(net_slots));memset(net_ring,0,sizeof(net_ring));memset(&net_pool,0,sizeof(net_pool));
@@ -4145,6 +4194,7 @@ static void net_case(int write,int cancel,int limited) {
 }
 int main(void) {
   CHECK(KU_TASK_DRIVER_ABI_VERSION==11u);
+  net_result_storage_reuse();
   net_case(0,0,0);net_case(1,0,0);net_case(0,0,1);net_case(0,1,0);net_case(1,1,0);
   puts("net-job-owners-ok");return 0;
 }

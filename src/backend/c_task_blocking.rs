@@ -80,16 +80,27 @@ typedef struct KuTaskBlockingJobV1 {
   void* path;
 #endif
   KuString content;
-  KuResult_null result;
-  KuResult_str read_result;
+  /* kind is fixed from BUILDING through DONE retirement. Only its matching
+   * Result is ever published; inputs, physical operation state and exists_value
+   * remain independent because they may outlive/ accompany that Result. */
+  union {
+    KuResult_null result;             /* write/exists/net write/net close */
+    KuResult_str read_result;         /* file read */
 #if KU_TASK_BLOCKING_DIRECTORY
-  KuResult_array_str directory_result;
+    KuResult_array_str directory_result;
 #endif
+#if KU_TASK_BLOCKING_PG
+    KuResult_pg_result pg_result;
+#endif
+#if KU_TASK_BLOCKING_NETWORK
+    KuResult_net_client net_connect_result;
+    KuResult_bytes net_read_result;
+#endif
+  };
   bool exists_value;
 #if KU_TASK_BLOCKING_PG
   KuPgAsyncOp* pg_operation;
   KuTaskBlockingPoolV1* pg_pool;
-  KuResult_pg_result pg_result;
   uint32_t pg_ready;
 #endif
 #if KU_TASK_BLOCKING_NETWORK
@@ -99,8 +110,6 @@ typedef struct KuTaskBlockingJobV1 {
   int64_t net_requested;
   KuNetClient* net_client;
   KuBytes net_write;
-  KuResult_net_client net_connect_result;
-  KuResult_bytes net_read_result;
   size_t net_owner,net_offset,net_address_count,net_address_index;
   void* net_addresses;
   uint32_t net_plain,net_resolved;
@@ -367,6 +376,14 @@ static void ku_task_blocking_output_release(void* raw, void* pointer) {
   output->status=KU_TASK_DRIVER_INTERNAL;
 }
 #if KU_TASK_BLOCKING_NETWORK
+/* The Result storage is shared. Dropping another variant would interpret its
+ * payload/error at the wrong offsets; kind, not zero-filled inactive fields,
+ * identifies the sole owner on every normal/error/cancel retirement path. */
+static void ku_task_blocking_net_drop_result(KuTaskBlockingJobV1* job) {
+  if (job->kind==5u) ku_result_drop_net_client(&job->net_connect_result);
+  else if (job->kind==6u) ku_result_drop_bytes(&job->net_read_result);
+  else ku_result_drop_null(&job->result);
+}
 static void ku_task_net_resolve(KuTaskBlockingJobV1*,KuObject*,KuTaskBlockingOutputV1*);
 static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
     KuTaskBlockingOutputV1* allocation) {
@@ -414,9 +431,7 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
   }
   ku_task_blocking_free(job->net_write.ptr); job->net_write=(KuBytes){0};
   if (allocation->status!=KU_TASK_DRIVER_OK) {
-    if (job->kind==5u) ku_result_drop_net_client(&job->net_connect_result);
-    else if (job->kind==6u) ku_result_drop_bytes(&job->net_read_result);
-    else ku_result_drop_null(&job->result);
+    ku_task_blocking_net_drop_result(job);
     error=ku_task_blocking_error(allocation->status==KU_TASK_DRIVER_LIMIT ? "memory_limit"
         : allocation->status==KU_TASK_DRIVER_CLOSED ? "cancelled"
         : allocation->status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "internal_error",
@@ -907,9 +922,7 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
 #if KU_TASK_BLOCKING_NETWORK
         if (job->kind>=5u) {
           ku_drop_net_client(&job->net_client);
-          ku_result_drop_net_client(&job->net_connect_result);
-          ku_result_drop_bytes(&job->net_read_result);
-          ku_result_drop_null(&job->result);
+          ku_task_blocking_net_drop_result(job);
         } else
 #endif
 #if KU_TASK_BLOCKING_DIRECTORY

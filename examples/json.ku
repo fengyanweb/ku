@@ -39,6 +39,13 @@ fn main(): null! {
     if (json.encode(decoded)? != text || json.stringify(value)? != text) {
         panic("JSON aliases disagree")
     }
+    // Indexed reads above return independent owned copies. When the root is
+    // no longer needed, take(key) consumes it and transfers only this subtree.
+    // It returns the same missing_key/type_unsupported Results as indexed reads.
+    transferred = decoded.take("nested")?
+    if (json.encode(transferred)? != json.encode(nested)?) {
+        panic("JSON consuming extraction changed the subtree")
+    }
     println("roundtrip ok")
 
     rejected = false

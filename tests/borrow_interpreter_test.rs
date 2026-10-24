@@ -203,3 +203,68 @@ fn borrow_interpreter_defensively_rejects_mutation_escape_capture_and_async() {
         assert!(error.message.contains(expected), "{source}: {error:?}");
     }
 }
+
+#[test]
+fn borrow_interpreter_json_take_owns_selected_subtree_and_crosses_await() {
+    ku::cli::run_source("json-take.ku", r#"
+import json from "std.json"
+async fn pause(): int! { return ok(1) }
+fn key(): str! { return ok("data") }
+fn main_value(): str! { return json.encode((json.decode("{\"data\":\"temporary\"}")?).take(key()?)?) }
+async fn main(): null! {
+    text = "{\"data\":{\"text\":\"中文😀\\u0000\\n\\\"\\\\tail\",\"items\":[1,true,null]},\"unused\":\"drop me\"}"
+    root = json.decode(text)?
+    copied = root["data"]?
+    selected = root.take(key()?)?
+    text = "input released"
+    awaited = (await pause())?
+    if (awaited != 1 || json.encode(selected)? != json.encode(copied)?) { panic("selected subtree lifetime") }
+    if (main_value()? != "\"temporary\"") { panic("temporary receiver") }
+    named = json.decode("{\"take\":7,\"data\":null}")?
+    if ((named.take("take")?).as_int()? != 7) { panic("ordinary JSON take key") }
+    failures = 0
+    finalized = 0
+    try { (json.decode("{\"other\":1}")?).take("missing")? }
+    catch(error) { if (error.domain == "object" && error.code == "missing_key" && error.message == "missing object key: missing") { failures++ } }
+    finally { finalized++ }
+    try { (json.decode("[1,2]")?).take("missing")? }
+    catch(error) { if (error.domain == "object" && error.code == "type_unsupported" && error.message == "expected object value") { failures++ } }
+    finally { finalized++ }
+    if (failures != 2 || finalized != 2) { panic("take errors") }
+    return ok(null)
+}
+"#).unwrap();
+    let error = run_unchecked(
+        r#"
+fn read(&value) { value.take("data") }
+fn main(): null! { root = json.decode("{\"data\":1}")? read(root) return ok(null) }
+"#,
+    )
+    .unwrap_err();
+    assert!(error.message.contains("borrowed"), "{error}");
+}
+
+#[test]
+fn borrow_interpreter_callable_take_fields_keep_prior_dispatch_and_source_order() {
+    ku::cli::run_source("callable-take.ku", r#"
+struct ZeroReader { take: fn(): int, label: str }
+struct KeyReader { take: fn(&str): int, label: str }
+fn zero(): int { return 7 }
+fn count(&text: str): int { return text.byte_len() }
+fn inspect(&reader: KeyReader, &text: str): int { return reader.take(text) }
+fn main() {
+    x = ZeroReader { take: zero, label: "still owned" }
+    if (x.take() != 7 || x.label != "still owned") { panic("zero callable field") }
+    reader = KeyReader { take: count, label: "still owned" }
+    text = "Ku"
+    if (inspect(reader, text) != 2 || reader.label != "still owned") { panic("borrowed callable field") }
+    object = { take: count, label: "object owned" }
+    if (object.take(text) != 2 || object.label != "object owned" || text != "Ku") { panic("object callable field") }
+    calls = 0
+    arguments = 0
+    fn make(): KeyReader { calls += 1 return KeyReader { take: count, label: "temporary" } }
+    fn key(): str { arguments += 1 return "data" }
+    if (make().take(key()) != 4 || calls != 1 || arguments != 1) { panic("temporary receiver evaluated once") }
+}
+"#).unwrap();
+}

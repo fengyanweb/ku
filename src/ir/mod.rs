@@ -3103,7 +3103,12 @@ impl<'a> FunctionLowerer<'a> {
         // client/result merely to freeze its pointer before an effectful argument
         // would duplicate ownership and reaches the backend's forbidden-clone
         // trap. The checker requires these receivers to be bound places.
-        let receiver = if matches!(
+        let receiver = if module == "kuvalue" && name == "take" {
+            // This explicit consuming method freezes its receiver by MOVE before
+            // evaluating the key. An effectful key must not clone the subtree,
+            // nor replace the source owner before the transfer has occurred.
+            self.emit_temp(receiver)?
+        } else if matches!(
             module,
             "redis" | "net" | "mysql" | "pg_client" | "pg_result"
         ) {

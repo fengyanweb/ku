@@ -386,12 +386,6 @@ typedef struct KuTaskDriverExecutionV1 {
   uint64_t generation;
   KuTaskControlV1* control;
   uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum;
-  /* Private owner-segment allowance, not a public poll budget. A generated
-   * scalar continuation may spend it without returning through R2/R4. The
-   * driver still accounts every completed 64-state logical poll separately. */
-  size_t remaining_quanta, fused_quanta;
-  uint64_t segment_started_ms;
-  int segment_clock_fault;
 } KuTaskDriverExecutionV1;
 static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
 /* Called immediately after an existing mutex-owned explicit intent write.
@@ -1836,35 +1830,6 @@ static void ku_task_driver_note_quantum_yield(const KuTaskDriverTicketV1* ticket
     execution->scalar_quantum=scalar_quantum!=0;
   }
 }
-/* Only verified generated scalar edges call this, while R2's executor and the
- * driver's original RUNNING execution lease are both held. No slot fields are
- * read unlocked: the scoped record authenticates slot/generation/control. A
- * real WAIT/YIELD, unknown Pending or raw adapter must use the normal commit.
- * This spends one of the SAME <=32 logical polls, never a larger quantum;
- * pump(1) cannot authorize another 64-state slice. Each slice retains its
- * original phase checks and the original segment's 1ms clock boundary. */
-static int ku_task_driver_continue_scalar_quantum(const KuTaskDriverTicketV1* ticket,
-    KuTaskControlV1* control) {
-  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
-  if (!execution || !ticket || !control || execution->driver!=ticket->driver
-      || execution->slot!=ticket->slot || execution->generation!=ticket->generation
-      || execution->control!=control || !execution->default_yield || execution->intent_touched
-      || execution->segment_clock_fault || !execution->remaining_quanta
-      || execution->fused_quanta>=execution->remaining_quanta-1u)
-    return 0;
-  if (ku_task_driver_check_ticket(ticket)!=KU_TASK_DRIVER_OK
-      || control->abi_version!=KU_TASK_CONTROL_ABI_VERSION || control->storage_size!=sizeof(*control)
-      || ku_task_control_atomic_load(&control->executor)!=1u
-      || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE)
-    return 0;
-  uint64_t now=ku_task_driver_now_ms();
-  if (now==UINT64_MAX || now<execution->segment_started_ms) {
-    execution->segment_clock_fault=1; return 0;
-  }
-  if (now-execution->segment_started_ms>=1u) return 0;
-  execution->fused_quanta++;
-  return 1;
-}
 /* This local witness never reads cached shared charges. The adapter separately
  * excludes blocking functions, active children/receipts, waits and drain. */
 static int ku_task_driver_scalar_quantum(const KuTaskDriverTicketV1* ticket,
@@ -2736,7 +2701,7 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
   slot->cleanup_acked_generation = slot->generation;
   return KU_TASK_DRIVER_CLEANUP_ACK;
 }
-/* One owner segment, consuming at most max_quanta logical control polls (<=32).
+/* One owner segment, consuming at most max_quanta actual control polls (<=32).
  * Enter and return with the publication mutex held. User callbacks/drop run
  * unlocked. Only pure generated dispatch-budget yields may share the live
  * RUNNING execution lease. Time is checked after each 64-dispatch boundary:
@@ -2773,8 +2738,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
-    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,
-      max_quanta,0,started,started==UINT64_MAX};
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0};
     KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 
@@ -2784,23 +2748,23 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     ku_task_driver_execution=&context;
     size_t quanta=0;
     uint32_t outcome=KU_TASK_CONTROL_PENDING;
+    int segment_clock_fault=started==UINT64_MAX;
     do {
       context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0;
-      context.remaining_quanta=max_quanta-quanta; context.fused_quanta=0;
       outcome=ku_task_control_poll(&execution);
-      quanta+=1u+context.fused_quanta;
+      quanta++;
       if (outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
-          || quanta>=max_quanta || context.segment_clock_fault
+          || quanta>=max_quanta || segment_clock_fault
           || ku_task_control_atomic_load(&execution.control->phase)!=KU_TASK_CONTROL_LIVE) break;
       uint64_t now=ku_task_driver_now_ms();
-      if (now==UINT64_MAX || now<started) { context.segment_clock_fault=1; break; }
+      if (now==UINT64_MAX || now<started) { segment_clock_fault=1; break; }
       if (now-started>=1u) break;
     } while (1);
     ku_task_driver_execution=previous_execution;
 
     if (ku_task_driver_lock(driver)) return -1;
     slot = &driver->slots[index];
-    if (context.segment_clock_fault) ku_task_driver_enter_clock_fault(driver);
+    if (segment_clock_fault) ku_task_driver_enter_clock_fault(driver);
     if (!slot->intent && context.default_yield) slot->intent=KU_TASK_DRIVER_YIELD;
     driver->polls=quanta>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+quanta;
     driver->running--; slot->executor_worker = 0;

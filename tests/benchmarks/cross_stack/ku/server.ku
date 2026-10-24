@@ -25,7 +25,9 @@ async fn ready(req: HttpRequest): HttpResponse! {
 fn encode(req: HttpRequest): HttpResponse! {
     decoded = json.decode(req.body)?
     counter = decoded["counter"]?.as_int()?
-    data = decoded["data"]?
+    // Explicitly consume the decoded root after the counter read. The selected
+    // subtree moves to the response; ordinary indexed reads still return copies.
+    data = decoded.take("data")?
     body = json.encode({id: req.query.rid.clone(), counter: counter + 1, data: data})?
     return ok(http.text(body))
 }

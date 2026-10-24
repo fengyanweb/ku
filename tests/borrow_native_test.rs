@@ -154,6 +154,14 @@ fn borrow_ir_function_field_call_preserves_parameter_modes() {
         dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
         "{dump}"
     );
+    // Adding KuValue.take must not reserve the same spelling for ordinary
+    // callable struct fields. Keep the old indirect-call path and its modes.
+    let take = ir("struct Reader { take: fn(&str): int } fn Read(&text: str): int { return text.len() } fn Use(&reader: Reader, &text: str): int { return reader.take(text) } fn main() { text = \"Ku\" reader = Reader { take: Read } println(Use(reader, text)) println(reader.take(text)) }");
+    let dump = take.to_string();
+    assert!(
+        dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
+        "{dump}"
+    );
 }
 
 #[test]

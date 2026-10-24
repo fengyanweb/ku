@@ -9,7 +9,9 @@
 `protocol.json` 冻结语料哈希、算法、数据库表、SLO、资源档和测量窗口。
 四个服务分别使用 Ku native C、Go net/http、Rust Tokio/Axum、Node node:http；
 Node 多核使用 cluster，长计算在正常的有界后台执行。锁文件保留准确依赖。
-JSON 必须完整解码、构造新对象并重新编码；Ku 现有取值接口的子树复制成本也计入。
+JSON 必须完整解码、构造新对象并重新编码。当前 Ku 用显式 `decoded.take("data")?`
+消费根对象并转移子树；旧索引接口仍返回 owned 副本。旧／新必须分别绑定源码身份，
+不能把历史索引路径成绩重新标为 take。
 数据库使用私有 PostgreSQL 16 的 1024 行夹具，总池 16，不重试业务查询。
 Ku 的 `/json` 在 `--ku-json text` 下使用 text/plain，`response` 模式通过公开
 `http.json` 使用 application/json；`/db` 两种执行路径都保持原 text/plain。
@@ -57,7 +59,9 @@ RSS 求和可能重复计算共享页，不能当作独占物理内存。
 # 独立、可清理的 Linux guest；不要在真实数据库或生产主机执行。
 sudo env BENCH_ROOT=/opt/ku-bench BENCH_USER=mac bash tests/benchmarks/cross_stack/provision-linux.sh
 # 将确切候选源码复制到 /opt/ku-bench/src；不要复制构建缓存和 node_modules。
-python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/build_linux.py --root /opt/ku-bench
+python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/build_linux.py --root /opt/ku-bench \
+  --candidate "$(git -C /opt/ku-bench/src rev-parse HEAD)" \
+  --ku-format direct --ku-json response --ku-pg-execution async --ku-pg-read int
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/database.py --root /opt/ku-bench start
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/linux_harness.py \
   --root /opt/ku-bench --output /opt/ku-bench/results/golden --phase smoke
