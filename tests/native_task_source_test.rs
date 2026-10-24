@@ -713,6 +713,11 @@ async fn Remainder(divisor:int):int! {
     }
     return ok(total)
 }
+async fn Grow(value:int):int! {
+    total=value; i=0
+    while(i<100) { total=total*2; i=i+1 }
+    return ok(total)
+}
 async fn main():null! { return ok(null) }
 "#,
     );
@@ -723,13 +728,26 @@ async fn main():null! { return ok(null) }
         .unwrap();
     generated.insert_str(
         first,
-        "static size_t fixture_range_steps;\nstatic int fixture_range_slow;\n",
+        "static size_t fixture_range_steps,fixture_range_calls;\nstatic int fixture_range_slow;\n",
     );
     generated = generated.replace(
         "__ku_range_fast=!cleanup && (",
         "__ku_range_fast=!fixture_range_slow && !cleanup && (",
     );
-    for function in &tasks.tasks.functions[..2] {
+    generated = generated.replace(
+        "__ku_range_fast=(",
+        "__ku_range_fast=!fixture_range_slow && (",
+    );
+    // The range proof covers 64 states, including when several logical polls
+    // remain inside one drive call. Keep this regression deterministic; this
+    // clock is solely a structural witness and never a performance result.
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    generated = generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now_ms(void) {",1);
+    let resume = "static uint32_t ku_task_2_resume(void* raw) {";
+    assert_eq!(generated.matches(resume).count(), 1);
+    generated = generated.replacen(resume, &format!("{resume}\n  fixture_range_calls++;"), 1);
+    for function in &tasks.tasks.functions[..3] {
         let begin = generated
             .find(&format!(
                 "static uint32_t ku_task_frame_{}_drive(",
@@ -751,7 +769,7 @@ async fn main():null! { return ok(null) }
                 drive[fast..].contains("ku_int_mul("),
                 "later squares must retain overflow checks"
             );
-        } else {
+        } else if function.id.0 == 1 {
             assert!(drive[fast..].contains("ku_int_rem("));
             assert!(drive[fast..].contains("ku_int_div("));
         }
@@ -773,22 +791,24 @@ static int fixture_case(int variant,int slow) {
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
   uint64_t deadline=ku_task_driver_now_ms()+2000u;
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
-  fixture_range_steps=0; fixture_range_slow=slow;
+  fixture_range_steps=fixture_range_calls=0; fixture_range_slow=slow;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
-    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),1u,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2),1u,
     deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
-  int64_t value=variant==0?INT32_MAX:variant==1?-1:variant==2?0:2;
+  int64_t value=variant==0?INT32_MAX:variant==1?-1:variant==2?0:variant==4?1:2;
   CHECK((variant==0?ku_task_0_start_value(&driver,&value,&task)
+    :variant==4?ku_task_2_start_value(&driver,&value,&task)
     :ku_task_1_start_value(&driver,&value,&task))==KU_TASK_DRIVER_OK);
   for(size_t turn=0;turn<64u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
     CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
   CHECK(ku_task_control_status(&task.owner.lease)!=KU_TASK_CONTROL_PENDING);
+  if(variant==4) CHECK(driver.polls>1u && fixture_range_calls<driver.polls);
   if(slow) CHECK(!fixture_range_steps); else CHECK(fixture_range_steps>0);
   KuTaskAdapterOutcomeV1 outcome={0};
   CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
   CHECK(outcome.result_kind==1u && !outcome.value.integer.ok);
   KuString message=outcome.value.integer.error.message;
-  const char* expected=variant<2?"integer overflow":"division by zero";
+  const char* expected=variant<2 || variant==4?"integer overflow":"division by zero";
   CHECK(message.len==strlen(expected) && !memcmp(message.ptr,expected,message.len));
   ku_task_outcome_drop(&outcome);
   CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
@@ -801,7 +821,7 @@ static int fixture_case(int variant,int slow) {
   return 0;
 }
 int main(void) {
-  for(int slow=0;slow<2;slow++) for(int variant=0;variant<4;variant++) CHECK(!fixture_case(variant,slow));
+  for(int slow=0;slow<2;slow++) for(int variant=0;variant<5;variant++) CHECK(!fixture_case(variant,slow));
   puts("task-guarded-range-growth-error-order-ok"); return 0;
 }
 "#;
@@ -841,9 +861,21 @@ fn native_task_segments_keep_quantum_limits_and_explicit_intent_boundaries() {
     // deterministic. Real wall-clock fairness remains a separate HTTP gate.
     generated = generated.replacen(
         clock,
-        "static uint64_t fixture_clock=1000u;\nstatic size_t fixture_lock_entries,fixture_calls,fixture_last_lock,fixture_same_segment;\nstatic int fixture_mode,fixture_touch_seen,fixture_touch_boundary;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {",
+        "static uint64_t fixture_clock=1000u;\nstatic size_t fixture_lock_entries,fixture_calls,fixture_last_lock,fixture_same_segment,fixture_fused,fixture_boundaries;\nstatic int fixture_mode,fixture_touch_seen,fixture_touch_boundary;\nstatic const KuTaskControlLeaseV1* fixture_cancel_lease;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {",
         1,
     );
+    let continuation = "static int ku_task_driver_continue_scalar_quantum(const KuTaskDriverTicketV1* ticket,\n    KuTaskControlV1* control) {";
+    assert_eq!(generated.matches(continuation).count(), 1);
+    generated = generated.replacen(
+        continuation,
+        &format!(
+            "{continuation}\n  fixture_boundaries++;\n  if(fixture_mode==2) fixture_clock++;\n  if(fixture_mode==3) return 0;\n  if(fixture_mode==4 && fixture_boundaries==3u && ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_clock+1000u)!=KU_TASK_CONTROL_OK) abort();"
+        ),
+        1,
+    );
+    let credit = "  execution->fused_quanta++;";
+    assert_eq!(generated.matches(credit).count(), 1);
+    generated = generated.replacen(credit, &format!("{credit}\n  fixture_fused++;"), 1);
     let lock = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
     assert_eq!(generated.matches(lock).count(), 1);
     generated = generated.replacen(lock, &format!("{lock}\n  fixture_lock_entries++;"), 1);
@@ -864,7 +896,6 @@ static uint32_t ku_task_{id}_resume(void* raw) {{
     fixture_touch_seen=ku_task_driver_execution && ku_task_driver_execution->intent_touched
       && ku_task_driver_execution->cooperative_yield;
   fixture_last_lock=fixture_lock_entries;
-  if(fixture_mode==2) fixture_clock++;
   return result;
 }}
 static uint32_t ku_task_{id}_resume_inner(void* raw) {{"#
@@ -881,7 +912,7 @@ static uint32_t ku_task_{id}_resume_inner(void* raw) {{"#
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 static int fixture_case(int mode) {
   fixture_mode=mode;
-  fixture_calls=fixture_last_lock=fixture_same_segment=0;
+  fixture_calls=fixture_last_lock=fixture_same_segment=fixture_fused=fixture_boundaries=0;
   fixture_touch_seen=fixture_touch_boundary=0;
   KuTaskDriverV1 driver={0};
   KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
@@ -893,6 +924,11 @@ static int fixture_case(int mode) {
     1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
   CHECK((mode==1 ? ku_task_1_start_value(&driver,&task) : ku_task_0_start_value(&driver,&task))==KU_TASK_DRIVER_OK);
   KuTaskDriverTicketV1 old=task.ticket;
+  CHECK(!ku_task_driver_continue_scalar_quantum(&task.ticket,task.owner.lease.control));
+  fixture_boundaries=0;
+  fixture_cancel_lease=&task.owner.lease;
+  KuTaskDriverExecutionV1 enclosing={0};
+  ku_task_driver_execution=&enclosing;
   uint64_t next=UINT64_MAX;
   if(mode==0) {
     CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
@@ -902,16 +938,26 @@ static int fixture_case(int mode) {
   uint64_t before_polls=driver.polls;
   size_t before_calls=fixture_calls, before_locks=fixture_lock_entries;
   CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
-  CHECK(driver.polls-before_polls==32u && fixture_calls-before_calls==32u);
-  CHECK(driver.workers[0].polls==driver.polls && driver.queued==1u && next==0u);
+  CHECK(ku_task_driver_execution==&enclosing && !enclosing.default_yield && !enclosing.fused_quanta);
+  CHECK(driver.workers[0].polls==driver.polls);
+  if(mode==4) {
+    CHECK(driver.polls-before_polls==3u && fixture_calls-before_calls==1u && fixture_fused==2u);
+    CHECK(!driver.queued && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  } else {
+    CHECK(driver.polls-before_polls==32u && driver.queued==1u && next==0u);
+  }
   if(mode==0) {
-    CHECK(fixture_same_segment==31u);
+    CHECK(fixture_calls-before_calls==1u && fixture_fused==31u && !fixture_same_segment);
     CHECK(fixture_lock_entries-before_locks==2u);
   } else if(mode==1) {
     CHECK(fixture_touch_seen && fixture_touch_boundary);
-    CHECK(fixture_same_segment==30u);
-  } else {
+    CHECK(fixture_calls-before_calls==2u && fixture_fused==30u && !fixture_same_segment);
+  } else if(mode==2) {
+    CHECK(fixture_calls-before_calls==32u && !fixture_fused);
     CHECK(!fixture_same_segment && fixture_lock_entries-before_locks==33u);
+  } else if(mode==3) {
+    CHECK(fixture_calls-before_calls==32u && !fixture_fused && fixture_same_segment==31u);
+    CHECK(fixture_lock_entries-before_locks==2u);
   }
   CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
@@ -919,13 +965,14 @@ static int fixture_case(int mode) {
     CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
   CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers
     && !driver.reserved_bytes && driver.workers_exited==1u && !driver.fault);
-  CHECK(!ku_task_driver_execution && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_execution==&enclosing && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
   CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  ku_task_driver_execution=NULL; fixture_cancel_lease=NULL;
   return 0;
 }
 int main(void) {
-  for(int mode=0;mode<3;mode++) CHECK(!fixture_case(mode));
+  for(int mode=0;mode<5;mode++) CHECK(!fixture_case(mode));
   puts("task-segment-quantum-intent-clock-ok"); return 0;
 }
 "#;
