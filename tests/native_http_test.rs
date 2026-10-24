@@ -3302,6 +3302,133 @@ int main(int argc,char** argv) {
 }
 
 #[test]
+fn native_http_sync_body_transfer_preserves_owner_and_budget_handoff() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let input = runtime
+        .split_once(
+            "typedef struct {\n  KuHttpBufferBudget* budget; size_t body_charge, metadata_charge;",
+        )
+        .expect("production input layout")
+        .1
+        .split_once("static KuStruct___ku_http_response ku_http_status_response(")
+        .expect("production input lifecycle end")
+        .0;
+    let execute = runtime
+        .split_once("static KuStruct___ku_http_response ku_http_execute_request(")
+        .unwrap()
+        .1
+        .split_once("typedef struct KuHttpQueue")
+        .unwrap()
+        .0;
+    assert!(execute.contains("req.body = ku_http_input_take_body(input);"));
+    assert!(!execute.contains("req.body = ku_http_string_copy("));
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define KU_STRING_OWNED 1
+typedef struct { uint8_t* ptr; size_t len,capacity; uint8_t storage; } KuString;
+typedef struct { size_t current; } KuHttpBufferBudget;
+typedef struct { int unused; } KuObject;
+static size_t allocations,body_frees;
+static uintptr_t body_identity;
+static void* fixture_malloc(size_t bytes) { allocations++; return malloc(bytes); }
+static void fixture_free(void* pointer) {
+  if(pointer && (uintptr_t)pointer==body_identity && ++body_frees!=1) abort();
+  free(pointer);
+}
+#define malloc fixture_malloc
+#define free fixture_free
+static void ku_object_drop(KuObject* value) { free(value); }
+static void ku_http_buffer_refund(KuHttpBufferBudget* budget,size_t bytes) {
+  if(!bytes) return;
+  if(!budget || bytes>budget->current) abort();
+  budget->current-=bytes;
+}
+static void fixture_drop_string(KuString* string) {
+  if(string->storage==KU_STRING_OWNED) free(string->ptr);
+  *string=(KuString){0};
+}
+#define CHECK(value) do { if(!(value)) { fprintf(stderr,"body handoff check %d: %s\n",__LINE__,#value); return 97; } } while(0)
+typedef struct {
+  KuHttpBufferBudget* budget; size_t body_charge, metadata_charge;
+"#;
+    let checks = r#"
+int main(void) {
+  const unsigned char payload[]={'K',0,0xe4,0xb8,0xad,'!'};
+  for(int repeat=0;repeat<16;repeat++) for(int mode=0;mode<3;mode++) {
+    allocations=body_frees=0;body_identity=0;
+    KuHttpBufferBudget budget={sizeof(payload)*(mode==2 ? 1u : 2u)+13u};
+    KuHttpInput input={0};input.budget=&budget;input.metadata_charge=13u;
+    input.body=(char*)malloc(sizeof(payload));CHECK(input.body);
+    body_identity=(uintptr_t)input.body;memcpy(input.body,payload,sizeof(payload));
+    input.body_len=input.body_charge=sizeof(payload);
+    if(mode==2) {
+      /* Unadmitted or incomplete input has never transferred ownership. */
+      ku_http_input_drop(&input);CHECK(body_frees==1 && !budget.current);
+    } else {
+      KuString request_body=ku_http_input_take_body(&input);
+      CHECK((uintptr_t)request_body.ptr==body_identity && !input.body && allocations==1);
+      CHECK(request_body.len==sizeof(payload) && request_body.capacity==sizeof(payload));
+      CHECK(request_body.storage==KU_STRING_OWNED && !memcmp(request_body.ptr,payload,sizeof(payload)));
+      CHECK(input.body_len==sizeof(payload) && input.body_charge==sizeof(payload));
+      if(mode==0) {
+        /* A successful echo moves the owner into the response. Projection
+           stays charged across input refund, then response admission. */
+        KuString response=request_body;request_body=(KuString){0};
+        ku_http_input_drop(&input);
+        CHECK(!body_frees && budget.current==sizeof(payload));
+        CHECK(!memcmp(response.ptr,payload,sizeof(payload)));
+        budget.current+=response.capacity;
+        ku_http_buffer_refund(&budget,sizeof(payload));
+        CHECK(budget.current==response.capacity);
+        size_t response_charge=response.capacity;fixture_drop_string(&response);
+        ku_http_buffer_refund(&budget,response_charge);
+      } else {
+        /* Handler failure/expiry drops the owned request before input refund. */
+        fixture_drop_string(&request_body);CHECK(body_frees==1);
+        ku_http_input_drop(&input);CHECK(budget.current==sizeof(payload));
+        ku_http_buffer_refund(&budget,sizeof(payload));
+      }
+      CHECK(body_frees==1 && !budget.current);
+    }
+    ku_http_input_drop(&input);CHECK(body_frees==1 && !budget.current && allocations==1);
+  }
+  KuHttpInput empty={0};KuString body=ku_http_input_take_body(&empty);
+  CHECK(!body.ptr && !body.len && !body.capacity);fixture_drop_string(&body);ku_http_input_drop(&empty);
+  puts("http-sync-body-owner-budget-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-sync-body-owner");
+    let path = directory.path().join("body.c");
+    fs::write(&path, format!("{header}{input}{checks}")).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "body")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-sync-body-owner-budget-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
@@ -3873,8 +4000,8 @@ fn main(): null! {
     assert!(response
         .to_ascii_lowercase()
         .contains("connection: close\r\n"));
-    // The budget includes the projected request maps and copied body, as well
-    // as network input. Completing both retained bodies under this deliberately
+    // The budget includes projected maps and a conservative body reservation,
+    // as well as network input. Completing both retained bodies under this deliberately
     // tiny budget is no longer a valid success assumption. Disconnect them,
     // then observe actual reclamation with a fresh, smaller request.
     drop(retained);

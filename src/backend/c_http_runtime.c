@@ -878,6 +878,13 @@ static void ku_http_input_drop(KuHttpInput* input) {
   ku_http_buffer_refund(input->budget, input->metadata_charge);
   *input = (KuHttpInput){0};
 }
+static KuString ku_http_input_take_body(KuHttpInput* input) {
+  KuString body = { (uint8_t*)input->body, input->body_len, input->body_len, KU_STRING_OWNED };
+  input->body = NULL;
+  /* Keep body_charge/body_len until input_drop. The unchanged projection
+     reservation covers this owner after that refund, through response admission. */
+  return body;
+}
 static KuStruct___ku_http_response ku_http_status_response(int64_t status, const char* message) {
   KuStruct___ku_http_response response = {0};
   response.status = status;
@@ -1052,8 +1059,6 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
   const char* method = input->method;
   const char* target = input->target;
   size_t path_len = input->path_len;
-  const char* body_buf = input->body;
-  size_t body_len = input->body_len;
   /* Sized off the target limit, not a smaller fixed buffer: normalization only
      ever adds a leading '/', so this cannot truncate a target that passed the 414
      check -- and a truncated normalized path would reintroduce exactly the route
@@ -1099,7 +1104,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       KuStruct___ku_http_request req;
       req.method = ku_http_string_copy(method, strlen(method));
       req.path = ku_http_string_copy(target, path_len);
-      req.body = ku_http_string_copy(body_buf ? body_buf : "", body_len);
+      req.body = ku_http_input_take_body(input);
       req.params = params;
       req.query = ku_http_parse_query(target, path_len);
       req.headers = input->headers; input->headers = NULL;

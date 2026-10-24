@@ -251,8 +251,16 @@ class ProfileReceiptTests(unittest.TestCase):
         self.assertEqual(current.count('result.value_int('),2)
         response=expand_ku_server(source,19191,json_mode='response')
         encode_body=lambda x:x.split('fn encode(',1)[1].split('async fn work(',1)[0]
-        prefix='    decoded = json.decode(req.body)?\n    counter = decoded["counter"]?.as_int()?\n    data = decoded["data"]?\n'
-        self.assertIn(prefix,encode_body(response))
+        decode='    decoded = json.decode(req.body)?'
+        counter='    counter = decoded["counter"]?.as_int()?'
+        take='    data = decoded.take("data")?'
+        for expanded in (current,response):
+            handler=encode_body(expanded)
+            for step in (decode,counter,take):
+                self.assertEqual(handler.count(step),1)
+            self.assertLess(handler.index(decode),handler.index(counter))
+            self.assertLess(handler.index(counter),handler.index(take))
+            self.assertNotIn('data = decoded["data"]?',handler)
         self.assertNotIn('json.encode(',encode_body(response))
         self.assertIn('return ok(http.json(',encode_body(response))
         self.assertEqual(response.split('fn main():',1)[1],current.split('fn main():',1)[1])
