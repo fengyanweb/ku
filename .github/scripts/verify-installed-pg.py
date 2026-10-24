@@ -219,7 +219,11 @@ def private_pid_evidence(root):
 
 @contextmanager
 def owned_temporary_root(report):
-    root = Path(tempfile.mkdtemp(prefix="ku-installed-pg-")).resolve()
+    # The Windows PG fixture's existing ACL helper accepts only an owned root
+    # directly below the system temporary directory with this fixture prefix.
+    # POSIX database-owner validation keeps its original installed-PG prefix.
+    prefix = "ku-http-pg-acceptance-" if os.name == "nt" else "ku-installed-pg-"
+    root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     report["temporary_cleanup_confirmed"] = False
     try:
         yield root
@@ -474,6 +478,19 @@ class PosixPrivatePostgres:
 def run_pg_lifecycles(exporter, prepare, repo, installed, root, lifecycle, report):
     driver = repo / "tests" / "acceptance" / "http_pg_lifecycle.py"
     executable = installed / ("ku.exe" if os.name == "nt" else "ku")
+    if os.name == "nt":
+        # initdb's restricted token must traverse the outer Python-created
+        # 0700 directory too. Grant the current SID through the fixture's
+        # unchanged guard/helper before fixture-work can inherit its ACL.
+        # Match normal script sibling imports, then restore our import path.
+        previous_path = sys.path[:]
+        try:
+            sys.path.insert(0, str(driver.resolve().parent))
+            fixture = load_trusted(driver, "ku_installed_pg_directory_setup")
+        finally:
+            sys.path[:] = previous_path
+        report["windows_pg_directory_acl_root"] = str(root)
+        fixture.prepare_windows_pg_directory(root, report)
     working = root / "fixture-work"
     working.mkdir()
     command = [sys.executable, "-B", str(driver), "--ku", str(executable),

@@ -613,6 +613,124 @@ class ReleaseExportTests(unittest.TestCase):
 
 
 
+class InstalledPostgresDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("ku_installed_pg_directory_test", Path(__file__).with_name("verify-installed-pg.py"))
+        self.gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.gate)
+        self.repo = Path(__file__).resolve().parents[2]
+
+    def exercise_windows_setup(self, root, report, powershell_result):
+        gate = self.gate
+        driver = self.repo / "tests" / "acceptance" / "http_pg_lifecycle.py"
+        original_path = sys.path[:]
+        events = []
+        load = gate.load_trusted
+        def trusted_load(path, name):
+            self.assertEqual(path, driver)
+            self.assertEqual(sys.path[0], str(driver.parent.resolve()))
+            module = load(path, name)
+            self.assertEqual(Path(module.process_sample.__code__.co_filename).resolve(),
+                             driver.with_name("multiloop_load.py").resolve())
+            return module
+        def acl(command, **kwargs):
+            self.assertEqual(command[0], "powershell.exe")
+            self.assertEqual(kwargs["env"]["KU_PG_FIXTURE_ROOT"], str(root.resolve()))
+            self.assertFalse((root / "fixture-work").exists())
+            self.assertNotIn("pg_fixture_invoked", report)
+            events.append("outer-root-acl")
+            return powershell_result
+        def runtime(arguments, repo, working):
+            self.assertEqual(sys.path, original_path)
+            self.assertEqual(working, root / "fixture-work")
+            self.assertEqual(report["windows_pg_directory_acl_root"], str(root))
+            self.assertTrue(working.is_dir())
+            self.assertEqual(arguments[arguments.index("--lane") + 1], "both")
+            self.assertTrue(report["pg_fixture_invoked"])
+            self.assertTrue(report["windows_pg_directory_acl"]["acl"]["current_user_modify_inheritable"])
+            events.append("original-contained-fixture")
+            return subprocess.CompletedProcess(arguments, 0)
+        exporter = SimpleNamespace(run_runtime_check=mock.Mock(side_effect=runtime))
+        try:
+            with mock.patch.object(gate, "os", SimpleNamespace(name="nt")), \
+                 mock.patch.object(gate.sys, "platform", "win32"), \
+                 mock.patch.object(gate, "load_trusted", side_effect=trusted_load), \
+                 mock.patch.object(gate.subprocess, "run", side_effect=acl) as powershell:
+                gate.run_pg_lifecycles(exporter, None, self.repo, root / "installed", root,
+                                       root / "lifecycle.json", report)
+        finally:
+            self.assertEqual(sys.path, original_path)
+            if powershell_result.returncode or not root.name.startswith("ku-http-pg-acceptance-") or root.parent != Path(tempfile.gettempdir()).resolve():
+                exporter.run_runtime_check.assert_not_called()
+                self.assertFalse((root / "fixture-work").exists())
+            if not root.name.startswith("ku-http-pg-acceptance-") or root.parent != Path(tempfile.gettempdir()).resolve():
+                powershell.assert_not_called()
+        return events, powershell
+
+    def test_windows_owned_root_acl_precedes_working_directory_and_original_fixture(self):
+        acl = {"parent_sddl_before": "parent", "parent_sddl_after": "parent",
+               "current_user_modify_inheritable": True}
+        success = SimpleNamespace(returncode=0, stdout=json.dumps(acl), stderr="")
+        report = {}
+        with mock.patch.object(self.gate, "os", SimpleNamespace(name="nt")), \
+             self.gate.owned_temporary_root(report) as root:
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            self.assertTrue(root.name.startswith("ku-http-pg-acceptance-"))
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            events, powershell = self.exercise_windows_setup(root, report, success)
+            self.assertEqual(events, ["outer-root-acl", "original-contained-fixture"])
+            powershell.assert_called_once()
+            report["fixture_cleanup_confirmed"] = True
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+        self.assertFalse(root.exists())
+
+    def test_windows_outer_acl_failure_never_starts_fixture_and_root_is_cleaned(self):
+        failure = SimpleNamespace(returncode=1, stdout="{}", stderr="ACL setup denied")
+        report = {}
+        with self.assertRaises(RuntimeError):
+            with mock.patch.object(self.gate, "os", SimpleNamespace(name="nt")), \
+                 self.gate.owned_temporary_root(report) as root:
+                self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                self.exercise_windows_setup(root, report, failure)
+        self.assertNotIn("pg_fixture_invoked", report)
+        self.assertEqual(report["windows_pg_directory_acl"]["exit_code"], 1)
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+        self.assertFalse(root.exists())
+
+    def test_existing_fixture_guard_still_refuses_other_prefix_and_nested_root(self):
+        success = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        with tempfile.TemporaryDirectory(prefix="ku-installed-pg-") as temporary:
+            outer = Path(temporary).resolve()
+            nested = outer / "ku-http-pg-acceptance-nested"
+            nested.mkdir()
+            for root in (outer, nested):
+                with self.subTest(root=root), self.assertRaises(ValueError):
+                    self.exercise_windows_setup(root, {}, success)
+
+    def test_posix_owned_root_keeps_original_prefix(self):
+        report = {}
+        with mock.patch.object(self.gate, "os", SimpleNamespace(name="posix")), \
+             self.gate.owned_temporary_root(report) as root:
+            self.assertTrue(root.name.startswith("ku-installed-pg-"))
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+
+    @unittest.skipUnless(os.name == "nt", "actual outer directory ACL requires Windows")
+    def test_real_windows_outer_root_is_accessible_without_changing_parent_acl(self):
+        report = {}
+        exporter = SimpleNamespace(run_runtime_check=mock.Mock(return_value=subprocess.CompletedProcess([], 0)))
+        with self.gate.owned_temporary_root(report) as root:
+            self.gate.run_pg_lifecycles(exporter, None, self.repo, root / "installed", root,
+                                       root / "lifecycle.json", report)
+            acl = report["windows_pg_directory_acl"]["acl"]
+            self.assertEqual(acl["parent_sddl_before"], acl["parent_sddl_after"])
+            self.assertEqual(acl["owner_before"], acl["owner_after"])
+            self.assertTrue(acl["current_user_modify_inheritable"])
+            self.assertTrue((root / "fixture-work").is_dir())
+            exporter.run_runtime_check.assert_called_once()
+            report["fixture_cleanup_confirmed"] = True
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+
+
 @unittest.skipIf(os.name == "nt", "POSIX foreground postgres owner; Windows uses the existing Job")
 class InstalledPostgresOwnerTests(unittest.TestCase):
     def setUp(self):

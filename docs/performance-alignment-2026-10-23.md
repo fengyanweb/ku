@@ -185,7 +185,7 @@ c1cc实际Clang18布局为job1200→1208B、pool2600→2728B，固定账本增�
 | O06 资源 | 容量／固定账本、lazy触页；轻负载少1.039MiB | 同速率整服务稳态／峰值、8192等待与收尾保留量 | 未验收 |
 | O07 JSON | 旧默认、writer／parser局部处理、只读请求正文及边界回归 | 三语料组件A/B、最新完整调用／资源，类型化与动态分表 | 未验收 |
 | O08 PG | 原共享池owner状态机、同turn预算；等待者交接3个反例修复、14回归及本机sync／async实库过 | 偶发acquire_timeout仍缺现场因果证据；normal／reset正式对照、最新三平台CI及实际安装包PG链 | 未验收 |
-| O09 调优 | 旧源实编及训练留出闭环 | 最终源普通／调优有效表、flags／大小／编译时间及产物身份 | 未验收 |
+| O09 调优 | e1ca实际13个新变体、3个完整训练／use、9个独立正确性留出；26个短观察原样保留 | Rust训练失败，2个use位置未执行；短窗非平稳且后13窗可能受外部交互影响，正式normal／tuned配对尚缺 | 未验收 |
 
 O09编排另修正一个已复现的身份丢失问题：重建Go／Rust变体后，原helper未保留PG模式及源码清单，`pg_variants.derive`正确拒绝该产物。本轮仅在实际输入与原完整源码清单一致、两个模式声明有效时继承这两项；ELF哈希仍取新产物，旧flags及产物只放normal参考。两模块17项单测通过，不把mock编译的单测当成实际调优构建。旧1b四栈业务源均已改变，旧调优产物／profile不能复用为最终源；旧batch训练输入又与普通L1相同，最终PGO需重新冻结代表性训练／留出，不能仅改标签称已验收。
 
@@ -225,7 +225,7 @@ checkedmul候选8f42已定向拒绝：compiler／portable各4211二元＋29取�
 | 86f push40024100907／PR40024106559 | push唯一失败为Windows Caddy rolling资源快照spare41线程>33，cleanup采样PID1956仍存在；PR全部必要项过。两次CI三平台PG sync／async共12路均实际passed | spare为supervisor6＋launcher6＋两个直接子12／17线程，总105<133；旧记录缺映像／创建时间，不能唯一判断两Ku实例重叠或PID归属。PR同检查通过、无遗留，不能覆盖push失败；不增加reserve |
 | WAIT索引4ea→c1cc配对 | 首个control正式30秒60000/60000，fullCPU117.774117µs／正确、p99 7.48ms、5秒静止过；candidate首次100rps／30秒预热2999/3000，1个acquire_timeout即停止，未进入candidate正式窗 | 0个完整配对，不计算收益／bootstrap。RID0964695060001391计划13.910s、首发13.921261s、完成14.186446s，不能将客户总耗时当内部排队。各域0节流，现场lease／queue／线程未采，不能唯一定因；两代exit0／无强杀／域删除，candidate事后5秒账本静止未采 |
 
-39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最新d450 push40027977065／PR40027992019必要CI均成功；push三平台实际包及资产集合检查成功，分支发布步骤按规则跳过，不作为发布通过。实际安装包PG仍待独立验收；新增sanitizer及安装包PG workflow因OAuth无workflow权限尚不能上传，不绕过权限，普通Git推送已完成。
+39c PR40015062381／push40015050574均failure；Rust workspace步骤、Clippy及已有detector通过，三平台包构建／包内小范围smoke有成功回执，但不能写成实库全矩阵通过。现有包smoke覆盖解包／安装CLI版本、hello、JSON、HTTP两loop的/ok／cpu／timer及正常drain；不含安装包PG运行。Actions外ZIP digest不同于内归档hash，完整39c包未在本机下载重算。最新d450 push40027977065／PR40027992019必要CI均成功；push三平台实际包及资产集合检查成功，分支发布步骤按规则跳过，不作为发布通过。该时点尚未独立验收实际安装包PG，新增workflow受OAuth权限限制；后续官方授权、f2b668d上传与实际门禁结果见第8节。
 
 另一个有序退出修正限Java基准：同4.5秒绝对预算依次HTTP drain／在途0／CPU executor／PG pool／Vertx，严格匹配实际SIGTERM、PID／listeners、阶段／计数、无OOM／强制终止和cgroup清理才接受143；其他栈要求exit0。19项驱动回归及真实PG／timer在途退出通过，不把任意非零退出放宽。
 
@@ -239,7 +239,13 @@ d450 push的三平台PG原始artifact已下载核对API ZIP字节数及SHA：Win
 
 ## 8. 证据索引、缺口与交付边界
 
-实际安装包PG入口已在本机执行：d450 push Mac ZIP／API digest相符，解包CLI `bc4de8917b290a8c089e68d9b4ab7641e4a26a1e327e390f349eaa6963026f64` 的版本／hello／JSON及真实sync／async均通过；postmaster0退出、进程树／session回收及临时根清理均确认。另将sync driver原180秒外层上限仅缩短至8秒，在实际HTTP readiness后受控停住，观察到期限终止并真实回收HTTP及PG，随后独立async lane通过。默认产品／SQL期限不变、没有重试。163项旧准备回归加同目录导入反例后，共164项（141过、23平台跳过）。实际还修复原runpy包装未设置script目录导致PG driver sibling import失败；未回收zombie在macOS的getsid/getpgid ESRCH已用真实子进程复现并由独立ps parent/group/Z核对处理。证据`evidence/installed-pg-gate-local-verification/verification.json` SHA `2b968da84686b31e3f8bc7514bcf4d2f925463b6a9d1065507c253a6d28e8350`。这验证门禁实现，**不是最新产品或三平台最终交付**；新增workflow尚需现有GitHub凭据的workflow scope，已向用户说明并等待，未绕过。
+实际安装包PG入口已在本机执行：d450 push Mac ZIP／API digest相符，解包CLI `bc4de8917b290a8c089e68d9b4ab7641e4a26a1e327e390f349eaa6963026f64` 的版本／hello／JSON及真实sync／async均通过；postmaster0退出、进程树／session回收及临时根清理均确认。另将sync driver原180秒外层上限仅缩短至8秒，在实际HTTP readiness后受控停住，观察到期限终止并真实回收HTTP及PG，随后独立async lane通过。默认产品／SQL期限不变、没有重试。163项旧准备回归加同目录导入反例后，共164项（141过、23平台跳过）。实际还修复原runpy包装未设置script目录导致PG driver sibling import失败；未回收zombie在macOS的getsid/getpgid ESRCH已用真实子进程复现并由独立ps parent/group/Z核对处理。证据`evidence/installed-pg-gate-local-verification/verification.json` SHA `2b968da84686b31e3f8bc7514bcf4d2f925463b6a9d1065507c253a6d28e8350`。这验证当时的门禁实现，**不是最新产品或三平台最终交付**；本机阶段尚未上传新增workflow，后续实际CI状态如下。
+
+后续官方设备授权已完成，实际API确认同账号的workflow scope，门禁提交f2b668d正常推送。e1ca的push40042849739及PR40042854151必要CI已通过；f2b668d push40046655519的Linux／macOS实际安装包sync／async四路也通过，包及CLI身份、进程回收均有原始报告。两个作业随后败在import-library目录清理：POSIX生成点号前缀，清理只接受横线前缀。Windows则在initdb前失败，内层目录的用户SID规则已正确设置，但新增外层临时目录仍只有保护ACL，PG降权后无法遍历。本次仅跟进目录前缀及新建Windows私有外层目录的已有权限处理；不更改产品或放宽系统父目录。原ZIP大小／API digest和失败日志保留于`ci-f2b668d/`；后续修订仍须实际三平台门禁，不能把四路通过写成整个作业或全矩阵通过。
+
+e1ca O09训练／留出及短观察的原始819成员归档SHA `fda4d35fc5ec6b25a30701513b579fbccbe4f32964628d86d01107ceb41674a1`。Ku normal／O3／PGO实际batch热路径约34／33／25条静态指令；PGO减少界限构造和栈加载，原溢出及期限规则仍在，但静态条数不是CPU成本占比。两个短配对的Ku纯PGO相对O3方向不一致，不能由此改变默认flags。Rust训练800次中6次读头超时，未形成合格use；后续13窗与外部浏览器交互可能区间相交，第一轮也有数秒采样空窗，均保留且不补测或当正式收益。独占重复构建缓存831044227B和一次性控制器已清理，22个执行文件SHA前后相同。详见项目外`o09-e1ca225/结论.md`。
+
+正式矩阵新v3冻结实际Node入口同目录的5份源文件及成员，补上v2未登记的compute.cjs；40项离线检查通过，旧freeze不改写。旧c1cc L1保持原提交／boot下的观察：Ku batch源／C／ELF逐字相同，其他依赖的旧build proof181项与当前相同，但旧执行期未逐项记录实际Node worker路径及.NET共享runtime，未自动将整组改写为新矩阵。新golden共10项，9项通过；Ku normal在先ok200、JSON200后的mixed200中199正确、1个PG acquire_timeout，RID `2679895060000176`。本轮acquire为250ms，从操作创建起且包含后台建连；HTTP发送至返回277.423ms不等于内部等池耗时。各域未节流、无OOM、服务正常退出并回收；尚无PG阶段／owner线程现场，不能归为旧handoff缺陷。相关正式main矩阵尚未开始，保留失败，不增加超时或预热DB掩盖问题。
 
 隔离VM已在无负载时正常停私库，稀疏盘32→128GiB；实际文件系统132011507712B、可用约118104334336B，CPU8／4GiB不变。私库PG16.15的1024行／schema hash与原一致、无强制停止；新boot／DB域另记，旧freeze／manifest不覆写，不将跨重启差异称因果收益。新矩阵冻结另补Java classpath、.NET publish、Node NODE_PATH及复用证明逐文件覆盖；53个离线反例过，仍需新freeze实际重哈希。
 

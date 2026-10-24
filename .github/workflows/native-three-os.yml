@@ -891,7 +891,7 @@ jobs:
           sudo apt-get install --yes --no-install-recommends libpq-dev postgresql
           source_lib="$(pg_config --libdir)/libpq.so"
           test -e "$source_lib"
-          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link.XXXXXXXX")"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
           chmod 700 "$private_lib"
           ln -s "$source_lib" "$private_lib/libpq.so"
           printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
@@ -907,7 +907,7 @@ jobs:
           brew install libpq postgresql@17
           source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
           test -e "$source_lib"
-          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link.XXXXXXXX")"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
           chmod 700 "$private_lib"
           ln -s "$source_lib" "$private_lib/libpq.dylib"
           printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
