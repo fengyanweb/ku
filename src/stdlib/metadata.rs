@@ -94,6 +94,7 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "object.get_or"
             | "kuvalue.as_int"
             | "kuvalue.as_str"
+            | "kuvalue.take"
             | "json.parse"
             | "json.decode"
             | "json.try_parse"
@@ -134,6 +135,7 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "pg_result.rows"
             | "pg_result.cols"
             | "pg_result.value"
+            | "pg_result.value_int"
             | "pg_result.is_null"
             | "mysql.client"
             | "mysql.query"
@@ -162,8 +164,8 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
     );
     let mut modes = vec![if registered_read_inputs { View } else { Owned }; count];
     let owned = match name {
-        "ok" | "err" | "kuvalue.as_int" | "kuvalue.as_str" | "pg_client.close" | "redis.close"
-        | "mysql.close" | "net.close" => Some(0),
+        "ok" | "err" | "kuvalue.as_int" | "kuvalue.as_str" | "kuvalue.take" | "pg_client.close"
+        | "redis.close" | "mysql.close" | "net.close" => Some(0),
         "object.get_or" => Some(2),
         "http.text" | "http.html" | "http.json" | "http.redirect" => count.checked_sub(1),
         _ => None,
@@ -191,6 +193,9 @@ pub(crate) fn supports_borrowed_call(name: &str) -> bool {
             | "string.ends_with"
             | "array.len"
             | "array.is_empty"
+            | "json.parse"
+            | "json.decode"
+            | "json.try_parse"
             | "json.stringify"
             | "json.encode"
     )
@@ -247,6 +252,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             ArgRule::Is(TypePattern::Any),
         ],
         ("kuvalue", "as_int" | "as_str") => vec![ArgRule::Is(TypePattern::Any)],
+        ("kuvalue", "take") => vec![ArgRule::Is(TypePattern::KuValue), str_arg()],
         ("json", "parse" | "try_parse" | "decode") => vec![str_arg()],
         ("json", "stringify" | "encode") => vec![ArgRule::Is(TypePattern::Any)],
         ("config", "env") => vec![],
@@ -281,7 +287,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
         ],
         ("pg_result", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
-        ("pg_result", "value" | "is_null") => vec![
+        ("pg_result", "value" | "value_int" | "is_null") => vec![
             ArgRule::Is(TypePattern::Native(PG_RESULT)),
             int_arg(),
             int_arg(),
@@ -331,6 +337,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("object", "get_or") => TypePattern::Unknown,
         ("kuvalue", "as_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("kuvalue", "as_str") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("kuvalue", "take") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "parse" | "decode") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "stringify" | "encode") => TypePattern::ResultOf(Box::new(TypePattern::String)),
@@ -354,6 +361,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("pg_client", "query") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT))),
         ("pg_result", "rows" | "cols") => TypePattern::Int,
         ("pg_result", "value") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("pg_result", "value_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("pg_result", "is_null") => TypePattern::ResultOf(Box::new(TypePattern::Bool)),
         ("pg_client", "close") => TypePattern::Null,
         ("mysql", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CLIENT))),
@@ -561,14 +569,14 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         ("fs", "read" | "try_read" | "write" | "try_write" | "read_dir")
         | ("string", "slice")
         | ("array", "try_get")
-        | ("kuvalue", "as_int" | "as_str")
+        | ("kuvalue", "as_int" | "as_str" | "take")
         | ("json", "parse" | "try_parse" | "decode" | "stringify" | "encode")
         | ("config", "yaml")
         | ("time", "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
         | ("pg_client", "query")
-        | ("pg_result", "value" | "is_null")
+        | ("pg_result", "value" | "value_int" | "is_null")
         | ("mysql", "client")
         | ("redis", "client")
         | ("bytes", "from_str" | "from_array")
@@ -748,7 +756,10 @@ mod borrow_tests {
                 &["len", "byte_len", "contains", "starts_with", "ends_with"][..],
             ),
             ("array", &["len", "is_empty"][..]),
-            ("json", &["stringify", "encode"][..]),
+            (
+                "json",
+                &["parse", "decode", "try_parse", "stringify", "encode"][..],
+            ),
         ] {
             for function in functions {
                 let signature = dotted_signature(module, function).unwrap();
@@ -762,6 +773,14 @@ mod borrow_tests {
             dotted_signature("object", "get_or").unwrap().arg_modes,
             [View, View, Owned]
         );
+        let take = dotted_signature("kuvalue", "take").unwrap();
+        assert_eq!(take.arg_modes, [Owned, View]);
+        assert_eq!(take.failure, FailureMode::ReturnsResult);
+        assert_eq!(
+            take.returns,
+            TypePattern::ResultOf(Box::new(TypePattern::KuValue))
+        );
+
         assert_eq!(
             dotted_signature("pg_client", "close").unwrap().arg_modes,
             [Owned]

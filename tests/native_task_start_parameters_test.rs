@@ -90,6 +90,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::ArrayLen { dst, src }
                 | TaskOp::StringLen { dst, src, .. }
                 | TaskOp::StringClone { dst, src }
+                | TaskOp::PrimitiveString { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }
@@ -135,6 +136,46 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     }
                 }
                 TaskOp::Print { value, .. } => map(value),
+                TaskOp::HttpMapGet {
+                    dst, request, key, ..
+                } => {
+                    map(dst);
+                    map(request);
+                    map(key);
+                }
+                TaskOp::PgResult {
+                    dst,
+                    source,
+                    row,
+                    col,
+                    ..
+                } => {
+                    map(dst);
+                    map(source);
+                    if let Some(row) = row {
+                        map(row);
+                    }
+                    if let Some(col) = col {
+                        map(col);
+                    }
+                }
+                TaskOp::JsonEncodeObject { dst, fields } => {
+                    map(dst);
+                    for (_, value) in fields {
+                        map(value);
+                    }
+                }
+                TaskOp::HttpResponse {
+                    dst, body, status, ..
+                } => {
+                    map(dst);
+                    if let Some(body) = body {
+                        map(body);
+                    }
+                    if let Some(status) = status {
+                        map(status);
+                    }
+                }
             }
         }
         match &mut state.terminator {
@@ -164,6 +205,18 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 for input in inputs.iter_mut().flatten() {
                     map(input);
                 }
+                map(dst);
+            }
+            TaskTerminator::PgQuery {
+                client,
+                sql,
+                params,
+                dst,
+                ..
+            } => {
+                map(client);
+                map(sql);
+                map(params);
                 map(dst);
             }
             TaskTerminator::TryResult {

@@ -1,4 +1,4 @@
-//! Private same-thread arithmetic return mailbox for synchronous native frames.
+//! Private same-thread fatal return mailbox for synchronous native frames.
 //! No allocation, user Result, new deadline, or Task outcome is introduced here.
 use std::collections::HashSet;
 
@@ -115,13 +115,16 @@ const SYNC_GLOBAL_NAMES: &[&str] = &[
     "KuSyncExitSignal",
     "KU_SYNC_EXIT_NONE",
     "KU_SYNC_EXIT_ARITHMETIC_FATAL",
+    "KU_SYNC_EXIT_HTTP_JSON_FATAL",
     "KU_SYNC_EXIT_CLEANUP_ABORT",
     "__ku_sync_return_signal",
     "__ku_sync_reset",
     "__ku_sync_take",
     "__ku_sync_publish",
     "__ku_sync_raise_math",
+    "__ku_sync_raise_http_json",
     "__ku_sync_error_message",
+    "__ku_sync_error_message_length",
     "__ku_sync_finish_request",
 ];
 const INTEGER_GLOBAL_NAMES: &[&str] = &[
@@ -279,6 +282,7 @@ pub(super) fn validate_identifiers(
                         "KuSyncExitSignal",
                         "KU_SYNC_EXIT_NONE",
                         "KU_SYNC_EXIT_ARITHMETIC_FATAL",
+                        "KU_SYNC_EXIT_HTTP_JSON_FATAL",
                         "__ku_sync_take",
                     ],
                 )?,
@@ -365,11 +369,19 @@ const SYNC_RUNTIME: &str = r#"
 /* A return mailbox, not a persistent cancellation flag. Every generated call
  * takes it immediately; only execution roots reset it. No owning payload. */
 enum { KU_SYNC_EXIT_NONE = 0u, KU_SYNC_EXIT_ARITHMETIC_FATAL = 1u,
-       KU_SYNC_EXIT_CLEANUP_ABORT = 2u };
-typedef struct KuSyncExitSignal { uint8_t kind; uint8_t arithmetic_status; } KuSyncExitSignal;
+       KU_SYNC_EXIT_CLEANUP_ABORT = 2u, KU_SYNC_EXIT_HTTP_JSON_FATAL = 3u };
+typedef struct KuSyncExitSignal {
+  uint8_t kind;
+  uint8_t arithmetic_status;
+  const uint8_t* static_message;
+  size_t static_message_len;
+} KuSyncExitSignal;
 static KU_THREAD_LOCAL KuSyncExitSignal __ku_sync_return_signal;
 static void __ku_sync_reset(void) { __ku_sync_return_signal = (KuSyncExitSignal){0}; }
 static KuSyncExitSignal __ku_sync_take(void) {
+  /* Only reset/take or a nonempty publish write this mailbox. */
+  if (__ku_sync_return_signal.kind == KU_SYNC_EXIT_NONE)
+    return (KuSyncExitSignal){0};
   KuSyncExitSignal signal = __ku_sync_return_signal;
   __ku_sync_return_signal = (KuSyncExitSignal){0};
   return signal;
@@ -382,14 +394,29 @@ static void __ku_sync_raise_math(uint32_t status) {
   /* These are the existing pure arithmetic helper success/error statuses.
    * The mailbox is emitted even when comparison-only code needs no helpers. */
   if (status == 0u) return;
-  KuSyncExitSignal signal;
+  KuSyncExitSignal signal = {0};
   signal.kind = (__ku_handler_timed_out && __ku_handler_unwind_depth != 0)
       ? KU_SYNC_EXIT_CLEANUP_ABORT : KU_SYNC_EXIT_ARITHMETIC_FATAL;
   signal.arithmetic_status = (uint8_t)status;
   __ku_sync_publish(signal);
 }
+/* Callers may only supply a proven static view. No owner crosses the mailbox. */
+static void __ku_sync_raise_http_json(const uint8_t* message, size_t len) {
+  KuSyncExitSignal signal = {0};
+  signal.kind = KU_SYNC_EXIT_HTTP_JSON_FATAL;
+  signal.static_message = message;
+  signal.static_message_len = len;
+  __ku_sync_publish(signal);
+}
 static const char* __ku_sync_error_message(KuSyncExitSignal signal) {
+  if (signal.kind == KU_SYNC_EXIT_HTTP_JSON_FATAL && signal.static_message)
+    return (const char*)signal.static_message;
   return signal.arithmetic_status == 2u ? "division by zero" : "integer overflow";
+}
+static size_t __ku_sync_error_message_length(KuSyncExitSignal signal) {
+  if (signal.kind == KU_SYNC_EXIT_HTTP_JSON_FATAL && signal.static_message)
+    return signal.static_message_len;
+  return strlen(__ku_sync_error_message(signal));
 }
 static int __ku_sync_finish_request(KuSyncExitSignal* signal) {
   *signal = __ku_sync_take();

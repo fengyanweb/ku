@@ -5,7 +5,7 @@
 //! Hosted frames use generated child Start/Await and adapter-owned scope drain.
 //! User cleanup remains finite and cannot await; source admission stays separate.
 
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet};
 
 use crate::error::KuResult;
 use crate::ir::task::{
@@ -20,6 +20,81 @@ use super::{
     c_drop_value, c_move_value, c_static_utf8_string, c_type, c_type_suffix, c_zero_initializer,
     unsupported,
 };
+
+// Copy the complete bounded drive text while changing only actual return
+// statements. Source string literals may themselves contain C-looking text.
+// Unknown future return forms fail code generation instead of missing a spill.
+fn emit_scalar_spill_returns(out: &mut COutput, body: &str, call: &str) -> KuResult<()> {
+    let bytes = body.as_bytes();
+    let mut cursor = 0;
+    let mut copied = 0;
+    while cursor < bytes.len() {
+        out.check()?;
+        if bytes[cursor] == b'"' || bytes[cursor] == b'\'' {
+            let quote = bytes[cursor];
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'\\' {
+                    cursor = (cursor + 2).min(bytes.len());
+                } else if bytes[cursor] == quote {
+                    cursor += 1;
+                    break;
+                } else {
+                    cursor += 1;
+                }
+            }
+        } else if bytes[cursor..].starts_with(b"//") {
+            cursor += 2;
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+        } else if bytes[cursor..].starts_with(b"/*") {
+            cursor += 2;
+            while cursor + 1 < bytes.len() && &bytes[cursor..cursor + 2] != b"*/" {
+                cursor += 1;
+            }
+            cursor = (cursor + 2).min(bytes.len());
+        } else if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            if &body[start..cursor] != "return" {
+                continue;
+            }
+            let end = body[cursor..]
+                .find(';')
+                .map(|offset| cursor + offset)
+                .ok_or_else(|| unsupported("unterminated generated Task return"))?;
+            let value = body[cursor..end].trim();
+            if !matches!(
+                value,
+                "KU_TASK_FRAME_PENDING"
+                    | "KU_TASK_FRAME_INVALID_STATE"
+                    | "KU_TASK_FRAME_READY"
+                    | "KU_TASK_FRAME_EXIT_STAGED"
+                    | "KU_TASK_FRAME_SCOPE_REQUEST"
+                    | "frame->header.status"
+                    | "continued"
+            ) {
+                return Err(unsupported(
+                    "unrecognized generated Task scalar-cache return",
+                ));
+            }
+            out.push_str(&body[copied..cursor]);
+            out.push_str(&format!(" {call},{value})"));
+            cursor = end;
+            copied = end;
+        } else {
+            cursor += 1;
+        }
+    }
+    out.push_str(&body[copied..]);
+    out.check()
+}
 
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
@@ -40,10 +115,30 @@ pub(super) fn uses_blocking_fs(tasks: &TaskProgram) -> bool {
 
 pub(super) fn uses_blocking_net(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            matches!(
+                state.terminator,
+                TaskTerminator::BlockingNet { .. } | TaskTerminator::PgQuery { .. }
+            )
+        })
+    })
+}
+pub(super) fn uses_postgres(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
         function
             .states
             .iter()
-            .any(|state| matches!(state.terminator, TaskTerminator::BlockingNet { .. }))
+            .any(|state| matches!(state.terminator, TaskTerminator::PgQuery { .. }))
+    })
+}
+pub(super) fn uses_json(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            state
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TaskOp::JsonEncodeObject { .. }))
+        })
     })
 }
 pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
@@ -86,6 +181,7 @@ pub(super) fn emit_frames(
     out: &mut COutput,
     tasks: &TaskProgram,
     plan: &TaskFramePlan,
+    cooperative: bool,
 ) -> KuResult<()> {
     if tasks.functions.is_empty() {
         return Ok(());
@@ -100,8 +196,10 @@ pub(super) fn emit_frames(
         uses_blocking_fs(tasks),
         uses_blocking_read_dir(tasks),
         uses_blocking_net(tasks),
+        uses_postgres(tasks),
     )?;
     super::task_adapter::emit_host(out, tasks)?;
+    let mut range_work = super::task_range::WorkBudget::default();
     for function in &tasks.functions {
         out.check()?;
         let frame = plan
@@ -109,7 +207,29 @@ pub(super) fn emit_frames(
             .iter()
             .find(|frame| frame.function == function.id)
             .ok_or_else(|| unsupported("native task frame plan is missing a function"))?;
-        FrameEmitter::new(function, frame)?.emit(out)?;
+        let mut emitter = FrameEmitter::new(function, frame)?;
+        emitter.cooperative = cooperative;
+        if cooperative {
+            // The existing verifier computes liveness across every CFG edge.
+            // A quantum may stop before any state, but cannot stop halfway
+            // through that state's operations. Dead scalar intermediates can
+            // therefore stay in C locals, while owned storage remains hosted.
+            for slot in &frame.cooperative_slots {
+                emitter.persistent.insert(slot.0);
+            }
+        }
+        if super::task_range::enabled() {
+            emitter.range_plan = super::task_range::RangePlan::build(
+                function,
+                (0..function.states.len())
+                    .map(|state| emitter.scalar_direct_state(state))
+                    .collect(),
+                |slot| emitter.cached_scalar(SlotId(slot)),
+                |slot| !emitter.persistent.contains(&slot),
+                &mut range_work,
+            );
+        }
+        emitter.emit(out)?;
     }
     super::task_adapter::emit_adapters(out, tasks)?;
     out.check()
@@ -128,6 +248,13 @@ struct FrameEmitter<'a> {
     indirect_calls: &'a [TaskIndirectCallPlan],
     callable_parameters: &'a [crate::ir::task::TaskCallableParameterPlan],
     finally: &'a TaskFinallyPlan,
+    cooperative: bool,
+    scalar_cache_active: Cell<bool>,
+    scalar_init_cache_active: Cell<bool>,
+    scalar_cache_mask: Cell<u64>,
+    range_plan: Option<super::task_range::RangePlan>,
+    range_active: Cell<bool>,
+    range_fast: Cell<bool>,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -196,7 +323,9 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::flat_array(ty)
                             || crate::ir::task::error_type(ty)
                             || crate::ir::task::local_bytes_type(ty)
-                            || crate::ir::task::local_net_type(ty))
+                            || crate::ir::task::local_net_type(ty)
+                            || crate::ir::task::local_pg_type(ty)
+                            || crate::ir::task::http_type(ty))
                         && !persistent.contains(&index)
                     {
                         return Err(unsupported(
@@ -229,8 +358,8 @@ impl<'a> FrameEmitter<'a> {
             || frame.hosted
                 != (task_mask != 0
                     || exit_bridge
-                    || crate::ir::task::array_result(&function.result)
-                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty)))
+                    || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -238,7 +367,7 @@ impl<'a> FrameEmitter<'a> {
                                 | TaskTerminator::BlockingWrite { .. }
                                 | TaskTerminator::BlockingRead { .. } | TaskTerminator::BlockingReadDir { .. }
                                 | TaskTerminator::BlockingExists { .. }
-                                | TaskTerminator::BlockingNet { .. }
+                                | TaskTerminator::BlockingNet { .. } | TaskTerminator::PgQuery { .. }
                         ) || state
                             .operations
                             .iter()
@@ -271,6 +400,13 @@ impl<'a> FrameEmitter<'a> {
             indirect_calls: &frame.indirect_calls,
             callable_parameters: &frame.callable_parameters,
             finally: &frame.finally,
+            cooperative: false,
+            scalar_cache_active: Cell::new(false),
+            scalar_init_cache_active: Cell::new(false),
+            scalar_cache_mask: Cell::new(0),
+            range_plan: None,
+            range_active: Cell::new(false),
+            range_fast: Cell::new(false),
         })
     }
 
@@ -419,7 +555,9 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::flat_array(ty)
                         || crate::ir::task::error_type(ty)
                         || crate::ir::task::local_bytes_type(ty)
-                        || crate::ir::task::local_net_type(ty))
+                        || crate::ir::task::local_net_type(ty)
+                        || crate::ir::task::local_pg_type(ty)
+                        || crate::ir::task::http_type(ty))
             }
         }
     }
@@ -428,8 +566,21 @@ impl<'a> FrameEmitter<'a> {
         self.task_mask & (1u64 << slot.0) != 0
     }
 
+    fn cached_scalar(&self, slot: SlotId) -> bool {
+        self.persistent.contains(&slot.0)
+            && matches!(
+                self.function.slots[slot.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Int | IrType::Bool | IrType::Null,
+                    borrowed: false
+                }
+            )
+    }
+
     fn place(&self, slot: SlotId) -> String {
-        if self.persistent.contains(&slot.0) {
+        if self.scalar_cache_active.get() && self.cached_scalar(slot) {
+            format!("cached_{}", slot.0)
+        } else if self.persistent.contains(&slot.0) {
             format!("frame->s_{}", slot.0)
         } else {
             format!("slot_{}", slot.0)
@@ -437,7 +588,9 @@ impl<'a> FrameEmitter<'a> {
     }
 
     fn bitmap(&self, slot: SlotId) -> &'static str {
-        if self.persistent.contains(&slot.0) {
+        if self.scalar_init_cache_active.get() && self.cached_scalar(slot) {
+            "__ku_copy_initialized"
+        } else if self.persistent.contains(&slot.0) {
             "frame->header.initialized"
         } else {
             "local_initialized"
@@ -783,14 +936,263 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         Ok(())
     }
 
+    // A local proof for one drive invocation, not a cached charge or a general
+    // ownership analysis. Unknown operations are deliberately non-scalar.
+    fn scalar_charge_state(&self, state: &crate::ir::task::TaskState) -> bool {
+        let scalar = |slot: SlotId| {
+            matches!(
+                self.function.slots[slot.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Int | IrType::Bool | IrType::Null,
+                    borrowed: false,
+                }
+            )
+        };
+        let operations = state.operations.iter().all(|operation| match operation {
+            TaskOp::Init { dst, value } => {
+                scalar(*dst)
+                    && matches!(
+                        value,
+                        TaskConstant::Int(_) | TaskConstant::Bool(_) | TaskConstant::Null
+                    )
+            }
+            TaskOp::Copy { dst, src } | TaskOp::Move { dst, src } => scalar(*dst) && scalar(*src),
+            TaskOp::Unary { dst, src, .. } => scalar(*dst) && scalar(*src),
+            TaskOp::Binary {
+                dst, left, right, ..
+            } => scalar(*dst) && scalar(*left) && scalar(*right),
+            TaskOp::Read { slot } => scalar(*slot),
+            // Scalar drops only clear their initialized bit; no destructor or
+            // allocation host is emitted for these exact types.
+            TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => scalar(*slot),
+            // This verified lexical annotation emits no runtime operation.
+            TaskOp::ScopeEnter { tasks, .. } => tasks.is_empty(),
+            _ => false,
+        });
+        operations
+            && match &state.terminator {
+                TaskTerminator::Jump { .. } | TaskTerminator::Suspend { .. } => true,
+                TaskTerminator::Branch { condition, .. } => scalar(*condition),
+                // The cooperative empty-manifest continuation only changes
+                // frame control fields; its separate Value drops are TaskOps.
+                TaskTerminator::ScopeDrain { scope, .. } => self.scopes[scope.0].task_mask == 0,
+                _ => false,
+            }
+    }
+
+    // A verified scalar edge cannot call user code, allocate, publish a Task or
+    // touch an owned payload. Keep its control flow visible to the C optimizer
+    // instead of storing/reloading a state number through the shared switch.
+    // Finally regions and borrowed temporaries retain the general dispatcher.
+    fn scalar_direct_state(&self, index: usize) -> bool {
+        self.cooperative
+            && self.hosted
+            && self.finally.state_cleanup.is_empty()
+            && !self
+                .function
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }))
+            && self.scalar_charge_state(&self.function.states[index])
+    }
+
+    fn emit_transition(&self, out: &mut COutput, target: usize) {
+        if self.scalar_direct_state(target) {
+            let label = if self.range_fast.get() {
+                "range"
+            } else {
+                "scalar"
+            };
+            out.push_str(&format!("  goto ku_task_{label}_check_{target};\n"));
+        } else {
+            out.push_str(&format!(
+                "  frame->header.state = {target}u;\n  goto ku_task_dispatch;\n"
+            ));
+        }
+    }
+
+    fn emit_scalar_checkpoint(&self, out: &mut COutput, state: usize) {
+        // Exactly the old phase-before-quantum ordering and one unit per IR
+        // state. Only externally observable exits materialize the state number.
+        // Cleanup still reads its clock on every original dispatch boundary.
+        let (phase, budget) = if self.scalar_cache_active.get() {
+            // Pure operations cannot replace the host/control identity. Cache
+            // its address only until the next general/owned/host boundary;
+            // the atomic phase VALUE is still acquired at every checkpoint.
+            (
+                "if (!__ku_scalar_phase) __ku_scalar_phase=&((KuTaskAdapterHostV1*)clock->host)->control->phase;\nif (ku_task_control_atomic_load(__ku_scalar_phase)!=KU_TASK_CONTROL_LIVE)",
+                // Hosted resume validates host before drive, and this exact
+                // path already dereferences it for the preceding phase read.
+                "if (!__ku_dispatch_budget--)",
+            )
+        } else {
+            (
+                "if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE)",
+                "if (clock->host && !__ku_dispatch_budget--)",
+            )
+        };
+        let label = if self.range_fast.get() {
+            "range"
+        } else {
+            "scalar"
+        };
+        out.push_str(&format!(
+            "ku_task_{label}_check_{state}:;\n\
+             if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
+             {phase} {{\n\
+               frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
+               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
+             }}\n\
+             {budget} {{\n\
+               frame->header.state={state}u;\n\
+               KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
+               ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
+               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
+             }}\n"
+        ));
+    }
+
+    fn emit_scalar_init_flush(&self, out: &mut COutput) {
+        if self.scalar_cache_active.get() {
+            if self.range_active.get() {
+                // A general/Owned/host/cleanup boundary ends the numeric
+                // proof. Never reselect within this drive invocation.
+                out.push_str("  __ku_range_fast=0;\n");
+            }
+            let mask = self.scalar_cache_mask.get();
+            out.push_str("  __ku_scalar_phase=NULL;\n");
+            // Merge only Copy bits. Owned/Task publications may have changed
+            // the other header bits since this pure segment began.
+            out.push_str(&format!(
+                "  if (__ku_copy_init_active) {{\n    frame->header.initialized=(frame->header.initialized & ~UINT64_C({mask})) | (__ku_copy_initialized & UINT64_C({mask}));\n    __ku_copy_init_active=0;\n  }}\n"
+            ));
+        }
+    }
+
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
+        let slots = (0..self.function.slots.len())
+            .map(SlotId)
+            .filter(|slot| self.cached_scalar(*slot))
+            .collect::<Vec<_>>();
+        let enabled = self.cooperative
+            && self.hosted
+            && !slots.is_empty()
+            && self.finally.state_cleanup.is_empty()
+            && !self
+                .function
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }))
+            && (0..self.function.states.len()).any(|state| self.scalar_direct_state(state));
+        if !enabled {
+            return self.emit_drive_body(out);
+        }
+        // Only verified Copy scalars get a private invocation-local cache.
+        // Owning headers and control/lease storage stay in the original frame.
+        // Only pure segments cache Copy initialization bits; every observable
+        // exit/host boundary publishes them before other code can inspect them.
+        // A callback never receives this cache address
+        // except for finite pure arithmetic output parameters.
+        let mut body = COutput::new(out.remaining());
+        let scalar_mask = slots
+            .iter()
+            .fold(0u64, |mask, slot| mask | (1u64 << slot.0));
+        self.scalar_cache_mask.set(scalar_mask);
+        self.scalar_cache_active.set(true);
+        let emitted = self.emit_drive_body(&mut body);
+        emitted?;
+        let body = body.finish()?;
+        let mut baseline = COutput::new(out.remaining());
+        self.emit_scalar_drive_artifact(&mut baseline, &slots, &body, scalar_mask)?;
+        let baseline = baseline.finish()?;
+        drop(body);
+        let mut chosen = None;
+        if self.range_plan.is_some() {
+            super::task_range::attempted();
+            self.range_active.set(true);
+            let limit = baseline
+                .len()
+                .saturating_add(super::task_range::MAX_EXTRA_SOURCE_BYTES)
+                .min(out.remaining());
+            let mut candidate_body = COutput::new(limit);
+            let candidate = self
+                .emit_drive_body(&mut candidate_body)
+                .and_then(|()| candidate_body.finish())
+                .and_then(|body| {
+                    let mut artifact = COutput::new(limit);
+                    self.emit_scalar_drive_artifact(&mut artifact, &slots, &body, scalar_mask)?;
+                    artifact.finish()
+                });
+            self.range_active.set(false);
+            if let Ok(candidate) = candidate {
+                if super::task_range::claim_extra(candidate.len().saturating_sub(baseline.len())) {
+                    chosen = Some(candidate);
+                }
+            }
+        }
+        self.scalar_cache_active.set(false);
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
+        out.push_str(chosen.as_deref().unwrap_or(&baseline));
+        out.check()
+    }
+
+    fn emit_scalar_drive_artifact(
+        &self,
+        out: &mut COutput,
+        slots: &[SlotId],
+        body: &str,
+        scalar_mask: u64,
+    ) -> KuResult<()> {
+        let helper = format!("{}_spill_scalars", self.prefix);
+        out.push_str(&format!(
+            "static uint32_t {helper}({}* frame",
+            self.frame_type
+        ));
+        for slot in slots {
+            out.push_str(&format!(
+                ", {} cached_{}",
+                c_type(self.slot_type(*slot)?)?,
+                slot.0
+            ));
+        }
+        out.push_str(&format!(
+            ", uint64_t copy_initialized, int copy_active, uint32_t result) {{\n  if (copy_active) frame->header.initialized=(frame->header.initialized & ~UINT64_C({scalar_mask})) | (copy_initialized & UINT64_C({scalar_mask}));\n"
+        ));
+        for slot in slots {
+            out.push_str(&format!("  frame->s_{}=cached_{};\n", slot.0, slot.0));
+        }
+        out.push_str("  return result;\n}\n");
+        let mut call = format!("{helper}(frame");
+        for slot in slots {
+            call.push_str(&format!(",cached_{}", slot.0));
+        }
+        call.push_str(",__ku_copy_initialized,__ku_copy_init_active");
+        emit_scalar_spill_returns(out, body, &call)?;
+        out.check()
+    }
+
+    fn emit_drive_body(&self, out: &mut COutput) -> KuResult<()> {
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
             self.prefix, self.frame_type
         ));
+        if self.cooperative {
+            out.push_str("  size_t __ku_dispatch_budget=64u;\n  int __ku_charge_unchanged=1;\n");
+        }
+        if self.scalar_cache_active.get() {
+            out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
+        }
+        if self.range_active.get() {
+            out.push_str("  int __ku_range_unselected=1;\n  int __ku_range_fast=0;\n");
+        }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
-            if !self.persistent.contains(&index) {
+            if self.scalar_cache_active.get() && self.cached_scalar(SlotId(index)) {
+                out.push_str(&format!(
+                    "  {} cached_{index}=(frame->header.initialized & (UINT64_C(1)<<{index})) ? frame->s_{index} : {};\n",
+                    c_type(self.slot_type(SlotId(index))?)?, c_zero_initializer(self.slot_type(SlotId(index))?)?));
+            } else if !self.persistent.contains(&index) {
                 let TaskSlotType::Value { ty, .. } = &slot.ty else {
                     return Err(unsupported("Task slots must be persistent"));
                 };
@@ -801,9 +1203,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
             }
         }
+        out.push_str("  goto ku_task_dispatch;\nku_task_dispatch:;\n");
+        // A general dispatcher may call a clock/check/host helper. Its view
+        // must include every prior Copy initialization before that call.
+        self.emit_scalar_init_flush(out);
         out.push_str(
-            "  goto ku_task_dispatch;\nku_task_dispatch:;\n\
-               if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
+            "  if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
                  frame->header.cleanup_timed_out = 1;\n\
                  goto ku_task_terminated;\n\
                }\n",
@@ -818,40 +1223,116 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str("  }\n");
             }
         }
+        if self.cooperative {
+            let borrowed =
+                self.function
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |mask, (index, slot)| {
+                        if matches!(&slot.ty, TaskSlotType::Value { borrowed: true, .. }) {
+                            mask | (1u64 << index)
+                        } else {
+                            mask
+                        }
+                    });
+            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
+        }
+        if self.range_active.get() {
+            let guard = self
+                .range_plan
+                .as_ref()
+                .unwrap()
+                .guard_slots
+                .iter()
+                .map(|slot| format!("(cached_{slot}>=INT32_MIN && cached_{slot}<=INT32_MAX)"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            // This selector follows the original phase and budget checks. The
+            // selected initial body has ALREADY consumed one logical unit.
+            out.push_str(&format!("  if (__ku_range_unselected) {{ __ku_range_unselected=0; __ku_range_fast=!cleanup && ({guard}); }}\n"));
+        }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
-            out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
+            if self.range_active.get() && self.scalar_direct_state(index) {
+                out.push_str(&format!("  case {index}u: if (__ku_range_fast) goto ku_task_range_state_{index}; goto ku_task_state_{index};\n"));
+            } else {
+                out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
+            }
         }
         out.push_str(
             "  default: frame->header.running = 0; return KU_TASK_FRAME_INVALID_STATE;\n  }\n",
         );
-        for (index, state) in self.function.states.iter().enumerate() {
+        let states = self
+            .function
+            .states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| (index, state, false))
+            .chain(
+                self.function
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        self.range_active.get() && self.range_plan.as_ref().unwrap().states[*index]
+                    })
+                    .map(|(index, state)| (index, state, true)),
+            );
+        for (index, state, range_fast) in states {
             out.check()?;
-            out.push_str(&format!("ku_task_state_{index}:;\n"));
+            self.range_fast.set(range_fast);
+            let cached_init = self.scalar_cache_active.get() && self.scalar_direct_state(index);
+            self.scalar_init_cache_active.set(cached_init);
+            if self.scalar_direct_state(index) {
+                self.emit_scalar_checkpoint(out, index);
+            }
+            if range_fast {
+                out.push_str(&format!("ku_task_range_state_{index}:;\n"));
+            } else {
+                out.push_str(&format!("ku_task_state_{index}:;\n"));
+            }
+            if cached_init {
+                let mask = self.scalar_cache_mask.get();
+                out.push_str(&format!(
+                    "  if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n"
+                ));
+            } else {
+                // Also guard direct label entry: future non-pure transitions
+                // must never expose a stale bitmap to a callback or _check.
+                self.emit_scalar_init_flush(out);
+            }
+            if self.cooperative && !self.scalar_charge_state(state) {
+                out.push_str("  __ku_charge_unchanged=0;\n");
+            }
             for (operation_id, operation) in state.operations.iter().enumerate() {
                 out.check()?;
                 self.emit_operation(out, operation, index, operation_id)?;
             }
             match &state.terminator {
                 TaskTerminator::Jump { target } => {
-                    out.push_str(&format!(
-                        "  frame->header.state = {}u;\n  goto ku_task_dispatch;\n",
-                        target.0
-                    ));
+                    self.emit_transition(out, target.0);
                 }
                 TaskTerminator::Branch {
                     condition,
                     then_state,
                     else_state,
                 } => {
-                    out.push_str(&format!(
-                        "  frame->header.state = {} ? {}u : {}u;\n  goto ku_task_dispatch;\n",
-                        self.place(*condition),
-                        then_state.0,
-                        else_state.0
-                    ));
+                    out.push_str(&format!("  if ({}) {{\n", self.place(*condition)));
+                    self.emit_transition(out, then_state.0);
+                    out.push_str("  } else {\n");
+                    self.emit_transition(out, else_state.0);
+                    out.push_str("  }\n");
                 }
                 TaskTerminator::Suspend { resume, cleanup } => {
+                    if self.cooperative {
+                        /* Source-loop latches share the finite dispatch quantum.
+                         * Timer/Await/Blocking terminators still publish genuine
+                         * waits; raw frame fixtures preserve their old latch ABI. */
+                        out.push_str(&format!("  if (cleanup) goto ku_task_terminated;\n  frame->header.cleanup_state={}u;\n",cleanup.0));
+                        self.emit_transition(out, resume.0);
+                        continue;
+                    }
                     out.push_str(&format!(
                         "  if (cleanup) goto ku_task_terminated;\n\
                            frame->header.state = {}u;\n\
@@ -862,7 +1343,24 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         resume.0, cleanup.0
                     ));
                 }
-                TaskTerminator::ScopeDrain { .. } => {
+                TaskTerminator::ScopeDrain { scope, ready, .. } => {
+                    if self.scalar_direct_state(index) {
+                        // The verified immutable descriptor has an empty Task
+                        // manifest. No owner/receipt/host operation can run here;
+                        // this is exactly scope_continue's successful witness.
+                        // Keep its status/cleanup facts but omit re-validating
+                        // the complete frame at every scalar loop iteration.
+                        out.push_str("  if (cleanup) goto ku_task_terminated;\n  frame->header.cleanup_state=UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_PENDING;\n");
+                        self.emit_transition(out, ready.0);
+                        continue;
+                    }
+                    if self.cooperative && self.scopes[scope.0].task_mask == 0 {
+                        /* A statically empty Task manifest has no receipt or
+                         * asynchronous retirement to await. Use the same typed
+                         * continuation witness inside this dispatch quantum. */
+                        out.push_str(&format!("  if (cleanup) goto ku_task_terminated;\n  {{ const KuTaskFrameScopeDescriptorV1* descriptor={}_scope_lookup(frame->header.state);\n  if (!descriptor || descriptor->task_mask) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->header.cleanup_state=descriptor->cleanup_state; frame->header.status=KU_TASK_FRAME_SCOPE_REQUEST; frame->header.running=0;\n  uint32_t continued={}_scope_continue(frame,sizeof(*frame),KU_TASK_FRAME_ABI_VERSION,descriptor->scope_id);\n  if(continued!=KU_TASK_FRAME_OK)return continued;\n  frame->header.running=1; goto ku_task_dispatch;\n  }}\n",self.prefix,self.prefix));
+                        continue;
+                    }
                     out.push_str(&format!(
                         "  if (cleanup) goto ku_task_terminated;\n  {{ const KuTaskFrameScopeDescriptorV1* descriptor={}_scope_lookup(frame->header.state);\n  if (!descriptor) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->header.cleanup_state=descriptor->cleanup_state;\n  frame->header.status=KU_TASK_FRAME_SCOPE_REQUEST;\n  frame->header.running=0;\n  return KU_TASK_FRAME_SCOPE_REQUEST;\n  }}\n",
                         self.prefix
@@ -1063,6 +1561,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ready.0
                     ));
                 }
+                TaskTerminator::PgQuery {
+                    client,
+                    sql,
+                    params,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t pg_status=ku_task_host_pg_query((KuTaskAdapterHostV1*)clock->host,{},{},{},&{});\n  if (pg_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (pg_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*client),self.place(*sql),self.place(*params),self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
                 TaskTerminator::BlockingExists {
                     path,
                     dst,
@@ -1115,6 +1629,8 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 }
             }
         }
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
         if !self.finally.state_cleanup.is_empty() {
             out.push_str("ku_task_protected_failure:;\n  switch (frame->header.state) {\n");
             for (state, region) in self.finally.regions.iter().enumerate() {
@@ -1139,9 +1655,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             out.push_str("  default: goto ku_task_terminated;\n  }\n");
         }
-        out.push_str(
-            "ku_task_terminated:;\n  if (clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n",
-        );
+        out.push_str("ku_task_terminated:;\n");
+        self.emit_scalar_init_flush(out);
+        out.push_str("  if (clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n");
         self.emit_all_slot_drops(out, true)?;
         if !self.finally.state_cleanup.is_empty() {
             out.push_str(&format!("  if ((frame->header.status==KU_TASK_FRAME_CANCELLED || frame->header.status==KU_TASK_FRAME_TIMED_OUT) && frame->header.result_initialized) {{ frame->header.result_initialized=0; {} }}\n",drop_statement(&self.function.result,"frame->result")?));
@@ -1197,11 +1713,29 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     ));
                     self.set_init(out, *dst, true);
                 }
-                TaskUnaryOp::Negate => self.emit_checked_integer(
-                    out,
-                    *dst,
-                    &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
-                )?,
+                TaskUnaryOp::Negate => {
+                    if self.range_fast.get()
+                        && self
+                            .range_plan
+                            .as_ref()
+                            .unwrap()
+                            .proves(state, operation_id)
+                    {
+                        out.push_str(&format!(
+                            "  {} = -{};\n",
+                            self.place(*dst),
+                            self.place(*src)
+                        ));
+                        self.set_init(out, *dst, true);
+                    } else {
+                        self.emit_checked_integer(
+                            out,
+                            *dst,
+                            &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
+                            state,
+                        )?;
+                    }
+                }
             },
             TaskOp::Binary {
                 dst,
@@ -1217,7 +1751,29 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     TaskBinaryOp::Remainder => Some("ku_int_rem"),
                     _ => None,
                 };
-                if let Some(helper) = helper {
+                if self.range_fast.get()
+                    && self
+                        .range_plan
+                        .as_ref()
+                        .unwrap()
+                        .proves(state, operation_id)
+                {
+                    let operator = match op {
+                        TaskBinaryOp::Add => "+",
+                        TaskBinaryOp::Subtract => "-",
+                        TaskBinaryOp::Multiply => "*",
+                        TaskBinaryOp::Divide => "/",
+                        TaskBinaryOp::Remainder => "%",
+                        _ => unreachable!(),
+                    };
+                    out.push_str(&format!(
+                        "  {} = ({} {operator} {});\n",
+                        self.place(*dst),
+                        self.place(*left),
+                        self.place(*right)
+                    ));
+                    self.set_init(out, *dst, true);
+                } else if let Some(helper) = helper {
                     self.emit_checked_integer(
                         out,
                         *dst,
@@ -1227,6 +1783,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             self.place(*right),
                             self.place(*dst)
                         ),
+                        state,
                     )?;
                 } else {
                     let operator = match op {
@@ -1339,6 +1896,40 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{},&{});\n",self.place(*src),self.place(*dst)));
                 self.emit_string_allocation_check(out, "allocated")?;
                 out.push_str("  }\n");
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::PrimitiveString { dst, src } => {
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                match self.slot_type(*src)? {
+                    IrType::Int => {
+                        // int64 decimal needs at most 20 bytes plus NUL. The
+                        // existing concat host copies this bounded read view
+                        // before returning; the frame never stores its address.
+                        out.push_str(&format!("  {{ char formatted[21];\n  int length=snprintf(formatted,sizeof(formatted),\"%lld\",(long long){source});\n  if(length<0 || (size_t)length>=sizeof(formatted)) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  uint32_t allocated=ku_task_host_concat_string((KuTaskAdapterHostV1*)clock->host,(KuString){{(uint8_t*)formatted,(size_t)length,0,KU_STRING_STATIC}},(KuString){{0}},&{destination});\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str("  }\n");
+                    }
+                    IrType::Bool => out.push_str(&format!(
+                        "  {destination}={source} ? {} : {};\n",
+                        c_static_utf8_string("true"),
+                        c_static_utf8_string("false")
+                    )),
+                    IrType::Null => out.push_str(&format!(
+                        "  {destination}={};\n",
+                        c_static_utf8_string("null")
+                    )),
+                    IrType::Str => {
+                        out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source},&{destination});\n"));
+                        self.emit_string_allocation_check(out, "allocated")?;
+                        out.push_str("  }\n");
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "str() requires a supported primitive Task value",
+                        ))
+                    }
+                }
                 self.set_init(out, *dst, true);
             }
             TaskOp::StringConcat { dst, left, right } => {
@@ -1525,13 +2116,128 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.set_init(out, *dst, true);
             }
             TaskOp::ErrorField { dst, src, field } => {
-                if !matches!(field.as_str(), "domain" | "code" | "message") {
+                if !matches!(
+                    field.as_str(),
+                    "domain" | "code" | "message" | "method" | "path" | "body"
+                ) {
                     return Err(unsupported("unknown Task Error field"));
                 }
                 out.push_str(&format!("  {{ uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{}.{field},&{});\n  if (cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {{\n", self.place(*src), self.place(*dst)));
                 self.emit_runtime_error(out, &format!("ku_error_make({},cloned==KU_TASK_DRIVER_LIMIT ? {} : {},cloned==KU_TASK_DRIVER_LIMIT ? {} : {})",
                     c_static_utf8_string("task"), c_static_utf8_string("memory_limit"), c_static_utf8_string("out_of_memory"), c_static_utf8_string("native Task allocation budget exceeded"), c_static_utf8_string("native Task allocation failed")))?;
                 out.push_str("  }\n  if (cloned!=KU_TASK_DRIVER_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  }\n");
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::HttpMapGet {
+                dst,
+                request,
+                key,
+                map,
+            } => {
+                out.push_str(&format!("  {{ KuValue* field_value=ku_object_get({}.{map},{});\n  KuString field_string=field_value && field_value->tag==KU_STR ? field_value->as.s : (KuString){{0}};\n  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,field_string,&{});\n  if(cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {{\n",self.place(*request),self.place(*key),self.place(*dst)));
+                self.emit_runtime_error(out,"ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"memory_limit\",12),ku_string_static((const uint8_t*)\"request map projection allocation rejected\",42))")?;
+                out.push_str("  }\n  if(cloned!=KU_TASK_DRIVER_OK) {frame->header.running=0;return KU_TASK_FRAME_INVALID_STATE;}\n  }\n");
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::HttpResponse {
+                dst,
+                body,
+                status,
+                kind,
+            } => {
+                let status = status.map(|slot| self.place(slot)).unwrap_or_else(|| {
+                    if *kind == 3 {
+                        "302"
+                    } else if *kind == 2 {
+                        "204"
+                    } else {
+                        "200"
+                    }
+                    .into()
+                });
+                let content = if *kind == 1 {
+                    "text/html; charset=utf-8"
+                } else if *kind == 2 || *kind == 3 {
+                    ""
+                } else {
+                    "text/plain; charset=utf-8"
+                };
+                let value = if let Some(body) = body {
+                    c_move_value(&IrType::Str, &self.place(*body))?
+                } else {
+                    "(KuString){0}".into()
+                };
+                let (body_value, location) = if *kind == 3 {
+                    ("(KuString){0}".to_string(), value)
+                } else {
+                    (value, "(KuString){0}".into())
+                };
+                out.push_str(&format!(
+                    "  {}=(KuStruct___ku_http_response){{{status},{},{body_value},{location}}};\n",
+                    self.place(*dst),
+                    c_static_utf8_string(content)
+                ));
+                if let Some(body) = body {
+                    self.set_init(out, *body, false);
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::PgResult {
+                dst,
+                source,
+                row,
+                col,
+                operation,
+            } => {
+                use crate::ir::task::TaskPgResultOperation as Pg;
+                let source = self.place(*source);
+                let call = match operation {
+                    Pg::Rows => format!("ku_pg_rows({source})"),
+                    Pg::Cols => format!("ku_pg_cols({source})"),
+                    Pg::Value => format!(
+                        "ku_task_host_pg_value((KuTaskAdapterHostV1*)clock->host,{source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                    Pg::ValueInt => format!(
+                        "ku_pg_value_int({source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                    Pg::IsNull => format!(
+                        "ku_pg_is_null({source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                };
+                out.push_str(&format!("  {}={call};\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::JsonEncodeObject { dst, fields } => {
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                for (key, slot) in fields {
+                    keys.push(c_static_utf8_string(key));
+                    let wrapper = match self.slot_type(*slot)? {
+                        IrType::Int => "ku_v_int",
+                        IrType::Bool => "ku_v_bool",
+                        IrType::Str => "ku_v_str",
+                        IrType::Null => "ku_v_null",
+                        _ => return Err(unsupported("Task JSON field type")),
+                    };
+                    values.push(if wrapper == "ku_v_null" {
+                        "ku_v_null()".into()
+                    } else {
+                        format!("{wrapper}({})", self.place(*slot))
+                    });
+                }
+                let call = if fields.is_empty() {
+                    "ku_task_host_json_object((KuTaskAdapterHostV1*)clock->host,NULL,NULL,0u)"
+                        .to_string()
+                } else {
+                    format!("ku_task_host_json_object((KuTaskAdapterHostV1*)clock->host,(KuString[]){{{}}},(KuValue[]){{{}}},{}u)",keys.join(","),values.join(","),fields.len())
+                };
+                out.push_str(&format!("  {}={call};\n", self.place(*dst)));
                 self.set_init(out, *dst, true);
             }
             TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
@@ -1588,18 +2294,18 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             TaskOp::Print { value, newline } => {
                 let place = self.place(*value);
                 let expression = match self.slot_type(*value)? {
-                    IrType::Int => format!("printf(\"%lld\",(long long){place}) < 0"),
-                    IrType::Bool => format!("fputs({place} ? \"true\" : \"false\",stdout) == EOF"),
-                    IrType::Null => "fputs(\"null\",stdout) == EOF".to_string(),
-                    IrType::Str => format!(
-                        "({place}.len && fwrite({place}.ptr,1,{place}.len,stdout)!={place}.len)"
+                    IrType::Int => format!("ku_output_printf(\"%lld\",(long long){place}) < 0"),
+                    IrType::Bool => format!(
+                        "ku_output_write({place} ? \"true\" : \"false\",{place} ? 4u : 5u) < 0"
                     ),
+                    IrType::Null => "ku_output_write(\"null\",4u) < 0".to_string(),
+                    IrType::Str => format!("ku_output_write({place}.ptr,{place}.len) < 0"),
                     _ => return Err(unsupported("Task print requires primitive value")),
                 };
                 out.push_str(&format!(
-                    "  if ({expression}{} || fflush(stdout)==EOF) {{\n",
+                    "  if ({expression}{} || ku_output_flush()<0) {{\n",
                     if *newline {
-                        " || fputc('\\n',stdout)==EOF"
+                        " || ku_output_printf(\"\\n\")<0"
                     } else {
                         ""
                     }
@@ -1611,13 +2317,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         Ok(())
     }
 
-    fn emit_checked_integer(&self, out: &mut COutput, dst: SlotId, call: &str) -> KuResult<()> {
+    fn emit_checked_integer(
+        &self,
+        out: &mut COutput,
+        dst: SlotId,
+        call: &str,
+        state: usize,
+    ) -> KuResult<()> {
         // Inputs are already materialized Copy slots. The helper neither exits
         // nor writes the destination on failure; cleanup follows the same
         // outer-runtime-failure path as native Task output errors.
         out.push_str(&format!(
             "  {{ uint32_t arithmetic_status = {call};\n  if (arithmetic_status != KU_INT_OK) {{\n"
         ));
+        if self.scalar_direct_state(state) {
+            out.push_str(&format!("  frame->header.state={state}u;\n"));
+        }
         self.emit_runtime_error(out,
             "ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))")?;
         out.push_str("  } }\n");
@@ -1894,6 +2609,8 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
     if crate::ir::task::error_type(ty)
         || crate::ir::task::local_bytes_type(ty)
         || crate::ir::task::local_net_type(ty)
+        || crate::ir::task::http_type(ty)
+        || crate::ir::task::local_pg_type(ty)
     {
         return Ok(());
     }
@@ -1908,7 +2625,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
 }
 
 fn require_result_type(ty: &IrType) -> KuResult<()> {
-    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner))
+    if matches!(ty, IrType::Result(inner) if matches!(**inner, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) || crate::ir::task::flat_array(inner) || crate::ir::task::http_response_type(inner) || matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
     {
         Ok(())
     } else {
@@ -1932,6 +2649,31 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+    if matches!(ty, IrType::Named(name) if name == "__ku_pg_result") {
+        return Ok(format!("({place}) == NULL"));
+    }
+    if crate::ir::task::pg_capture_type(ty) {
+        return Ok(format!(
+            "!({place}).client && !({place}).env && !({place}).deadline"
+        ));
+    }
+    if crate::ir::task::http_response_type(ty) {
+        let leaves = ["content_type", "body", "location"]
+            .iter()
+            .map(|name| empty_value_expr(&IrType::Str, &format!("({place}).{name}")))
+            .collect::<KuResult<Vec<_>>>()?;
+        return Ok(format!("!({place}).status && ({})", leaves.join(") && (")));
+    }
+    if crate::ir::task::http_request_type(ty) {
+        let leaves = ["method", "path", "body"]
+            .iter()
+            .map(|name| empty_value_expr(&IrType::Str, &format!("({place}).{name}")))
+            .collect::<KuResult<Vec<_>>>()?;
+        return Ok(format!(
+            "!({place}).params && !({place}).query && !({place}).headers && ({})",
+            leaves.join(") && (")
+        ));
+    }
     if crate::ir::task::error_type(ty) {
         return Ok(format!(
             "({}) && ({}) && ({})",
@@ -2101,3 +2843,37 @@ static int ku_task_frame_is_terminal(uint32_t status) {
       || status == KU_TASK_FRAME_TIMED_OUT;
 }
 "#;
+
+#[cfg(test)]
+mod scalar_spill_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_spill_rewrites_code_and_preserves_quoted_data_comments_and_bounds() {
+        let input = r#"const char* text="return KU_TASK_FRAME_READY;";
+char quote='\\'; /* return KU_TASK_FRAME_PENDING; */
+// return frame->header.status;
+if (ready) return KU_TASK_FRAME_READY;
+return frame->header.status;
+"#;
+        let mut out = COutput::new(4096);
+        emit_scalar_spill_returns(&mut out, input, "spill(frame,cached_1").unwrap();
+        let text = out.finish().unwrap();
+        assert!(text.contains("if (ready) return spill(frame,cached_1,KU_TASK_FRAME_READY);"));
+        assert!(text.contains("return spill(frame,cached_1,frame->header.status);"));
+        assert!(text.contains("\"return KU_TASK_FRAME_READY;\""));
+        assert!(text.contains("/* return KU_TASK_FRAME_PENDING; */"));
+        assert!(text.contains("// return frame->header.status;"));
+        let mut unknown = COutput::new(4096);
+        assert!(
+            emit_scalar_spill_returns(&mut unknown, "return unexpected;", "spill(frame").is_err()
+        );
+        let mut bounded = COutput::new(1);
+        assert!(emit_scalar_spill_returns(
+            &mut bounded,
+            "return KU_TASK_FRAME_READY;",
+            "spill(frame"
+        )
+        .is_err());
+    }
+}

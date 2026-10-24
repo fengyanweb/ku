@@ -1,0 +1,191 @@
+name: Multicore execution and capacity acceptance
+run-name: Multicore ${{ inputs.scope || github.event.label.name }} at ${{ github.event.pull_request.head.sha || github.sha }}
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'diagnose: bounded Linux diagnosis; capacity: full acceptance; all: both; waiting: affected waits only'
+        type: choice
+        default: diagnose
+        options: [diagnose, capacity, all, waiting]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multicore-capacity-${{ github.ref }}-${{ inputs.scope }}
+  cancel-in-progress: false
+
+jobs:
+  capacity:
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["diagnose-multicore","run-multicore-capacity","run-multicore-all","run-multicore-waiting"]'), github.event.label.name)
+    name: ${{ matrix.os }} ${{ inputs.scope }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((inputs.scope == 'diagnose' || github.event.label.name == 'diagnose-multicore') && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      GOTOOLCHAIN: local
+      GOPROXY: "off"
+      GOSUMDB: "off"
+      KU_EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      KU_CAPACITY_SCOPE: ${{ inputs.scope || (github.event.label.name == 'diagnose-multicore' && 'diagnose' || github.event.label.name == 'run-multicore-all' && 'all' || github.event.label.name == 'run-multicore-waiting' && 'waiting' || 'capacity') }}
+
+    steps:
+      - name: Check out the requested source exactly
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Freeze source, invocation and evidence location
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import json, os, platform, subprocess
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])/"capacity"
+          root.mkdir(parents=True, exist_ok=True)
+          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          dirty = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+          command = ["python3", "-u", "-B", "tests/acceptance/multicore_capacity.py",
+              "--ku", "target/release/ku", "--output", str(root/"report.json"),
+              "--mode", os.environ["KU_CAPACITY_SCOPE"]]
+          manifest = {"source_sha": source, "expected_source_sha": os.environ["KU_EXPECTED_SOURCE_SHA"],
+              "source_status": dirty, "scope": os.environ["KU_CAPACITY_SCOPE"], "command": command,
+              "platform": platform.platform(), "machine": platform.machine(),
+              "runner_os": os.environ["RUNNER_OS"], "runner_arch": os.environ["RUNNER_ARCH"],
+              "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"], "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+              "scope_boundary": "Own loopback HTTP only; no database, website deployment or historical-504 rerun"}
+          (root/"invocation.json").write_text(json.dumps(manifest, indent=2)+"\n")
+          if source != os.environ["KU_EXPECTED_SOURCE_SHA"] or dirty:
+              raise SystemExit("capacity requires the clean exact requested source")
+          PY
+
+      - name: Install bounded loopback diagnostic tools on Linux
+        if: runner.os == 'Linux' && env.KU_CAPACITY_SCOPE != 'capacity' && env.KU_CAPACITY_SCOPE != 'waiting'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends strace tcpdump
+
+      - name: Provide the pinned bounded load generator toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+
+      - name: Install pinned Rust and require the existing native tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup component add rustfmt --toolchain 1.89.0
+          rustup default 1.89.0
+          rustc --version --verbose > "$RUNNER_TEMP/capacity/rustc.txt"
+          cargo --version > "$RUNNER_TEMP/capacity/cargo.txt"
+          clang --version > "$RUNNER_TEMP/capacity/clang.txt"
+          go version > "$RUNNER_TEMP/capacity/go.txt"
+          python3 --version > "$RUNNER_TEMP/capacity/python.txt"
+
+      - name: Check Rust formatting and build the actual release CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo build --locked --release --bin ku 2>&1 | tee "$RUNNER_TEMP/capacity/build.log"
+          python3 -B - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          paths = [Path("target/release/ku"), Path("tests/acceptance/multicore_capacity.py")]
+          paths += sorted(Path("tests/fixtures").glob("multicore*.ku"))
+          hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+          (Path(os.environ["RUNNER_TEMP"])/"capacity"/"inputs.sha256.json").write_text(json.dumps(hashes, indent=2)+"\n")
+          PY
+
+      - name: Verify the affected native HTTP and owner-driver paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KU_BIN="$PWD/target/release/ku"
+          cargo test --locked --release --test native_task_source_test --test native_http_test -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/capacity/affected-regressions.log"
+
+      - name: Run the selected bounded diagnosis or capacity acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u -B tests/acceptance/multicore_capacity.py --ku target/release/ku --output "$RUNNER_TEMP/capacity/report.json" --mode "$KU_CAPACITY_SCOPE" 2>&1 | tee "$RUNNER_TEMP/capacity/driver.log"
+
+      - name: Preserve compact reports and diagnostic evidence on every outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: multicore-capacity-${{ matrix.os }}-${{ inputs.scope }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/capacity
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-regression:
+    if: (github.event_name == 'workflow_dispatch' && inputs.scope != 'diagnose' && inputs.scope != 'waiting') || contains(fromJSON('["run-multicore-capacity","run-multicore-all"]'), github.event.label.name)
+    name: Windows affected native regressions
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out the same requested source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust and verify the C compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/capacity" -Force | Out-Null
+          rustup set profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select the minimal Rust profile' }
+          rustup toolchain install 1.89.0 --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot install Rust 1.89.0' }
+          rustup default 1.89.0
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot select Rust 1.89.0' }
+          rustc --version --verbose | Out-File "$env:RUNNER_TEMP/capacity/rustc.txt" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect Rust' }
+          clang --version | Out-File "$env:RUNNER_TEMP/capacity/clang.txt" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'The affected native regressions require Clang' }
+          git rev-parse HEAD | Out-File "$env:RUNNER_TEMP/capacity/source-sha.txt" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the checked-out source' }
+
+      - name: Build and verify the affected native HTTP and owner-driver paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --bin ku 2>&1 | Tee-Object "$env:RUNNER_TEMP/capacity/build.log"
+          if ($LASTEXITCODE -ne 0) { throw 'The release CLI build failed' }
+          $env:KU_BIN = Join-Path $env:GITHUB_WORKSPACE 'target/release/ku.exe'
+          cargo test --locked --release --test native_task_source_test --test native_http_test -- --nocapture --test-threads=1 2>&1 | Tee-Object "$env:RUNNER_TEMP/capacity/affected-regressions.log"
+          if ($LASTEXITCODE -ne 0) { throw 'The affected native regressions failed' }
+
+      - name: Preserve Windows affected-path results on every outcome
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: multicore-capacity-windows-regression-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/capacity
+          if-no-files-found: error
+          retention-days: 30

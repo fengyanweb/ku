@@ -110,6 +110,61 @@ fn rejected(program: &TaskProgram, case: &str) {
 }
 
 #[test]
+fn native_task_primitive_string_ir_preserves_input_and_rejects_invalid_owners() {
+    for ty in [IrType::Int, IrType::Bool, IrType::Null, IrType::Str] {
+        let fixture = program(
+            vec![ty.clone(), IrType::Str, result(IrType::Null)],
+            &[0],
+            vec![state(
+                vec![
+                    TaskOp::PrimitiveString {
+                        dst: SlotId(1),
+                        src: SlotId(0),
+                    },
+                    read(0),
+                    drop_slot(1),
+                    drop_slot(0),
+                    init(2, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+                ],
+                complete(2),
+            )],
+        );
+        let plan = accepted(&fixture);
+        assert!(plan.functions[0].hosted && plan.functions[0].slots.contains(&SlotId(1)));
+        let mut bad = fixture.clone();
+        bad.functions[0].parameters.clear();
+        rejected(&bad, "str input must already be initialized");
+        let mut bad = fixture.clone();
+        bad.functions[0].states[0].operations.insert(
+            1,
+            TaskOp::PrimitiveString {
+                dst: SlotId(1),
+                src: SlotId(0),
+            },
+        );
+        rejected(&bad, "str cannot overwrite a live owned output");
+        let mut bad = fixture.clone();
+        bad.functions[0].slots[1].ty = TaskSlotType::Value {
+            ty: IrType::Int,
+            borrowed: false,
+        };
+        rejected(&bad, "str destination must own a string");
+        let mut bad = fixture.clone();
+        bad.functions[0].states[0].operations[0] = TaskOp::PrimitiveString {
+            dst: SlotId(0),
+            src: SlotId(0),
+        };
+        rejected(&bad, "str cannot consume its own source slot");
+        let mut bad = fixture.clone();
+        bad.functions[0].slots[0].ty = TaskSlotType::Value { ty, borrowed: true };
+        rejected(
+            &bad,
+            "str must not turn raw borrowed IR storage into an owner",
+        );
+    }
+}
+
+#[test]
 fn native_task_frame_ir_owns_bare_catch_errors_and_validates_projections() {
     let error = IrType::Named("__ku_error_type".into());
     let fixture = program(

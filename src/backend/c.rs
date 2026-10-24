@@ -7,6 +7,10 @@ use output::COutput;
 
 #[path = "c_int.rs"]
 mod checked_int;
+#[path = "c_database_budget.rs"]
+mod database_budget;
+#[path = "c_service_output.rs"]
+mod service_output;
 #[path = "c_sync.rs"]
 mod sync;
 
@@ -20,6 +24,12 @@ mod task_blocking;
 mod task_control;
 #[path = "c_task_driver.rs"]
 mod task_driver;
+#[path = "c_task_http.rs"]
+mod task_http;
+#[path = "c_task_mixed.rs"]
+mod task_mixed;
+#[path = "c_task_range.rs"]
+mod task_range;
 #[path = "c_task_root.rs"]
 mod task_root;
 
@@ -239,6 +249,9 @@ pub fn generate_task_frame_c_source(
     program: &IrProgram,
     frames: &crate::ir::task::TaskProgram,
 ) -> KuResult<String> {
+    if frames.functions.is_empty() {
+        return generate_c_source(program);
+    }
     let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
     if !frames.functions.is_empty()
         && program.functions.iter().any(|function| {
@@ -279,6 +292,29 @@ pub fn generate_task_frame_c_source(
     generate_c_source_with_frames_bounded(
         program,
         &CBackendOptions::default(),
+        MAX_GENERATED_C_BYTES,
+        Some((frames, &plan, None)),
+    )
+}
+
+/// Mix the existing synchronous service setup with verified async handler frames.
+/// Async function placeholders carry signatures only; the HTTP route bridge
+/// starts the real frame on its connection's fixed event owner.
+pub fn generate_mixed_http_c_source(
+    program: &IrProgram,
+    frames: &crate::ir::task::TaskProgram,
+    options: &CBackendOptions,
+) -> KuResult<String> {
+    task_mixed::validate(program, frames)?;
+    if !program_uses_http(program) || frames.functions.is_empty() {
+        return Err(unsupported(
+            "async functions outside an async entry require an HTTP service",
+        ));
+    }
+    let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
+    generate_c_source_with_frames_bounded(
+        program,
+        options,
         MAX_GENERATED_C_BYTES,
         Some((frames, &plan, None)),
     )
@@ -335,18 +371,36 @@ fn generate_c_source_with_frames_bounded(
         Option<crate::ir::task::TaskFunctionId>,
     )>,
 ) -> KuResult<String> {
+    // Generation only builds source and rebuilds invocation-local symbol
+    // registries. An optional range candidate must not reduce output admission.
+    task_range::generate_with_fallback(|| {
+        generate_c_source_with_frames_attempt(program, options, byte_limit, frames)
+    })
+}
+
+fn generate_c_source_with_frames_attempt(
+    program: &IrProgram,
+    options: &CBackendOptions,
+    byte_limit: usize,
+    frames: Option<(
+        &crate::ir::task::TaskProgram,
+        &crate::ir::task::TaskFramePlan,
+        Option<crate::ir::task::TaskFunctionId>,
+    )>,
+) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
     sync::validate_program(program)?;
     let checked_integer_runtime = sync::uses_checked_integer(program)
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
     let task_net = frames.is_some_and(|(tasks, _, _)| {
-        tasks.functions.iter().any(|function| {
-            function.slots.iter().any(|slot| {
-                matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
+        task::uses_postgres(tasks)
+            || tasks.functions.iter().any(|function| {
+                function.slots.iter().any(|slot| {
+                    matches!(&slot.ty, crate::ir::task::TaskSlotType::Value { ty, .. }
                     if crate::ir::task::local_net_type(ty))
+                })
             })
-        })
     });
     let task_bytes = task_net
         || frames.is_some_and(|(tasks, _, _)| {
@@ -357,6 +411,7 @@ fn generate_c_source_with_frames_bounded(
                 })
             })
         });
+    let task_json = frames.is_some_and(|(tasks, _, _)| task::uses_json(tasks));
     let task_fs = frames.is_some_and(|(tasks, _, _)| task::uses_blocking_fs(tasks));
     let task_native_tls = frames.is_some_and(|(tasks, _, _)| {
         tasks.functions.iter().any(|function| {
@@ -419,6 +474,12 @@ fn generate_c_source_with_frames_bounded(
             collect_result_type(&IrType::Result(Box::new(payload)), &mut frame_result_types)?;
         }
     }
+    if task_json {
+        collect_result_type(
+            &IrType::Result(Box::new(IrType::Named("__ku_value".into()))),
+            &mut frame_result_types,
+        )?;
+    }
     for function in &program.functions {
         validate_cfg(function)?;
     }
@@ -449,13 +510,17 @@ fn generate_c_source_with_frames_bounded(
          #elif defined(__GNUC__) || defined(__clang__)\n__attribute__((dllimport)) unsigned long long __attribute__((stdcall)) GetTickCount64(void);\n\
          #else\nunsigned long long GetTickCount64(void);\n#endif\n\
          #endif\n\n\
+         static int ku_output_stream_write(FILE*, const void*, size_t);\n\
+         static int ku_output_write(const void*, size_t);\n\
+         static int ku_output_printf(const char*, ...);\n\
+         static int ku_output_flush(void);\n\
          typedef struct KuString {\n  uint8_t* ptr;\n  size_t len;\n  size_t capacity;\n  uint8_t storage;\n} KuString;\n\
          enum { KU_STRING_STATIC = 0, KU_STRING_OWNED = 1 };\n\
          static KuString ku_string_static(const uint8_t* ptr, size_t len) {\n  return (KuString){ (uint8_t*)ptr, len, 0, KU_STRING_STATIC };\n}\n\
          static KuString ku_string_clone(KuString value) {\n  if (value.storage == KU_STRING_STATIC) return value;\n  if (!value.ptr) return (KuString){0};\n  size_t capacity = value.len ? value.len : 1;\n  uint8_t* data = (uint8_t*)malloc(capacity);\n  if (!data) { fprintf(stderr, \"out of memory\\n\"); exit(1); }\n  if (value.len) memcpy(data, value.ptr, value.len);\n  return (KuString){ data, value.len, capacity, KU_STRING_OWNED };\n}\n\
          static KuString ku_string_move(KuString* value) {\n  KuString moved = *value;\n  *value = (KuString){0};\n  return moved;\n}\n\
          static void ku_string_drop(KuString* value) {\n  if (!value) return;\n  if (value->storage == KU_STRING_OWNED && value->ptr) free(value->ptr);\n  *value = (KuString){0};\n}\n\
-         static void ku_string_write(FILE* stream, KuString value) {\n  if (!stream || !value.ptr || value.len == 0) return;\n  size_t offset = 0;\n  while (offset < value.len) {\n    size_t written = fwrite(value.ptr + offset, 1, value.len - offset, stream);\n    if (written == 0) {\n      if (stream != stderr) fputs(\"output write failed\\n\", stderr);\n      exit(1);\n    }\n    offset += written;\n  }\n}\n\
+         static void ku_string_write(FILE* stream, KuString value) {\n  if (!stream || !value.ptr || value.len == 0) return;\n  if (stream == stdout || stream == stderr) { if (ku_output_stream_write(stream, value.ptr, value.len) < 0) exit(1); return; }\n  size_t offset = 0;\n  while (offset < value.len) {\n    size_t written = fwrite(value.ptr + offset, 1, value.len - offset, stream);\n    if (written == 0) {\n      if (stream != stderr) fputs(\"output write failed\\n\", stderr);\n      exit(1);\n    }\n    offset += written;\n  }\n}\n\
          static size_t ku_size_add(size_t left, size_t right, const char* what) {\n  if (right > SIZE_MAX - left) { fprintf(stderr, \"%s is too large\\n\", what); exit(1); }\n  return left + right;\n}\n\
          static size_t ku_size_mul(size_t left, size_t right, const char* what) {\n  if (left != 0 && right > SIZE_MAX / left) { fprintf(stderr, \"%s is too large\\n\", what); exit(1); }\n  return left * right;\n}\n\
          static size_t ku_collection_capacity(size_t current, size_t required, size_t element_size, const char* what) {\n  size_t limit = SIZE_MAX / element_size;\n  if (required > limit || current > limit) { fprintf(stderr, \"%s is too large\\n\", what); exit(1); }\n  size_t capacity = current ? current : (limit < 8 ? limit : 8);\n  while (capacity < required) capacity = capacity > limit / 2 ? limit : capacity * 2;\n  return capacity;\n}\n\
@@ -490,7 +555,7 @@ fn generate_c_source_with_frames_bounded(
          static int64_t ku_time_value_millis(KuTime value) {\n  ku_time_validate(value);\n  return value.millis;\n}\n\
          static bool ku_time_equal(KuTime left, KuTime right) {\n  ku_time_validate(left);\n  ku_time_validate(right);\n  return left.millis == right.millis;\n}\n\
          static int64_t ku_time_elapsed(KuTime previous) {\n  ku_time_validate(previous);\n  int64_t now = ku_time_now_millis();\n  if ((previous.millis > 0 && now < INT64_MIN + previous.millis) ||\n      (previous.millis < 0 && now > INT64_MAX + previous.millis)) {\n    ku_time_fail(\"time.elapsed: elapsed milliseconds overflow\");\n  }\n  return now - previous.millis;\n}\n\
-         static void ku_time_print(KuTime value) {\n  ku_time_validate(value);\n  printf(\"{ kind: time.time, millis: %lld }\", (long long)value.millis);\n}\n\n",
+         static void ku_time_print(KuTime value) {\n  ku_time_validate(value);\n  ku_output_printf(\"{ kind: time.time, millis: %lld }\", (long long)value.millis);\n}\n\n",
     );
     out.check()?;
     // Socket headers shared by the native HTTP and Redis runtimes. `winsock2.h`
@@ -540,6 +605,7 @@ fn generate_c_source_with_frames_bounded(
         );
     }
     emit_fs_headers(&mut out, fs_usage);
+    service_output::emit(&mut out, program_uses_http(program));
     // Call-depth guard: match the interpreter's MAX_CALL_DEPTH so deep/infinite
     // recursion reports "maximum function call depth exceeded" instead of a
     // native stack-overflow crash. Counted at every function/closure-body entry
@@ -581,13 +647,37 @@ fn generate_c_source_with_frames_bounded(
          \x20 __ku_handler_cleanup_deadline = 0;\n\
          \x20 __ku_handler_deadline = (~0ULL - now < timeout_ms) ? ~0ULL : now + timeout_ms;\n\
          }\n\
-         static int __ku_handler_timeout_poll(void) {\n\
-         \x20 if (!__ku_handler_timed_out && __ku_handler_deadline == 0) return 0;\n\
+         #if defined(_MSC_VER)\n\
+         #define KU_HANDLER_NOINLINE __declspec(noinline)\n\
+         #elif defined(__GNUC__) || defined(__clang__)\n\
+         #define KU_HANDLER_NOINLINE __attribute__((noinline))\n\
+         #else\n#define KU_HANDLER_NOINLINE\n#endif\n\
+         #if defined(__APPLE__)\n\
+         /* Retain TLS addresses across loop polls, never the values or sampled time. */\n\
+         static KU_HANDLER_NOINLINE int __ku_handler_timeout_poll_active(unsigned long long* deadline, int* timed_out) {\n\
+         \x20 unsigned long long now = __ku_handler_now_ms();\n\
+         \x20 if (!*timed_out && *deadline != 0 && now >= *deadline) *timed_out = 1;\n\
+         \x20 if (!*timed_out) return 0;\n\
+         \x20 if (__ku_handler_unwind_depth == 0) return 1;\n\
+         \x20 return __ku_handler_cleanup_deadline != 0 && now >= __ku_handler_cleanup_deadline;\n\
+         }\n\
+         #else\n\
+         static KU_HANDLER_NOINLINE int __ku_handler_timeout_poll_active(void) {\n\
          \x20 unsigned long long now = __ku_handler_now_ms();\n\
          \x20 if (!__ku_handler_timed_out && __ku_handler_deadline != 0 && now >= __ku_handler_deadline) __ku_handler_timed_out = 1;\n\
          \x20 if (!__ku_handler_timed_out) return 0;\n\
          \x20 if (__ku_handler_unwind_depth == 0) return 1;\n\
          \x20 return __ku_handler_cleanup_deadline != 0 && now >= __ku_handler_cleanup_deadline;\n\
+         }\n\
+         #endif\n\
+         #undef KU_HANDLER_NOINLINE\n\
+         static inline int __ku_handler_timeout_poll(void) {\n\
+         \x20 if (!__ku_handler_timed_out && __ku_handler_deadline == 0) return 0;\n\
+         #if defined(__APPLE__)\n\
+         \x20 return __ku_handler_timeout_poll_active(&__ku_handler_deadline, &__ku_handler_timed_out);\n\
+         #else\n\
+         \x20 return __ku_handler_timeout_poll_active();\n\
+         #endif\n\
          }\n\
          static void __ku_handler_timeout_enter(void) {\n\
          \x20 if (__ku_handler_cleanup_deadline == 0) {\n\
@@ -668,7 +758,7 @@ fn generate_c_source_with_frames_bounded(
     emit_object_abi(
         &mut out,
         program,
-        task_net,
+        task_net || task_json,
         options.object_oom_fault_injection,
     )?;
     // Object-valued typed arrays need KuObject/KuValue to be complete before
@@ -707,7 +797,7 @@ fn generate_c_source_with_frames_bounded(
     emit_string_slice_helper(&mut out, program)?;
     emit_object_result_helpers(&mut out, program)?;
     emit_closure_value_wrappers(&mut out, program)?;
-    if program_uses_object(program) {
+    if program_uses_object(program) || task_json {
         // JSON returns Result<str> and its typed writers borrow fully-defined
         // arrays/closures/results. Keep it after all of those ABI phases rather
         // than defining functions over incomplete forward declarations.
@@ -719,6 +809,55 @@ fn generate_c_source_with_frames_bounded(
     emit_array_map_helpers(&mut out, program)?;
     emit_function_prototypes(&mut out, program)?;
     emit_closure_thunk_prototypes(&mut out, program)?;
+    if program_uses_pg(program) || program_uses_mysql(program) || program_uses_redis(program) {
+        database_budget::emit(&mut out);
+    }
+    if program_uses_http(program) || frames.is_some() {
+        out.push_str(include_str!("c_runtime_config.c"));
+    }
+    if program_uses_http(program) {
+        if let Some((tasks, _, None)) = frames {
+            out.push_str("#define KU_HTTP_HAS_TASK_RUNTIME 1\n");
+            if task::uses_blocking_net(tasks) {
+                out.push_str(include_str!("c_task_reactor.h"));
+                out.push_str("#define KU_HTTP_HAS_TASK_NET 1\nstatic size_t ku_http_task_net_interests(void*,size_t,KuTaskNetPollV1*,size_t,uint64_t*);\nstatic uint32_t ku_http_task_net_dispatch(void*,size_t,size_t,uint64_t,uint32_t);\n");
+            }
+
+            out.push_str("static void* ku_http_task_runtime_new(size_t,size_t,size_t,void*,void(*)(void*,size_t),uint64_t);\nstatic uint32_t ku_http_task_pump(void*,size_t,size_t,uint64_t*);\nstatic uint32_t ku_http_task_runtime_close(void*,uint64_t);\nstatic uint32_t ku_http_task_runtime_free(void*,uint64_t);\nstatic size_t ku_http_task_blocking_threads(size_t);\nstatic uint32_t ku_http_task_poll(void*,void**,int,uint64_t,KuStruct___ku_http_response*,size_t*);\nstatic void ku_http_task_metrics(void*,size_t,uint64_t*);\nstatic void ku_http_task_blocking_metrics(void*,uint64_t*);\nstatic int ku_http_task_owner_exited(void*,size_t);\n");
+            let handlers = tasks.functions.iter().filter(|function| matches!(&function.result,
+                IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_http_response")))
+                .filter(|function| task_http::is_handler(function))
+                .collect::<Vec<_>>();
+            for function in &handlers {
+                out.push_str(&format!("static uint32_t ku_http_task_start_{}(void*,size_t,void*,uint64_t,KuStruct___ku_http_request*,void**);\n",function.id.0));
+            }
+            out.push_str("static void* ku_http_async_factory(void* invoke) {\n");
+            let thunk_targets = closure_thunk_targets(program);
+            for function in handlers {
+                if let Some(setup) = program
+                    .functions
+                    .iter()
+                    .find(|setup| setup.name == function.name)
+                {
+                    // An unregistered source handler has a Task frame, but no
+                    // MakeClosure and therefore no emitted signature thunk.
+                    // Factory lookup must only reference symbols emitted above.
+                    if !setup.is_closure_body
+                        && !thunk_targets.iter().any(|target| target.id == setup.id)
+                    {
+                        continue;
+                    }
+                    let invoke = closure_invoke_symbol(setup.id)
+                        .ok_or_else(|| unsupported("missing async handler signature thunk"))?;
+                    out.push_str(&format!(
+                        "  if (invoke == (void*){invoke}) return (void*)ku_http_task_start_{};\n",
+                        function.id.0
+                    ));
+                }
+            }
+            out.push_str("  return NULL;\n}\n");
+        }
+    }
     emit_http_runtime(&mut out, program)?;
     emit_pg_runtime(&mut out, program);
     emit_redis_runtime(&mut out, program);
@@ -729,8 +868,16 @@ fn generate_c_source_with_frames_bounded(
         out.push('\n');
     }
     emit_closure_thunks(&mut out, program)?;
-    if let Some((frames, plan, _)) = frames {
-        task::emit_frames(&mut out, frames, plan)?;
+    if let Some((frames, plan, entry)) = frames {
+        task::emit_frames(
+            &mut out,
+            frames,
+            plan,
+            entry.is_some() || program_uses_http(program),
+        )?;
+        if program_uses_http(program) {
+            task_http::emit(&mut out, frames, program)?;
+        }
     }
     if let Some((frames, _, Some(entry))) = frames {
         task_root::emit(&mut out, frames, entry)?;
@@ -2569,7 +2716,7 @@ fn emit_statement_intrinsic(out: &mut COutput, value: &IrExpr) -> KuResult<bool>
                 .first()
                 .ok_or_else(|| unsupported("println requires one argument"))?;
             emit_print(out, value)?;
-            out.push_str("  printf(\"\\n\");\n  fflush(stdout);\n");
+            out.push_str("  ku_output_printf(\"\\n\");\n  ku_output_flush();\n");
             Ok(true)
         }
         _ => Ok(false),
@@ -2581,13 +2728,13 @@ fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
     match value.ty {
         IrType::Int => {
             out.push_str(&format!(
-                "  printf(\"%lld\", (long long){});\n  fflush(stdout);\n",
+                "  ku_output_printf(\"%lld\", (long long){});\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
         IrType::Float => {
             out.push_str(&format!(
-                "  printf(\"%.17g\", (double){});\n  fflush(stdout);\n",
+                "  ku_output_printf(\"%.17g\", (double){});\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
@@ -2595,7 +2742,7 @@ fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
         // numeric `1`/`0` that `%lld` would produce.
         IrType::Bool => {
             out.push_str(&format!(
-                "  printf(\"%s\", ({}) ? \"true\" : \"false\");\n  fflush(stdout);\n",
+                "  ku_output_printf(\"%s\", ({}) ? \"true\" : \"false\");\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
@@ -2603,19 +2750,19 @@ fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
             // Evaluate the argument ONCE: a second evaluation would re-run any side
             // effect (e.g. a move-and-clear projection) and read a cleared string.
             out.push_str(&format!(
-                "  {{ KuString __ku_p = {}; ku_string_write(stdout, __ku_p); }}\n  fflush(stdout);\n",
+                "  {{ KuString __ku_p = {}; ku_string_write(stdout, __ku_p); }}\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
         IrType::Named(ref name) if name == "__ku_value" => {
             out.push_str(&format!(
-                "  ku_value_print({});\n  fflush(stdout);\n",
+                "  ku_value_print({});\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
         IrType::Named(ref name) if name == "__ku_time" => {
             out.push_str(&format!(
-                "  ku_time_print({});\n  fflush(stdout);\n",
+                "  ku_time_print({});\n  ku_output_flush();\n",
                 c_expr(value)?
             ));
         }
@@ -2844,7 +2991,7 @@ fn emit_terminator(
             // Take once before a finally/helper can run. An old frame-local
             // suppressed failure must not poison healthy cleanup calls.
             out.push_str(&format!(
-                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
+                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL || __ku_observed.kind == KU_SYNC_EXIT_HTTP_JSON_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
                 cleanup_block.0, continue_block.0,
             ));
             out.check()
@@ -3513,6 +3660,7 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         // pg opaque handles are the raw libpq pointers; NULL means moved-out/closed.
         IrType::Named(name) if name == "__ku_pg_result" => Ok("KuPgResult*".to_string()),
         IrType::Named(name) if name == "__ku_pg_client" => Ok("KuPgClient*".to_string()),
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok("KuTaskPgCapture".to_string()),
         IrType::Named(name) if name == "__ku_redis_client" => Ok("KuRedisClient*".to_string()),
         IrType::Named(name) if name == "__ku_bytes" => Ok("KuBytes".to_string()),
         IrType::Named(name) if name == "__ku_net_client" => Ok("KuNetClient*".to_string()),
@@ -3648,6 +3796,7 @@ fn emit_result_abi_phase(
         // accessors, even when the source only calls the legacy `value` helper.
         forced.push(IrType::Str);
         forced.push(IrType::Bool);
+        forced.push(IrType::Int);
     }
     if program_uses_pg_client(program) {
         forced.push(IrType::Named("__ku_pg_client".to_string()));
@@ -4309,14 +4458,14 @@ static KuValue ku_value_clone(KuValue value) {
 
 static void ku_value_print(KuValue value) {
   switch (value.tag) {
-    case KU_INT: printf("%lld", (long long)value.as.i); break;
-    case KU_FLOAT: printf("%.17g", value.as.f); break;
-    case KU_BOOL: printf("%s", value.as.b ? "true" : "false"); break;
+    case KU_INT: ku_output_printf("%lld", (long long)value.as.i); break;
+    case KU_FLOAT: ku_output_printf("%.17g", value.as.f); break;
+    case KU_BOOL: ku_output_printf("%s", value.as.b ? "true" : "false"); break;
     case KU_STR: ku_string_write(stdout, value.as.s); break;
-    case KU_OBJECT: printf("[object]"); break;
-    case KU_ARRAY: printf("[array]"); break;
-    case KU_FUNCTION: printf("<function>"); break;
-    default: printf("null"); break;
+    case KU_OBJECT: ku_output_printf("[object]"); break;
+    case KU_ARRAY: ku_output_printf("[array]"); break;
+    case KU_FUNCTION: ku_output_printf("<function>"); break;
+    default: ku_output_printf("null"); break;
   }
 }
 
@@ -4639,6 +4788,30 @@ static KuResult_kuvalue ku_object_get_result(KuObject* object, KuString key) {
       ku_string_static((const uint8_t*)"object", 6),
       ku_string_static((const uint8_t*)"missing_key", 11),
       message) };
+}
+
+/* Consume only the explicit take() receiver. Ordinary obj[key] keeps its
+ * independent-owned clone contract. The moved slot remains a valid null entry
+ * until the rest of the consumed object is dropped; no hash deletion is needed. */
+static KuResult_kuvalue ku_value_take_result(KuValue value, KuString key) {
+  if (value.tag != KU_OBJECT) {
+    ku_value_drop(&value);
+    return (KuResult_kuvalue){ false, ku_v_null(), ku_error_make(
+        ku_string_static((const uint8_t*)"object", 6),
+        ku_string_static((const uint8_t*)"type_unsupported", 16),
+        ku_string_static((const uint8_t*)"expected object value", 21)) };
+  }
+  KuValue* found = ku_object_get(value.as.o, key);
+  if (found) {
+    KuValue moved = ku_value_move(found);
+    ku_value_drop(&value);
+    return (KuResult_kuvalue){ true, moved, (KuError){0} };
+  }
+  /* Build the existing missing-key error before releasing the owner, including
+   * its fallible message allocation. Never clone a present subtree here. */
+  KuResult_kuvalue result = ku_object_get_result(value.as.o, key);
+  ku_value_drop(&value);
+  return result;
 }
 
 static KuResult_int ku_value_as_int(KuValue value) {
@@ -5706,27 +5879,39 @@ static bool ku_json_parse_string(
       ku_json_buffer_drop(&buffer);
       return ku_json_fail(error, "parse_error", "control character in json string");
     }
-    if (byte < 0x80) {
-      if (!ku_json_buffer_byte(&buffer, byte, KU_JSON_MAX_INPUT_BYTES,
-              error, "json string is too large")) {
-        ku_json_buffer_drop(&buffer);
-        return false;
-      }
-      continue;
-    }
+    /* Copy one ordinary span, validating each UTF-8 scalar before extending
+       it. Quotes, escapes and C0 retain their original per-byte paths. */
     parser->current--;
-    size_t width = 0;
-    uint32_t scalar = 0;
-    if (!ku_json_utf8_scalar(parser->current, parser->end, &width, &scalar)) {
-      ku_json_buffer_drop(&buffer);
-      return ku_json_fail(error, "parse_error", "invalid utf-8 in json string");
+    const uint8_t* start = parser->current;
+    const uint8_t* end = parser->end;
+    while (parser->current < end) {
+      uint8_t next = *parser->current;
+      if (next < 0x20 || next == '"' || next == '\\') break;
+      if (next < 0x80) {
+        parser->current++;
+        continue;
+      }
+      size_t width = 0;
+      uint32_t scalar = 0;
+      if (!ku_json_utf8_scalar(parser->current, end, &width, &scalar)) {
+        /* An allocation failure in the earlier valid prefix must still win
+           over this later syntax error, whose byte position stays unchanged. */
+        if (parser->current != start && !ku_json_buffer_append(&buffer, start,
+                (size_t)(parser->current - start), KU_JSON_MAX_INPUT_BYTES,
+                error, "json string is too large")) {
+          ku_json_buffer_drop(&buffer);
+          return false;
+        }
+        ku_json_buffer_drop(&buffer);
+        return ku_json_fail(error, "parse_error", "invalid utf-8 in json string");
+      }
+      parser->current += width;
     }
-    if (!ku_json_buffer_append(&buffer, parser->current, width,
+    if (!ku_json_buffer_append(&buffer, start, (size_t)(parser->current - start),
             KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
       ku_json_buffer_drop(&buffer);
       return false;
     }
-    parser->current += width;
   }
   ku_json_buffer_drop(&buffer);
   return ku_json_fail(error, "parse_error", "unterminated json string");
@@ -6065,30 +6250,49 @@ static bool ku_json_write_string(
   if (!ku_json_write_byte(output, '"', error)) return false;
   const uint8_t* current = string.ptr ? string.ptr : (const uint8_t*)"";
   const uint8_t* end = current + string.len;
+  const uint8_t* span = current;
   while (current < end) {
-    size_t width = 0;
-    uint32_t scalar = 0;
-    if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
-      return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+    uint8_t byte = *current;
+    if (byte >= 0x20 && byte != '"' && byte != '\\') {
+      if (byte < 0x80) current++;
+      else {
+        size_t width = 0;
+        uint32_t scalar = 0;
+        if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
+          return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+        }
+        current += width;
+      }
+      /* Preserve the output bound before inspecting any following byte; a
+         long valid prefix cannot bypass the old size error with a later invalid
+         UTF-8 sequence. No borrowed bytes escape this synchronous writer. */
+      if ((size_t)(current-span) > KU_JSON_MAX_OUTPUT_BYTES-output->len)
+        return ku_json_fail(error, "stringify_error", "json.stringify output is too large");
+      continue;
     }
-    if (scalar == '"' || scalar == '\\') {
-      uint8_t escaped[2] = { '\\', (uint8_t)scalar };
+    if (current != span && !ku_json_buffer_append(output, span,
+          (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
+          "json.stringify output is too large")) return false;
+    if (byte == '"' || byte == '\\') {
+      uint8_t escaped[2] = { '\\', byte };
       if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
               error, "json.stringify output is too large")) return false;
-    } else if (scalar == '\n' || scalar == '\r' || scalar == '\t') {
-      uint8_t escaped[2] = { '\\', scalar == '\n' ? 'n' : (scalar == '\r' ? 'r' : 't') };
+    } else if (byte == '\n' || byte == '\r' || byte == '\t') {
+      uint8_t escaped[2] = { '\\', byte == '\n' ? 'n' : (byte == '\r' ? 'r' : 't') };
       if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
               error, "json.stringify output is too large")) return false;
-    } else if (scalar < 0x20) {
-      char escaped[7];
-      int len = snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)scalar);
-      if (len != 6 || !ku_json_write_bytes(output, escaped, 6, error)) return false;
-    } else if (!ku_json_buffer_append(output, current, width, KU_JSON_MAX_OUTPUT_BYTES,
-                   error, "json.stringify output is too large")) {
-      return false;
+    } else {
+      static const uint8_t hex[] = "0123456789abcdef";
+      uint8_t escaped[6] = { '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15] };
+      if (!ku_json_buffer_append(output, escaped, sizeof(escaped), KU_JSON_MAX_OUTPUT_BYTES,
+              error, "json.stringify output is too large")) return false;
     }
-    current += width;
+    current++;
+    span=current;
   }
+  if (current != span && !ku_json_buffer_append(output, span,
+        (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
+        "json.stringify output is too large")) return false;
   return ku_json_write_byte(output, '"', error);
 }
 
@@ -6103,7 +6307,11 @@ static bool ku_json_write_object(
   if (count > SIZE_MAX / sizeof(KuEntry*)) {
     return ku_json_fail(error, "stringify_error", "json object is too large");
   }
-  KuEntry** entries = (KuEntry**)malloc(count * sizeof(KuEntry*));
+  /* Bounded small-object scratch avoids one allocation at each common JSON
+   * object. Deep traversal is still limited by KU_JSON_MAX_DEPTH. */
+  KuEntry* local_entries[8];
+  KuEntry** entries = count <= 8 ? local_entries
+      : (KuEntry**)malloc(count * sizeof(KuEntry*));
   if (!entries) return ku_json_fail(error, "out_of_memory", "json allocation failed");
   size_t found = 0;
   for (size_t index = 0; index < object->cap && found < count; index++) {
@@ -6116,11 +6324,11 @@ static bool ku_json_write_object(
         && ku_json_write_byte(output, ':', error)
         && ku_json_write_value(output, entries[index]->value, depth + 1, error);
     if (!ok) {
-      free(entries);
+      if (entries != local_entries) free(entries);
       return false;
     }
   }
-  free(entries);
+  if (entries != local_entries) free(entries);
   return ku_json_write_byte(output, '}', error);
 }
 
@@ -6151,9 +6359,19 @@ static bool ku_json_write_value(
     case KU_NULL:
       return ku_json_write_bytes(output, "null", 4, error);
     case KU_INT: {
-      int len = snprintf(number, sizeof(number), "%lld", (long long)value.as.i);
-      return len > 0 && (size_t)len < sizeof(number)
-          && ku_json_write_bytes(output, number, (size_t)len, error);
+      /* At most 19 magnitude digits and one sign. Unsigned subtraction keeps
+         INT64_MIN representable without signed negation or extra allocation. */
+      char digits[20];
+      size_t start = sizeof(digits);
+      uint64_t magnitude = (uint64_t)value.as.i;
+      bool negative = value.as.i < 0;
+      if (negative) magnitude = UINT64_C(0) - magnitude;
+      do {
+        digits[--start] = (char)('0' + magnitude % UINT64_C(10));
+        magnitude /= UINT64_C(10);
+      } while (magnitude != 0);
+      if (negative) digits[--start] = '-';
+      return ku_json_write_bytes(output, digits + start, sizeof(digits) - start, error);
     }
     case KU_FLOAT: {
       if (!isfinite(value.as.f)) {
@@ -7805,6 +8023,7 @@ struct KuMysqlClient {
   bool sync_ready;
   bool connect_in_flight;
   bool backoff_timer_armed;
+  KuDatabaseReservation budget;
 };
 
 typedef struct {
@@ -7982,6 +8201,7 @@ static KuError ku_mysql_error(const char* code, const char* message) {
 }
 
 static KuError ku_mysql_execution_unknown_error(void) {
+  ku_database_budget_record_unknown();
   return ku_mysql_error(
       "execution_unknown",
       "MySQL statement may have executed; outcome is unknown; never retry automatically");
@@ -8419,6 +8639,7 @@ static void ku_mysql_client_free_fields(KuMysqlClient* client) {
   client->password_len = 0;
   client->database = NULL;
   client->slots = NULL;
+  ku_database_budget_release(&client->budget);
 }
 
 static void ku_mysql_close_connections(KuMysqlClient* client) {
@@ -8653,6 +8874,11 @@ static KuResult_mysql_client ku_mysql_client_new(KuObject* config) {
       false, NULL,
       ku_mysql_error("out_of_memory", "MySQL client allocation failed")
     };
+  }
+  if (!ku_database_budget_reserve(&client->budget, max_connections, max_waiters)) {
+    ku_mysql_free(client);
+    return (KuResult_mysql_client){false, NULL,
+        ku_mysql_error("resource_limit", "database process connection/waiter budget exhausted or invalid")};
   }
   client->port = port;
   client->max_connections = max_connections;
@@ -9616,18 +9842,10 @@ static KuMysqlResult* ku_mysql_fetch_result(
   return result;
 }
 
-static KuResult_mysql_result ku_mysql_client_query(
-    KuMysqlClient* client, KuString sql, KuArray_str params) {
+static KuResult_mysql_result ku_mysql_client_query_impl(
+    KuMysqlClient* client, KuString sql, KuArray_str params,
+    unsigned long long deadline) {
   KuError error = (KuError){0};
-  if (!client) {
-    return (KuResult_mysql_result){
-      false, NULL, ku_mysql_error("client_closed", "MySQL client is closed")
-    };
-  }
-  unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
-  if (!ku_mysql_validate_statement_input(sql, params, &error, deadline)) {
-    return (KuResult_mysql_result){ false, NULL, error };
-  }
   if (!ku_mysql_thread_enter()) {
     return (KuResult_mysql_result){
       false, NULL,
@@ -9669,18 +9887,33 @@ static KuResult_mysql_result ku_mysql_client_query(
   return (KuResult_mysql_result){ true, result, (KuError){0} };
 }
 
-static KuResult_int ku_mysql_client_execute(
+static KuResult_mysql_result ku_mysql_client_query(
     KuMysqlClient* client, KuString sql, KuArray_str params) {
   KuError error = (KuError){0};
   if (!client) {
-    return (KuResult_int){
-      false, 0, ku_mysql_error("client_closed", "MySQL client is closed")
+    return (KuResult_mysql_result){
+      false, NULL, ku_mysql_error("client_closed", "MySQL client is closed")
     };
   }
   unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
   if (!ku_mysql_validate_statement_input(sql, params, &error, deadline)) {
-    return (KuResult_int){ false, 0, error };
+    return (KuResult_mysql_result){ false, NULL, error };
   }
+  size_t input_bytes = sql.len + params.len * sizeof(KuString);
+  for (size_t index = 0; index < params.len; index++) input_bytes += params.data[index].len;
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(input_bytes, &operation_charge))
+    return (KuResult_mysql_result){false, NULL, ku_mysql_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
+  KuResult_mysql_result result = ku_mysql_client_query_impl(client, sql, params, deadline);
+  ku_database_operation_end(operation_charge);
+  return result;
+}
+
+static KuResult_int ku_mysql_client_execute_impl(
+    KuMysqlClient* client, KuString sql, KuArray_str params,
+    unsigned long long deadline) {
+  KuError error = (KuError){0};
   if (!ku_mysql_thread_enter()) {
     return (KuResult_int){
       false, 0,
@@ -9738,6 +9971,29 @@ static KuResult_int ku_mysql_client_execute(
   ku_mysql_thread_leave();
   if (!ok) return (KuResult_int){ false, 0, error };
   return (KuResult_int){ true, affected, (KuError){0} };
+}
+
+static KuResult_int ku_mysql_client_execute(
+    KuMysqlClient* client, KuString sql, KuArray_str params) {
+  KuError error = (KuError){0};
+  if (!client) {
+    return (KuResult_int){
+      false, 0, ku_mysql_error("client_closed", "MySQL client is closed")
+    };
+  }
+  unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
+  if (!ku_mysql_validate_statement_input(sql, params, &error, deadline)) {
+    return (KuResult_int){ false, 0, error };
+  }
+  size_t input_bytes = sql.len + params.len * sizeof(KuString);
+  for (size_t index = 0; index < params.len; index++) input_bytes += params.data[index].len;
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(input_bytes, &operation_charge))
+    return (KuResult_int){false, 0, ku_mysql_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
+  KuResult_int result = ku_mysql_client_execute_impl(client, sql, params, deadline);
+  ku_database_operation_end(operation_charge);
+  return result;
 }
 
 static int64_t ku_mysql_result_rows(KuMysqlResult* result) {
@@ -11704,6 +11960,7 @@ struct KuRedisClient {
   uint8_t finalizing;
   uint8_t connect_in_flight;
   uint8_t backoff_timer_armed;
+  KuDatabaseReservation budget;
 };
 
 typedef struct {
@@ -13128,6 +13385,7 @@ static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_rea
   ku_string_drop(&client->host);
   ku_string_drop(&client->username);
   ku_string_drop(&client->password);
+  ku_database_budget_release(&client->budget);
   free(client);
 }
 
@@ -13211,6 +13469,11 @@ static KuResult_redis_client ku_redis_client(KuObject* config) {
   if (!client)
     return (KuResult_redis_client){ false, NULL, ku_redis_out_of_memory_err() };
   memset(client, 0, sizeof(*client));
+  if (!ku_database_budget_reserve(&client->budget, max_connections, max_waiters)) {
+    free(client);
+    return (KuResult_redis_client){false, NULL,
+        ku_redis_static_error("resource_limit", "database process connection/waiter budget exhausted or invalid")};
+  }
   client->port = (int64_t)port;
   client->max_connections = max_connections;
   client->max_waiters = max_waiters;
@@ -13437,10 +13700,15 @@ static KuResult_null ku_redis_ping(KuRedisClient* client) {
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_null){ false, 0, ku_redis_command_timeout_err() };
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(0, &operation_charge))
+    return (KuResult_null){false, 0, ku_redis_static_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
   KuRedisLeaseResult lease = ku_redis_client_acquire(client, deadline);
-  if (!lease.ok) return (KuResult_null){ false, 0, lease.error };
+  if (!lease.ok) { ku_database_operation_end(operation_charge); return (KuResult_null){ false, 0, lease.error }; }
   KuResult_null result = ku_redis_connection_ping(lease.value, deadline);
   ku_redis_client_release(client, lease.value);
+  ku_database_operation_end(operation_charge);
   return result;
 }
 
@@ -13449,10 +13717,15 @@ static KuResult_null ku_redis_set(KuRedisClient* client, KuString key, KuString 
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_null){ false, 0, ku_redis_command_timeout_err() };
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(key.len > SIZE_MAX - value.len ? SIZE_MAX : key.len + value.len, &operation_charge))
+    return (KuResult_null){false, 0, ku_redis_static_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
   KuRedisLeaseResult lease = ku_redis_client_acquire(client, deadline);
-  if (!lease.ok) return (KuResult_null){ false, 0, lease.error };
+  if (!lease.ok) { ku_database_operation_end(operation_charge); return (KuResult_null){ false, 0, lease.error }; }
   KuResult_null result = ku_redis_connection_set(lease.value, key, value, deadline);
   ku_redis_client_release(client, lease.value);
+  ku_database_operation_end(operation_charge);
   return result;
 }
 
@@ -13462,10 +13735,15 @@ static KuResult_str ku_redis_get(KuRedisClient* client, KuString key) {
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_str){ false, (KuString){0}, ku_redis_command_timeout_err() };
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(key.len, &operation_charge))
+    return (KuResult_str){false, (KuString){0}, ku_redis_static_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
   KuRedisLeaseResult lease = ku_redis_client_acquire(client, deadline);
-  if (!lease.ok) return (KuResult_str){ false, (KuString){0}, lease.error };
+  if (!lease.ok) { ku_database_operation_end(operation_charge); return (KuResult_str){ false, (KuString){0}, lease.error }; }
   KuResult_str result = ku_redis_connection_get(lease.value, key, deadline);
   ku_redis_client_release(client, lease.value);
+  ku_database_operation_end(operation_charge);
   return result;
 }
 
@@ -13474,10 +13752,15 @@ static KuResult_int ku_redis_del(KuRedisClient* client, KuString key) {
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_int){ false, 0, ku_redis_command_timeout_err() };
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(key.len, &operation_charge))
+    return (KuResult_int){false, 0, ku_redis_static_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
   KuRedisLeaseResult lease = ku_redis_client_acquire(client, deadline);
-  if (!lease.ok) return (KuResult_int){ false, 0, lease.error };
+  if (!lease.ok) { ku_database_operation_end(operation_charge); return (KuResult_int){ false, 0, lease.error }; }
   KuResult_int result = ku_redis_connection_del(lease.value, key, deadline);
   ku_redis_client_release(client, lease.value);
+  ku_database_operation_end(operation_charge);
   return result;
 }
 
@@ -13486,10 +13769,15 @@ static KuResult_bool ku_redis_exists(KuRedisClient* client, KuString key) {
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_bool){ false, false, ku_redis_command_timeout_err() };
+  size_t operation_charge = 0;
+  if (!ku_database_operation_begin(key.len, &operation_charge))
+    return (KuResult_bool){false, false, ku_redis_static_error("resource_limit",
+        "database pending input byte budget exhausted or invalid")};
   KuRedisLeaseResult lease = ku_redis_client_acquire(client, deadline);
-  if (!lease.ok) return (KuResult_bool){ false, false, lease.error };
+  if (!lease.ok) { ku_database_operation_end(operation_charge); return (KuResult_bool){ false, false, lease.error }; }
   KuResult_bool result = ku_redis_connection_exists(lease.value, key, deadline);
   ku_redis_client_release(client, lease.value);
+  ku_database_operation_end(operation_charge);
   return result;
 }
 
@@ -13590,6 +13878,7 @@ fn emit_pg_types(out: &mut COutput, program: &IrProgram) {
         "static void ku_drop_pg_client(KuPgClient** p);\n",
         "static KuPgClient* ku_clone_pg_client(KuPgClient* c);\n\n",
     ));
+    out.push_str(include_str!("c_pg_diagnostics.c"));
 }
 
 /// Emit the `pg` (thin libpq binding) runtime: `PQ*` prototypes, the
@@ -13615,6 +13904,12 @@ fn emit_pg_runtime(out: &mut COutput, program: &IrProgram) {
         "extern int PQsetnonblocking(PGconn*, int);\n",
         "extern const char* PQparameterStatus(const PGconn*, const char*);\n",
         "extern void PQfinish(PGconn*);\n",
+        "typedef struct pg_cancel PGcancel;\n",
+        "extern PGcancel* PQgetCancel(PGconn*);\n",
+        "extern int PQsslInUse(PGconn*);\n",
+        "extern int PQisthreadsafe(void);\n",
+        "extern int PQcancel(PGcancel*, char*, int);\n",
+        "extern void PQfreeCancel(PGcancel*);\n",
         "extern int PQsendQuery(PGconn*, const char*);\n",
         "extern int PQsendQueryParams(PGconn*, const char*, int, const void*, const char* const*, const int*, const int*, int);\n",
         "extern int PQsetSingleRowMode(PGconn*);\n",
@@ -14101,9 +14396,121 @@ static int ku_pg_sql_has_explicit_session_control(
    close/PQfinish, makes any ambiguous raw connection incapable of sending more
    SQL without invalidating the owner's pointer or double-closing a recycled fd.
    No timeout path retries SQL or claims that the server rolled it back. */
+/* Optional PG17+ cancellation preserves the connection's TLS requirements.
+   Older supported libpq releases lack these entry points. Never send the old
+   unencrypted cancellation packet for an encrypted original connection. */
+typedef struct pg_cancel_conn PGcancelConn;
+typedef PGcancelConn* (*KuPgCancelCreate)(PGconn*);
+typedef int (*KuPgCancelStart)(PGcancelConn*);
+typedef int (*KuPgCancelPoll)(PGcancelConn*);
+typedef int (*KuPgCancelSocket)(const PGcancelConn*);
+typedef void (*KuPgCancelFinish)(PGcancelConn*);
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#elif !defined(_WIN32)
+#define KU_PG_OPTIONAL __attribute__((weak))
+extern PGcancelConn* PQcancelCreate(PGconn*) KU_PG_OPTIONAL;
+extern int PQcancelStart(PGcancelConn*) KU_PG_OPTIONAL;
+extern int PQcancelPoll(PGcancelConn*) KU_PG_OPTIONAL;
+extern int PQcancelSocket(const PGcancelConn*) KU_PG_OPTIONAL;
+extern void PQcancelFinish(PGcancelConn*) KU_PG_OPTIONAL;
+extern int PQgssEncInUse(PGconn*) KU_PG_OPTIONAL;
+#endif
+static int ku_pg_send_cancel(PGconn* conn, unsigned long long deadline) {
+#if defined(_WIN32)
+  HMODULE library = GetModuleHandleA("libpq.dll");
+  KuPgCancelCreate create = library ? (KuPgCancelCreate)GetProcAddress(library,"PQcancelCreate") : NULL;
+  KuPgCancelStart start = library ? (KuPgCancelStart)GetProcAddress(library,"PQcancelStart") : NULL;
+  KuPgCancelPoll poll_cancel = library ? (KuPgCancelPoll)GetProcAddress(library,"PQcancelPoll") : NULL;
+  KuPgCancelSocket socket_cancel = library ? (KuPgCancelSocket)GetProcAddress(library,"PQcancelSocket") : NULL;
+  KuPgCancelFinish finish = library ? (KuPgCancelFinish)GetProcAddress(library,"PQcancelFinish") : NULL;
+  typedef int (*KuPgGssInUse)(PGconn*);
+  KuPgGssInUse gss_in_use = library ? (KuPgGssInUse)GetProcAddress(library,"PQgssEncInUse") : NULL;
+  int encrypted = PQsslInUse(conn) || (gss_in_use && gss_in_use(conn));
+#elif defined(__APPLE__)
+  KuPgCancelCreate create=(KuPgCancelCreate)dlsym(RTLD_DEFAULT,"PQcancelCreate");
+  KuPgCancelStart start=(KuPgCancelStart)dlsym(RTLD_DEFAULT,"PQcancelStart");
+  KuPgCancelPoll poll_cancel=(KuPgCancelPoll)dlsym(RTLD_DEFAULT,"PQcancelPoll");
+  KuPgCancelSocket socket_cancel=(KuPgCancelSocket)dlsym(RTLD_DEFAULT,"PQcancelSocket");
+  KuPgCancelFinish finish=(KuPgCancelFinish)dlsym(RTLD_DEFAULT,"PQcancelFinish");
+  typedef int (*KuPgGssInUse)(PGconn*);
+  KuPgGssInUse gss_in_use=(KuPgGssInUse)dlsym(RTLD_DEFAULT,"PQgssEncInUse");
+  int encrypted=PQsslInUse(conn) || (gss_in_use && gss_in_use(conn));
+#else
+  KuPgCancelCreate create=PQcancelCreate;
+  KuPgCancelStart start=PQcancelStart;
+  KuPgCancelPoll poll_cancel=PQcancelPoll;
+  KuPgCancelSocket socket_cancel=PQcancelSocket;
+  KuPgCancelFinish finish=PQcancelFinish;
+  int encrypted=PQsslInUse(conn) || (PQgssEncInUse && PQgssEncInUse(conn));
+#endif
+  if (create && start && poll_cancel && socket_cancel && finish) {
+    if (ku_pg_deadline_expired(deadline)) return 0;
+    PGcancelConn* cancel = create(conn);
+    if (!cancel) return 0;
+    int sent=0;
+    if (start(cancel)) {
+      int direction=KU_PG_WAIT_WRITE;
+      while (!ku_pg_deadline_expired(deadline)) {
+        if (ku_pg_wait_socket(socket_cancel(cancel),direction,deadline)!=1) break;
+        int status=poll_cancel(cancel);
+        if (status==KU_PGRES_POLLING_OK) { sent=1; break; }
+        if (status==KU_PGRES_POLLING_READING) direction=KU_PG_WAIT_READ;
+        else if (status==KU_PGRES_POLLING_WRITING) direction=KU_PG_WAIT_WRITE;
+        else if (status==KU_PGRES_POLLING_ACTIVE) direction=KU_PG_WAIT_ACTIVE;
+        else break;
+      }
+    }
+    finish(cancel);
+    return sent;
+  }
+  if (encrypted || ku_pg_deadline_expired(deadline)) return 0;
+  PGcancel* cancel=PQgetCancel(conn);
+  if (!cancel) return 0;
+  char diagnostic[256]={0};
+  int sent=PQcancel(cancel,diagnostic,(int)sizeof(diagnostic));
+  PQfreeCancel(cancel);
+  ku_pg_wipe_secret(diagnostic,sizeof(diagnostic));
+  return sent;
+}
+/* Cancellation executes only in the bounded handler facility, retaining the
+   lease and input charge. The legacy non-TLS call may itself block and require
+   process retirement. Dispatch is not confirmation: consume the original stream
+   through its terminal null result within a separate cleanup-only budget.
+   No SQL is sent or replayed. Failure connections are always discarded. */
+static void ku_pg_cancel_and_drain(PGconn* conn) {
+  if (!conn || PQstatus(conn) != KU_PG_CONNECTION_OK
+      || PQtransactionStatus(conn) != KU_PQTRANS_ACTIVE) return;
+  unsigned long long now = KU_PG_MONOTONIC_MS();
+  unsigned long long cleanup_deadline = ~0ULL - now < KU_HANDLER_CLEANUP_GRACE_MS
+      ? ~0ULL : now + KU_HANDLER_CLEANUP_GRACE_MS;
+  if (__ku_handler_cleanup_deadline && __ku_handler_cleanup_deadline < cleanup_deadline)
+    cleanup_deadline = __ku_handler_cleanup_deadline;
+  if (!ku_pg_send_cancel(conn,cleanup_deadline)) return;
+  for (size_t results = 0; results < 1024;) {
+    if (ku_pg_deadline_expired(cleanup_deadline) || !PQconsumeInput(conn)) return;
+    if (PQisBusy(conn)) {
+      if (ku_pg_wait_socket(PQsocket(conn), KU_PG_WAIT_READ, cleanup_deadline) != 1) return;
+      continue;
+    }
+    PGresult* result = PQgetResult(conn);
+    if (!result) {
+      if (PQstatus(conn) == KU_PG_CONNECTION_OK
+          && PQtransactionStatus(conn) != KU_PQTRANS_ACTIVE)
+        ku_database_budget_record_cancel_confirmed();
+      return;
+    }
+    int status = PQresultStatus(result);
+    PQclear(result);
+    results++;
+    if (status == KU_PGRES_COPY_IN || status == KU_PGRES_COPY_OUT
+        || status == KU_PGRES_COPY_BOTH || status == KU_PGRES_BAD_RESPONSE) return;
+  }
+}
 static void ku_pg_break_connection(PGconn* conn, int* broken) {
   if (broken) *broken = 1;
   if (!conn) return;
+  ku_pg_cancel_and_drain(conn);
   int fd = PQsocket(conn);
   if (fd < 0) return;
 #if defined(_WIN32)
@@ -14116,6 +14523,7 @@ static KuError ku_pg_query_connection_error(void) {
   return ku_pg_static_error("query_error", sizeof("query_error") - 1, "PostgreSQL query connection failed; close and reconnect", sizeof("PostgreSQL query connection failed; close and reconnect") - 1);
 }
 static KuError ku_pg_execution_unknown_error(void) {
+  ku_database_budget_record_unknown();
   return ku_pg_static_error("execution_unknown", sizeof("execution_unknown") - 1, "PostgreSQL statement may have executed; outcome is unknown; never retry automatically; close and reconnect", sizeof("PostgreSQL statement may have executed; outcome is unknown; never retry automatically; close and reconnect") - 1);
 }
 static KuError ku_pg_execution_completed_without_result_error(void) {
@@ -14467,6 +14875,41 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
         "  memcpy(copied, r->bytes + cell.offset, (size_t)cell.len);\n",
         "  return (KuResult_str){ true, (KuString){ copied, (size_t)cell.len, (size_t)cell.len, KU_STRING_OWNED }, (KuError){0} };\n",
         "}\n",
+        r#"/* Canonical JSON integer token only, with no surrounding whitespace.
+ * Read the independent owned table; no string owner or JSON value is created. */
+static KuResult_int ku_pg_value_int(KuPgResult* r, int64_t row, int64_t col) {
+  if (!ku_pg_cell_in_bounds(r,row,col) || !r->cells
+      || (size_t)row > (SIZE_MAX-(size_t)col)/r->cols)
+    return (KuResult_int){false,0,ku_pg_value_error()};
+  size_t index=(size_t)row*r->cols+(size_t)col;
+  if(index>=r->cell_capacity)return (KuResult_int){false,0,ku_pg_value_error()};
+  KuPgCell cell=r->cells[index];
+  if(cell.len==KU_PG_NULL_CELL)return (KuResult_int){false,0,ku_pg_static_error(
+      "null_value",sizeof("null_value")-1,"PostgreSQL NULL must be checked with is_null()",sizeof("PostgreSQL NULL must be checked with is_null()")-1)};
+  if(r->bytes_len>r->bytes_capacity || (size_t)cell.offset>r->bytes_len
+      || (size_t)cell.len>r->bytes_len-(size_t)cell.offset || (cell.len && !r->bytes))
+    return (KuResult_int){false,0,ku_pg_value_error()};
+  /* Canonical int64 text is at most 20 bytes, including its minus sign. */
+  if(!cell.len || cell.len>20u)goto invalid_integer;
+  const uint8_t* text=r->bytes+cell.offset;
+  size_t at=0;int negative=text[0]=='-';
+  if(negative && ++at==(size_t)cell.len)goto invalid_integer;
+  if(text[at]=='0' && at+1u!=(size_t)cell.len)goto invalid_integer;
+  uint64_t limit=(uint64_t)INT64_MAX+(negative?UINT64_C(1):UINT64_C(0)),value=0;
+  for(;at<(size_t)cell.len;at++) {
+    uint8_t digit=text[at];
+    if(digit<'0' || digit>'9')goto invalid_integer;
+    uint64_t next=(uint64_t)(digit-'0');
+    if(value>(limit-next)/UINT64_C(10))goto invalid_integer;
+    value=value*UINT64_C(10)+next;
+  }
+  int64_t parsed=negative ? value==(uint64_t)INT64_MAX+UINT64_C(1)?INT64_MIN:-(int64_t)value : (int64_t)value;
+  return (KuResult_int){true,parsed,{0}};
+invalid_integer:
+  return (KuResult_int){false,0,ku_pg_static_error("integer_value_error",sizeof("integer_value_error")-1,
+      "PostgreSQL value is not a canonical int64 integer",sizeof("PostgreSQL value is not a canonical int64 integer")-1)};
+}
+"#,
         "static KuResult_bool ku_pg_is_null(KuPgResult* r, int64_t row, int64_t col) {\n",
         "  if (!ku_pg_cell_in_bounds(r, row, col)) return (KuResult_bool){ false, false, ku_pg_value_error() };\n",
         "  return (KuResult_bool){ true, r->cells[(size_t)row * r->cols + (size_t)col].len == KU_PG_NULL_CELL, (KuError){0} };\n",
@@ -14545,9 +14988,49 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "#define KU_PG_CLIENT_DEFAULT_CONNECT_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_ACQUIRE_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_QUERY_TIMEOUT_MS 30000LL\n",
-            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int finalizing; int connect_in_flight; int backoff_timer_armed; };\n",
+            "typedef struct KuPgAsyncWaiter { struct KuPgAsyncWaiter* next; struct KuPgAsyncWaiter* previous; void (*wake)(void*); void* context; size_t in_flight; int linked, notified; KuPgDiagnosticLease diagnostic; } KuPgAsyncWaiter;\n",
+            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int finalizing; int connect_in_flight; int backoff_timer_armed; size_t async_operations, capture_pins; KuPgAsyncWaiter* async_head; KuPgAsyncWaiter* async_tail; KuDatabaseReservation budget; KuPgAsyncWaiter** async_owners; uint64_t* lease_generations; };\n",
             "static void ku_pg_client_dispose(KuPgClient* p);\n",
-            "static int ku_pg_client_take_dispose_locked(KuPgClient* p) { if (!p->closing || p->finalizing || p->active != 0 || p->waiters != 0) return 0; p->finalizing = 1; return 1; }\n",
+            "static int ku_pg_client_take_dispose_locked(KuPgClient* p) { if (!p->closing || p->finalizing || p->active != 0 || p->waiters != 0 || p->async_operations != 0 || p->capture_pins != 0) return 0; p->finalizing = 1; return 1; }\n",
+            r#"/* Pin notifications before releasing the pool lock. The stable job cannot
+ * retire until every pinned callback returns. Drain every batch, including a
+ * close with more than 64 waiters; no subsequent release is required. */
+static void ku_pg_client_signal_locked(KuPgClient* p, int all) {
+  if (all) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv);
+  size_t remaining=p->waiters;
+  while (remaining) {
+    KuPgAsyncWaiter* batch[64]; size_t count=0;
+    for (KuPgAsyncWaiter* node=p->async_head;node && count<64u && count<remaining;node=node->next) {
+      if (node->notified) continue;
+      node->notified=1;if(node->diagnostic.published!=UINT64_MAX)node->diagnostic.published++; node->in_flight++; batch[count++]=node;
+    }
+    if (!count) break;
+    remaining-=count;
+    ku_pg_mutex_unlock(&p->lock);
+    for (size_t i=0;i<count;i++) batch[i]->wake(batch[i]->context);
+    ku_pg_mutex_lock(&p->lock);
+    for (size_t i=0;i<count;i++) batch[i]->in_flight--;
+  }
+}
+"#,
+            r#"/* The checked PG capture binding is immutable while registered. Retain
+ * the actual pool as well as its lexical cell before admitting a source Task. */
+static int ku_pg_client_capture_retain(KuPgClient* p) {
+  if(!p)return 0;
+  ku_pg_mutex_lock(&p->lock);
+  int retained=!p->closing && p->capture_pins!=SIZE_MAX;
+  if(retained)p->capture_pins++;
+  ku_pg_mutex_unlock(&p->lock);return retained;
+}
+static void ku_pg_client_capture_release(KuPgClient* p) {
+  if(!p)return;
+  ku_pg_mutex_lock(&p->lock);
+  if(!p->capture_pins) {ku_pg_mutex_unlock(&p->lock);abort();}
+  p->capture_pins--;int dispose=ku_pg_client_take_dispose_locked(p);
+  ku_pg_mutex_unlock(&p->lock);
+  if(dispose)ku_pg_client_dispose(p);
+}
+"#,
             "static unsigned long long ku_pg_client_saturating_add_ms(unsigned long long now, unsigned long long delay) { return ~0ULL - now < delay ? ~0ULL : now + delay; }\n",
             "static unsigned long long ku_pg_client_backoff_delay_ms(KuPgClient* p, unsigned long long now) {\n",
             "  uint32_t failures = p->consecutive_connect_failures; unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);\n",
@@ -14580,20 +15063,24 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "static KuResult_pg_client ku_pg_client_open(KuString conninfo, int64_t size, int64_t max_waiters, int64_t connect_timeout_ms, int64_t acquire_timeout_ms, int64_t query_timeout_ms) {\n",
             "  if (size < 1 || size > 256 || max_waiters < 0 || max_waiters > 4096 || connect_timeout_ms < 1 || connect_timeout_ms > 300000 || acquire_timeout_ms < 1 || acquire_timeout_ms > 300000 || query_timeout_ms < 1 || query_timeout_ms > 300000) return (KuResult_pg_client){ false, 0, ku_pg_invalid_config(\"PostgreSQL client configuration is outside its allowed range\", sizeof(\"PostgreSQL client configuration is outside its allowed range\") - 1) };\n",
             "  if (conninfo.len == SIZE_MAX || conninfo.len > KU_PG_MAX_CONNINFO_BYTES || (conninfo.len && !conninfo.ptr) || ku_pg_string_has_nul(conninfo)) return (KuResult_pg_client){ false, 0, ku_pg_invalid_config(\"PostgreSQL conninfo is invalid, too large, or contains a NUL byte\", sizeof(\"PostgreSQL conninfo is invalid, too large, or contains a NUL byte\") - 1) };\n",
+            "  if (!PQisthreadsafe()) return (KuResult_pg_client){ false, 0, ku_pg_static_error(\"client_thread_unsupported\", sizeof(\"client_thread_unsupported\") - 1, \"libpq was built without thread support\", sizeof(\"libpq was built without thread support\") - 1) };\n",
             "  KuPgClient* p = (KuPgClient*)malloc(sizeof(KuPgClient));\n",
             "  if (!p) return (KuResult_pg_client){ false, 0, ku_pg_out_of_memory_error() };\n",
             "  memset(p, 0, sizeof(*p)); p->size = (size_t)size; p->max_waiters = (size_t)max_waiters; p->conninfo_len = conninfo.len; p->connect_timeout_ms = (unsigned long long)connect_timeout_ms; p->acquire_timeout_ms = (unsigned long long)acquire_timeout_ms; p->query_timeout_ms = (unsigned long long)query_timeout_ms;\n",
+            "  if (!ku_database_budget_reserve(&p->budget, p->size, p->max_waiters)) { free(p); return (KuResult_pg_client){ false, 0, ku_pg_static_error(\"resource_limit\", sizeof(\"resource_limit\") - 1, \"database process connection/waiter budget exhausted or invalid\", sizeof(\"database process connection/waiter budget exhausted or invalid\") - 1) }; }\n",
             "  p->conns = (PGconn**)calloc(p->size, sizeof(PGconn*));\n",
             "  p->in_use = (char*)calloc(p->size, 1);\n",
+            "  p->async_owners = (KuPgAsyncWaiter**)calloc(p->size, sizeof(*p->async_owners));\n",
+            "  p->lease_generations = (uint64_t*)calloc(p->size, sizeof(*p->lease_generations));\n",
             "  p->conninfo = (char*)malloc(conninfo.len + 1);\n",
-            "  if (!p->conns || !p->in_use || !p->conninfo) { free(p->conns); free(p->in_use); free(p->conninfo); free(p); return (KuResult_pg_client){ false, 0, ku_pg_out_of_memory_error() }; }\n",
+            "  if (!p->conns || !p->in_use || !p->async_owners || !p->lease_generations || !p->conninfo) { free(p->conns); free(p->in_use); free(p->async_owners); free(p->lease_generations); free(p->conninfo); ku_database_budget_release(&p->budget); free(p); return (KuResult_pg_client){ false, 0, ku_pg_out_of_memory_error() }; }\n",
             "  if (conninfo.len) memcpy(p->conninfo, conninfo.ptr, conninfo.len); p->conninfo[conninfo.len] = '\\0';\n",
-            "  if (ku_pg_sync_init(&p->lock, &p->cv) != 0) { free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p); return (KuResult_pg_client){ false, 0, ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"PostgreSQL client synchronization initialization failed\", sizeof(\"PostgreSQL client synchronization initialization failed\") - 1) }; }\n",
+            "  if (ku_pg_sync_init(&p->lock, &p->cv) != 0) { free(p->conns); free(p->in_use); free(p->async_owners); free(p->lease_generations); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); ku_database_budget_release(&p->budget); free(p); return (KuResult_pg_client){ false, 0, ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"PostgreSQL client synchronization initialization failed\", sizeof(\"PostgreSQL client synchronization initialization failed\") - 1) }; }\n",
             "  unsigned long long initial_deadline = ku_pg_deadline_after_ms(p->connect_timeout_ms);\n",
             "  KuPgConnectAttempt initial_attempt = ku_pg_connect_until(p->conninfo, initial_deadline);\n",
             "  PGconn* initial = initial_attempt.conn;\n",
             "  if (!initial) {\n",
-            "    ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->conninfo); free(p);\n",
+            "    ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->async_owners); free(p->lease_generations); free(p->conninfo); ku_database_budget_release(&p->budget); free(p);\n",
             "    KuError initial_error = initial_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (initial_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"PostgreSQL client connection timed out\", sizeof(\"PostgreSQL client connection timed out\") - 1) : ku_pg_connect_failure_error());\n",
             "    return (KuResult_pg_client){ false, 0, initial_error };\n",
             "  }\n",
@@ -14611,12 +15098,12 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "}\n",
             "static void ku_pg_client_handoff_available_locked(KuPgClient* p) {\n",
             "  if (!p || p->waiters == 0) return;\n",
-            "  for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }\n",
             "  if (p->connect_in_flight || ku_pg_now_ms() < p->reconnect_not_before_ms) return;\n",
-            "  for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { ku_pg_client_signal_locked(p,0); return; }\n",
             "}\n",
             "static void ku_pg_client_release_backoff_timer_locked(KuPgClient* p, int owned) {\n",
-            "  if (!owned) return; p->backoff_timer_armed = 0; if (p->waiters != 0) ku_pg_cond_signal(&p->cv);\n",
+            "  if (!owned) return; p->backoff_timer_armed = 0; if (p->waiters != 0) ku_pg_client_signal_locked(p,0);\n",
             "}\n",
             // Acquire a slot (blocking). Returns slot index and sets *out; on connect
             // failure returns -1 with a static structured error. A reserved slot has
@@ -14632,7 +15119,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  for (;;) {\n",
             "    if (p->closing) { ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); return -1; }\n",
             "    unsigned long long now = ku_pg_now_ms();\n",
-            "    if (now >= deadline) { ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
+            "    if (now >= deadline) { ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, 0, -1, now, NULL); ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
             "    int can_claim = has_waited || p->waiters == 0;\n",
             "    if (can_claim) for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { p->in_use[i] = 1; p->active++; *out = p->conns[i]; ku_pg_mutex_unlock(&p->lock); return (int)i; }\n",
             "    int made = -1;\n",
@@ -14640,7 +15127,8 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "    if (made >= 0) {\n",
             "      now = ku_pg_now_ms();\n",
             "      if (now >= deadline) {\n",
-            "        p->connect_in_flight = 0; p->in_use[made] = 0; p->active--; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, 0, made, now, NULL);\n",
+            "        p->connect_in_flight = 0; p->in_use[made] = 0; p->active--; ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_unlock(&p->lock);\n",
@@ -14649,7 +15137,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "      PGconn* h = connect_attempt.conn;\n",
             "      if (!h) {\n",
             "        KuError e = connect_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? (acquire_limited_connect ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1) : ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"timed out connecting a PostgreSQL client connection\", sizeof(\"timed out connecting a PostgreSQL client connection\") - 1)) : ku_pg_connect_failure_error());\n",
-            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        ku_pg_mutex_lock(&p->lock); if (connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT && acquire_limited_connect) ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, connect_deadline, made, ku_pg_now_ms(), NULL); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = e; if (dispose) ku_pg_client_dispose(p); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_lock(&p->lock);\n",
@@ -14659,19 +15147,19 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
                while holding the lock so an expired reservation is rolled back
                instead of being installed and used by the query pump. */
             "      int connect_expired = ku_pg_now_ms() >= deadline;\n",
-            "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
-            "      p->conns[made] = h; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "      if (p->closing || connect_expired) { int client_closing = p->closing; if (!client_closing) ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, connect_deadline, made, ku_pg_now_ms(), h); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "      p->conns[made] = h; ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "      *out = h; return made;\n",
             "    }\n",
             "    now = ku_pg_now_ms();\n",
-            "    if (now >= deadline) { ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
+            "    if (now >= deadline) { ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, 0, -1, now, NULL); ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
             "    if (p->waiters >= p->max_waiters) { ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"pool_busy\", sizeof(\"pool_busy\") - 1, \"PostgreSQL client waiter limit reached\", sizeof(\"PostgreSQL client waiter limit reached\") - 1); return -1; }\n",
             "    unsigned long long wait_deadline = deadline; int owns_backoff_timer = 0;\n",
             "    if (p->reconnect_not_before_ms > now && !p->backoff_timer_armed) { p->backoff_timer_armed = 1; owns_backoff_timer = 1; if (p->reconnect_not_before_ms < wait_deadline) wait_deadline = p->reconnect_not_before_ms; }\n",
             "    unsigned long long remaining = wait_deadline - now;\n",
             "    p->waiters++; int wait_result = ku_pg_cond_wait_ms(&p->cv, &p->lock, remaining); p->waiters--; ku_pg_client_release_backoff_timer_locked(p, owns_backoff_timer);\n",
-            "    if (p->closing) { int dispose = ku_pg_client_take_dispose_locked(p); ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
-            "    if (wait_result != 0) { now = ku_pg_now_ms(); if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
+            "    if (p->closing) { int dispose = ku_pg_client_take_dispose_locked(p); ku_pg_client_signal_locked(p,1); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "    if (wait_result != 0) { now = ku_pg_now_ms(); if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } if (wait_result == 1) ku_pg_diagnostics_sync_acquire_locked(p, started, deadline, operation_deadline, 0, -1, now, NULL); ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
             "    has_waited = 1;\n",
             "  }\n",
             "}\n",
@@ -14707,7 +15195,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  if ((broken || p->closing) && p->conns[slot]) { discard = p->conns[slot]; p->conns[slot] = 0; }\n",
             "  p->in_use[slot] = 0; if (p->active > 0) p->active--;\n",
             "  int dispose = ku_pg_client_take_dispose_locked(p);\n",
-            "  if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "  if (p->closing) ku_pg_client_signal_locked(p,1); else ku_pg_client_signal_locked(p,0); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (discard) PQfinish(discard);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
@@ -14720,24 +15208,27 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  if (session_control != 0) return (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client\", sizeof(\"PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client\") - 1) };\n",
             "  size_t param_bytes = 0; KuError param_error = (KuError){0};\n",
             "  if (!ku_pg_validate_query_params(params, &param_bytes, &param_error, deadline)) return (KuResult_pg_result){ false, 0, param_error };\n",
+            "  size_t operation_charge = 0; size_t input_bytes = sql.len + param_bytes + params.len * sizeof(KuString);\n",
+            "  if (!ku_database_operation_begin(input_bytes, &operation_charge)) return (KuResult_pg_result){ false, 0, ku_pg_static_error(\"resource_limit\", sizeof(\"resource_limit\") - 1, \"database pending input byte budget exhausted or invalid\", sizeof(\"database pending input byte budget exhausted or invalid\") - 1) };\n",
             "  PGconn* c = 0; KuError err = (KuError){0};\n",
             "  int slot = ku_pg_client_acquire(p, &c, &err, deadline);\n",
-            "  if (slot < 0) return (KuResult_pg_result){ false, 0, err };\n",
+            "  if (slot < 0) { ku_database_operation_end(operation_charge); return (KuResult_pg_result){ false, 0, err }; }\n",
             "  int broken = 0; KuResult_pg_result r = ku_pg_query_params_all_validated_impl(c, sql, params, param_bytes, deadline, &broken);\n",
             "  if (r.ok && PQtransactionStatus(c) != KU_PQTRANS_IDLE) { ku_drop_pg_result(&r.value); r = (KuResult_pg_result){ false, 0, ku_pg_post_execution_session_state_error() }; broken = 1; }\n",
             "  ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline);\n",
+            "  ku_database_operation_end(operation_charge);\n",
             "  return r;\n",
             "}\n",
             "static void ku_pg_client_dispose(KuPgClient* p) {\n",
             "  if (!p) return;\n",
             "  for (size_t i = 0; i < p->size; i++) if (p->conns[i]) PQfinish(p->conns[i]);\n",
-            "  ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->conninfo); free(p);\n",
+            "  ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->async_owners); free(p->lease_generations); free(p->conninfo); ku_database_budget_release(&p->budget); free(p);\n",
             "}\n",
             "static void ku_pg_client_close_owned(KuPgClient* p) {\n",
             "  if (!p) return;\n",
             "  ku_pg_mutex_lock(&p->lock);\n",
             "  p->closing = 1; int dispose = ku_pg_client_take_dispose_locked(p);\n",
-            "  ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "  ku_pg_client_signal_locked(p,1); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
             "static KuPgClient* ku_move_pg_client(KuPgClient** p) { KuPgClient* m = *p; *p = 0; return m; }\n",
@@ -14745,6 +15236,8 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "static KuPgClient* ku_clone_pg_client(KuPgClient* c) { (void)c; fprintf(stderr, \"cannot clone a pg client\\n\"); exit(1); }\n",
             "static uint8_t ku_pg_client_close(KuPgClient* p) { ku_pg_client_close_owned(p); return 0; }\n",
         ));
+        out.push_str("#define KU_TASK_PG 1\n");
+        out.push_str(include_str!("c_pg_async_runtime.c"));
     }
     out.push('\n');
 }
@@ -14813,2142 +15306,38 @@ fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     if !program_uses_http(program) {
         return Ok(());
     }
-    out.push_str(
-        r####"#define KU_NATIVE_RUNTIME_HTTP_SOCKET 1
-#define KU_HTTP_MAX_SEGS 64
-/* Longest accepted request target, pinned to the interpreter's
-   MAX_REQUEST_TARGET_BYTES (src/stdlib/http.rs). A longer target is answered with
-   414 before it is copied or routed -- never truncated: truncating would let two
-   distinct paths that share a long prefix resolve to the same route. */
-#define KU_HTTP_MAX_TARGET 8192
-#define KU_HTTP_MAX_TIMEOUT_MS 300000LL
-#define KU_HTTP_MAX_HEADER_BYTES 65536LL
-#define KU_HTTP_MAX_BODY_BYTES 16777216LL
-#define KU_HTTP_MAX_BUFFER_BYTES 1073741824LL
-#define KU_HTTP_MAX_CONNECTIONS 4096LL
-#define KU_HTTP_MAX_ACTIVE_REQUESTS 1024LL
-#define KU_HTTP_MAX_PENDING_REQUESTS 8192LL
-#define KU_HTTP_READ_CHUNK 8192
-
-/* Private platform boundary. HTTP parsing/routing above the socket calls is
-   byte-for-byte shared by Windows, Linux and macOS. */
-#if defined(_WIN32)
-typedef SOCKET KuHttpSocket;
-#define KU_HTTP_INVALID_SOCKET INVALID_SOCKET
-typedef volatile LONG KuHttpAtomicCounter;
-static void ku_http_atomic_store(KuHttpAtomicCounter* counter, long value) { InterlockedExchange(counter, value); }
-static long ku_http_atomic_increment(KuHttpAtomicCounter* counter) { return (long)InterlockedIncrement(counter); }
-static void ku_http_atomic_decrement(KuHttpAtomicCounter* counter) { (void)InterlockedDecrement(counter); }
-#else
-typedef int KuHttpSocket;
-#define KU_HTTP_INVALID_SOCKET (-1)
-typedef _Atomic long KuHttpAtomicCounter;
-static void ku_http_atomic_store(KuHttpAtomicCounter* counter, long value) { atomic_store_explicit(counter, value, memory_order_relaxed); }
-static long ku_http_atomic_increment(KuHttpAtomicCounter* counter) { return atomic_fetch_add_explicit(counter, 1, memory_order_acq_rel) + 1; }
-static void ku_http_atomic_decrement(KuHttpAtomicCounter* counter) { (void)atomic_fetch_sub_explicit(counter, 1, memory_order_acq_rel); }
-#endif
-
-static unsigned long long ku_http_now_ms(void) { return __ku_handler_now_ms(); }
-
-static int ku_http_socket_last_error(void) {
-#if defined(_WIN32)
-  return WSAGetLastError();
-#else
-  return errno;
-#endif
-}
-
-static int ku_http_socket_error_interrupted(int error) {
-#if defined(_WIN32)
-  return error == WSAEINTR;
-#else
-  return error == EINTR;
-#endif
-}
-
-/* accept(2) may surface already-aborted connections and pending network errors
-   even though the listening socket itself is still healthy. A remote peer can
-   trigger these, so they must never consume a stop-the-server retry budget. */
-static int ku_http_socket_error_accept_peer_transient(int error) {
-#if defined(_WIN32)
-  return error == WSAEINTR || error == WSAECONNRESET || error == WSAECONNABORTED;
-#else
-  if (error == EINTR || error == ECONNABORTED) return 1;
-#ifdef EPROTO
-  if (error == EPROTO) return 1;
-#endif
-#ifdef ENETDOWN
-  if (error == ENETDOWN) return 1;
-#endif
-#ifdef ENOPROTOOPT
-  if (error == ENOPROTOOPT) return 1;
-#endif
-#ifdef EHOSTDOWN
-  if (error == EHOSTDOWN) return 1;
-#endif
-#ifdef ENONET
-  if (error == ENONET) return 1;
-#endif
-#ifdef EHOSTUNREACH
-  if (error == EHOSTUNREACH) return 1;
-#endif
-#ifdef EOPNOTSUPP
-  if (error == EOPNOTSUPP) return 1;
-#endif
-#ifdef ENETUNREACH
-  if (error == ENETUNREACH) return 1;
-#endif
-  return 0;
-#endif
-}
-
-/* Local descriptor/memory pressure is different: retry it with a longer bounded
-   backoff, then fail rather than leave a resident process spinning forever. */
-static int ku_http_socket_error_accept_resource_pressure(int error) {
-#if defined(_WIN32)
-  return error == WSAEMFILE || error == WSAENOBUFS;
-#else
-  return error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM;
-#endif
-}
-
-static int ku_http_net_init(void) {
-#if defined(_WIN32)
-  WSADATA data;
-  return WSAStartup(MAKEWORD(2, 2), &data) == 0 ? 0 : -1;
-#else
-  return 0;
-#endif
-}
-
-static void ku_http_net_cleanup(void) {
-#if defined(_WIN32)
-  WSACleanup();
-#endif
-}
-
-static void ku_http_socket_close(KuHttpSocket socket_value) {
-  if (socket_value == KU_HTTP_INVALID_SOCKET) return;
-#if defined(_WIN32)
-  closesocket(socket_value);
-#else
-  /* close(2) must not be retried after EINTR; the descriptor may already have
-     been released and reused by another thread. */
-  (void)close(socket_value);
-#endif
-}
-
-static void ku_http_socket_shutdown_write(KuHttpSocket socket_value) {
-#if defined(_WIN32)
-  (void)shutdown(socket_value, SD_SEND);
-#else
-  (void)shutdown(socket_value, SHUT_WR);
-#endif
-}
-
-static int ku_http_socket_suppress_sigpipe(KuHttpSocket socket_value) {
-#if defined(__APPLE__)
-  int enabled = 1;
-  return setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) == 0 ? 0 : -1;
-#else
-  (void)socket_value;
-  return 0;
-#endif
-}
-
-static int ku_http_socket_send(KuHttpSocket socket_value, const char* data, size_t len) {
-  size_t chunk = len > (size_t)INT_MAX ? (size_t)INT_MAX : len;
-#if defined(_WIN32)
-  return send(socket_value, data, (int)chunk, 0);
-#elif defined(__APPLE__)
-  ssize_t sent = send(socket_value, data, chunk, 0);
-  return sent > (ssize_t)INT_MAX ? INT_MAX : (int)sent;
-#elif defined(MSG_NOSIGNAL)
-  ssize_t sent = send(socket_value, data, chunk, MSG_NOSIGNAL);
-  return sent > (ssize_t)INT_MAX ? INT_MAX : (int)sent;
-#else
-#error "std.http POSIX transport requires MSG_NOSIGNAL or SO_NOSIGPIPE"
-#endif
-}
-
-static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len) {
-  size_t chunk = len > (size_t)INT_MAX ? (size_t)INT_MAX : len;
-#if defined(_WIN32)
-  return recv(socket_value, data, (int)chunk, 0);
-#else
-  ssize_t received = recv(socket_value, data, chunk, 0);
-  return received > (ssize_t)INT_MAX ? INT_MAX : (int)received;
-#endif
-}
-
-/* A terminal handler registered at a trie node, one per HTTP method. Parameter
-   names belong to the route/handler, not to shared trie nodes: two methods (or
-   two routes with a shared param-shaped prefix) may legitimately use different
-   names for the same captured segment positions. */
-typedef struct { char* method; char** param_names; size_t nparams; void* invoke; void* env; int arity; int returns_result; } KuHttpHandler;
-/* Stage 8b: a routing trie node. Each node holds static children (keyed by the
-   literal path segment) and at most one `{param}` child. Matching prefers a
-   static child over the param child at every segment (with backtracking), which
-   mirrors the interpreter's exact-shape-before-param-scan lookup. */
-typedef struct KuHttpNode {
-  char* seg;                     /* static segment label for this node (NULL at root) */
-  struct KuHttpNode** children;  /* static children */
-  size_t nchild; size_t cchild;
-  struct KuHttpNode* param;      /* single `{param}` child, or NULL */
-  KuHttpHandler* handlers;       /* terminal handlers, keyed by method */
-  size_t nh; size_t ch;
-} KuHttpNode;
-/* Stage 8d/8e: the route trie plus the limits read from the `http.server({...})`
-   config object (or assigned field-by-field). Defaults mirror the interpreter's
-   HttpServerRuntimeLimits (src/stdlib/http.rs:16-25).
-
-   These are `long long`, not `long`: the interpreter stores every limit as i64,
-   and `long` is 32-bit on Windows LLP64, which would silently truncate a limit
-   above 2^31 (e.g. `max_body_bytes: 3_000_000_000` wrapping negative and
-   disabling the 413 check). */
-typedef struct KuHttpBufferBudget KuHttpBufferBudget;
-struct KuHttpServer {
-  KuHttpNode* root;
-  KuHttpBufferBudget* buffer_budget;
-  long long max_buffer_bytes;
-  long long max_connections;
-  long long max_active_requests;
-  long long max_pending_requests;
-  long long handler_timeout_ms;
-  long long max_body_bytes;
-  long long max_header_bytes;
-  long long read_header_timeout_ms;
-  long long read_body_timeout_ms;
-  long long write_timeout_ms;
-  long long idle_timeout_ms;
-};
-static void ku_http_normalize_path(const char* in, size_t in_len, char* out, size_t out_cap) {
-  size_t oi = 0; size_t i = 0;
-  if (out_cap == 0) return;
-  out[oi++] = '/';
-  while (i < in_len) {
-    while (i < in_len && in[i] == '/') i++;
-    size_t start = i;
-    while (i < in_len && in[i] != '/') i++;
-    if (i > start) {
-      if (oi > 1 && oi + 1 < out_cap) out[oi++] = '/';
-      size_t seg = i - start;
-      if (oi + seg >= out_cap) seg = out_cap - 1 - oi;
-      memcpy(out + oi, in + start, seg); oi += seg;
-    }
-  }
-  out[oi] = '\0';
-}
-static KuHttpNode* ku_http_node_new(void) {
-  KuHttpNode* n = (KuHttpNode*)calloc(1, sizeof(KuHttpNode));
-  if (!n) { fprintf(stderr, "out of memory\n"); exit(1); }
-  return n;
-}
-static KuHttpServer* ku_http_server_new(void) {
-  KuHttpServer* s = (KuHttpServer*)calloc(1, sizeof(KuHttpServer));
-  if (!s) { fprintf(stderr, "out of memory\n"); exit(1); }
-  s->root = ku_http_node_new();
-  s->max_connections = 1024;
-  s->max_active_requests = 256;
-  s->max_pending_requests = 1024;
-  s->handler_timeout_ms = 15000;
-  s->max_body_bytes = 1000000;
-  s->max_buffer_bytes = 64LL * 1024 * 1024;
-  s->max_header_bytes = 16 * 1024;
-  s->read_header_timeout_ms = 5000;
-  s->read_body_timeout_ms = 10000;
-  s->write_timeout_ms = 10000;
-  s->idle_timeout_ms = 5000;
-  return s;
-}
-/* Spell a KuValue tag the way the interpreter's Value::type_name() does, so a
-   wrong-typed config field reports the same text on both runtimes. */
-static const char* ku_http_value_type_name(KuValueTag tag) {
-  switch (tag) {
-    case KU_INT: return "int";
-    case KU_FLOAT: return "float";
-    case KU_BOOL: return "bool";
-    case KU_STR: return "str";
-    case KU_OBJECT: return "object";
-    case KU_ARRAY: return "array";
-    case KU_FUNCTION: return "function";
-    default: return "null";
-  }
-}
-/* Read an int field from the `http.server({...})` config object. Mirrors the
-   interpreter's optional_int (src/stdlib/http.rs:418) exactly: absent or null
-   yields the default, a positive int yields that value, and a non-positive int
-   or a wrong-typed value is a hard error carrying the interpreter's message.
-   Silently defaulting instead (the previous behaviour) would let native accept
-   configs the interpreter rejects. `http.server(...)` has no Result channel in
-   native, so this reports and exits like the runtime's other faults.
-   The config object is only READ here; it stays owned by the caller, which
-   drops it after `http.server(...)` returns. */
-static long long ku_http_cfg_int(KuObject* config, const char* key, long long dflt, long long maximum) {
-  if (!config) return dflt;
-  KuValue* v = ku_object_get(config, ku_string_static((const uint8_t*)key, strlen(key)));
-  if (!v || v->tag == KU_NULL) return dflt;
-  if (v->tag != KU_INT) {
-    fprintf(stderr, "type error: http.request field '%s' must be int but got %s\n", key, ku_http_value_type_name(v->tag));
-    exit(1);
-  }
-  if (v->as.i <= 0) {
-    fprintf(stderr, "http config field '%s' must be a positive int\n", key);
-    exit(1);
-  }
-  if ((long long)v->as.i > maximum) {
-    fprintf(stderr, "http config field '%s' must be at most %lld\n", key, maximum);
-    exit(1);
-  }
-  return (long long)v->as.i;
-}
-static void ku_http_validate_server(KuHttpServer* s) {
-  struct KuHttpLimit { const char* name; long long value; long long maximum; } limits[] = {
-    { "max_connections", s->max_connections, KU_HTTP_MAX_CONNECTIONS },
-    { "max_active_requests", s->max_active_requests, KU_HTTP_MAX_ACTIVE_REQUESTS },
-    { "max_pending_requests", s->max_pending_requests, KU_HTTP_MAX_PENDING_REQUESTS },
-    { "handler_timeout_ms", s->handler_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
-    { "max_body_bytes", s->max_body_bytes, KU_HTTP_MAX_BODY_BYTES },
-    { "max_buffer_bytes", s->max_buffer_bytes, KU_HTTP_MAX_BUFFER_BYTES },
-    { "max_header_bytes", s->max_header_bytes, KU_HTTP_MAX_HEADER_BYTES },
-    { "read_header_timeout_ms", s->read_header_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
-    { "read_body_timeout_ms", s->read_body_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
-    { "write_timeout_ms", s->write_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS },
-    { "idle_timeout_ms", s->idle_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS }
-  };
-  for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
-    if (limits[i].value <= 0) {
-      fprintf(stderr, "http config field '%s' must be a positive int\n", limits[i].name); exit(1);
-    }
-    if (limits[i].value > limits[i].maximum) {
-      fprintf(stderr, "http config field '%s' must be at most %lld\n", limits[i].name, limits[i].maximum); exit(1);
-    }
-  }
-}
-static int ku_http_server_config_key_allowed(KuString key) {
-  static const char* allowed[] = {
-    "read_header_timeout_ms", "read_body_timeout_ms", "write_timeout_ms",
-    "idle_timeout_ms", "handler_timeout_ms", "max_body_bytes",
-    "max_header_bytes", "max_connections", "max_active_requests",
-    "max_pending_requests", "max_buffer_bytes"
-  };
-  static const size_t lengths[] = { 22, 20, 16, 15, 18, 14, 16, 15, 19, 20, 16 };
-  for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
-    if (ku_string_equal(key, ku_string_static((const uint8_t*)allowed[i], lengths[i]))) return 1;
-  }
+    out.push_str(include_str!("c_http_runtime.c"));
+    if program_uses_intrinsic(program, "__ku_http_json_response") {
+        out.push_str(
+            r#"
+static int64_t ku_http_json_status(int64_t status) {
+  if (status >= 100 && status <= 599) return status;
+  static const uint8_t message[] = "http status must be between 100 and 599";
+  __ku_sync_raise_http_json(message, sizeof(message) - 1);
   return 0;
 }
-static void ku_http_validate_server_config_keys(KuObject* config) {
-  if (!config) return;
-  for (size_t i = 0; i < config->cap; i++) {
-    KuEntry* entry = &config->entries[i];
-    if (!entry->used || ku_http_server_config_key_allowed(entry->key)) continue;
-    fprintf(stderr, "unknown http config field '");
-    if (entry->key.len && entry->key.ptr) fwrite(entry->key.ptr, 1, entry->key.len, stderr);
-    fprintf(stderr, "'\n");
-    exit(1);
-  }
-}
-/* `http.server(config)` / `http.service(config)`: start from the defaults, then
-   override each admission-control limit present in the config object. */
-static KuHttpServer* ku_http_server_new_cfg(KuObject* config) {
-  ku_http_validate_server_config_keys(config);
-  KuHttpServer* s = ku_http_server_new();
-  s->max_connections = ku_http_cfg_int(config, "max_connections", s->max_connections, KU_HTTP_MAX_CONNECTIONS);
-  s->max_active_requests = ku_http_cfg_int(config, "max_active_requests", s->max_active_requests, KU_HTTP_MAX_ACTIVE_REQUESTS);
-  s->max_pending_requests = ku_http_cfg_int(config, "max_pending_requests", s->max_pending_requests, KU_HTTP_MAX_PENDING_REQUESTS);
-  s->handler_timeout_ms = ku_http_cfg_int(config, "handler_timeout_ms", s->handler_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
-  s->max_body_bytes = ku_http_cfg_int(config, "max_body_bytes", s->max_body_bytes, KU_HTTP_MAX_BODY_BYTES);
-  s->max_buffer_bytes = ku_http_cfg_int(config, "max_buffer_bytes", s->max_buffer_bytes, KU_HTTP_MAX_BUFFER_BYTES);
-  s->max_header_bytes = ku_http_cfg_int(config, "max_header_bytes", s->max_header_bytes, KU_HTTP_MAX_HEADER_BYTES);
-  s->read_header_timeout_ms = ku_http_cfg_int(config, "read_header_timeout_ms", s->read_header_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
-  s->read_body_timeout_ms = ku_http_cfg_int(config, "read_body_timeout_ms", s->read_body_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
-  s->write_timeout_ms = ku_http_cfg_int(config, "write_timeout_ms", s->write_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
-  s->idle_timeout_ms = ku_http_cfg_int(config, "idle_timeout_ms", s->idle_timeout_ms, KU_HTTP_MAX_TIMEOUT_MS);
-  ku_http_validate_server(s);
-  return s;
-}
-static KuHttpNode* ku_http_node_child(KuHttpNode* node, const char* seg, size_t seg_len) {
-  for (size_t i = 0; i < node->nchild; i++) {
-    KuHttpNode* c = node->children[i];
-    if (strlen(c->seg) == seg_len && memcmp(c->seg, seg, seg_len) == 0) return c;
-  }
-  return NULL;
-}
-static KuHttpNode* ku_http_node_add_static(KuHttpNode* node, const char* seg, size_t seg_len) {
-  KuHttpNode* existing = ku_http_node_child(node, seg, seg_len);
-  if (existing) return existing;
-  if (node->nchild + 1 > node->cchild) {
-    size_t nc = node->cchild ? node->cchild * 2 : 4;
-    node->children = (KuHttpNode**)realloc(node->children, nc * sizeof(KuHttpNode*));
-    if (!node->children) { fprintf(stderr, "out of memory\n"); exit(1); }
-    node->cchild = nc;
-  }
-  KuHttpNode* child = ku_http_node_new();
-  child->seg = (char*)malloc(seg_len + 1);
-  if (!child->seg) { fprintf(stderr, "out of memory\n"); exit(1); }
-  memcpy(child->seg, seg, seg_len); child->seg[seg_len] = '\0';
-  node->children[node->nchild++] = child;
-  return child;
-}
-static KuHttpNode* ku_http_node_add_param(KuHttpNode* node) {
-  if (!node->param) node->param = ku_http_node_new();
-  return node->param;
-}
-static int ku_http_is_tchar(unsigned char c) {
-  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-         c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
-         c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
-         c == '`' || c == '|' || c == '~';
-}
-static int ku_http_is_hex(unsigned char c) {
-  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
-}
-static int ku_http_is_uri_pchar(unsigned char c) {
-  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-         c == '-' || c == '.' || c == '_' || c == '~' || c == '!' || c == '$' ||
-         c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' || c == '+' ||
-         c == ',' || c == ';' || c == '=' || c == ':' || c == '@';
-}
-static int ku_http_valid_pchar_sequence(const uint8_t* ptr, size_t len) {
-  size_t i = 0;
-  while (i < len) {
-    if (ptr[i] == '%') {
-      if (i + 2 >= len || !ku_http_is_hex(ptr[i + 1]) || !ku_http_is_hex(ptr[i + 2])) return 0;
-      i += 3;
-    } else if (ku_http_is_uri_pchar(ptr[i])) {
-      i++;
-    } else {
-      return 0;
+/* Consume the writer Result once. Its errors currently contain static literals;
+ * guard that provenance before dropping the full error and publishing a view. */
+static KuStruct___ku_http_response ku_http_json_response(int64_t status, KuResult_str encoded) {
+  if (!encoded.ok) {
+    static const uint8_t fallback[] = "json stringify failed";
+    const uint8_t* message = fallback;
+    size_t message_len = sizeof(fallback) - 1;
+    if (encoded.error.message.storage == KU_STRING_STATIC && encoded.error.message.ptr) {
+      message = encoded.error.message.ptr;
+      message_len = encoded.error.message.len;
     }
+    ku_error_drop(&encoded.error);
+    __ku_sync_raise_http_json(message, message_len);
+    return (KuStruct___ku_http_response){0};
   }
-  return 1;
+  return (KuStruct___ku_http_response){ status,
+    ku_string_static((const uint8_t*)"application/json; charset=utf-8", 31),
+    ku_string_move(&encoded.value), (KuString){0} };
 }
-static int ku_http_utf8_valid(const uint8_t* data, size_t len) {
-  if (len != 0 && !data) return 0;
-  size_t i = 0;
-  while (i < len) {
-    uint8_t c = data[i];
-    if (c <= 0x7f) { i++; continue; }
-    if (c >= 0xc2 && c <= 0xdf) {
-      if (i + 1 >= len || (data[i + 1] & 0xc0) != 0x80) return 0;
-      i += 2; continue;
+"#,
+        );
     }
-    if (c == 0xe0) {
-      if (i + 2 >= len || data[i + 1] < 0xa0 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80) return 0;
-      i += 3; continue;
-    }
-    if ((c >= 0xe1 && c <= 0xec) || (c >= 0xee && c <= 0xef)) {
-      if (i + 2 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80) return 0;
-      i += 3; continue;
-    }
-    if (c == 0xed) {
-      if (i + 2 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x9f || (data[i + 2] & 0xc0) != 0x80) return 0;
-      i += 3; continue;
-    }
-    if (c == 0xf0) {
-      if (i + 3 >= len || data[i + 1] < 0x90 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
-      i += 4; continue;
-    }
-    if (c >= 0xf1 && c <= 0xf3) {
-      if (i + 3 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
-      i += 4; continue;
-    }
-    if (c == 0xf4) {
-      if (i + 3 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x8f || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
-      i += 4; continue;
-    }
-    return 0;
-  }
-  return 1;
-}
-/* RFC 9112 origin-form with RFC 3986 pchar/query characters. This rejects
-   whitespace, controls, backslashes, fragments and malformed percent escapes
-   before any C-string operation or routing decision. */
-static int ku_http_valid_origin_form(const uint8_t* ptr, size_t len) {
-  if (!ptr || len == 0 || ptr[0] != '/') return 0;
-  int in_query = 0;
-  size_t i = 0;
-  while (i < len) {
-    uint8_t c = ptr[i];
-    if (c == '?' && !in_query) { in_query = 1; i++; continue; }
-    if (c == '/' || (in_query && c == '?')) { i++; continue; }
-    if (c == '%') {
-      if (i + 2 >= len || !ku_http_is_hex(ptr[i + 1]) || !ku_http_is_hex(ptr[i + 2])) return 0;
-      i += 3;
-      continue;
-    }
-    if (!ku_http_is_uri_pchar(c)) return 0;
-    i++;
-  }
-  return 1;
-}
-static int ku_http_valid_route_param(const uint8_t* ptr, size_t len) {
-  if (len == 0 || !((ptr[0] >= 'A' && ptr[0] <= 'Z') ||
-                    (ptr[0] >= 'a' && ptr[0] <= 'z') || ptr[0] == '_')) return 0;
-  for (size_t i = 1; i < len; i++) {
-    uint8_t c = ptr[i];
-    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-          (c >= 'a' && c <= 'z') || c == '_')) return 0;
-  }
-  return 1;
-}
-static int ku_http_valid_route_path(const uint8_t* ptr, size_t len, size_t* segment_count) {
-  if (!ptr || len == 0 || ptr[0] != '/') return 0;
-  size_t count = 0, i = 0;
-  while (i < len) {
-    while (i < len && ptr[i] == '/') i++;
-    size_t start = i;
-    while (i < len && ptr[i] != '/') i++;
-    size_t seg_len = i - start;
-    if (seg_len == 0) continue;
-    count++;
-    const uint8_t* seg = ptr + start;
-    if (seg[0] == '{' || seg[seg_len - 1] == '}') {
-      if (seg_len < 3 || seg[0] != '{' || seg[seg_len - 1] != '}' ||
-          !ku_http_valid_route_param(seg + 1, seg_len - 2)) return 0;
-    } else {
-      for (size_t k = 0; k < seg_len; k++) if (seg[k] == ':') return 0;
-      if (!ku_http_valid_pchar_sequence(seg, seg_len)) return 0;
-    }
-  }
-  if (segment_count) *segment_count = count;
-  return 1;
-}
-static KuHttpServer* ku_http_server_add_route(KuHttpServer* s, KuString method, KuString path, void* invoke, void* env, int arity, int returns_result) {
-  if (method.len == 0 || method.len > 32) {
-    fprintf(stderr, "http route method must be a valid HTTP token of at most 32 bytes\n"); exit(1);
-  }
-  for (size_t i = 0; i < method.len; i++) if (!ku_http_is_tchar(((const uint8_t*)method.ptr)[i])) {
-    fprintf(stderr, "http route method must be a valid HTTP token of at most 32 bytes\n"); exit(1);
-  }
-  if (path.len > (size_t)KU_HTTP_MAX_TARGET) {
-    fprintf(stderr, "http route path must be at most %d bytes\n", KU_HTTP_MAX_TARGET); exit(1);
-  }
-  size_t route_segments = 0;
-  if (!ku_http_valid_route_path((const uint8_t*)path.ptr, path.len, &route_segments)) {
-    fprintf(stderr, "invalid http route path\n"); exit(1);
-  }
-  if (route_segments > (size_t)KU_HTTP_MAX_SEGS) {
-    fprintf(stderr, "http route path must contain at most %d segments\n", KU_HTTP_MAX_SEGS); exit(1);
-  }
-  /* Normalize into a buffer sized to the validated path, never a fixed one. */
-  size_t pcap = path.len + 2;
-  char* pbuf = (char*)malloc(pcap);
-  if (!pbuf) { fprintf(stderr, "out of memory\n"); exit(1); }
-  ku_http_normalize_path((const char*)path.ptr, path.len, pbuf, pcap);
-  size_t plen = strlen(pbuf);
-  KuHttpNode* node = s->root;
-  const char* route_param_names[KU_HTTP_MAX_SEGS];
-  size_t route_param_name_lens[KU_HTTP_MAX_SEGS];
-  size_t route_param_count = 0;
-  size_t i = 0;
-  while (i < plen) {
-    while (i < plen && pbuf[i] == '/') i++;
-    size_t start = i;
-    while (i < plen && pbuf[i] != '/') i++;
-    size_t seg_len = i - start;
-    if (seg_len == 0) continue;
-    const char* seg = pbuf + start;
-    if (seg_len >= 2 && seg[0] == '{' && seg[seg_len - 1] == '}') {
-      size_t param_len = seg_len - 2;
-      for (size_t p = 0; p < route_param_count; p++) {
-        if (route_param_name_lens[p] == param_len &&
-            memcmp(route_param_names[p], seg + 1, param_len) == 0) {
-          fputs("duplicate http route param '", stderr);
-          fwrite(seg + 1, 1, param_len, stderr);
-          fputs("'\n", stderr);
-          exit(1);
-        }
-      }
-      route_param_names[route_param_count] = seg + 1;
-      route_param_name_lens[route_param_count] = param_len;
-      route_param_count++;
-      node = ku_http_node_add_param(node);
-    } else {
-      node = ku_http_node_add_static(node, seg, seg_len);
-    }
-  }
-  for (size_t i = 0; i < node->nh; i++) {
-    size_t registered_len = strlen(node->handlers[i].method);
-    if (registered_len == method.len &&
-        memcmp(node->handlers[i].method, method.ptr, method.len) == 0) {
-      fprintf(stderr, "duplicate http route\n"); exit(1);
-    }
-  }
-  if (node->nh + 1 > node->ch) {
-    size_t nc = node->ch ? node->ch * 2 : 2;
-    node->handlers = (KuHttpHandler*)realloc(node->handlers, nc * sizeof(KuHttpHandler));
-    if (!node->handlers) { fprintf(stderr, "out of memory\n"); exit(1); }
-    node->ch = nc;
-  }
-  KuHttpHandler* h = &node->handlers[node->nh++];
-  h->method = ku_string_to_cstr(method);
-  h->param_names = NULL;
-  h->nparams = route_param_count;
-  if (route_param_count > 0) {
-    h->param_names = (char**)calloc(route_param_count, sizeof(char*));
-    if (!h->param_names) { fprintf(stderr, "out of memory\n"); exit(1); }
-    for (size_t p = 0; p < route_param_count; p++) {
-      h->param_names[p] = (char*)malloc(route_param_name_lens[p] + 1);
-      if (!h->param_names[p]) { fprintf(stderr, "out of memory\n"); exit(1); }
-      memcpy(h->param_names[p], route_param_names[p], route_param_name_lens[p]);
-      h->param_names[p][route_param_name_lens[p]] = '\0';
-    }
-  }
-  /* The route table outlives the closure value passed by the generated caller.
-     Retain its environment so scope cleanup cannot leave the handler dangling;
-     ku_http_node_free releases this retained ownership exactly once. */
-  if (env) ((KuEnvHeader*)env)->retain(env);
-  h->invoke = invoke; h->env = env; h->arity = arity; h->returns_result = returns_result;
-  ku_string_drop(&method); ku_string_drop(&path);
-  free(pbuf);
-  return s;
-}
-static KuHttpHandler* ku_http_node_handler(KuHttpNode* node, const char* method) {
-  for (size_t i = 0; i < node->nh; i++)
-    if (strcmp(node->handlers[i].method, method) == 0) return &node->handlers[i];
-  return NULL;
-}
-static void ku_http_node_free(KuHttpNode* node) {
-  if (!node) return;
-  for (size_t i = 0; i < node->nchild; i++) ku_http_node_free(node->children[i]);
-  free(node->children);
-  ku_http_node_free(node->param);
-  free(node->seg);
-  for (size_t i = 0; i < node->nh; i++) {
-    free(node->handlers[i].method);
-    for (size_t p = 0; p < node->handlers[i].nparams; p++) free(node->handlers[i].param_names[p]);
-    free(node->handlers[i].param_names);
-    if (node->handlers[i].env) ((KuEnvHeader*)node->handlers[i].env)->release(node->handlers[i].env);
-  }
-  free(node->handlers);
-  free(node);
-}
-static void ku_http_server_free(KuHttpServer* s) {
-  if (!s) return;
-  ku_http_node_free(s->root);
-  free(s);
-}
-static const char* ku_http_status_text(int64_t status) {
-  switch (status) {
-    case 200: return "OK"; case 201: return "Created"; case 202: return "Accepted"; case 204: return "No Content";
-    case 301: return "Moved Permanently"; case 302: return "Found"; case 303: return "See Other"; case 304: return "Not Modified";
-    case 307: return "Temporary Redirect"; case 308: return "Permanent Redirect";
-    case 400: return "Bad Request"; case 401: return "Unauthorized"; case 403: return "Forbidden"; case 404: return "Not Found";
-    case 405: return "Method Not Allowed"; case 408: return "Request Timeout"; case 413: return "Content Too Large";
-    case 414: return "URI Too Long"; case 417: return "Expectation Failed";
-    case 431: return "Request Header Fields Too Large"; case 500: return "Internal Server Error";
-    case 501: return "Not Implemented"; case 502: return "Bad Gateway"; case 503: return "Service Unavailable"; case 504: return "Gateway Timeout";
-    default: return "Unknown";
-  }
-}
-static KuString ku_http_string_copy(const char* ptr, size_t len) {
-  if (len == 0) return (KuString){0};
-  uint8_t* data = (uint8_t*)malloc(len);
-  if (!data) { fprintf(stderr, "out of memory\n"); exit(1); }
-  memcpy(data, ptr, len);
-  return (KuString){ data, len, len, KU_STRING_OWNED };
-}
-static KuStruct___ku_http_response ku_http_response_from_result(KuResult_struct___ku_http_response r) {
-  if (r.ok) { KuStruct___ku_http_response v = r.value; r.value = (KuStruct___ku_http_response){0}; return v; }
-  KuStruct___ku_http_response v;
-  v.status = 500;
-  v.content_type = ku_string_static((const uint8_t*)"text/plain; charset=utf-8", 25);
-  v.body = ku_string_static((const uint8_t*)"Internal Server Error", 21);
-  v.location = (KuString){0};
-  ku_error_drop(&r.error);
-  return v;
-}
-static int ku_http_field_value_safe(const uint8_t* ptr, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    uint8_t c = ptr[i];
-    if (c != '\t' && (c < 0x20 || c == 0x7f)) return 0;
-  }
-  return 1;
-}
-/* `req.params`/`req.query`/`req.headers` `.field` read: an owned KuString copy of
-   the string value, or an empty string when the key is absent (the interpreter's
-   StringMap `.field` yields str; absent-key aborts there but is never exercised
-   by the routing tests, so native returns "" instead of crashing). */
-static KuString ku_http_map_get(KuObject* o, KuString key) {
-  KuValue* v = ku_object_get(o, key);
-  if (v && v->tag == KU_STR) return ku_string_clone(v->as.s);
-  return ku_string_static((const uint8_t*)"", 0);
-}
-/* `?k=v&k2=v2` -> KuObject{str->str}. Empty parts are skipped; a non-empty
-   `=value` part keeps its empty key, and a key without `=` maps to "", matching
-   the interpreter's split_path_query. */
-static KuObject* ku_http_parse_query(const char* target, size_t path_len) {
-  KuObject* q = ku_object_new(0);
-  const char* p = target + path_len;
-  if (*p != '?') return q;
-  p++;
-  while (*p) {
-    const char* amp = p; while (*amp && *amp != '&') amp++;
-    const char* eq = p; while (eq < amp && *eq != '=') eq++;
-    size_t klen = (size_t)(eq - p);
-    const char* vstart; size_t vlen;
-    if (eq < amp) { vstart = eq + 1; vlen = (size_t)(amp - (eq + 1)); }
-    else { vstart = amp; vlen = 0; }
-    if (amp > p) {
-      KuString key = ku_http_string_copy(p, klen);
-      KuString val = ku_http_string_copy(vstart, vlen);
-      ku_object_set(q, key, ku_v_str(val));
-    }
-    if (*amp == '&') p = amp + 1; else break;
-  }
-  return q;
-}
-/* Request header lines -> KuObject{lowercased-name -> trimmed-value}, matching the
-   interpreter (header names lowercased, names and values trimmed). */
-static KuObject* ku_http_parse_headers(const char* buf, int header_end) {
-  KuObject* h = ku_object_new(0);
-  int i = 0;
-  while (i + 1 < header_end && !(buf[i] == '\r' && buf[i + 1] == '\n')) i++;
-  if (i + 1 < header_end) i += 2; else return h;
-  while (i < header_end) {
-    int ls = i;
-    while (i + 1 < header_end && !(buf[i] == '\r' && buf[i + 1] == '\n')) i++;
-    int le = (i + 1 < header_end) ? i : header_end;
-    if (i + 1 < header_end) i += 2; else i = header_end;
-    if (le <= ls) continue;
-    int colon = ls; while (colon < le && buf[colon] != ':') colon++;
-    if (colon >= le) continue;
-    int ns = ls, ne = colon;
-    while (ns < ne && (buf[ns] == ' ' || buf[ns] == '\t')) ns++;
-    while (ne > ns && (buf[ne - 1] == ' ' || buf[ne - 1] == '\t')) ne--;
-    int vs = colon + 1, ve = le;
-    while (vs < ve && (buf[vs] == ' ' || buf[vs] == '\t')) vs++;
-    while (ve > vs && (buf[ve - 1] == ' ' || buf[ve - 1] == '\t')) ve--;
-    size_t nlen = (size_t)(ne - ns);
-    if (nlen == 0) continue;
-    KuString key = ku_http_string_copy(buf + ns, nlen);
-    for (size_t k = 0; k < key.len; k++) { uint8_t c = ((uint8_t*)key.ptr)[k]; if (c >= 'A' && c <= 'Z') ((uint8_t*)key.ptr)[k] = (uint8_t)(c + 32); }
-    KuString val = ku_http_string_copy(buf + vs, (size_t)(ve - vs));
-    ku_object_set(h, key, ku_v_str(val));
-  }
-  return h;
-}
-/* Trie match with static-before-param priority and backtracking. It records only
-   captured segment VALUES while walking. Parameter NAMES are attached to the
-   final method-specific handler and are applied after a handler is selected;
-   shared trie nodes therefore cannot leak one route's names into another route.
-   The static-first-with-backtracking walk reproduces the interpreter's
-   exact-shape-then-param-scan result (e.g. `/user/me` beats `/user/{id}`). */
-static KuHttpHandler* ku_http_trie_match(KuHttpNode* node, const char** segs, size_t* seglens, size_t nseg, size_t i, const char* method, const char** param_values, size_t* param_value_lens, size_t* param_count) {
-  if (i == nseg) return ku_http_node_handler(node, method);
-  KuHttpNode* sc = ku_http_node_child(node, segs[i], seglens[i]);
-  if (sc) {
-    size_t saved = *param_count;
-    KuHttpHandler* r = ku_http_trie_match(sc, segs, seglens, nseg, i + 1, method, param_values, param_value_lens, param_count);
-    if (r) return r;
-    *param_count = saved;
-  }
-  if (node->param) {
-    size_t saved = *param_count;
-    if (saved >= KU_HTTP_MAX_SEGS) return NULL;
-    param_values[saved] = segs[i];
-    param_value_lens[saved] = seglens[i];
-    *param_count = saved + 1;
-    KuHttpHandler* r = ku_http_trie_match(node->param, segs, seglens, nseg, i + 1, method, param_values, param_value_lens, param_count);
-    if (r) return r;
-    *param_count = saved;
-  }
-  return NULL;
-}
-/* True when the path matches some route under any method (405-vs-404 decision). */
-static int ku_http_trie_path_exists(KuHttpNode* node, const char** segs, size_t* seglens, size_t nseg, size_t i) {
-  if (i == nseg) return node->nh > 0 ? 1 : 0;
-  KuHttpNode* sc = ku_http_node_child(node, segs[i], seglens[i]);
-  if (sc && ku_http_trie_path_exists(sc, segs, seglens, nseg, i + 1)) return 1;
-  if (node->param && ku_http_trie_path_exists(node->param, segs, seglens, nseg, i + 1)) return 1;
-  return 0;
-}
-static int ku_http_name_eq(const char* ptr, size_t len, const char* expected) {
-  size_t n = strlen(expected);
-  if (len != n) return 0;
-  for (size_t i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)ptr[i];
-    if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
-    if (c != (unsigned char)expected[i]) return 0;
-  }
-  return 1;
-}
-static unsigned long long ku_http_deadline_ms(uint32_t timeout_ms) {
-  unsigned long long now = ku_http_now_ms();
-  if (~0ULL - now < (unsigned long long)timeout_ms) return ~0ULL;
-  return now + (unsigned long long)timeout_ms;
-}
-/* Shared-I/O request storage. No field borrows a connection buffer or worker
-   stack. Once queued, the job owns this input through actual handler return. */
-static int ku_http_buffer_reserve(KuHttpBufferBudget* budget, size_t bytes);
-static void ku_http_buffer_refund(KuHttpBufferBudget* budget, size_t bytes);
-typedef struct {
-  KuHttpBufferBudget* budget; size_t body_charge, metadata_charge;
-  char method[33];
-  char* target;
-  size_t path_len;
-  KuObject* headers;
-  char* body;
-  size_t body_len;
-  int keep_alive;
-} KuHttpInput;
-static void ku_http_input_drop(KuHttpInput* input) {
-  if (!input) return;
-  if (input->headers) ku_object_drop(input->headers);
-  free(input->target);
-  free(input->body);
-  ku_http_buffer_refund(input->budget, input->body_charge);
-  ku_http_buffer_refund(input->budget, input->metadata_charge);
-  *input = (KuHttpInput){0};
-}
-static KuStruct___ku_http_response ku_http_status_response(int64_t status, const char* message) {
-  KuStruct___ku_http_response response = {0};
-  response.status = status;
-  response.content_type = ku_string_static((const uint8_t*)"text/plain; charset=utf-8", 25);
-  response.body = ku_string_static((const uint8_t*)message, strlen(message));
-  return response;
-}
-/* Pure header interpretation, shared by every socket readiness turn. Framing
-   and its byte-limit/CRLF precedence have already been checked by the owner.
-   The caller drops input on every error, including partial construction. */
-static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, size_t hlen, KuHttpInput* input) {
-  long long max_body = server->max_body_bytes >= 0 ? server->max_body_bytes : 1000000;
-  if (hlen == 0) { return 400; }
-  /* The interpreter decodes the complete header block as UTF-8 before parsing.
-     Enforce the same boundary here so invalid field values never become KuString
-     instances or reach a handler. The body prefix is validated separately after
-     Content-Length is applied. */
-  if (!ku_http_utf8_valid((const uint8_t*)hdr, hlen)) { return 400; }
-  size_t fl_end = hlen;
-  for (size_t i = 0; i + 1 < hlen; i++) { if (hdr[i] == '\r' && hdr[i + 1] == '\n') { fl_end = i; break; } }
-  size_t sp1 = fl_end, sp2 = fl_end;
-  for (size_t i = 0; i < fl_end; i++) if (hdr[i] == ' ') { sp1 = i; break; }
-  if (sp1 < fl_end) for (size_t i = sp1 + 1; i < fl_end; i++) if (hdr[i] == ' ') { sp2 = i; break; }
-  if (sp1 == 0 || sp1 >= fl_end || sp2 <= sp1 + 1 || sp2 + 1 >= fl_end) { return 400; }
-  for (size_t i = sp2 + 1; i < fl_end; i++) if (hdr[i] == ' ') { return 400; }
-  size_t method_len = sp1;
-  size_t target_start = sp1 + 1, target_len = sp2 - target_start;
-  size_t version_start = sp2 + 1, version_len = fl_end - version_start;
-  if (method_len > 32) { return 400; }
-  for (size_t i = 0; i < method_len; i++) if (!ku_http_is_tchar((unsigned char)hdr[i])) { return 400; }
-  if (version_len != 8 || memcmp(hdr + version_start, "HTTP/1.1", 8) != 0) { return 400; }
-  if (!ku_http_valid_origin_form((const uint8_t*)hdr + target_start, target_len)) {
-    return 400;
-  }
-  int host_count = 0, content_length_count = 0;
-  input->keep_alive = 1;
-  { size_t i = (fl_end < hlen) ? fl_end + 2 : hlen;
-    while (i < hlen) {
-      size_t ls = i;
-      size_t le = hlen;
-      for (size_t k = i; k + 1 < hlen; k++) { if (hdr[k] == '\r' && hdr[k + 1] == '\n') { le = k; break; } }
-      if (le > ls) {
-        if (hdr[ls] == ' ' || hdr[ls] == '\t') { return 400; }
-        size_t colon = le;
-        for (size_t k = ls; k < le; k++) if (hdr[k] == ':') { colon = k; break; }
-        if (colon == ls || colon >= le) { return 400; }
-        for (size_t k = ls; k < colon; k++) if (!ku_http_is_tchar((unsigned char)hdr[k])) { return 400; }
-        size_t vs = colon + 1, ve = le;
-        for (size_t k = vs; k < ve; k++) {
-          unsigned char c = (unsigned char)hdr[k];
-          if (c != '\t' && (c < 0x20 || c == 0x7f)) { return 400; }
-        }
-        while (vs < ve && (hdr[vs] == ' ' || hdr[vs] == '\t')) vs++;
-        while (ve > vs && (hdr[ve - 1] == ' ' || hdr[ve - 1] == '\t')) ve--;
-        if (ku_http_name_eq(hdr + ls, colon - ls, "host")) {
-          host_count++;
-          if (host_count != 1 || vs == ve) { return 400; }
-        } else if (ku_http_name_eq(hdr + ls, colon - ls, "connection")) {
-          /* Every duplicate field participates; a later keep-alive can never
-             undo close. Match whole comma-separated, OWS-trimmed tokens. */
-          for (size_t start = vs; start < ve;) {
-            size_t end = start;
-            while (end < ve && hdr[end] != ',') end++;
-            size_t left = start, right = end;
-            while (left < right && (hdr[left] == ' ' || hdr[left] == '\t')) left++;
-            while (right > left && (hdr[right - 1] == ' ' || hdr[right - 1] == '\t')) right--;
-            if (ku_http_name_eq(hdr + left, right - left, "close")) input->keep_alive = 0;
-            start = end < ve ? end + 1 : ve;
-          }
-        } else if (ku_http_name_eq(hdr + ls, colon - ls, "transfer-encoding")) {
-          return 400;
-        } else if (ku_http_name_eq(hdr + ls, colon - ls, "expect")) {
-          return 417;
-        } else if (ku_http_name_eq(hdr + ls, colon - ls, "content-length")) {
-          content_length_count++;
-          if (content_length_count != 1 || vs == ve) { return 400; }
-          for (size_t k = vs; k < ve; k++) if (hdr[k] < '0' || hdr[k] > '9') { return 400; }
-        }
-      }
-      if (le >= hlen) break;
-      i = le + 2;
-    }
-  }
-  if (host_count != 1) { return 400; }
-  memcpy(input->method, hdr, method_len); input->method[method_len] = '\0';
-  /* The target is length-checked BEFORE it is copied and before any routing, so an
-     over-long target can never be truncated into a shorter one that matches a real
-     route, and never reaches a handler. */
-  if (target_len > (size_t)KU_HTTP_MAX_TARGET) { return 414; }
-  /* All header string allocations, including overwritten duplicate values,
-     fit within the raw block length. Reserve before target/map construction;
-     the HashMap control buckets are a separately documented fixed/type cost. */
-  size_t metadata_bound = target_len + 1 + hlen;
-  if (!ku_http_buffer_reserve(input->budget, metadata_bound)) return 503;
-  input->metadata_charge = metadata_bound;
-  char* target = (char*)malloc(target_len + 1);
-  if (!target) return 500;
-  input->target = target;
-  memcpy(target, hdr + target_start, target_len); target[target_len] = '\0';
-  /* Header map (lowercased names, trimmed values) matching the interpreter, plus a
-     strict content-length parse: present-but-non-numeric -> 400. */
-  KuObject* headers = ku_http_parse_headers(hdr, (int)hlen);
-  input->headers = headers;
-  size_t metadata_bytes = target_len + 1;
-  for (size_t slot=0; slot<headers->cap; slot++) {
-    KuEntry* entry=&headers->entries[slot];
-    if (!entry->used) continue;
-    if (entry->key.storage==KU_STRING_OWNED) metadata_bytes+=entry->key.capacity;
-    if (entry->value.tag==KU_STR && entry->value.as.s.storage==KU_STRING_OWNED)
-      metadata_bytes+=entry->value.as.s.capacity;
-  }
-  if (metadata_bytes > input->metadata_charge) { return 500; }
-  ku_http_buffer_refund(input->budget, input->metadata_charge-metadata_bytes);
-  input->metadata_charge=metadata_bytes;
-  /* Content-Length is strict RFC decimal: one or more digits, no sign. Duplicate
-     fields and Transfer-Encoding were rejected before the map was built.
-
-     The accumulator is unsigned WITH an explicit overflow guard. A signed
-     accumulator wraps on a huge value (undefined behaviour), and the wrapped
-     negative result would then slip past the 413 check and reach the handler with
-     an empty body and a 200 -- where the interpreter answers 400. */
-  unsigned long long content_length = 0;
-  { KuValue* cv = ku_object_get(headers, ku_string_static((const uint8_t*)"content-length", 14));
-    if (cv && cv->tag == KU_STR) {
-      KuString s = cv->as.s;
-      unsigned long long v = 0; int ok = 1; size_t k = 0;
-      if (s.len == 0) ok = 0;
-      for (; ok && k < s.len; k++) {
-        uint8_t d = ((uint8_t*)s.ptr)[k];
-        if (d < '0' || d > '9') { ok = 0; break; }
-        if (v > (~0ULL - (unsigned long long)(d - '0')) / 10ULL) { ok = 0; break; }
-        v = v * 10ULL + (unsigned long long)(d - '0');
-      }
-      if (!ok) { return 400; }
-      content_length = v;
-    }
-  }
-  if (content_length > (unsigned long long)max_body) { return 413; }
-  char* qmark = strchr(target, '?');
-  size_t path_len = qmark ? (size_t)(qmark - target) : strlen(target);
-  input->path_len = path_len;
-  size_t request_segments = 0;
-  { size_t i = 0;
-    while (i < path_len) {
-      while (i < path_len && target[i] == '/') i++;
-      size_t start = i;
-      while (i < path_len && target[i] != '/') i++;
-      if (i > start && ++request_segments > (size_t)KU_HTTP_MAX_SEGS) {
-        return 414;
-      }
-    }
-  }
-  input->body_len = (size_t)content_length;
-  if (input->body_len) {
-    if (!ku_http_buffer_reserve(input->budget, input->body_len)) return 503;
-    input->body_charge = input->body_len;
-    input->body = (char*)malloc(input->body_len);
-    if (!input->body) return 500; /* input_drop refunds after freeing the owner. */
-  }
-  return 0;
-}
-typedef struct KuHttpJob KuHttpJob;
-static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms);
-/* Only a handler worker calls this function. All synchronous exit/deadline TLS
-   remains on that same execution thread; socket ownership never enters it. */
-static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server, KuHttpInput* input, KuHttpJob* job) {
-  const char* method = input->method;
-  const char* target = input->target;
-  size_t path_len = input->path_len;
-  const char* body_buf = input->body;
-  size_t body_len = input->body_len;
-  /* Sized off the target limit, not a smaller fixed buffer: normalization only
-     ever adds a leading '/', so this cannot truncate a target that passed the 414
-     check -- and a truncated normalized path would reintroduce exactly the route
-     collision the 414 check exists to prevent. */
-  char norm[KU_HTTP_MAX_TARGET + 2];
-  ku_http_normalize_path(target, path_len, norm, sizeof(norm));
-  const char* segs[KU_HTTP_MAX_SEGS]; size_t seglens[KU_HTTP_MAX_SEGS]; size_t nseg = 0;
-  { size_t nl = strlen(norm); size_t j = 0;
-    while (j < nl) {
-      while (j < nl && norm[j] == '/') j++;
-      size_t st = j;
-      while (j < nl && norm[j] != '/') j++;
-      if (j > st) {
-        if (nseg >= KU_HTTP_MAX_SEGS) { return ku_http_status_response(414, "URI Too Long"); }
-        segs[nseg] = norm + st; seglens[nseg] = j - st; nseg++;
-      }
-    }
-  }
-  const char* param_values[KU_HTTP_MAX_SEGS];
-  size_t param_value_lens[KU_HTTP_MAX_SEGS];
-  size_t param_count = 0;
-  KuHttpHandler* route = ku_http_trie_match(server->root, segs, seglens, nseg, 0, method, param_values, param_value_lens, &param_count);
-  if (route && param_count != route->nparams) {
-    return ku_http_status_response(500, "Internal Server Error");
-  }
-  if (route) {
-    KuStruct___ku_http_response resp = (KuStruct___ku_http_response){0};
-    int handler_timed_out = 0;
-    KuSyncExitSignal handler_signal = {0};
-    __ku_sync_reset();
-    if (route->arity == 1) {
-      KuObject* params = ku_object_new(0);
-      for (size_t p = 0; p < route->nparams; p++) {
-        KuString key = ku_http_string_copy(route->param_names[p], strlen(route->param_names[p]));
-        KuString val = ku_http_string_copy(param_values[p], param_value_lens[p]);
-        ku_object_set(params, key, ku_v_str(val));
-      }
-      KuStruct___ku_http_request req;
-      req.method = ku_http_string_copy(method, strlen(method));
-      req.path = ku_http_string_copy(target, path_len);
-      req.body = ku_http_string_copy(body_buf ? body_buf : "", body_len);
-      req.params = params;
-      req.query = ku_http_parse_query(target, path_len);
-      req.headers = input->headers; input->headers = NULL;
-      if (route->returns_result) {
-        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
-        KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_sync_finish_request(&handler_signal);
-        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
-        else resp = ku_http_response_from_result(rr);
-      } else {
-        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
-        resp = ((KuStruct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_sync_finish_request(&handler_signal);
-      }
-    } else {
-      if (route->returns_result) {
-        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
-        KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_sync_finish_request(&handler_signal);
-        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
-        else resp = ku_http_response_from_result(rr);
-      } else {
-        ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
-        resp = ((KuStruct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_sync_finish_request(&handler_signal);
-      }
-    }
-    if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) {
-      /* The execution worker owns the response until publication. A plain
-         handler may complete after its original deadline; drop that response
-         before selecting 504/500. Failed Result transport was dropped above. */
-      if (!route->returns_result) ku_drop_struct___ku_http_response(&resp);
-      return handler_timed_out
-        ? ku_http_status_response(504, "Gateway Timeout")
-        : ku_http_status_response(500, "Internal Server Error");
-    } else {
-      return resp;
-    }
-  } else {
-    if (ku_http_trie_path_exists(server->root, segs, seglens, nseg, 0)) {
-      return ku_http_status_response(405, "Method Not Allowed");
-    } else {
-      return ku_http_status_response(404, "Not Found");
-    }
-  }
-}
-static KuResult_null ku_http_listen_err(KuHttpServer* server, const char* message) {
-  ku_http_server_free(server);
-  return (KuResult_null){ false, 0, ku_error_make(ku_string_static((const uint8_t*)"http", 4), ku_string_static((const uint8_t*)"listen_failed", 13), ku_string_static((const uint8_t*)message, strlen(message))) };
-}
-/* One shared socket owner, bounded input slots, and handler-only workers.
-   A slot remains charged while its independent job has any worker/queue owner,
-   even after its socket closes. Thus at most max_active slot/job obligations
-   coexist, plus max_pending accepted sockets and one bounded 503 owner. */
-#define KU_HTTP_WORKER_CAP 64
-#define KU_HTTP_ACCEPT_PEER_BACKOFF_CAP_MS 8
-#define KU_HTTP_ACCEPT_RESOURCE_RETRY_CAP 8
-#define KU_HTTP_ACCEPT_RESOURCE_BACKOFF_STEP_MS 10
-static KuHttpAtomicCounter ku_http_active_conns;
-
-#if defined(_WIN32)
-typedef CRITICAL_SECTION KuHttpMutex;
-typedef CONDITION_VARIABLE KuHttpCondition;
-typedef WSAPOLLFD KuHttpPollFd;
-#define KU_HTTP_POLL_READ POLLRDNORM
-#define KU_HTTP_POLL_WRITE POLLWRNORM
-static int ku_http_mutex_init(KuHttpMutex* mutex) { return InitializeCriticalSectionAndSpinCount(mutex, 0) != 0; }
-static void ku_http_mutex_destroy(KuHttpMutex* mutex) { DeleteCriticalSection(mutex); }
-static void ku_http_mutex_lock(KuHttpMutex* mutex) { EnterCriticalSection(mutex); }
-static void ku_http_mutex_unlock(KuHttpMutex* mutex) { LeaveCriticalSection(mutex); }
-static int ku_http_sync_init(KuHttpMutex* mutex, KuHttpCondition* condition) {
-  if (!ku_http_mutex_init(mutex)) return 0;
-  InitializeConditionVariable(condition);
-  return 1;
-}
-static void ku_http_sync_destroy(KuHttpMutex* mutex, KuHttpCondition* condition) {
-  (void)condition; ku_http_mutex_destroy(mutex);
-}
-static void ku_http_condition_wait(KuHttpCondition* condition, KuHttpMutex* mutex) {
-  if (!SleepConditionVariableCS(condition, mutex, INFINITE)) {
-    fputs("http queue condition wait failed\n", stderr); exit(1);
-  }
-}
-static void ku_http_condition_signal(KuHttpCondition* condition) { WakeConditionVariable(condition); }
-static void ku_http_condition_broadcast(KuHttpCondition* condition) { WakeAllConditionVariable(condition); }
-static int ku_http_poll(KuHttpPollFd* items, size_t count, int timeout_ms) {
-  return WSAPoll(items, (ULONG)count, timeout_ms);
-}
-static int ku_http_socket_nonblocking(KuHttpSocket socket_value) {
-  u_long enabled = 1;
-  return ioctlsocket(socket_value, FIONBIO, &enabled) == 0;
-}
-static int ku_http_socket_would_block(int error) { return error == WSAEWOULDBLOCK; }
-#else
-typedef pthread_mutex_t KuHttpMutex;
-typedef pthread_cond_t KuHttpCondition;
-typedef struct pollfd KuHttpPollFd;
-#define KU_HTTP_POLL_READ POLLIN
-#define KU_HTTP_POLL_WRITE POLLOUT
-static int ku_http_mutex_init(KuHttpMutex* mutex) { return pthread_mutex_init(mutex, NULL) == 0; }
-static void ku_http_mutex_destroy(KuHttpMutex* mutex) {
-  if (pthread_mutex_destroy(mutex) != 0) { fputs("http mutex destroy failed\n", stderr); exit(1); }
-}
-static void ku_http_mutex_lock(KuHttpMutex* mutex) {
-  if (pthread_mutex_lock(mutex) != 0) { fputs("http queue mutex lock failed\n", stderr); exit(1); }
-}
-static void ku_http_mutex_unlock(KuHttpMutex* mutex) {
-  if (pthread_mutex_unlock(mutex) != 0) { fputs("http queue mutex unlock failed\n", stderr); exit(1); }
-}
-static int ku_http_sync_init(KuHttpMutex* mutex, KuHttpCondition* condition) {
-  if (!ku_http_mutex_init(mutex)) return 0;
-  if (pthread_cond_init(condition, NULL) != 0) { ku_http_mutex_destroy(mutex); return 0; }
-  return 1;
-}
-static void ku_http_sync_destroy(KuHttpMutex* mutex, KuHttpCondition* condition) {
-  if (pthread_cond_destroy(condition) != 0) { fputs("http condition destroy failed\n", stderr); exit(1); }
-  ku_http_mutex_destroy(mutex);
-}
-static void ku_http_condition_wait(KuHttpCondition* condition, KuHttpMutex* mutex) {
-  if (pthread_cond_wait(condition, mutex) != 0) {
-    fputs("http queue condition wait failed\n", stderr); exit(1);
-  }
-}
-static void ku_http_condition_signal(KuHttpCondition* condition) {
-  if (pthread_cond_signal(condition) != 0) { fputs("http queue condition signal failed\n", stderr); exit(1); }
-}
-static void ku_http_condition_broadcast(KuHttpCondition* condition) {
-  if (pthread_cond_broadcast(condition) != 0) { fputs("http queue condition broadcast failed\n", stderr); exit(1); }
-}
-static int ku_http_poll(KuHttpPollFd* items, size_t count, int timeout_ms) {
-  return poll(items, (nfds_t)count, timeout_ms);
-}
-static int ku_http_socket_nonblocking(KuHttpSocket socket_value) {
-  int flags = fcntl(socket_value, F_GETFL, 0);
-  return flags >= 0 && fcntl(socket_value, F_SETFL, flags | O_NONBLOCK) == 0;
-}
-static int ku_http_socket_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
-#endif
-
-/* A connected, private loopback datagram pair needs no connect/accept wait.
-   Both endpoints are nonblocking. A full receiver already makes poll readable;
-   no per-job completion can be lost when redundant wake bytes are coalesced. */
-typedef struct { KuHttpSocket read_socket; KuHttpSocket write_socket; } KuHttpWake;
-static void ku_http_wake_close(KuHttpWake* wake) {
-  ku_http_socket_close(wake->read_socket);
-  ku_http_socket_close(wake->write_socket);
-  wake->read_socket = wake->write_socket = KU_HTTP_INVALID_SOCKET;
-}
-static int ku_http_wake_init(KuHttpWake* wake) {
-  wake->read_socket = wake->write_socket = KU_HTTP_INVALID_SOCKET;
-  wake->read_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (wake->read_socket == KU_HTTP_INVALID_SOCKET) return 0;
-  struct sockaddr_in address; memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  address.sin_port = 0;
-  if (bind(wake->read_socket, (struct sockaddr*)&address, sizeof(address)) != 0) goto failed;
-#if defined(_WIN32)
-  int address_length = (int)sizeof(address);
-#else
-  socklen_t address_length = (socklen_t)sizeof(address);
-#endif
-  if (getsockname(wake->read_socket, (struct sockaddr*)&address, &address_length) != 0) goto failed;
-  wake->write_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (wake->write_socket == KU_HTTP_INVALID_SOCKET) goto failed;
-  if (!ku_http_socket_nonblocking(wake->read_socket) || !ku_http_socket_nonblocking(wake->write_socket)) goto failed;
-  if (connect(wake->write_socket, (struct sockaddr*)&address, sizeof(address)) != 0) goto failed;
-  return 1;
-failed:
-  ku_http_wake_close(wake);
-  return 0;
-}
-static void ku_http_wake_notify(KuHttpWake* wake) {
-  const char byte = 1;
-  for (int attempt = 0; attempt < 8; attempt++) {
-    int sent = ku_http_socket_send(wake->write_socket, &byte, 1);
-    if (sent == 1) return;
-    int error = ku_http_socket_last_error();
-    if (sent < 0 && ku_http_socket_would_block(error)) return;
-    if (sent < 0 && ku_http_socket_error_interrupted(error)) continue;
-    /* Never leave accepted work waiting forever after a hard wake failure. */
-    fputs("http reactor wake failed\n", stderr); exit(1);
-  }
-  fputs("http reactor wake repeatedly interrupted\n", stderr); exit(1);
-}
-static void ku_http_wake_drain(KuHttpWake* wake) {
-  char bytes[64];
-  for (int turn = 0; turn < 256; turn++) {
-    int received = ku_http_socket_recv(wake->read_socket, bytes, sizeof(bytes));
-    if (received >= 0) continue;
-    int error = ku_http_socket_last_error();
-    if (ku_http_socket_would_block(error)) return;
-    if (ku_http_socket_error_interrupted(error)) continue;
-    fputs("http reactor wake read failed\n", stderr); exit(1);
-  }
-}
-
-/* Payload backing quota, independent from Task/frame budgets. Mutex protects
-   worker input retirement against the socket owner's allocation admission.
-   Fixed slots, header maps, arbitrary Ku values and external libraries are not
-   charged here; pre-existing response backing is admitted at publication. */
-struct KuHttpBufferBudget {
-  KuHttpMutex lock;
-  size_t limit, current, peak, rejected;
-};
-static int ku_http_buffer_reserve(KuHttpBufferBudget* budget, size_t bytes) {
-  if (!bytes) return 1;
-  if (!budget) return 0;
-  ku_http_mutex_lock(&budget->lock);
-  int admitted = bytes <= budget->limit - budget->current;
-  if (admitted) {
-    budget->current += bytes;
-    if (budget->current > budget->peak) budget->peak = budget->current;
-  } else if (budget->rejected < SIZE_MAX) budget->rejected++;
-  ku_http_mutex_unlock(&budget->lock);
-  return admitted;
-}
-static void ku_http_buffer_refund(KuHttpBufferBudget* budget, size_t bytes) {
-  if (!bytes) return;
-  if (!budget) { fputs("http buffer budget owner missing\n",stderr); exit(1); }
-  ku_http_mutex_lock(&budget->lock);
-  if (bytes > budget->current) { fputs("http buffer budget underflow\n",stderr); exit(1); }
-  budget->current -= bytes;
-  ku_http_mutex_unlock(&budget->lock);
-}
-static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct___ku_http_response* response) {
-  size_t response_charge = 0;
-  KuString response_strings[3] = { response->body, response->content_type, response->location };
-  int response_fits = 1;
-  for (int index=0; index<3; index++) if (response_strings[index].storage == KU_STRING_OWNED) {
-    size_t bytes = response_strings[index].capacity;
-    if (bytes > SIZE_MAX - response_charge) { response_fits = 0; break; }
-    response_charge += bytes;
-  }
-  if (!response_fits || !ku_http_buffer_reserve(budget, response_charge)) {
-    ku_drop_struct___ku_http_response(response);
-    *response = ku_http_status_response(503, "Service Unavailable");
-    response_charge = 0;
-  }
-  return response_charge;
-}
-typedef struct KuHttpQueue {
-  KuHttpJob** items;
-  int cap; int head; int tail; int count; int closed; int abort;
-  size_t resident;
-  KuHttpMutex lock;
-  KuHttpCondition not_empty;
-  KuHttpWake* wake;
-} KuHttpQueue;
-struct KuHttpJob {
-  KuAtomicRefcount owners;
-  KuHttpMutex lock;
-  KuHttpQueue* queue;
-  KuHttpBufferBudget* budget; size_t response_charge;
-  KuHttpInput input;
-  KuStruct___ku_http_response response;
-  unsigned long long handler_deadline;
-  int claimed; int started; int completed; int cancelled;
-};
-static int ku_http_queue_init(KuHttpQueue* queue, int cap, KuHttpWake* wake) {
-  memset(queue, 0, sizeof(*queue));
-  queue->cap = cap;
-  queue->wake = wake;
-  queue->items = (KuHttpJob**)calloc((size_t)cap, sizeof(KuHttpJob*));
-  if (!queue->items) return 0;
-  if (!ku_http_sync_init(&queue->lock, &queue->not_empty)) {
-    free(queue->items); queue->items = NULL; return 0;
-  }
-  return 1;
-}
-static KuHttpJob* ku_http_job_new(KuHttpQueue* queue, KuHttpInput* input) {
-  KuHttpJob* job = (KuHttpJob*)calloc(1, sizeof(KuHttpJob));
-  if (!job) return NULL;
-  if (!ku_http_mutex_init(&job->lock)) { free(job); return NULL; }
-  ku_atomic_refcount_init(&job->owners);
-  job->queue = queue;
-  job->budget = input->budget;
-  job->input = *input; *input = (KuHttpInput){0};
-  ku_http_mutex_lock(&queue->lock);
-  queue->resident++;
-  ku_http_mutex_unlock(&queue->lock);
-  return job;
-}
-static void ku_http_job_release(KuHttpJob* job) {
-  if (!job) return;
-  KuHttpQueue* queue = job->queue;
-  if (ku_refcount_release(&job->owners, "http job")) {
-    ku_http_input_drop(&job->input);
-    ku_drop_struct___ku_http_response(&job->response);
-    ku_http_buffer_refund(job->budget, job->response_charge);
-    ku_http_mutex_destroy(&job->lock);
-    free(job);
-    ku_http_mutex_lock(&queue->lock);
-    if (!queue->resident) { fputs("http job retirement underflow\n", stderr); exit(1); }
-    queue->resident--;
-    ku_http_mutex_unlock(&queue->lock);
-  }
-  /* Release publication precedes wake, including the non-final worker owner.
-     ClosedWaitingJob can now see the actual remaining owner count. */
-  ku_http_wake_notify(queue->wake);
-}
-static int ku_http_job_only_owner(KuHttpJob* job) {
-  size_t current = ku_atomic_refcount_load(&job->owners);
-  for (;;) {
-    size_t expected = current;
-    if (ku_atomic_refcount_compare_exchange_acq_rel(&job->owners, &expected, current)) return current == 1;
-    current = expected;
-  }
-}
-static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
-  /* Exactly once at actual handler invocation, preserving native's original
-     deadline origin. No queue or readiness turn restarts an active deadline. */
-  __ku_handler_timeout_begin(timeout_ms);
-  ku_http_mutex_lock(&job->lock);
-  if (job->started) { fputs("http handler deadline restarted\n", stderr); exit(1); }
-  job->handler_deadline = __ku_handler_deadline;
-  job->started = 1;
-  ku_http_mutex_unlock(&job->lock);
-  ku_http_wake_notify(job->queue->wake);
-}
-static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
-  KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
-  ku_http_input_drop(&job->input);
-  size_t response_charge = ku_http_buffer_admit_response(job->budget, &response);
-  ku_http_mutex_lock(&job->lock);
-  job->response_charge = response_charge;
-  job->response = response;
-  job->completed = 1;
-  ku_http_mutex_unlock(&job->lock);
-  ku_http_wake_notify(job->queue->wake);
-}
-static int ku_http_queue_push(KuHttpQueue* queue, KuHttpJob* job) {
-  int accepted = 0;
-  ku_http_mutex_lock(&queue->lock);
-  if (!queue->closed) {
-    /* Each queued job already owns one of cap live slots. A second pending
-       credit is neither acquired nor needed; a full queue here is a bug. */
-    if (queue->count >= queue->cap) { fputs("http job queue capacity invariant failed\n", stderr); exit(1); }
-    ku_refcount_retain(&job->owners, "http job");
-    queue->items[queue->tail] = job;
-    queue->tail = (queue->tail + 1) % queue->cap;
-    queue->count++;
-    ku_http_condition_signal(&queue->not_empty);
-    accepted = 1;
-  }
-  ku_http_mutex_unlock(&queue->lock);
-  return accepted;
-}
-static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
-  KuHttpJob* job = NULL;
-  ku_http_mutex_lock(&queue->lock);
-  while (queue->count == 0 && !queue->closed) ku_http_condition_wait(&queue->not_empty, &queue->lock);
-  if (queue->count && !queue->abort) {
-    job = queue->items[queue->head];
-    queue->items[queue->head] = NULL;
-    queue->head = (queue->head + 1) % queue->cap;
-    queue->count--;
-    ku_http_mutex_lock(&job->lock);
-    job->claimed = 1;
-    ku_http_mutex_unlock(&job->lock);
-  }
-  ku_http_mutex_unlock(&queue->lock);
-  if (job) ku_http_wake_notify(queue->wake);
-  return job;
-}
-static void ku_http_queue_close(KuHttpQueue* queue, int drain) {
-  ku_http_mutex_lock(&queue->lock);
-  queue->closed = 1;
-  if (!drain) queue->abort = 1;
-  ku_http_condition_broadcast(&queue->not_empty);
-  ku_http_mutex_unlock(&queue->lock);
-  if (!drain) for (;;) {
-    ku_http_mutex_lock(&queue->lock);
-    KuHttpJob* job = NULL;
-    if (queue->count) {
-      job = queue->items[queue->head];
-      queue->items[queue->head] = NULL;
-      queue->head = (queue->head + 1) % queue->cap;
-      queue->count--;
-    }
-    ku_http_mutex_unlock(&queue->lock);
-    if (!job) break;
-    ku_http_input_drop(&job->input);
-    ku_http_mutex_lock(&job->lock);
-    job->cancelled = 1; job->completed = 1;
-    ku_http_mutex_unlock(&job->lock);
-    ku_http_job_release(job);
-  }
-}
-static size_t ku_http_queue_resident(KuHttpQueue* queue) {
-  ku_http_mutex_lock(&queue->lock);
-  size_t resident = queue->resident;
-  ku_http_mutex_unlock(&queue->lock);
-  return resident;
-}
-static void ku_http_queue_free(KuHttpQueue* queue) {
-  if (queue->count || queue->resident) { fputs("http queue freed before actual retirement\n", stderr); exit(1); }
-  ku_http_sync_destroy(&queue->lock, &queue->not_empty);
-  free(queue->items); queue->items = NULL;
-}
-typedef struct { KuHttpServer* server; KuHttpQueue* queue; } KuHttpWorkerCtx;
-#if defined(_WIN32)
-static unsigned __stdcall ku_http_worker(void* argument) {
-#else
-static void* ku_http_worker(void* argument) {
-#endif
-  KuHttpWorkerCtx* context = (KuHttpWorkerCtx*)argument;
-  for (;;) {
-    KuHttpJob* job = ku_http_queue_pop(context->queue);
-    if (!job) break;
-    ku_http_job_run(context->server, job);
-    ku_http_job_release(job);
-  }
-#if defined(KU_NATIVE_RUNTIME_MYSQL)
-  /* Every request/input/temporary owned value was retired on this worker. */
-  ku_mysql_thread_shutdown();
-#endif
-#if defined(_WIN32)
-  return 0;
-#else
-  return NULL;
-#endif
-}
-
-typedef struct { const char* bytes; size_t length; } KuHttpPart;
-typedef struct {
-  KuStruct___ku_http_response response;
-  size_t charge;
-  char first[256]; char last[128];
-  KuHttpPart parts[9];
-  int count; int part;
-  size_t offset;
-} KuHttpOutput;
-enum {
-  KU_HTTP_IO_FREE = 0, KU_HTTP_IO_HEADER = 1, KU_HTTP_IO_BODY = 2,
-  KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
-  KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7
-};
-typedef struct {
-  KuHttpSocket socket_value;
-  KuHttpBufferBudget* budget;
-  int phase; int poll_index;
-  unsigned long long deadline;
-  char* header; size_t capacity; size_t buffered;
-  size_t body_received;
-  char* carry; size_t carry_length;
-  int keep_alive; int reused;
-  KuHttpInput input;
-  KuHttpJob* job;
-  KuHttpOutput output;
-  size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
-} KuHttpConnection;
-static void ku_http_output_part(KuHttpOutput* output, const char* bytes, size_t length) {
-  if (!length) return;
-  if (output->count >= 9) { fputs("http response segment bound exceeded\n", stderr); exit(1); }
-  output->parts[output->count++] = (KuHttpPart){bytes, length};
-}
-static void ku_http_connection_close(KuHttpConnection* connection) {
-  if (connection->socket_value != KU_HTTP_INVALID_SOCKET) {
-    ku_http_socket_shutdown_write(connection->socket_value);
-    ku_http_socket_close(connection->socket_value);
-    connection->socket_value = KU_HTTP_INVALID_SOCKET;
-    ku_http_atomic_decrement(&ku_http_active_conns);
-  }
-  free(connection->header); connection->header = NULL;
-  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
-  free(connection->carry); connection->carry = NULL;
-  ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
-  ku_http_input_drop(&connection->input);
-  ku_drop_struct___ku_http_response(&connection->output.response);
-  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
-  if (connection->job && !ku_http_job_only_owner(connection->job)) {
-    /* Keep the active slot charged until the queue/worker's real reference
-       retires. No completed or disconnected request can create an unbounded
-       tail of jobs while this physical socket/slot would otherwise be reused. */
-    connection->phase = KU_HTTP_IO_CLOSED_JOB;
-    connection->deadline = 0;
-    return;
-  }
-  if (connection->job) ku_http_job_release(connection->job);
-  memset(connection, 0, sizeof(*connection));
-  connection->socket_value = KU_HTTP_INVALID_SOCKET;
-}
-static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
-  free(connection->header); connection->header = NULL;
-  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
-  ku_http_input_drop(&connection->input);
-  ku_drop_struct___ku_http_response(&connection->output.response);
-  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
-  memset(&connection->output, 0, sizeof(connection->output));
-  if (response.status < 100 || response.status > 599 ||
-      !ku_http_field_value_safe(response.content_type.ptr, response.content_type.len) ||
-      !ku_http_field_value_safe(response.location.ptr, response.location.len)) {
-    ku_drop_struct___ku_http_response(&response);
-    ku_http_buffer_refund(connection->budget, response_charge); response_charge = 0; admitted = 1;
-    response = ku_http_status_response(500, "Internal Server Error");
-  }
-  if (!admitted) response_charge = ku_http_buffer_admit_response(connection->budget, &response);
-  connection->output.charge = response_charge;
-  connection->keep_alive = connection->keep_alive && response.status >= 200 && response.status < 400;
-  KuHttpOutput* output = &connection->output;
-  output->response = response;
-  size_t body_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
-    ? 0 : response.body.len;
-  int first_length = snprintf(output->first, sizeof(output->first), "HTTP/1.1 %lld %s\r\n", (long long)response.status, ku_http_status_text(response.status));
-  if (first_length < 0 || (size_t)first_length >= sizeof(output->first)) {
-    ku_http_connection_close(connection); return;
-  }
-  ku_http_output_part(output, output->first, (size_t)first_length);
-  if (response.content_type.len) {
-    ku_http_output_part(output, "content-type: ", 14);
-    ku_http_output_part(output, (const char*)response.content_type.ptr, response.content_type.len);
-    ku_http_output_part(output, "\r\n", 2);
-  }
-  if (response.location.len) {
-    ku_http_output_part(output, "location: ", 10);
-    ku_http_output_part(output, (const char*)response.location.ptr, response.location.len);
-    ku_http_output_part(output, "\r\n", 2);
-  }
-  int last_length = ((response.status >= 100 && response.status < 200) || response.status == 204 || response.status == 304)
-    ? snprintf(output->last, sizeof(output->last), "connection: %s\r\n\r\n", connection->keep_alive ? "keep-alive" : "close")
-    : snprintf(output->last, sizeof(output->last), "content-length: %llu\r\nconnection: %s\r\n\r\n", (unsigned long long)body_length, connection->keep_alive ? "keep-alive" : "close");
-  if (last_length < 0 || (size_t)last_length >= sizeof(output->last)) {
-    ku_http_connection_close(connection); return;
-  }
-  ku_http_output_part(output, output->last, (size_t)last_length);
-  ku_http_output_part(output, (const char*)response.body.ptr, body_length);
-  connection->phase = KU_HTTP_IO_WRITE;
-  connection->deadline = ku_http_deadline_ms((uint32_t)(server->write_timeout_ms > 0 ? server->write_timeout_ms : 10000));
-}
-static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer* server, int status) {
-  connection->keep_alive = 0;
-  ku_http_connection_response(connection, server, ku_http_status_response(status, ku_http_status_text(status)), 0, 0);
-}
-static void ku_http_connection_start(KuHttpConnection* connection, KuHttpSocket socket_value, KuHttpServer* server) {
-  memset(connection, 0, sizeof(*connection));
-  connection->socket_value = socket_value;
-  connection->budget = server->buffer_budget;
-  connection->phase = KU_HTTP_IO_HEADER;
-  if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
-  connection->capacity = 1024;
-  connection->header = (char*)malloc(connection->capacity);
-  connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) ku_http_connection_status(connection, server, 500);
-}
-/* A response may be published before the worker releases its real reference.
-   Reuse the physical slot only after that owner retires, exactly as close does. */
-static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttpServer* server) {
-  if (!connection->keep_alive) { ku_http_connection_close(connection); return; }
-  if (connection->job && !ku_http_job_only_owner(connection->job)) {
-    connection->phase = KU_HTTP_IO_REUSE_WAIT; connection->deadline = 0; return;
-  }
-  if (connection->job) { ku_http_job_release(connection->job); connection->job = NULL; }
-  ku_drop_struct___ku_http_response(&connection->output.response);
-  ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
-  memset(&connection->output, 0, sizeof(connection->output));
-  connection->keep_alive = 0; connection->reused = 1;
-  connection->buffered = 0; connection->body_received = 0;
-  if (!ku_http_buffer_reserve(connection->budget, 1024)) { ku_http_connection_status(connection, server, 503); return; }
-  connection->capacity = 1024;
-  connection->header = (char*)malloc(connection->capacity);
-  connection->phase = KU_HTTP_IO_HEADER;
-  connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) ku_http_connection_status(connection, server, 500);
-}
-static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
-  if (!ku_http_utf8_valid((const uint8_t*)connection->input.body, connection->input.body_len)) {
-    ku_http_connection_status(connection, server, 400); return;
-  }
-  KuHttpJob* job = ku_http_job_new(queue, &connection->input);
-  if (!job) { ku_http_connection_status(connection, server, 500); return; }
-  connection->job = job;
-  connection->phase = KU_HTTP_IO_JOB;
-  connection->deadline = 0;
-  if (!workers) {
-    /* Preserve the old no-worker fallback. The owner may execute a complete
-       handler inline only when no execution worker could be created at all. */
-    ku_http_mutex_lock(&job->lock); job->claimed = 1; ku_http_mutex_unlock(&job->lock);
-    ku_http_job_run(server, job);
-  } else if (!ku_http_queue_push(queue, job)) {
-    ku_http_connection_close(connection);
-  }
-}
-static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
-  if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
-  char incoming[KU_HTTP_READ_CHUNK];
-  int received;
-  if (connection->carry_length) {
-    if (connection->carry_length > sizeof(incoming)) { ku_http_connection_status(connection, server, 500); return; }
-    received = (int)connection->carry_length;
-    memcpy(incoming, connection->carry, connection->carry_length);
-    free(connection->carry); connection->carry = NULL;
-  ku_http_buffer_refund(connection->budget, connection->carry_length); connection->carry_length = 0;
-  } else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
-  if (received < 0) {
-    int error = ku_http_socket_last_error();
-    if (ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
-    ku_http_connection_status(connection, server, 408); return;
-  }
-  if (!received) {
-    if (connection->reused && !connection->buffered) ku_http_connection_close(connection);
-    else ku_http_connection_status(connection, server, 400);
-    return;
-  }
-  size_t scan_from = connection->buffered;
-  if ((size_t)received > SIZE_MAX - scan_from) { ku_http_connection_status(connection, server, 500); return; }
-  size_t needed = scan_from + (size_t)received;
-  if (needed > connection->capacity) {
-    size_t capacity = connection->capacity;
-    while (capacity < needed) {
-      if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
-      capacity *= 2;
-    }
-    /* Reserve the full new backing while the old allocation may coexist. */
-    if (!ku_http_buffer_reserve(connection->budget, capacity)) { ku_http_connection_status(connection, server, 503); return; }
-    char* grown = (char*)realloc(connection->header, capacity);
-    if (!grown) {
-      ku_http_buffer_refund(connection->budget, capacity);
-      ku_http_connection_status(connection, server, 500); return;
-    }
-    ku_http_buffer_refund(connection->budget, connection->capacity);
-    connection->header = grown; connection->capacity = capacity;
-  }
-  memcpy(connection->header + scan_from, incoming, (size_t)received);
-  connection->buffered = needed;
-  if (!scan_from) connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_header_timeout_ms > 0 ? server->read_header_timeout_ms : 5000));
-  long long max_header = server->max_header_bytes > 0 ? server->max_header_bytes : (16 * 1024);
-  for (size_t index = scan_from; index < needed; index++) {
-    const char* header = connection->header;
-    char byte = header[index];
-    /* Preserve the original byte max_header+1 => 431 precedence even when
-       that same byte would also violate a CRLF framing rule. */
-    if ((long long)(index + 1) > max_header) { ku_http_connection_status(connection, server, 431); return; }
-    if (byte == '\n' && (index < 1 || header[index - 1] != '\r')) { ku_http_connection_status(connection, server, 400); return; }
-    if (index >= 1 && header[index - 1] == '\r' && byte != '\n') { ku_http_connection_status(connection, server, 400); return; }
-    if (index < 3 || header[index - 3] != '\r' || header[index - 2] != '\n' || header[index - 1] != '\r' || byte != '\n') continue;
-    size_t header_length = index - 3;
-    connection->input.budget = connection->budget;
-    int status = ku_http_parse_complete_header(server, header, header_length, &connection->input);
-    if (status) { ku_http_connection_status(connection, server, status); return; }
-    connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_body_timeout_ms > 0 ? server->read_body_timeout_ms : 10000));
-    connection->keep_alive = connection->input.keep_alive;
-    size_t prefix = needed - (index + 1);
-    if (prefix > connection->input.body_len) prefix = connection->input.body_len;
-    size_t extra = needed - (index + 1) - prefix;
-    if (extra && connection->keep_alive) {
-      /* At most this one finite recv chunk can be ahead of the current body. */
-      if (extra > KU_HTTP_READ_CHUNK) { ku_http_connection_status(connection, server, 500); return; }
-      if (!ku_http_buffer_reserve(connection->budget, extra)) { ku_http_connection_status(connection, server, 503); return; }
-      connection->carry = (char*)malloc(extra);
-      if (!connection->carry) {
-        ku_http_buffer_refund(connection->budget, extra);
-        ku_http_connection_status(connection, server, 500); return;
-      }
-      memcpy(connection->carry, header + index + 1 + prefix, extra);
-      connection->carry_length = extra;
-    }
-    if (prefix) memcpy(connection->input.body, header + index + 1, prefix);
-    connection->body_received = prefix;
-    free(connection->header); connection->header = NULL;
-  ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
-    if (prefix == connection->input.body_len) ku_http_connection_submit(connection, server, queue, workers);
-    else connection->phase = KU_HTTP_IO_BODY;
-    return;
-  }
-}
-static void ku_http_connection_read_body(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
-  if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
-  size_t remaining = connection->input.body_len - connection->body_received;
-  if (remaining > (size_t)65536) remaining = (size_t)65536;
-  int received = ku_http_socket_recv(connection->socket_value, connection->input.body + connection->body_received, remaining);
-  if (received < 0) {
-    int error = ku_http_socket_last_error();
-    if (ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
-    ku_http_connection_status(connection, server, 408); return;
-  }
-  if (!received) { ku_http_connection_status(connection, server, 408); return; }
-  connection->body_received += (size_t)received;
-  if (connection->body_received == connection->input.body_len) ku_http_connection_submit(connection, server, queue, workers);
-}
-static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer* server) {
-  KuHttpOutput* output = &connection->output;
-  size_t bytes = 0;
-  /* Each readiness turn is finite even for a peer that remains writable and a
-     very large Ku response. Neither partial sends nor EINTR refresh write D. */
-  for (int turn = 0; turn < 32 && bytes < (size_t)262144; turn++) {
-    if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_close(connection); return; }
-    if (output->part >= output->count) { ku_http_connection_next_request(connection, server); return; }
-    KuHttpPart* part = &output->parts[output->part];
-    size_t remaining = part->length - output->offset;
-    if (remaining > (size_t)65536) remaining = (size_t)65536;
-    int sent = ku_http_socket_send(connection->socket_value, part->bytes + output->offset, remaining);
-    if (sent < 0) {
-      int error = ku_http_socket_last_error();
-      if (ku_http_socket_error_interrupted(error)) continue;
-      if (ku_http_socket_would_block(error)) return;
-      ku_http_connection_close(connection); return;
-    }
-    if (!sent) { ku_http_connection_close(connection); return; }
-    output->offset += (size_t)sent;
-    bytes += (size_t)sent;
-    if (output->offset == part->length) { output->part++; output->offset = 0; }
-  }
-  if (output->part >= output->count) ku_http_connection_next_request(connection, server);
-}
-static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpServer* server) {
-  if (connection->phase == KU_HTTP_IO_REUSE_WAIT) {
-    ku_http_connection_next_request(connection, server); return;
-  }
-  if (connection->phase == KU_HTTP_IO_CLOSED_JOB) {
-    if (ku_http_job_only_owner(connection->job)) ku_http_connection_close(connection);
-    return;
-  }
-  if (connection->phase != KU_HTTP_IO_JOB) return;
-  KuHttpJob* job = connection->job;
-  KuStruct___ku_http_response response = {0};
-  size_t response_charge = 0;
-  ku_http_mutex_lock(&job->lock);
-  int completed = job->completed;
-  int cancelled = job->cancelled;
-  if (completed && !cancelled) {
-    response = job->response; response_charge = job->response_charge;
-    job->response = (KuStruct___ku_http_response){0}; job->response_charge = 0;
-  }
-  ku_http_mutex_unlock(&job->lock);
-  if (!completed) return;
-  if (cancelled) ku_http_connection_close(connection);
-  else ku_http_connection_response(connection, server, response, response_charge, 1);
-}
-static void ku_http_reject_start(KuHttpConnection* connection, KuHttpSocket socket_value) {
-  memset(connection, 0, sizeof(*connection));
-  connection->socket_value = socket_value;
-  connection->phase = KU_HTTP_IO_REJECT;
-  connection->deadline = ku_http_deadline_ms(50);
-}
-static void ku_http_reject_read(KuHttpConnection* connection, KuHttpServer* server) {
-  char incoming[1024];
-  for (int turn = 0; turn < 8; turn++) {
-    if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 503); return; }
-    int received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));
-    if (received < 0) {
-      int error = ku_http_socket_last_error();
-      if (ku_http_socket_would_block(error)) return;
-      if (ku_http_socket_error_interrupted(error)) continue;
-      ku_http_connection_status(connection, server, 503); return;
-    }
-    if (!received) { ku_http_connection_status(connection, server, 503); return; }
-    connection->rejected_bytes += (size_t)received;
-    long long max_header = server->max_header_bytes > 0 ? server->max_header_bytes : (16 * 1024);
-    int done = connection->rejected_bytes >= (size_t)max_header;
-    for (int index = 0; index < received && !done; index++) {
-      unsigned char* window = connection->rejected_window;
-      window[0] = window[1]; window[1] = window[2]; window[2] = window[3]; window[3] = (unsigned char)incoming[index];
-      connection->rejected_seen++;
-      if (connection->rejected_seen >= 4 && window[0] == '\r' && window[1] == '\n' && window[2] == '\r' && window[3] == '\n') done = 1;
-      else if (connection->rejected_seen >= 2 && window[2] == '\n' && window[3] == '\n') done = 1;
-    }
-    if (done) { ku_http_connection_status(connection, server, 503); return; }
-  }
-}
-static int ku_http_free_slot(KuHttpConnection* connections, int count) {
-  for (int index = 0; index < count; index++) if (connections[index].phase == KU_HTTP_IO_FREE) return index;
-  return -1;
-}
-/* Pending sockets carry permits, but no input allocation, job, or worker. */
-typedef struct { KuHttpSocket* items; int cap; int head; int tail; int count; } KuHttpPending;
-static void ku_http_pending_activate(KuHttpPending* pending, KuHttpConnection* connections, int count, KuHttpServer* server) {
-  while (pending->count) {
-    int slot = ku_http_free_slot(connections, count);
-    if (slot < 0) break;
-    KuHttpSocket socket_value = pending->items[pending->head];
-    pending->head = (pending->head + 1) % pending->cap;
-    pending->count--;
-    ku_http_connection_start(&connections[slot], socket_value, server);
-  }
-}
-static void ku_http_pending_close(KuHttpPending* pending) {
-  while (pending->count) {
-    KuHttpSocket socket_value = pending->items[pending->head];
-    pending->head = (pending->head + 1) % pending->cap;
-    pending->count--;
-    ku_http_socket_close(socket_value);
-    ku_http_atomic_decrement(&ku_http_active_conns);
-  }
-}
-static void ku_http_poll_add(KuHttpPollFd* items, int* count, KuHttpSocket socket_value, short events) {
-  KuHttpPollFd* item = &items[(*count)++];
-  memset(item, 0, sizeof(*item));
-  item->fd = socket_value; item->events = events;
-}
-
-static int ku_http_parse_ipv4(const char* text, unsigned long* network_order) {
-  unsigned long octets[4] = {0, 0, 0, 0};
-  size_t part = 0;
-  const char* p = text;
-  while (part < 4) {
-    if (*p < '0' || *p > '9') return 0;
-    unsigned long value = 0;
-    size_t digits = 0;
-    while (*p >= '0' && *p <= '9') {
-      value = value * 10UL + (unsigned long)(*p - '0');
-      if (value > 255UL || ++digits > 3) return 0;
-      p++;
-    }
-    octets[part++] = value;
-    if (part < 4) {
-      if (*p != '.') return 0;
-      p++;
-    }
-  }
-  if (*p != '\0') return 0;
-  unsigned long host_order = (octets[0] << 24) | (octets[1] << 16) |
-                             (octets[2] << 8) | octets[3];
-  *network_order = htonl(host_order);
-  return 1;
-}
-static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
-  ku_http_validate_server(server);
-  if (address.len == 0 || memchr(address.ptr, 0, address.len) != NULL) {
-    ku_string_drop(&address);
-    return ku_http_listen_err(server, "invalid listen address");
-  }
-  char* addr = ku_string_to_cstr(address);
-  ku_string_drop(&address);
-  unsigned long host = htonl(INADDR_LOOPBACK);
-  unsigned long port = 0;
-  char* colon = strchr(addr, ':');
-  int valid_address = colon != NULL && strchr(colon + 1, ':') == NULL;
-  if (valid_address) {
-    *colon = '\0';
-    const char* port_text = colon + 1;
-    if (*port_text == '\0') valid_address = 0;
-    while (valid_address && *port_text) {
-      if (*port_text < '0' || *port_text > '9') { valid_address = 0; break; }
-      port = port * 10UL + (unsigned long)(*port_text - '0');
-      if (port > 65535UL) { valid_address = 0; break; }
-      port_text++;
-    }
-    if (valid_address && addr[0] != '\0' && strcmp(addr, "localhost") != 0 &&
-        !ku_http_parse_ipv4(addr, &host)) valid_address = 0;
-  }
-  if (!valid_address) {
-    free(addr);
-    return ku_http_listen_err(server, "invalid listen address");
-  }
-  free(addr);
-  if (ku_http_net_init() != 0) return ku_http_listen_err(server, "network initialization failed");
-  KuHttpSocket srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (srv == KU_HTTP_INVALID_SOCKET) { ku_http_net_cleanup(); return ku_http_listen_err(server, "socket failed"); }
-  int yes = 1;
-  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-  struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));
-  sa.sin_family = AF_INET; sa.sin_addr.s_addr = host; sa.sin_port = htons((unsigned short)port);
-  if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) != 0) { ku_http_socket_close(srv); ku_http_net_cleanup(); return ku_http_listen_err(server, "bind failed"); }
-  if (listen(srv, SOMAXCONN) != 0) { ku_http_socket_close(srv); ku_http_net_cleanup(); return ku_http_listen_err(server, "listen failed"); }
-  if (!ku_http_socket_nonblocking(srv)) {
-    ku_http_socket_close(srv); ku_http_net_cleanup();
-    return ku_http_listen_err(server, "listener nonblocking setup failed");
-  }
-  long max_requests = 0;
-  { const char* mr = getenv("KU_HTTP_MAX_REQUESTS"); if (mr) max_requests = atol(mr); }
-  long long mc = server->max_connections > 0 ? server->max_connections : 1024;
-  if (mc > 0x7fffffffLL) mc = 0x7fffffffLL;
-  long max_conn = (long)mc;
-  long long mp = server->max_pending_requests > 0 ? server->max_pending_requests : 1;
-  if (mp > 0x7fffffffLL) mp = 0x7fffffffLL;
-  int max_pending = (int)mp;
-  long long ma = server->max_active_requests > 0 ? server->max_active_requests : 1;
-  if (ma > KU_HTTP_MAX_ACTIVE_REQUESTS) ma = KU_HTTP_MAX_ACTIVE_REQUESTS;
-  int slot_count = (int)ma;
-  int nworkers = slot_count > KU_HTTP_WORKER_CAP ? KU_HTTP_WORKER_CAP : slot_count;
-  KuHttpConnection* connections = (KuHttpConnection*)calloc((size_t)slot_count, sizeof(KuHttpConnection));
-  KuHttpPollFd* poll_items = (KuHttpPollFd*)calloc((size_t)slot_count + 3, sizeof(KuHttpPollFd));
-  KuHttpPending pending = {0};
-  pending.cap = max_pending;
-  pending.items = (KuHttpSocket*)malloc((size_t)max_pending * sizeof(KuHttpSocket));
-  if (!connections || !poll_items || !pending.items) {
-    free(connections); free(poll_items); free(pending.items);
-    ku_http_socket_close(srv); ku_http_net_cleanup();
-    return ku_http_listen_err(server, "reactor allocation failed");
-  }
-  for (int index = 0; index < slot_count; index++) connections[index].socket_value = KU_HTTP_INVALID_SOCKET;
-  KuHttpConnection rejection = {0};
-  rejection.socket_value = KU_HTTP_INVALID_SOCKET;
-  KuHttpWake wake;
-  if (!ku_http_wake_init(&wake)) {
-    free(connections); free(poll_items); free(pending.items);
-    ku_http_socket_close(srv); ku_http_net_cleanup();
-    return ku_http_listen_err(server, "reactor wake initialization failed");
-  }
-  KuHttpQueue queue;
-  /* At most one job per active slot; socket pending is a separate FIFO whose
-     original max_pending bound is not duplicated by another pending job pool. */
-  if (!ku_http_queue_init(&queue, slot_count, &wake)) {
-    ku_http_wake_close(&wake);
-    free(connections); free(poll_items); free(pending.items);
-    ku_http_socket_close(srv); ku_http_net_cleanup();
-    return ku_http_listen_err(server, "handler queue initialization failed");
-  }
-  KuHttpBufferBudget buffer_budget = {0};
-  buffer_budget.limit = (size_t)server->max_buffer_bytes;
-  if (!ku_http_mutex_init(&buffer_budget.lock)) {
-    ku_http_queue_free(&queue); ku_http_wake_close(&wake);
-    free(connections); free(poll_items); free(pending.items);
-    ku_http_socket_close(srv); ku_http_net_cleanup();
-    return ku_http_listen_err(server, "buffer budget initialization failed");
-  }
-  server->buffer_budget = &buffer_budget;
-  ku_http_atomic_store(&ku_http_active_conns, 0);
-  KuHttpWorkerCtx ctx; ctx.server = server; ctx.queue = &queue;
-#if defined(_WIN32)
-  HANDLE* workers = (HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE));
-#else
-  pthread_t* workers = (pthread_t*)malloc((size_t)nworkers * sizeof(pthread_t));
-#endif
-  int spawned = 0;
-  if (workers) for (int index = 0; index < nworkers; index++) {
-#if defined(_WIN32)
-    uintptr_t handle = _beginthreadex(NULL, 0, ku_http_worker, &ctx, 0, NULL);
-    if (!handle) break;
-    workers[spawned++] = (HANDLE)handle;
-#else
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, ku_http_worker, &ctx) != 0) break;
-    workers[spawned++] = worker;
-#endif
-  }
-  long accepted = 0;
-  int listening = 1;
-  int failure_handled = 0;
-  int peer_accept_errors = 0;
-  int resource_accept_errors = 0;
-  unsigned long long accept_retry_deadline = 0;
-  const char* listen_failure = NULL;
-  for (;;) {
-    if (listen_failure && !failure_handled) {
-      failure_handled = 1; listening = 0;
-      ku_http_socket_close(srv); srv = KU_HTTP_INVALID_SOCKET;
-      ku_http_queue_close(&queue, 0);
-      ku_http_pending_close(&pending);
-      ku_http_connection_close(&rejection);
-      for (int index = 0; index < slot_count; index++) {
-        KuHttpConnection* connection = &connections[index];
-        if (connection->phase == KU_HTTP_IO_JOB) {
-          ku_http_mutex_lock(&connection->job->lock);
-          int claimed = connection->job->claimed;
-          ku_http_mutex_unlock(&connection->job->lock);
-          if (claimed) continue; /* Already executing handlers finish normally. */
-        } else if (connection->phase == KU_HTTP_IO_WRITE) continue;
-        ku_http_connection_close(connection);
-      }
-    }
-    unsigned long long now = ku_http_now_ms();
-    for (int index = 0; index < slot_count; index++) {
-      KuHttpConnection* connection = &connections[index];
-      if (!listening || listen_failure || pending.count) connection->keep_alive = 0;
-      ku_http_connection_observe_job(connection, server);
-      if (connection->phase == KU_HTTP_IO_HEADER && connection->carry_length)
-        ku_http_connection_read_header(connection, server, &queue, spawned);
-      /* Under pressure a genuinely idle persistent socket yields its slot.
-         Partial requests keep their original byte ownership and deadline. */
-      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&
-          connection->reused && !connection->buffered && !connection->carry_length) {
-        /* An empty user buffer is not idle when the next request is already
-           waiting in the socket. A single peek never consumes bytes or renews D. */
-        char next_byte;
-        int ready = recv(connection->socket_value, &next_byte, 1, MSG_PEEK);
-        if (ready == 0 || (ready < 0 &&
-            !ku_http_socket_error_interrupted(ku_http_socket_last_error())))
-          ku_http_connection_close(connection);
-      }
-      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)
-        ku_http_connection_status(connection, server, 408);
-      else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline)
-        ku_http_connection_close(connection);
-    }
-    if (rejection.phase == KU_HTTP_IO_REJECT && now >= rejection.deadline)
-      ku_http_connection_status(&rejection, server, 503);
-    else if (rejection.phase == KU_HTTP_IO_WRITE && now >= rejection.deadline)
-      ku_http_connection_close(&rejection);
-    if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
-    int occupied = rejection.phase != KU_HTTP_IO_FREE;
-    for (int index = 0; index < slot_count; index++) occupied |= connections[index].phase != KU_HTTP_IO_FREE;
-    if (!listening && !occupied && !pending.count && !ku_http_queue_resident(&queue)) break;
-
-    int poll_count = 0;
-    int wake_index = poll_count;
-    ku_http_poll_add(poll_items, &poll_count, wake.read_socket, KU_HTTP_POLL_READ);
-    int listener_index = -1;
-    unsigned long long nearest = ~0ULL;
-    now = ku_http_now_ms();
-    if (listening && rejection.phase == KU_HTTP_IO_FREE) {
-      if (accept_retry_deadline > now) nearest = accept_retry_deadline;
-      else {
-        listener_index = poll_count;
-        ku_http_poll_add(poll_items, &poll_count, srv, KU_HTTP_POLL_READ);
-      }
-    }
-    for (int index = 0; index < slot_count; index++) {
-      KuHttpConnection* connection = &connections[index];
-      connection->poll_index = -1;
-      short events = 0;
-      if (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) events = KU_HTTP_POLL_READ;
-      else if (connection->phase == KU_HTTP_IO_WRITE) events = KU_HTTP_POLL_WRITE;
-      if (!events) continue;
-      connection->poll_index = poll_count;
-      ku_http_poll_add(poll_items, &poll_count, connection->socket_value, events);
-      if (connection->deadline < nearest) nearest = connection->deadline;
-    }
-    rejection.poll_index = -1;
-    if (rejection.phase == KU_HTTP_IO_REJECT || rejection.phase == KU_HTTP_IO_WRITE) {
-      rejection.poll_index = poll_count;
-      ku_http_poll_add(poll_items, &poll_count, rejection.socket_value,
-        rejection.phase == KU_HTTP_IO_REJECT ? KU_HTTP_POLL_READ : KU_HTTP_POLL_WRITE);
-      if (rejection.deadline < nearest) nearest = rejection.deadline;
-    }
-    int wait_ms = -1;
-    if (nearest != ~0ULL) {
-      now = ku_http_now_ms();
-      unsigned long long remaining = nearest > now ? nearest - now : 0;
-      wait_ms = remaining > (unsigned long long)INT_MAX ? INT_MAX : (int)remaining;
-    }
-    /* No periodic wake tick: idle/read/write/job progress blocks in one OS
-       poll until actual readiness, worker publication, or the nearest old D. */
-    int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
-    if (selected < 0) {
-      if (ku_http_socket_error_interrupted(ku_http_socket_last_error())) continue;
-      if (!listen_failure) listen_failure = "reactor wait failed";
-      else { fputs("http reactor wait repeatedly failed\n", stderr); exit(1); }
-      continue;
-    }
-    if (!selected) continue;
-    short wake_events = poll_items[wake_index].revents;
-    if (wake_events & POLLNVAL) { fputs("http reactor wake socket invalid\n", stderr); exit(1); }
-    if (wake_events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)) ku_http_wake_drain(&wake);
-    for (int index = 0; index < slot_count; index++) {
-      KuHttpConnection* connection = &connections[index];
-      if (connection->poll_index < 0) continue;
-      short events = poll_items[connection->poll_index].revents;
-      if (!events) continue;
-      if (events & POLLNVAL) { ku_http_connection_close(connection); continue; }
-      if (connection->phase == KU_HTTP_IO_HEADER && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
-        ku_http_connection_read_header(connection, server, &queue, spawned);
-      else if (connection->phase == KU_HTTP_IO_BODY && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
-        ku_http_connection_read_body(connection, server, &queue, spawned);
-      else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
-        ku_http_connection_write(connection, server);
-    }
-    if (rejection.poll_index >= 0) {
-      short events = poll_items[rejection.poll_index].revents;
-      if (events & POLLNVAL) ku_http_connection_close(&rejection);
-      else if (rejection.phase == KU_HTTP_IO_REJECT && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
-        ku_http_reject_read(&rejection, server);
-      else if (rejection.phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
-        ku_http_connection_write(&rejection, server);
-    }
-    /* Existing pending connections always acquire newly free slots first. */
-    if (!listen_failure) ku_http_pending_activate(&pending, connections, slot_count, server);
-    if (listener_index < 0 || !poll_items[listener_index].revents) continue;
-    if (poll_items[listener_index].revents & POLLNVAL) { listen_failure = "listener descriptor invalid"; continue; }
-    for (int turn = 0; turn < 32 && listening && rejection.phase == KU_HTTP_IO_FREE; turn++) {
-      KuHttpSocket cli = accept(srv, NULL, NULL);
-      if (cli == KU_HTTP_INVALID_SOCKET) {
-        int accept_error = ku_http_socket_last_error();
-        if (ku_http_socket_would_block(accept_error)) break;
-        if (ku_http_socket_error_accept_peer_transient(accept_error)) {
-          if (peer_accept_errors < KU_HTTP_ACCEPT_PEER_BACKOFF_CAP_MS) peer_accept_errors++;
-          resource_accept_errors = 0;
-          accept_retry_deadline = ku_http_deadline_ms((uint32_t)peer_accept_errors);
-          break;
-        }
-        peer_accept_errors = 0;
-        if (ku_http_socket_error_accept_resource_pressure(accept_error) && resource_accept_errors < KU_HTTP_ACCEPT_RESOURCE_RETRY_CAP) {
-          resource_accept_errors++;
-          accept_retry_deadline = ku_http_deadline_ms((uint32_t)resource_accept_errors * KU_HTTP_ACCEPT_RESOURCE_BACKOFF_STEP_MS);
-          break;
-        }
-        listen_failure = "accept failed";
-        break;
-      }
-      peer_accept_errors = resource_accept_errors = 0;
-      accept_retry_deadline = 0;
-      if (ku_http_socket_suppress_sigpipe(cli) != 0 || !ku_http_socket_nonblocking(cli)) {
-        ku_http_socket_close(cli);
-        listen_failure = "accepted socket configuration failed";
-        break;
-      }
-      if (max_requests > 0) accepted++;
-      long live = ku_http_atomic_increment(&ku_http_active_conns);
-      int slot = ku_http_free_slot(connections, slot_count);
-      if (live > max_conn) ku_http_reject_start(&rejection, cli);
-      else if (slot >= 0 && !pending.count) ku_http_connection_start(&connections[slot], cli, server);
-      else if (pending.count < pending.cap) {
-        pending.items[pending.tail] = cli;
-        pending.tail = (pending.tail + 1) % pending.cap;
-        pending.count++;
-      } else ku_http_reject_start(&rejection, cli);
-      if (max_requests > 0 && accepted >= max_requests) {
-        listening = 0;
-        ku_http_socket_close(srv); srv = KU_HTTP_INVALID_SOCKET;
-      }
-    }
-  }
-  /* Finite N drains accepted reads, handler jobs, partial responses and their
-     actual owner retirement before stopping workers. Fatal accept failure has
-     already cancelled queued work, without touching a running handler's TLS. */
-  ku_http_socket_close(srv);
-  ku_http_queue_close(&queue, listen_failure == NULL);
-  if (spawned > 0) {
-#if defined(_WIN32)
-    if (WaitForMultipleObjects((DWORD)spawned, workers, TRUE, INFINITE) == WAIT_FAILED) {
-      fputs("http worker join failed\n", stderr); exit(1);
-    }
-    for (int index = 0; index < spawned; index++) CloseHandle(workers[index]);
-#else
-    for (int w = 0; w < spawned; w++) {
-      if (pthread_join(workers[w], NULL) != 0) { fputs("http worker join failed\n", stderr); exit(1); }
-    }
-#endif
-  }
-  free(workers);
-  ku_http_queue_free(&queue);
-  if (buffer_budget.current) { fputs("http transport buffers remain after drain\n",stderr); exit(1); }
-  ku_http_mutex_destroy(&buffer_budget.lock); server->buffer_budget = NULL;
-  ku_http_wake_close(&wake);
-  free(pending.items); free(poll_items); free(connections);
-  ku_http_net_cleanup();
-  if (listen_failure) return ku_http_listen_err(server, listen_failure);
-  ku_http_server_free(server);
-  return (KuResult_null){ true, 0, (KuError){0} };
-}
-
-"####,
-    );
     Ok(())
 }
 
@@ -17312,7 +15701,18 @@ fn emit_main_wrapper(
             "native C main wrapper does not support main parameters",
         ));
     }
+    let service = program_uses_http(program);
+    let exit = |value: &str| {
+        if service {
+            format!("ku_service_output_exit({value})")
+        } else {
+            value.to_owned()
+        }
+    };
     out.push_str("int main(void) {\n");
+    if service {
+        out.push_str("  if (!ku_service_output_start()) { fputs(\"service output initialization failed\\n\", stderr); return 1; }\n");
+    }
     out.push_str("  __ku_sync_reset();\n");
     if fs_usage.any() && matches!(fs_base, NativeFsBase::ExecutableRelative(_)) {
         // Initialization is deliberately non-fatal. Absolute paths remain usable
@@ -17343,36 +15743,38 @@ fn emit_main_wrapper(
         emit_drop_expr(out, &function.return_type, "result")?;
     }
     out.push_str(mysql_shutdown);
-    out.push_str(
-        "  fputs(__ku_sync_error_message(signal), stderr); fputc('\\n', stderr); return 1;\n  }\n",
-    );
+    out.push_str(&format!(
+        "  const char* message = __ku_sync_error_message(signal); ku_output_stream_write(stderr, message, __ku_sync_error_message_length(signal)); ku_output_stream_write(stderr, \"\\n\", 1); return {};\n  }}\n", exit("1")
+    ));
     match &function.return_type {
         IrType::Void => {
             out.push_str(mysql_shutdown);
-            out.push_str("  return 0;\n");
+            out.push_str(&format!("  return {};\n", exit("0")));
         }
         IrType::Int => {
             out.push_str("  int exit_code = (int)result;\n");
             out.push_str(mysql_shutdown);
-            out.push_str("  return exit_code;\n");
+            out.push_str(&format!("  return {};\n", exit("exit_code")));
         }
         IrType::Bool => {
             out.push_str("  int exit_code = result ? 0 : 1;\n");
             out.push_str(mysql_shutdown);
-            out.push_str("  return exit_code;\n");
+            out.push_str(&format!("  return {};\n", exit("exit_code")));
         }
         IrType::Str => {
-            out.push_str("  ku_string_write(stdout, result);\n  fputc('\\n', stdout);\n  ku_string_drop(&result);\n");
+            out.push_str("  ku_string_write(stdout, result);\n  ku_output_write(\"\\n\", 1);\n  ku_string_drop(&result);\n");
             out.push_str(mysql_shutdown);
-            out.push_str("  return 0;\n");
+            out.push_str(&format!("  return {};\n", exit("0")));
         }
         IrType::Result(inner) => {
             out.push_str(&format!(
-                "  if (!result.ok) {{ ku_string_write(stderr, result.error.message); fputc('\\n', stderr); ku_result_drop_{}(&result);{}  return 1; }}\n  ku_result_drop_{}(&result);\n{}  return 0;\n",
+                "  if (!result.ok) {{ ku_string_write(stderr, result.error.message); ku_output_stream_write(stderr, \"\\n\", 1); ku_result_drop_{}(&result);{}  return {}; }}\n  ku_result_drop_{}(&result);\n{}  return {};\n",
                 c_type_suffix(inner)?,
                 mysql_shutdown,
+                exit("1"),
                 c_type_suffix(inner)?,
-                mysql_shutdown
+                mysql_shutdown,
+                exit("0")
             ));
         }
         other => {
@@ -17449,6 +15851,26 @@ fn c_str_literal_static(value: &str) -> KuResult<String> {
 /// an HTTP intrinsic, `None` otherwise so the generic dispatch continues.
 fn c_http_intrinsic_expr(name: &str, args: &[IrExpr]) -> KuResult<Option<String>> {
     let resp_ty = "KuStruct___ku_http_response";
+    if name == "__ku_http_json_status" {
+        let [status] = args else {
+            return Err(unsupported("native HTTP JSON status expects one argument"));
+        };
+        let status = c_expr(status)?;
+        // IR has already staged this argument before later argument effects.
+        return Ok(Some(format!("ku_http_json_status({status})")));
+    }
+    if name == "__ku_http_json_response" {
+        let [status, body] = args else {
+            return Err(unsupported(
+                "native HTTP JSON response expects status and encoded body",
+            ));
+        };
+        return Ok(Some(format!(
+            "ku_http_json_response({}, {})",
+            c_expr(status)?,
+            c_value_expr(body)?
+        )));
+    }
     // http.server() / http.service(): a fresh empty route table. Stage 8d: when a
     // config object is passed, read its admission-control limits (max_connections,
     // max_active_requests, max_pending_requests, handler_timeout_ms) into the
@@ -17592,6 +16014,12 @@ fn c_pg_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
         "cols" => Ok(format!("ku_pg_cols({})", c_expr(arg(0)?)?)),
         "value" => Ok(format!(
             "ku_pg_value({}, {}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?,
+            c_expr(arg(2)?)?
+        )),
+        "value_int" => Ok(format!(
+            "ku_pg_value_int({}, {}, {})",
             c_expr(arg(0)?)?,
             c_expr(arg(1)?)?,
             c_expr(arg(2)?)?
@@ -17898,6 +16326,16 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
         match method {
             "as_int" => return Ok(format!("ku_value_as_int({})", c_value_expr(value)?)),
             "as_str" => return Ok(format!("ku_value_as_str({})", c_value_expr(value)?)),
+            "take" => {
+                let key = args
+                    .get(1)
+                    .ok_or_else(|| unsupported("native C KuValue.take requires a string key"))?;
+                return Ok(format!(
+                    "ku_value_take_result({}, {})",
+                    c_value_expr(value)?,
+                    c_expr(key)?
+                ));
+            }
             other => {
                 return Err(unsupported(format!(
                     "native C prototype does not support kuvalue method '{other}' yet"
@@ -18357,6 +16795,9 @@ fn c_binary(op: BinaryOp) -> &'static str {
 /// `c_value_expr`; copy types return the place unchanged.
 fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => {
+            Ok(format!("ku_task_pg_capture_move(&{place})"))
+        }
         IrType::Str => Ok(format!("ku_string_move(&{place})")),
         IrType::Array(element) => Ok(format!(
             "ku_array_move_{}(&{place})",
@@ -18429,6 +16870,7 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
 
 fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok(format!("ku_task_pg_capture_drop(&{expression});")),
         IrType::Array(element) => Ok(format!(
             "ku_array_drop_{}(&{expression});",
             c_type_suffix(element)?
@@ -18513,6 +16955,7 @@ fn c_array_type(element: &IrType) -> KuResult<String> {
 
 fn c_type_suffix(ty: &IrType) -> KuResult<String> {
     match ty {
+        IrType::Named(name) if name == "__ku_pg_capture" => Ok("pg_capture".into()),
         IrType::Int => Ok("int".to_string()),
         IrType::Float => Ok("float".to_string()),
         IrType::Bool => Ok("bool".to_string()),

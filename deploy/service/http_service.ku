@@ -1,0 +1,16 @@
+// Build one executable into each slot directory with an `http.addr` text file.
+// Health/drain management is provided by the native runtime when started by
+// `ku service`; business handlers keep their ordinary zero/one-argument API.
+import http from "std.http"
+import "std.fs"
+
+fn main(): null! {
+    address = fs.read("http.addr")?
+    app = http.service()
+    app.max_connections = 256
+    app.max_active_requests = 64
+    app.max_pending_requests = 128
+    app.get("/", fn() { return http.text("Ku HTTP OK") })
+    app.listen(address)?
+    return ok(null)
+}

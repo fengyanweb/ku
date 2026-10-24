@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'full runs all gates; platform scopes reuse passed checks on unchanged runtime sources'
+        type: choice
+        default: full
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll]
 
 permissions:
   contents: read
@@ -14,6 +20,7 @@ concurrency:
 
 jobs:
   quality:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: Rust format, check and clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -66,6 +73,7 @@ jobs:
           python3 -B .github/scripts/test-prepare-release.py
 
   borrow-sanitizers:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: Native borrow and Task ASan, UBSan and leak checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -99,10 +107,17 @@ jobs:
       - name: Verify HTTP lexical capture and owned response regression under sanitizers
         run: cargo test --locked --test native_http_test native_http_lexical_capture_replay_ -- --nocapture --test-threads=1
 
+      - name: Verify native HTTP async owner, timer and retirement under sanitizers
+        run: cargo test --locked --test native_http_test native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout -- --exact --nocapture --test-threads=1
+
+      - name: Verify native HTTP async TCP owner waits under sanitizers
+        run: cargo test --locked --test native_http_test native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker -- --exact --nocapture --test-threads=1
+
       - name: Verify scheduler probe rows and actual cancellation reclamation under sanitizers
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
   task-tsan:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: Linux native Task selected-path ThreadSanitizer gate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -139,19 +154,13 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    name: ${{ matrix.os }} unfiltered workspace test suite
+    name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            tls_target: x86_64-pc-windows-msvc
-          - os: ubuntu-24.04
-            tls_target: x86_64-unknown-linux-gnu
-          - os: macos-15
-            tls_target: aarch64-apple-darwin
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.scope == 'macos-service' && '[{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]' || github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && inputs.scope != 'service-recovery' && '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"}]' || '[{"os":"windows-2025","tls_target":"x86_64-pc-windows-msvc"},{"os":"ubuntu-24.04","tls_target":"x86_64-unknown-linux-gnu"},{"os":"macos-15","tls_target":"aarch64-apple-darwin"}]') }}
     env:
       CARGO_INCREMENTAL: "0"
       KU_NATIVE_TLS_LINK_REQUIRED: "1"
@@ -168,7 +177,7 @@ jobs:
         run: |
           rustup set profile minimal
           rustup toolchain install 1.89.0 --no-self-update
-          rustup component add clippy --toolchain 1.89.0
+          rustup component add clippy rustfmt --toolchain 1.89.0
           rustup default 1.89.0
           rustc --version --verbose
 
@@ -179,7 +188,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            default-libmysqlclient-dev libpq-dev pkg-config
+            default-libmysqlclient-dev libpq-dev pkg-config postgresql haproxy
           source_lib="$(pg_config --libdir)/libpq.so"
           test -e "$source_lib"
           pg_config --version
@@ -218,7 +227,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
           set -euo pipefail
-          brew install libpq mysql-client
+          brew install libpq mysql-client postgresql@17 haproxy
           brew list --versions libpq mysql-client
           source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
           test -e "$source_lib"
@@ -324,7 +333,14 @@ jobs:
             Format-List FileVersion,ProductVersion
 
       - name: Build Ku CLI
+        id: build_ku
         run: cargo build --locked --release --bin ku
+
+      - name: Verify resident deployment budget and rollback contracts
+        shell: bash
+        run: |
+          python3 -B deploy/service/test_manage.py
+          python3 -B -m unittest discover -s tests/acceptance -p 'test_*.py'
 
       - name: Build and verify the native TLS target pack
         shell: pwsh
@@ -414,18 +430,182 @@ jobs:
           }
 
       - name: Reject platform-specific clippy warnings
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || inputs.scope == 'service-recovery'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run every default test target without stopping at the first failure
+        if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
         run: >-
           cargo test --locked --release --workspace --no-fail-fast
           -- --nocapture --test-threads=2
 
+      - name: Verify focused service and blocking lifecycle regressions
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-service'
+        run: >-
+          cargo test --locked --release
+          --test service_supervision_test --test native_task_adapter_test
+          -- --nocapture --test-threads=2
+
+      - name: Verify service control and resident lifecycle regressions
+        if: github.event_name == 'workflow_dispatch' && inputs.scope == 'service-recovery'
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --release --test service_supervision_test -- --nocapture --test-threads=2
+
       - name: Verify native scheduler probe correctness, not performance
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery' && inputs.scope != 'windows-roll')
         run: cargo test --locked --release --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
+      - name: Verify resident hard memory provider recovery or explicit platform rejection
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery' && inputs.scope != 'windows-roll')
+        shell: bash
+        run: |
+          set -euo pipefail
+          ku="$PWD/target/release/ku${{ runner.os == 'Windows' && '.exe' || '' }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            delegated="/sys/fs/cgroup/ku-service-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            sudo mkdir "$delegated"
+            trap 'sudo rmdir "$delegated"' EXIT
+            if ! grep -qw memory "$delegated/cgroup.controllers" || ! grep -qw pids "$delegated/cgroup.controllers"; then
+              echo 'Dedicated cgroup v2 delegation lacks memory or pids controller; no weaker provider is substituted' >&2
+              cat "$delegated/cgroup.controllers"
+              exit 1
+            fi
+            test -z "$(cat "$delegated/cgroup.procs")"
+            printf '+memory +pids\n' | sudo tee "$delegated/cgroup.subtree_control" >/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$delegated"
+            # This one isolated provider test needs administrator migration
+            # rights from the runner's existing cgroup into its private domain.
+            sudo env "PATH=$PATH" python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
+              --cgroup-root "$delegated" --output "$RUNNER_TEMP/ku-service-memory-provider.json"
+          else
+            python3 -B deploy/service/verify.py --memory-only --ku "$ku" \
+              --output "$RUNNER_TEMP/ku-service-memory-provider.json"
+          fi
+
+      - name: Verify native blocking retirement and resident replacement
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery' && inputs.scope != 'windows-roll')
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B deploy/service/verify.py --blocking-only \
+            --ku "$PWD/target/release/ku${{ runner.os == 'Windows' && '.exe' || '' }}" \
+            --output "$RUNNER_TEMP/ku-native-blocking-retirement.json"
+
+      - name: Verify short native runtime matrix with actual bounded blocking regression
+        if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-pg-host' && inputs.scope != 'macos-service' && inputs.scope != 'service-recovery' && inputs.scope != 'windows-roll')
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          suffix = '.exe' if os.name == 'nt' else ''
+          candidates = [path for path in Path('target/release/deps').glob('native_task_adapter_test-*')
+                        if path.is_file() and (path.suffix == '.exe' if os.name == 'nt' else not path.suffix)
+                        and os.access(path, os.X_OK)]
+          if len(candidates) != 1:
+              raise SystemExit(f'Expected one current native_task_adapter_test executable, got {candidates}')
+          subprocess.run([sys.executable, '-B', 'tests/acceptance/runtime_matrix.py',
+                          '--ku', str(Path('target/release/ku'+suffix).resolve()),
+                          '--profile', 'release', '--loops', '1', '2', '4', '--blocking-regression', str(candidates[0].resolve()),
+                          '--output', str(Path(os.environ['RUNNER_TEMP'])/'ku-runtime-matrix.json')], check=True)
+          PYTHON
+
+      - name: Verify native resident recovery, rolling and rollback through HAProxy
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B deploy/service/verify.py \
+            --ku "$PWD/target/release/ku" \
+            --haproxy "$(command -v haproxy)" \
+            --output "$RUNNER_TEMP/ku-resident-service.json"
+
+      - name: Verify real HTTP to PostgreSQL lifecycle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = macOS ]; then
+            export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          else
+            export PATH="$(pg_config --bindir):$PATH"
+          fi
+          python3 -B tests/acceptance/http_pg_lifecycle.py \
+            --ku "$PWD/target/release/ku" --loops 4 \
+            --output "$RUNNER_TEMP/ku-http-pg-lifecycle.json"
+
+      - name: Verify real HTTP to PostgreSQL lifecycle on Windows
+        if: runner.os == 'Windows' && !cancelled() && steps.build_ku.outcome == 'success' && (github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-service' && inputs.scope != 'windows-roll')) && (success() || inputs.scope == 'windows-pg-host')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONUTF8 = '1'
+          $env:PATH = (Join-Path $env:PGROOT 'bin') + ';' + $env:PATH
+          cargo build --locked --release --example acceptance-runner
+          if ($LASTEXITCODE -ne 0) { throw 'Acceptance runner build failed' }
+          & (Join-Path $PWD 'target/release/examples/acceptance-runner.exe') 180 python -u -B tests/acceptance/http_pg_lifecycle.py `
+            --ku (Join-Path $PWD 'target/release/ku.exe') --loops 4 `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-http-pg-lifecycle.json')
+          if ($LASTEXITCODE -ne 0) { throw 'HTTP PostgreSQL lifecycle failed' }
+
+      - name: Verify actual isolated Windows host task registration, recovery and stop
+        if: runner.os == 'Windows' && !cancelled() && steps.build_ku.outcome == 'success' && (github.event_name != 'workflow_dispatch' || (inputs.scope != 'windows-service' && inputs.scope != 'windows-roll')) && (success() || inputs.scope == 'windows-pg-host')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONUTF8 = '1'
+          & python -B deploy/service/verify.py --blocking-only --windows-host-task `
+            --ku (Join-Path $PWD 'target/release/ku.exe') `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-windows-host-task.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Actual Windows Task Scheduler service acceptance failed' }
+
+      - name: Verify Windows native recovery, rolling and rollback through pinned Caddy
+        if: runner.os == 'Windows' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full' || inputs.scope == 'windows-roll')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONUTF8 = '1'
+          $caddyRoot = Join-Path $env:RUNNER_TEMP 'ku-caddy-v2.11.7'
+          if (Test-Path $caddyRoot) { throw 'Private Caddy acceptance path already exists' }
+          New-Item -ItemType Directory -Path $caddyRoot | Out-Null
+          try {
+            $archive = Join-Path $caddyRoot 'caddy.zip'
+            Invoke-WebRequest -Uri 'https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_windows_amd64.zip' -OutFile $archive
+            $expected = '0a1edc0b799512051c57071ce0e798d3f2cf67dc98171366f1d2b326072e3b06'
+            if ((Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant() -ne $expected) { throw 'Caddy archive SHA256 mismatch' }
+            Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $caddyRoot 'unpacked')
+            $caddy = Join-Path $caddyRoot 'unpacked/caddy.exe'
+            & $caddy version
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned Caddy version query failed' }
+            & python -B deploy/service/verify.py --caddy $caddy `
+              --ku (Join-Path $PWD 'target/release/ku.exe') `
+              --output (Join-Path $env:RUNNER_TEMP 'ku-caddy-service.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Windows Caddy recovery, rolling or rollback failed' }
+          } finally {
+            Remove-Item -LiteralPath $caddyRoot -Recurse -Force
+          }
+
+      - name: Retain resident service and PostgreSQL acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: service-lifecycle-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/ku-resident-service.json
+            ${{ runner.temp }}/ku-caddy-service.json
+            ${{ runner.temp }}/ku-http-pg-lifecycle.json
+            ${{ runner.temp }}/ku-native-blocking-retirement.json
+            ${{ runner.temp }}/ku-runtime-matrix.json
+            ${{ runner.temp }}/ku-windows-host-task.json
+            ${{ runner.temp }}/ku-service-memory-provider.json
+          if-no-files-found: error
+
   release-contract:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: ${{ matrix.os }} release scripts and clean CheckOnly
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -505,6 +685,7 @@ jobs:
           fi
 
   native:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope == 'full'
     name: ${{ matrix.target }} native build and run
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -669,6 +850,136 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  installed-pg:
+    name: ${{ matrix.target }} actual installed CLI PostgreSQL lifecycle
+    if: github.event_name == 'push'
+    needs: [release-bundle]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out the exact archive source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare the existing PostgreSQL fixture tools on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libpq-dev postgresql
+          source_lib="$(pg_config --libdir)/libpq.so"
+          test -e "$source_lib"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.so"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+          pg_config --version
+
+      - name: Prepare the existing PostgreSQL fixture tools on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install libpq postgresql@17
+          source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
+          test -e "$source_lib"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-installed-pg-link-XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.dylib"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+          printf '%s\n' "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+          "$(brew --prefix postgresql@17)/bin/pg_config" --version
+
+      - name: Prepare the existing PostgreSQL fixture tools on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or
+              -not [IO.Path]::IsPathFullyQualified($env:PGROOT)) {
+            throw 'The Windows runner did not provide an absolute PGROOT'
+          }
+          $selected = (Resolve-Path -LiteralPath $env:PGROOT).Path
+          $importLibrary = Join-Path $selected 'lib\libpq.lib'
+          $runtimeDirectory = Join-Path $selected 'bin'
+          foreach ($tool in @('pg_config.exe', 'initdb.exe', 'pg_ctl.exe', 'psql.exe', 'libpq.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $runtimeDirectory $tool) -PathType Leaf)) {
+              throw "The selected PostgreSQL install is missing $tool"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+            throw 'The selected PostgreSQL install is missing libpq.lib'
+          }
+          $privateLib = Join-Path $env:RUNNER_TEMP ('ku-installed-pg-link-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $privateLib | Out-Null
+          Copy-Item -LiteralPath $importLibrary -Destination (Join-Path $privateLib 'libpq.lib')
+          "KU_PG_LIB=$privateLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KU_PG_RUNTIME_DIR=$runtimeDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $runtimeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $runtimeDirectory 'pg_config.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'Selected pg_config failed' }
+
+      - name: Verify current-run artifact bytes and installed sync/async PG lifecycles
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
+          & ${{ matrix.python }} -B .github/scripts/verify-installed-pg.py `
+            --repo $env:GITHUB_WORKSPACE --version $version `
+            --target '${{ matrix.target }}' --commit $env:GITHUB_SHA `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-installed-pg.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Actual installed CLI PostgreSQL acceptance failed' }
+
+      - name: Retain bounded installed-archive PG evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installed-pg-${{ matrix.target }}
+          path: ${{ runner.temp }}/ku-installed-pg*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove the owned PostgreSQL import-library link directory
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:KU_PG_LIB)) {
+            $parent = [IO.Path]::GetFullPath((Split-Path -Path $env:KU_PG_LIB -Parent))
+            $expected = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $leaf = Split-Path -Path $env:KU_PG_LIB -Leaf
+            if ($parent -ne $expected -or $leaf -notlike 'ku-installed-pg-link-*') {
+              throw 'Refusing to clean an unowned PostgreSQL import-library path'
+            }
+            Remove-Item -LiteralPath $env:KU_PG_LIB -Recurse -Force
+          }
+
   verify-release:
     name: Verify the complete release asset set
     if: github.event_name == 'push'
@@ -701,7 +1012,7 @@ jobs:
   publish-release:
     name: Publish all verified release bundles together
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release]
+    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release, installed-pg]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

@@ -1150,6 +1150,16 @@ class BoundedProcessTests(unittest.TestCase):
             VERIFIER.close_finished_output_streams((stream,), [reader])
         self.assertTrue(stream.closed)
 
+    def test_success_and_primary_failure_report_only_the_actual_owned_tree_cleanup(self) -> None:
+        completed = VERIFIER.run_bounded([sys.executable, "-B", "-c", "pass"], SCRIPT.parent, "cleanup receipt success")
+        self.assertIs(completed.process_owner_cleanup["process_tree_cleanup_confirmed"], True)
+        self.assertIs(completed.process_owner_cleanup["root_reaped"], True)
+        self.assertEqual(completed.process_owner_cleanup["windows_job_drained"], os.name == "nt")
+        with self.assertRaises(SystemExit) as failure:
+            VERIFIER.run_bounded([sys.executable, "-B", "-c", "raise SystemExit(7)"], SCRIPT.parent, "cleanup receipt failed checks")
+        self.assertIs(failure.exception.process_owner_cleanup["process_tree_cleanup_confirmed"], True)
+        self.assertIs(failure.exception.process_owner_cleanup["root_reaped"], True)
+
     def test_normal_output_is_collected(self) -> None:
         result = VERIFIER.run_bounded(
             [sys.executable, "-B", "-c", "print('bounded-ok')"],

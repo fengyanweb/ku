@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "scope": "Short direct native Ku HTTP/libpq/PostgreSQL read performance on macOS; not formal long-duration acceptance",
+  "source_commit": "e70290e31a773b1b66e04f637c141e4136280f57",
+  "source_tree": "modified; exact frozen CLI hash and fixture hash are retained per row",
+  "status": "passed",
+  "profile": "release",
+  "transport": "HTTP -> Ku shared four-connection libpq pool -> private PostgreSQL directly -> JSON field validation. No Python fault proxy is created in performance mode.",
+  "parameters": {
+    "clients": 8,
+    "http_connections": "persistent; failed logical requests are counted once and never replayed",
+    "database_connections": 4,
+    "database_waiters": 8,
+    "blocking_threads": 8,
+    "acquire_timeout_ms": 100,
+    "query_timeout_ms": 150,
+    "handler_timeout_ms": 2000,
+    "seconds_per_loop_setting": 5,
+    "database_retry": false,
+    "database_host": "private loopback PostgreSQL 17.11 cluster, removed after each run",
+    "shared_buffers_bytes": 16777216,
+    "database_max_connections_including_admin": 24
+  },
+  "rows": [
+    {
+      "loops": 1,
+      "status": "passed",
+      "source_report": "pg-performance-direct-release-1.json",
+      "report_sha256": "22e6d2e22bf20abc881e34704df48a4e964cdb3f3bfd9232908f65b5c00bee2d",
+      "cli_sha256": "aef4dd8f829840b91f7ec145b93541c70cbdff8994661504cdc26fec034227b0",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "postgres_version": "17.11 (Homebrew)",
+      "seconds": 5.001023249999999,
+      "completed": 29048,
+      "successes": 29048,
+      "errors": {},
+      "rps": 5808.41130862569,
+      "p50_ms": 1.2,
+      "p95_ms": 3.0,
+      "p99_ms": 4.2,
+      "service_before": {
+        "rss_bytes": 19005440,
+        "cpu_time": "0:00.02",
+        "threads": 13,
+        "fds": 9
+      },
+      "service_after": {
+        "rss_bytes": 18317312,
+        "cpu_time": "0:04.10",
+        "threads": 13,
+        "fds": 12
+      },
+      "loop_work": [
+        {
+          "id": 0,
+          "accepted": 10,
+          "requests": 29049,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 1,
+          "pending": 0
+        }
+      ],
+      "database_metrics": {
+        "reserved_connections": 4,
+        "reserved_waiters": 8,
+        "pending_operations": 0,
+        "pending_bytes": 0,
+        "peak_pending_bytes": 1176,
+        "rejections": 0,
+        "unknown_results": 0,
+        "confirmed_cancellations": 0
+      },
+      "connections_before_exit": 4,
+      "drain_exit": 0,
+      "connections_after_exit": 0
+    },
+    {
+      "loops": 2,
+      "status": "passed",
+      "source_report": "pg-performance-direct-release-2.json",
+      "report_sha256": "1edda83cdac050966df39c3f3addeac87e82eb767c3a548791cd106506149226",
+      "cli_sha256": "aef4dd8f829840b91f7ec145b93541c70cbdff8994661504cdc26fec034227b0",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "postgres_version": "17.11 (Homebrew)",
+      "seconds": 5.002010542000001,
+      "completed": 28559,
+      "successes": 28559,
+      "errors": {},
+      "rps": 5709.50416041726,
+      "p50_ms": 1.3,
+      "p95_ms": 3.0,
+      "p99_ms": 4.1,
+      "service_before": {
+        "rss_bytes": 19038208,
+        "cpu_time": "0:00.02",
+        "threads": 14,
+        "fds": 11
+      },
+      "service_after": {
+        "rss_bytes": 18481152,
+        "cpu_time": "0:04.13",
+        "threads": 14,
+        "fds": 14
+      },
+      "loop_work": [
+        {
+          "id": 0,
+          "accepted": 5,
+          "requests": 14378,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 1,
+          "accepted": 5,
+          "requests": 14182,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 1,
+          "pending": 0
+        }
+      ],
+      "database_metrics": {
+        "reserved_connections": 4,
+        "reserved_waiters": 8,
+        "pending_operations": 0,
+        "pending_bytes": 0,
+        "peak_pending_bytes": 1176,
+        "rejections": 0,
+        "unknown_results": 0,
+        "confirmed_cancellations": 0
+      },
+      "connections_before_exit": 4,
+      "drain_exit": 0,
+      "connections_after_exit": 0
+    },
+    {
+      "loops": 4,
+      "status": "passed",
+      "source_report": "pg-performance-direct-release-4.json",
+      "report_sha256": "f8ca99a3ba17b63ba0250f10ade33de8a76db20f18179a132ccc482820888dbc",
+      "cli_sha256": "aef4dd8f829840b91f7ec145b93541c70cbdff8994661504cdc26fec034227b0",
+      "fixture_sha256": "a864b30eb59e4d5ff94a347ca2304011803e53a3b213894395eb004d2b64f2af",
+      "postgres_version": "17.11 (Homebrew)",
+      "seconds": 5.004186083,
+      "completed": 27274,
+      "successes": 27274,
+      "errors": {},
+      "rps": 5450.236971133833,
+      "p50_ms": 1.3,
+      "p95_ms": 3.1,
+      "p99_ms": 4.4,
+      "service_before": {
+        "rss_bytes": 19021824,
+        "cpu_time": "0:00.02",
+        "threads": 16,
+        "fds": 15
+      },
+      "service_after": {
+        "rss_bytes": 18153472,
+        "cpu_time": "0:03.94",
+        "threads": 16,
+        "fds": 18
+      },
+      "loop_work": [
+        {
+          "id": 0,
+          "accepted": 3,
+          "requests": 6846,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 1,
+          "accepted": 3,
+          "requests": 6752,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 1,
+          "pending": 0
+        },
+        {
+          "id": 2,
+          "accepted": 2,
+          "requests": 6870,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        },
+        {
+          "id": 3,
+          "accepted": 2,
+          "requests": 6807,
+          "queued": 0,
+          "running": 0,
+          "resident": 0,
+          "connections": 0,
+          "pending": 0
+        }
+      ],
+      "database_metrics": {
+        "reserved_connections": 4,
+        "reserved_waiters": 8,
+        "pending_operations": 0,
+        "pending_bytes": 0,
+        "peak_pending_bytes": 1176,
+        "rejections": 0,
+        "unknown_results": 0,
+        "confirmed_cancellations": 0
+      },
+      "connections_before_exit": 4,
+      "drain_exit": 0,
+      "connections_after_exit": 0
+    }
+  ],
+  "confirmed_fixture_issue": {
+    "source_report": "pg-performance-direct-before-client-reuse-1.json",
+    "report_sha256": "fa3ec6d76da21331384164748f32b1b064a446616b080c0b595c8aa5d798e91b",
+    "observed_error": "client connect OSError errno 49, Cannot assign requested address, before any HTTP response body",
+    "successes_before_failure": 16265,
+    "error_count": {
+      "OSError": 1365
+    },
+    "macos_ephemeral_port_first": 49152,
+    "macos_ephemeral_port_last": 65535,
+    "cause": "One new TCP connection for every request consumed the 16384-port client range at the higher direct throughput. Fixed eight persistent clients remove that fixture bottleneck.",
+    "change_scope": "Performance client only. Ku HTTP architecture, PostgreSQL pool, SQL, timeouts and fault-mode proxy were not changed."
+  },
+  "interpretation": [
+    "All measured requests succeeded, both every loop setting and every loop owner actually processed HTTP requests.",
+    "No throughput scaling claim: pool capacity remains four connections and the same-host eight Python clients plus PostgreSQL are part of the measured chain.",
+    "Proxy throughput and direct persistent-client throughput use different fixture topology and connection policy and must not be combined into a before/after Ku speedup.",
+    "Earlier 49 JSONDecodeError instances have no retained body. Their cause remains unknown; these passes do not retroactively repair or classify them. See pg-performance-diagnostic-macos.json.",
+    "No PostgreSQL production change was justified by the focused follow-up. No full fault suite or 36-case memory matrix was repeated."
+  ],
+  "reproduce": "python3 tests/acceptance/http_pg_lifecycle.py --ku <current-ku> --loops <1|2|4> --performance-seconds 5 --profile release --output <report.json>"
+}

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -44,6 +45,12 @@ RLIB_NAME = re.compile(r"deps/lib[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\.rlib\Z")
 
 class ExportError(ValueError):
     pass
+
+
+class RuntimeSmokeError(ExportError):
+    def __init__(self, message: str, evidence: dict):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 def canonical_example(source: bytes) -> bytes:
@@ -123,6 +130,110 @@ def verify_installation(installed: Path, repo: Path, version: str, target: str) 
                         or value.get("nested") != {"numbers": [[1, 2], [3]]}):
                     raise ExportError("installed Ku JSON result differs from the example")
             receipt["checks"].append({"name": name, **record})
+    return receipt
+
+
+def run_runtime_check(arguments: list[str], repo: Path, working: Path,
+                      timeout_seconds: float = 180) -> subprocess.CompletedProcess:
+    """Reuse the existing suspended Windows Job/POSIX session owner and bounds."""
+    if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 180:
+        raise ExportError("runtime verification may only shorten the existing 180-second execution cap")
+    runner_path = Path(__file__).with_name("verify-native-three-os.py")
+    spec = importlib.util.spec_from_file_location("ku_release_runtime_runner", runner_path)
+    if spec is None or spec.loader is None:
+        raise ExportError("cannot load existing native process owner")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    runner.COMMAND_TIMEOUT_SECONDS = timeout_seconds
+    runner.MAX_CAPTURE_BYTES = 1024 * 1024
+    # Run the unchanged driver in this same contained Python process after
+    # directing all of its TemporaryDirectories into our outer owned root.
+    # run_path does not set sys.path[0] for a source file; restore normal Python
+    # script sibling imports instead of retaining the -c working-directory entry.
+    wrapper = ("import os,runpy,sys; root=sys.argv.pop(1); "
+               "os.environ.update({name:root for name in ('TMPDIR','TMP','TEMP')}); "
+               "sys.argv=sys.argv[1:]; "
+               "sys.path[0]=os.path.dirname(os.path.realpath(sys.argv[0])); "
+               "runpy.run_path(sys.argv[0],run_name='__main__')")
+    command = [arguments[0], "-B", "-c", wrapper, str(working), *arguments[2:]]
+    return runner.run_bounded(command, repo, "installed runtime smoke")
+
+
+def verify_runtime_installation(installed: Path, repo: Path, target: str) -> dict:
+    """Run the existing three-second fixture with the extracted CLI, not Cargo."""
+    repo = repo.resolve()
+    executable = installed / ("ku.exe" if target.endswith("windows-msvc") else "ku")
+    driver = repo / "tests/acceptance/multiloop_load.py"
+    fixture = repo / "tests/fixtures/multiloop_service.ku"
+    receipt = {"format": "ku-installed-runtime-smoke-v1", "status": "running", "target": target,
+               "executable_sha256": file_hash(executable), "driver_sha256": file_hash(driver),
+               "fixture_sha256": file_hash(fixture), "duration_seconds": 3, "arrival_rps": 1,
+               "process_owner": {"path": ".github/scripts/verify-native-three-os.py",
+                                 "sha256": file_hash(Path(__file__).with_name("verify-native-three-os.py")),
+                                 "execution_timeout_seconds": 180, "combined_capture_bytes": 1024 * 1024,
+                                 "cleanup_budget_seconds": 10, "windows_setup_seconds": 5},
+               "selected_loops": 2, "scope": "installed native HTTP/Task/timer smoke, not capacity or sustained acceptance"}
+    failure = None
+    failure_error = None
+    with tempfile.TemporaryDirectory(prefix="ku-installed-runtime-") as temporary:
+        working = Path(temporary).resolve()
+        report_path = working / "runtime.json"
+        arguments = [sys.executable, "-B", str(driver), "--ku", str(executable), "--loops", "2",
+                     "--duration", "3", "--rps", "1", "--profile", "release", "--output", str(report_path)]
+        result = None
+        try:
+            result = run_runtime_check(arguments, repo, working)
+            receipt["driver_exit_code"] = result.returncode
+            receipt["process_tree_cleanup_confirmed"] = True
+            if result.returncode != 0:
+                raise ExportError(f"installed runtime check failed (exit {result.returncode})")
+            report = json.loads(read_bounded(report_path, 1024 * 1024))
+            if (report.get("status") != "passed" or report.get("cli_sha256") != receipt["executable_sha256"]
+                    or report.get("fixture_sha256") != receipt["fixture_sha256"]
+                    or len(report.get("runs", [])) != 1):
+                raise ExportError("installed runtime check report identity/status differs")
+            run = report["runs"][0]
+            phases = run.get("phases", [])
+            if (run.get("loops") != 2 or run.get("exit_code") != 0 or len(phases) != 1
+                    or phases[0].get("name") != "short"):
+                raise ExportError("installed runtime check did not complete two-loop run and normal drain")
+            phase = phases[0]
+            if (phase.get("arrivals") != 3 or phase.get("completed") != 3 or phase.get("client_shed") != 0
+                    or phase.get("counts") != {"success": 3} or phase.get("first_errors")):
+                raise ExportError("installed runtime check did not return all three correct bodies")
+            metrics = run["final_metrics"]
+            loops, tasks, outcomes = metrics["loops"], metrics["tasks"], metrics["outcomes"]
+            if (len(loops) != 2 or len(tasks) != 2 or len(outcomes) != 2
+                    or any(type(row[key]) is not int or row[key] != 0 for row in loops
+                           for key in ("queued", "running", "resident", "pending"))
+                    or any(type(row[key]) is not int or row[key] != 0 for row in tasks
+                           for key in ("ready", "waiting", "running", "resident", "timers"))
+                    or any(type(row["queued_bytes"]) is not int or row["queued_bytes"] != 0 for row in outcomes)):
+                raise ExportError("installed runtime check left Task or HTTP queue records/bytes")
+            if file_hash(executable) != receipt["executable_sha256"]:
+                raise ExportError("installed Ku changed during its runtime check")
+            receipt.update(requests={"planned": 3, "completed": 3, "correct": 3,
+                                     "paths_in_order": ["/ok", "/cpu", "/timer"]},
+                           observed_loops=len(loops), task_records=0, http_queue_records=0,
+                           http_queue_bytes=0, drain_exit_code=run["exit_code"], status="passed")
+        except (Exception, SystemExit) as error:
+            failure_error = error
+            failure = str(error)[-8192:]
+            receipt.update(status="failed", error=failure, error_truncated=len(str(error)) > 8192)
+            if result is None:
+                # The reused owner reports cleanup uncertainty as an error;
+                # never infer a clean tree just because its launcher exited.
+                receipt["process_tree_cleanup_confirmed"] = False
+            if report_path.is_file():
+                with report_path.open("rb") as stream:
+                    stream.seek(max(0, os.fstat(stream.fileno()).st_size - 8192))
+                    receipt["report_tail"] = stream.read(8192).decode("utf-8", errors="replace")
+            if result is not None:
+                for name, data in (("stdout_tail", result.stdout), ("stderr_tail", result.stderr)):
+                    receipt[name] = data[-8192:].decode("utf-8", errors="replace")
+    receipt["temporary_tree_removed"] = not working.exists()
+    if failure:
+        raise RuntimeSmokeError(failure, receipt) from failure_error
     return receipt
 
 
@@ -592,13 +703,19 @@ components. No additional license grant for Ku is implied by this archive.
                     "size": compressed.stat().st_size, "files": stage.files}
         if verify_install:
             manifest["installation_check"] = verify_installation(verified, repo, version, target)
+            runtime_check = verify_runtime_installation(verified, repo, target)
         # Exclusive creation also closes the race with another publisher.
         with asset_path.open("xb") as destination, compressed.open("rb") as source:
             shutil.copyfileobj(source, destination, length=1024 * 1024)
         with manifest_path.open("xb") as destination:
             destination.write(json_bytes(manifest))
-    return {"asset_path": str(asset_path.resolve()), "manifest_path": str(manifest_path.resolve()),
-            "sha256": manifest["sha256"], "size": manifest["size"]}
+    result = {"asset_path": str(asset_path.resolve()), "manifest_path": str(manifest_path.resolve()),
+              "sha256": manifest["sha256"], "size": manifest["size"]}
+    if verify_install:
+        # Side-channel evidence stays in the single CLI JSON result. The exact
+        # six-file release asset set and strict installation manifest stay intact.
+        result["runtime_installation"] = runtime_check
+    return result
 
 
 def main() -> int:
@@ -612,6 +729,8 @@ def main() -> int:
         result = export_release(**vars(arguments), verify_install=True)
     except (ExportError, OSError, ValueError, KeyError, TypeError, AttributeError,
             RecursionError, tarfile.TarError, EOFError) as error:
+        if isinstance(error, RuntimeSmokeError):
+            print(json.dumps({"runtime_installation": error.evidence}, sort_keys=True), file=sys.stderr)
         print(f"release export failed: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))

@@ -1220,7 +1220,7 @@ fn main(): null! {{
     assert!(generated.contains("#define KU_NATIVE_RUNTIME_HTTP_SOCKET 1"));
     assert!(generated.contains("#define KU_NATIVE_RUNTIME_REDIS_SOCKET 1"));
     assert!(generated.contains("ku_redis_lock_until(r, deadline)"));
-    assert!(generated.contains("pthread_create(&worker, NULL, ku_http_worker, &ctx)"));
+    assert!(generated.contains("pthread_create(&worker, &attributes, ku_http_worker, &ctx)"));
 
     let redis_server = thread::spawn(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

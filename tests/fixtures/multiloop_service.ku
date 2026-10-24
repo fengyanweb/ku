@@ -1,0 +1,47 @@
+// Acceptance fixture; the driver supplies only its own temporary http.addr.
+import { http, time, fs } from "std"
+
+async fn delayed(): HttpResponse! {
+    time.sleep(25)?
+    return ok(http.text("timer-ready"))
+}
+
+async fn cpu(): HttpResponse! {
+    total = 0
+    i = 0
+    while (i < 5000) {
+        total = total + i
+        i = i + 1
+    }
+    if (total != 12497500) { fail "incorrect calculation" }
+    return ok(http.text("cpu-ready"))
+}
+
+async fn hot(): HttpResponse! {
+    i = 0
+    while (i < 200000) { i = i + 1 }
+    return ok(http.text("hot-ready"))
+}
+
+async fn cancelled(): HttpResponse! {
+    time.sleep(5000)?
+    return ok(http.text("must-time-out"))
+}
+
+fn main(): null! {
+    address = fs.read("http.addr")?
+    app = http.server({max_connections: 256, max_active_requests: 128,
+        max_pending_requests: 128, max_buffer_bytes: 8388608,
+        max_header_bytes: 4096, max_body_bytes: 65536,
+        handler_timeout_ms: 1000, idle_timeout_ms: 1000,
+        read_header_timeout_ms: 1000, read_body_timeout_ms: 1000,
+        write_timeout_ms: 1000})
+    app.get("/ok", fn() { return http.text("ok-ready") })
+    app.post("/echo", fn(req) { return http.text(req.body) })
+    app.get("/timer", delayed)
+    app.get("/cpu", cpu)
+    app.get("/hot", hot)
+    app.get("/cancel", cancelled)
+    app.listen(address)?
+    return ok(null)
+}

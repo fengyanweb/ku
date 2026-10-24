@@ -649,10 +649,17 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
         exit_error.process = process
         exit_error.readers = readers
         raise exit_error from failure
+    cleanup_receipt = {"process_tree_cleanup_confirmed": True,
+                       "root_reaped": True,  # successful owned wait above; any failure already raised
+                       "windows_job_drained": os.name == "nt" and windows_job is not None,
+                       "scope": "only this owner session/Job, not unrelated sessions"}
     if primary is not None:
+        primary.process_owner_cleanup = cleanup_receipt
         raise primary
     assert return_code is not None
-    return subprocess.CompletedProcess(command, return_code, stdout, stderr)
+    completed = subprocess.CompletedProcess(command, return_code, stdout, stderr)
+    completed.process_owner_cleanup = cleanup_receipt
+    return completed
 
 
 @contextmanager

@@ -6,7 +6,7 @@
 //! failed program. Output is retained within a fixed byte allowance and emitted
 //! as streaming JSONL/base64 so receipts do not allocate copies of that output.
 
-mod platform;
+pub(crate) mod platform;
 
 use std::{
     collections::VecDeque,
@@ -1204,6 +1204,14 @@ fn write_receipt(output: &mut impl Write, receipt: Receipt<'_>) -> io::Result<()
         } else {
             output.write_all(b"null")?;
         }
+        output.write_all(b",\"memory_limit_evidence\":")?;
+        output.write_all(
+            metrics
+                .memory_limit_evidence
+                .as_deref()
+                .unwrap_or("null")
+                .as_bytes(),
+        )?;
     }
     write!(
         output,

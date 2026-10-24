@@ -4527,6 +4527,7 @@ mod tests {
     mod connection_diagnostics;
 
     const TEST_HTTP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+    const TEST_REGISTRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
     const MAX_TEST_HTTP_RESPONSE_HEADER_BYTES: usize = MAX_REQUEST_HEADER_BYTES;
     const MAX_TEST_HTTP_RESPONSE_HEADERS: usize = MAX_REQUEST_HEADERS;
     const MAX_TEST_HTTP_RESPONSE_BODY_BYTES: usize = MAX_REGISTRY_DOWNLOAD_BYTES as usize;
@@ -4657,8 +4658,8 @@ mod tests {
             .tls_config(client_config)
             .resolver(test_registry_resolver(address))
             .timeout_connect(Duration::from_secs(2))
-            .timeout(Duration::from_secs(8))
-            .timeout_read(Duration::from_secs(8))
+            .timeout(TEST_REGISTRY_OPERATION_TIMEOUT)
+            .timeout_read(TEST_REGISTRY_OPERATION_TIMEOUT)
             .redirects(0)
             .build()
     }
@@ -4973,6 +4974,46 @@ mod tests {
         BufReader::new(StreamOwned::new(connection, stream))
     }
 
+    fn test_registry_operation_deadline(outer_deadline: Instant) -> io::Result<Instant> {
+        let deadline = Instant::now()
+            .checked_add(TEST_REGISTRY_OPERATION_TIMEOUT)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "test deadline overflowed"))?
+            .min(outer_deadline);
+        test_http_remaining(deadline)?;
+        Ok(deadline)
+    }
+
+    fn connect_test_tls_until(
+        base_url: &str,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        deadline: Instant,
+    ) -> io::Result<BufReader<StreamOwned<ClientConnection, DeadlineTcpStream>>> {
+        // Reject expiry before address parsing or opening a socket. The same D
+        // then covers TCP, lazy TLS handshakes, writes, response reads and EOF.
+        test_http_remaining(deadline)?;
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(certificate)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connection = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("localhost").expect("valid registry test server name"),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let stream = TcpStream::connect_timeout(
+            &registry_test_address(base_url),
+            test_http_remaining(deadline)?.min(Duration::from_secs(2)),
+        )?;
+        test_http_remaining(deadline)?;
+        Ok(BufReader::new(StreamOwned::new(
+            connection,
+            DeadlineTcpStream::new(stream, deadline),
+        )))
+    }
+
     trait TestHttpResponseReader: BufRead {
         fn set_response_read_timeout(&mut self, timeout: Duration) -> io::Result<()>;
     }
@@ -4980,6 +5021,14 @@ mod tests {
     impl TestHttpResponseReader for BufReader<StreamOwned<ClientConnection, TcpStream>> {
         fn set_response_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
             self.get_mut().sock.set_read_timeout(Some(timeout))
+        }
+    }
+
+    impl TestHttpResponseReader for BufReader<StreamOwned<ClientConnection, DeadlineTcpStream>> {
+        fn set_response_read_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+            // This never changes the transport's absolute deadline. Each raw
+            // TLS read/write still rechecks that original D in DeadlineTcpStream.
+            self.get_mut().sock.inner.set_read_timeout(Some(timeout))
         }
     }
 
@@ -5135,6 +5184,13 @@ mod tests {
                 "registry test response timeout overflowed",
             )
         })?;
+        read_test_http_response_until(reader, deadline)
+    }
+
+    fn read_test_http_response_until(
+        reader: &mut impl TestHttpResponseReader,
+        deadline: Instant,
+    ) -> io::Result<(u16, HashMap<String, String>, Vec<u8>)> {
         let mut total = 0usize;
         let status_line =
             read_test_http_line_until(reader, MAX_REQUEST_LINE_BYTES, &mut total, deadline)?;
@@ -5618,13 +5674,11 @@ mod tests {
         status
     }
 
-    fn put_buffered_artifact(
-        base_url: &str,
-        certificate: rustls::pki_types::CertificateDer<'static>,
+    fn buffered_test_publish_request(
         token: &str,
         artifact: &PackageArtifact,
         checksum: &str,
-    ) -> u16 {
+    ) -> Vec<u8> {
         let body = fs::read(&artifact.path).expect("read buffered test package artifact");
         assert_eq!(
             u64::try_from(body.len()).expect("test package length fits u64"),
@@ -5639,6 +5693,17 @@ mod tests {
             request.len() <= REGISTRY_TLS_INPUT_BUFFER_BYTES,
             "buffered rejection fixture exceeds the server TLS input buffer"
         );
+        request
+    }
+
+    fn put_buffered_artifact(
+        base_url: &str,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        token: &str,
+        artifact: &PackageArtifact,
+        checksum: &str,
+    ) -> u16 {
+        let request = buffered_test_publish_request(token, artifact, checksum);
         let mut reader = connect_test_tls(base_url, certificate);
         reader
             .get_mut()
@@ -5649,6 +5714,44 @@ mod tests {
             .flush()
             .expect("flush buffered test publish request");
         read_closed_test_status(&mut reader)
+    }
+
+    fn read_closed_test_status_until(
+        reader: &mut BufReader<StreamOwned<ClientConnection, DeadlineTcpStream>>,
+        deadline: Instant,
+    ) -> io::Result<u16> {
+        assert_eq!(reader.get_ref().sock.deadline, deadline);
+        let (status, headers, _) = read_test_http_response_until(reader, deadline)?;
+        if headers.get("connection").map(String::as_str) != Some("close") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test response did not honor Connection: close",
+            ));
+        }
+        if !reader.fill_buf()?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected bytes after complete test response",
+            ));
+        }
+        test_http_remaining(deadline)?;
+        Ok(status)
+    }
+
+    fn put_buffered_artifact_until(
+        base_url: &str,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        token: &str,
+        artifact: &PackageArtifact,
+        checksum: &str,
+        outer_deadline: Instant,
+    ) -> io::Result<u16> {
+        let deadline = test_registry_operation_deadline(outer_deadline)?;
+        let request = buffered_test_publish_request(token, artifact, checksum);
+        let mut reader = connect_test_tls_until(base_url, certificate, deadline)?;
+        reader.get_mut().write_all(&request)?;
+        reader.get_mut().flush()?;
+        read_closed_test_status_until(&mut reader, deadline)
     }
 
     fn put_buffered_yank(
@@ -6354,6 +6457,10 @@ mod tests {
             pack_package(&race_a).expect("pack first race artifact"),
             pack_package(&race_b).expect("pack second race artifact"),
         ];
+        // This is a correctness check, not a three-second response SLO. Match
+        // the existing test agent's 8s operation budget without changing the
+        // server's 5s deadline. Two explicit rounds have one 16s outer bound.
+        let race_deadline = Instant::now() + TEST_REGISTRY_OPERATION_TIMEOUT * 2;
         let barrier = Arc::new(Barrier::new(3));
         let mut publishers = Vec::new();
         for artifact in artifacts {
@@ -6362,13 +6469,15 @@ mod tests {
             let certificate = certificate.clone();
             publishers.push(thread::spawn(move || {
                 barrier.wait();
-                let status = put_buffered_artifact(
+                let status = put_buffered_artifact_until(
                     &base_url,
                     certificate,
                     "token-race",
                     &artifact,
                     &artifact.checksum,
-                );
+                    race_deadline,
+                )
+                .expect("race publication must complete within its original operation deadline");
                 (artifact, status)
             }));
         }
@@ -6377,19 +6486,27 @@ mod tests {
             .into_iter()
             .map(|publisher| publisher.join().expect("race publisher panicked"))
             .collect::<Vec<_>>();
+        assert!(
+            outcomes.iter().filter(|(_, status)| *status == 429).count() <= 1,
+            "at most one rejected race request may need an explicit conflict check"
+        );
         // Wait for both attempts to finish before one explicit retry. Busy is
         // admission rejection, not success or a content conflict in disguise.
         let mut statuses = outcomes
             .into_iter()
             .map(|(artifact, status)| {
                 if status == 429 {
-                    put_buffered_artifact(
+                    // Only an explicit 429 rejection permits this independent
+                    // conflict check. Unknown transport outcomes are not retried.
+                    put_buffered_artifact_until(
                         &server.base_url,
                         certificate.clone(),
                         "token-race",
                         &artifact,
                         &artifact.checksum,
+                        race_deadline,
                     )
+                    .expect("explicit conflict check must stay within the race deadline")
                 } else {
                     status
                 }
@@ -6397,6 +6514,7 @@ mod tests {
             .collect::<Vec<_>>();
         statuses.sort_unstable();
         assert_eq!(statuses, vec![201, 409]);
+        test_http_remaining(race_deadline).expect("the two race rounds must finish within 16s");
 
         let restart_port = server
             .base_url
@@ -7323,6 +7441,74 @@ mod tests {
                 "parser accepted unsafe request: {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn registry_test_tls_operation_keeps_one_deadline_through_response_and_close() {
+        let root = TestRoot::new("one-operation-deadline");
+        let files = test_server_files(&root.0, &[("token-math", "math")], Duration::from_secs(5));
+        let certificate = files.certificate.clone();
+        let server = TestServer::start(files.config, certificate.clone());
+        let outer_deadline = Instant::now() + TEST_REGISTRY_OPERATION_TIMEOUT * 2;
+        let deadline =
+            test_registry_operation_deadline(outer_deadline).expect("live operation deadline");
+        let mut reader = connect_test_tls_until(&server.base_url, certificate, deadline)
+            .expect("connect within the original operation deadline");
+        assert_eq!(reader.get_ref().sock.deadline, deadline);
+        reader
+            .set_response_read_timeout(Duration::from_secs(60))
+            .expect("setting an I/O timeout must not renew the operation");
+        assert_eq!(reader.get_ref().sock.deadline, deadline);
+        write_test_get(
+            reader.get_mut(),
+            "/v1/packages/missing/index.toml",
+            Some("close"),
+        );
+        reader.get_mut().flush().expect("flush within original D");
+        assert_eq!(reader.get_ref().sock.deadline, deadline);
+        assert_eq!(
+            read_closed_test_status_until(&mut reader, deadline)
+                .expect("read complete response and TLS EOF within original D"),
+            404
+        );
+        assert_eq!(reader.get_ref().sock.deadline, deadline);
+        assert!(deadline <= outer_deadline);
+    }
+
+    #[test]
+    fn registry_test_expired_tls_operation_performs_no_io() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        // Neither the invalid address/certificate nor the absent local artifact
+        // may be accessed after expiry. They would fail if setup preceded D.
+        let certificate = rustls::pki_types::CertificateDer::from(Vec::new());
+        let artifact = PackageArtifact {
+            path: PathBuf::new(),
+            name: "math".to_string(),
+            version: "1.0.0".to_string(),
+            checksum: "unused".to_string(),
+            size: 0,
+        };
+        let error = put_buffered_artifact_until(
+            "not-a-fixture-address",
+            certificate.clone(),
+            "unused",
+            &artifact,
+            &artifact.checksum,
+            expired,
+        )
+        .expect_err("an expired operation must not read input or open TCP");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let error = connect_test_tls_until("not-a-fixture-address", certificate, expired)
+            .err()
+            .expect("direct expired connect must perform no I/O");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut reader = BufReader::new(std::io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ));
+        let error = read_test_http_response_until(&mut reader, expired)
+            .expect_err("response parsing must preserve an already-expired D");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(reader.get_ref().position(), 0);
     }
 
     #[test]

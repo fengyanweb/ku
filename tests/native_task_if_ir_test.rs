@@ -1679,3 +1679,90 @@ async fn main(): null! { total=(await Inspect())? return ok(null) }
     let repeated = parsed("async fn Bad(left: [str], right: [str]): int! { return ok(left.len()+right.len()) } async fn main(): null! { values=[\"owned\"] total=(await Bad(values,values))? println(total) return ok(null) }");
     assert!(Checker::new().check(&repeated).is_err());
 }
+
+#[test]
+fn native_task_scalar_compaction_keeps_the_real_direct_http_work_function() {
+    let source = include_str!("benchmarks/cross_stack/ku/server.ku")
+        .replace("__PEER_PORT__", "19191")
+        .replace(
+            "    return (await work_response(req, total))",
+            r#"    text = str(total)
+    while (text.len() < 8) { text = "0" + text }
+    return ok(http.text(req.query.rid + ":" + text))"#,
+        );
+    ku::cli::check_source("/tmp/ku-direct-compaction.ku", &source).unwrap();
+    let tasks = task_lower::lower_service_handlers(&parsed(&source)).unwrap();
+    let work = tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "work")
+        .unwrap();
+    eprintln!("real direct HTTP work physical slots: {} (previously rejected above64 logical temporaries)", work.slots.len());
+    assert!(work.slots.len() <= 64);
+    assert!(work
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::PrimitiveString { .. })));
+    assert!(
+        !work
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .any(|op| matches!(op, TaskOp::Start { .. } | TaskOp::StartIndirect { .. })),
+        "direct formatting must not secretly restart helper Tasks"
+    );
+    task::verify_and_plan(&tasks, TaskLimits::default()).unwrap();
+}
+
+#[test]
+fn native_task_scalar_compaction_preserves_branches_awaits_and_named_storage() {
+    let temporaries = "println(1 + 2 * 3)\n".repeat(18);
+    let source = format!(
+        r#"async fn Ready(value:int):int! {{ return ok(value) }}
+async fn main():null! {{
+    retained=123
+    {temporaries}
+    pending=Ready(7)
+    if (retained>0) {{ println((await pending)?) }} else {{ println((await pending)?) }}
+    println(retained)
+    return ok(null)
+}}"#
+    );
+    let tasks = task_lower::lower_program(&checked(&source)).unwrap();
+    assert!(tasks
+        .tasks
+        .functions
+        .iter()
+        .all(|function| function.slots.len() <= 64));
+    task::verify_and_plan(&tasks.tasks, TaskLimits::default()).unwrap();
+    let mut named = String::from("async fn main():null! {");
+    for index in 0..70 {
+        named.push_str(&format!("v{index}={index}\n"));
+    }
+    named.push_str("return ok(null) }");
+    assert!(
+        task_lower::lower_program(&checked(&named))
+            .unwrap_err()
+            .message
+            .contains("physical Task slots"),
+        "named source bindings remain fixed even when unused"
+    );
+}
+
+#[test]
+fn native_task_scalar_compaction_does_not_mask_move_or_finally_gates() {
+    let temporary_work = "println(1 + 2 * 3)\n".repeat(18);
+    let invalid = format!("async fn main():null! {{ {temporary_work} result=ok(true) while(result?) {{}} return ok(null) }}");
+    let error = task_lower::lower_program(&parsed(&invalid)).unwrap_err();
+    assert!(
+        error.message.contains("not definitely initialized"),
+        "{error}"
+    );
+    let conservative = format!("async fn main():null! {{ try {{ {temporary_work} }} finally {{ println(\"cleanup\") }} return ok(null) }}");
+    let error = task_lower::lower_program(&checked(&conservative)).unwrap_err();
+    assert!(
+        error.message.contains("across finally is not enabled"),
+        "{error}"
+    );
+}

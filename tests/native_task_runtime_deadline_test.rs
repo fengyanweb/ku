@@ -335,7 +335,7 @@ int main(void) {
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(startup_deadline!=UINT64_MAX);
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==11u);
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,6,ring,6,fixed+instances+31u,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   uint8_t* buffer=(uint8_t*)malloc(31u); CHECK(buffer); memcpy(buffer,"payload",7u);

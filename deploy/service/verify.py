@@ -1,0 +1,1443 @@
+#!/usr/bin/env python3
+"""Actual Ku native + HAProxy/Caddy recovery / rolling / rollback check.
+
+All generated sources, binaries, tokens, configs and processes are temporary.
+Keep only the requested JSON result. This is W5/W6 coverage, not the complete
+runtime matrix or the separate fixed 30-minute acceptance.
+"""
+
+import argparse
+import hashlib
+import http.client
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+
+
+HERE = Path(__file__).resolve().parent
+SPEC = importlib.util.spec_from_file_location("ku_service_manage", HERE / "manage.py")
+M = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(M)
+ALLOCATED_ADDRESSES = set()
+
+
+def reserve_fixture_threads(budget, windows=None):
+    """Reserve measured full-process platform cost, not extra Ku workers.
+
+    The Windows auxiliary-thread sources are not uniquely attributed. Sixteen
+    is an explicit conservative admission reserve, not an OS thread hard cap.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    per_instance = budget["per_instance"]
+    reserve = 16 if windows else 0
+    per_instance["platform_thread_reserve"] = reserve
+    if windows:
+        per_instance["total_threads"] = (per_instance["event_threads"]
+            + per_instance["blocking_threads"]+9+reserve)
+        budget["total_threads"] = (budget["max_parallel_instances"]*per_instance["total_threads"]
+            + budget.get("management_threads", 0))
+
+
+class ProxyCapture:
+    """Drain combined proxy output into one fixed 64 KiB temporary-file ring."""
+
+    capacity = 65536
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.file = tempfile.TemporaryFile()
+        self.total = self.position = 0
+        self.error = None
+        self.thread = threading.Thread(target=self.collect, daemon=True)
+        self.thread.start()
+
+    def collect(self):
+        try:
+            while chunk := self.stream.read1(4096):
+                first = min(len(chunk), self.capacity-self.position)
+                self.file.seek(self.position)
+                self.file.write(chunk[:first])
+                if first < len(chunk):
+                    self.file.seek(0)
+                    self.file.write(chunk[first:])
+                self.position = (self.position+len(chunk)) % self.capacity
+                self.total += len(chunk)
+        except (OSError, ValueError) as error:
+            self.error = f"{type(error).__name__}: {error}"[:256]
+        finally:
+            self.stream.close()
+
+    def finish(self):
+        try:
+            self.thread.join(timeout=5)
+            if self.thread.is_alive():
+                raise RuntimeError("proxy output reader did not retire within 5 seconds")
+            size = min(self.total, self.capacity)
+            start = (self.position-size) % self.capacity
+            self.file.seek(start)
+            data = self.file.read(min(size, self.capacity-start))
+            if len(data) < size:
+                self.file.seek(0)
+                data += self.file.read(size-len(data))
+            return {"total_bytes": self.total, "capture_capacity_bytes": self.capacity,
+                    "tail": data[-8192:].decode("utf-8", errors="replace"), "reader_error": self.error}
+        finally:
+            self.file.close()
+
+
+def task_command(name, verb):
+    # name is generated locally from an ASCII-only random prefix, not user data.
+    confirm = " -Confirm:$false" if verb == "Unregister" else ""
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            f"$ErrorActionPreference='Stop'; {verb}-ScheduledTask -TaskName '{name}'{confirm}"]
+
+
+def windows_host_processes(root):
+    prefix = str(root).replace("'", "''")
+    command = ("$ErrorActionPreference='Stop'; @("+
+        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and "+
+        f"$_.CommandLine -and $_.CommandLine.Contains('{prefix}') "+
+        "} | Select-Object ProcessId,ParentProcessId,Name,CreationDate) | ConvertTo-Json -Depth 4 -Compress")
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                            capture_output=True, text=True, timeout=10, check=True)
+    return json.loads(result.stdout or "[]")
+
+
+def memory_retirement(args):
+    """One actual service/provider integration case; not the old 36-case matrix."""
+    report = {"kind": "resident-hard-memory-provider", "platform": platform.platform(),
+              "database_retry": False, "database_used": False, "status": "prepared",
+              "plan": {"worker_memory_bytes": 67108864, "event_loops": 2,
+                  "blocking_threads": 2, "pressure_target_bytes": 268435456,
+                  "replacement_deadline_seconds": 15, "pressure_requests": 1}}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    def save():
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
+    save()
+    config = None
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="ku-svc-hard-memory-") as temporary:
+        root = Path(temporary)
+        try:
+            cli = root / ("ku.exe" if os.name == "nt" else "ku")
+            shutil.copy2(args.ku.resolve(strict=True), cli)
+            report["cli_sha256"] = hashlib.sha256(cli.read_bytes()).hexdigest()
+            source = root / "memory.ku"
+            source.write_text('''import {http, fs} from "std"
+fn pressure(): HttpResponse! {
+    text = fs.read("seed.txt")?
+    i = 0
+    while (i < 12) {
+        text = text + text
+        i = i + 1
+    }
+    return ok(http.text(text))
+}
+fn main(): null! {
+    fs.write("application-started", "started")?
+    address = fs.read("http.addr")?
+    app = http.service()
+    app.max_connections = 32
+    app.max_active_requests = 16
+    app.max_pending_requests = 16
+    app.get("/", fn() { return http.text("ready") })
+    app.get("/pressure", pressure)
+    app.listen(address)?
+    return ok(null)
+}
+''', encoding="utf-8")
+            executable = root / ("memory.exe" if os.name == "nt" else "memory")
+            build = subprocess.run([str(cli), "build", "--native", str(source), "-o", str(executable)],
+                                   cwd=root, capture_output=True, text=True, timeout=60)
+            report["build"] = {"exit": build.returncode, "stderr_tail": build.stderr[-4000:]}
+            if build.returncode:
+                raise RuntimeError("hard-memory native fixture did not build")
+            data = json.loads((HERE / "cluster.example.json").read_text(encoding="utf-8"))
+            data["deployment_budget"]["per_instance"].update(event_threads=2, blocking_threads=2, total_threads=13)
+            reserve_fixture_threads(data["deployment_budget"])
+            token = root / "token"
+            token.write_text(secrets.token_hex(32), encoding="ascii")
+            token.chmod(0o600)
+            data.update(ku=str(cli), control_token_file=str(token), frontend_addr=address(),
+                        operation_timeout_seconds=15)
+            data["service_options"].update(probe_interval_ms=100, probe_timeout_ms=100,
+                startup_timeout_ms=5000, drain_timeout_ms=1000, restart_limit=3)
+            for slot in data["slots"]:
+                directory = root / slot["name"]
+                directory.mkdir()
+                slot["listen_addr"], slot["probe_addr"], slot["control_addr"] = address(), address(), address()
+                (directory / "http.addr").write_text(slot["listen_addr"], encoding="ascii")
+                (directory / "seed.txt").write_bytes(b"x" * 65536)
+                target = directory / executable.name
+                shutil.copy2(executable, target)
+                slot.update(program=str(target), memory_limit_bytes=67108864)
+                if platform.system() == "Linux":
+                    if not args.cgroup_root:
+                        raise RuntimeError("Linux memory-only requires a dedicated empty delegated --cgroup-root")
+                    slot["cgroup_root"] = str(args.cgroup_root.resolve(strict=True))
+                slot.pop("manager_start", None)
+                slot.pop("manager_stop", None)
+            path = root / "cluster.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            config = M.load(path)
+            a, b, _ = config["slots"]
+            report["slot_preflight"] = {
+                slot["name"]: M.status(config, slot) for slot in config["slots"]
+            }
+            save()
+            if platform.system() == "Darwin":
+                rejected = subprocess.run(M.command(config, a), env=M.environment(config, a),
+                                          capture_output=True, text=True, timeout=5)
+                report["unsupported_provider"] = {"exit": rejected.returncode,
+                    "stderr": rejected.stderr[-4000:],
+                    "application_started": (Path(a["program"]).parent/"application-started").exists()}
+                if not (rejected.returncode != 0 and "unavailable" in rejected.stderr
+                        and "macOS" in rejected.stderr and not report["unsupported_provider"]["application_started"]):
+                    raise RuntimeError("macOS did not reject the hard provider before application startup")
+                report["guarantee"] = "macOS native hard mode explicitly unavailable; no RSS-sampling substitute"
+            else:
+                if platform.system() == "Linux":
+                    report["cgroup_before"] = [item.name for item in args.cgroup_root.iterdir() if item.is_dir()]
+                    if report["cgroup_before"] or (args.cgroup_root/"cgroup.procs").read_text().strip():
+                        raise RuntimeError("CI delegated cgroup root must initially be dedicated and empty")
+                first = M.start(config, a)
+                M.start(config, b)
+                report["initial_status"] = first
+                trigger = time.monotonic()
+                try:
+                    code, body = M.call(a["listen_addr"], "GET", "/pressure", timeout=5)
+                    report["pressure_result"] = {"status": code, "body_prefix": body[:128]}
+                except (OSError, ValueError, http.client.HTTPException) as error:
+                    report["pressure_result"] = {"transport_or_limit_result": type(error).__name__, "detail": str(error)[:256]}
+                others = [M.call(b["listen_addr"], "GET", "/") for _ in range(10)]
+                deadline = trigger + 15
+                while time.monotonic() < deadline:
+                    current = M.status(config, a)
+                    if current["phase"] == "ready" and current["generation"] > first["generation"]:
+                        break
+                    time.sleep(.02)
+                else:
+                    raise RuntimeError("limited native instance was not retired and replaced within 15 seconds")
+                report.update(replacement_status=current,
+                    recovery_ms=round((time.monotonic()-trigger)*1000, 3),
+                    other_instance_responses=others,
+                    replacement_business=M.call(a["listen_addr"], "GET", "/"))
+                expected_metric = "linux_cgroup_v2_charged_memory_bytes" if platform.system() == "Linux" else "windows_job_committed_memory_bytes"
+                if not (current.get("limit_metric") == expected_metric
+                        and current.get("memory_peak_bytes", 0) >= 33554432
+                        and current.get("database_outcome") == "unknown"
+                        and current.get("database_retry") is False
+                        and others == [(200, "ready")] * 10
+                        and report["replacement_business"] == (200, "ready")):
+                    raise RuntimeError("provider metrics, uncertainty, surviving instance or replacement response mismatch")
+                if platform.system() == "Linux" and not current.get("memory_limit_observed"):
+                    raise RuntimeError("Linux pressure did not record actual cgroup limit/OOM evidence")
+                if platform.system() == "Linux":
+                    evidence = current.get("memory_limit_evidence") or {}
+                    worker = evidence.get("worker", {})
+                    before = evidence.get("private_domain_before", {})
+                    after = evidence.get("private_domain_after", {})
+                    for counters in (worker, before, after):
+                        if not (set(counters) == {"max", "oom", "oom_kill"}
+                                and all(type(value) is int and value >= 0 for value in counters.values())):
+                            raise RuntimeError("Linux provider omitted bounded raw worker/private-domain event evidence")
+                    if any(after[key] < before[key] for key in before):
+                        raise RuntimeError("Linux private-domain event counter decreased")
+                    leaf_oom = worker["oom"] > 0
+                    domain_oom = after["oom"] > before["oom"]
+                    if not (worker["oom_kill"] > 0 and (leaf_oom or domain_oom)
+                            and current.get("last_reason") == "os_memory_limit"):
+                        raise RuntimeError("Linux pressure termination lacks correlated configured-domain OOM and worker victim evidence")
+                    report["limit_event_scope"] = "worker_and_private_domain" if leaf_oom and domain_oom else "worker" if leaf_oom else "private_domain"
+                report["guarantee"] = ("Linux cgroup v2 actual memory/oom evidence" if platform.system() == "Linux"
+                    else "Windows configured Job commit limit, pressure process failure and replacement; no OS-kill or OOM inference from exit code")
+            report["status"] = "passed"
+        except BaseException as error:
+            report["status"] = "failed"
+            report["failure"] = f"{type(error).__name__}: {error}"
+        finally:
+            errors = []
+            if config:
+                for slot in config["slots"]:
+                    try:
+                        M.stop(config, slot)
+                    except (OSError, RuntimeError, TimeoutError) as error:
+                        errors.append(f"{slot['name']}: {error}")
+            if platform.system() == "Linux" and args.cgroup_root:
+                report["cgroup_after"] = [item.name for item in args.cgroup_root.iterdir() if item.is_dir()]
+                if report["cgroup_after"]:
+                    errors.append("provider domains remain under the dedicated CI delegation")
+            report["cleanup_errors"] = errors
+            if errors:
+                report["status"] = "failed"
+            report["duration_seconds"] = round(time.monotonic()-started, 3)
+            save()
+    print(json.dumps({"status": report["status"], "output": str(args.output)}, ensure_ascii=False))
+    if report["status"] != "passed":
+        raise SystemExit(1)
+
+
+def blocking_retirement(args):
+    """A14: real native pipe read remains live until process retirement.
+
+    This path deliberately needs neither HAProxy nor a database and also runs
+    on Windows. It shares the controlled kernel wait with runtime_matrix.py.
+    """
+    acceptance = HERE.parents[1] / "tests" / "acceptance"
+    sys.path.insert(0, str(acceptance))
+    try:
+        spec = importlib.util.spec_from_file_location("ku_a14_matrix", acceptance / "runtime_matrix.py")
+        matrix = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(matrix)
+    finally:
+        sys.path.remove(str(acceptance))
+    report = {"kind": "native-blocking-service-retirement", "platform": platform.platform(),
+              "python": platform.python_version(), "database_retry": False, "database_used": False,
+              "windows_host_task": args.windows_host_task,
+              "status": "prepared", "plan": {"handler_timeout_ms": 1000,
+                  "native_cleanup_grace_ms": 1000, "native_drain_timeout_ms": 200,
+                  "supervisor_drain_timeout_ms": 1500, "replacement_ready_deadline_seconds": 10,
+                  "event_loops": 4, "blocking_threads": 5, "held_requests": 1,
+                  "surviving_instance_requests": 10}}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    def save():
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    save()  # Freeze thresholds before building or starting the fixture.
+    config = gate = peer = None
+    task_names = []
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="ku-svc-native-block-") as temporary:
+        root = Path(temporary)
+        try:
+            cli = root / ("ku.exe" if os.name == "nt" else "ku")
+            shutil.copy2(args.ku.resolve(strict=True), cli)
+            report["cli_sha256"] = hashlib.sha256(cli.read_bytes()).hexdigest()
+            program = root / "blocking.ku"
+            program.write_text('''import {http, fs} from "std"
+async fn held(): HttpResponse! {
+    path = fs.read("block.path")?
+    text = fs.read(path)?
+    return ok(http.text(text))
+}
+fn main(): null! {
+    address = fs.read("http.addr")?
+    app = http.service()
+    app.max_connections = 32
+    app.max_active_requests = 16
+    app.max_pending_requests = 16
+    app.handler_timeout_ms = 1000
+    app.get("/", fn() { return http.text("ready") })
+    app.get("/held", held)
+    app.listen(address)?
+    return ok(null)
+}
+''', encoding="utf-8")
+            executable = root / ("service.exe" if os.name == "nt" else "service")
+            build = subprocess.run([str(cli), "build", "--native", str(program), "-o", str(executable)],
+                                   cwd=root, capture_output=True, text=True, timeout=60)
+            report["build"] = {"exit": build.returncode, "stderr_tail": build.stderr[-4000:]}
+            if build.returncode:
+                raise RuntimeError("A14 native fixture did not build")
+            report["native_sha256"] = hashlib.sha256(executable.read_bytes()).hexdigest()
+            data = json.loads((HERE / "cluster.example.json").read_text(encoding="utf-8"))
+            # Async native file work reserves one of the declared blocking
+            # threads, in addition to the four synchronous HTTP owner workers.
+            budget = data["deployment_budget"]
+            budget["per_instance"].update(blocking_threads=5, total_threads=18)
+            budget.update(blocking_threads=15, total_threads=56)
+            reserve_fixture_threads(budget)
+            token = root / "token"
+            token.write_text(secrets.token_hex(32), encoding="ascii")
+            token.chmod(0o600)
+            data.update(ku=str(cli), control_token_file=str(token), frontend_addr=address(),
+                        operation_timeout_seconds=10)
+            data["service_options"].update(probe_interval_ms=100, probe_timeout_ms=100,
+                drain_timeout_ms=1500, startup_timeout_ms=5000, restart_limit=3)
+            directories = {}
+            for slot in data["slots"]:
+                directory = root / slot["name"]
+                directory.mkdir()
+                directories[slot["name"]] = directory
+                slot["listen_addr"], slot["probe_addr"], slot["control_addr"] = address(), address(), address()
+                (directory / "http.addr").write_text(slot["listen_addr"], encoding="ascii")
+                target = directory / executable.name
+                shutil.copy2(executable, target)
+                slot.update(program=str(target), env={"KU_HTTP_DRAIN_TIMEOUT_MS": "200"})
+                slot.pop("manager_start", None)
+                slot.pop("manager_stop", None)
+            if args.windows_host_task:
+                prefix = f"KuCI-{os.getpid()}-{secrets.token_hex(4)}"
+                task_names = [f"{prefix}-{slot['name']}" for slot in data["slots"]]
+                for slot, name in zip(data["slots"], task_names):
+                    slot["manager_start"] = task_command(name, "Start")
+                    slot["manager_stop"] = task_command(name, "Stop")
+            path = root / "cluster.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            config = M.load(path)
+            a, b, _ = config["slots"]
+            gate = matrix.BlockingGate(directories["a"])
+            if args.windows_host_task:
+                host = root / "host"
+                host.mkdir()
+                for name in ("manage.py", "install-windows-task.ps1"):
+                    shutil.copy2(HERE / name, host / name)
+                # Only this isolated temporary tree gains read/execute access;
+                # do not modify the runner checkout or credential locations.
+                acl = subprocess.run(["icacls", str(root), "/grant", "*S-1-5-19:(OI)(CI)RX", "/T", "/C"],
+                                     capture_output=True, text=True, timeout=10)
+                report["host_acl"] = {"exit": acl.returncode, "stdout_tail": acl.stdout[-2000:],
+                                      "stderr_tail": acl.stderr[-1000:]}
+                if acl.returncode:
+                    raise RuntimeError("temporary Local Service read/execute grant failed")
+                install = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", str(host / "install-windows-task.ps1"),
+                    "-Config", str(path), "-Python", sys.executable, "-TaskPrefix", prefix, "-Register"],
+                    capture_output=True, text=True, timeout=20)
+                report["host_registration"] = {"exit": install.returncode,
+                    "stdout_tail": install.stdout[-6000:], "stderr_tail": install.stderr[-3000:],
+                    "task_names": task_names, "principal_requested": "NT AUTHORITY\\LOCAL SERVICE"}
+                if install.returncode:
+                    raise RuntimeError("Register-ScheduledTask failed; see retained exact API output")
+                query = (f"$ErrorActionPreference='Stop'; @(Get-ScheduledTask -TaskName '{prefix}-*' | "+
+                    "Select-Object TaskName,State,@{n='principal';e={$_.Principal.UserId}},"+
+                    "@{n='logon_type';e={$_.Principal.LogonType.ToString()}},"+
+                    "@{n='principal_sid';e={if($_.Principal.UserId -match '^S-[0-9-]+$') {$_.Principal.UserId} else {([System.Security.Principal.NTAccount]::new($_.Principal.UserId)).Translate([System.Security.Principal.SecurityIdentifier]).Value}}},"+
+                    "@{n='action_count';e={@($_.Actions).Count}},"+
+                    "@{n='execute';e={@($_.Actions)[0].Execute}},"+
+                    "@{n='arguments';e={@($_.Actions)[0].Arguments}},"+
+                    "@{n='restart_count';e={$_.Settings.RestartCount}},"+
+                    "@{n='restart_interval';e={$_.Settings.RestartInterval}}) | ConvertTo-Json -Depth 4 -Compress")
+                registered = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query],
+                                           capture_output=True, text=True, timeout=10, check=True)
+                report["host_registration_readback"] = json.loads(registered.stdout)
+                if sorted(item["TaskName"] for item in report["host_registration_readback"]) != sorted(task_names):
+                    raise RuntimeError("registered Task Scheduler names did not match the isolated plan")
+                plans = {plan["task"]: plan for plan in json.loads(install.stdout)}
+                for actual in report["host_registration_readback"]:
+                    plan = plans[actual["TaskName"]]
+                    if (actual["principal_sid"] != "S-1-5-19" or actual["logon_type"] != "ServiceAccount"
+                            or actual["action_count"] != 1
+                            or os.path.normcase(os.path.abspath(actual["execute"])) != os.path.normcase(os.path.abspath(plan["execute"]))
+                            or actual["arguments"] != plan["arguments"]
+                            or actual["restart_count"] != 3 or actual["restart_interval"] not in ("PT1M", "PT60S")):
+                        raise RuntimeError("registered account, executable, argv or restart policy did not match the actual isolated plan")
+            initial = M.start(config, a)
+            M.start(config, b)
+            report["initial_status"] = initial
+            request_started = time.monotonic()
+            host, port = a["listen_addr"].rsplit(":", 1)
+            peer = socket.create_connection((host, int(port)), timeout=2)
+            peer.sendall(b"GET /held HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            entry_deadline = time.monotonic() + .8
+            entered = False
+            while time.monotonic() < entry_deadline:
+                if os.name == "nt":
+                    entered = gate.connected.is_set()
+                elif platform.system() == "Linux":
+                    pid = native_child(initial["pid"])
+                    entered = any(handle.resolve() == Path(gate.path).resolve()
+                        for handle in Path(f"/proc/{pid}/fd").iterdir())
+                else:
+                    pid = native_child(initial["pid"])
+                    # Darwin may print /private/var for a /var locator and its
+                    # filename filter can miss the FIFO. Inspect this child's
+                    # actual numeric FDs and compare canonical paths instead.
+                    opened = subprocess.run(["lsof", "-p", str(pid), "-Ffn"],
+                                            capture_output=True, text=True, timeout=2)
+                    report["kernel_wait_last_probe"] = {"native_pid": pid,
+                        "lsof_exit": opened.returncode, "stdout_tail": opened.stdout[-1500:],
+                        "stderr_tail": opened.stderr[-500:]}
+                    entered = opened.returncode == 0 and any(line.startswith("n/")
+                        and Path(line[1:]).resolve() == Path(gate.path).resolve()
+                        for line in opened.stdout.splitlines())
+                if entered:
+                    break
+                time.sleep(.01)
+            if not entered:
+                report["slot_files"] = [item.name for item in directories["a"].iterdir()]
+                if platform.system() == "Darwin":
+                    opened = subprocess.run(["lsof", "-p", str(pid), "-Ffn"],
+                                            capture_output=True, text=True, timeout=3)
+                    report["native_fds"] = opened.stdout[-6000:]
+                    stack = root / "entry-stack.txt"
+                    subprocess.run(["sample", str(pid), "1", "2", "-file", str(stack)],
+                                   capture_output=True, text=True, timeout=5)
+                    if stack.exists():
+                        report["native_stack_excerpt"] = stack.read_text(encoding="utf-8", errors="replace")[:24000]
+                peer.settimeout(.1)
+                try:
+                    report["early_http_response"] = peer.recv(1024).decode("utf-8", "replace")
+                except OSError as error:
+                    report["early_http_response"] = type(error).__name__
+                raise RuntimeError("actual native pipe read entry was not observed before HTTP timeout")
+            report["kernel_wait_entry_ms"] = round((time.monotonic()-request_started)*1000, 3)
+            report["while_native_blocked"] = M.status(config, a)
+            peer.settimeout(3)
+            received = bytearray()
+            while b"\r\n" not in received and len(received) < 4096:
+                chunk = peer.recv(512)
+                if not chunk:
+                    break
+                received.extend(chunk)
+            report["held_http_status"] = bytes(received).split(b"\r\n", 1)[0].decode("ascii", "replace")
+            report["held_http_response_ms"] = round((time.monotonic()-request_started)*1000, 3)
+            if " 504 " not in report["held_http_status"]:
+                raise RuntimeError("held native request did not produce the declared HTTP timeout")
+            # Do not release the pipe: only native process retirement can end
+            # its wait. The other instance serves fresh requests throughout.
+            other = []
+            left_ready_at = None
+            deadline = request_started + 10
+            while time.monotonic() < deadline:
+                current = M.status(config, a)
+                if current["phase"] != "ready" and left_ready_at is None:
+                    left_ready_at = round((time.monotonic()-request_started)*1000, 3)
+                if len(other) < 10:
+                    code, body = M.call(b["listen_addr"], "GET", "/")
+                    other.append({"status": code, "body": body})
+                if current["phase"] == "ready" and current["generation"] > initial["generation"] and len(other) == 10:
+                    break
+                time.sleep(.05)
+            else:
+                raise RuntimeError("native work retirement did not recover within fixed 10-second deadline")
+            report.update(first_not_ready_ms=left_ready_at, replacement_status=current,
+                          replacement_ready_ms=round((time.monotonic()-request_started)*1000, 3),
+                          surviving_instance_responses=other,
+                          replacement_business=M.call(a["listen_addr"], "GET", "/"))
+            if not (current.get("last_exit_code") == 75
+                    and current.get("launcher_status") == "runtime_unfinished_work"
+                    and current.get("database_outcome") == "unknown"
+                    and current.get("database_retry") is False
+                    and not current.get("termination_requested")
+                    and all(item == {"status": 200, "body": "ready"} for item in other)
+                    and report["replacement_business"] == (200, "ready")):
+                raise RuntimeError("native runtime 75, no replay, uncertainty or replacement result mismatch")
+            if args.windows_host_task:
+                report["host_processes_before_stop"] = windows_host_processes(root)
+                stopped = subprocess.run(task_command(task_names[0], "Stop"),
+                                         capture_output=True, text=True, timeout=10)
+                report["host_stop"] = {"exit": stopped.returncode,
+                    "stdout_tail": stopped.stdout[-1000:], "stderr_tail": stopped.stderr[-2000:]}
+                if stopped.returncode:
+                    raise RuntimeError("Stop-ScheduledTask failed")
+                M.wait_absent(config, a, 10)
+                report["other_instance_after_host_stop"] = M.call(b["listen_addr"], "GET", "/")
+                if report["other_instance_after_host_stop"] != (200, "ready"):
+                    raise RuntimeError("other instance did not survive the real host task stop")
+            report["status"] = "passed"
+        except BaseException as error:
+            report["status"] = "failed"
+            report["failure"] = f"{type(error).__name__}: {error}"
+        finally:
+            if peer:
+                peer.close()
+            if gate:
+                try:
+                    gate.release()
+                    report["pipe_release_error"] = gate.error
+                except (OSError, RuntimeError) as error:
+                    report["pipe_release_error"] = str(error)
+                    report["status"] = "failed"
+                report["pipe_release_note"] = "After native process retirement Windows may report broken pipe; it is not a business retry."
+            errors = []
+            if config:
+                for slot in config["slots"]:
+                    try:
+                        M.stop(config, slot)
+                    except (OSError, RuntimeError, TimeoutError) as error:
+                        errors.append(f"{slot['name']}: {error}")
+            if args.windows_host_task:
+                for name in task_names:
+                    removed = subprocess.run(task_command(name, "Unregister"), capture_output=True,
+                                             text=True, timeout=10)
+                    if removed.returncode:
+                        errors.append(f"Unregister-ScheduledTask {name}: {removed.stderr[-1500:]}")
+                try:
+                    deadline = time.monotonic() + 10
+                    while True:
+                        remaining = windows_host_processes(root)
+                        if not remaining or time.monotonic() >= deadline:
+                            break
+                        time.sleep(.1)
+                    report["host_processes_after_cleanup"] = remaining
+                    if remaining:
+                        errors.append("temporary host-task process tree did not retire")
+                except (OSError, subprocess.SubprocessError, ValueError) as error:
+                    errors.append(f"host process cleanup receipt: {error}")
+            report["cleanup_errors"] = errors
+            if errors:
+                report["status"] = "failed"
+            report["duration_seconds"] = round(time.monotonic()-started, 3)
+            save()
+    print(json.dumps({"status": report["status"], "output": str(args.output)}, ensure_ascii=False))
+    if report["status"] != "passed":
+        raise SystemExit(1)
+
+
+def address():
+    while True:
+        with socket.socket() as stream:
+            stream.bind(("127.0.0.1", 0))
+            value = f"127.0.0.1:{stream.getsockname()[1]}"
+        if value not in ALLOCATED_ADDRESSES:
+            ALLOCATED_ADDRESSES.add(value)
+            return value
+
+
+def native_child(leader, return_identity=False, expected_parent_creation_time_100ns=None):
+    # The actual native service is the launcher's single direct child. Match
+    # process instances, without treating a name/prefix as ownership evidence.
+    if os.name == "nt":
+        selected = windows_owned_processes(windows_process_records(), {int(leader)}, confirm_birth_order=True)
+        windows_same_processes(selected["processes"],
+            windows_owned_processes(windows_process_records(), {int(leader)}, confirm_birth_order=True)["processes"])
+        parent = selected["processes"][int(leader)]
+        if (expected_parent_creation_time_100ns is not None
+                and parent["creation_time_100ns"] != expected_parent_creation_time_100ns):
+            raise RuntimeError(f"launcher {leader} identity changed before fault selection")
+        matches = [pid for pid, row in selected["processes"].items()
+                   if row["ppid"] == int(leader) and pid != int(leader)]
+    else:
+        result = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True, capture_output=True, timeout=3, check=True)
+        matches = [int(parts[0]) for line in result.stdout.splitlines()
+                   if len(parts := line.split()) == 2 and int(parts[1]) == leader]
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one native child of launcher {leader}, got {matches}")
+    pid = matches[0]
+    return (pid, selected["processes"][pid]) if return_identity and os.name == "nt" else pid
+
+
+def windows_process_records():
+    """A bounded Toolhelp snapshot; process ancestry never comes from a name."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR*260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    for function in (kernel.Process32FirstW, kernel.Process32NextW):
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+        function.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot(processes)")
+    try:
+        entry = Entry()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        rows = {}
+        while more:
+            if len(rows) >= 16384:
+                raise RuntimeError("process snapshot exceeds fixed 16384-record bound")
+            rows[int(entry.th32ProcessID)] = {"ppid": int(entry.th32ParentProcessID),
+                                            "image_name": str(entry.szExeFile)[:260]}
+            entry.dwSize = ctypes.sizeof(entry)
+            more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:
+            raise OSError(ctypes.get_last_error(), "Process32FirstW/NextW")
+        return rows
+    finally:
+        if not kernel.CloseHandle(snapshot):
+            raise OSError(ctypes.get_last_error(), "CloseHandle(process snapshot)")
+
+
+def windows_process_identity(pid, process_handle=None):
+    """Read a process instance; a borrowed Popen handle stays with its owner."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    result = {"identity_status": "unknown"}
+    process = None
+
+    def check(ok, operation):
+        if not ok:
+            raise OSError(ctypes.get_last_error(), operation)
+
+    try:
+        process = process_handle if process_handle is not None else kernel.OpenProcess(0x1000, False, int(pid))
+        check(process, "OpenProcess(identity)")
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        check(kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                     ctypes.byref(system), ctypes.byref(user)), "GetProcessTimes(identity)")
+        result["creation_time_100ns"] = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        size = wintypes.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        check(kernel.QueryFullProcessImageNameW(process, 0, image, ctypes.byref(size)),
+              "QueryFullProcessImageNameW(identity)")
+        result.update(identity_status="observed", image_path=image.value[:4096],
+                      image_path_truncated=len(image.value) > 4096)
+    except OSError as error:
+        result["identity_error"] = str(error)[:256]
+    finally:
+        if process and process_handle is None and not kernel.CloseHandle(process):
+            result["identity_close_error"] = ctypes.get_last_error()
+    return result
+
+
+def windows_creation_time(pid, identity):
+    created = identity.get("creation_time_100ns")
+    if (identity.get("identity_status") != "observed" or type(created) is not int
+            or created <= 0 or "identity_close_error" in identity):
+        raise RuntimeError(f"process {pid} identity unknown; resource ownership is unverified")
+    return created
+
+
+def windows_process_birth_order(pid, expected_creation_time_100ns):
+    """Cold UTC-reversal check; copy fixed telemetry fields, never payload strings.
+
+    Class 64 and its header are documented by Microsoft; unlike CreateTime,
+    CreateInterruptTime is unaffected by time-service/user clock adjustments.
+    Unsupported or changed native metadata leaves ownership unverified.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class TelemetryHeader(ctypes.Structure):
+        _fields_ = [("HeaderSize", ctypes.c_uint32), ("ProcessId", ctypes.c_uint32)] + [
+            (name, ctypes.c_uint64) for name in ("ProcessStartKey", "CreateTime",
+                "CreateInterruptTime", "CreateUnbiasedInterruptTime", "ProcessSequenceNumber",
+                "SessionCreateTime")] + [(name, ctypes.c_uint32) for name in (
+                    "SessionId", "BootId", "ImageChecksum", "ImageTimeDateStamp", "UserSidOffset",
+                    "ImagePathOffset", "PackageNameOffset", "RelativeAppNameOffset", "CommandLineOffset")]
+
+    def unknown(reason):
+        return RuntimeError(f"process {pid} birth order unknown: {reason}")
+
+    process = None
+    kernel = None
+    try:
+        if type(expected_creation_time_100ns) is not int or expected_creation_time_100ns <= 0:
+            raise unknown("invalid expected creation time")
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        query = ctypes.WinDLL("ntdll", use_last_error=True).NtQueryInformationProcess
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.GetProcessTimes.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        query.argtypes = [wintypes.HANDLE, ctypes.c_uint32, ctypes.c_void_p,
+                          ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        query.restype = ctypes.c_int32
+        process = kernel.OpenProcess(0x1000, False, int(pid))
+        if not process:
+            raise unknown(f"OpenProcess failed ({ctypes.get_last_error()})")
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise unknown(f"GetProcessTimes failed ({ctypes.get_last_error()})")
+        actual = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if actual != expected_creation_time_100ns:
+            raise unknown("held process identity changed")
+        buffer = ctypes.create_string_buffer(65536)
+        returned = ctypes.c_uint32()
+        status = query(process, 64, buffer, len(buffer), ctypes.byref(returned))
+        if ctypes.c_int32(status).value < 0:
+            raise unknown(f"NtQueryInformationProcess status 0x{status & 0xffffffff:08x}")
+        if not ctypes.sizeof(TelemetryHeader) <= returned.value <= len(buffer):
+            raise unknown("telemetry return length is outside the fixed buffer/header")
+        header = TelemetryHeader.from_buffer(buffer)
+        if not ctypes.sizeof(TelemetryHeader) <= header.HeaderSize <= returned.value:
+            raise unknown("telemetry header size is outside returned bytes")
+        if header.ProcessId != int(pid) or header.CreateTime != expected_creation_time_100ns:
+            raise unknown("telemetry process identity changed")
+        if header.CreateInterruptTime == 0:
+            raise unknown("missing interrupt creation time")
+        return {"identity_status": "observed", "creation_time_100ns": int(header.CreateTime),
+                "create_interrupt_time_100ns": int(header.CreateInterruptTime),
+                "boot_id": int(header.BootId), "telemetry_header_size": int(header.HeaderSize),
+                "telemetry_return_length": int(returned.value)}
+    except (OSError, AttributeError) as error:
+        raise unknown(f"native telemetry unavailable ({type(error).__name__})") from error
+    finally:
+        if process and not kernel.CloseHandle(process):
+            raise unknown(f"CloseHandle failed ({ctypes.get_last_error()})")
+
+
+def windows_owned_processes(records, owners, identity_reader=None, confirm_birth_order=False):
+    """Reject provably stale PPID edges, never silently omit unknown identities."""
+    identity_reader = identity_reader or windows_process_identity
+    children = {}
+    for pid, row in records.items():
+        children.setdefault(row["ppid"], []).append(pid)
+    selected, excluded, excluded_count, birth_orders = {}, [], 0, {}
+
+    def read(pid):
+        if pid not in records:
+            raise RuntimeError(f"owned process {pid} missing from resource snapshot")
+        identity = identity_reader(pid)
+        windows_creation_time(pid, identity)
+        return {"pid": pid, **records[pid], **identity}
+
+    def birth_order(row):
+        pid = row["pid"]
+        if pid not in birth_orders:
+            observed = windows_process_birth_order(pid, row["creation_time_100ns"])
+            interrupt = observed.get("create_interrupt_time_100ns")
+            boot = observed.get("boot_id")
+            if (observed.get("identity_status") != "observed"
+                    or observed.get("creation_time_100ns") != row["creation_time_100ns"]
+                    or type(interrupt) is not int or interrupt <= 0
+                    or type(boot) is not int or not 0 <= boot <= 0xffffffff):
+                raise RuntimeError(f"process {pid} birth order unknown: invalid telemetry identity/order")
+            birth_orders[pid] = observed
+        return birth_orders[pid]
+
+    pending = []
+    for pid in owners:
+        selected[pid] = read(pid)
+        pending.append(pid)
+    while pending:
+        parent = pending.pop()
+        for pid in children.get(parent, []):
+            if pid in selected:
+                continue
+            child = read(pid)
+            if confirm_birth_order or child["creation_time_100ns"] < selected[parent]["creation_time_100ns"]:
+                parent_order, child_order = birth_order(selected[parent]), birth_order(child)
+                if parent_order["boot_id"] != child_order["boot_id"]:
+                    raise RuntimeError(f"process {pid} birth order unknown: incomparable boot IDs")
+                if child_order["create_interrupt_time_100ns"] < parent_order["create_interrupt_time_100ns"]:
+                    excluded_count += 1
+                    if len(excluded) < 32:
+                        excluded.append({"pid": pid, "ppid": parent, "reason": "parent_pid_reused",
+                            "creation_time_100ns": child["creation_time_100ns"],
+                            "parent_creation_time_100ns": selected[parent]["creation_time_100ns"],
+                            "create_interrupt_time_100ns": child_order["create_interrupt_time_100ns"],
+                            "parent_create_interrupt_time_100ns": parent_order["create_interrupt_time_100ns"],
+                            "boot_id": child_order["boot_id"]})
+                    continue
+            selected[pid] = child
+            pending.append(pid)
+    return {"processes": selected, "excluded_processes": excluded,
+            "excluded_process_count": excluded_count,
+            "excluded_processes_truncated": excluded_count > len(excluded)}
+
+
+def windows_same_processes(expected, actual):
+    if set(expected) != set(actual) or any(
+            (row["creation_time_100ns"], row["ppid"]) !=
+            (actual[pid]["creation_time_100ns"], actual[pid]["ppid"])
+            for pid, row in expected.items()):
+        raise RuntimeError("Windows process identity changed or ancestry changed during resource snapshot")
+
+
+def windows_cleanup_receipt(expected, records=None, identity_reader=None):
+    """A reused PID is not the sampled instance; unknown remains unverified."""
+    records = windows_process_records() if records is None else records
+    identity_reader = identity_reader or windows_process_identity
+    result = {"remaining": [], "reused": [], "unverified": []}
+    for pid, created in sorted(expected):
+        if pid not in records:
+            continue
+        current = {"pid": pid, **records[pid], **identity_reader(pid)}
+        try:
+            now_created = windows_creation_time(pid, current)
+        except RuntimeError:
+            current["expected_creation_time_100ns"] = created
+            result["unverified"].append(current)
+            continue
+        if now_created == created:
+            result["remaining"].append(current)
+        else:
+            current["expected_creation_time_100ns"] = created
+            result["reused"].append(current)
+    return result
+
+
+def windows_terminate_process(pid, expected_creation_time_100ns):
+    """Validate and terminate one held instance, never reopen a validated PID."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    process = kernel.OpenProcess(0x1001, False, int(pid))
+    if not process:
+        raise OSError(ctypes.get_last_error(), "OpenProcess(fault target)")
+    try:
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(process, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise OSError(ctypes.get_last_error(), "GetProcessTimes(fault target)")
+        actual = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if (type(expected_creation_time_100ns) is not int or expected_creation_time_100ns <= 0
+                or actual != expected_creation_time_100ns):
+            raise RuntimeError(f"process {pid} identity changed before fault termination")
+        if not kernel.TerminateProcess(process, 1):
+            raise OSError(ctypes.get_last_error(), "TerminateProcess(fault target)")
+    finally:
+        if not kernel.CloseHandle(process):
+            raise OSError(ctypes.get_last_error(), "CloseHandle(fault target)")
+
+
+def resource_snapshot(proxy, include_roles=False):
+    if os.name == "nt":
+        records = windows_process_records()
+        spec = importlib.util.spec_from_file_location("ku_service_resources", HERE.parents[1] / "tests/acceptance/multiloop_load.py")
+        samples = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(samples)
+    else:
+        listing = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True, timeout=3, check=True)
+        records = {int(parts[0]): {"ppid": int(parts[1]), "rss_bytes": int(parts[2]) * 1024}
+                   for line in listing.stdout.splitlines() if len(parts := line.split()) == 3}
+    owner_processes = {process.pid: process for process in M.OWNED_SUPERVISORS.values()
+                       if process.poll() is None}
+    owner_slots = {process.pid: name for name, process in M.OWNED_SUPERVISORS.items()
+                   if process.pid in owner_processes}
+    owners = set(owner_slots)
+    if os.name == "nt":
+        # Popen retains the exact supervisor/proxy process handle across PID reuse.
+        handles = {pid: process._handle for pid, process in owner_processes.items()}
+        handles[proxy.pid] = proxy._handle
+
+        def identity(pid):
+            if pid in handles:
+                held = windows_process_identity(pid, process_handle=handles[pid])
+                current = windows_process_identity(pid)
+                if windows_creation_time(pid, held) != windows_creation_time(pid, current):
+                    raise RuntimeError(f"process {pid} identity changed from its owned handle")
+                return held
+            return windows_process_identity(pid)
+
+        def selected_tree(current):
+            tree = windows_owned_processes(current, owners, identity)
+            for pid in (os.getpid(), proxy.pid):
+                if pid not in current:
+                    raise RuntimeError(f"owned process {pid} missing from resource snapshot")
+                observed = identity(pid)
+                windows_creation_time(pid, observed)
+                tree["processes"][pid] = {"pid": pid, **current[pid], **observed}
+            return tree
+
+        tree = selected_tree(records)
+        windows_same_processes(tree["processes"], selected_tree(windows_process_records())["processes"])
+        processes = set(tree["processes"])
+    else:
+        processes = set(owners)
+        while True:
+            descendants = {pid for pid, record in records.items() if record["ppid"] in processes}
+            if descendants <= processes:
+                break
+            processes.update(descendants)
+        processes.update([os.getpid(), proxy.pid])
+    rows = []
+    for pid in sorted(processes):
+        if pid not in records:
+            if os.name == "nt":
+                raise RuntimeError(f"owned process {pid} missing from resource snapshot")
+            continue
+        if os.name == "nt":
+            rows.append({**tree["processes"][pid], **samples.windows_process_sample(pid)})
+            continue
+        option = "-M" if os.uname().sysname == "Darwin" else "-T"
+        result = subprocess.run(["ps", option, "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=2, check=True)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        threads = len(lines) - (1 if os.uname().sysname == "Darwin" else 0)
+        rows.append({"pid": pid, "threads": threads, **records[pid]})
+    snapshot = {"processes": rows, "process_count": len(rows), "thread_count": sum(row["threads"] for row in rows),
+                "sum_rss_bytes": sum(row["rss_bytes"] for row in rows),
+                "rss_note": "sum of process RSS includes shared pages more than once; not PSS or an OS hard limit"}
+    if os.name == "nt":
+        windows_same_processes(tree["processes"], selected_tree(windows_process_records())["processes"])
+        snapshot.update(excluded_processes=tree["excluded_processes"],
+                        excluded_process_count=tree["excluded_process_count"],
+                        excluded_processes_truncated=tree["excluded_processes_truncated"])
+    if include_roles:
+        annotate_resource_roles(snapshot, owner_slots, os.getpid(), proxy.pid)
+    return snapshot
+
+
+def annotate_resource_roles(snapshot, owner_slots, manager_pid, proxy_pid):
+    """Assign each sampled process by exact parent ancestry to its owner slot."""
+    records = {row["pid"]: row for row in snapshot["processes"]}
+    for row in snapshot["processes"]:
+        pid = row["pid"]
+        if pid in (manager_pid, proxy_pid):
+            row.update(role="manager" if pid == manager_pid else "proxy", slot=None)
+            continue
+        ancestor, depth, seen = pid, 0, set()
+        while ancestor not in owner_slots and ancestor in records and ancestor not in seen:
+            seen.add(ancestor)
+            ancestor = records[ancestor]["ppid"]
+            depth += 1
+        if ancestor not in owner_slots:
+            row.update(role="unattributed", slot=None)
+        else:
+            row.update(role=("supervisor", "launcher", "native")[depth] if depth < 3 else "descendant",
+                       slot=owner_slots[ancestor])
+
+
+def validate_caddy_resources(snapshot, config, proxy_pid):
+    budget = config["deployment_budget"]
+    management = [row for row in snapshot["processes"] if row.get("role") in ("manager", "proxy")]
+    usage = {"threads": sum(row["threads"] for row in management),
+             "sum_rss_bytes": sum(row["rss_bytes"] for row in management),
+             "thread_reservation": budget["management_threads"],
+             "memory_reservation_bytes": budget["management_memory_bytes"]}
+    snapshot["management_usage"] = usage
+    instance_usage = {}
+    errors = []
+    per_instance = budget["per_instance"]
+    slots = {slot["name"] for slot in config["slots"]}
+    for row in snapshot["processes"]:
+        if row in management:
+            continue
+        slot = row.get("slot")
+        if slot not in slots or row.get("role") not in ("supervisor", "launcher", "native", "descendant"):
+            errors.append(f"unattributed process {row['pid']}")
+            continue
+        entry = instance_usage.setdefault(slot, {"threads": 0, "sum_rss_bytes": 0, "processes": [],
+            "thread_reservation": per_instance["total_threads"],
+            "memory_reservation_bytes": per_instance["reserved_memory_bytes"]})
+        entry["threads"] += row["threads"]
+        entry["sum_rss_bytes"] += row["rss_bytes"]
+        entry["processes"].append({"pid": row["pid"], "role": row["role"], "threads": row["threads"]})
+    snapshot["instance_usage"] = instance_usage
+    for slot, entry in instance_usage.items():
+        if entry["threads"] > entry["thread_reservation"]:
+            errors.append(f"slot {slot} threads {entry['threads']} > {entry['thread_reservation']}")
+        if entry["sum_rss_bytes"] > entry["memory_reservation_bytes"]:
+            errors.append(f"slot {slot} RSS sum exceeds its reservation")
+    if {row["pid"] for row in management} != {os.getpid(), proxy_pid}:
+        errors.append("manager/proxy process attribution missing")
+    if usage["threads"] > usage["thread_reservation"]:
+        errors.append(f"management threads {usage['threads']} > {usage['thread_reservation']}")
+    if usage["sum_rss_bytes"] > usage["memory_reservation_bytes"]:
+        errors.append("management RSS sum exceeds its reservation")
+    if snapshot["thread_count"] > budget["total_threads"]:
+        errors.append(f"total threads {snapshot['thread_count']} > {budget['total_threads']}")
+    if snapshot["sum_rss_bytes"] > budget["reserved_memory_bytes"]:
+        errors.append("total RSS sum exceeds deployment reservation")
+    snapshot["reservation_errors"] = errors
+    if errors:
+        raise RuntimeError("actual Caddy fixture resource reservation failed: "+"; ".join(errors))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ku", required=True, type=Path)
+    parser.add_argument("--haproxy", default=shutil.which("haproxy"))
+    parser.add_argument("--caddy", type=Path, help="Use an actual Caddy executable instead of HAProxy, including on Windows")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--blocking-only", action="store_true", help="Cross-platform A14 native pipe retirement and resident replacement, without HAProxy")
+    parser.add_argument("--windows-host-task", action="store_true", help="Actually register/start/stop/unregister unique Windows Task Scheduler instances for the A14 fixture")
+    parser.add_argument("--memory-only", action="store_true", help="One resident-service hard memory provider recovery case, or macOS startup rejection")
+    parser.add_argument("--cgroup-root", type=Path, help="Dedicated empty delegated Linux cgroup v2 root, used only with --memory-only")
+    args = parser.parse_args()
+    if args.memory_only:
+        if args.blocking_only or args.windows_host_task:
+            parser.error("--memory-only is a separate targeted provider acceptance")
+        memory_retirement(args)
+        return
+    if args.windows_host_task and (os.name != "nt" or not args.blocking_only):
+        parser.error("--windows-host-task requires Windows and --blocking-only")
+    if args.blocking_only:
+        blocking_retirement(args)
+        return
+    proxy_kind = "caddy" if args.caddy else "haproxy"
+    if os.name == "nt" and proxy_kind != "caddy":
+        parser.error("normal Windows proxy acceptance requires --caddy; HAProxy uses a Unix runtime socket")
+    if not args.caddy and not args.haproxy:
+        parser.error("HAProxy must be installed")
+    proxy_executable = str(args.caddy.resolve(strict=True)) if args.caddy else args.haproxy
+    args.ku = args.ku.resolve(strict=True)
+    report = {"kind": "resident-service-acceptance", "platform": platform.system(),
+              "ku": str(args.ku), "database_retry": False, "results": {}, "complete_runtime_acceptance": False}
+    report["cli_sha256"] = hashlib.sha256(args.ku.read_bytes()).hexdigest()
+    report["python_version"] = sys.version.split()[0]
+    report["architecture"] = platform.machine()
+    report["proxy_kind"] = proxy_kind
+    if args.caddy:
+        report["caddy_sha256"] = hashlib.sha256(args.caddy.resolve(strict=True).read_bytes()).hexdigest()
+    version_args = [proxy_executable, "version" if args.caddy else "-v"]
+    report[proxy_kind+"_version"] = subprocess.run(version_args, capture_output=True, text=True, timeout=3, check=True).stdout.splitlines()[0]
+    report["base_commit"] = subprocess.run(["git", "-C", str(HERE.parents[1]), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3, check=True).stdout.strip()
+    proxy = None
+    proxy_capture = None
+    config = None
+    started = time.monotonic()
+    diagnostic = {"stage": "prepare", "slot_last_status": {},
+                  "surviving_b_requests": {"attempted": 0, "completed": 0,
+                                            "http_200": 0, "status_codes": []}}
+    report["diagnostic"] = diagnostic
+    known_owned = {}
+    supervisor_errors = {}
+    sampled_processes = {}
+
+    def remember_sample(snapshot):
+        if os.name == "nt":
+            for row in snapshot["processes"]:
+                if row["pid"] != os.getpid():
+                    created = windows_creation_time(row["pid"], row)
+                    sampled_processes[(row["pid"], created)] = {"pid": row["pid"],
+                                                               "creation_time_100ns": created}
+
+    def bounded_text(value, limit=256):
+        text = str(value)
+        if config is not None:
+            text = text.replace(config["_token"], "<control-token>")
+        return text[:limit]
+
+    def control_context(error):
+        context = getattr(error, "ku_control_context", None)
+        if not isinstance(context, dict):
+            return None
+        return {key: bounded_text(context[key]) if isinstance(context[key], str) else context[key]
+                for key in ("stage", "elapsed_ms", "error_type", "errno", "winerror", "detail")
+                if key in context and (context[key] is None or type(context[key]) in (str, int, float))}
+
+    def remember_owned():
+        for name, process in list(M.OWNED_SUPERVISORS.items())[:3]:
+            if process.pid in known_owned or len(known_owned) < 6:
+                known_owned[process.pid] = (name, process)
+
+    def stage(name):
+        diagnostic.update(stage=name, stage_elapsed_ms=round((time.monotonic()-started)*1000, 3))
+        remember_owned()
+
+    def record_status(slot, state):
+        # Only bounded lifecycle fields, never the config, argv, token or body.
+        fields = ("phase", "pid", "generation", "last_reason", "last_exit_generation",
+                  "last_exit_code", "last_launcher_signal", "launcher_status",
+                  "owned_supervisor_alive", "termination_requested", "unfinished_work_possible",
+                  "database_outcome", "database_retry", "control_error")
+        safe = {key: bounded_text(state[key]) if isinstance(state[key], str) else state[key]
+                for key in fields if key in state
+                and (state[key] is None or type(state[key]) in (str, int, bool))}
+        if isinstance(state.get("control_failure"), dict):
+            wrapper = RuntimeError()
+            wrapper.ku_control_context = state["control_failure"]
+            safe["control_failure"] = control_context(wrapper)
+        diagnostic["slot_last_status"][slot["name"]] = safe
+        return state
+
+    def slot_status(slot):
+        return record_status(slot, M.status(config, slot))
+
+    def owned_receipt():
+        remember_owned()
+        return [{"slot": name, "pid": pid, "returncode": process.poll()}
+                for pid, (name, process) in known_owned.items()]
+
+    with tempfile.TemporaryDirectory(prefix="ku-svc-", dir=None if os.name == "nt" else "/tmp") as temporary:
+        root = Path(temporary)
+        try:
+            stage("freeze_cli_and_config")
+            # Cargo may replace a workspace binary during independent checks.
+            # Freeze one private CLI inode so the recorded hash identifies all
+            # builds, generations and launcher invocations in this acceptance.
+            suffix = ".exe" if os.name == "nt" else ""
+            fixed_cli = root / ("ku"+suffix)
+            shutil.copy2(args.ku, fixed_cli)
+            args.ku = fixed_cli
+            report["cli_sha256"] = hashlib.sha256(fixed_cli.read_bytes()).hexdigest()
+            report["cli_snapshot"] = "private immutable CLI copy; deleted after process cleanup"
+            config_data = json.loads((HERE / "cluster.example.json").read_text(encoding="utf-8"))
+            reserve_fixture_threads(config_data["deployment_budget"])
+            token = root / "token"
+            token.write_text(secrets.token_hex(32), encoding="ascii")
+            token.chmod(0o600)
+            config_data.update(ku=str(args.ku), control_token_file=str(token),
+                               frontend_addr=address(), haproxy_runtime_socket=str(root / "proxy.sock"),
+                               operation_timeout_seconds=15)
+            if args.caddy:
+                config_data.update(proxy_kind="caddy", caddy_admin_addr=address(), caddy_health_addr=address())
+                budget = config_data["deployment_budget"]
+                budget.update(management_threads=34, management_memory_bytes=128*1024*1024,
+                              total_threads=3*budget["per_instance"]["total_threads"]+34,
+                              reserved_memory_bytes=3*budget["per_instance"]["reserved_memory_bytes"]+128*1024*1024)
+            config_data["service_options"].update(probe_interval_ms=100, probe_timeout_ms=100,
+                                                   drain_timeout_ms=1000, startup_timeout_ms=5000)
+            builds = {}
+            for revision in ("previous", "new"):
+                stage(f"build_{revision}")
+                build = root / revision
+                build.mkdir()
+                source = (HERE / "http_service.ku").read_text(encoding="utf-8").replace("Ku HTTP OK", f"Ku HTTP OK {revision}")
+                (build / "service.ku").write_text(source, encoding="utf-8")
+                result = subprocess.run([str(args.ku), "build", "--native", "service.ku", "-o", "service"+suffix],
+                                        cwd=build, capture_output=True, text=True, timeout=120)
+                if result.returncode:
+                    raise RuntimeError(f"native build {revision}: {result.stdout}\n{result.stderr}")
+                builds[revision] = build / ("service"+suffix)
+            for slot in config_data["slots"]:
+                directory = root / slot["name"]
+                directory.mkdir()
+                slot["listen_addr"], slot["probe_addr"], slot["control_addr"] = address(), address(), address()
+                (directory / "http.addr").write_text(slot["listen_addr"], encoding="ascii")
+                shutil.copy2(builds["previous"], directory / ("previous"+suffix))
+                shutil.copy2(builds["new"], directory / ("new"+suffix))
+                slot["program"] = str(directory / ("previous"+suffix))
+                slot.pop("manager_start", None)
+                slot.pop("manager_stop", None)
+            config_path = root / "cluster.json"
+            config_path.write_text(json.dumps(config_data), encoding="utf-8")
+            config = M.load(config_path)
+            # The supervisor only emits its final CLI error; native output is
+            # still discarded by ku service. Anonymous files avoid pipe-reader
+            # threads and preserve a bounded tail for a failed coordinator.
+            supervisor_errors = {slot["name"]: tempfile.TemporaryFile()
+                                 for slot in config["slots"]}
+            config["_supervisor_stderr"] = supervisor_errors
+            report["parameters"] = {"service_options": config["service_options"], "deployment_budget": config["deployment_budget"],
+                                    "recovery_deadline_seconds": 10, "operation_timeout_seconds": config["operation_timeout_seconds"],
+                                    "proxy_threads": None if args.caddy else 1,
+                                    "proxy_thread_note": "Caddy runtime threads are sampled and checked against management reservation; no OS thread hard limit" if args.caddy else "HAProxy nbthread=1",
+                                    "proxy_output_capacity_bytes": ProxyCapture.capacity if args.caddy else 0,
+                                    "proxy_gomaxprocs": 1 if args.caddy else None,
+                                    "tls": "loopback HTTP only; no TLS in this isolated fixture"}
+            proxy_config = root / ("caddy.json" if args.caddy else "haproxy.cfg")
+            proxy_config.write_text(M.render(config), encoding="utf-8")
+            stage("validate_proxy_config")
+            validation_args = ([proxy_executable, "validate", "--config", str(proxy_config)] if args.caddy
+                               else [proxy_executable, "-c", "-f", str(proxy_config)])
+            validation = subprocess.run(validation_args, capture_output=True, text=True, timeout=10)
+            if validation.returncode:
+                raise RuntimeError(validation.stdout + validation.stderr)
+            report["results"]["proxy_config"] = "passed"
+            stage("start_proxy")
+            proxy_args = ([proxy_executable, "run", "--config", str(proxy_config)] if args.caddy
+                          else [proxy_executable, "-db", "-f", str(proxy_config)])
+            proxy_env = os.environ | ({"GOMAXPROCS": "1", "XDG_DATA_HOME": str(root / "caddy-data"),
+                                      "XDG_CONFIG_HOME": str(root / "caddy-config")} if args.caddy else {})
+            if args.caddy:
+                proxy = subprocess.Popen(proxy_args, env=proxy_env, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                proxy_capture = ProxyCapture(proxy.stdout)
+            else:
+                proxy = subprocess.Popen(proxy_args, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            a, b, spare = config["slots"]
+            stage("start_a")
+            record_status(a, M.start(config, a))
+            stage("start_b")
+            record_status(b, M.start(config, b))
+            report["initial_slot_status"] = {name: dict(diagnostic["slot_last_status"][name])
+                                              for name in ("a", "b")}
+            stage("normal_proxy")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                try:
+                    code, body = M.call(config["frontend_addr"], "GET", "/")
+                    if code == 200 and body == "Ku HTTP OK previous":
+                        break
+                except OSError:
+                    pass
+                time.sleep(.05)
+            else:
+                raise RuntimeError(f"{proxy_kind} did not admit the ready native instances")
+            report["results"]["normal_proxy"] = "passed"
+            stage("steady_resource_snapshot")
+            report["steady_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
+            remember_sample(report["steady_resource_snapshot"])
+            if args.caddy:
+                validate_caddy_resources(report["steady_resource_snapshot"], config, proxy.pid)
+            stage("native_exit_initial_a_status")
+            initial = slot_status(a)
+            failure_started = time.monotonic()
+            stage("native_exit_resolve_target")
+            target_identity = None
+            if os.name == "nt":
+                launcher = next((row for row in report["steady_resource_snapshot"]["processes"]
+                                 if row["pid"] == initial["pid"]), None)
+                if launcher is None:
+                    raise RuntimeError("launcher identity missing from the verified resource snapshot")
+                target_pid, target_identity = native_child(initial["pid"], return_identity=True,
+                    expected_parent_creation_time_100ns=launcher["creation_time_100ns"])
+                remember_sample({"processes": [target_identity]})
+            else:
+                target_pid = native_child(initial["pid"])
+            diagnostic["fault_target"] = {"slot": "a", "launcher_pid": initial["pid"],
+                                          "native_pid": target_pid, "generation": initial["generation"]}
+            stage("native_exit_terminate_process" if os.name == "nt" else "native_exit_send_sigkill")
+            if os.name == "nt":
+                diagnostic["fault_target"]["creation_time_100ns"] = target_identity["creation_time_100ns"]
+                windows_terminate_process(target_pid, target_identity["creation_time_100ns"])
+            else:
+                os.kill(target_pid, signal.SIGKILL)
+            ordinary = []
+            for index in range(10):
+                stage(f"native_exit_surviving_b_request_{index+1}")
+                progress = diagnostic["surviving_b_requests"]
+                progress["attempted"] += 1
+                code = M.call(b["listen_addr"], "GET", "/")[0]
+                ordinary.append(code)
+                progress["completed"] += 1
+                progress["http_200"] += int(code == 200)
+                progress["status_codes"].append(code)
+            if ordinary != [200] * 10:
+                raise RuntimeError(f"surviving instance results: {ordinary}")
+            stage("native_exit_wait_replacement")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                recovered = slot_status(a)
+                if recovered["phase"] == "ready" and recovered["generation"] > initial["generation"]:
+                    break
+                time.sleep(.02)
+            else:
+                raise RuntimeError("replacement was not ready within frozen 10 s recovery budget")
+            report["results"]["native_exit_recovery"] = {"passed": True, "recovery_ms": round((time.monotonic() - failure_started) * 1000, 3),
+                "old_generation": initial["generation"], "new_generation": recovered["generation"], "surviving_requests": len(ordinary)}
+            rolling_started = time.monotonic()
+            def capture_coexist():
+                stage("rolling_resource_snapshot")
+                report["rolling_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
+                remember_sample(report["rolling_resource_snapshot"])
+                if args.caddy:
+                    validate_caddy_resources(report["rolling_resource_snapshot"], config, proxy.pid)
+                stage("rolling_after_resource_snapshot")
+            stage("rolling")
+            deployment = M.roll(config, "a", "spare", root / "spare" / ("new"+suffix), on_coexist=capture_coexist)
+            stage("rolling_proxy_responses")
+            observations = [M.call(config["frontend_addr"], "GET", "/")[1] for _ in range(20)]
+            if "Ku HTTP OK new" not in observations:
+                raise RuntimeError("new revision never received proxy traffic")
+            stage("rolling_old_slot_status")
+            if slot_status(a)["phase"] != "absent":
+                raise RuntimeError("old supervisor remained after rolling drain")
+            report["results"]["rolling"] = {"passed": True, "duration_ms": round((time.monotonic() - rolling_started) * 1000, 3), "deployment": deployment}
+            rollback_started = time.monotonic()
+            stage("rollback")
+            M.roll(config, deployment["new_slot"], deployment["old_slot"], deployment["old_program"], rollback=True)
+            stage("rollback_proxy_responses")
+            observations = [M.call(config["frontend_addr"], "GET", "/")[1] for _ in range(20)]
+            if any(body != "Ku HTTP OK previous" for body in observations):
+                raise RuntimeError(f"rollback content mismatch: {observations}")
+            report["results"]["rollback"] = {"passed": True, "duration_ms": round((time.monotonic() - rollback_started) * 1000, 3), "verified_proxy_requests": len(observations)}
+            if os.name == "nt":
+                stage("final_resource_snapshot")
+                report["final_resource_snapshot"] = resource_snapshot(proxy, include_roles=bool(args.caddy))
+                remember_sample(report["final_resource_snapshot"])
+                validate_caddy_resources(report["final_resource_snapshot"], config, proxy.pid)
+            stage("completed_checks")
+            report["passed"] = True
+        except BaseException as error:
+            report["passed"] = False
+            report["failure"] = bounded_text(f"{type(error).__name__}: {error}", 2048)
+            diagnostic["failure_stage"] = diagnostic["stage"]
+            diagnostic["failure_elapsed_ms"] = round((time.monotonic()-started)*1000, 3)
+            diagnostic["trace"] = [{"file": Path(frame.filename).name[:128], "line": frame.lineno,
+                                    "function": frame.name[:128]}
+                                   for frame in traceback.extract_tb(error.__traceback__, limit=-12)]
+            diagnostic["ku_control_context"] = control_context(error)
+            diagnostic["owned_before_cleanup"] = owned_receipt()
+            diagnostic["proxy_before_cleanup"] = (None if proxy is None else
+                {"pid": proxy.pid, "returncode": proxy.poll()})
+            if config is not None:
+                # Once per fixed slot, existing one-second management reads;
+                # diagnostic failures never erase the original test failure.
+                for slot in config["slots"][:3]:
+                    try:
+                        slot_status(slot)
+                    except (OSError, RuntimeError, ValueError, http.client.HTTPException) as probe_error:
+                        diagnostic["slot_last_status"].setdefault(slot["name"], {}).update(
+                            diagnostic_error=bounded_text(f"{type(probe_error).__name__}: {probe_error}"))
+        finally:
+            cleanup_errors = []
+            remember_owned()
+            if config is not None:
+                for slot in config["slots"]:
+                    try:
+                        M.stop(config, slot)
+                    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+                        cleanup_errors.append(bounded_text(f"{slot['name']}: {error}"))
+            if proxy is not None:
+                try:
+                    proxy.terminate()
+                    try:
+                        proxy.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proxy.kill()
+                        proxy.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError) as error:
+                    cleanup_errors.append(bounded_text(f"proxy: {type(error).__name__}: {error}"))
+            report["cleanup_errors"] = cleanup_errors
+            if cleanup_errors:
+                report["passed"] = False
+            diagnostic["owned_after_cleanup"] = owned_receipt()
+            diagnostic["proxy_after_cleanup"] = (None if proxy is None else
+                {"pid": proxy.pid, "returncode": proxy.poll()})
+            if proxy_capture is not None:
+                try:
+                    capture = proxy_capture.finish()
+                    capture["tail"] = bounded_text(capture["tail"], 8192)
+                    diagnostic["proxy_output"] = capture
+                    if capture["reader_error"]:
+                        report["passed"] = False
+                        cleanup_errors.append("proxy output reader failed")
+                except (OSError, RuntimeError, ValueError) as error:
+                    cleanup_errors.append(bounded_text(f"proxy output: {error}"))
+                    report["passed"] = False
+            if os.name == "nt":
+                try:
+                    receipt = windows_cleanup_receipt(sampled_processes)
+                    diagnostic["sampled_processes_after_cleanup"] = receipt["remaining"]
+                    diagnostic["sampled_process_ids_reused_after_cleanup"] = receipt["reused"]
+                    diagnostic["sampled_processes_unverified_after_cleanup"] = receipt["unverified"]
+                    if diagnostic["sampled_processes_after_cleanup"]:
+                        cleanup_errors.append("sampled fixture process instances remain after cleanup")
+                        report["passed"] = False
+                    if receipt["unverified"]:
+                        cleanup_errors.append("sampled fixture process cleanup identity remains unverified")
+                        report["passed"] = False
+                except (OSError, RuntimeError) as error:
+                    cleanup_errors.append(bounded_text(f"process cleanup receipt: {error}"))
+                    report["passed"] = False
+            diagnostic["supervisor_stderr_tails"] = {}
+            for name, capture in supervisor_errors.items():
+                try:
+                    capture.seek(0, os.SEEK_END)
+                    capture.seek(max(0, capture.tell()-8192))
+                    diagnostic["supervisor_stderr_tails"][name] = bounded_text(
+                        capture.read(8192).decode("utf-8", errors="replace"), 8192)
+                finally:
+                    capture.close()
+            report["duration_seconds"] = round(time.monotonic() - started, 3)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["passed"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

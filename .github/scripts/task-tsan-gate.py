@@ -33,6 +33,9 @@ TARGETS = (
     ("native_task_adapter_test", "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline", False),
     ("native_task_adapter_test", "native_task_flat_array_snapshots_charge_partial_owners_and_release_each_failure", False),
     ("native_task_start_charge_test", "native_task_start_charge_multihop_active_results_and_late_observers_execute_in_c", False),
+    ("native_task_source_test", "native_task_external_owner_pump_preserves_affinity_wakes_and_retirement", False),
+    ("native_http_test", "native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout", False),
+    ("native_http_test", "native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker", False),
 )
 TSAN_OPTIONS = "halt_on_error=1:exitcode=66"
 

@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.22)
+project(ku_cross_stack_cpp LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Drogon 1.9.14 CONFIG REQUIRED)
+add_executable(cpp-server main.cc)
+target_link_libraries(cpp-server PRIVATE Drogon::Drogon)
+target_compile_options(cpp-server PRIVATE -Wall -Wextra)

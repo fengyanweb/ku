@@ -1,0 +1,333 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-10-21T23:55:51.960440+00:00",
+  "scope": "New fixed-owner native HTTP hot-loop path only; historical seven 504 events are not reattributed.",
+  "status": "Confirmed redundant locked self-notification removed; focused regression and original five-second preflight pass. Final source CI and sustained acceptance are separate.",
+  "source_identity": {
+    "cached_before_cli_sha256": "b5c594b64713f69f057f002a5926245f029fa7d898d2d572eeb55ca50a5eeb6b",
+    "unmodified_before_native_sha256": "6416a71809c85bce45f91c8979046b72b7d632ebda3418ca2486e1330248c1f5",
+    "instrumented_before_native_sha256": "3f4f9f53ffeb21b4cff0bb55ef53f0626241c282ec5c7b3ea947f043d6f19d02",
+    "before_generated_c_sha256": "d1191d3e7f15f12b1c2d9c8c6ee67086f2ccdb1a18156aa33974c1c3cfdbc083",
+    "production_fix_cli_sha256": "a95fc368bdcfbf3a384943a8bf344b75648b8bd1957b59437da455ef2b7fe873",
+    "production_fix_native_sha256": "a81f9c29967628271896cbfc846b65025ba13c31ed51072044dd47c92f0e4771",
+    "ambient_preflight_commit": "432517e097c6d9ab9cc0e0e1b821d7022e8b923d",
+    "working_tree_modified": true,
+    "driver_diff_sha256": "6d4fed353d83658fd02c0157dc8681cf95ccc805d96a23b584c18c0a4638a060",
+    "note": "Diagnostic builds use the frozen cached CLI and separate private generated C. Ambient Git HEAD moved through documentation/acceptance commits; artifact hashes identify the actual binaries. The old f9d20... artifact was not reused or claimed equivalent.",
+    "patches_at_preflight": {
+      "src/backend/c_task_driver.rs": {
+        "base_commit": "432517e097c6d9ab9cc0e0e1b821d7022e8b923d",
+        "uncommitted_patch_sha256": "6d4fed353d83658fd02c0157dc8681cf95ccc805d96a23b584c18c0a4638a060",
+        "working_file_sha256": "f108bdf966dbe7b2d8b6c0555720d26260f1f56c6821eeb82e95dce57209455c"
+      },
+      "tests/native_task_source_test.rs": {
+        "base_commit": "432517e097c6d9ab9cc0e0e1b821d7022e8b923d",
+        "uncommitted_patch_sha256": "13b98c5854fd9cf01e05ac9dffc8dfc0d4d19393bbbef29b70eca7fb9a3c7268",
+        "working_file_sha256": "96c09a721310da22eb69ec7d6737359d2f43a6f38361ba0c1231869eaa0bb4d9"
+      }
+    }
+  },
+  "diagnostic_parameters": {
+    "loops": 4,
+    "blocking_threads": 5,
+    "thread_budget": 16,
+    "arrival_rps": 50,
+    "client_threads": 32,
+    "inflight_bound": 64,
+    "max_seconds": 30,
+    "handler_timeout_ms": 1000,
+    "trigger_ms": 100,
+    "ring_rows_per_owner": 16384,
+    "stack_sample_interval_ms": 5
+  },
+  "diagnostic_counts": {
+    "success": 1402,
+    "http_504": 1
+  },
+  "timeline": {
+    "request_id": 1400,
+    "path": "/hot",
+    "client_offered_ns": 1251598082772000,
+    "client_started_ns": 1251598094331000,
+    "server_submit_enter_ns": 1251598095824000,
+    "server_admitted_ns": 1251598096913000,
+    "absolute_handler_deadline_ms": 1251599096,
+    "server_504_selection_ns": 1251599096083000,
+    "client_response_complete_ns": 1251599470979000,
+    "server_submit_to_504_ms": 1000.259,
+    "owner_thread_cpu_ms": 20.845833,
+    "server_factory_done_ns": 1251598096911000,
+    "first_sampled_callback_enter_ns": 1251598096930000,
+    "last_sampled_callback_return_ns": 1251599092227000,
+    "server_admitted_to_504_ms": 999.17,
+    "absolute_deadline_to_504_selection_ms": 0.083,
+    "execution_sampling_scope": "Callback events are sampled every 64 owner polls. Factory_done follows real Task registration/enqueue; it is not a distinct exact enqueue or first-execution timestamp."
+  },
+  "confirmed_segments": [
+    {
+      "from_kind": 8,
+      "to_kind": 1,
+      "start_ns": 1251598150220000,
+      "end_ns": 1251598192150000,
+      "wall_ms": 41.93,
+      "thread_cpu_ms": 0.028458,
+      "from_a": 1,
+      "to_a": 32
+    },
+    {
+      "from_kind": 34,
+      "to_kind": 35,
+      "start_ns": 1251598196102000,
+      "end_ns": 1251598266075000,
+      "wall_ms": 69.973,
+      "thread_cpu_ms": 0.025542,
+      "from_a": 6137324960,
+      "to_a": 6137324960
+    },
+    {
+      "from_kind": 1,
+      "to_kind": 31,
+      "start_ns": 1251598281802000,
+      "end_ns": 1251598314355000,
+      "wall_ms": 32.553,
+      "thread_cpu_ms": 0.011458,
+      "from_a": 32,
+      "to_a": 32520000
+    },
+    {
+      "from_kind": 8,
+      "to_kind": 1,
+      "start_ns": 1251598437655000,
+      "end_ns": 1251598743782000,
+      "wall_ms": 306.127,
+      "thread_cpu_ms": 0.050042,
+      "from_a": 1,
+      "to_a": 32
+    },
+    {
+      "from_kind": 7,
+      "to_kind": 8,
+      "start_ns": 1251598746137000,
+      "end_ns": 1251598818761000,
+      "wall_ms": 72.624,
+      "thread_cpu_ms": 0.010375,
+      "from_a": 0,
+      "to_a": 0
+    },
+    {
+      "from_kind": 7,
+      "to_kind": 8,
+      "start_ns": 1251598827378000,
+      "end_ns": 1251598869228000,
+      "wall_ms": 41.85,
+      "thread_cpu_ms": 0.013583,
+      "from_a": 0,
+      "to_a": 0
+    },
+    {
+      "from_kind": 7,
+      "to_kind": 8,
+      "start_ns": 1251598877120000,
+      "end_ns": 1251598911286000,
+      "wall_ms": 34.166,
+      "thread_cpu_ms": 0.0135,
+      "from_a": 0,
+      "to_a": 0
+    },
+    {
+      "from_kind": 34,
+      "to_kind": 35,
+      "start_ns": 1251598923166000,
+      "end_ns": 1251599003430000,
+      "wall_ms": 80.264,
+      "thread_cpu_ms": 0.124041,
+      "from_a": 6137324960,
+      "to_a": 6137324960
+    },
+    {
+      "from_kind": 4,
+      "to_kind": 21,
+      "start_ns": 1251599060564000,
+      "end_ns": 1251599091074000,
+      "wall_ms": 30.51,
+      "thread_cpu_ms": 0.047375,
+      "from_a": 40240185344,
+      "to_a": 1
+    }
+  ],
+  "cross_owner_lock_wait": {
+    "owner": 3,
+    "wall_ms": 120.623,
+    "reported_at_ns": 1251598266480000,
+    "scope": "Driver mutex acquisition interval overlaps owner0 self-send interval. Interval includes any scheduling delay while acquiring; not exact lock-held CPU time."
+  },
+  "race_argument": [
+    "Pump computes next_deadline=0 for remaining ready work and clears pumping under the same driver mutex.",
+    "Publication before this final locked check is reflected in the ready queue; HTTP converts the due deadline to OS poll timeout zero.",
+    "Publication after that lock observes pumping==0 and still invokes the directed external wake before the owner can sleep.",
+    "Close/fault broadcasts and ordinary external notifications remain; no timeout, quantum, ownership or M:N change."
+  ],
+  "production_change": {
+    "file": "src/backend/c_task_driver.rs",
+    "change": "Remove only pump-tail event_wake for its own already-ready continuation; update adjacent synchronization comment."
+  },
+  "permanent_regression": {
+    "file": "tests/native_task_source_test.rs",
+    "test": "native_task_external_owner_pump_preserves_affinity_wakes_and_retirement",
+    "before": "Fails the new no-self-notification assertion on unmodified code.",
+    "after": "Passes, with all sixteen native_task_source_test tests passing.",
+    "assertions": [
+      "Remaining ready work returns deadline zero without notifying either owner.",
+      "5000-iteration cooperative work pumps without self-notifications.",
+      "New publication after pump returns still wakes its target owner, without notifying the other owner.",
+      "Close still broadcasts and both owners retire, join, and return their accounted bytes."
+    ]
+  },
+  "private_candidate": {
+    "counts": {
+      "success": 280
+    },
+    "first_tail_ms": 116.209,
+    "scope": "280/280 success before the first 100ms diagnostic trigger stopped arrivals. Its window differs from before; not an error-rate or sustained-pass comparison. Residual off-CPU tails remain."
+  },
+  "uninstrumented_fixed_preflight": {
+    "report": "mac-tail-fixed-5s-preflight.json",
+    "parameters": {
+      "duration_seconds": 5,
+      "arrival_rps": 50.0,
+      "loops": [
+        4
+      ],
+      "native_c_profile": "release",
+      "blocking_threads_total": 5,
+      "thread_budget": 16,
+      "normal_unexpected_errors": 0,
+      "normal_p99_ms": 250,
+      "pre_overload_peak_loop_delay_ms": 100,
+      "overload_http_statuses": [
+        200,
+        408,
+        503,
+        504
+      ],
+      "overload_unclassified_measured_errors": 0,
+      "overload_slow_peer_attempts_per_second": 280,
+      "overload_slow_peer_connections": 280,
+      "recovery_seconds": 5,
+      "formal_phases_seconds": null,
+      "overload_duration_reason": "280 slow peers over 30s fits the same-host 16384 ephemeral-port budget; service deadlines unchanged",
+      "queue_bytes": "fixed64 descriptors, no queued request bodies",
+      "timers": "25ms real async wait"
+    },
+    "counts": {
+      "success": 250
+    },
+    "arrivals": 250,
+    "completed": 250,
+    "client_shed": 0,
+    "p99_ms": 28.5,
+    "peak_loop_delay_ms": 3,
+    "exit": 0,
+    "status": "passed",
+    "scope": "Actual release C from rebuilt CLI; no diagnostic ring, libproc observer, or sample process. Original five-second threshold only; not a thirty-minute claim."
+  },
+  "environment_and_limits": [
+    "All owner threads requested QoS class 21 (DEFAULT), relative priority zero; nice zero. No DARWINBG/external-DARWINBG/SUPPRESSED process flag was set.",
+    "A system sample after diagnosis showed 8 GiB host memory and about 11.5 GiB swap in use. It is environment evidence, not proof of the unique stall cause.",
+    "Root closed its own GitHub editor tab/TextEdit during this work. UI/host conditions were not frozen across diagnostic rounds; no UI change is credited as a runtime fix.",
+    "The remaining 306.127ms interval lies between OS poll return and the next pump entry, including wake drain and loop maintenance; it was not uniquely attributed.",
+    "Several poll(timeout=0) and pure pump intervals also accrued wall time with very little thread CPU. Snapshot RUNNING does not establish continuous CPU execution or exclude short unsampled waits.",
+    "Native owner identity is exported once using THREAD_IDENTIFIER_INFO.thread_handle and verified unique thread ID, not guessed from pthread pointer offsets.",
+    "The prestarted stack sampler is diagnostic instrumentation; aggregate stacks do not provide a timestamp for every frame and may affect scheduling.",
+    "504 selection is precisely correlated; the interval from selection to client response completion is not uniquely split into socket write and client scheduling.",
+    "The retained raw rusage CPU/QoS metadata uses Mach ticks, calibrated separately at ratio 0.024 to process CPU nanoseconds; timebase 125/3 conversion is explicit.",
+    "The new five-second pass does not prove every off-CPU tail fixed or substitute for final three-OS and formal acceptance. Historical seven failures remain unconfirmed."
+  ],
+  "local_evidence": {
+    "initial-123ms": {
+      "window": "mac-tail-initial-123ms-window.json.gz",
+      "bytes": 270135,
+      "request": {
+        "id": 450,
+        "path": "/hot",
+        "offered_ns": 1251376854872000,
+        "start_ns": 1251376855256000,
+        "worker": 26,
+        "end_ns": 1251376978947000,
+        "elapsed_ms": 123.691,
+        "category": "success",
+        "detail": null
+      },
+      "native_sha256": "15d1313f69e379345f017cf1927f6971a0beb7af6a4c617cd1d7a5e4bd35d94b",
+      "generated_c_sha256": "52949814d4fb6172e5e8db941ed8ddba7b54df1f8e3261cb63841f58f9733550"
+    },
+    "before-504": {
+      "window": "mac-tail-before-504-window.json.gz",
+      "bytes": 438788,
+      "request": {
+        "id": 1400,
+        "path": "/hot",
+        "offered_ns": 1251598082772000,
+        "start_ns": 1251598094331000,
+        "worker": 24,
+        "end_ns": 1251599470979000,
+        "elapsed_ms": 1376.648,
+        "category": "http_504",
+        "detail": {
+          "status": 504,
+          "body": "b'Gateway Timeout'"
+        }
+      },
+      "native_sha256": "3f4f9f53ffeb21b4cff0bb55ef53f0626241c282ec5c7b3ea947f043d6f19d02",
+      "generated_c_sha256": "d1191d3e7f15f12b1c2d9c8c6ee67086f2ccdb1a18156aa33974c1c3cfdbc083"
+    },
+    "private-candidate": {
+      "window": "mac-tail-private-candidate-window.json.gz",
+      "bytes": 309855,
+      "request": {
+        "id": 275,
+        "path": "/hot",
+        "offered_ns": 1251731342549000,
+        "start_ns": 1251731342806000,
+        "worker": 8,
+        "end_ns": 1251731459015000,
+        "elapsed_ms": 116.209,
+        "category": "success",
+        "detail": null
+      },
+      "native_sha256": "82f4855f1a571d0feeb70a35eb5d3ab5645b5f2765eb7219fde0ee795a8b1091",
+      "generated_c_sha256": "96467ad35bfc14aa7e717815bcf7d973fe1c314a35f636936482c859e8361574"
+    }
+  },
+  "cleanup": "Completed: private CLI copies, generated diagnostic/candidate C and headers, helper scripts, native/observer binaries, mmap ring, logs, and temporary directory removed. All spawned service, observer, sampler and client processes exited. Only bounded evidence windows/stacks and the original fixed preflight remain in Downloads; the existing permanent regression remains in the repository.",
+  "validation": {
+    "native_task_source_test": {
+      "passed": 16,
+      "failed": 0
+    },
+    "rustfmt": "passed",
+    "diff_check": "passed",
+    "formal_and_three_os": "root executes after final freeze; this file does not assert their outcome"
+  },
+  "event_kind_legend": {
+    "1": "pump_enter",
+    "2": "pump_return, a=status,b=next_deadline_ms",
+    "3": "sampled_callback_enter, a=control,b=slot,c=generation,d=polls",
+    "4": "sampled_callback_return,a=control,b=slot,c=generation,d=outcome",
+    "7": "os_poll_enter,a=wait_ms,b=task_deadline_ms,c=nearest_ms,d=poll_count",
+    "8": "os_poll_return,a=selected",
+    "10": "async_submit_enter,a=request_id,b=connection,c=request_deadline_ms",
+    "11": "factory_done,a=control,b=slot,c=generation,d=http_handle",
+    "12": "async_admitted,a=request_id,b=http_handle,c=async_deadline_ms",
+    "13": "http_504_selected,a=request_id,b=http_handle,c=deadline_ms,d=504",
+    "14": "http_response_selected,a=request_id,c=deadline_ms,d=status",
+    "90": "owner_thread_bound",
+    "21": "pump_tail_self_wake_enter, a=ready_count",
+    "22": "pump_tail_self_wake_return, a=ready_count",
+    "31": "driver_lock_acquisition_interval_over_250us,a=wall_ns,b=driver",
+    "32": "event_wake_group_lock_enter,a=owner",
+    "33": "event_wake_group_lock_acquired,a=owner",
+    "34": "wake_send_enter,a=wake_pointer,b=socket",
+    "35": "wake_send_return,a=wake_pointer,b=socket,c=sent"
+  }
+}

@@ -4,7 +4,7 @@
 
 #[allow(dead_code)]
 #[path = "bounded_process.rs"]
-mod bounded_process;
+pub mod bounded_process;
 
 use std::env;
 use std::fs;
@@ -375,7 +375,19 @@ fn compile_harness_linked(
             command.arg("-pthread");
         }
         if let Some(libdir) = libpq_dir {
-            command.arg("-L").arg(libdir).arg("-lpq");
+            if cfg!(windows) {
+                // Windows PostgreSQL ships libpq.lib, while clang's -lpq
+                // requests pq.lib under the MSVC target. Link the actual
+                // import library instead of inventing another basename.
+                let library = ["libpqdll.lib", "libpq.lib"]
+                    .into_iter()
+                    .map(|name| libdir.join(name))
+                    .find(|path| path.is_file())
+                    .expect("PG poll harness requires a Windows libpq import library");
+                command.arg(library);
+            } else {
+                command.arg("-L").arg(libdir).arg("-lpq");
+            }
         }
         command.arg("-o").arg(&output);
         if require_tsan {

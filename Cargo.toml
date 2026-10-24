@@ -38,3 +38,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+# Test-only process-tree deadline; not installed or shipped as a Ku command.
+[[example]]
+name = "acceptance-runner"
+path = "tests/support/acceptance_runner.rs"

@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import gzip
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tarfile
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -134,11 +138,181 @@ class ReleaseExportTests(unittest.TestCase):
             self.assertEqual((installed / "ku").read_bytes(), (self.bundle / "ku").read_bytes())
             self.assertTrue((installed / "SHA256SUMS").is_file())
             return {"format": "test-receipt", "target": target}
-        with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check:
+        with mock.patch.object(EXPORT, "verify_installation", side_effect=verify) as check, mock.patch.object(
+                EXPORT, "verify_runtime_installation", return_value={"status": "passed"}) as runtime:
             result = self.run_export(verify_install=True)
         self.assertEqual(check.call_count, 1)
+        runtime.assert_called_once_with(check.call_args.args[0], self.repo, self.target)
+        self.assertEqual(result["runtime_installation"], {"status": "passed"})
         manifest = json.loads(Path(result["manifest_path"]).read_bytes())
         self.assertEqual(manifest["installation_check"], {"format": "test-receipt", "target": self.target})
+        self.assertNotIn("runtime_installation", manifest)
+        self.assertEqual(len(list(self.output.iterdir())), 2)
+
+    def runtime_fixture(self):
+        self.put(self.repo / "tests/acceptance/multiloop_load.py", b"not executed by unit tests\n")
+        self.put(self.repo / "tests/fixtures/multiloop_service.ku", b"unmodified runtime fixture\n")
+        return {"status": "passed", "cli_sha256": EXPORT.file_hash(self.bundle / "ku"),
+                "fixture_sha256": EXPORT.file_hash(self.repo / "tests/fixtures/multiloop_service.ku"),
+                "runs": [{"loops": 2, "exit_code": 0, "phases": [{"name": "short", "arrivals": 3,
+                    "completed": 3, "counts": {"success": 3}, "client_shed": 0, "first_errors": []}],
+                    "final_metrics": {
+                        "loops": [dict(id=i, queued=0, running=0, resident=0, pending=0) for i in range(2)],
+                        "tasks": [dict(id=i, ready=0, waiting=0, running=0, resident=0, timers=0) for i in range(2)],
+                        "outcomes": [dict(id=i, queued_bytes=0) for i in range(2)]}}]}
+
+    def runtime_process(self, report, directories, **overrides):
+        def spawn(arguments, repo, working):
+            self.assertEqual(arguments[:3], [sys.executable, "-B", str(self.repo / "tests/acceptance/multiloop_load.py")])
+            self.assertEqual(arguments[3:13], ["--ku", str(self.bundle / "ku"), "--loops", "2",
+                                             "--duration", "3", "--rps", "1", "--profile", "release"])
+            destination = Path(arguments[-1])
+            directories.append(destination.parent)
+            self.assertEqual(repo, self.repo)
+            self.assertEqual(working, destination.parent)
+            destination.write_text(json.dumps(report), encoding="utf-8")
+            return EXPORT.subprocess.CompletedProcess(arguments, overrides.get("returncode", 0),
+                                                       overrides.get("stdout", b""), overrides.get("stderr", b""))
+        return spawn
+
+    def test_installed_runtime_smoke_checks_extracted_cli_and_cleans_temporary_tree(self):
+        report, directories = self.runtime_fixture(), []
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=self.runtime_process(report, directories)):
+            receipt = EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        self.assertEqual(receipt["requests"]["paths_in_order"], ["/ok", "/cpu", "/timer"])
+        self.assertEqual(receipt["observed_loops"], 2)
+        self.assertEqual(receipt["executable_sha256"], EXPORT.file_hash(self.bundle / "ku"))
+        self.assertEqual(receipt["drain_exit_code"], 0)
+        self.assertTrue(receipt["temporary_tree_removed"])
+        self.assertTrue(receipt["process_tree_cleanup_confirmed"])
+        self.assertTrue(directories and all(not root.exists() for root in directories))
+
+    def test_runtime_smoke_rejects_wrong_bodies_partial_runs_and_live_records(self):
+        baseline = self.runtime_fixture()
+        mutations = [
+            lambda value: value.update(cli_sha256="b" * 64),
+            lambda value: value["runs"][0]["phases"][0].update(counts={"success": 2, "wrong_body": 1}),
+            lambda value: value["runs"][0]["phases"][0].update(arrivals=2, completed=2),
+            lambda value: value["runs"][0].update(exit_code=-9),
+            lambda value: value["runs"][0]["final_metrics"]["tasks"][1].update(resident=1),
+            lambda value: value["runs"][0]["final_metrics"]["outcomes"][0].update(queued_bytes=1),
+            lambda value: value["runs"][0]["final_metrics"].update(loops=[]),
+        ]
+        for index, mutate in enumerate(mutations):
+            report, directories = copy.deepcopy(baseline), []
+            mutate(report)
+            with self.subTest(index=index), mock.patch.object(EXPORT, "run_runtime_check",
+                    side_effect=self.runtime_process(report, directories)):
+                with self.assertRaises(EXPORT.RuntimeSmokeError) as caught:
+                    EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+                self.assertEqual(caught.exception.evidence["status"], "failed")
+                self.assertIn("report_tail", caught.exception.evidence)
+                self.assertTrue(caught.exception.evidence["temporary_tree_removed"])
+                self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_smoke_owner_failure_is_not_reported_as_confirmed_cleanup(self):
+        report, directories = self.runtime_fixture(), []
+        spawn = self.runtime_process(report, directories)
+        def failed(*arguments):
+            spawn(*arguments)
+            raise SystemExit("installed runtime smoke exceeded 180 seconds; cleanup unconfirmed")
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=failed):
+            with self.assertRaisesRegex(EXPORT.RuntimeSmokeError, "180 seconds") as caught:
+                EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        self.assertFalse(caught.exception.evidence["process_tree_cleanup_confirmed"])
+        self.assertTrue(caught.exception.evidence["temporary_tree_removed"])
+        self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_failure_does_not_publish_unchecked_archive(self):
+        evidence = {"status": "failed", "temporary_tree_removed": True}
+        with mock.patch.object(EXPORT, "verify_installation", return_value={}), mock.patch.object(
+                EXPORT, "verify_runtime_installation", side_effect=EXPORT.RuntimeSmokeError("runtime failed", evidence)):
+            with self.assertRaisesRegex(EXPORT.RuntimeSmokeError, "runtime failed"):
+                self.run_export(verify_install=True)
+        self.assertFalse(any(self.output.iterdir()))
+
+    def test_runtime_failure_logs_are_bounded_and_temporary_files_are_removed(self):
+        report, directories = self.runtime_fixture(), []
+        spawn = self.runtime_process(report, directories, returncode=1, stderr=b"failure evidence\n" * 1000)
+        with mock.patch.object(EXPORT, "run_runtime_check", side_effect=spawn):
+            with self.assertRaises(EXPORT.RuntimeSmokeError) as caught:
+                EXPORT.verify_runtime_installation(self.bundle, self.repo, self.target)
+        evidence = caught.exception.evidence
+        self.assertEqual(evidence["driver_exit_code"], 1)
+        self.assertEqual(len(evidence["stderr_tail"].encode()), 8192)
+        self.assertTrue(evidence["temporary_tree_removed"])
+        self.assertTrue(all(not root.exists() for root in directories))
+
+    def test_runtime_wrapper_uses_driver_directory_for_sibling_imports(self):
+        driver_directory = self.root / "driver helpers 目录"
+        driver_directory.mkdir()
+        working = self.root / "runtime-temp"
+        working.mkdir()
+        (driver_directory / "installed_runtime_sibling.py").write_text(
+            "MARKER = 'trusted sibling'\n", encoding="utf-8")
+        driver = driver_directory / "driver.py"
+        driver.write_text(
+            "import json, os, sys, tempfile\n"
+            "from installed_runtime_sibling import MARKER\n"
+            "print(json.dumps({'marker': MARKER, 'arguments': sys.argv[1:], "
+            "'script_parent': os.path.realpath(sys.path[0]), "
+            "'working_directory': os.path.realpath(os.getcwd()), "
+            "'temporary_root': os.path.realpath(tempfile.gettempdir())}))\n",
+            encoding="utf-8")
+        direct = subprocess.run([sys.executable, "-B", str(driver), "argument with space"],
+            cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=True, timeout=5)
+        direct_report = json.loads(direct.stdout)
+        result = EXPORT.run_runtime_check(
+            [sys.executable, "-B", str(driver), "argument with space"], self.root, working)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["marker"], direct_report["marker"])
+        self.assertEqual(report["arguments"], direct_report["arguments"])
+        self.assertEqual(report["script_parent"], str(driver_directory.resolve()))
+        self.assertEqual(report["working_directory"], str(self.root))
+        self.assertEqual(report["temporary_root"], str(working.resolve()))
+        self.assertTrue(result.process_owner_cleanup["process_tree_cleanup_confirmed"])
+
+    def test_runtime_owner_retires_descendant_even_after_launcher_exits(self):
+        ready, escaped = self.root / "orphan-ready", self.root / "orphan-escaped"
+        descendant = ("from pathlib import Path; import time; "
+                      f"Path({str(ready)!r}).write_text('ready'); time.sleep(10); "
+                      f"Path({str(escaped)!r}).write_text('escaped'); print('descendant-escaped',flush=True)")
+        source = ("import subprocess,sys,time\nfrom pathlib import Path\n"
+                  f"subprocess.Popen([sys.executable,'-B','-c',{descendant!r}])\n"
+                  "deadline=time.monotonic()+2\n"
+                  f"while not Path({str(ready)!r}).exists():\n"
+                  "    if time.monotonic()>=deadline: raise RuntimeError('child did not start')\n"
+                  "    time.sleep(.01)\n"
+                  "print('parent-exited',flush=True)\n")
+        driver = self.root / "orphan-driver.py"
+        driver.write_text(source, encoding="utf-8")
+        began = time.monotonic()
+        result = EXPORT.run_runtime_check([sys.executable, "-B", str(driver)], self.root, self.root)
+        self.assertEqual(result.stdout.replace(b"\r\n", b"\n"), b"parent-exited\n")
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertTrue(ready.exists(), "the actual descendant never reached its held phase")
+        self.assertFalse(escaped.exists())
+
+    def test_runtime_result_is_single_cli_json_and_failure_only_uses_stderr(self):
+        arguments = ["export-release.py", "--bundle", str(self.bundle), "--output", str(self.output),
+                     "--repo", str(self.repo), "--metadata", str(self.metadata),
+                     "--rust-sysroot", str(self.sysroot), "--version", "0.0.17",
+                     "--target", self.target, "--commit", "a" * 40]
+        result = {"asset_path": "asset", "runtime_installation": {"status": "passed"}}
+        for failure in (False, True):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            error = EXPORT.RuntimeSmokeError("failed smoke", {"status": "failed"})
+            with self.subTest(failure=failure), mock.patch.object(sys, "argv", arguments), mock.patch.object(
+                    EXPORT, "export_release", side_effect=error if failure else None, return_value=result), \
+                    mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                self.assertEqual(EXPORT.main(), 1 if failure else 0)
+            if failure:
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(json.loads(stderr.getvalue().splitlines()[0])["runtime_installation"]["status"], "failed")
+            else:
+                self.assertEqual(json.loads(stdout.getvalue()), result)
+                self.assertEqual(stderr.getvalue(), "")
 
     def test_installed_commands_validate_version_examples_and_normal_exit(self):
         for name in ("hello.ku", "json.ku"):
@@ -436,6 +610,428 @@ class ReleaseExportTests(unittest.TestCase):
                 destination.mkdir()
                 with self.assertRaisesRegex((EXPORT.ExportError, gzip.BadGzipFile), message):
                     EXPORT.verify_archive(archive, expected, destination)
+
+
+
+class InstalledPostgresDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("ku_installed_pg_directory_test", Path(__file__).with_name("verify-installed-pg.py"))
+        self.gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.gate)
+        self.repo = Path(__file__).resolve().parents[2]
+
+    def exercise_windows_setup(self, root, report, powershell_result):
+        gate = self.gate
+        driver = self.repo / "tests" / "acceptance" / "http_pg_lifecycle.py"
+        original_path = sys.path[:]
+        events = []
+        load = gate.load_trusted
+        def trusted_load(path, name):
+            self.assertEqual(path, driver)
+            self.assertEqual(sys.path[0], str(driver.parent.resolve()))
+            module = load(path, name)
+            self.assertEqual(Path(module.process_sample.__code__.co_filename).resolve(),
+                             driver.with_name("multiloop_load.py").resolve())
+            return module
+        def acl(command, **kwargs):
+            self.assertEqual(command[0], "powershell.exe")
+            self.assertEqual(kwargs["env"]["KU_PG_FIXTURE_ROOT"], str(root.resolve()))
+            self.assertFalse((root / "fixture-work").exists())
+            self.assertNotIn("pg_fixture_invoked", report)
+            events.append("outer-root-acl")
+            return powershell_result
+        def runtime(arguments, repo, working):
+            self.assertEqual(sys.path, original_path)
+            self.assertEqual(working, root / "fixture-work")
+            self.assertEqual(report["windows_pg_directory_acl_root"], str(root))
+            self.assertTrue(working.is_dir())
+            self.assertEqual(arguments[arguments.index("--lane") + 1], "both")
+            self.assertTrue(report["pg_fixture_invoked"])
+            self.assertTrue(report["windows_pg_directory_acl"]["acl"]["current_user_modify_inheritable"])
+            events.append("original-contained-fixture")
+            return subprocess.CompletedProcess(arguments, 0)
+        exporter = SimpleNamespace(run_runtime_check=mock.Mock(side_effect=runtime))
+        try:
+            with mock.patch.object(gate, "os", SimpleNamespace(name="nt")), \
+                 mock.patch.object(gate.sys, "platform", "win32"), \
+                 mock.patch.object(gate, "load_trusted", side_effect=trusted_load), \
+                 mock.patch.object(gate.subprocess, "run", side_effect=acl) as powershell:
+                gate.run_pg_lifecycles(exporter, None, self.repo, root / "installed", root,
+                                       root / "lifecycle.json", report)
+        finally:
+            self.assertEqual(sys.path, original_path)
+            if powershell_result.returncode or not root.name.startswith("ku-http-pg-acceptance-") or root.parent != Path(tempfile.gettempdir()).resolve():
+                exporter.run_runtime_check.assert_not_called()
+                self.assertFalse((root / "fixture-work").exists())
+            if not root.name.startswith("ku-http-pg-acceptance-") or root.parent != Path(tempfile.gettempdir()).resolve():
+                powershell.assert_not_called()
+        return events, powershell
+
+    def test_windows_owned_root_acl_precedes_working_directory_and_original_fixture(self):
+        acl = {"parent_sddl_before": "parent", "parent_sddl_after": "parent",
+               "current_user_modify_inheritable": True}
+        success = SimpleNamespace(returncode=0, stdout=json.dumps(acl), stderr="")
+        report = {}
+        with mock.patch.object(self.gate, "os", SimpleNamespace(name="nt")), \
+             self.gate.owned_temporary_root(report) as root:
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+            self.assertTrue(root.name.startswith("ku-http-pg-acceptance-"))
+            self.assertEqual(root.parent, Path(tempfile.gettempdir()).resolve())
+            events, powershell = self.exercise_windows_setup(root, report, success)
+            self.assertEqual(events, ["outer-root-acl", "original-contained-fixture"])
+            powershell.assert_called_once()
+            report["fixture_cleanup_confirmed"] = True
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+        self.assertFalse(root.exists())
+
+    def test_windows_outer_acl_failure_never_starts_fixture_and_root_is_cleaned(self):
+        failure = SimpleNamespace(returncode=1, stdout="{}", stderr="ACL setup denied")
+        report = {}
+        with self.assertRaises(RuntimeError):
+            with mock.patch.object(self.gate, "os", SimpleNamespace(name="nt")), \
+                 self.gate.owned_temporary_root(report) as root:
+                self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+                self.exercise_windows_setup(root, report, failure)
+        self.assertNotIn("pg_fixture_invoked", report)
+        self.assertEqual(report["windows_pg_directory_acl"]["exit_code"], 1)
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+        self.assertFalse(root.exists())
+
+    def test_existing_fixture_guard_still_refuses_other_prefix_and_nested_root(self):
+        success = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        with tempfile.TemporaryDirectory(prefix="ku-installed-pg-") as temporary:
+            outer = Path(temporary).resolve()
+            nested = outer / "ku-http-pg-acceptance-nested"
+            nested.mkdir()
+            for root in (outer, nested):
+                with self.subTest(root=root), self.assertRaises(ValueError):
+                    self.exercise_windows_setup(root, {}, success)
+
+    def test_posix_owned_root_keeps_original_prefix(self):
+        report = {}
+        with mock.patch.object(self.gate, "os", SimpleNamespace(name="posix")), \
+             self.gate.owned_temporary_root(report) as root:
+            self.assertTrue(root.name.startswith("ku-installed-pg-"))
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+
+
+@unittest.skipIf(os.name == "nt", "POSIX foreground postgres owner; Windows uses the existing Job")
+class InstalledPostgresOwnerTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("ku_installed_pg_owner_test", Path(__file__).with_name("verify-installed-pg.py"))
+        self.gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.gate)
+        self.temporary = tempfile.TemporaryDirectory(prefix="ku-pg-owner-unit-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve() / "private-cluster"
+        self.root.mkdir(mode=0o700)
+        (self.root / "data").mkdir()
+        self.events = []
+        self.process = mock.Mock(pid=190101, returncode=None)
+        self.process.poll.side_effect = AssertionError("early poll would reap the signal anchor")
+        self.process.communicate.side_effect = AssertionError("early communicate would reap the signal anchor")
+        self.process.wait.side_effect = lambda **kwargs: self.events.append("final-reap") or 0
+        self.snapshots = [[(190101, os.getpid(), 190101, "Z")]]
+        self.owner = self.gate.PosixPrivatePostgres(self.root, Path("/inert/postgresql"), "sync", self.tool)
+        self.owner.root_identity = (self.root.stat().st_dev, self.root.stat().st_ino)
+        self.owner.data_identity = ((self.root / "data").stat().st_dev, (self.root / "data").stat().st_ino)
+        self.owner.tool_identities = {}
+        self.owner.process, self.owner.data, self.owner.port = self.process, self.root / "data", 19192
+        self.owner.log = mock.Mock()
+        self.gate.HELD_POSTGRES_OWNERS.append(self.owner)
+        self.addCleanup(self.gate.HELD_POSTGRES_OWNERS.clear)
+        self.pid_file = self.root / "data/postmaster.pid"
+        self.pid_file.write_text(f"190101\n{self.root / 'data'}\n1700000000\n19192\n\n\n\nready\n")
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(self.gate.signal, "getsignal", return_value=self.gate.signal.SIG_DFL))
+        self.stack.enter_context(mock.patch.object(self.gate.os, "getpgid", return_value=190101))
+        self.stack.enter_context(mock.patch.object(self.gate.os, "getsid", return_value=190101))
+        self.kill = self.stack.enter_context(mock.patch.object(self.gate.os, "killpg", side_effect=lambda pid, sig: self.events.append(("owned-signal", pid, sig))))
+        self.stack.enter_context(mock.patch.object(self.gate.time, "sleep"))
+
+    def tool(self, command, timeout):
+        self.assertGreater(timeout, 0)
+        if Path(command[0]).name == "pg_ctl":
+            self.events.append("pg_ctl-stop")
+            self.assertEqual(command[1:3], ["-D", str(self.owner.data)])
+            self.assertEqual(command[-3:], ["stop", "-m", "immediate"])
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        self.assertEqual(command, ["ps", "-axo", "pid=,ppid=,pgid=,uid=,state="])
+        self.events.append("independent-snapshot")
+        rows = self.snapshots[0]
+        if len(self.snapshots) > 1:
+            self.snapshots.pop(0)
+        content = "".join(f"{pid} {ppid} {pgid} {os.getuid()} {state}\n" for pid, ppid, pgid, state in rows).encode()
+        return subprocess.CompletedProcess(command, 0, content, b"")
+
+    def test_foreground_start_holds_child_without_polling_and_disables_unused_unix_socket(self):
+        tools = self.root.parent / "tools"
+        tools.mkdir()
+        for name in ("postgres", "pg_ctl"):
+            (tools / name).write_bytes(("inert " + name).encode())
+        original = self.owner
+        self.gate.HELD_POSTGRES_OWNERS.remove(original)
+        self.owner = self.gate.PosixPrivatePostgres(self.root.parent / "launch", tools, "sync", self.tool)
+        def run_tool(command, timeout):
+            if Path(command[0]).name == "initdb":
+                self.owner.data.mkdir()
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+            return self.tool(command, timeout)
+        self.owner.run_tool = run_tool
+        def launch(command, **kwargs):
+            self.assertTrue(kwargs["start_new_session"])
+            self.assertEqual(kwargs["cwd"], self.owner.root)
+            self.assertEqual(command[command.index("-k") + 1], "")
+            (self.owner.data / "postmaster.pid").write_text(f"190101\n{self.owner.data}\n1700000000\n19192\n\n\n\nready\n")
+            return self.process
+        listener = mock.MagicMock()
+        listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 19192)
+        with mock.patch.object(self.gate.socket, "socket", return_value=listener), \
+             mock.patch.object(self.gate.subprocess, "Popen", side_effect=launch):
+            configured = self.owner.start()
+        spec = json.loads(configured.read_bytes())
+        self.assertEqual(spec["owner_pid"], os.getpid())
+        self.assertEqual(spec["lane"], "sync")
+        self.assertEqual(len(self.owner.receipt["postgres_sha256"]), 64)
+        self.process.poll.assert_not_called()
+        self.process.wait.assert_not_called()
+        self.process.communicate.assert_not_called()
+        self.owner.cleanup()
+
+    def test_darwin_zombie_esrch_uses_direct_parent_group_and_never_signals(self):
+        with mock.patch.object(self.gate.os, "getpgid", side_effect=ProcessLookupError), \
+             mock.patch.object(self.gate.os, "getsid", side_effect=ProcessLookupError):
+            self.owner.cleanup()
+        self.assertEqual(self.events, ["independent-snapshot", "final-reap"])
+        self.assertTrue(self.owner.receipt["cleanup_confirmed"])
+        self.assertIsNone(self.owner.receipt["snapshots"][0][0]["session"])
+        self.process.poll.assert_not_called()
+        self.process.communicate.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_unqueryable_non_zombie_never_authorizes_signal_or_reap(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "S")]]
+        with mock.patch.object(self.gate.os, "getpgid", side_effect=ProcessLookupError), \
+             mock.patch.object(self.gate.os, "getsid", side_effect=ProcessLookupError), \
+             self.assertRaises(TimeoutError):
+            self.owner.cleanup()
+        self.process.wait.assert_not_called()
+        self.kill.assert_not_called()
+        self.assertNotIn("pg_ctl-stop", self.events)
+        self.assertFalse(self.owner.receipt["cleanup_confirmed"])
+
+    def test_real_retained_instant_child_is_reaped_only_after_ps_zombie_proof(self):
+        # Exercise the actual host API without PostgreSQL, signals, or compilers.
+        # Darwin returns ESRCH from getpgid/getsid for this still-unreaped child.
+        self.stack.close()
+        child = subprocess.Popen([sys.executable, "-B", "-c", "pass"],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.owner.process = child
+        self.pid_file.unlink()
+        def actual_ps(command, timeout):
+            self.assertEqual(command, ["ps", "-axo", "pid=,ppid=,pgid=,uid=,state="])
+            return subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=timeout)
+        self.owner.run_tool = actual_ps
+        try:
+            deadline = time.monotonic() + 3
+            while not self.owner.snapshot(1):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            self.assertIsNone(child.returncode)
+            self.owner.cleanup()
+            self.assertTrue(self.owner.receipt["cleanup_confirmed"])
+            self.assertEqual(child.returncode, 0)
+            self.assertNotIn("owned_group_signals", self.owner.receipt)
+        finally:
+            child.wait(timeout=3)
+
+    def test_changed_data_inode_is_not_signaled_or_reaped(self):
+        self.owner.data.rename(self.root / "old-data")
+        self.owner.data.mkdir()
+        with self.assertRaises(ValueError): self.owner.cleanup()
+        self.kill.assert_not_called()
+        self.process.wait.assert_not_called()
+
+    def test_pg_ctl_then_independent_empty_group_then_one_final_reap(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "S")], [(190101, os.getpid(), 190101, "Z")]]
+        self.owner.cleanup()
+        self.assertEqual(self.events, ["independent-snapshot", "pg_ctl-stop", "independent-snapshot", "final-reap"])
+        self.assertTrue(self.owner.receipt["cleanup_confirmed"])
+        self.assertTrue(self.owner.signal_closed)
+        self.assertNotIn(self.owner, self.gate.HELD_POSTGRES_OWNERS)
+        self.process.poll.assert_not_called()
+        self.process.communicate.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_child_group_shutdown_uses_only_unreaped_anchor_and_never_signals_after_reap(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "S"), (190102, 190101, 190101, "S")], [(190101, os.getpid(), 190101, "S"), (190102, 190101, 190101, "S")], [(190101, os.getpid(), 190101, "Z")]]
+        self.owner.cleanup()
+        self.kill.assert_called_once_with(190101, self.gate.signal.SIGQUIT)
+        self.assertEqual(self.events[-1], "final-reap")
+        self.assertTrue(self.owner.receipt["cleanup_confirmed"])
+        self.process.poll.assert_not_called()
+        self.process.communicate.assert_not_called()
+
+    def test_changed_pid_record_session_or_direct_parent_is_never_signaled_or_reaped(self):
+        original = self.pid_file.read_text()
+        with self.subTest(case="pid-record"):
+            self.pid_file.write_text(original.replace("190101\n", "190999\n", 1))
+            with self.assertRaises(ValueError): self.owner.cleanup()
+        self.pid_file.write_text(original)
+        with self.subTest(case="session"), mock.patch.object(self.gate.os, "getsid", return_value=190999):
+            with self.assertRaises(ValueError): self.owner.cleanup()
+        self.snapshots = [[(190101, 190999, 190101, "Z")]]
+        with self.subTest(case="parent"), self.assertRaises(ValueError): self.owner.cleanup()
+        self.kill.assert_not_called()
+        self.process.wait.assert_not_called()
+        self.assertIn(self.owner, self.gate.HELD_POSTGRES_OWNERS)
+        self.assertFalse(self.owner.receipt["cleanup_confirmed"])
+
+    def test_sigchld_ignored_reaped_child_and_missing_anchor_fail_closed(self):
+        with mock.patch.object(self.gate.signal, "getsignal", return_value=self.gate.signal.SIG_IGN), self.assertRaises(ValueError): self.owner.cleanup()
+        self.process.returncode = 0
+        with self.assertRaises(ValueError): self.owner.cleanup()
+        self.process.returncode = None
+        self.snapshots = [[]]
+        with mock.patch.object(self.gate.os, "getpgid", side_effect=ProcessLookupError), self.assertRaises(ValueError): self.owner.cleanup()
+        self.kill.assert_not_called()
+        self.process.wait.assert_not_called()
+
+    def test_persistent_members_are_failure_not_directory_deletion_or_success(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "S"), (190102, 190101, 190101, "S")]]
+        with self.assertRaises(TimeoutError): self.owner.cleanup()
+        self.assertEqual(self.kill.call_args_list, [mock.call(190101, self.gate.signal.SIGQUIT), mock.call(190101, self.gate.signal.SIGKILL)])
+        self.process.wait.assert_not_called()
+        self.assertTrue(self.owner.root.is_dir())
+        self.assertFalse(self.owner.receipt["cleanup_confirmed"])
+
+    def test_failed_pg_ctl_still_uses_exact_owned_group_and_confirms_reclaim(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "S")], [(190101, os.getpid(), 190101, "Z")]]
+        original = self.owner.run_tool
+        def fail_ctl(command, timeout):
+            if Path(command[0]).name == "pg_ctl": raise TimeoutError("mock tool timeout")
+            return original(command, timeout)
+        self.owner.run_tool = fail_ctl
+        self.owner.cleanup()
+        self.assertEqual(self.owner.receipt["pg_ctl_stop"], "TimeoutError")
+        self.assertTrue(self.owner.receipt["cleanup_confirmed"])
+        self.process.wait.assert_called_once()
+
+    def test_live_member_in_other_group_same_session_does_not_authorize_foreign_group_signal(self):
+        self.snapshots = [[(190101, os.getpid(), 190101, "Z"), (190102, 190101, 190200, "S")]]
+        with self.assertRaises(TimeoutError): self.owner.cleanup()
+        self.kill.assert_not_called()
+        self.process.wait.assert_not_called()
+
+    def test_reap_exception_keeps_root_and_does_not_signal_again(self):
+        self.process.wait.side_effect = TimeoutError("mock final reap failure")
+        with self.assertRaises(TimeoutError): self.owner.cleanup()
+        self.assertTrue(self.owner.signal_closed)
+        self.kill.assert_not_called()
+        self.assertFalse(self.owner.receipt["cleanup_confirmed"])
+        self.assertTrue(self.owner.root.is_dir())
+
+    def test_unconfirmed_context_retains_root_but_confirmed_failed_check_can_clean(self):
+        report = {"status": "failed", "pg_fixture_invoked": True, "fixture_cleanup_confirmed": False}
+        with self.gate.owned_temporary_root(report) as retained: pass
+        self.addCleanup(shutil.rmtree, retained)
+        self.assertTrue(retained.is_dir())
+        self.assertTrue(report["cleanup_unconfirmed"])
+        report = {"status": "failed", "pg_fixture_invoked": True, "fixture_cleanup_confirmed": True}
+        with self.gate.owned_temporary_root(report) as cleaned: pass
+        self.assertFalse(cleaned.exists())
+        self.assertTrue(report["temporary_cleanup_confirmed"])
+
+    def exercise_lanes(self, mode):
+        gate = self.gate
+        base = self.root.parent / ("lane-controller-" + mode)
+        base.mkdir()
+        registry, events = {}, []
+        class InertOwner:
+            def __init__(self, root, tools, lane, tool):
+                self.root, self.lane = root, lane
+                self.process = SimpleNamespace(pid=190101 if lane == "sync" else 190102)
+                self.receipt = {"cleanup_confirmed": False, "postmaster_exit_code": 0}
+                registry[lane] = self
+            def start(self, execution_deadline):
+                self.execution_deadline = execution_deadline
+                events.append("start-" + self.lane)
+                return base / (self.lane + "-owner.json")
+            def cleanup(self):
+                events.append("cleanup-" + self.lane)
+                if mode == "cleanup-fails" and self.lane == "sync":
+                    raise TimeoutError("mock private group remains")
+                self.receipt["cleanup_confirmed"] = True
+        def runtime(arguments, repo, working, timeout_seconds):
+            self.assertGreater(timeout_seconds, 0)
+            self.assertLessEqual(timeout_seconds, 180)
+            lane = arguments[arguments.index("--lane") + 1]
+            self.assertEqual(arguments[arguments.index("--loops") + 1], "4")
+            self.assertEqual(arguments[arguments.index("--profile") + 1], "debug")
+            self.assertIn("--database-owner-config", arguments)
+            events.append("driver-" + lane)
+            raw = {"database_process_owner": "outer installed-archive verifier",
+                   "database_owner_pid": registry[lane].process.pid}
+            path = Path(arguments[arguments.index("--output") + 1])
+            path.write_text(json.dumps({"required_lanes": [lane], "lanes": {
+                lane: {"status": "passed", "report": raw}}}))
+            if mode in ("driver-fails", "unconfirmed-driver") and lane == "sync":
+                failure = TimeoutError("mock original owner timeout")
+                failure.process_owner_cleanup = {"process_tree_cleanup_confirmed": mode == "driver-fails"}
+                raise failure
+            completed = subprocess.CompletedProcess(arguments, 0)
+            completed.process_owner_cleanup = {"process_tree_cleanup_confirmed": True}
+            return completed
+        runner = SimpleNamespace(MAX_CAPTURE_BYTES=0,
+            run_bounded=lambda args, repo, label: subprocess.CompletedProcess(args, 0, b"/inert/postgresql\n", b""))
+        exporter = SimpleNamespace(plain=lambda path: None, run_runtime_check=runtime)
+        prepare = SimpleNamespace(read_file=lambda path, limit: path.read_bytes(), json_object=json.loads, MAX_JSON=1048576)
+        report = {}
+        with mock.patch.object(gate, "PosixPrivatePostgres", InertOwner), \
+             mock.patch.object(gate, "load_trusted", return_value=runner), \
+             mock.patch.object(gate.shutil, "which", return_value="/inert/pg_config"):
+            if mode == "normal":
+                gate.run_pg_lifecycles(exporter, prepare, base, base, base, base / "lifecycle.json", report)
+            else:
+                with self.assertRaises((TimeoutError, ValueError)):
+                    gate.run_pg_lifecycles(exporter, prepare, base, base, base, base / "lifecycle.json", report)
+        if set(registry) == {"sync", "async"}:
+            self.assertEqual(registry["sync"].execution_deadline, registry["async"].execution_deadline)
+        return events, report, json.loads((base / "lifecycle.json").read_bytes())
+
+    def test_runtime_cap_can_only_be_shortened_and_expired_start_never_launches(self):
+        for value in (0, -1, 181, float("inf"), float("nan"), True):
+            with self.subTest(value=value), self.assertRaises(EXPORT.ExportError):
+                EXPORT.run_runtime_check([], self.root, self.root, timeout_seconds=value)
+        with mock.patch.object(self.gate.time, "monotonic", return_value=100), \
+             mock.patch.object(self.gate.subprocess, "Popen") as launch, self.assertRaises(TimeoutError):
+            self.owner.start(execution_deadline=100)
+        launch.assert_not_called()
+
+    def test_independent_lanes_preserve_order_parameters_and_cleanup_before_next(self):
+        events, report, data = self.exercise_lanes("normal")
+        self.assertEqual(events, ["start-sync", "driver-sync", "cleanup-sync", "start-async", "driver-async", "cleanup-async"])
+        self.assertTrue(report["fixture_cleanup_confirmed"])
+        self.assertEqual(data["status"], "passed")
+
+    def test_failed_lane_still_runs_other_lane_only_after_confirmed_cleanup(self):
+        events, report, data = self.exercise_lanes("driver-fails")
+        self.assertEqual(events, ["start-sync", "driver-sync", "cleanup-sync", "start-async", "driver-async", "cleanup-async"])
+        self.assertTrue(report["fixture_cleanup_confirmed"])
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["lanes"]["sync"]["status"], "failed")
+        self.assertEqual(data["lanes"]["async"]["status"], "passed")
+
+    def test_unconfirmed_runtime_or_database_cleanup_blocks_other_lane(self):
+        for mode in ("cleanup-fails", "unconfirmed-driver"):
+            with self.subTest(mode=mode):
+                events, report, data = self.exercise_lanes(mode)
+                self.assertEqual(events, ["start-sync", "driver-sync", "cleanup-sync"])
+                self.assertFalse(report["fixture_cleanup_confirmed"])
+                self.assertEqual(data["status"], "failed")
 
 
 if __name__ == "__main__":

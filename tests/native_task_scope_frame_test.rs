@@ -542,7 +542,18 @@ fn native_task_finally_frame_cancellation_errors_deadlines_and_single_execution(
             .unwrap();
         Checker::new().check(&ast).unwrap();
         let native = ku::ir::task_lower::lower_program(&ast).unwrap();
-        let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+        let generated = if mode == 8 {
+            // This case injects a scope-timeout witness through the raw frame
+            // ABI. Source emission legitimately continues statically empty
+            // scopes within one dispatch quantum, so it exposes no such stop.
+            let sync_ast = Parser::new(Lexer::new("fn main() {}").lex().unwrap())
+                .parse_program()
+                .unwrap();
+            let sync = ir::lower_program(&sync_ast).unwrap();
+            c::generate_task_frame_c_source(&sync, &native.tasks).unwrap()
+        } else {
+            c::generate_native_task_c_source(&native, &Default::default()).unwrap()
+        };
         let hooks = format!(
             "#if defined(_WIN32)\n#include <windows.h>\n#else\n#include <pthread.h>\n#endif\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic size_t fixture_finally_write(const void*,size_t,size_t,FILE*);\n#define fwrite fixture_finally_write\n"
         );

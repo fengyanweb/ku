@@ -124,7 +124,7 @@ fn emit(path: PathBuf) -> Result<(), Box<dyn Error>> {
     );
     let clock = "static uint64_t ku_task_driver_now_ms(void) {";
     let returned =
-        "slot = &driver->slots[index];\n    if (driver->polls != UINT64_MAX) driver->polls++;";
+        "driver->polls=quanta>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+quanta;";
     for unique in [
         "typedef struct KuString {",
         "int main(void) {",
@@ -141,13 +141,13 @@ fn emit(path: PathBuf) -> Result<(), Box<dyn Error>> {
             &format!(
                 "#ifndef KU_BENCH_OBSERVE\n#define KU_BENCH_OBSERVE 0\n#endif\n\
                  #if KU_BENCH_OBSERVE != 0 && KU_BENCH_OBSERVE != 1\n#error invalid_observer_mode\n#endif\n\
-                 static void bench_returned_locked(const KuTaskDriverWorkerV1*, size_t);\n{clock}"
+                 static void bench_returned_locked(const KuTaskDriverWorkerV1*, size_t, size_t);\n{clock}"
             ),
             1,
         )
         .replacen(
             returned,
-            &format!("{returned}\n#if KU_BENCH_OBSERVE\n    bench_returned_locked(worker, index);\n#endif"),
+            &format!("{returned}\n#if KU_BENCH_OBSERVE\n    bench_returned_locked(worker, index, quanta);\n#endif"),
             1,
         );
     source.push_str(HARNESS);
@@ -350,15 +350,17 @@ static BenchTask* bench_tasks[BENCH_MAX_TASKS];
 static uint64_t bench_worker_polls[BENCH_MAX_WORKERS];
 static size_t bench_count;
 static int bench_observing, bench_counter_fault;
-/* Called only under the driver's ALREADY HELD post-poll mutex. No additional
- * lock, atomic, clock, OS identity syscall or allocation is added per poll.
+/* Called only under the driver's ALREADY HELD post-segment mutex. Every poll
+ * in the segment ran on this same worker; counts remain actual returned polls,
+ * not segment counts. No additional lock, atomic, clock, OS identity syscall
+ * or allocation is added per poll.
  * The extra stores/branch/cache traffic still perturb that critical section. */
-static void bench_returned_locked(const KuTaskDriverWorkerV1* worker, size_t index) {
+static void bench_returned_locked(const KuTaskDriverWorkerV1* worker, size_t index, size_t quanta) {
   if (!bench_observing) return;
-  CHECK(index < bench_count && worker->index < BENCH_MAX_WORKERS);
+  CHECK(index < bench_count && worker->index < BENCH_MAX_WORKERS && quanta && quanta<=32u);
   BenchTask* task = bench_tasks[index];
   CHECK(task && task->ticket.slot == index);
-  if (task->observed_polls == UINT64_MAX || bench_worker_polls[worker->index] == UINT64_MAX) {
+  if (quanta>UINT64_MAX-task->observed_polls || quanta>UINT64_MAX-bench_worker_polls[worker->index]) {
     bench_counter_fault = 1; return;
   }
   if (task->observed_polls && task->previous_worker != worker->index) {
@@ -366,8 +368,8 @@ static void bench_returned_locked(const KuTaskDriverWorkerV1* worker, size_t ind
     task->migrations++;
   }
   task->previous_worker = worker->index;
-  task->observed_polls++;
-  bench_worker_polls[worker->index]++;
+  task->observed_polls+=quanta;
+  bench_worker_polls[worker->index]+=quanta;
 }
 static uint64_t bench_now(void* raw) { (void)raw; return ku_task_driver_now_ms(); }
 static uint64_t bench_deadline(uint64_t span) {
@@ -447,7 +449,7 @@ static size_t bench_argument(const char* input, size_t maximum) {
   CHECK(result && result <= maximum); return result;
 }
 int main(int argc, char** argv) {
-  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 10u && KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
+  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 11u && KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   size_t workers = bench_argument(argv[1], BENCH_MAX_WORKERS);
   bench_count = bench_argument(argv[2], BENCH_MAX_TASKS);
   size_t quanta = bench_argument(argv[3], 65536);

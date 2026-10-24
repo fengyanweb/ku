@@ -269,7 +269,11 @@ static void fixture_timed_case(void) {
   CHECK(signal.kind==KU_SYNC_EXIT_CLEANUP_ABORT && signal.arithmetic_status==KU_INT_DIV_ZERO);
   CHECK(!strcmp(__ku_sync_error_message(signal),"division by zero"));
   CHECK(__ku_sync_return_signal.kind==KU_SYNC_EXIT_NONE);
-  CHECK(__ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+  for (unsigned empty_read=0; empty_read<2; ++empty_read) {
+    KuSyncExitSignal empty=__ku_sync_take();
+    CHECK(empty.kind==KU_SYNC_EXIT_NONE && empty.arithmetic_status==0);
+    CHECK(!empty.static_message && !empty.static_message_len);
+  }
   CHECK(__ku_handler_timed_out && __ku_handler_cleanup_deadline==1101);
   CHECK(!result.ok && result.value==0);
   fixture_empty_error(result.error);
@@ -280,6 +284,7 @@ static void fixture_timed_case(void) {
 }
 static void fixture_healthy_case(void) {
   fixture_begin(0);
+  CHECK(__ku_handler_timeout_poll()==0 && fixture_clock_reads==0);
   size_t before=ku_perf_calls;
   healthy();
   CHECK(!strcmp(fixture_trace,"healthy-owner|healthy|"));
@@ -287,6 +292,7 @@ static void fixture_healthy_case(void) {
   CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   CHECK(!__ku_call_depth && !__ku_handler_unwind_depth);
   CHECK(__ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+  CHECK(fixture_clock_reads==0);
   CHECK(__ku_handler_timeout_finish()==0);
 }
 int main(void) {
