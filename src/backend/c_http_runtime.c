@@ -2,6 +2,13 @@
 #if !defined(_WIN32)
 #include <sys/uio.h>
 #endif
+#if defined(__linux__)
+#include <sys/epoll.h>
+#define KU_HTTP_PERSISTENT_EVENT_LOOP 1
+#elif defined(__APPLE__)
+#include <sys/event.h>
+#define KU_HTTP_PERSISTENT_EVENT_LOOP 1
+#endif
 #if defined(__APPLE__)
 #include <sys/select.h>
 #define KU_HTTP_PAUSED_PEER_PROBE_MS 25u
@@ -1717,12 +1724,19 @@ typedef struct KuHttpActiveSet {
   int* indices;
   int count,capacity,free_head,high_water;
   size_t sockets;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  struct KuHttpReactor* reactor;
+#endif
 } KuHttpActiveSet;
 typedef struct KuHttpConnection {
   KuHttpSocket socket_value;
   KuHttpBufferBudget* budget;
   KuHttpActiveSet* active_set;
   int active_position,free_next;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  struct KuHttpReactor* reactor;
+  int work_position,idle_position;
+#endif
   int phase; int poll_index; int management;
   uint64_t connection_slot,connection_generation,request_sequence;
   unsigned char request_id[48]; uint32_t request_id_length,request_id_truncated;
@@ -1744,6 +1758,11 @@ typedef struct KuHttpConnection {
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
 typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+static void ku_http_reactor_admit(KuHttpActiveSet*,KuHttpConnection*);
+static void ku_http_reactor_retire(KuHttpConnection*);
+static void ku_http_reactor_forget(KuHttpConnection*);
+#endif
 /* Owner-thread-only indices borrow fixed connection storage. Neither the
    dense table nor the free chain owns a socket, Task, job, or lease. */
 static int ku_http_free_slot(const KuHttpActiveSet* active) {
@@ -1778,10 +1797,16 @@ static void ku_http_active_begin(KuHttpActiveSet* active,KuHttpConnection* conne
   connection->active_position=active->count;
   active->indices[active->count++]=slot;
   active->sockets++;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  ku_http_reactor_admit(active,connection);
+#endif
 }
 static void ku_http_active_retire(KuHttpConnection* connection) {
   KuHttpActiveSet* active=connection->active_set;
   if(!active || connection->active_position<0) return;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  ku_http_reactor_retire(connection);
+#endif
   int slot=(int)(connection-active->connections),position=connection->active_position;
   if(position>=active->count || active->indices[position]!=slot) {
     fputs("http active-slot retirement invariant failed\n",stderr); exit(1);
@@ -1821,6 +1846,10 @@ static int ku_http_async_retire(KuHttpConnection*);
 static void ku_http_count_response(int);
 static void ku_http_count_admitted(void);
 static void ku_http_connection_close(KuHttpConnection* connection) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  /* Delete the old full-generation registration before close can recycle fd. */
+  ku_http_reactor_forget(connection);
+#endif
 #if defined(__APPLE__)
   connection->peer_error_probe_deadline=0;
 #endif
@@ -1858,9 +1887,15 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   ku_http_active_retire(connection);
   KuHttpActiveSet* active=connection->active_set;
   int free_next=connection->free_next;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  struct KuHttpReactor* reactor=connection->reactor;
+#endif
   memset(connection, 0, sizeof(*connection));
   connection->socket_value = KU_HTTP_INVALID_SOCKET;
   connection->active_set=active; connection->active_position=-1; connection->free_next=free_next;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  connection->reactor=reactor; connection->work_position=-1; connection->idle_position=-1;
+#endif
 }
 static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
 #if defined(__APPLE__)
@@ -1924,8 +1959,15 @@ static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer
 static void ku_http_connection_start(KuHttpConnection* connection, KuHttpActiveSet* active, KuHttpSocket socket_value, KuHttpServer* server) {
   ku_http_active_begin(active,connection);
   int position=connection->active_position;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  int work_position=active?connection->work_position:-1;
+#endif
   memset(connection, 0, sizeof(*connection));
   connection->active_set=active; connection->active_position=position;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  connection->reactor=active?active->reactor:NULL;
+  connection->work_position=work_position; connection->idle_position=-1;
+#endif
   connection->socket_value = socket_value;
   connection->budget = server->buffer_budget;
   connection->phase = KU_HTTP_IO_HEADER;
@@ -2173,7 +2215,13 @@ static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpS
   else ku_http_connection_response(connection, server, response, response_charge, 1);
 }
 static void ku_http_reject_start(KuHttpConnection* connection, KuHttpSocket socket_value) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  struct KuHttpReactor* reactor=connection->reactor;
+#endif
   memset(connection, 0, sizeof(*connection));
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  connection->reactor=reactor;connection->work_position=-1;connection->idle_position=-1;
+#endif
   connection->socket_value = socket_value;
   connection->phase = KU_HTTP_IO_REJECT;
   connection->failure.reason = KU_HTTP_ERROR_QUEUE;
@@ -2903,6 +2951,308 @@ static int ku_http_task_slice_interrupted(void* raw) {
 #endif
 }
 #endif
+/* Persistent owner reactor. Kernel payloads are unique 64-bit registration
+ * tokens, never pointers to mutable/recycled slots or truncated generations.
+ * Strict idle sockets have one READ registration and one indexed heap item;
+ * they are absent from the owner's per-turn work and interest traversal. */
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+#define KU_HTTP_READY_BATCH 256u
+typedef struct {
+  KuHttpSocket fd;
+  uint64_t token,generation;
+  short events;
+  int registered,poll_index;
+  size_t resource_slot;
+} KuHttpRegistration;
+typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHash;
+typedef struct {
+  size_t entry;
+  uint64_t token,generation;
+  KuHttpSocket fd;
+  short events;
+} KuHttpReadyEvent;
+typedef struct KuHttpReactor {
+  int descriptor,fault,slots,work_count,idle_count;
+  size_t capacity,hash_capacity,old_net_count,ready_count;
+  uint64_t next_token;
+  KuHttpActiveSet* active;
+  KuHttpRegistration* registrations;
+  KuHttpRegistrationHash* hash;
+  int* work;
+  int* idle_heap;
+  KuHttpReadyEvent ready[KU_HTTP_READY_BATCH];
+#if defined(__linux__)
+  struct epoll_event events[KU_HTTP_READY_BATCH];
+#else
+  struct kevent events[KU_HTTP_READY_BATCH];
+#endif
+} KuHttpReactor;
+#if defined(__APPLE__)
+typedef char KuHttpReactorTokenWidth[(sizeof(uintptr_t)>=sizeof(uint64_t))?1:-1];
+#endif
+static size_t ku_http_reactor_hash_capacity(size_t capacity) {
+  size_t result=8u;
+  while(result<capacity*2u) result*=2u;
+  return result;
+}
+static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
+  size_t capacity=slots+3u+net;
+  return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
+      +ku_http_reactor_hash_capacity(capacity)*sizeof(KuHttpRegistrationHash)
+      +slots*2u*sizeof(int);
+}
+static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
+  token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
+  token^=token>>27; token*=UINT64_C(0x94d049bb133111eb); token^=token>>31;
+  return (size_t)token&(r->hash_capacity-1u);
+}
+static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
+  if(!token || token==UINT64_MAX) return SIZE_MAX;
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    const KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
+    if(!item->token) break;
+    if(item->token==token) return item->entry;
+  }
+  return SIZE_MAX;
+}
+static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    size_t at=(start+i)&(r->hash_capacity-1u);
+    if(!r->hash[at].token) {r->hash[at]=(KuHttpRegistrationHash){token,entry};return 1;}
+  }
+  return 0;
+}
+static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
+  size_t start=ku_http_reactor_hash_start(r,token);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
+    if(!item->token) return;
+    if(item->token==token) {
+      /* Back-shift the finite probe cluster. Repeated request turnover must
+       * not fill the table with tombstones and turn stale lookup into O(cap). */
+      size_t mask=r->hash_capacity-1u,hole=(start+i)&mask,at=(hole+1u)&mask;
+      for(size_t moved=0;moved<r->hash_capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
+        size_t home=ku_http_reactor_hash_start(r,r->hash[at].token);
+        if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
+      }
+      r->hash[hole]=(KuHttpRegistrationHash){0,0};return;
+    }
+  }
+  r->fault=1;
+}
+static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
+    KuHttpSocket fd,short events,uint64_t token,int remove) {
+#if defined(__linux__)
+  struct epoll_event event={0};
+  if(events&KU_HTTP_POLL_READ) event.events|=EPOLLIN|EPOLLRDHUP;
+  if(events&KU_HTTP_POLL_WRITE) event.events|=EPOLLOUT;
+  event.data.u64=token;
+  int operation=remove?EPOLL_CTL_DEL:entry->registered?EPOLL_CTL_MOD:EPOLL_CTL_ADD;
+  int status;
+  do { status=epoll_ctl(r->descriptor,operation,fd,remove?NULL:&event); }
+  while(status<0 && errno==EINTR);
+  return !status || (remove && errno==ENOENT);
+#else
+  /* READ is removed while a live handler pauses it. Its real 25ms SO_ERROR
+   * deadline remains in the owner maintenance loop; FIN is not cancellation. */
+  short previous=entry->registered?entry->events:0;
+  const short masks[2]={KU_HTTP_POLL_READ,KU_HTTP_POLL_WRITE};
+  const int16_t filters[2]={EVFILT_READ,EVFILT_WRITE};
+  for(size_t i=0;i<2u;i++) {
+    int had=(previous&masks[i])!=0,want=!remove && (events&masks[i])!=0;
+    if(had==want) continue;
+    struct kevent change;
+    EV_SET(&change,(uintptr_t)fd,filters[i],want?(EV_ADD|EV_ENABLE):EV_DELETE,0,0,
+        (void*)(uintptr_t)token);
+    int status;
+    do { status=kevent(r->descriptor,&change,1,NULL,0,NULL); }
+    while(status<0 && errno==EINTR);
+    if(status<0 && !(had && !want && errno==ENOENT)) return 0;
+  }
+  return 1;
+#endif
+}
+static void ku_http_reactor_delete(KuHttpReactor* r,size_t index) {
+  if(index>=r->capacity) {r->fault=1;return;}
+  KuHttpRegistration* entry=&r->registrations[index];
+  if(!entry->registered) return;
+  if(!ku_http_reactor_kernel(r,entry,entry->fd,0,entry->token,1)) r->fault=1;
+  ku_http_reactor_hash_remove(r,entry->token);
+  *entry=(KuHttpRegistration){0};
+}
+static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
+    KuHttpSocket fd,short events,uint64_t generation,int poll_index) {
+  if(index>=r->capacity) {r->fault=1;return;}
+  KuHttpRegistration* entry=&r->registrations[index];
+  if(fd==KU_HTTP_INVALID_SOCKET) {ku_http_reactor_delete(r,index);return;}
+  if(entry->registered && entry->fd==fd && entry->generation==generation) {
+    if(entry->events!=events && !ku_http_reactor_kernel(r,entry,fd,events,entry->token,0)) r->fault=1;
+    entry->events=events;entry->poll_index=poll_index;return;
+  }
+  ku_http_reactor_delete(r,index);
+  if(r->next_token>=UINT64_MAX-1u) {r->fault=1;return;}
+  uint64_t token=++r->next_token;
+  if(!ku_http_reactor_hash_add(r,token,index)) {r->fault=1;return;}
+  if(!ku_http_reactor_kernel(r,entry,fd,events,token,0)) {
+    ku_http_reactor_hash_remove(r,token);r->fault=1;return;
+  }
+  *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
+}
+static int ku_http_reactor_idle(const KuHttpConnection* c) {
+  return c->phase==KU_HTTP_IO_HEADER && c->reused && !c->buffered && !c->carry_length
+      && !c->job && !c->async_task && !c->request_deadline
+      && c->deadline && c->deadline!=UINT64_MAX && c->socket_value!=KU_HTTP_INVALID_SOCKET;
+}
+static short ku_http_reactor_connection_events(const KuHttpConnection* c) {
+  if(c->phase==KU_HTTP_IO_HEADER || c->phase==KU_HTTP_IO_BODY) return KU_HTTP_POLL_READ;
+  if(c->phase==KU_HTTP_IO_WRITE) return KU_HTTP_POLL_WRITE;
+  if((c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB) && !c->peer_read_paused)
+    return KU_HTTP_POLL_READ;
+  return 0;
+}
+static int ku_http_reactor_heap_before(KuHttpReactor* r,int left,int right) {
+  const KuHttpConnection* a=&r->active->connections[left];
+  const KuHttpConnection* b=&r->active->connections[right];
+  return a->deadline<b->deadline || (a->deadline==b->deadline && left<right);
+}
+static void ku_http_reactor_heap_swap(KuHttpReactor* r,int a,int b) {
+  int slot=r->idle_heap[a];r->idle_heap[a]=r->idle_heap[b];r->idle_heap[b]=slot;
+  r->active->connections[r->idle_heap[a]].idle_position=a;
+  r->active->connections[r->idle_heap[b]].idle_position=b;
+}
+static void ku_http_reactor_heap_fix(KuHttpReactor* r,int position) {
+  while(position>0) {
+    int parent=(position-1)/2;
+    if(!ku_http_reactor_heap_before(r,r->idle_heap[position],r->idle_heap[parent])) break;
+    ku_http_reactor_heap_swap(r,position,parent);position=parent;
+  }
+  for(;;) {
+    int left=position*2+1;if(left>=r->idle_count) break;
+    int right=left+1,best=right<r->idle_count && ku_http_reactor_heap_before(r,r->idle_heap[right],r->idle_heap[left])?right:left;
+    if(!ku_http_reactor_heap_before(r,r->idle_heap[best],r->idle_heap[position])) break;
+    ku_http_reactor_heap_swap(r,position,best);position=best;
+  }
+}
+static void ku_http_reactor_idle_remove(KuHttpReactor* r,KuHttpConnection* c) {
+  int position=c->idle_position;if(position<0) return;
+  if(position>=r->idle_count || &r->active->connections[r->idle_heap[position]]!=c) {r->fault=1;return;}
+  int last=r->idle_heap[--r->idle_count];c->idle_position=-1;
+  if(position<r->idle_count) {
+    r->idle_heap[position]=last;r->active->connections[last].idle_position=position;
+    ku_http_reactor_heap_fix(r,position);
+  }
+}
+static void ku_http_reactor_work_remove(KuHttpReactor* r,KuHttpConnection* c) {
+  int position=c->work_position;if(position<0) return;
+  if(position>=r->work_count || &r->active->connections[r->work[position]]!=c) {r->fault=1;return;}
+  int last=r->work[--r->work_count];c->work_position=-1;
+  if(position<r->work_count) {r->work[position]=last;r->active->connections[last].work_position=position;}
+}
+static void ku_http_reactor_work_add(KuHttpReactor* r,KuHttpConnection* c) {
+  if(c->work_position>=0) return;
+  if(r->work_count>=r->slots) {r->fault=1;return;}
+  c->work_position=r->work_count;r->work[r->work_count++]=(int)(c-r->active->connections);
+}
+static void ku_http_reactor_admit(KuHttpActiveSet* active,KuHttpConnection* c) {
+  c->reactor=active->reactor;c->work_position=-1;c->idle_position=-1;
+  if(active->reactor) ku_http_reactor_work_add(active->reactor,c);
+}
+static void ku_http_reactor_retire(KuHttpConnection* c) {
+  KuHttpReactor* r=c->reactor;if(!r) return;
+  ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_remove(r,c);
+}
+static void ku_http_reactor_forget(KuHttpConnection* c) {
+  KuHttpReactor* r=c->reactor;if(!r) return;
+  size_t index=c->active_set?(size_t)(c-r->active->connections):(size_t)r->slots+2u;
+  ku_http_reactor_delete(r,index);
+  if(c->active_set && c->active_position>=0) {
+    ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_add(r,c);
+  }
+}
+static void ku_http_reactor_refresh(KuHttpConnection* c) {
+  KuHttpReactor* r=c->reactor;
+  if(!r || !c->active_set || c->active_position<0) return;
+  if(ku_http_reactor_idle(c)) {
+    ku_http_reactor_work_remove(r,c);
+    if(c->idle_position<0) {
+      if(r->idle_count>=r->slots) {r->fault=1;return;}
+      c->idle_position=r->idle_count;r->idle_heap[r->idle_count++]=(int)(c-r->active->connections);
+    }
+    ku_http_reactor_heap_fix(r,c->idle_position);
+  } else {
+    ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_add(r,c);
+  }
+  int watch=c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB;
+  ku_http_reactor_interest(r,(size_t)(c-r->active->connections),
+      (watch || ku_http_reactor_connection_events(c))?c->socket_value:KU_HTTP_INVALID_SOCKET,
+      ku_http_reactor_connection_events(c),c->connection_generation,-1);
+}
+static unsigned long long ku_http_reactor_idle_deadline(const KuHttpReactor* r) {
+  return r->idle_count?r->active->connections[r->idle_heap[0]].deadline:UINT64_MAX;
+}
+static int ku_http_reactor_event_valid(const KuHttpReactor* r,const KuHttpReadyEvent* event) {
+  if(event->entry>=r->capacity) return 0;
+  const KuHttpRegistration* entry=&r->registrations[event->entry];
+  return entry->registered && entry->token==event->token && entry->generation==event->generation && entry->fd==event->fd;
+}
+static int ku_http_reactor_wait(KuHttpReactor* r,KuHttpPollFd* items,int timeout_ms) {
+  r->ready_count=0;if(r->fault) {errno=EIO;return -1;}
+#if defined(__linux__)
+  int selected=epoll_wait(r->descriptor,r->events,(int)KU_HTTP_READY_BATCH,timeout_ms);
+#else
+  struct timespec duration={0,0};
+  if(timeout_ms>=0) {duration.tv_sec=timeout_ms/1000;duration.tv_nsec=(timeout_ms%1000)*1000000L;}
+  int selected=kevent(r->descriptor,NULL,0,r->events,(int)KU_HTTP_READY_BATCH,timeout_ms<0?NULL:&duration);
+#endif
+  if(selected<=0) return selected;
+  int valid=0;
+  for(int i=0;i<selected;i++) {
+#if defined(__linux__)
+    uint64_t token=r->events[i].data.u64;uint32_t flags=r->events[i].events;
+    short events=(short)(((flags&EPOLLIN)?KU_HTTP_POLL_READ:0)|((flags&EPOLLOUT)?KU_HTTP_POLL_WRITE:0)
+        |((flags&EPOLLERR)?POLLERR:0)|((flags&(EPOLLHUP|EPOLLRDHUP))?POLLHUP:0));
+#else
+    uint64_t token=(uint64_t)(uintptr_t)r->events[i].udata;
+    short events=(short)((r->events[i].filter==EVFILT_READ?KU_HTTP_POLL_READ:KU_HTTP_POLL_WRITE)
+        |((r->events[i].flags&EV_ERROR)?POLLERR:0)|((r->events[i].flags&EV_EOF)?POLLHUP:0));
+#endif
+    size_t index=ku_http_reactor_lookup(r,token);if(index==SIZE_MAX) continue;
+    KuHttpRegistration* entry=&r->registrations[index];if(!entry->registered || entry->token!=token) continue;
+    if(index<(size_t)r->slots) {
+      r->ready[r->ready_count++]=(KuHttpReadyEvent){index,token,entry->generation,entry->fd,events};
+    } else if(entry->poll_index>=0) items[entry->poll_index].revents|=events;
+    valid++;
+  }
+  /* Stale events are not a zero-readiness receipt. The caller must re-enter
+   * maintenance/I/O rather than grant compute from an invalid old token. */
+  return valid?valid:1;
+}
+static void ku_http_reactor_destroy(KuHttpReactor* r) {
+  if(r->descriptor>=0) close(r->descriptor);
+  free(r->registrations);free(r->hash);free(r->work);free(r->idle_heap);
+  r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->work=NULL;r->idle_heap=NULL;
+}
+static int ku_http_reactor_init(KuHttpReactor* r,KuHttpActiveSet* active,size_t net) {
+  memset(r,0,sizeof(*r));r->descriptor=-1;r->slots=active->capacity;r->active=active;
+  r->capacity=(size_t)r->slots+3u+net;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
+  r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
+  r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
+  r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
+#if defined(__linux__)
+  r->descriptor=epoll_create1(EPOLL_CLOEXEC);
+#else
+  r->descriptor=kqueue();
+  if(r->descriptor>=0 && fcntl(r->descriptor,F_SETFD,FD_CLOEXEC)<0) {close(r->descriptor);r->descriptor=-1;}
+#endif
+  if(r->descriptor<0 || !r->registrations || !r->hash || !r->work || !r->idle_heap) {
+    ku_http_reactor_destroy(r);return 0;
+  }
+  active->reactor=r;return 1;
+}
+#endif
+/* End persistent owner reactor. */
 static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpLoopGroup* group = owner->group;
   KuHttpServer* server = group->server;
@@ -2922,6 +3272,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      independent copy of the service's configured byte budget. */
   size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int)+sizeof(KuHttpPollConnection)+sizeof(KuHttpJob*))
       +poll_capacity*sizeof(KuHttpPollFd)+(size_t)max_pending*sizeof(KuHttpPendingItem)+net_bytes;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  fixed_bytes+=ku_http_reactor_storage_bytes((size_t)slot_count,net_capacity);
+#endif
 #if defined(_WIN32)
   fixed_bytes+=(size_t)nworkers*sizeof(HANDLE);
 #else
@@ -2939,7 +3292,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
 #endif
-  KuHttpActiveSet active={connections,active_indices,0,slot_count,-1,0,0};
+  KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count,.free_head=-1};
   KuHttpPending pending={0};pending.cap=max_pending;
   pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));
   if(!connections || !poll_items || !pending.items || !active_indices || !poll_connections || (net_bytes && !net_storage)) {
@@ -2949,10 +3302,26 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
     return "reactor allocation failed";
   }
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  KuHttpReactor reactor;
+  if(!ku_http_reactor_init(&reactor,&active,net_capacity)) {
+    free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
+#endif
+    return "persistent reactor initialization failed";
+  }
+#endif
   KuHttpConnection rejection = {0};
   rejection.socket_value = KU_HTTP_INVALID_SOCKET;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  rejection.reactor=&reactor;rejection.work_position=-1;rejection.idle_position=-1;
+#endif
   KuHttpWake wake;
   if (!ku_http_wake_init(&wake)) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_destroy(&reactor);
+#endif
     free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections); free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
@@ -2964,6 +3333,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      original max_pending bound is not duplicated by another pending job pool. */
   if (!ku_http_queue_init(&queue, slot_count, &wake)) {
     ku_http_wake_close(&wake);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_destroy(&reactor);
+#endif
     free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections); free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
@@ -3075,10 +3447,27 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     if (pumped > 1u && !listen_failure) listen_failure = "HTTP Task event loop failed";
 #endif
     unsigned long long now = ku_http_now_ms();
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    /* Idle sockets are touched only for a due deadline, bounded admission
+     * pressure, drain or actual kernel readiness. Move candidates to the work
+     * list before its reverse pass; list/heap storage never duplicates slots. */
+    for(unsigned int turn=0;turn<64u && reactor.idle_count;turn++) {
+      if(listening && !listen_failure && !pending.count && ku_http_reactor_idle_deadline(&reactor)>now) break;
+      KuHttpConnection* idle=&connections[reactor.idle_heap[0]];
+      ku_http_reactor_idle_remove(&reactor,idle);ku_http_reactor_work_add(&reactor,idle);
+    }
+    int maintenance_count=reactor.work_count;
+#else
+    int maintenance_count=active.count;
+#endif
     /* Reverse traversal is intentional: swap-remove moves only a tail that
        this pass already observed. Admission runs strictly between passes. */
-    for (int position=active.count;position-->0;) {
+    for (int position=maintenance_count;position-->0;) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+      int index=reactor.work[position];
+#else
       int index=active.indices[position];
+#endif
       KuHttpConnection* connection = &connections[index];
       /* This is reuse admission at the response boundary. A keep-alive header
          already sent is a snapshot, not a promise to retain a pressured idle
@@ -3128,6 +3517,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
         ku_http_connection_close(connection);
       }
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+      ku_http_reactor_refresh(connection);
+#endif
     }
     if (rejection.phase == KU_HTTP_IO_REJECT && now >= rejection.deadline)
       ku_http_connection_status(&rejection, server, 503);
@@ -3156,6 +3548,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_poll_add(poll_items, &poll_count, wake.read_socket, KU_HTTP_POLL_READ);
     int listener_index = -1;
     unsigned long long nearest = health_deadline;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    unsigned long long idle_deadline=ku_http_reactor_idle_deadline(&reactor);
+    if(idle_deadline<nearest) nearest=idle_deadline;
+#endif
     if (task_deadline < nearest) nearest = task_deadline; /* real in-loop health timer */
     now = ku_http_now_ms();
     if (started && accept_turn && listening && rejection.phase == KU_HTTP_IO_FREE) {
@@ -3165,16 +3561,32 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_poll_add(poll_items, &poll_count, srv, KU_HTTP_POLL_READ);
       }
     }
+#if !defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     int connection_poll_base=poll_count,connection_poll_count=0;
+#endif
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     KuHttpTaskIoEligibility task_io_eligibility={~0ULL,
         task_deadline==0u && active.count!=0,task_deadline==0u && active.count!=0,0};
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    task_io_eligibility.deadline=idle_deadline;
+    task_io_eligibility.has_idle=reactor.idle_count!=0;
+    if(reactor.idle_count) task_io_eligibility.all_async=0;
+#endif
     unsigned long long task_io_slice_deadline=health_deadline;
     if (accept_retry_deadline>now && accept_retry_deadline<task_io_slice_deadline)
       task_io_slice_deadline=accept_retry_deadline;
 #endif
-    for (int position=0;position<active.count;position++) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    int interest_count=reactor.work_count;
+#else
+    int interest_count=active.count;
+#endif
+    for (int position=0;position<interest_count;position++) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+      int index=reactor.work[position];
+#else
       int index=active.indices[position];
+#endif
       KuHttpConnection* connection = &connections[index];
       connection->poll_index = -1;
       short events = 0;
@@ -3208,7 +3620,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
          must not remove a live handler socket from transport-error observation. */
       if (!events && !watch_peer) continue;
       connection->poll_index = poll_count;
+#if !defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
       poll_connections[connection_poll_count++]=(KuHttpPollConnection){index,connection->connection_generation};
+#endif
       ku_http_poll_add(poll_items, &poll_count, connection->socket_value, events);
       if ((connection->phase==KU_HTTP_IO_HEADER || connection->phase==KU_HTTP_IO_BODY || connection->phase==KU_HTTP_IO_WRITE)
           && connection->deadline < nearest) nearest = connection->deadline;
@@ -3298,7 +3712,36 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
     /* No global wake tick: progress blocks until readiness, worker publication
        or the nearest deadline (including only Darwin's paused-handler error probe). */
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_interest(&reactor,(size_t)slot_count,wake.read_socket,KU_HTTP_POLL_READ,0,wake_index);
+    ku_http_reactor_interest(&reactor,(size_t)slot_count+1u,
+        listener_index>=0?srv:KU_HTTP_INVALID_SOCKET,KU_HTTP_POLL_READ,0,listener_index);
+    ku_http_reactor_interest(&reactor,(size_t)slot_count+2u,
+        rejection.poll_index>=0?rejection.socket_value:KU_HTTP_INVALID_SOCKET,
+        rejection.phase==KU_HTTP_IO_REJECT?KU_HTTP_POLL_READ:KU_HTTP_POLL_WRITE,0,rejection.poll_index);
+#if defined(KU_HTTP_HAS_TASK_NET)
+    /* The driver's bounded snapshot is compact and may reorder live FDs.
+     * Detach every changed identity before adding any replacement, otherwise
+     * swapping two entries could delete a just-added generation or hit EEXIST. */
+    for(size_t i=0;i<reactor.old_net_count;i++) {
+      KuHttpRegistration* entry=&reactor.registrations[(size_t)slot_count+3u+i];
+      if(i>=net_count || entry->fd!=poll_items[net_base+(int)i].fd
+          || entry->generation!=net_interests[i].generation || entry->resource_slot!=net_interests[i].slot)
+        ku_http_reactor_delete(&reactor,(size_t)slot_count+3u+i);
+    }
+    for(size_t i=0;i<net_count;i++)
+    {
+      ku_http_reactor_interest(&reactor,(size_t)slot_count+3u+i,poll_items[net_base+(int)i].fd,
+          poll_items[net_base+(int)i].events,net_interests[i].generation,net_base+(int)i);
+      reactor.registrations[(size_t)slot_count+3u+i].resource_slot=net_interests[i].slot;
+    }
+    reactor.old_net_count=net_count;
+#endif
+    if(reactor.idle_count && (!listening || listen_failure || pending.count)) wait_ms=0;
+    int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);
+#else
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
+#endif
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     ku_http_task_io_batch_probe_result(&task_io_batch,wait_ms,selected,
         task_io_probe_can_bootstrap,batch_now,owner->connection_generation,active.count,accept_turn);
@@ -3349,6 +3792,15 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     short wake_events = poll_items[wake_index].revents;
     if (wake_events & POLLNVAL) { fputs("http reactor wake socket invalid\n", stderr); exit(1); }
     if (wake_events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)) ku_http_wake_drain(&wake);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    for(size_t selected_connection=0;selected_connection<reactor.ready_count;selected_connection++) {
+      const KuHttpReadyEvent* event=&reactor.ready[selected_connection];
+      if(!ku_http_reactor_event_valid(&reactor,event)) continue;
+      KuHttpConnection* connection=&connections[event->entry];
+      if(connection->active_set!=&active || connection->active_position<0
+          || connection->connection_generation!=event->generation || connection->socket_value!=event->fd) continue;
+      short events=event->events;
+#else
     for (int selected_connection=0;selected_connection<connection_poll_count;selected_connection++) {
       int poll_index=connection_poll_base+selected_connection;
       /* Poll entries borrow this exact owner/slot/socket generation. Close
@@ -3357,6 +3809,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
           &poll_connections[selected_connection],poll_index,poll_items[poll_index].fd);
       if(!connection) continue;
       short events=poll_items[poll_index].revents;
+#endif
       if (!events) continue;
       if (events & POLLNVAL) { ku_http_connection_close(connection); continue; }
       if (connection->phase == KU_HTTP_IO_HEADER && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
@@ -3367,6 +3820,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_write(connection, server);
       else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
           && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection,events,0);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+      ku_http_reactor_refresh(connection);
+#endif
     }
     if (rejection.poll_index >= 0) {
       short events = poll_items[rejection.poll_index].revents;
@@ -3456,7 +3912,13 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   free(workers);
   ku_http_queue_free(&queue);
   ku_http_mutex_lock(&group->lock); owner->wake = NULL; ku_http_mutex_unlock(&group->lock);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  ku_http_reactor_delete(&reactor,(size_t)slot_count);
+#endif
   ku_http_wake_close(&wake);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  ku_http_reactor_destroy(&reactor);
+#endif
   free(pending.items); free(poll_items); free(connections); free(active_indices); free(poll_connections);free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
   if(ku_http_task_fixed_refund(group->tasks,fixed_bytes)!=0u)return "reactor fixed storage refund failed";

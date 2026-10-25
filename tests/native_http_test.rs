@@ -6195,3 +6195,210 @@ fn main(): null! {{
         .success());
     assert!(!watchdog.timed_out());
 }
+
+
+#[test]
+fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines() {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return; // Windows intentionally retains its existing poll backend.
+    }
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let begin = runtime.find("/* Persistent owner reactor.").unwrap();
+    let end = runtime[begin..]
+        .find("/* End persistent owner reactor. */")
+        .unwrap() + begin;
+    // Compile actual production registry/heap/kernel helpers with a model of
+    // only their borrowed connection fields. Real socketpair readiness and fd
+    // recycling exercise the OS backend; no alternate event algorithm exists.
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
+#include <sys/socket.h>
+#if defined(__linux__)
+#include <sys/epoll.h>
+#else
+#include <sys/event.h>
+#endif
+#define KU_HTTP_PERSISTENT_EVENT_LOOP 1
+#define KU_HTTP_INVALID_SOCKET (-1)
+#define KU_HTTP_POLL_READ POLLIN
+#define KU_HTTP_POLL_WRITE POLLOUT
+typedef int KuHttpSocket;
+typedef struct pollfd KuHttpPollFd;
+enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8 };
+struct KuHttpConnection;
+typedef struct KuHttpActiveSet {
+  struct KuHttpConnection* connections;
+  int capacity;
+  struct KuHttpReactor* reactor;
+} KuHttpActiveSet;
+typedef struct KuHttpConnection {
+  KuHttpActiveSet* active_set;
+  struct KuHttpReactor* reactor;
+  int work_position,idle_position,active_position;
+  int phase,reused,peer_read_paused,socket_value;
+  size_t buffered,carry_length;
+  void* job;void* async_task;
+  uint64_t request_deadline,deadline,connection_generation;
+} KuHttpConnection;
+"#;
+    let checks = r#"
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static int fixture_external_net_close(int reuse) {
+  KuHttpConnection connections[1]={{0}};
+  KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_init(&reactor,&active,1u));
+  int retired[2],replacement[2];
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,retired));
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+  int fd=retired[0];size_t old_net=4u;
+  ku_http_reactor_interest(&reactor,old_net,fd,KU_HTTP_POLL_READ,UINT64_MAX-300u,-1);
+  CHECK(!reactor.fault && reactor.registrations[old_net].registered);
+  /* The net owner closes during pump/interests before HTTP reconciles the
+   * previous compact snapshot. No HTTP close hook runs on that resource. */
+  CHECK(!close(fd));
+  if(!reuse) {
+    ku_http_reactor_delete(&reactor,old_net);
+    CHECK(!reactor.fault && !reactor.registrations[old_net].registered);
+  } else {
+    CHECK(dup2(replacement[0],fd)==fd);CHECK(!close(replacement[0]));
+    ku_http_reactor_interest(&reactor,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-200u,-1);
+    CHECK(!reactor.fault && reactor.registrations[0].registered);
+    uint64_t current_token=reactor.registrations[0].token;
+    /* A new HTTP slot (or new net resource) can register the reused numeric
+     * fd before the retired net entry is reconciled. DEL is by numeric fd:
+     * the old token must never delete this new kernel registration. */
+    ku_http_reactor_delete(&reactor,old_net);
+    CHECK(!reactor.fault);
+    CHECK(write(replacement[1],"r",1)==1);
+    KuHttpPollFd items[8]={{0}};
+    CHECK(ku_http_reactor_wait(&reactor,items,1000)>0);
+    int found=0;
+    for(size_t i=0;i<reactor.ready_count;i++) if(reactor.ready[i].token==current_token) {
+      CHECK(reactor.ready[i].generation==UINT64_MAX-200u);
+      CHECK(ku_http_reactor_event_valid(&reactor,&reactor.ready[i]));found=1;
+    }
+    CHECK(found);
+    char byte;CHECK(read(fd,&byte,1)==1 && byte=='r');
+    ku_http_reactor_delete(&reactor,0u);CHECK(!close(fd));
+  }
+  CHECK(!close(retired[1]));
+  if(!reuse) CHECK(!close(replacement[0]));
+  CHECK(!close(replacement[1]));ku_http_reactor_destroy(&reactor);
+  puts(reuse?"http-external-net-reuse-preserves-current-registration-ok":"http-external-net-close-retirement-ok");
+  return 0;
+}
+int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"external-net-close")) return fixture_external_net_close(0);
+  if(argc>1 && !strcmp(argv[1],"external-net-reuse")) return fixture_external_net_close(1);
+  KuHttpConnection connections[4]={{0}};
+  KuHttpActiveSet active={connections,4,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_storage_bytes(4u,0u)>sizeof(reactor));
+  CHECK(ku_http_reactor_init(&reactor,&active,0u));
+  for(int i=0;i<4;i++) {
+    connections[i].active_set=&active;connections[i].active_position=i;
+    connections[i].socket_value=-1;ku_http_reactor_admit(&active,&connections[i]);
+  }
+  CHECK(reactor.work_count==4 && !reactor.idle_count);
+  int first[2],second[2],replacement[2];
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,first));
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,second));
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+  for(int i=0;i<2;i++) {
+    KuHttpConnection* c=&connections[i];c->socket_value=i?second[0]:first[0];
+    c->connection_generation=UINT64_MAX-100u+(uint64_t)i;
+    c->phase=KU_HTTP_IO_HEADER;c->reused=1;c->deadline=(uint64_t)(1000+i*1000);
+    ku_http_reactor_refresh(c);
+  }
+  CHECK(!reactor.fault && reactor.work_count==2 && reactor.idle_count==2);
+  CHECK(ku_http_reactor_idle_deadline(&reactor)==1000u);
+  uint64_t stable=reactor.registrations[0].token;
+  connections[0].deadline=3000u;ku_http_reactor_refresh(&connections[0]);
+  CHECK(ku_http_reactor_idle_deadline(&reactor)==2000u);
+  CHECK(reactor.registrations[0].token==stable);
+  connections[0].buffered=1u;ku_http_reactor_refresh(&connections[0]);
+  CHECK(reactor.work_count==3 && reactor.idle_count==1 && connections[0].idle_position==-1);
+  KuHttpPollFd items[8]={{0}};
+  CHECK(ku_http_reactor_wait(&reactor,items,0)==0);
+  CHECK(write(first[1],"a",1)==1);
+  CHECK(ku_http_reactor_wait(&reactor,items,1000)>0 && reactor.ready_count);
+  KuHttpReadyEvent old={0};int found=0;
+  for(size_t i=0;i<reactor.ready_count;i++) if(reactor.ready[i].entry==0u) {old=reactor.ready[i];found=1;}
+  CHECK(found && old.generation==UINT64_MAX-100u && ku_http_reactor_event_valid(&reactor,&old));
+  char byte;CHECK(read(first[0],&byte,1)==1 && byte=='a');
+  int recycled=first[0];ku_http_reactor_forget(&connections[0]);
+  CHECK(!reactor.registrations[0].registered && ku_http_reactor_lookup(&reactor,old.token)==SIZE_MAX);
+  CHECK(!close(recycled));CHECK(dup2(replacement[0],recycled)==recycled);CHECK(!close(replacement[0]));
+  connections[0].socket_value=recycled;connections[0].buffered=0;
+  connections[0].connection_generation=UINT64_MAX-10u;ku_http_reactor_refresh(&connections[0]);
+  CHECK(!reactor.fault && reactor.idle_count==2);
+  CHECK(reactor.registrations[0].token!=old.token && !ku_http_reactor_event_valid(&reactor,&old));
+  CHECK(ku_http_reactor_wait(&reactor,items,0)==0);
+  CHECK(write(replacement[1],"b",1)==1);
+  CHECK(ku_http_reactor_wait(&reactor,items,1000)>0);
+  found=0;
+  for(size_t i=0;i<reactor.ready_count;i++) if(reactor.ready[i].entry==0u) {
+    CHECK(ku_http_reactor_event_valid(&reactor,&reactor.ready[i]));
+    CHECK(reactor.ready[i].generation==UINT64_MAX-10u);found=1;
+  }
+  CHECK(found && read(recycled,&byte,1)==1 && byte=='b');
+  /* Exercise finite open-address back-shift deletion across repeated churn.
+   * It must preserve every other live full-width token and leave no tombstones. */
+  for(uint64_t round=0;round<1024u;round++) {
+    for(uint64_t i=0;i<4u;i++) CHECK(ku_http_reactor_hash_add(&reactor,UINT64_C(1000000)+round*4u+i,6u));
+    for(uint64_t i=0;i<4u;i++) {
+      uint64_t token=UINT64_C(1000000)+round*4u+i;
+      CHECK(ku_http_reactor_lookup(&reactor,token)==6u);ku_http_reactor_hash_remove(&reactor,token);
+      CHECK(ku_http_reactor_lookup(&reactor,token)==SIZE_MAX);
+      CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[0].token)==0u);
+      CHECK(ku_http_reactor_lookup(&reactor,reactor.registrations[1].token)==1u);
+    }
+  }
+  CHECK(!reactor.fault);
+  reactor.next_token=UINT64_MAX-1u;
+  ku_http_reactor_interest(&reactor,5u,first[1],KU_HTTP_POLL_READ,0,-1);
+  CHECK(reactor.fault && !reactor.registrations[5].registered);
+  for(int i=0;i<4;i++) {ku_http_reactor_forget(&connections[i]);ku_http_reactor_retire(&connections[i]);}
+  CHECK(!reactor.idle_count && !reactor.work_count);
+  CHECK(!close(recycled) && !close(first[1]) && !close(second[0]) && !close(second[1]) && !close(replacement[1]));
+  ku_http_reactor_destroy(&reactor);
+  puts("http-persistent-owner-generation-idle-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-persistent-owner");
+    let path = directory.path().join("persistent.c");
+    fs::write(&path, format!("{header}{}{checks}", &runtime[begin..end])).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "persistent")
+    else {
+        assert!(env::var_os("GITHUB_ACTIONS").is_none(), "CI requires a native C compiler");
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(&executable), RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"http-persistent-owner-generation-idle-ok\n");
+    // Run both independent external-close counterexamples even if the first
+    // fails, so retained output distinguishes stale-fd fault from a lost new
+    // registration. Root serializes execution; product code is unchanged.
+    let mut failures = Vec::new();
+    for scenario in ["external-net-close", "external-net-reuse"] {
+        let output = run_bounded(
+            Command::new(&executable).arg(scenario),
+            RUN_TIMEOUT,
+            RUN_OUTPUT_LIMITS,
+        )
+        .unwrap();
+        if !output.status.success() {
+            failures.push(format!("{scenario}: {output:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
