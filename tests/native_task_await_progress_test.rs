@@ -292,11 +292,20 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
         // The real R2 poll has returned with no driver mutex held. This quantum
         // is still RUNNING until the driver's following locked publication;
         // Pending has not released the control lifecycle pin or execution lease.
-        let returned = "      outcome=ku_task_control_poll(&execution);";
+        let returned = "      outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);";
         generated = replace_once(
             generated,
             returned,
             &format!("{returned}\n      fixture_source_poll_returned(driver,outcome,quanta);"),
+        );
+        // Observe the supported exact one-poll mode. Production may retain
+        // executor across a private pure segment; a returned R2 poll is then a
+        // segment boundary, not every old IR budget checkpoint. Keep this
+        // fixture's two returned-poll cancellation witness at an exact bound.
+        generated = replace_once(
+            generated,
+            "int advanced=ku_task_driver_run_one_locked(worker,32u);",
+            "int advanced=ku_task_driver_run_one_locked(worker,1u);",
         );
         generated = replace_once(
             generated,

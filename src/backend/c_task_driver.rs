@@ -385,7 +385,7 @@ typedef struct KuTaskDriverExecutionV1 {
   size_t slot;
   uint64_t generation;
   KuTaskControlV1* control;
-  uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum;
+  uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum, pure_ready;
 } KuTaskDriverExecutionV1;
 static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
 /* Called immediately after an existing mutex-owned explicit intent write.
@@ -1840,6 +1840,17 @@ static int ku_task_driver_scalar_quantum(const KuTaskDriverTicketV1* ticket,
       && execution->cooperative_yield && execution->scalar_quantum && !execution->intent_touched
       && ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE;
 }
+/* The charge-only frame witness is insufficient: only the generated adapter
+ * can exclude active waits/receipts/drain and blocking/finally behavior after
+ * its complete return path. This thread-local fact never publishes a shared
+ * queue/intent and cannot authorize a second poll through raw pump(1). */
+static void ku_task_driver_note_pure_ready(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control)
+    execution->pure_ready=1;
+}
 static uint32_t ku_task_driver_wrapper_begin(
     const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
   uint32_t checked = ku_task_driver_check_ticket(ticket);
@@ -2701,7 +2712,39 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
   slot->cleanup_acked_generation = slot->generation;
   return KU_TASK_DRIVER_CLEANUP_ACK;
 }
-/* One owner segment, consuming at most max_quanta actual control polls (<=32).
+/* This stack-only record is private to the sole RUNNING executor. Pure ready
+ * continuations need not release/reclaim R2 executor between dispatch budgets:
+ * no ownership or host observation can occur in the witnessed quantum. Every
+ * actual resume still consumes one pump credit; pump(1) cannot run a second
+ * one. No phase/time sample is cached across a boundary or used as a deadline
+ * decision. Ordinary/raw callbacks continue through the full control poll. */
+typedef struct KuTaskDriverSegmentV1 {
+  KuTaskDriverExecutionV1* execution;
+  size_t max_quanta, quanta;
+  uint64_t started;
+  int clock_fault, time_exhausted;
+} KuTaskDriverSegmentV1;
+static uint32_t ku_task_driver_resume_segment(void* raw) {
+  KuTaskDriverSegmentV1* segment=(KuTaskDriverSegmentV1*)raw;
+  KuTaskDriverExecutionV1* execution=segment->execution;
+  uint32_t outcome;
+  do {
+    outcome=execution->control->operations.resume(execution->control->context);
+    segment->quanta++;
+    if (outcome!=KU_TASK_CONTROL_PENDING || !execution->cooperative_yield
+        || !execution->pure_ready || execution->intent_touched
+        || segment->quanta>=segment->max_quanta || segment->clock_fault
+        || ku_task_control_atomic_load(&execution->control->phase)!=KU_TASK_CONTROL_LIVE)
+      break;
+    uint64_t now=ku_task_driver_now_ms();
+    if (now==UINT64_MAX || now<segment->started) { segment->clock_fault=1; break; }
+    if (now-segment->started>=1u) { segment->time_exhausted=1; break; }
+    execution->default_yield=0; execution->cooperative_yield=0;
+    execution->intent_touched=0; execution->scalar_quantum=0; execution->pure_ready=0;
+  } while (1);
+  return outcome;
+}
+/* One owner segment, consuming at most max_quanta logical control polls (<=32).
  * Enter and return with the publication mutex held. User callbacks/drop run
  * unlocked. Only pure generated dispatch-budget yields may share the live
  * RUNNING execution lease. Time is checked after each 64-dispatch boundary:
@@ -2738,7 +2781,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
-    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0};
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0};
     KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 
@@ -2750,11 +2793,15 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     uint32_t outcome=KU_TASK_CONTROL_PENDING;
     int segment_clock_fault=started==UINT64_MAX;
     do {
-      context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0;
-      outcome=ku_task_control_poll(&execution);
-      quanta++;
+      context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0; context.pure_ready=0;
+      KuTaskDriverSegmentV1 segment={&context,max_quanta-quanta,0u,started,segment_clock_fault,0};
+      outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);
+      /* A terminal/cancelled/contended control poll may not invoke resume. It
+       * still spends one exact pump credit, as before this private batching. */
+      quanta+=segment.quanta ? segment.quanta : 1u;
+      segment_clock_fault=segment.clock_fault;
       if (outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
-          || quanta>=max_quanta || segment_clock_fault
+          || quanta>=max_quanta || segment_clock_fault || segment.time_exhausted
           || ku_task_control_atomic_load(&execution.control->phase)!=KU_TASK_CONTROL_LIVE) break;
       uint64_t now=ku_task_driver_now_ms();
       if (now==UINT64_MAX || now<started) { segment_clock_fault=1; break; }

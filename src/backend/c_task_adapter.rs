@@ -1055,7 +1055,7 @@ static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
 const RECONCILE_AFTER_RESUME: &str = r#"
   /* Only a proved scalar-only budget yield can omit this redundant scan.
    * Final/failed/waiting/mixed callbacks and every other reconcile call stay. */
-  if(!(@SCALAR_RECONCILE_SKIP@)
+  if(!pure_ready
       && ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)return KU_TASK_CONTROL_INVALID_STATE;
 "#;
 
@@ -1250,9 +1250,14 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
     if (ku_task_driver_begin_quantum(&instance->ticket,&instance->control)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
     status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
   }
+  /* One complete adapter proof serves both charge reconciliation and the
+   * private executor segment. A frame's charge-only witness alone does not
+   * exclude active waits, children/receipts, drain, blocking or finally. */
+  int pure_ready=(@SCALAR_RECONCILE_SKIP@);
 @RECONCILE_RETURN@
 @SCOPE_RESUME@
   if (status == KU_TASK_FRAME_PENDING) {
+    if (pure_ready) ku_task_driver_note_pure_ready(&instance->ticket,&instance->control);
     return KU_TASK_CONTROL_PENDING;
   } else if (status == KU_TASK_FRAME_READY && !instance->payload_initialized) {
     status=ku_task_@ID@_take_frame_payload(instance);

@@ -438,7 +438,14 @@ static uint32_t ku_task_control_finish_poll(KuTaskControlV1* control, uint32_t t
     ku_task_control_unref(control);
   return terminal;
 }
-static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
+/* The driver may retain this executor across a bounded run of compiler-proven
+ * pure ready continuations. Its trusted resume callback uses the SAME control,
+ * context and live execution lease; it must stop on a real WAIT/YIELD, ownership
+ * or host boundary, or a changed phase. It may not finish/drop/release this
+ * control. Terminal arbitration and cleanup remain exclusively below. Raw
+ * callers use poll(), which still invokes the registered resume at most once. */
+static uint32_t ku_task_control_poll_impl(const KuTaskControlLeaseV1* lease,
+    uint32_t (*resume_segment)(void*),void* segment) {
   uint32_t checked = ku_task_control_check_lease(lease);
   if (checked != KU_TASK_CONTROL_OK) return checked;
   KuTaskControlV1* control = lease->control;
@@ -449,7 +456,8 @@ static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
   if (ku_task_control_is_terminal(phase))
     return ku_task_control_finish_poll(control, (uint32_t)phase);
   if (phase == KU_TASK_CONTROL_LIVE) {
-    uint32_t outcome = control->operations.resume(control->context);
+    uint32_t outcome = resume_segment ? resume_segment(segment)
+        : control->operations.resume(control->context);
     if (ku_task_control_is_payload_terminal(outcome)) {
       expected = KU_TASK_CONTROL_LIVE;
       /* Reserve the irreversible winner BEFORE destructive frame cleanup.
@@ -515,5 +523,8 @@ static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
    * state after all frame ownership has ended. */
   ku_task_control_atomic_store(&control->phase, reason);
   return ku_task_control_finish_poll(control, reason);
+}
+static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
+  return ku_task_control_poll_impl(lease,NULL,NULL);
 }
 "#;

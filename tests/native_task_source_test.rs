@@ -589,16 +589,26 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
     assert!(drive.contains("goto ku_task_scalar_check_"));
     assert!(drive.contains("goto ku_task_range_state_"));
     assert!(drive.contains("__ku_range_fast=!cleanup && ("));
-    // Count executed *verified IR states*, including lexical empty drains and
-    // latches; do not count C branches or substitute a different work quantum.
+    // Fuel remains exact per executed typed state, including empty drains and
+    // latches. Cancellation now observes the next bounded pure-region cut;
+    // the instrumented request may therefore finish its current region.
     for state in 0..work.states.len() {
         let label = format!("ku_task_state_{state}:;");
         assert_eq!(drive.matches(&label).count(), 1);
         drive = drive.replacen(&label, &format!("{label}\n  fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
-        let fast = format!("ku_task_range_state_{state}:;");
-        if drive.contains(&fast) {
-            assert_eq!(drive.matches(&fast).count(), 1);
-            drive = drive.replacen(&fast, &format!("{fast}\n  fixture_fast_steps++; fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+        let region = format!("ku_task_region_scalar_state_{state}:;");
+        if drive.contains(&region) {
+            assert_eq!(drive.matches(&region).count(), 1);
+            drive = drive.replacen(&region, &format!("{region}\n  fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+        }
+        for fast in [
+            format!("ku_task_range_state_{state}:;"),
+            format!("ku_task_region_range_state_{state}:;"),
+        ] {
+            if drive.contains(&fast) {
+                assert_eq!(drive.matches(&fast).count(), 1);
+                drive = drive.replacen(&fast, &format!("{fast}\n  fixture_fast_steps++; fixture_steps++;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
+            }
         }
     }
     drive = drive.replace(
@@ -629,7 +639,7 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
   fixture_cancel_lease=&task.owner.lease;
   CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
-  if(cancel_at) CHECK(fixture_steps==cancel_at && fixture_cancel_result==KU_TASK_CONTROL_OK);
+  if(cancel_at) CHECK(fixture_steps>=cancel_at && fixture_steps<=64u && fixture_cancel_result==KU_TASK_CONTROL_OK);
   else if(!overflow) CHECK(fixture_steps==64u && driver.polls==1u && driver.queued==1u);
   if(force_slow) CHECK(!fixture_fast_steps);
   else if(!overflow) CHECK(fixture_fast_steps>0);
@@ -661,8 +671,9 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
 int main(void) {
   for(int force_slow=0;force_slow<2;force_slow++) {
     CHECK(!fixture_case(0,0,0,force_slow));
-    /* Publish at every original state position in both emitted paths. The
-     * initial fast body has already been charged by general dispatch. */
+    /* Publish inside every original state position in both numeric paths.
+     * Observation may finish its bounded region, never exceed this exact
+     * 64-state poll. Dispatch entry is charged exactly once in either path. */
     for(size_t cancel_at=1u;cancel_at<=64u;cancel_at++)
       CHECK(!fixture_case(cancel_at,0,0,force_slow));
     CHECK(!fixture_case(0,1,0,force_slow));
@@ -695,6 +706,68 @@ int main(void) {
         "task-scalar-exact-quantum-cancel-errors-ok\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_scalar_regions_preserve_branch_prefix_errors_and_host_boundaries() {
+    let function = r#"
+async fn Region(limit:int, seed:int, divisor:int):int! {
+    index=0
+    total=seed
+    while(index<limit) {
+        if(index%2==0) { total=total+3 } else { total=total*2 }
+        total=total/divisor
+        index=index+1
+    }
+    return ok(total)
+}
+"#;
+    for (index, main, stdout, stderr, success) in [
+        (
+            0,
+            "async fn main():null! { first=(await Region(0,3,1))? println(first) second=(await Region(5,3,1))? println(second) third=(await Region(7,3,1))? println(third) return ok(null) }",
+            "3\n33\n69\n",
+            "",
+            true,
+        ),
+        (
+            1,
+            "async fn main():null! { value=(await Region(5,3,0))? println(value) return ok(null) }",
+            "",
+            "division by zero\n",
+            false,
+        ),
+        (
+            2,
+            "async fn main():null! { value=(await Region(5,9223372036854775807,0))? println(value) return ok(null) }",
+            "",
+            "integer overflow\n",
+            false,
+        ),
+    ] {
+        let generated = native(&format!("{function}\n{main}"));
+        assert!(generated.contains("ku_task_region_scalar_state_"));
+        let directory = TempDir::new(&format!("task-scalar-regions-{index}"));
+        let path = directory.path().join("regions.c");
+        fs::write(&path, generated).unwrap();
+        let Some(executable) = compile_harness(directory.path(), &path, "regions") else {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI must execute native scalar regions"
+            );
+            return;
+        };
+        fs::remove_file(path).unwrap();
+        let output = run_bounded(
+            Command::new(executable).current_dir(directory.path()),
+            RUN_TIMEOUT,
+            RUN_LIMITS,
+        )
+        .unwrap();
+        assert_eq!(output.status.success(), success, "case {index}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).replace('\r', ""), stdout);
+        assert_eq!(String::from_utf8_lossy(&output.stderr).replace('\r', ""), stderr);
+    }
 }
 
 #[test]
@@ -759,8 +832,12 @@ async fn main():null! { return ok(null) }
             assert!(drive[fast..].contains("ku_int_div("));
         }
         for state in 0..function.states.len() {
-            let label = format!("ku_task_range_state_{state}:;");
-            drive = drive.replace(&label, &format!("{label}\n  fixture_range_steps++;\n"));
+            for label in [
+                format!("ku_task_range_state_{state}:;"),
+                format!("ku_task_region_range_state_{state}:;"),
+            ] {
+                drive = drive.replace(&label, &format!("{label}\n  fixture_range_steps++;\n"));
+            }
         }
         generated.replace_range(begin..end, &drive);
     }
@@ -982,6 +1059,8 @@ fn native_task_scalar_empty_scope_publishes_pending_before_host_allocation() {
         for label in [
             format!("ku_task_state_{state}:;"),
             format!("ku_task_range_state_{state}:;"),
+            format!("ku_task_region_scalar_state_{state}:;"),
+            format!("ku_task_region_range_state_{state}:;"),
         ] {
             if drive.contains(&label) {
                 // Observe actual state entry; never canonicalize the header.

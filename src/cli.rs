@@ -894,7 +894,7 @@ Usage:
                         Also emit checked Ku IR draft under .ku/build
   ku build --backend c [--target <target>] [file.ku]
                         Build one native binary for host, x86_64-linux,
-                        x86_64-windows, or aarch64-darwin
+                        aarch64-linux, x86_64-windows, or aarch64-darwin
   ku build --native [--locked|--offline] <file.ku>
                         Compatibility form: emit prototype native C source beside file
   ku package gc [path]
@@ -1882,6 +1882,9 @@ impl BuildTarget {
             NativeBinaryFormat::ElfX86_64 => {
                 cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")
             }
+            NativeBinaryFormat::ElfArm64 => {
+                cfg!(target_os = "linux") && cfg!(target_arch = "aarch64")
+            }
             NativeBinaryFormat::PeX86_64 => cfg!(windows) && cfg!(target_arch = "x86_64"),
             NativeBinaryFormat::MachOArm64 => {
                 cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")
@@ -1909,6 +1912,7 @@ enum CCompilerKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeBinaryFormat {
     ElfX86_64,
+    ElfArm64,
     PeX86_64,
     MachOArm64,
 }
@@ -2307,7 +2311,7 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
         || value.split('-').any(|part| part == "." || part == "..")
     {
         return Err(command_error(format!(
-            "invalid build target '{raw}'\nhelp: use host, x86_64-linux, x86_64-windows, or aarch64-darwin"
+            "invalid build target '{raw}'\nhelp: use host, x86_64-linux, aarch64-linux, x86_64-windows, or aarch64-darwin"
         )));
     }
     let target = match value {
@@ -2317,6 +2321,13 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
             c_triple: "x86_64-linux-gnu",
             is_windows: false,
             binary_format: NativeBinaryFormat::ElfX86_64,
+        },
+        "aarch64-linux" => BuildTarget {
+            slug: value.to_string(),
+            rust_triple: "aarch64-unknown-linux-gnu",
+            c_triple: "aarch64-linux-gnu",
+            is_windows: false,
+            binary_format: NativeBinaryFormat::ElfArm64,
         },
         "x86_64-windows" => BuildTarget {
             slug: value.to_string(),
@@ -2334,7 +2345,7 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
         },
         _ => {
             return Err(command_error(format!(
-                "unsupported build target '{raw}'\nhelp: this stage supports host, x86_64-linux, x86_64-windows, and aarch64-darwin"
+                "unsupported build target '{raw}'\nhelp: this stage supports host, x86_64-linux, aarch64-linux, x86_64-windows, and aarch64-darwin"
             )))
         }
     };
@@ -2344,6 +2355,9 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
 fn supported_host_build_target() -> Option<BuildTarget> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return resolve_build_target(Some("x86_64-linux")).ok().flatten();
+    }
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return resolve_build_target(Some("aarch64-linux")).ok().flatten();
     }
     if cfg!(all(windows, target_arch = "x86_64")) {
         return resolve_build_target(Some("x86_64-windows")).ok().flatten();
@@ -5529,7 +5543,8 @@ fn verify_native_binary_target_file(
     target: &BuildTarget,
 ) -> Result<(), String> {
     match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => verify_elf_x86_64(file, file_len)?,
+        NativeBinaryFormat::ElfX86_64 => verify_elf_linux(file, file_len, 62, "x86_64")?,
+        NativeBinaryFormat::ElfArm64 => verify_elf_linux(file, file_len, 183, "aarch64")?,
         NativeBinaryFormat::PeX86_64 => verify_pe_x86_64(file, file_len)?,
         NativeBinaryFormat::MachOArm64 => verify_macho_arm64_macos(file, file_len)?,
     }
@@ -5566,7 +5581,9 @@ fn verify_native_binary_dynamic_dependencies_file(
         return Ok(());
     }
     let names = match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => read_elf_dynamic_dependencies(file, file_len)?,
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::ElfArm64 => {
+            read_elf_dynamic_dependencies(file, file_len)?
+        }
         NativeBinaryFormat::PeX86_64 => read_pe_dynamic_dependencies(file, file_len)?,
         NativeBinaryFormat::MachOArm64 => read_macho_dynamic_dependencies(file, file_len)?,
     };
@@ -5701,7 +5718,9 @@ fn dynamic_dependency_matches_selected_loader(
                 .unwrap_or(expected);
             actual.eq_ignore_ascii_case(expected)
         }
-        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::MachOArm64 => actual == expected,
+        NativeBinaryFormat::ElfX86_64
+        | NativeBinaryFormat::ElfArm64
+        | NativeBinaryFormat::MachOArm64 => actual == expected,
     }
 }
 
@@ -6310,7 +6329,12 @@ fn read_macho_dynamic_metadata(
     })
 }
 
-fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
+fn verify_elf_linux(
+    file: &mut fs::File,
+    file_len: u64,
+    expected_machine: u16,
+    architecture: &str,
+) -> Result<(), String> {
     const ELF_HEADER_SIZE: usize = 64;
     const ELF_PROGRAM_HEADER_SIZE: u64 = 56;
     const MAX_PROGRAM_HEADERS: u16 = 4_096;
@@ -6332,7 +6356,7 @@ fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
         || !matches!(os_abi, 0 | 3)
         || header[8] != 0
         || !matches!(file_type, 2 | 3)
-        || machine != 62
+        || machine != expected_machine
         || version != 1
         || entry == 0
         || header_size as usize != ELF_HEADER_SIZE
@@ -6341,9 +6365,9 @@ fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
         || program_count > MAX_PROGRAM_HEADERS
         || program_offset < ELF_HEADER_SIZE as u64
     {
-        return Err(
-            "expected a Linux-compatible little-endian x86_64 ELF64 executable".to_string(),
-        );
+        return Err(format!(
+            "expected a Linux-compatible little-endian {architecture} ELF64 executable"
+        ));
     }
     let table_size = ELF_PROGRAM_HEADER_SIZE
         .checked_mul(program_count as u64)
@@ -6879,7 +6903,7 @@ fn compile_c_source(
     validate_native_output_name(output)?;
     if target.is_none() && supported_host_build_target().is_none() {
         return Err(KuError::message(
-            "native C linking is not validated for this host architecture\nhelp: emit C only, or use an explicit supported target: x86_64-linux, x86_64-windows, aarch64-darwin",
+            "native C linking is not validated for this host architecture\nhelp: emit C only, or use an explicit supported target: x86_64-linux, aarch64-linux, x86_64-windows, aarch64-darwin",
         ));
     }
     let output_directory = link_output_directory(output);
@@ -7528,10 +7552,12 @@ fn compiler_target_matches_build(value: &str, target: &BuildTarget) -> bool {
         NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::PeX86_64 => {
             value.contains("x86_64") || value.contains("amd64")
         }
-        NativeBinaryFormat::MachOArm64 => value.contains("aarch64") || value.contains("arm64"),
+        NativeBinaryFormat::ElfArm64 | NativeBinaryFormat::MachOArm64 => {
+            value.contains("aarch64") || value.contains("arm64")
+        }
     };
     let operating_system_matches = match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => value.contains("linux"),
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::ElfArm64 => value.contains("linux"),
         NativeBinaryFormat::PeX86_64 => value.contains("windows") || value.contains("mingw"),
         NativeBinaryFormat::MachOArm64 => {
             value.contains("darwin") || value.contains("apple") || value.contains("macos")
@@ -11180,6 +11206,19 @@ mod tests {
         assert_eq!(linux.c_triple, "x86_64-linux-gnu");
         assert!(!linux.is_windows);
 
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("resolved Linux ARM64 target");
+        assert_eq!(linux_arm64.slug, "aarch64-linux");
+        assert_eq!(linux_arm64.rust_triple, "aarch64-unknown-linux-gnu");
+        assert_eq!(linux_arm64.c_triple, "aarch64-linux-gnu");
+        assert_eq!(linux_arm64.binary_format, NativeBinaryFormat::ElfArm64);
+        assert!(!linux_arm64.is_windows);
+        assert_eq!(
+            linux_arm64.matches_host(),
+            cfg!(all(target_os = "linux", target_arch = "aarch64"))
+        );
+
         let windows = resolve_build_target(Some("x86_64-windows"))
             .expect("windows target")
             .expect("resolved windows target");
@@ -11212,15 +11251,15 @@ mod tests {
     }
 
     #[test]
-    fn three_native_targets_emit_separate_source_free_import_graphs_without_a_linker() {
+    fn native_targets_emit_separate_source_free_import_graphs_without_a_linker() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_nanos();
-        let dir = env::temp_dir().join(format!("ku-three-target-c-{}-{nonce}", std::process::id()));
+        let dir = env::temp_dir().join(format!("ku-native-target-c-{}-{nonce}", std::process::id()));
         let source_dir = dir.join("source");
         let retained_dir = dir.join("retained-c");
-        fs::create_dir_all(&source_dir).expect("create three-target source fixture");
+        fs::create_dir_all(&source_dir).expect("create native-target source fixture");
         fs::create_dir_all(&retained_dir).expect("create retained C fixture");
         fs::write(
             source_dir.join("math.ku"),
@@ -11235,7 +11274,12 @@ mod tests {
         .expect("write target entry fixture");
 
         let mut retained = Vec::new();
-        for target_name in ["x86_64-windows", "x86_64-linux", "aarch64-darwin"] {
+        for target_name in [
+            "x86_64-windows",
+            "x86_64-linux",
+            "aarch64-linux",
+            "aarch64-darwin",
+        ] {
             let args = vec![
                 "ku".to_string(),
                 "build".to_string(),
@@ -11949,6 +11993,11 @@ mod tests {
         let darwin = resolve_build_target(Some("aarch64-darwin"))
             .expect("darwin target")
             .expect("explicit darwin target");
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        let mut arm64_dependencies = dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]);
+        arm64_dependencies[18..20].copy_from_slice(&183u16.to_le_bytes());
         let features = CSourceFeatures {
             libpq: true,
             libmysql: true,
@@ -11959,6 +12008,13 @@ mod tests {
                 dir.join("app-linux"),
                 linux,
                 dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]),
+                "libpq.so.5",
+                "libmysqlclient.so.21",
+            ),
+            (
+                dir.join("app-linux-arm64"),
+                linux_arm64,
+                arm64_dependencies,
                 "libpq.so.5",
                 "libmysqlclient.so.21",
             ),
@@ -12324,6 +12380,19 @@ mod tests {
             .expect("darwin target")
             .expect("explicit darwin target");
         verify_native_binary_target(&elf_path, &linux).expect("matching ELF target");
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        let arm64_path = dir.join("app-linux-arm64");
+        let mut arm64 = elf.clone();
+        arm64[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(&arm64_path, &arm64).expect("write ARM64 ELF fixture");
+        verify_native_binary_target(&arm64_path, &linux_arm64).expect("matching ARM64 ELF");
+        assert!(verify_native_binary_target(&arm64_path, &linux).is_err());
+        assert!(verify_native_binary_target(&elf_path, &linux_arm64).is_err());
+        let truncated_arm64 = dir.join("truncated-arm64-elf");
+        fs::write(&truncated_arm64, &arm64[..100]).expect("write truncated ARM64 ELF");
+        assert!(verify_native_binary_target(&truncated_arm64, &linux_arm64).is_err());
         verify_native_binary_target(&pe_path, &windows).expect("matching PE target");
         verify_native_binary_target(&macho_path, &darwin).expect("matching Mach-O target");
         assert!(verify_native_binary_target(&elf_path, &windows).is_err());
@@ -12554,7 +12623,12 @@ mod tests {
 
     #[test]
     fn explicit_matching_host_target_links_when_a_native_toolchain_is_available() {
-        let Some(target) = ["x86_64-linux", "x86_64-windows", "aarch64-darwin"]
+        let Some(target) = [
+            "x86_64-linux",
+            "aarch64-linux",
+            "x86_64-windows",
+            "aarch64-darwin",
+        ]
             .into_iter()
             .map(|name| {
                 resolve_build_target(Some(name))
@@ -13213,7 +13287,12 @@ fn main(): null! {
             .iter()
             .all(|candidate| !candidate.explicitly_configured));
         assert_eq!(automatic[2].kind, CCompilerKind::Preconfigured);
-        let cross_target = ["x86_64-linux", "x86_64-windows", "aarch64-darwin"]
+        let cross_target = [
+            "x86_64-linux",
+            "aarch64-linux",
+            "x86_64-windows",
+            "aarch64-darwin",
+        ]
             .into_iter()
             .map(|name| {
                 resolve_build_target(Some(name))
@@ -13323,6 +13402,25 @@ fn main(): null! {
             c_compiler_target_arguments(&clang, &linux).expect("clang target arguments"),
             vec!["--target=x86_64-unknown-linux-gnu"]
         );
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("supported Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        assert_eq!(
+            c_compiler_target_arguments(&clang, &linux_arm64).expect("ARM64 clang arguments"),
+            vec!["--target=aarch64-unknown-linux-gnu"]
+        );
+        assert!(compiler_target_matches_build(
+            "aarch64-unknown-linux-gnu",
+            &linux_arm64
+        ));
+        assert!(!compiler_target_matches_build(
+            "x86_64-unknown-linux-gnu",
+            &linux_arm64
+        ));
+        assert!(!compiler_target_matches_build(
+            "aarch64-apple-darwin",
+            &linux_arm64
+        ));
         #[cfg(windows)]
         let zig_command = r#""C:\Program Files\zig\zig.exe" cc"#;
         #[cfg(unix)]
@@ -13335,6 +13433,10 @@ fn main(): null! {
         assert_eq!(
             c_compiler_target_arguments(&zig, &linux).expect("Zig target arguments"),
             vec!["-target", "x86_64-linux-gnu"]
+        );
+        assert_eq!(
+            c_compiler_target_arguments(&zig, &linux_arm64).expect("ARM64 Zig target arguments"),
+            vec!["-target", "aarch64-linux-gnu"]
         );
         let preconfigured =
             parse_c_compiler_candidate("x86_64-linux-gnu-gcc", true).expect("parse configured GCC");

@@ -21,6 +21,9 @@ use super::{
     unsupported,
 };
 
+#[path = "c_task_region.rs"]
+mod scalar_region;
+
 // Copy the complete bounded drive text while changing only actual return
 // statements. Source string literals may themselves contain C-looking text.
 // Unknown future return forms fail code generation instead of missing a spill.
@@ -217,6 +220,12 @@ pub(super) fn emit_frames(
             for slot in &frame.cooperative_slots {
                 emitter.persistent.insert(slot.0);
             }
+            emitter.scalar_regions = scalar_region::ScalarRegions::build(
+                function,
+                (0..function.states.len())
+                    .map(|state| emitter.scalar_direct_state(state))
+                    .collect(),
+            );
         }
         if super::task_range::enabled() {
             emitter.range_plan = super::task_range::RangePlan::build(
@@ -252,6 +261,7 @@ struct FrameEmitter<'a> {
     scalar_cache_active: Cell<bool>,
     scalar_init_cache_active: Cell<bool>,
     scalar_cache_mask: Cell<u64>,
+    scalar_regions: scalar_region::ScalarRegions,
     range_plan: Option<super::task_range::RangePlan>,
     range_active: Cell<bool>,
     range_fast: Cell<bool>,
@@ -404,6 +414,7 @@ impl<'a> FrameEmitter<'a> {
             scalar_cache_active: Cell::new(false),
             scalar_init_cache_active: Cell::new(false),
             scalar_cache_mask: Cell::new(0),
+            scalar_regions: scalar_region::ScalarRegions::default(),
             range_plan: None,
             range_active: Cell::new(false),
             range_fast: Cell::new(false),
@@ -1012,17 +1023,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_scalar_checkpoint(&self, out: &mut COutput, state: usize) {
-        // Exactly the old phase-before-quantum ordering and one unit per IR
-        // state. Only externally observable exits materialize the state number.
-        // Cleanup still reads its clock on every original dispatch boundary.
         let (phase, budget) = if self.scalar_cache_active.get() {
-            // Pure operations cannot replace the host/control identity. Cache
-            // its address only until the next general/owned/host boundary;
-            // the atomic phase VALUE is still acquired at every checkpoint.
             (
                 "if (!__ku_scalar_phase) __ku_scalar_phase=&((KuTaskAdapterHostV1*)clock->host)->control->phase;\nif (ku_task_control_atomic_load(__ku_scalar_phase)!=KU_TASK_CONTROL_LIVE)",
-                // Hosted resume validates host before drive, and this exact
-                // path already dereferences it for the preceding phase read.
                 "if (!__ku_dispatch_budget--)",
             )
         } else {
@@ -1036,14 +1039,40 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         } else {
             "scalar"
         };
+        out.push_str(&format!("ku_task_{label}_check_{state}:;\n"));
+        self.emit_scalar_region_header_flush(out);
         out.push_str(&format!(
-            "ku_task_{label}_check_{state}:;\n\
-             if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
+            "if (cleanup) {{ frame->header.state={state}u; goto ku_task_dispatch; }}\n\
              {phase} {{\n\
                frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
                frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
-             }}\n\
-             {budget} {{\n\
+             }}\n"
+        ));
+        if self.scalar_cache_active.get() {
+            if let Some(region) = self.scalar_regions.at_entry(state).filter(|region| {
+                !self.range_fast.get()
+                    || region.states.iter().all(|&state| {
+                        self.range_plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.states[state])
+                    })
+            }) {
+                // No speculative fuel charge: the guard proves that every
+                // possible path to the next cut fits. Each executed state
+                // decrements only the local remaining count; a checked error
+                // therefore charges precisely its prefix. Small tails keep
+                // the original phase-before-unit precise fallback below.
+                let mask = self.scalar_cache_mask.get();
+                out.push_str(&format!(
+                    "  if (__ku_dispatch_budget>={}u) {{\n\
+                       if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n\
+                       goto ku_task_region_{label}_state_{state};\n  }}\n",
+                    region.max_path_states
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "  {budget} {{\n\
                frame->header.state={state}u;\n\
                KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
                ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
@@ -1052,7 +1081,149 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         ));
     }
 
+    fn emit_scalar_region_header_flush(&self, out: &mut COutput) {
+        if self.scalar_cache_active.get() && !self.scalar_regions.regions.is_empty() {
+            // An empty lexical drain has a visible PENDING fact even before
+            // the first quantum. Preserve it before any host/drop/error edge;
+            // no observer or callback executes inside a pure region.
+            out.push_str("  if (__ku_region_cleanup_dirty) { frame->header.cleanup_state=__ku_region_cleanup_state; __ku_region_cleanup_dirty=0; }\n  if (__ku_region_pending) { frame->header.status=KU_TASK_FRAME_PENDING; __ku_region_pending=0; }\n");
+        }
+    }
+
+    fn emit_scalar_region_transition(
+        &self,
+        out: &mut COutput,
+        region: &scalar_region::ScalarRegion,
+        target: usize,
+    ) {
+        let label = if self.range_fast.get() {
+            "range"
+        } else {
+            "scalar"
+        };
+        if target != region.entry && region.states.binary_search(&target).is_ok() {
+            out.push_str(&format!("  goto ku_task_region_{label}_state_{target};\n"));
+        } else if self.range_fast.get()
+            && self.scalar_direct_state(target)
+            && !self.range_plan.as_ref().unwrap().states[target]
+        {
+            out.push_str(&format!("  goto ku_task_scalar_check_{target};\n"));
+        } else {
+            self.emit_transition(out, target);
+        }
+    }
+
+    fn emit_scalar_region_dispatch_entry(&self, out: &mut COutput, state: usize) {
+        if !self.scalar_cache_active.get() {
+            return;
+        }
+        let Some(region) = self.scalar_regions.at_entry(state) else {
+            return;
+        };
+        let mut variants = vec![(
+            "scalar",
+            if self.range_active.get() {
+                " && !__ku_range_fast"
+            } else {
+                ""
+            },
+        )];
+        if self.range_active.get()
+            && region
+                .states
+                .iter()
+                .all(|&state| self.range_plan.as_ref().unwrap().states[state])
+        {
+            variants.push(("range", " && __ku_range_fast"));
+        }
+        let mask = self.scalar_cache_mask.get();
+        for (label, guard) in variants {
+            // The general dispatcher already acquired phase and charged the
+            // entry state. Refund that local unit only when handing it to the
+            // region, whose first block charges it exactly once again.
+            out.push_str(&format!(
+                "  if (!cleanup && __ku_dispatch_budget>={}u{guard}) {{\n\
+                   ++__ku_dispatch_budget;\n\
+                   if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n\
+                   goto ku_task_region_{label}_state_{state};\n  }}\n",
+                region.max_path_states - 1
+            ));
+        }
+    }
+
+    fn emit_scalar_regions(&self, out: &mut COutput) -> KuResult<()> {
+        if !self.scalar_cache_active.get() {
+            return Ok(());
+        }
+        for range_fast in [false, true] {
+            if range_fast && !self.range_active.get() {
+                continue;
+            }
+            self.range_fast.set(range_fast);
+            self.scalar_init_cache_active.set(true);
+            let label = if range_fast { "range" } else { "scalar" };
+            for region in &self.scalar_regions.regions {
+                if range_fast
+                    && !region
+                        .states
+                        .iter()
+                        .all(|&state| self.range_plan.as_ref().unwrap().states[state])
+                {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "  /* typed scalar region: entry {}, max {} states, {} operations;\n   * one acquired boundary, exact executed-prefix fuel, no host/owner edge. */\n",
+                    region.entry, region.max_path_states, region.operations
+                ));
+                for &index in &region.states {
+                    out.check()?;
+                    let state = &self.function.states[index];
+                    out.push_str(&format!(
+                        "ku_task_region_{label}_state_{index}:;\n  --__ku_dispatch_budget;\n"
+                    ));
+                    for (operation_id, operation) in state.operations.iter().enumerate() {
+                        self.emit_operation(out, operation, index, operation_id)?;
+                    }
+                    match state.terminator {
+                        TaskTerminator::Jump { target } => {
+                            self.emit_scalar_region_transition(out, region, target.0);
+                        }
+                        TaskTerminator::Branch {
+                            condition,
+                            then_state,
+                            else_state,
+                        } => {
+                            out.push_str(&format!("  if ({}) {{\n", self.place(condition)));
+                            self.emit_scalar_region_transition(out, region, then_state.0);
+                            out.push_str("  } else {\n");
+                            self.emit_scalar_region_transition(out, region, else_state.0);
+                            out.push_str("  }\n");
+                        }
+                        TaskTerminator::Suspend { resume, cleanup } => {
+                            // A source loop latch is a cut, not a real WAIT.
+                            // Preserve its cleanup continuation at the cut.
+                            out.push_str(&format!(
+                                "  __ku_region_cleanup_state={}u; __ku_region_cleanup_dirty=1;\n",
+                                cleanup.0
+                            ));
+                            self.emit_scalar_region_transition(out, region, resume.0);
+                        }
+                        TaskTerminator::ScopeDrain { ready, .. } => {
+                            out.push_str("  __ku_region_pending=1; __ku_region_cleanup_state=UINT32_MAX; __ku_region_cleanup_dirty=1;\n");
+                            self.emit_scalar_region_transition(out, region, ready.0);
+                        }
+                        _ => return Err(unsupported("non-scalar boundary in Task region proof")),
+                    }
+                }
+            }
+        }
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
+        out.check()
+    }
+
     fn emit_scalar_init_flush(&self, out: &mut COutput) {
+        self.emit_scalar_region_header_flush(out);
         if self.scalar_cache_active.get() {
             if self.range_active.get() {
                 // A general/Owned/host/cleanup boundary ends the numeric
@@ -1182,6 +1353,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         if self.scalar_cache_active.get() {
             out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
+            if !self.scalar_regions.regions.is_empty() {
+                out.push_str("  int __ku_region_pending=0, __ku_region_cleanup_dirty=0;\n  uint32_t __ku_region_cleanup_state=UINT32_MAX;\n");
+            }
         }
         if self.range_active.get() {
             out.push_str("  int __ku_range_unselected=1;\n  int __ku_range_fast=0;\n");
@@ -1254,10 +1428,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
+            out.push_str(&format!("  case {index}u:\n"));
+            self.emit_scalar_region_dispatch_entry(out, index);
             if self.range_active.get() && self.scalar_direct_state(index) {
-                out.push_str(&format!("  case {index}u: if (__ku_range_fast) goto ku_task_range_state_{index}; goto ku_task_state_{index};\n"));
+                out.push_str(&format!("    if (__ku_range_fast) goto ku_task_range_state_{index}; goto ku_task_state_{index};\n"));
             } else {
-                out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
+                out.push_str(&format!("    goto ku_task_state_{index};\n"));
             }
         }
         out.push_str(
@@ -1629,6 +1805,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 }
             }
         }
+        self.emit_scalar_regions(out)?;
         self.scalar_init_cache_active.set(false);
         self.range_fast.set(false);
         if !self.finally.state_cleanup.is_empty() {
@@ -2355,6 +2532,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_runtime_error(&self, out: &mut COutput, error: &str) -> KuResult<()> {
+        self.emit_scalar_region_header_flush(out);
         let IrType::Result(inner) = &self.function.result else {
             return Err(unsupported("runtime exit requires Result"));
         };

@@ -73,6 +73,171 @@ fn fixture_source_with_backedge(backedge: bool) -> String {
 }
 
 #[test]
+fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
+    let ast = Parser::new(
+        Lexer::new("import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<5000) { index=index+1 } return ok(index) } async fn Wait(): int! { time.sleep(100)? return ok(9) } async fn main(): null! { return ok(null) }")
+            .lex()
+            .unwrap(),
+    )
+    .parse_program()
+    .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let tasks = ir::task_lower::lower_program(&ast).unwrap();
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    for (old, new) in [
+        (
+            "typedef struct KuString {",
+            format!("{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\nstatic size_t fixture_claims,fixture_resumes,fixture_cancel_at;\nstatic uint64_t fixture_clock=1000u;\nstatic KuTestEvent fixture_cancel_entered,fixture_cancel_release;\ntypedef struct KuString {{"),
+        ),
+        (
+            "static uint64_t ku_task_driver_now_ms(void) {",
+            "static uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {".to_string(),
+        ),
+        (
+            "  if (!ku_task_control_atomic_cas(&control->executor, &expected, 1))\n    return KU_TASK_CONTROL_PENDING;",
+            "  if (!ku_task_control_atomic_cas(&control->executor, &expected, 1))\n    return KU_TASK_CONTROL_PENDING;\n  fixture_claims++;".to_string(),
+        ),
+        (
+            "static uint32_t ku_task_0_resume(void* raw) {",
+            r#"static const KuTaskControlLeaseV1* fixture_observer;
+static uint32_t fixture_original_resume(void*);
+static uint32_t ku_task_0_resume(void* raw) {
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)raw;
+  fixture_resumes++;
+  if(ku_task_control_atomic_load(&instance->control.executor)!=1u) abort();
+  /* A separate live observer cannot claim the same executor between the
+   * private continuations. These failed observations consume no pump credit. */
+  if(ku_task_control_poll(fixture_observer)!=KU_TASK_CONTROL_PENDING) abort();
+  if(fixture_cancel_at && fixture_resumes==fixture_cancel_at) {
+    if(!ku_test_event_set(&fixture_cancel_entered)
+        || !ku_test_event_wait(&fixture_cancel_release,2000u)) abort();
+  }
+  return fixture_original_resume(raw);
+}
+static uint32_t fixture_original_resume(void* raw) {"#.to_string(),
+        ),
+        (
+            "int main(void) {",
+            "static int fixture_original_main(void) {".to_string(),
+        ),
+    ] {
+        assert_eq!(generated.matches(old).count(), 1, "segment hook: {old}");
+        generated = generated.replacen(old, &new, 1);
+    }
+    generated.push_str(r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"pure segment line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+typedef struct FixtureCancel {
+  KuTaskDriverTicketV1 ticket;
+  KuTaskControlLeaseV1 lease;
+  uint32_t result;
+} FixtureCancel;
+static int fixture_cancel_worker(void* raw) {
+  FixtureCancel* cancel=(FixtureCancel*)raw;
+  if(!ku_test_event_wait(&fixture_cancel_entered,2000u)) return 1;
+  /* A distinct live lease publishes cancellation on another native thread
+   * while the owner is inside its held executor, using the real wrapper. */
+  cancel->result=ku_task_driver_request_cancel(&cancel->ticket,&cancel->lease,
+      KU_TASK_CONTROL_CANCELLED,1042u);
+  return ku_test_event_set(&fixture_cancel_release) ? 0 : 2;
+}
+int main(void) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 work={0}; CHECK(ku_task_0_start_value(&driver,&work)==KU_TASK_DRIVER_OK);
+  fixture_observer=&work.owner.lease;
+  uint64_t next=UINT64_MAX;
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.polls==1u && fixture_resumes==1u && fixture_claims==1u && next==0u);
+  fixture_claims=fixture_resumes=0;
+  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.polls==33u && fixture_resumes==32u && fixture_claims==1u);
+  CHECK(driver.queued==1u && next==0u && !ku_task_driver_execution);
+  /* Publication at a real resume boundary must stop the private segment and
+   * enter the existing cancellation cleanup arbitration with the original D. */
+  CHECK(ku_test_event_init(&fixture_cancel_entered) && ku_test_event_init(&fixture_cancel_release));
+  FixtureCancel cancel={0}; cancel.ticket=work.ticket;
+  CHECK(ku_task_control_lease_retain(&work.owner.lease,&cancel.lease)==KU_TASK_CONTROL_OK);
+  KuTestThread thread; CHECK(ku_test_thread_start(&thread,fixture_cancel_worker,&cancel));
+  fixture_claims=fixture_resumes=0; fixture_cancel_at=3u;
+  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_thread_join(&thread,2000u) && thread.outcome==0 && cancel.result==KU_TASK_CONTROL_OK);
+  CHECK(fixture_resumes==3u && fixture_claims>=1u && fixture_claims<=2u);
+  /* A concurrent wrapper may leave its one notification for a terminal
+   * observation. Count that zero-resume poll exactly instead of discarding it. */
+  CHECK(driver.polls==33u+fixture_resumes+fixture_claims-1u);
+  CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  CHECK(ku_task_control_cleanup_deadline(work.owner.lease.control)==1042u);
+  CHECK(!driver.queued && !ku_task_driver_execution);
+  CHECK(ku_task_control_lease_release(&cancel.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_test_event_destroy(&fixture_cancel_entered) && ku_test_event_destroy(&fixture_cancel_release));
+  CHECK(ku_task_value_drop(&work,2000u)==KU_TASK_DRIVER_OK); fixture_observer=NULL;
+  for(size_t turn=0;turn<16u && driver.resident;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes);
+  /* A real timer WAIT exits the private executor immediately, remains parked
+   * with its original absolute D, and resumes only after that D is reached. */
+  KuTaskValueV1 waiting={0}; CHECK(ku_task_1_start_value(&driver,&waiting)==KU_TASK_DRIVER_OK);
+  uint64_t polls=driver.polls; fixture_claims=0;
+  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(driver.polls==polls+1u && fixture_claims==1u && !driver.queued && driver.timers==1u);
+  uint64_t timer_deadline=slots[waiting.ticket.slot].timer_deadline;
+  /* The driver's cached minimum may conservatively retain the old cancelled
+   * task's earlier D until its next expiry scan. It must never postpone D. */
+  CHECK(timer_deadline==1100u && next>fixture_clock && next<=timer_deadline);
+  CHECK(!ku_task_control_atomic_load(&waiting.owner.lease.control->executor));
+  CHECK(ku_task_control_status(&waiting.owner.lease)==KU_TASK_CONTROL_PENDING);
+  fixture_clock=timer_deadline;
+  for(size_t turn=0;turn<16u && ku_task_control_status(&waiting.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&waiting.owner.lease)==KU_TASK_CONTROL_COMPLETED && !driver.timers);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&waiting,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.value.integer.ok && output.value.integer.value==9); ku_task_outcome_drop(&output);
+  CHECK(ku_task_value_drop(&waiting,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers
+      && !driver.reserved_bytes && driver.workers_exited==1u && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("task-pure-segment-executor-and-credits-ok"); return 0;
+}
+"#);
+    let directory = TempDir::new("task-driver-pure-segment");
+    let c_file = directory.path().join("segment.c");
+    fs::write(&c_file, generated).expect("write pure segment witness");
+    let Some(executable) = compile_harness(directory.path(), &c_file, "segment") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute the executor/credit witness"
+        );
+        return;
+    };
+    fs::remove_file(&c_file).expect("remove temporary segment C");
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("segment witness and cleanup remain bounded");
+    assert!(
+        output.status.success(),
+        "segment witness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-pure-segment-executor-and-credits-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_driver_admission_wake_retirement_and_shutdown_execute_in_c() {
     let generated = fixture_source();
     for forbidden in ["run_source", "const SOURCE", "task.spawn", "Task.new"] {
@@ -2122,7 +2287,7 @@ fn native_task_driver_hot_yield_services_marker_before_cancellation() {
     let clock_entry = "static uint64_t ku_task_driver_now_ms(void) {";
     let lock_entry = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
     let unlock_entry = "static int ku_task_driver_unlock(KuTaskDriverV1* driver) {";
-    let poll = "outcome=ku_task_control_poll(&execution);";
+    let poll = "outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);";
     let published = "driver->building--;\n    slot->state = KU_TASK_DRIVER_PARKED;\n    if (source && !driver->closing) {\n      ku_task_driver_enqueue_local(driver, ticket->slot, parent->executor_worker);\n    } else ku_task_driver_enqueue(driver, ticket->slot);";
     for unique in [
         "typedef struct KuString {",
