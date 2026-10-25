@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'full runs all gates; platform scopes reuse passed checks on unchanged runtime sources'
+        description: 'full runs all gates; task-main-path checks Task/HTTP; platform scopes reuse unchanged checks'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path]
 
 permissions:
   contents: read
@@ -153,7 +153,80 @@ jobs:
           path: ${{ runner.temp }}/ku-task-tsan
           if-no-files-found: error
 
+  task-main-path:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path'
+    name: ${{ matrix.os }} Task main-path regressions
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_CC: "clang"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain and require Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          if [ "$RUNNER_OS" = Linux ]; then
+            rustup component add rustfmt clippy --toolchain 1.89.0
+          fi
+          rustc --version --verbose
+          command -v clang
+          clang --version
+
+      - name: Check workspace formatting, types and lint on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run affected native HTTP and Task regressions serially
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked \
+            --test native_http_test \
+            --test native_task_source_test \
+            --test native_task_control_test \
+            --test native_task_driver_test \
+            --test native_task_frame_c_test \
+            -- --nocapture --test-threads=1
+
+      - name: Check selected scalar, async I/O and batch boundaries with Linux detectors
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          KU_CC: "clang -fsanitize=address,undefined -fno-omit-frame-pointer -g -DKU_BORROW_REQUIRE_ASAN"
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --test native_task_source_test native_task_scalar_ \
+            -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test native_http_async_ \
+            -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
+            native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait \
+            -- --exact --nocapture --test-threads=1
+
   full-tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'task-main-path'
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

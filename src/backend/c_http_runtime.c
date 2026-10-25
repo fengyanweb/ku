@@ -2758,6 +2758,35 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
   if (drain) ku_http_group_notify(group);
   return 1;
 }
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+/* Bounded HTTP Task/I/O batch. These are owner-local bookkeeping fields, not
+ * a Task budget or a cached deadline clock. Every turn still calls pump(32),
+ * and each logical poll retains its original 64-dispatch/phase protocol.
+ * At most eight turns (256 logical polls) may share one immediate OS probe;
+ * a fresh monotonic sample must remain in the starting millisecond. Thus a
+ * stalled/backwards clock cannot create an unbounded loop. Any ordinary OS
+ * poll, urgent I/O, real wait, shutdown or fault ends this batch completely. */
+#define KU_HTTP_TASK_IO_BATCH_TURNS 8u
+typedef struct {
+  unsigned long long started_ms;
+  unsigned int turns;
+} KuHttpTaskIoBatch;
+static void ku_http_task_io_batch_reset(KuHttpTaskIoBatch* batch) {
+  batch->started_ms=0; batch->turns=0;
+}
+static void ku_http_task_io_batch_begin(KuHttpTaskIoBatch* batch,unsigned long long now) {
+  if (!batch->turns) batch->started_ms=now;
+  batch->turns++;
+}
+static int ku_http_task_io_batch_continue(KuHttpTaskIoBatch* batch,
+    unsigned long long now,int ready,int urgent) {
+  if (ready && !urgent && now!=~0ULL && batch->started_ms!=~0ULL
+      && batch->turns && batch->turns<KU_HTTP_TASK_IO_BATCH_TURNS
+      && now>=batch->started_ms && now-batch->started_ms<1u) return 1;
+  ku_http_task_io_batch_reset(batch); return 0;
+}
+/* End bounded HTTP Task/I/O batch. */
+#endif
 static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpLoopGroup* group = owner->group;
   KuHttpServer* server = group->server;
@@ -2855,6 +2884,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   unsigned long long accept_retry_deadline = 0;
   unsigned long long health_deadline=ku_http_deadline_ms(500);
   uint64_t next_cpu_sample_ms=0;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+  KuHttpTaskIoBatch task_io_batch={0};
+#endif
   const char* listen_failure = spawned == nworkers ? NULL : "handler thread startup failed";
   ku_http_mutex_lock(&group->lock);
   owner->wake = &wake; owner->ready = !listen_failure;
@@ -2868,6 +2900,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_mutex_unlock(&queue.lock);
     size_t occupied_connections=active.sockets;
     uint64_t sampled_cpu_ns=0, sampled_cpu_ms=ku_http_now_ms();
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    ku_http_task_io_batch_begin(&task_io_batch,sampled_cpu_ms);
+#endif
     int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
     int cpu_sample_valid=cpu_sample_due && ku_http_thread_cpu_ns(&sampled_cpu_ns);
     if (cpu_sample_due) next_cpu_sample_ms=sampled_cpu_ms>UINT64_MAX-10u ? UINT64_MAX : sampled_cpu_ms+10u;
@@ -3029,7 +3064,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     uint64_t net_deadline=UINT64_MAX;
     size_t net_count=ku_http_task_net_interests(group->tasks,(size_t)owner->index,
         net_interests,net_capacity,&net_deadline);
-    if (net_count>net_capacity) { listen_failure="Task network interest bound exceeded"; continue; }
+    if (net_count>net_capacity) {
+      listen_failure="Task network interest bound exceeded";
+      ku_http_task_io_batch_reset(&task_io_batch); continue;
+    }
     if (net_deadline<nearest) nearest=net_deadline;
     int net_base=poll_count;
     for (size_t i=0;i<net_count;i++) {
@@ -3045,6 +3083,41 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       unsigned long long remaining = nearest > now ? nearest - now : 0;
       wait_ms = remaining > (unsigned long long)INT_MAX ? INT_MAX : (int)remaining;
     }
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    /* Only already-ready computation can defer an empty nonblocking probe.
+     * Every subturn above still observes group close, Task deadlines, response
+     * completion and finite cleanup. HTTP reads/writes, pending admission and
+     * registered Task-network interests retain their original I/O turn.
+     * Fresh listener/peer readiness can wait only for this bounded batch;
+     * its bytes and every wake publication remain registered and unconsumed. */
+    int task_io_ready=task_deadline==0u && wait_ms==0 && active.count;
+    int task_io_urgent=!task_io_ready || !started || !listening || listen_failure || pending.count
+        || rejection.phase!=KU_HTTP_IO_FREE || now>=health_deadline;
+#if defined(KU_HTTP_HAS_TASK_NET)
+    if (net_count) task_io_urgent=1;
+#endif
+    for (int position=0;position<active.count && !task_io_urgent;position++) {
+      KuHttpConnection* connection=&connections[active.indices[position]];
+      if (connection->phase!=KU_HTTP_IO_ASYNC || !connection->async_task
+          || connection->async_cancelled || now>=connection->async_deadline)
+        task_io_urgent=1;
+    }
+#if !defined(_WIN32)
+    /* An already-published wake is an immediate reason to service the pipe.
+     * This is only an acquire observation: the original drain/clear and the
+     * producer's byte publication remain the no-lost-wakeup protocol. */
+    if (atomic_load_explicit(&wake.pending,memory_order_acquire)) task_io_urgent=1;
+#else
+    /* Windows' UDP wake has no coalescing marker. Keep its original I/O turn
+     * rather than adding a new notification protocol to this optimization. */
+    task_io_urgent=1;
+#endif
+    /* Eligibility scans/locks can consume time too. Never use the earlier
+     * deadline sample to extend the OS-service batch past its time bound. */
+    unsigned long long batch_now=task_io_urgent ? now : ku_http_now_ms();
+    if (ku_http_task_io_batch_continue(&task_io_batch,batch_now,
+        task_io_ready,task_io_urgent)) continue;
+#endif
     /* No periodic wake tick: idle/read/write/job progress blocks in one OS
        poll until actual readiness, worker publication, or the nearest old D. */
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
@@ -3157,6 +3230,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 
     }
   }
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+  ku_http_task_io_batch_reset(&task_io_batch);
+#endif
   /* Finite N drains accepted reads, handler jobs, partial responses and their
      actual owner retirement before stopping workers. Fatal accept failure has
      already cancelled queued work, without touching a running handler's TLS. */

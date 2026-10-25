@@ -4134,6 +4134,99 @@ fn main(): null! {
 }
 
 #[test]
+fn native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let start = runtime.find("/* Bounded HTTP Task/I/O batch.").unwrap();
+    let end = runtime[start..]
+        .find("/* End bounded HTTP Task/I/O batch. */")
+        .unwrap()
+        + start;
+    let batch = &runtime[start..end];
+    let checks = r#"
+#include <stdio.h>
+#include <stdint.h>
+"#
+    .to_owned()
+        + batch
+        + r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"Task I/O batch line %d: %s\n",__LINE__,#c); return 97; } } while(0)
+int main(void) {
+  KuHttpTaskIoBatch batch={0};
+  /* Frozen time cannot turn ready computation into an unbounded I/O skip.
+   * Each caller turn still has its original pump(32) logical-poll limit. */
+  unsigned int skipped=0,logical_polls=0;
+  for(unsigned int turn=0;turn<1024u;turn++) {
+    ku_http_task_io_batch_begin(&batch,1000u);
+    logical_polls+=32u;
+    if(!ku_http_task_io_batch_continue(&batch,1000u,1,0)) break;
+    skipped++;
+  }
+  CHECK(skipped==7u && logical_polls==256u && !batch.turns && !batch.started_ms);
+  /* A fresh clock boundary, including the exact millisecond, requires I/O.
+   * A backwards sample must reset rather than restart/extend this burst. */
+  ku_http_task_io_batch_begin(&batch,1000u);
+  CHECK(!ku_http_task_io_batch_continue(&batch,1001u,1,0));
+  CHECK(!batch.turns && !batch.started_ms);
+  ku_http_task_io_batch_begin(&batch,2000u);
+  CHECK(!ku_http_task_io_batch_continue(&batch,1999u,1,0));
+  CHECK(!batch.turns && !batch.started_ms);
+  ku_http_task_io_batch_begin(&batch,UINT64_MAX);
+  CHECK(!ku_http_task_io_batch_continue(&batch,UINT64_MAX,1,0));
+  ku_http_task_io_batch_begin(&batch,UINT64_MAX);
+  CHECK(!ku_http_task_io_batch_continue(&batch,0u,1,0));
+  /* No ready work (real WAIT), urgent I/O, cancellation/close/fault and a
+   * blocking OS wait all use this same reset-before-poll branch. None may
+   * carry the prior turn credit or timestamp into the next owner iteration. */
+  for(int ready=0;ready<=1;ready++) for(int urgent=0;urgent<=1;urgent++) {
+    if(ready && !urgent) continue;
+    ku_http_task_io_batch_begin(&batch,3000u);
+    CHECK(ku_http_task_io_batch_continue(&batch,3000u,1,0));
+    ku_http_task_io_batch_begin(&batch,3000u);
+    CHECK(!ku_http_task_io_batch_continue(&batch,3000u,ready,urgent));
+    CHECK(!batch.turns && !batch.started_ms);
+    ku_http_task_io_batch_begin(&batch,4000u);
+    CHECK(batch.turns==1u && batch.started_ms==4000u);
+    CHECK(ku_http_task_io_batch_continue(&batch,4000u,1,0));
+    ku_http_task_io_batch_reset(&batch);
+  }
+  CHECK(!ku_http_task_io_batch_continue(&batch,0u,1,0));
+  ku_http_task_io_batch_begin(&batch,0u);
+  CHECK(ku_http_task_io_batch_continue(&batch,0u,1,0));
+  CHECK(!ku_http_task_io_batch_continue(&batch,1u,1,0));
+  puts("http-task-io-batch-bounds-reset-ok"); return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-task-io-batch");
+    let path = directory.path().join("batch.c");
+    fs::write(&path, checks).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "batch")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires the native Task I/O batch regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(&executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "Task I/O batch regression failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-task-io-batch-bounds-reset-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn native_http_macos_zero_poll_preserves_real_socket_events_and_fallbacks() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

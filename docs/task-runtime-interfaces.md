@@ -34,6 +34,7 @@ fn main(): null! {
 - 同一 Task 只允许一个执行者；重复 wake 合并到其固定 ready 节点。driver 外部 pump 接受每轮最多 64 个 Task 量子，HTTP owner 每轮实际取 32 个；source frame 每量子最多 64 个 dispatch；真实 timer/await/I/O 等待仍登记后挂起。
 - 纯循环 latch 和没有 Task 的空 scope 在有限 dispatch 量子内继续，不为每个整数迭代进行两次调度。取消仍在 dispatch 边界检查。
 - 外部loop正在pump时不为每个自排队量子发送socket通知；pump末尾在同一发布锁下重查ready/期限，剩余ready返回deadline0，不再在driver锁内发送多余自唤醒。真正跨线程发布到已停泵的owner时仍发送持久唤醒，关闭和故障保留全组通知。
+- POSIX HTTP owner 对已经 ready 的计算可合并即时 OS 探测：仅在没有紧急 HTTP 读写、Task 网络兴趣、待准入连接、已发布唤醒、关闭或故障时继续；新鲜单调时钟必须仍在首轮的同一毫秒，且最多连续 8 个原有 pump(32)，即 256 个逻辑 poll。每子轮仍检查原期限、清理及 group 状态；真实等待和任何 OS 探测前清空批次状态。Windows 保留原探测路径。该边界是合作式的，单次昂贵操作或 OS 停顿仍可能超界，不是严格 1ms 抢占。
 - 动态 owned 槽位仍在返回、真实等待、分配预付、子 Task 转账、清理和结果取出时执行原计费检查。曾定向试验只对纯 Copy 预算量子跳过一次重复扫描；生成 C 证明条件生效，但同负载没有证明收益，因此已移除两个私有状态位及该分支，保留完整检查与 owned 回归。
 
 `c_task_driver.rs` 的 external init/pump 不创建线程。实际线程由 HTTP loop 持有；没有创建成功的逻辑 owner 只能在无准入工作、请求关闭后由协调线程进行最后一次 pump，走正常 EXITED/join/destroy 路径。内部 raw C fixture 的旧共享队列模式仍保留，用于原 ABI 回归。
