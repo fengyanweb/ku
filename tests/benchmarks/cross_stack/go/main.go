@@ -25,10 +25,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const cpuCancelChunk int64 = 512
+const cpuRequestTimeout = 3 * time.Second
+
+type cpuResult struct {
+	value int64
+	err   error
+}
+
 type cpuJob struct {
 	iterations int64
 	seed       int64
-	reply      chan int64
+	reply      chan cpuResult
 	context    context.Context
 }
 
@@ -38,6 +46,29 @@ func checksum(iterations, seed int64) int64 {
 		total = (total*33 + i + seed) % 100000000
 	}
 	return total
+}
+
+// The HTTP reference keeps the batch kernel unchanged, with one cooperative
+// cancellation check per bounded chunk and one before result publication.
+func checksumContext(ctx context.Context, iterations, seed int64) (int64, error) {
+	total := seed
+	for first := int64(0); first < iterations; {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		end := first + cpuCancelChunk
+		if end > iterations {
+			end = iterations
+		}
+		for i := first; i < end; i++ {
+			total = (total*33 + i + seed) % 100000000
+		}
+		first = end
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func envInt(name string, fallback int) int {
@@ -85,24 +116,24 @@ type service struct {
 	pgMode        pgMode
 	peer          string
 	cpu           chan cpuJob
+	cpuWorkers    int
 	waitingTimer  atomic.Int64
 	waitingTCP    atomic.Int64
 	active        atomic.Int64
 	actualCPUJobs atomic.Int64
 }
 
+func (s *service) runCPUJob(job cpuJob) {
+	// This reservation belongs to the physical job, not its HTTP waiter. Even
+	// after cancellation it is released only as this worker operation exits.
+	defer s.actualCPUJobs.Add(-1)
+	value, err := checksumContext(job.context, job.iterations, job.seed)
+	job.reply <- cpuResult{value: value, err: err}
+}
+
 func (s *service) cpuWorker() {
 	for job := range s.cpu {
-		// A cancelled queued job releases its reservation only when it is
-		// actually removed. A running calculation retains it until completion.
-		select {
-		case <-job.context.Done():
-			s.actualCPUJobs.Add(-1)
-			continue
-		default:
-		}
-		job.reply <- checksum(job.iterations, job.seed)
-		s.actualCPUJobs.Add(-1)
+		s.runCPUJob(job)
 	}
 }
 
@@ -150,13 +181,25 @@ func runtimeSnapshot() (map[string]any, []string) {
 func (s *service) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/metrics" {
 		values, unavailable := runtimeSnapshot()
-		body, _ := json.Marshal(map[string]any{"waiting_timer": s.waitingTimer.Load(), "waiting_tcp": s.waitingTCP.Load(), "active": s.active.Load(), "actual_cpu_jobs": s.actualCPUJobs.Load(), "runtime": values, "runtime_unavailable": unavailable})
+		body, _ := json.Marshal(map[string]any{
+			"waiting_timer": s.waitingTimer.Load(), "waiting_tcp": s.waitingTCP.Load(), "active": s.active.Load(),
+			"actual_cpu_jobs": s.actualCPUJobs.Load(), "cpu_queue_length": len(s.cpu), "cpu_queue_capacity": cap(s.cpu),
+			"cpu_workers": s.cpuWorkers, "gomaxprocs": runtime.GOMAXPROCS(0),
+			"cpu_cancel_chunk": cpuCancelChunk, "cpu_timeout_ms": cpuRequestTimeout.Milliseconds(),
+			"runtime": values, "runtime_unavailable": unavailable,
+		})
 		text(w, 200, string(body))
 		return
 	}
 	s.active.Add(1)
 	defer s.active.Add(-1)
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	timeout := 45 * time.Second
+	if r.URL.Path == "/work" {
+		// One absolute request deadline includes validation and channel wait;
+		// the worker never starts a fresh timeout when computation begins.
+		timeout = cpuRequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	rid := r.URL.Query().Get("rid")
 	switch r.URL.Path {
@@ -193,7 +236,7 @@ func (s *service) serve(w http.ResponseWriter, r *http.Request) {
 			text(w, 400, "invalid_cpu_input")
 			return
 		}
-		job := cpuJob{iterations, seed, make(chan int64, 1), ctx}
+		job := cpuJob{iterations, seed, make(chan cpuResult, 1), ctx}
 		// Reserve before publication so even an immediately scheduled worker
 		// cannot finish before this increment. Rejecting a full queue refunds
 		// immediately; a metrics read may conservatively see that brief reserve.
@@ -206,8 +249,12 @@ func (s *service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		select {
-		case value := <-job.reply:
-			text(w, 200, fmt.Sprintf("%s:%08d", rid, value))
+		case result := <-job.reply:
+			if result.err != nil || ctx.Err() != nil {
+				text(w, 504, "deadline")
+				return
+			}
+			text(w, 200, fmt.Sprintf("%s:%08d", rid, result.value))
 		case <-ctx.Done():
 			text(w, 504, "deadline")
 		}
@@ -309,8 +356,9 @@ func main() {
 	}
 	workers := envInt("BENCH_WORKERS", 1)
 	runtime.GOMAXPROCS(workers)
-	s := &service{pgMode: mode, peer: net.JoinHostPort("127.0.0.1", strconv.Itoa(envInt("BENCH_PEER_PORT", 19091))), cpu: make(chan cpuJob, 128)}
-	for range envInt("BENCH_CPU_WORKERS", workers) {
+	cpuWorkers := envInt("BENCH_CPU_WORKERS", workers)
+	s := &service{pgMode: mode, peer: net.JoinHostPort("127.0.0.1", strconv.Itoa(envInt("BENCH_PEER_PORT", 19091))), cpu: make(chan cpuJob, 128), cpuWorkers: cpuWorkers}
+	for range cpuWorkers {
 		go s.cpuWorker()
 	}
 	if dbURL := os.Getenv("BENCH_DB_URL"); dbURL != "" {
@@ -340,7 +388,7 @@ func main() {
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}()
-	log.Printf("Go net/http %s workers=%d cpu_workers=%d GC=%s", addr, workers, envInt("BENCH_CPU_WORKERS", workers), strings.TrimSpace(os.Getenv("GOGC")))
+	log.Printf("Go net/http %s workers=%d cpu_workers=%d cpu_chunk=%d cpu_timeout_ms=%d GC=%s", addr, workers, cpuWorkers, cpuCancelChunk, cpuRequestTimeout.Milliseconds(), strings.TrimSpace(os.Getenv("GOGC")))
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}

@@ -85,6 +85,7 @@ type job struct {
 	cpuCancel   bool
 	kind, rid   string
 	scheduled   time.Time
+	generated   time.Time // Arrival dispatcher, before client queue/dial/write.
 }
 type result struct {
 	category, stage, detail               string
@@ -183,6 +184,7 @@ type stats struct {
 	Read                                              int64             `json:"response_bytes_read"`
 	correctScheduled, correctSent, allScheduled, lag  histogram
 	queueDelay, dialDelay, coldLatency, reusedLatency histogram
+	generationLag                                     histogram
 	transportCounts                                   map[string]uint64
 	sentErrors                                        uint64
 	http500                                           uint64
@@ -214,7 +216,7 @@ func (s *stats) view(duration float64) map[string]any {
 	if s.Sent > 0 {
 		failureSent = float64(s.sentErrors) / float64(s.Sent)
 	}
-	return map[string]any{"planned": s.Planned, "attempted": s.Attempted, "sent": s.Sent, "terminal": terminal, "results": s.Results, "planned_reconciled": terminal == s.Planned, "correct_in_window": s.CorrectWindow, "goodput_rps": float64(s.CorrectWindow) / duration, "correct_total": correct, "failure_fraction_planned": failurePlanned, "failure_fraction_sent": failureSent, "correct_over_slo": s.SLOFailed, "http_500_total": s.http500, "late_response_events": s.Late, "request_bytes_written": s.Written, "response_bytes_read": s.Read, "correct_scheduled_to_complete": s.correctScheduled.value(), "correct_sent_to_complete": s.correctSent.value(), "all_scheduled_to_terminal": s.allScheduled.value(), "scheduled_to_sent": s.lag.value(), "scheduled_to_attempt": s.queueDelay.value(), "dial_duration": s.dialDelay.value(), "cold_connection_scheduled_to_complete": s.coldLatency.value(), "reused_connection_scheduled_to_complete": s.reusedLatency.value(), "transport_counts": s.transportCounts}
+	return map[string]any{"planned": s.Planned, "attempted": s.Attempted, "sent": s.Sent, "terminal": terminal, "results": s.Results, "planned_reconciled": terminal == s.Planned, "correct_in_window": s.CorrectWindow, "goodput_rps": float64(s.CorrectWindow) / duration, "correct_total": correct, "failure_fraction_planned": failurePlanned, "failure_fraction_sent": failureSent, "correct_over_slo": s.SLOFailed, "http_500_total": s.http500, "late_response_events": s.Late, "request_bytes_written": s.Written, "response_bytes_read": s.Read, "correct_scheduled_to_complete": s.correctScheduled.value(), "correct_sent_to_complete": s.correctSent.value(), "all_scheduled_to_terminal": s.allScheduled.value(), "scheduled_to_generated": s.generationLag.value(), "scheduled_to_sent": s.lag.value(), "scheduled_to_attempt": s.queueDelay.value(), "dial_duration": s.dialDelay.value(), "cold_connection_scheduled_to_complete": s.coldLatency.value(), "reused_connection_scheduled_to_complete": s.reusedLatency.value(), "transport_counts": s.transportCounts}
 }
 
 func (s *stats) taskMixView(duration, slo float64) map[string]any {
@@ -344,6 +346,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	}
 	for _, s := range []*stats{l.all, l.typed(j.kind)} {
 		s.Results[r.category]++
+		if !j.generated.IsZero() {
+			s.generationLag.add(j.generated.Sub(j.scheduled), &l.budget)
+		}
 		if j.cpuCancel {
 			if s.cancelResults == nil {
 				s.cancelResults = map[string]uint64{}
@@ -508,7 +513,7 @@ func openEvents(path string, taskMix ...bool) (*eventWriter, error) {
 		header := []string{"rid", "type", "index", "scheduled_ns", "sent_ns", "completed_ns", "attempt_started_ns", "terminal", "status", "request_bytes_written", "response_bytes_read", "late_response", "reused_connection", "dial_duration_ns", "stage"}
 		mixed := len(taskMix) > 0 && taskMix[0]
 		if mixed {
-			header = append(header, "stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed")
+			header = append(header, "stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed", "generated_ns")
 		}
 		err := csvw.Write(header)
 		var total int64
@@ -524,7 +529,7 @@ func openEvents(path string, taskMix ...bool) (*eventWriter, error) {
 			}
 			record := []string{row.j.rid, row.j.kind, strconv.FormatUint(row.j.index, 10), format(row.j.scheduled), format(row.result.sent), format(row.result.completed), format(row.began), row.result.category, strconv.Itoa(row.result.status), strconv.FormatInt(row.result.bytesWritten, 10), strconv.FormatInt(row.result.bytesRead, 10), strconv.FormatBool(row.result.late), strconv.FormatBool(row.result.reused), strconv.FormatInt(row.result.dialTime.Nanoseconds(), 10), row.result.stage}
 			if mixed {
-				record = append(record, strconv.FormatUint(row.j.streamIndex, 10), strconv.FormatBool(row.j.cpuCancel), format(row.result.cancelDue), format(row.result.cancelIssued), strconv.FormatBool(row.result.writeComplete))
+				record = append(record, strconv.FormatUint(row.j.streamIndex, 10), strconv.FormatBool(row.j.cpuCancel), format(row.result.cancelDue), format(row.result.cancelIssued), strconv.FormatBool(row.result.writeComplete), format(row.j.generated))
 			}
 			for _, v := range record {
 				total += int64(len(v) + 1)
@@ -676,6 +681,12 @@ func (w *worker) execute(j job) {
 }
 
 func enqueuePlanned(c config, l *ledger, j job, queue chan<- job, now time.Time) {
+	// This existing timestamp distinguishes a late dispatcher from delay in
+	// the client queue, connection acquisition, Write, or service backpressure.
+	// It adds no timer, syscall or per-arrival ledger lock.
+	if c.workload == "task_mix" {
+		j.generated = now
+	}
 	// The cutoff defines the arrival plan and the throughput window, not a
 	// replacement deadline. A delayed plan retains only its original budget.
 	if !now.Before(j.scheduled.Add(c.timeout)) {
@@ -1285,11 +1296,12 @@ func run(c config) (map[string]any, error) {
 	clocks["tail_policy"] = "planned arrivals may start after cutoff only before their original scheduled_at+timeout; late window completions never increase window goodput"
 	clocks["actual_clock_frozen"] = "after all planned requests reached one terminal state; does not renew the planned cutoff or request deadlines"
 	if c.workload == "task_mix" {
+		clocks["generated_definition"] = "arrival dispatcher timestamp before bounded client queue; existing clock sample, includes generator scheduling/plan work but excludes worker queue/dial/Write"
 		clocks["cpu_rate"] = c.cpuRate
 		clocks["task_mix_short_SLO_ms"] = c.taskMixShortSLOMS
 		clocks["cpu_cancel_every"] = c.cpuCancelEvery
 		clocks["cpu_cancel_delay_us"] = c.cpuCancelDelay.Microseconds()
-		out["task_mix"] = map[string]any{"short_type": "ok", "long_type": "cpu", "short_rate": c.rate, "cpu_rate": c.cpuRate, "short_SLO_ms": c.taskMixShortSLOMS, "arrival_plan": "independent absolute streams, same-time short first; CPU sequence selects seeds[3,11]; optional reset every10th CPU plan", "normal_long_denominator": "CPU planned minus predesignated cancellation plans; all cancelled/unsent/error rows remain in full ledger and planned_cancellation", "reset_samples": l.cancelSamples, "reset_scope": "full request write then sent+delay TCP SetLinger(0)+Close; timestamp precedes successful Close, not proof peer receipt, execution stop or resource reuse", "cancel_seed_scope": "with alternating[3,11] and every10th plan, predesignated resets use seed11", "CSV_extra_fields": []string{"stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed"}}
+		out["task_mix"] = map[string]any{"short_type": "ok", "long_type": "cpu", "short_rate": c.rate, "cpu_rate": c.cpuRate, "short_SLO_ms": c.taskMixShortSLOMS, "arrival_plan": "independent absolute streams, same-time short first; CPU sequence selects seeds[3,11]; optional reset every10th CPU plan", "normal_long_denominator": "CPU planned minus predesignated cancellation plans; all cancelled/unsent/error rows remain in full ledger and planned_cancellation", "reset_samples": l.cancelSamples, "reset_scope": "full request write then sent+delay TCP SetLinger(0)+Close; timestamp precedes successful Close, not proof peer receipt, execution stop or resource reuse", "cancel_seed_scope": "with alternating[3,11] and every10th plan, predesignated resets use seed11", "CSV_extra_fields": []string{"stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed", "generated_ns"}}
 	}
 	runEnd := time.Now()
 	clocks["run_end_offset_ns"] = offset(runEnd, l.origin)

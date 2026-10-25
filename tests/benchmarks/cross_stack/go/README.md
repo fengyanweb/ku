@@ -24,12 +24,32 @@ internal admission scheme. Timer/TCP waits suspend goroutines. `/metrics` report
 actual `waiting_timer`, `waiting_tcp`, and active business handlers, excluding
 the metrics query itself.
 
+Only `/work` derives a three-second absolute context deadline at handler entry,
+before input validation and CPU channel admission. Queue waiting consumes this
+same deadline; a worker never starts a fresh three-second timeout. Other routes
+keep their original 45-second contexts and the server's existing socket limits.
+The original batch `checksum` remains unchanged. The HTTP `checksumContext` runs
+the same integer kernel and checks cancellation before each fixed 512-iteration
+chunk and before publishing a result. The chunk is a cooperative observation
+boundary, not a wall-clock stop guarantee under OS scheduling delays.
+
 `actual_cpu_jobs` retains queued and running work after an HTTP request cancels.
-The worker releases this count only when computation finishes or an already
-cancelled queued job is actually removed. A rejected full queue refunds its
-brief publication reservation immediately. The comparison runner must observe
-this count, rather than treating an empty HTTP handler count as completed CPU
-work before freezing the service.
+The worker releases this count only when the real checksum operation returns,
+including an observed running cancellation, or an already canceled queued job
+is actually removed. Its buffered result carries success or cancellation, so
+an abandoned HTTP waiter cannot block worker retirement. A rejected full queue
+refunds its brief publication reservation immediately. The comparison runner
+must observe this count, rather than treating an empty HTTP handler count as
+completed CPU work before freezing the service.
+
+Metrics also state `cpu_queue_length`, `cpu_queue_capacity`, `cpu_workers`,
+`gomaxprocs`, `cpu_cancel_chunk`, and `cpu_timeout_ms`. These are queue/configuration
+observations, not a per-Task memory ledger or the total OS thread count. The
+whole service's actual process/thread/memory usage still needs the external
+resource-domain observer. Unit regressions verify identical seed-3/11 results,
+pre-canceled and running exits, queued ownership, request-origin deadlines and
+full-queue refunds. They do not establish the transport-linked 100ms stop / 500ms
+reuse qualification; that requires a separately recorded real-client window.
 
 The same metrics request reads cumulative standard `runtime/metrics` GC-cycle,
 heap allocation/free bytes and objects, live heap, heap objects, and GC CPU

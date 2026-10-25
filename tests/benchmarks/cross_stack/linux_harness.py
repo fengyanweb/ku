@@ -371,6 +371,14 @@ class Domain:
                   'cpu_stat': counters(self.path / 'cpu.stat'),
                   'memory_stat': counters(self.path / 'memory.stat'),
                   'memory_events': counters(self.path / 'memory.events')}
+        # Preserve the actual PSI text and scheduler runtime/runqueue counters.
+        # Neither a missing field nor a page fault is evidence of swap I/O.
+        result['pressure'] = {}
+        for kind in ('cpu', 'memory', 'io'):
+            try:
+                result['pressure'][kind] = (self.path / (kind+'.pressure')).read_text()
+            except OSError:
+                result['pressure'][kind] = None
         for key in ('memory.current', 'memory.peak', 'pids.current'):
             try:
                 result[key.replace('.', '_')] = int((self.path / key).read_text().strip())
@@ -385,6 +393,8 @@ class Domain:
                       pss_scope='sum of process proportional resident pages',
                       voluntary_context_switches_live_threads=0,nonvoluntary_context_switches_live_threads=0,
                       migrations_live_threads=0,last_cpu_thread_counts={},scheduler_threads_observed=0,
+                      scheduler_runtime_ns_live_threads=0,scheduler_runqueue_ns_live_threads=0,
+                      minor_faults_live_processes=0,major_faults_live_processes=0,
                       scheduler_scope='live-thread cumulative counters; terminated threads disappear, never treat a negative delta as zero-cost')
         for pid in pids:
             proc = Path('/proc') / str(pid)
@@ -405,10 +415,16 @@ class Domain:
                         cpu=(task/'stat').read_text().rsplit(')',1)[1].split()[36]
                         result['last_cpu_thread_counts'][cpu]=result['last_cpu_thread_counts'].get(cpu,0)+1
                         result['scheduler_threads_observed']+=1
+                        schedstat=(task/'schedstat').read_text().split()
+                        result['scheduler_runtime_ns_live_threads']+=int(schedstat[0])
+                        result['scheduler_runqueue_ns_live_threads']+=int(schedstat[1])
                     except (OSError,ValueError,IndexError):
                         pass
                 result['fd'] += len(list((proc / 'fd').iterdir()))
                 status = (proc / 'status').read_text()
+                stat=(proc/'stat').read_text().rsplit(')',1)[1].split()
+                result['minor_faults_live_processes']+=int(stat[7])
+                result['major_faults_live_processes']+=int(stat[9])
                 for line in status.splitlines():
                     if line.startswith('VmRSS:'):
                         result['sum_rss_bytes'] += int(line.split()[1]) * 1024

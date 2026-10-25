@@ -17,7 +17,7 @@ BENCH_ADDR=127.0.0.1:8080 BENCH_WORKERS=4 BENCH_CPU_WORKERS=4 \
 ```
 
 See `../protocol.json` for the frozen endpoints, corpora and SLO/resource rules.
-`BENCH_WORKERS` configures Tokio async workers; `BENCH_CPU_WORKERS` separately
+On the default `BENCH_RUNTIME=multi-thread`, `BENCH_WORKERS` configures Tokio async workers; `BENCH_CPU_WORKERS` separately
 sets both the spawn-blocking pool maximum and CPU concurrency semaphore. Both
 are 1/2/4 in the formal groups. Timer, TCP and PG operations remain asynchronous;
 the legacy CPU mode runs through `spawn_blocking`, never on an async event worker.
@@ -26,7 +26,8 @@ used as an application backlog. Already-running CPU work retains its permit
 until actual completion, including after an HTTP future is dropped.
 
 `BENCH_MAX_ACTIVE` (1024) and `BENCH_MAX_PENDING` (128) configure shared admission
-semaphores. Queue admission plus execution have one 45s service deadline; clients
+semaphores. The legacy mode has one 45s service deadline; the explicit CPU modes
+below instead keep their existing 3s deadline across admission and execution. Clients
 use the separate frozen ordinary/long-wait absolute deadlines. Axum/Hyper does
 not expose a native whole-server accepted-socket cap in this implementation;
 `BENCH_MAX_CONNECTIONS` is not enforced here, and the observed connections plus
@@ -50,8 +51,10 @@ observational snapshot, not a globally atomic transaction. `--batch` emits
 `{checksums:[integer],compute_ms:number}`; input/process startup are excluded from
 its internal timer and still belong in the driver's outer cost measurement.
 
-`actual_cpu_jobs` counts accepted CPU jobs until their real completion, including
-when the HTTP future is cancelled. It must be zero before a process is frozen.
+`actual_cpu_jobs` counts owned CPU resource records, including jobs waiting for a
+CPU permit, until their real release even when the HTTP future is cancelled. It
+is not a count of threads currently executing CPU instructions. It must be zero
+before a process is frozen.
 Repeat zero is allowed only for the separate cold-start observation; its elapsed
 time is never subtracted from the computation workload.
 
@@ -131,3 +134,70 @@ unit tests. Stopping the worker within 100ms and physical resource reuse within
 The permanent unit tests cover the frozen kernel, cancellation before work and
 ownership of a running pool worker's permit after its waiter is dropped. They do
 not replace transport, queue-overload, physical-reuse or SLO qualification.
+
+## Additional low-memory topology candidates
+
+The original two-async-worker/two-CPU-worker reference remains available. Its
+runtime is still the default. The following two opt-in candidates keep the same
+service cgroup budget and request/queue/deadline/cancellation requirements:
+
+| Candidate | Runtime | `BENCH_WORKERS` | `BENCH_CPU_WORKERS` | Mode | Chunk |
+|---|---|---:|---:|---|---:|
+| `ct-pool1-512` | `current-thread` | 1 | 1 | `bounded-cancel` | 512 |
+| `ct-pool1-4096` | `current-thread` | 1 | 1 | `bounded-cancel` | 4096 |
+
+```sh
+BENCH_RUNTIME=current-thread BENCH_WORKERS=1 BENCH_CPU_WORKERS=1 \
+  BENCH_CPU_MODE=bounded-cancel BENCH_CPU_CHUNK=512 \
+  BENCH_MAX_ACTIVE=1024 BENCH_MAX_PENDING=128 \
+  BENCH_ADDR=127.0.0.1:8080 /absolute/cache/cross-stack-rust/release/ku-cross-stack-rust
+```
+
+`current-thread` drives I/O/timers on the caller's main thread and creates no
+Tokio async worker threads. The CPU semaphore and maximum blocking pool both
+remain one for these candidates. `BENCH_WORKERS=1` is required explicitly, so a
+multi-thread configuration cannot silently be relabelled as one worker. Startup
+and metrics expose the topology, async worker count, main-thread role and maximum
+blocking workers. These are configuration facts; actual main/blocking/auxiliary
+threads, CPU and memory must still be measured for the whole process/cgroup.
+
+The two candidates separate I/O from one bounded compute worker and reduce the
+number of configured execution threads. Lower RSS, sufficient throughput and
+100ms/500ms cancellation behavior are hypotheses to qualify, not promised results.
+The best qualified throughput opponent and the qualified lowest-memory opponent
+may differ; retain the original reference and report the entire finite candidate
+set. No custom allocator, weakened work, retries, longer deadline or dependency
+change is introduced.
+
+## HTTP-stage trace coverage and unresolved historical samples
+
+With `BENCH_CPU_TRACE=1`, valid-RID `/work` requests now also record
+`http_observed`, `http_admission_wait`/`http_admission_started`, any
+`http_admission_rejected`, and either `http_response_ready` (with `http_status`)
+or `http_future_dropped`. A CPU pending-queue refusal records
+`cpu_queue_rejected` before any CPU `Control`/resource record exists. These events
+use the same bounded ring, sequence/drop counters and 256-event pages. `/ok` is
+not added to this trace. Disabled tracing does not parse another query or allocate
+a request guard; the diagnostic guard is boxed only when enabled.
+
+HTTP events have no CPU ownership snapshots. `http_admission_started` means the
+HTTP active permit was acquired, not that CPU work started. A response being
+ready does not prove a socket write or peer receipt; a future drop alone does not
+identify RST as its cause. Physical CPU release still requires the real
+`stopped` and `reusable` events, and client RST timestamps still define the
+100ms/500ms bounds. The guard records a completed HTTP response only once.
+
+The previous four diagnostics contain 98 RST RIDs without a CPU trace. The old
+trace began only after CPU pending admission, so missing records cannot uniquely
+distinguish unread/reset requests from HTTP or CPU queue refusal. Five separate
+`tokio-coop` queued samples exceeded 100ms even with the latest-Close timing bound.
+Their transport-versus-runtime delay is unproven. These historical failures and
+unknowns remain valid records. The added stages can classify newly observed
+requests; a RID absent even from `http_observed` remains unknown and must not be
+counted as passed. No existing sample is repaired retroactively.
+
+Trace-enabled qualification and trace-disabled performance runs are separate.
+The new unit cases exercise HTTP-versus-CPU receipts, visible queue refusal and
+dropping a genuinely queued future without returning an unrelated holder's
+permit. They do not establish wire-level stop latency or fix the historical
+queued-runtime delay by themselves.

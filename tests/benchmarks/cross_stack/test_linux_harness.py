@@ -9,6 +9,7 @@ import tempfile
 import types
 from pathlib import Path
 from unittest import mock
+from task_cpu_window import generation_gate
 
 from linux_harness import (arrival_cpu, business_send_end, measurement_clock, quiet_metrics,
                            qualification, recovery_probe_views, upper_point, aggregate_rounds,
@@ -27,6 +28,21 @@ def clock(origin=100_000_000_000, uncertainty=1000):
 def event(rid, planned, completed, terminal='correct'):
     return {'rid': rid, 'scheduled_ns': str(planned), 'completed_ns': str(completed),
             'terminal': terminal}
+
+
+class DispatchGateTest(unittest.TestCase):
+    def test_all_plan_dispatch_is_distinct_from_backpressure_and_missing_records(self):
+        driver = {"ledger": {"planned": 100,
+                            "scheduled_to_generated": {"count": 100, "p99_ms": 1},
+                            "scheduled_to_sent": {"count": 90, "p99_ms": 40}}}
+        cost = {"available": True, "usage_usec": {"seconds": .2}}
+        self.assertTrue(generation_gate(driver, cost, 0, 1_000_000_000)["passed"])
+        driver["ledger"]["scheduled_to_generated"]["count"] = 90
+        self.assertFalse(generation_gate(driver, cost, 0, 1_000_000_000)["passed"])
+        del driver["ledger"]["scheduled_to_generated"]
+        legacy = generation_gate(driver, cost, 0, 1_000_000_000)
+        self.assertFalse(legacy["passed"])
+        self.assertIn("legacy", legacy["basis"])
 
 
 class QuietMetricsTest(unittest.TestCase):

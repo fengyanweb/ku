@@ -799,7 +799,7 @@ func TestTaskMixCancellationPlanAndNormalDenominators(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events.offer(event{j: job{kind: "cpu", rid: "reset", streamIndex: 9, cpuCancel: true, scheduled: origin}, origin: origin, result: result{category: "planned_reset", sent: origin, completed: origin.Add(time.Millisecond), cancelDue: origin.Add(250 * time.Microsecond), cancelIssued: origin.Add(300 * time.Microsecond), writeComplete: true}})
+	events.offer(event{j: job{kind: "cpu", rid: "reset", streamIndex: 9, cpuCancel: true, scheduled: origin, generated: origin.Add(100 * time.Microsecond)}, origin: origin, result: result{category: "planned_reset", sent: origin, completed: origin.Add(time.Millisecond), cancelDue: origin.Add(250 * time.Microsecond), cancelIssued: origin.Add(300 * time.Microsecond), writeComplete: true}})
 	events.close()
 	file, err := os.Open(path)
 	if err != nil {
@@ -812,7 +812,7 @@ func TestTaskMixCancellationPlanAndNormalDenominators(t *testing.T) {
 	}
 	defer z.Close()
 	rows, err := csv.NewReader(z).ReadAll()
-	if err != nil || len(rows) != 2 || len(rows[0]) != 20 || rows[1][7] != "planned_reset" || rows[1][15] != "9" || rows[1][16] != "true" || rows[1][17] != "250000" || rows[1][18] != "300000" || rows[1][19] != "true" {
+	if err != nil || len(rows) != 2 || len(rows[0]) != 21 || rows[0][20] != "generated_ns" || rows[1][20] != "100000" || rows[1][7] != "planned_reset" || rows[1][15] != "9" || rows[1][16] != "true" || rows[1][17] != "250000" || rows[1][18] != "300000" || rows[1][19] != "true" {
 		t.Fatal(rows, err)
 	}
 }

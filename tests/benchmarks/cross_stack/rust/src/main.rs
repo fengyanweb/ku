@@ -1,5 +1,6 @@
 mod cpu_work;
 mod pg_mode;
+mod runtime_config;
 
 use axum::{
     body::to_bytes,
@@ -88,6 +89,7 @@ struct App {
     cpu_pending: Arc<Semaphore>,
     cpu_config: cpu_work::Config,
     cpu_trace: Arc<cpu_work::Trace>,
+    runtime_plan: runtime_config::Plan,
     counters: Counters,
     db: Option<Pool>,
     pg_mode: pg_mode::Mode,
@@ -159,21 +161,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = bounded("BENCH_WORKERS", 1, 1, 4);
     let cpu_workers = bounded("BENCH_CPU_WORKERS", workers, 1, 4);
     let cpu_config = cpu_work::Config::from_env()?;
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
-        .worker_threads(workers)
-        .max_blocking_threads(cpu_workers)
-        .enable_all();
-    if let Some(interval) = cpu_config.event_interval {
-        builder.event_interval(interval);
-    }
-    let runtime = builder.build()?;
-    runtime.block_on(serve(cpu_workers, cpu_config))
+    let runtime_name = std::env::var("BENCH_RUNTIME").ok();
+    let plan = runtime_config::Plan::parse(runtime_name.as_deref(), workers, cpu_workers)?;
+    let runtime = plan.build(cpu_config.event_interval)?;
+    runtime.block_on(serve(plan, cpu_config))
 }
 async fn serve(
-    cpu_workers: usize,
+    runtime_plan: runtime_config::Plan,
     cpu_config: cpu_work::Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cpu_workers = runtime_plan.cpu_workers;
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
     let active = bounded("BENCH_MAX_ACTIVE", 1024, 1, 65536);
     let pending = bounded("BENCH_MAX_PENDING", 128, 1, 65536);
@@ -204,6 +201,7 @@ async fn serve(
         cpu_pending: Arc::new(Semaphore::new(pending)),
         cpu_config,
         cpu_trace: Arc::new(cpu_work::Trace::new(cpu_config.trace)),
+        runtime_plan,
         counters: Counters::new(),
         pg_mode,
         db,
@@ -225,7 +223,7 @@ async fn serve(
     let listener = TcpListener::bind(&address).await?;
     eprintln!(
         "{}",
-        json!({"ready":true,"stack":"rust","async_workers":bounded("BENCH_WORKERS",1,1,4),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
+        json!({"ready":true,"stack":"rust","runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
     );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown())
@@ -261,19 +259,48 @@ async fn admission(State(app): State<Arc<App>>, mut request: Request, next: Next
         request.extensions_mut().insert(RequestDeadline(deadline));
         Some(deadline)
     };
+    // Diagnostic only: a complete CPU trace cannot identify requests rejected
+    // before a CPU Control exists. Observe only /work, keeping the high-rate
+    // short stream out of the same bounded ring. This is HTTP parsing evidence,
+    // not proof the peer received a response or that CPU resources stopped.
+    let mut request_trace = if app.cpu_config.trace && request.uri().path() == "/work" {
+        axum::extract::Query::<HashMap<String, String>>::try_from_uri(request.uri())
+            .ok()
+            .and_then(|mut query| query.0.remove("rid"))
+            .filter(|rid| {
+                !rid.is_empty() && rid.len() <= 16 && rid.bytes().all(|c| c.is_ascii_digit())
+            })
+            .and_then(|rid| cpu_work::RequestTrace::new(app.cpu_trace.clone(), &rid).map(Box::new))
+    } else {
+        None
+    };
     let operation = async {
         let permit: OwnedSemaphorePermit =
             if let Ok(permit) = app.active.clone().try_acquire_owned() {
                 permit
             } else {
                 let Ok(_waiting) = app.pending.clone().try_acquire_owned() else {
+                    if let Some(trace) = request_trace.as_ref() {
+                        trace.note("http_admission_rejected", "queue_full", Some(503));
+                    }
                     return text(StatusCode::SERVICE_UNAVAILABLE, "request queue full");
                 };
+                if let Some(trace) = request_trace.as_ref() {
+                    trace.note("http_admission_wait", "pending", None);
+                }
                 match app.active.clone().acquire_owned().await {
                     Ok(permit) => permit,
-                    Err(_) => return text(StatusCode::SERVICE_UNAVAILABLE, "service stopping"),
+                    Err(_) => {
+                        if let Some(trace) = request_trace.as_ref() {
+                            trace.note("http_admission_rejected", "closed", Some(503));
+                        }
+                        return text(StatusCode::SERVICE_UNAVAILABLE, "service stopping");
+                    }
                 }
             };
+        if let Some(trace) = request_trace.as_ref() {
+            trace.note("http_admission_started", "pending", None);
+        }
         let _count = Count::new(&app.counters.active);
         let response = next.run(request).await;
         drop(permit);
@@ -284,7 +311,12 @@ async fn admission(State(app): State<Arc<App>>, mut request: Request, next: Next
     } else {
         timeout(DEADLINE, operation).await
     };
-    response.unwrap_or_else(|_| text(StatusCode::GATEWAY_TIMEOUT, "request deadline"))
+    let response =
+        response.unwrap_or_else(|_| text(StatusCode::GATEWAY_TIMEOUT, "request deadline"));
+    if let Some(trace) = request_trace.as_mut() {
+        trace.response_ready(response.status().as_u16());
+    }
+    response
 }
 async fn metrics(State(app): State<Arc<App>>) -> Response {
     let mut snapshot = app.counters.snapshot();
@@ -296,6 +328,10 @@ async fn metrics(State(app): State<Arc<App>>) -> Response {
     snapshot["active_permits_available"] = json!(app.active.available_permits());
     snapshot["pending_permits_available"] = json!(app.pending.available_permits());
     snapshot["cpu_trace"] = app.cpu_trace.snapshot();
+    snapshot["runtime_topology"] = json!(app.runtime_plan.name());
+    snapshot["async_worker_threads"] = json!(app.runtime_plan.async_worker_threads());
+    snapshot["main_thread_role"] = json!(app.runtime_plan.main_thread_role());
+    snapshot["blocking_workers_max"] = json!(app.runtime_plan.cpu_workers);
     encoded(snapshot)
 }
 async fn handler(State(app): State<Arc<App>>, request: Request) -> Response {

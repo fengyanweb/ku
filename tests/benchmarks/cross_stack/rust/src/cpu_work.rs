@@ -86,6 +86,7 @@ struct Event {
     iteration: usize,
     started: bool,
     outcome: &'static str,
+    http_status: Option<u16>,
     cpu_permits_available: Option<usize>,
     actual_cpu_jobs: Option<usize>,
 }
@@ -148,6 +149,7 @@ impl Trace {
             iteration: control.iteration.load(Ordering::Relaxed),
             started: control.started.load(Ordering::Acquire),
             outcome: outcome_name(control.outcome.load(Ordering::Acquire)),
+            http_status: None,
             cpu_permits_available: control
                 .resource_counts
                 .as_ref()
@@ -157,6 +159,83 @@ impl Trace {
                 .as_ref()
                 .map(|(_, actual)| actual.load(Ordering::Relaxed)),
         });
+    }
+
+    fn request_event(
+        &self,
+        rid: &str,
+        event: &'static str,
+        outcome: &'static str,
+        http_status: Option<u16>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now = monotonic_ns();
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.sequence = events.sequence.saturating_add(1);
+        if events.rows.len() == TRACE_CAPACITY {
+            events.dropped = events.dropped.saturating_add(1);
+            return;
+        }
+        let sequence = events.sequence;
+        events.rows.push_back(Event {
+            sequence,
+            rid: rid.to_owned(),
+            event,
+            monotonic_ns: now,
+            iteration: 0,
+            started: false,
+            outcome,
+            http_status,
+            cpu_permits_available: None,
+            actual_cpu_jobs: None,
+        });
+    }
+}
+
+/// HTTP lifecycle observation, separate from physical CPU ownership.
+///
+/// A parsed request may be rejected before a CPU Control exists. Conversely,
+/// absence of this guard's first event is still not proof a request reached the
+/// server. `response_ready` is not a socket write or a CPU stop receipt.
+pub struct RequestTrace {
+    trace: Arc<Trace>,
+    rid: String,
+    responded: bool,
+}
+
+impl RequestTrace {
+    pub fn new(trace: Arc<Trace>, rid: &str) -> Option<Self> {
+        if !trace.enabled {
+            return None;
+        }
+        let value = Self {
+            trace,
+            rid: rid.to_owned(),
+            responded: false,
+        };
+        value.note("http_observed", "pending", None);
+        Some(value)
+    }
+
+    pub fn note(&self, event: &'static str, outcome: &'static str, status: Option<u16>) {
+        self.trace.request_event(&self.rid, event, outcome, status);
+    }
+
+    pub fn response_ready(&mut self, status: u16) {
+        if !self.responded {
+            self.responded = true;
+            self.note("http_response_ready", "response_ready", Some(status));
+        }
+    }
+}
+
+impl Drop for RequestTrace {
+    fn drop(&mut self) {
+        if !self.responded {
+            self.note("http_future_dropped", "future_dropped", None);
+        }
     }
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -372,10 +451,15 @@ pub struct Input<'a> {
     pub trace: Arc<Trace>,
 }
 pub async fn run(input: Input<'_>) -> Result<i64, Failure> {
-    let queue = input
-        .pending
-        .try_acquire_owned()
-        .map_err(|_| Failure::QueueFull)?;
+    let queue = match input.pending.try_acquire_owned() {
+        Ok(queue) => queue,
+        Err(_) => {
+            input
+                .trace
+                .request_event(input.rid, "cpu_queue_rejected", "queue_full", Some(503));
+            return Err(Failure::QueueFull);
+        }
+    };
     let mut control = Control::new(input.rid, input.trace);
     if control.trace.enabled {
         Arc::get_mut(&mut control)
@@ -435,6 +519,133 @@ pub async fn run(input: Input<'_>) -> Result<i64, Failure> {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn http_trace_distinguishes_response_from_future_drop_without_cpu_receipt() {
+        assert!(RequestTrace::new(Arc::new(Trace::new(false)), "1").is_none());
+        let trace = Arc::new(Trace::new(true));
+        {
+            let mut request = RequestTrace::new(trace.clone(), "1").unwrap();
+            request.response_ready(503);
+            request.response_ready(200); // A second call cannot forge another response.
+        }
+        drop(RequestTrace::new(trace.clone(), "2").unwrap());
+        let snapshot = trace.snapshot();
+        let rows = snapshot["events"].as_array().unwrap();
+        let events: Vec<_> = rows
+            .iter()
+            .map(|row| row["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "http_observed",
+                "http_response_ready",
+                "http_observed",
+                "http_future_dropped"
+            ]
+        );
+        assert_eq!(rows[1]["http_status"], 503);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["sequence"], (index + 1) as u64);
+            assert!(row["cpu_permits_available"].is_null());
+            assert!(row["actual_cpu_jobs"].is_null());
+        }
+        assert_eq!(snapshot["dropped"], 0);
+    }
+
+    #[test]
+    fn rejected_cpu_queue_is_visible_without_claiming_resources_existed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let trace = Arc::new(Trace::new(true));
+            let cpu = Arc::new(Semaphore::new(1));
+            let actual = Arc::new(AtomicUsize::new(0));
+            assert_eq!(
+                run(Input {
+                    rid: "3",
+                    iterations: 512000,
+                    seed: 3,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    config: Config {
+                        mode: Mode::Pool,
+                        chunk: 512,
+                        event_interval: None,
+                        trace: true
+                    },
+                    cpu: cpu.clone(),
+                    pending: Arc::new(Semaphore::new(0)),
+                    actual: actual.clone(),
+                    trace: trace.clone(),
+                })
+                .await,
+                Err(Failure::QueueFull)
+            );
+            assert_eq!(cpu.available_permits(), 1);
+            assert_eq!(actual.load(Ordering::Relaxed), 0);
+            let snapshot = trace.snapshot();
+            let rows = snapshot["events"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["event"], "cpu_queue_rejected");
+            assert_eq!(rows[0]["http_status"], 503);
+        });
+    }
+
+    #[test]
+    fn dropped_real_queued_future_releases_only_its_own_resources() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cpu = Arc::new(Semaphore::new(1));
+            let held = cpu.clone().acquire_owned().await.unwrap();
+            let pending = Arc::new(Semaphore::new(1));
+            let actual = Arc::new(AtomicUsize::new(0));
+            let trace = Arc::new(Trace::new(true));
+            let task = tokio::spawn(run(Input {
+                rid: "4",
+                iterations: 512000,
+                seed: 3,
+                deadline: Instant::now() + Duration::from_secs(3),
+                config: Config {
+                    mode: Mode::Pool,
+                    chunk: 512,
+                    event_interval: None,
+                    trace: true,
+                },
+                cpu: cpu.clone(),
+                pending: pending.clone(),
+                actual: actual.clone(),
+                trace: trace.clone(),
+            }));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while actual.load(Ordering::Relaxed) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(actual.load(Ordering::Relaxed), 0);
+            assert_eq!(pending.available_permits(), 1);
+            assert_eq!(cpu.available_permits(), 0); // The unrelated holder still owns it.
+            drop(held);
+            assert_eq!(cpu.available_permits(), 1);
+            let snapshot = trace.snapshot();
+            let rows = snapshot["events"].as_array().unwrap();
+            assert!(!rows.iter().any(|row| row["event"] == "started"));
+            let stopped = rows.iter().find(|row| row["event"] == "stopped").unwrap();
+            let reusable = rows.iter().find(|row| row["event"] == "reusable").unwrap();
+            assert_eq!(stopped["iteration"], 0);
+            assert_eq!(stopped["started"], false);
+            assert!(stopped["sequence"].as_u64().unwrap() < reusable["sequence"].as_u64().unwrap());
+        });
+    }
     #[test]
     fn frozen_kernel_chunks_keep_checksum_and_cancel_before_work() {
         for chunk in [512, 4096] {
