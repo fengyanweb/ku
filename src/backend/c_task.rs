@@ -34,11 +34,25 @@ struct CopyInitTransfer {
 
 struct LoopOutline {
     linear: scalar_region::LinearLoop,
+    trip: Option<CanonicalTrip>,
     inputs: Vec<SlotId>,
     outputs: Vec<SlotId>,
     locals: Vec<SlotId>,
     header_init: CopyInitTransfer,
     iteration_init: CopyInitTransfer,
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalTrip {
+    index: SlotId,
+    bound: SlotId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TripValue {
+    Index,
+    Next,
+    One,
 }
 
 impl CopyInitTransfer {
@@ -1317,6 +1331,111 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
     }
 
+    /// A deliberately small induction recognizer over verified typed states.
+    /// The ordinary outlined loop remains the fallback. No arithmetic is
+    /// reassociated, and the caller's one whole-drive range proof is retained.
+    fn outline_canonical_trip(
+        &self,
+        region: &scalar_region::ScalarLoop,
+        linear: &scalar_region::LinearLoop,
+    ) -> Option<CanonicalTrip> {
+        if !linear.body_when_true {
+            return None;
+        }
+        let TaskTerminator::Branch { condition, .. } =
+            self.function.states[region.header].terminator
+        else {
+            return None;
+        };
+        let mut aliases = (0..self.function.slots.len())
+            .map(|i| self.cached_scalar(SlotId(i)).then_some(SlotId(i)))
+            .collect::<Vec<_>>();
+        let mut trip = None;
+        for operation in &self.function.states[region.header].operations {
+            match *operation {
+                TaskOp::Read { .. } => {}
+                TaskOp::Copy { dst, src } if !self.cached_scalar(dst) && dst != condition => {
+                    aliases[dst.0] = Some(aliases[src.0]?);
+                }
+                TaskOp::Binary {
+                    dst,
+                    left,
+                    right,
+                    op: TaskBinaryOp::Less,
+                } if dst == condition && !self.cached_scalar(dst) && trip.is_none() => {
+                    let index = aliases[left.0]?;
+                    let bound = aliases[right.0]?;
+                    if index == bound
+                        || self.slot_type(index).ok()? != &IrType::Int
+                        || self.slot_type(bound).ok()? != &IrType::Int
+                    {
+                        return None;
+                    }
+                    trip = Some(CanonicalTrip { index, bound });
+                    aliases[dst.0] = None;
+                }
+                // Header writes/clears to persistent values or any other
+                // predicate could make a precomputed trip count observable.
+                _ => return None,
+            }
+        }
+        let trip = trip?;
+        let mut values = vec![None; self.function.slots.len()];
+        values[trip.index.0] = Some(TripValue::Index);
+        let mut index_writes = 0usize;
+        for &state in &linear.body {
+            for operation in &self.function.states[state].operations {
+                let (written, value, cleared) = match *operation {
+                    TaskOp::Init { dst, ref value } => (
+                        Some(dst),
+                        matches!(value, TaskConstant::Int(1)).then_some(TripValue::One),
+                        None,
+                    ),
+                    TaskOp::Copy { dst, src } => (Some(dst), values[src.0], None),
+                    TaskOp::Move { dst, src } => (Some(dst), values[src.0], Some(src)),
+                    TaskOp::Unary { dst, .. } => (Some(dst), None, None),
+                    TaskOp::Binary {
+                        dst,
+                        left,
+                        right,
+                        op,
+                    } => {
+                        let next = op == TaskBinaryOp::Add
+                            && matches!(
+                                (values[left.0], values[right.0]),
+                                (Some(TripValue::Index), Some(TripValue::One))
+                                    | (Some(TripValue::One), Some(TripValue::Index))
+                            );
+                        (Some(dst), next.then_some(TripValue::Next), None)
+                    }
+                    TaskOp::Read { .. } => (None, None, None),
+                    TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => (None, None, Some(slot)),
+                    TaskOp::ScopeEnter { ref tasks, .. } if tasks.is_empty() => (None, None, None),
+                    _ => return None,
+                };
+                if let Some(slot) = cleared {
+                    if slot == trip.index || slot == trip.bound {
+                        return None;
+                    }
+                    values[slot.0] = None;
+                }
+                if let Some(slot) = written {
+                    if slot == trip.bound {
+                        return None;
+                    }
+                    if slot == trip.index {
+                        index_writes += 1;
+                        if index_writes != 1 || value != Some(TripValue::Next) {
+                            return None;
+                        }
+                    }
+                    values[slot.0] = value;
+                }
+            }
+        }
+        (index_writes == 1).then_some(trip)
+    }
+
     fn outline_plan(&self, region: &scalar_region::ScalarLoop) -> Option<LoopOutline> {
         if !self.loop_active.get() || !self.range_active.get() {
             return None;
@@ -1433,6 +1552,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             return None;
         }
         Some(LoopOutline {
+            trip: self.outline_canonical_trip(region, &linear),
             linear,
             inputs,
             outputs,
@@ -1496,7 +1616,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         c_zero_initializer(self.slot_type(*slot)?)?
                     ));
                 }
-                out.push_str("  for (;result.iterations<max_iterations;result.iterations++) {\n");
+                if let Some(trip) = plan.trip {
+                    // Ordered signed comparison first; unsigned subtraction
+                    // then represents even the full i64 endpoint span. The
+                    // cast back is made only below the bounded size_t cap.
+                    out.push_str(&format!(
+                        "  /* canonical private trip; logical header entries remain exact */\n  uint64_t __ku_trip_span=0u;\n  if ({}>{}) __ku_trip_span=(uint64_t){}-(uint64_t){};\n  size_t __ku_trip_iterations=max_iterations;\n  if (__ku_trip_span<(uint64_t)max_iterations) __ku_trip_iterations=(size_t)__ku_trip_span;\n  for (;result.iterations<__ku_trip_iterations;result.iterations++) {{\n",
+                        self.place(trip.bound), self.place(trip.index),
+                        self.place(trip.bound), self.place(trip.index),
+                    ));
+                } else {
+                    out.push_str(
+                        "  for (;result.iterations<max_iterations;result.iterations++) {\n",
+                    );
+                }
                 for state in std::iter::once(region.header).chain(plan.linear.body.iter().copied())
                 {
                     out.push_str(&format!(
@@ -1508,7 +1641,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     {
                         self.emit_operation(out, operation, state, opid)?;
                     }
-                    if state == region.header {
+                    if state == region.header && plan.trip.is_none() {
                         let TaskTerminator::Branch { condition, .. } =
                             self.function.states[state].terminator
                         else {
@@ -1522,6 +1655,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     }
                 }
                 out.push_str("  }\n");
+                if plan.trip.is_some() {
+                    out.push_str(&format!(
+                        "  if (__ku_trip_span<(uint64_t)max_iterations) {{\nku_task_outline_range_{}_false_state_{}:;\n",
+                        region.header, region.header,
+                    ));
+                    for (opid, operation) in self.function.states[region.header]
+                        .operations
+                        .iter()
+                        .enumerate()
+                    {
+                        self.emit_operation(out, operation, region.header, opid)?;
+                    }
+                    out.push_str("  result.false_header=1;\n  }\n");
+                }
                 for slot in &plan.outputs {
                     out.push_str(&format!("  result.s_{}={};\n", slot.0, self.place(*slot)));
                 }

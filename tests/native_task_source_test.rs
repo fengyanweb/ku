@@ -31,7 +31,8 @@ fn native(source: &str) -> String {
 }
 
 // Instrument actual typed states in every emitted representation, including
-// bounded loop blocks. A generated entry/check label is not itself a state.
+// bounded loop blocks. The separate outlined false-header label is a real
+// header entry even for zero trips; an entry/check label is not a state.
 fn scalar_state_labels(drive: &str, state: usize) -> Vec<(String, bool)> {
     let suffix = format!("_state_{state}:;");
     drive
@@ -61,7 +62,12 @@ fn frame_probe_begin(generated: &str, id: usize) -> usize {
 
 #[test]
 fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and_caps() {
-    let mut generated=native("async fn Work(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=7; index=index+1 } return ok(value) } async fn main():null! { return ok(null) }");
+    let mut generated = native(
+        "async fn Work(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=7; index=index+1 } return ok(value) }
+         async fn StrideTwo(limit:int,seed:int):int! { index=0; while(index<limit) { index=index+2 } return ok(index) }
+         async fn ChangingBound(limit:int,seed:int):int! { bound=limit; index=0; while(index<bound) { bound=bound-1; index=index+1 } return ok(index) }
+         async fn main():null! { return ok(null) }",
+    );
     let marker = "/* outlined Task loops for frame 0 */";
     assert!(
         generated.contains(marker),
@@ -69,7 +75,7 @@ fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and
     );
     generated = generated.replacen(
         marker,
-        &format!("static size_t fixture_helper_entries;\n{marker}"),
+        &format!("static size_t fixture_helper_entries,fixture_helper_headers,fixture_first_iterations,fixture_first_headers,fixture_first_cap;\nstatic int fixture_first_false;\n{marker}"),
         1,
     );
     let helper = generated
@@ -77,14 +83,61 @@ fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and
         .unwrap();
     let body = helper + generated[helper..].find(") {").unwrap() + 3;
     let end = body + generated[body..].find("\n}\n").unwrap();
-    let helper_text = &generated[helper..end];
+    let mut helper_text = generated[helper..end].to_owned();
     assert!(
         !helper_text.contains("frame->")
             && !helper_text.contains("clock")
             && !helper_text.contains("KuTaskDriver")
             && !helper_text.contains("ku_int_")
     );
-    generated.insert_str(body, "\n  fixture_helper_entries++;");
+    assert!(helper_text.contains("/* canonical private trip;"));
+    let false_header = helper_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("ku_task_outline_") && line.contains("_false_state_"))
+        .expect("a false header has its own instrumentable typed-state label")
+        .to_owned();
+    let header_state = false_header
+        .split_once("_false_state_")
+        .unwrap()
+        .1
+        .trim_end_matches(":;")
+        .parse::<usize>()
+        .unwrap();
+    let headers = scalar_state_labels(&helper_text, header_state);
+    assert_eq!(headers.len(), 2, "normal and false header are both counted");
+    for (label, _) in headers {
+        helper_text =
+            helper_text.replacen(&label, &format!("{label}\n  fixture_helper_headers++;"), 1);
+    }
+    // A test-only smaller allowance gives exact cap/cap+1 oracles without
+    // changing the product phase cap or relying on today's typed IR size.
+    helper_text = helper_text.replacen(
+        ") {",
+        ") {\n  fixture_helper_entries++;\n  if(max_iterations>8u) max_iterations=8u;\n  size_t fixture_headers_before=fixture_helper_headers;\n  if(fixture_helper_entries==1u) fixture_first_cap=max_iterations;",
+        1,
+    );
+    helper_text = helper_text.replacen(
+        "  return result;",
+        "  if(fixture_helper_entries==1u) { fixture_first_iterations=result.iterations; fixture_first_false=result.false_header; fixture_first_headers=fixture_helper_headers-fixture_headers_before; }\n  return result;",
+        1,
+    );
+    generated.replace_range(helper..end, &helper_text);
+    for id in [1, 2] {
+        let begin = generated
+            .find(&format!("/* outlined Task loops for frame {id} */"))
+            .expect("noncanonical loops retain the ordinary small helper");
+        let end = begin
+            + generated[begin..]
+                .find(&format!(
+                    "static uint32_t ku_task_frame_{id}_spill_scalars("
+                ))
+                .unwrap();
+        assert!(
+            !generated[begin..end].contains("/* canonical private trip;"),
+            "different stride or changing bound must retain the exact fallback"
+        );
+    }
     let clock = "static uint64_t ku_task_driver_now_ms(void) {";
     assert_eq!(generated.matches(clock).count(), 1);
     generated=generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now(void) {",1);
@@ -95,22 +148,36 @@ fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and
     ) + r#"
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"outline line %d: %s\n",__LINE__,#c); return 1; } } while(0)
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
-static int fixture_case(int64_t limit,int private_mode) {
+static int fixture_case(int64_t limit,int private_mode,int variant) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t task_bytes=sizeof(KuTaskInstance_0);
+  if(task_bytes<sizeof(KuTaskInstance_1)) task_bytes=sizeof(KuTaskInstance_1);
+  if(task_bytes<sizeof(KuTaskInstance_2)) task_bytes=sizeof(KuTaskInstance_2);
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
-      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0),1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+      slots,1u,ring,1u,fixed+task_bytes,1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
   int64_t seed=3; KuTaskValueV1 task={0};
-  CHECK(ku_task_0_start_value(&driver,&limit,&seed,&task)==KU_TASK_DRIVER_OK);
-  fixture_helper_entries=0; uint64_t next=UINT64_MAX; KuTaskDriverSliceResultV1 sliced={0};
+  CHECK((variant==0 ? ku_task_0_start_value(&driver,&limit,&seed,&task)
+      :variant==1 ? ku_task_1_start_value(&driver,&limit,&seed,&task)
+      :ku_task_2_start_value(&driver,&limit,&seed,&task))==KU_TASK_DRIVER_OK);
+  fixture_helper_entries=fixture_helper_headers=fixture_first_iterations=fixture_first_headers=fixture_first_cap=0;
+  fixture_first_false=-1;
+  uint64_t next=UINT64_MAX; KuTaskDriverSliceResultV1 sliced={0};
   for(size_t turn=0;turn<256u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++) {
     CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,32u,1000u,2000u,NULL,NULL,&sliced)
         :ku_task_driver_pump(&driver,0u,1u,&next))<=KU_TASK_DRIVER_PENDING);
     if(private_mode) CHECK(sliced.work_credits<=32u);
   }
-  CHECK(private_mode ? fixture_helper_entries>0u : fixture_helper_entries==0u);
+  CHECK(private_mode && variant==0 ? fixture_helper_entries>0u : fixture_helper_entries==0u);
+  if(private_mode && variant==0) {
+    CHECK(fixture_first_cap==8u);
+    CHECK(fixture_first_iterations==(limit<=0 ? 0u : limit<8 ? (size_t)limit : 8u));
+    CHECK(fixture_first_false==(limit<8));
+    CHECK(fixture_first_headers==fixture_first_iterations+(size_t)fixture_first_false);
+  }
   KuTaskAdapterOutcomeV1 outcome={0}; CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
-  CHECK(outcome.value.integer.ok && outcome.value.integer.value==(limit ? 7 : seed));
+  int64_t expected=variant==0 ? (limit>0 ? 7 : seed) : limit<=0 ? 0 : variant==1 ? ((limit+1)/2)*2 : (limit+1)/2;
+  CHECK(outcome.value.integer.ok && outcome.value.integer.value==expected);
   ku_task_outcome_drop(&outcome);
   CHECK(ku_task_value_drop(&task,2000u)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
@@ -121,9 +188,10 @@ static int fixture_case(int64_t limit,int private_mode) {
   return 0;
 }
 int main(void) {
-  const int64_t limits[]={0,1,8,9,1000};
+  const int64_t limits[]={-1,0,1,7,8,9,1000};
   for(int private_mode=0;private_mode<2;private_mode++)
-    for(size_t i=0;i<sizeof(limits)/sizeof(limits[0]);i++) CHECK(!fixture_case(limits[i],private_mode));
+    for(int variant=0;variant<3;variant++)
+      for(size_t i=0;i<sizeof(limits)/sizeof(limits[0]);i++) CHECK(!fixture_case(limits[i],private_mode,variant));
   puts("task-outlined-private-linear-zero-output-ok"); return 0;
 }
 "#;
