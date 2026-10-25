@@ -3325,7 +3325,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         && !ku_http_task_slice_interrupted(&wake)) {
       ku_http_task_io_batch_reset(&task_io_batch);
       uint32_t sliced=ku_http_task_compute_slice(group->tasks,(size_t)owner->index,
-          KU_TASK_DRIVER_SLICE_MAX_CREDITS,batch_now,task_io_slice_deadline,
+          batch_now,task_io_slice_deadline,
           ku_http_task_slice_interrupted,&wake,&task_io_slice_turn.next_deadline,&task_io_slice_turn.force_io);
       if (sliced>1u && !listen_failure) listen_failure="HTTP Task computation slice failed";
       continue; /* Fresh maintenance/interests before any subsequent OS wait. */
