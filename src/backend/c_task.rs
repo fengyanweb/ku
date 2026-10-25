@@ -24,6 +24,31 @@ use super::{
 #[path = "c_task_region.rs"]
 mod scalar_region;
 
+#[derive(Clone, Copy, Default)]
+struct CopyInitTransfer {
+    cached_gen: u64,
+    cached_kill: u64,
+    local_gen: u64,
+    local_kill: u64,
+}
+
+impl CopyInitTransfer {
+    fn record(&mut self, bit: u64, cached: bool, initialized: bool) {
+        let (gen, kill) = if cached {
+            (&mut self.cached_gen, &mut self.cached_kill)
+        } else {
+            (&mut self.local_gen, &mut self.local_kill)
+        };
+        if initialized {
+            *gen |= bit;
+            *kill &= !bit;
+        } else {
+            *kill |= bit;
+            *gen &= !bit;
+        }
+    }
+}
+
 // Copy the complete bounded drive text while changing only actual return
 // statements. Source string literals may themselves contain C-looking text.
 // Unknown future return forms fail code generation instead of missing a spill.
@@ -226,6 +251,12 @@ pub(super) fn emit_frames(
                     .map(|state| emitter.scalar_direct_state(state))
                     .collect(),
             );
+            emitter.scalar_loops = scalar_region::ScalarLoops::build(
+                function,
+                &(0..function.states.len())
+                    .map(|state| emitter.scalar_direct_state(state))
+                    .collect::<Vec<_>>(),
+            );
         }
         if super::task_range::enabled() {
             emitter.range_plan = super::task_range::RangePlan::build(
@@ -262,6 +293,10 @@ struct FrameEmitter<'a> {
     scalar_init_cache_active: Cell<bool>,
     scalar_cache_mask: Cell<u64>,
     scalar_regions: scalar_region::ScalarRegions,
+    scalar_loops: scalar_region::ScalarLoops,
+    loop_active: Cell<bool>,
+    loop_error_prefix: Cell<Option<usize>>,
+    loop_init_transfer: Cell<Option<CopyInitTransfer>>,
     range_plan: Option<super::task_range::RangePlan>,
     range_active: Cell<bool>,
     range_fast: Cell<bool>,
@@ -415,6 +450,10 @@ impl<'a> FrameEmitter<'a> {
             scalar_init_cache_active: Cell::new(false),
             scalar_cache_mask: Cell::new(0),
             scalar_regions: scalar_region::ScalarRegions::default(),
+            scalar_loops: scalar_region::ScalarLoops::default(),
+            loop_active: Cell::new(false),
+            loop_error_prefix: Cell::new(None),
+            loop_init_transfer: Cell::new(None),
             range_plan: None,
             range_active: Cell::new(false),
             range_fast: Cell::new(false),
@@ -613,6 +652,11 @@ impl<'a> FrameEmitter<'a> {
     }
 
     fn set_init(&self, out: &mut COutput, slot: SlotId, initialized: bool) {
+        if let Some(mut transfer) = self.loop_init_transfer.get() {
+            transfer.record(1u64 << slot.0, self.cached_scalar(slot), initialized);
+            self.loop_init_transfer.set(Some(transfer));
+            return;
+        }
         out.push_str(&format!(
             "  {} {} {};\n",
             self.bitmap(slot),
@@ -1052,6 +1096,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                }}\n  __ku_dispatch_budget=64u;\n  }}\n"
         ));
         if self.scalar_cache_active.get() {
+            self.emit_scalar_loop_entry(out, state, false);
             if let Some(region) = self.scalar_regions.at_entry(state).filter(|region| {
                 !self.range_fast.get()
                     || region.states.iter().all(|&state| {
@@ -1089,8 +1134,231 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
     }
 
+    fn emit_loop_init_transfer(&self, out: &mut COutput, transfer: CopyInitTransfer) {
+        for (bitmap, gen, kill) in [
+            (
+                "__ku_copy_initialized",
+                transfer.cached_gen,
+                transfer.cached_kill,
+            ),
+            ("local_initialized", transfer.local_gen, transfer.local_kill),
+        ] {
+            if gen | kill != 0 {
+                out.push_str(&format!(
+                    "  {bitmap}=({bitmap} & ~UINT64_C({kill})) | UINT64_C({gen});\n"
+                ));
+            }
+        }
+    }
+
+    fn loop_variant_proved(&self, region: &scalar_region::ScalarLoop) -> bool {
+        !self.range_fast.get()
+            || region.states.iter().all(|&state| {
+                self.range_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.states[state])
+            })
+    }
+
+    fn emit_scalar_loop_entry(&self, out: &mut COutput, state: usize, charged: bool) {
+        if !self.loop_active.get() {
+            return;
+        }
+        let Some(region) = self.scalar_loops.at_header(state) else {
+            return;
+        };
+        if !self.loop_variant_proved(region) {
+            return;
+        }
+        let label = if self.range_fast.get() {
+            "range"
+        } else {
+            "scalar"
+        };
+        let mask = self.scalar_cache_mask.get();
+        let minimum = region.max_path_states * 2 - usize::from(charged);
+        out.push_str(&format!(
+            "  if (!cleanup && __ku_dispatch_budget>={minimum}u) {{\n"
+        ));
+        if charged {
+            out.push_str("  ++__ku_dispatch_budget;\n");
+        }
+        out.push_str(&format!(
+            "  if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n\
+               goto ku_task_loop_{label}_{state};\n  }}\n"
+        ));
+    }
+
+    fn emit_scalar_loop_dispatch_entry(&self, out: &mut COutput, state: usize) {
+        if !self.loop_active.get()
+            || !self.scalar_cache_active.get()
+            || self.scalar_loops.at_header(state).is_none()
+        {
+            return;
+        }
+        for range_fast in [false, true] {
+            if range_fast && !self.range_active.get() {
+                continue;
+            }
+            self.range_fast.set(range_fast);
+            if self.range_active.get() {
+                out.push_str(if range_fast {
+                    "  if (__ku_range_fast) {\n"
+                } else {
+                    "  if (!__ku_range_fast) {\n"
+                });
+            }
+            self.emit_scalar_loop_entry(out, state, true);
+            if self.range_active.get() {
+                out.push_str("  }\n");
+            }
+        }
+        self.range_fast.set(false);
+    }
+
+    fn emit_scalar_loop_transition(
+        &self,
+        out: &mut COutput,
+        region: &scalar_region::ScalarLoop,
+        target: usize,
+        block_cost: usize,
+    ) {
+        let label = if self.range_fast.get() {
+            "range"
+        } else {
+            "scalar"
+        };
+        if target == region.header {
+            out.push_str(&format!(
+                "  __ku_dispatch_budget-=__ku_loop_cost+{block_cost}u;\n  continue;\n"
+            ));
+        } else if region.states.binary_search(&target).is_ok() {
+            out.push_str(&format!(
+                "  __ku_loop_cost+={block_cost}u;\n  goto ku_task_loop_{label}_{}_state_{target};\n", region.header
+            ));
+        } else {
+            out.push_str(&format!(
+                "  __ku_dispatch_budget-=__ku_loop_cost+{block_cost}u;\n"
+            ));
+            if self.range_fast.get()
+                && self.scalar_direct_state(target)
+                && !self.range_plan.as_ref().unwrap().states[target]
+            {
+                out.push_str(&format!("  goto ku_task_scalar_check_{target};\n"));
+            } else {
+                self.emit_transition(out, target);
+            }
+        }
+    }
+
+    fn emit_scalar_loops(&self, out: &mut COutput) -> KuResult<()> {
+        if !self.loop_active.get() || !self.scalar_cache_active.get() {
+            return Ok(());
+        }
+        for range_fast in [false, true] {
+            if range_fast && !self.range_active.get() {
+                continue;
+            }
+            self.range_fast.set(range_fast);
+            self.scalar_init_cache_active.set(true);
+            let label = if range_fast { "range" } else { "scalar" };
+            for region in &self.scalar_loops.loops {
+                if !self.loop_variant_proved(region) {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "  /* typed native loop: header {}, latch {}, <= {} iterations,\n   * <= {} states/{} operations per iteration; exact taken-prefix debit.\n   * A chunk never crosses a bank, host, owner or real WAIT boundary. */\n\
+                     ku_task_loop_{label}_{}:;\n  {{\n\
+                     size_t __ku_loop_iterations=__ku_dispatch_budget/{}u;\n\
+                     if (__ku_loop_iterations>{}u) __ku_loop_iterations={}u;\n\
+                     for (;__ku_loop_iterations;--__ku_loop_iterations) {{\n\
+                     size_t __ku_loop_cost=0;\n\
+                     goto ku_task_loop_{label}_{}_state_{};\n",
+                    region.header, region.latch, region.max_iterations,
+                    region.max_path_states, region.max_path_operations,
+                    region.header, region.max_path_states, region.max_iterations,
+                    region.max_iterations, region.header, region.header
+                ));
+                for block in &region.blocks {
+                    self.loop_init_transfer
+                        .set(Some(CopyInitTransfer::default()));
+                    for (position, &index) in block.iter().enumerate() {
+                        out.check()?;
+                        self.loop_error_prefix.set(Some(position + 1));
+                        out.push_str(&format!(
+                            "ku_task_loop_{label}_{}_state_{index}:;\n",
+                            region.header
+                        ));
+                        let state = &self.function.states[index];
+                        for (operation_id, operation) in state.operations.iter().enumerate() {
+                            self.emit_operation(out, operation, index, operation_id)?;
+                        }
+                        if let TaskTerminator::ScopeDrain { .. } = state.terminator {
+                            out.push_str("  __ku_region_pending=1; __ku_region_cleanup_state=UINT32_MAX; __ku_region_cleanup_dirty=1;\n");
+                        } else if let TaskTerminator::Suspend { cleanup, .. } = state.terminator {
+                            out.push_str(&format!(
+                                "  __ku_region_cleanup_state={}u; __ku_region_cleanup_dirty=1;\n",
+                                cleanup.0
+                            ));
+                        }
+                    }
+                    self.loop_error_prefix.set(None);
+                    self.emit_loop_init_transfer(out, self.loop_init_transfer.take().unwrap());
+                    let last = *block.last().unwrap();
+                    match self.function.states[last].terminator {
+                        TaskTerminator::Jump { target }
+                        | TaskTerminator::ScopeDrain { ready: target, .. }
+                        | TaskTerminator::Suspend { resume: target, .. } => {
+                            self.emit_scalar_loop_transition(out, region, target.0, block.len());
+                        }
+                        TaskTerminator::Branch {
+                            condition,
+                            then_state,
+                            else_state,
+                        } => {
+                            out.push_str(&format!("  if ({}) {{\n", self.place(condition)));
+                            self.emit_scalar_loop_transition(
+                                out,
+                                region,
+                                then_state.0,
+                                block.len(),
+                            );
+                            out.push_str("  } else {\n");
+                            self.emit_scalar_loop_transition(
+                                out,
+                                region,
+                                else_state.0,
+                                block.len(),
+                            );
+                            out.push_str("  }\n");
+                        }
+                        _ => {
+                            return Err(unsupported(
+                                "non-scalar boundary in native Task loop proof",
+                            ))
+                        }
+                    }
+                }
+                out.push_str("  }\n  }\n");
+                // This is the next real cancellation observation. Any dirty
+                // PENDING/cleanup facts are published before its acquire.
+                out.push_str(&format!(
+                    "  goto ku_task_{label}_check_{};\n",
+                    region.header
+                ));
+            }
+        }
+        self.loop_error_prefix.set(None);
+        self.loop_init_transfer.set(None);
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
+        out.check()
+    }
+
     fn emit_scalar_region_header_flush(&self, out: &mut COutput) {
-        if self.scalar_cache_active.get() && !self.scalar_regions.regions.is_empty() {
+        if self.scalar_cache_active.get()
+            && (!self.scalar_regions.regions.is_empty() || !self.scalar_loops.loops.is_empty())
+        {
             // An empty lexical drain has a visible PENDING fact even before
             // the first quantum. Preserve it before any host/drop/error edge;
             // no observer or callback executes inside a pure region.
@@ -1307,8 +1575,33 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         let body = body.finish()?;
         let mut baseline = COutput::new(out.remaining());
         self.emit_scalar_drive_artifact(&mut baseline, &slots, &body, scalar_mask)?;
-        let baseline = baseline.finish()?;
+        let mut baseline = baseline.finish()?;
         drop(body);
+        if !self.scalar_loops.loops.is_empty() {
+            // Optional lowering must not reject an otherwise valid function
+            // when its extra labels/checked cold exits exceed the source cap.
+            // The original artifact is already complete and remains fallback.
+            const MAX_LOOP_EXTRA_SOURCE_BYTES: usize = 128 * 1024;
+            self.loop_active.set(true);
+            let limit = baseline
+                .len()
+                .saturating_add(MAX_LOOP_EXTRA_SOURCE_BYTES)
+                .min(out.remaining());
+            let mut candidate_body = COutput::new(limit);
+            let candidate = self
+                .emit_drive_body(&mut candidate_body)
+                .and_then(|()| candidate_body.finish())
+                .and_then(|body| {
+                    let mut artifact = COutput::new(limit);
+                    self.emit_scalar_drive_artifact(&mut artifact, &slots, &body, scalar_mask)?;
+                    artifact.finish()
+                });
+            if let Ok(candidate) = candidate {
+                baseline = candidate;
+            } else {
+                self.loop_active.set(false);
+            }
+        }
         let mut chosen = None;
         if self.range_plan.is_some() {
             super::task_range::attempted();
@@ -1336,6 +1629,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         self.scalar_cache_active.set(false);
         self.scalar_init_cache_active.set(false);
         self.range_fast.set(false);
+        self.loop_active.set(false);
+        self.loop_error_prefix.set(None);
+        self.loop_init_transfer.set(None);
         out.push_str(chosen.as_deref().unwrap_or(&baseline));
         out.check()
     }
@@ -1377,6 +1673,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_drive_body(&self, out: &mut COutput) -> KuResult<()> {
+        self.loop_error_prefix.set(None);
+        self.loop_init_transfer.set(None);
+        self.scalar_init_cache_active.set(false);
+        self.range_fast.set(false);
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
             self.prefix, self.frame_type
@@ -1386,7 +1686,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         if self.scalar_cache_active.get() {
             out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
-            if !self.scalar_regions.regions.is_empty() {
+            if !self.scalar_regions.regions.is_empty() || !self.scalar_loops.loops.is_empty() {
                 out.push_str("  int __ku_region_pending=0, __ku_region_cleanup_dirty=0;\n  uint32_t __ku_region_cleanup_state=UINT32_MAX;\n");
             }
         }
@@ -1462,6 +1762,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
             out.push_str(&format!("  case {index}u:\n"));
+            self.emit_scalar_loop_dispatch_entry(out, index);
             self.emit_scalar_region_dispatch_entry(out, index);
             if self.range_active.get() && self.scalar_direct_state(index) {
                 out.push_str(&format!("    if (__ku_range_fast) goto ku_task_range_state_{index}; goto ku_task_state_{index};\n"));
@@ -1840,6 +2141,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
         }
         self.emit_scalar_regions(out)?;
+        self.emit_scalar_loops(out)?;
         self.scalar_init_cache_active.set(false);
         self.range_fast.set(false);
         if !self.finally.state_cleanup.is_empty() {
@@ -2566,6 +2868,25 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_runtime_error(&self, out: &mut COutput, error: &str) -> KuResult<()> {
+        // A loop block has reserved capacity, not charged future work. A
+        // failing operation settles the states actually entered up to and
+        // including this state, and publishes only its preceding Copy effects.
+        // Later operations in that same state have not run.
+        let prefix = self.loop_error_prefix.take();
+        let transfer = self.loop_init_transfer.take();
+        if let Some(prefix) = prefix {
+            out.push_str(&format!(
+                "  __ku_dispatch_budget-=__ku_loop_cost+{prefix}u;\n"
+            ));
+            self.emit_loop_init_transfer(out, transfer.unwrap());
+        }
+        let result = self.emit_runtime_error_body(out, error);
+        self.loop_error_prefix.set(prefix);
+        self.loop_init_transfer.set(transfer);
+        result
+    }
+
+    fn emit_runtime_error_body(&self, out: &mut COutput, error: &str) -> KuResult<()> {
         self.emit_compute_close(out);
         self.emit_scalar_region_header_flush(out);
         let IrType::Result(inner) = &self.function.result else {
@@ -2606,6 +2927,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_slot_drop(&self, out: &mut COutput, slot: SlotId) -> KuResult<()> {
         if self.task_slot(slot) {
+            return Ok(());
+        }
+        if self.loop_init_transfer.get().is_some() {
+            // Loop eligibility admits only Copy scalars: conditional drop has
+            // no destructor and its complete effect is clearing this one bit.
+            self.set_init(out, slot, false);
             return Ok(());
         }
         let bitmap = self.bitmap(slot);
@@ -3060,6 +3387,27 @@ static int ku_task_frame_is_terminal(uint32_t status) {
 #[cfg(test)]
 mod scalar_spill_tests {
     use super::*;
+
+    #[test]
+    fn loop_copy_transfer_composes_each_taken_prefix_without_touching_other_bits() {
+        let changes = [(1u64, true), (2, false), (1, false), (4, true), (2, true)];
+        for initial in 0u64..16 {
+            let mut expected = initial;
+            let mut transfer = CopyInitTransfer::default();
+            for (bit, initialized) in changes {
+                transfer.record(bit, true, initialized);
+                if initialized {
+                    expected |= bit;
+                } else {
+                    expected &= !bit;
+                }
+                let actual = (initial & !transfer.cached_kill) | transfer.cached_gen;
+                assert_eq!(actual, expected); // Includes every cold error prefix.
+                assert_eq!(actual & 8, initial & 8); // Nonparticipating/owned bit.
+                assert_eq!(transfer.local_gen | transfer.local_kill, 0);
+            }
+        }
+    }
 
     #[test]
     fn scalar_spill_rewrites_code_and_preserves_quoted_data_comments_and_bounds() {
