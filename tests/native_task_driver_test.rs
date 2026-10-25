@@ -75,7 +75,7 @@ fn fixture_source_with_backedge(backedge: bool) -> String {
 #[test]
 fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
     let ast = Parser::new(
-        Lexer::new("import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<5000) { index=index+1 } return ok(index) } async fn Wait(): int! { time.sleep(100)? return ok(9) } async fn main(): null! { return ok(null) }")
+        Lexer::new("import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<500000) { index=index+1 } return ok(index) } async fn Wait(): int! { time.sleep(100)? return ok(9) } async fn Marker(): int! { return ok(17) } async fn main(): null! { return ok(null) }")
             .lex()
             .unwrap(),
     )
@@ -87,7 +87,7 @@ fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
     for (old, new) in [
         (
             "typedef struct KuString {",
-            format!("{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\nstatic size_t fixture_claims,fixture_resumes,fixture_cancel_at;\nstatic size_t fixture_credits,fixture_states,fixture_unreported;\nstatic uint64_t fixture_clock=1000u;\nstatic KuTestEvent fixture_cancel_entered,fixture_cancel_release;\ntypedef struct KuString {{"),
+            format!("{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\nstatic size_t fixture_claims,fixture_resumes,fixture_cancel_at,fixture_tick_at,fixture_pause_poll;\nstatic size_t fixture_credits,fixture_states,fixture_unreported;\nstatic uint64_t fixture_clock=1000u;\nstatic KuTestEvent fixture_cancel_entered,fixture_cancel_release;\ntypedef struct KuString {{"),
         ),
         (
             "static uint64_t ku_task_driver_now_ms(void) {",
@@ -96,6 +96,10 @@ fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
         (
             "  if (!ku_task_control_atomic_cas(&control->executor, &expected, 1))\n    return KU_TASK_CONTROL_PENDING;",
             "  if (!ku_task_control_atomic_cas(&control->executor, &expected, 1))\n    return KU_TASK_CONTROL_PENDING;\n  fixture_claims++;".to_string(),
+        ),
+        (
+            "outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);",
+            "outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);\n      if(fixture_pause_poll && outcome==KU_TASK_CONTROL_PENDING) { fixture_pause_poll=0; if(!ku_test_event_set(&fixture_cancel_entered) || !ku_test_event_wait(&fixture_cancel_release,2000u)) abort(); }".to_string(),
         ),
         (
             "static uint32_t ku_task_0_resume(void* raw) {",
@@ -112,6 +116,7 @@ static uint32_t ku_task_0_resume(void* raw) {
     if(!ku_test_event_set(&fixture_cancel_entered)
         || !ku_test_event_wait(&fixture_cancel_release,2000u)) abort();
   }
+  if(fixture_tick_at && fixture_resumes==fixture_tick_at) fixture_clock++;
   uint32_t result=fixture_original_resume(raw);
   KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
   if(!execution || execution->control!=&instance->control) abort();
@@ -133,6 +138,7 @@ static uint32_t fixture_original_resume(void* raw) {"#.to_string(),
     generated.push_str(r#"
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"pure segment line %d: %s\n",__LINE__,#c); return 1; } } while(0)
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_slice_wake(void* raw) { return *(int*)raw; }
 typedef struct FixtureCancel {
   KuTaskDriverTicketV1 ticket;
   KuTaskControlLeaseV1 lease;
@@ -148,10 +154,10 @@ static int fixture_cancel_worker(void* raw) {
   return ku_test_event_set(&fixture_cancel_release) ? 0 : 2;
 }
 int main(void) {
-  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
-      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+      slots,2u,ring,2u,fixed+2u*(sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2)),1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
   KuTaskValueV1 work={0}; CHECK(ku_task_0_start_value(&driver,&work)==KU_TASK_DRIVER_OK);
   fixture_observer=&work.owner.lease;
   uint64_t next=UINT64_MAX;
@@ -163,6 +169,54 @@ int main(void) {
   CHECK(fixture_credits==32u && fixture_states==2048u && !fixture_unreported);
   CHECK(fixture_resumes==8u && driver.polls==1u+fixture_resumes && fixture_claims==1u);
   CHECK(driver.queued==1u && next==0u && !ku_task_driver_execution);
+  KuTaskDriverSliceResultV1 sliced={0}; int late_wake=1;
+  sliced.work_credits=77u;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,0u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_INVALID_ARGUMENT && sliced.work_credits==77u);
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4097u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_INVALID_ARGUMENT && sliced.work_credits==77u);
+  CHECK(ku_task_driver_compute_slice(&driver,1u,32u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_INVALID_ARGUMENT && sliced.work_credits==77u);
+  uint64_t before_slice_polls=driver.polls;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      fixture_slice_wake,&late_wake,&sliced)==KU_TASK_DRIVER_PENDING);
+  CHECK(sliced.reason==KU_TASK_SLICE_WAKE && !sliced.work_credits && !sliced.resume_calls
+      && !sliced.segments && sliced.next_deadline==0u && driver.polls==before_slice_polls);
+  late_wake=0;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,fixture_clock,
+      fixture_slice_wake,&late_wake,&sliced)==KU_TASK_DRIVER_PENDING);
+  CHECK(sliced.reason==KU_TASK_SLICE_HTTP_DEADLINE && !sliced.work_credits);
+  /* The first CPU task gets at most its original 32-credit FIFO selection.
+   * A queued short task then completes and ends the WHOLE slice for I/O. */
+  KuTaskValueV1 marker={0}; CHECK(ku_task_2_start_value(&driver,&marker)==KU_TASK_DRIVER_OK);
+  KuTaskDriverTicketV1 marker_ticket=marker.ticket;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_COMPLETE && sliced.segments==2u
+      && sliced.work_credits==33u && sliced.resume_calls==9u);
+  CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING);
+  KuTaskAdapterOutcomeV1 mark={0}; CHECK(ku_task_value_take(&marker,NULL,&mark)==KU_TASK_CONTROL_OK);
+  CHECK(mark.value.integer.ok && mark.value.integer.value==17); ku_task_outcome_drop(&mark);
+  CHECK(ku_task_value_drop(&marker,2000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && slots[marker_ticket.slot].state!=KU_TASK_DRIVER_FREE;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(slots[marker_ticket.slot].state==KU_TASK_DRIVER_FREE);
+  fixture_claims=fixture_resumes=fixture_credits=fixture_states=fixture_unreported=0;
+  before_slice_polls=driver.polls;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_WORK_CAP && sliced.work_credits==4096u
+      && sliced.resume_calls==1024u && sliced.segments==128u);
+  CHECK(fixture_credits==4096u && fixture_states==262144u && !fixture_unreported);
+  CHECK(fixture_claims==128u && driver.polls-before_slice_polls==1024u && driver.queued==1u);
+  /* A tick inside selection two must stop the entire API. It cannot start
+   * another Task/segment with a newly minted 1ms origin. */
+  fixture_resumes=0; fixture_tick_at=9u;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_TIME && sliced.segments==2u
+      && sliced.work_credits==33u && sliced.resume_calls==9u);
+  fixture_tick_at=0;
   /* Publication at a real resume boundary must stop the private segment and
    * enter the existing cancellation cleanup arbitration with the original D. */
   CHECK(ku_test_event_init(&fixture_cancel_entered) && ku_test_event_init(&fixture_cancel_release));
@@ -171,31 +225,67 @@ int main(void) {
   KuTestThread thread; CHECK(ku_test_thread_start(&thread,fixture_cancel_worker,&cancel));
   uint64_t before_cancel_polls=driver.polls;
   fixture_claims=fixture_resumes=0; fixture_cancel_at=3u;
-  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_thread_join(&thread,2000u) && thread.outcome==0 && cancel.result==KU_TASK_CONTROL_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_CANCEL && sliced.resume_calls==3u);
   CHECK(fixture_resumes==3u && fixture_claims>=1u && fixture_claims<=2u);
   /* A concurrent wrapper may leave its one notification for a terminal
    * observation. Count that zero-resume poll exactly instead of discarding it. */
   CHECK(driver.polls==before_cancel_polls+fixture_resumes+fixture_claims-1u);
   CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_CANCELLED);
   CHECK(ku_task_control_cleanup_deadline(work.owner.lease.control)==1042u);
-  CHECK(!driver.queued && !ku_task_driver_execution);
+  CHECK(!ku_task_driver_execution);
+  /* The slice stopped at cancellation; a retained terminal notification is
+   * observed by the exact public entry, not hidden inside a renewed slice. */
+  if(driver.queued) CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.queued);
   CHECK(ku_task_control_lease_release(&cancel.lease)==KU_TASK_CONTROL_OK);
   CHECK(ku_test_event_destroy(&fixture_cancel_entered) && ku_test_event_destroy(&fixture_cancel_release));
   CHECK(ku_task_value_drop(&work,2000u)==KU_TASK_DRIVER_OK); fixture_observer=NULL;
   for(size_t turn=0;turn<16u && driver.resident;turn++)
     CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
   CHECK(!driver.resident && !driver.reserved_bytes);
+  /* Cancellation published AFTER R2 returned Pending but before the driver's
+   * final phase/queue commit must stop the whole slice even at a 32-credit
+   * boundary. Otherwise a later FIFO task could hide the observed request. */
+  KuTaskValueV1 raced={0},race_marker={0};
+  fixture_cancel_at=0;
+  CHECK(ku_task_0_start_value(&driver,&raced)==KU_TASK_DRIVER_OK);
+  fixture_observer=&raced.owner.lease;
+  CHECK(ku_task_2_start_value(&driver,&race_marker)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_init(&fixture_cancel_entered) && ku_test_event_init(&fixture_cancel_release));
+  FixtureCancel raced_cancel={0}; raced_cancel.ticket=raced.ticket;
+  CHECK(ku_task_control_lease_retain(&raced.owner.lease,&raced_cancel.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_test_thread_start(&thread,fixture_cancel_worker,&raced_cancel));
+  fixture_pause_poll=1;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_thread_join(&thread,2000u) && !thread.outcome && raced_cancel.result==KU_TASK_CONTROL_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_CANCEL && sliced.segments==1u
+      && sliced.work_credits==32u && sliced.resume_calls==8u);
+  CHECK(ku_task_control_status(&race_marker.owner.lease)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_lease_release(&raced_cancel.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_test_event_destroy(&fixture_cancel_entered) && ku_test_event_destroy(&fixture_cancel_release));
+  CHECK(ku_task_value_drop(&raced,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_value_drop(&race_marker,2000u)==KU_TASK_DRIVER_OK); fixture_observer=NULL;
+  for(size_t turn=0;turn<16u && driver.resident;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
   /* A real timer WAIT exits the private executor immediately, remains parked
    * with its original absolute D, and resumes only after that D is reached. */
   KuTaskValueV1 waiting={0}; CHECK(ku_task_1_start_value(&driver,&waiting)==KU_TASK_DRIVER_OK);
   uint64_t polls=driver.polls; fixture_claims=0;
-  CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
+  uint64_t expected_timer=fixture_clock+100u;
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
+      NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  CHECK(sliced.reason==KU_TASK_SLICE_WAIT && sliced.work_credits==1u && sliced.resume_calls==1u);
+  next=sliced.next_deadline;
   CHECK(driver.polls==polls+1u && fixture_claims==1u && !driver.queued && driver.timers==1u);
   uint64_t timer_deadline=slots[waiting.ticket.slot].timer_deadline;
   /* The driver's cached minimum may conservatively retain the old cancelled
    * task's earlier D until its next expiry scan. It must never postpone D. */
-  CHECK(timer_deadline==1100u && next>fixture_clock && next<=timer_deadline);
+  CHECK(timer_deadline==expected_timer && next>fixture_clock && next<=timer_deadline);
   CHECK(!ku_task_control_atomic_load(&waiting.owner.lease.control->executor));
   CHECK(ku_task_control_status(&waiting.owner.lease)==KU_TASK_CONTROL_PENDING);
   fixture_clock=timer_deadline;

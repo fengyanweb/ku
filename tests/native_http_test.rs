@@ -4315,6 +4315,22 @@ static int idle_probe_checks(void) {
 
 int main(void) {
   KuHttpTaskIoBatch batch={0};
+  /* Test the production obligation helpers, not a copy of the owner loop:
+   * forced I/O must suppress early compute, never sleep on a carried ready
+   * hint, and survive EINTR or maintenance continues until a real OS return. */
+  KuHttpTaskSliceTurn turn={1,0u}; uint64_t carried=UINT64_MAX;
+  CHECK(!ku_http_task_slice_needs_pump(&turn,&carried) && carried==0u);
+  CHECK(ku_http_task_slice_wait_ms(&turn,-1)==0);
+  ku_http_task_slice_observed_io(&turn,-1);
+  CHECK(turn.force_io && !ku_http_task_slice_needs_pump(&turn,&carried));
+  turn.next_deadline=UINT64_MAX;
+  CHECK(!ku_http_task_slice_needs_pump(&turn,&carried) && carried==UINT64_MAX);
+  CHECK(ku_http_task_slice_wait_ms(&turn,500)==0);
+  ku_http_task_slice_observed_io(&turn,0);
+  CHECK(!turn.force_io && ku_http_task_slice_needs_pump(&turn,&carried));
+  CHECK(ku_http_task_slice_wait_ms(&turn,-1)==-1);
+  turn.force_io=1; ku_http_task_slice_observed_io(&turn,2);
+  CHECK(!turn.force_io); /* A positive event also pays the full I/O turn. */
   /* A ready Task makes the shared nearest deadline zero. The same-turn
    * eligibility reduction must retain the real request deadline separately,
    * including connections whose paused peer supplies no poll interest. */

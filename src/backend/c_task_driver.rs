@@ -184,6 +184,7 @@ const DRIVER_ABI: &str = r#"
 #define KU_TASK_DRIVER_GLOBAL_BURST ((size_t)8u)
 #define KU_TASK_DRIVER_MAX_SLOTS ((size_t)16384u)
 #define KU_TASK_DRIVER_MAX_WORKERS ((size_t)32u)
+#define KU_TASK_DRIVER_SLICE_MAX_CREDITS ((size_t)4096u)
 enum {
   KU_TASK_DRIVER_OK = 0u, KU_TASK_DRIVER_PENDING = 1u,
   KU_TASK_DRIVER_INVALID_ARGUMENT = 7u, KU_TASK_DRIVER_ABI_MISMATCH = 8u,
@@ -2807,6 +2808,27 @@ typedef struct KuTaskDriverSegmentV1 {
   uint64_t started;
   int clock_fault, time_exhausted;
 } KuTaskDriverSegmentV1;
+enum {
+  KU_TASK_SLICE_CONTINUE=0u, KU_TASK_SLICE_IDLE=1u, KU_TASK_SLICE_WORK_CAP=2u,
+  KU_TASK_SLICE_TIME=3u, KU_TASK_SLICE_HTTP_DEADLINE=4u, KU_TASK_SLICE_WAKE=5u,
+  KU_TASK_SLICE_WAIT=6u, KU_TASK_SLICE_YIELD=7u, KU_TASK_SLICE_BOUNDARY=8u,
+  KU_TASK_SLICE_COMPLETE=9u, KU_TASK_SLICE_CANCEL=10u, KU_TASK_SLICE_FAULT=11u
+};
+typedef struct KuTaskDriverSliceResultV1 {
+  uint64_t next_deadline;
+  size_t work_credits, resume_calls, segments;
+  uint32_t reason;
+} KuTaskDriverSliceResultV1;
+typedef struct KuTaskDriverSliceV1 {
+  uint64_t origin_ms, stop_at_ms, external_deadline;
+  int (*interrupted)(void*);
+  void* interrupt_context;
+  KuTaskDriverSliceResultV1* result;
+} KuTaskDriverSliceV1;
+static uint32_t ku_task_driver_slice_time_reason(const KuTaskDriverSliceV1* slice) {
+  return slice->external_deadline<=slice->stop_at_ms
+      ? KU_TASK_SLICE_HTTP_DEADLINE : KU_TASK_SLICE_TIME;
+}
 static uint32_t ku_task_driver_resume_segment(void* raw) {
   KuTaskDriverSegmentV1* segment=(KuTaskDriverSegmentV1*)raw;
   KuTaskDriverExecutionV1* execution=segment->execution;
@@ -2849,8 +2871,20 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
  * inside a multi-bank frame or between registered resumes. Actual poll
  * metrics count registered-resume/control attempts, not borrowed banks:
  * the 1ms segment budget can overrun by one quantum/expensive operation. */
-static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta) {
+static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta,
+    KuTaskDriverSliceV1* slice) {
   KuTaskDriverV1* driver=worker->driver;
+    uint64_t selected_now=0;
+    if (slice) {
+      selected_now=ku_task_driver_now_ms();
+      if (selected_now==UINT64_MAX || selected_now<slice->origin_ms) {
+        ku_task_driver_enter_clock_fault(driver);
+        slice->result->reason=KU_TASK_SLICE_FAULT; return 0;
+      }
+      if (selected_now>=slice->stop_at_ms) {
+        slice->result->reason=ku_task_driver_slice_time_reason(slice); return 0;
+      }
+    }
     size_t index;
     if (!ku_task_driver_take_ready(driver, worker, &index)) {
       driver->closing = 1; driver->shutdown_deadline = 0;
@@ -2860,9 +2894,10 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     driver->running++;
     if (driver->running > driver->peak_running) driver->peak_running = driver->running;
     KuTaskDriverSlotV1* slot = &driver->slots[index];
-    uint64_t started=ku_task_driver_now_ms();
-    worker->last_queue_delay_ms=started!=UINT64_MAX && slot->queued_at_ms!=UINT64_MAX
-        && started>=slot->queued_at_ms ? started-slot->queued_at_ms : 0;
+    uint64_t started=slice ? slice->origin_ms : ku_task_driver_now_ms();
+    if (!slice) selected_now=started;
+    worker->last_queue_delay_ms=selected_now!=UINT64_MAX && slot->queued_at_ms!=UINT64_MAX
+        && selected_now>=slot->queued_at_ms ? selected_now-slot->queued_at_ms : 0;
     if(worker->last_queue_delay_ms>worker->peak_queue_delay_ms)
       worker->peak_queue_delay_ms=worker->last_queue_delay_ms;
     slot->state = KU_TASK_DRIVER_RUNNING; slot->notified = 0; slot->intent = 0;
@@ -2889,7 +2924,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     if (cancel) request = ku_task_control_request_cancel(&execution, KU_TASK_CONTROL_CANCELLED, deadline);
     if (owner.lease.control) dropped = ku_task_control_owner_drop(&owner, deadline);
     ku_task_driver_execution=&context;
-    size_t quanta=0, polls=0;
+    size_t quanta=0, polls=0, resume_calls=0;
     uint32_t outcome=KU_TASK_CONTROL_PENDING;
     int segment_clock_fault=started==UINT64_MAX;
     do {
@@ -2901,13 +2936,36 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
        * still spends one exact pump credit, as before this private batching. */
       quanta+=segment.quanta ? segment.quanta : 1u;
       polls+=segment.polls ? segment.polls : 1u;
+      resume_calls+=segment.polls;
       segment_clock_fault=segment.clock_fault;
-      if (outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
+      if (slice) {
+        if (segment_clock_fault) slice->result->reason=KU_TASK_SLICE_FAULT;
+        else if (segment.time_exhausted) slice->result->reason=ku_task_driver_slice_time_reason(slice);
+        else if (outcome==KU_TASK_CONTROL_CANCELLED || outcome==KU_TASK_CONTROL_TIMED_OUT)
+          slice->result->reason=KU_TASK_SLICE_CANCEL;
+        else if (ku_task_control_is_terminal(outcome)) slice->result->reason=KU_TASK_SLICE_COMPLETE;
+        else if (outcome!=KU_TASK_CONTROL_PENDING) slice->result->reason=KU_TASK_SLICE_FAULT;
+        else if (!context.pure_ready || context.intent_touched)
+          slice->result->reason=KU_TASK_SLICE_BOUNDARY;
+      }
+      int stop=outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
           || quanta>=max_quanta || segment_clock_fault || segment.time_exhausted
-          || ku_task_control_atomic_load(&execution.control->phase)!=KU_TASK_CONTROL_LIVE) break;
+          || (slice && slice->result->reason!=KU_TASK_SLICE_CONTINUE);
+      if (!stop) {
+        size_t continued_phase=ku_task_control_atomic_load(&execution.control->phase);
+        if (continued_phase!=KU_TASK_CONTROL_LIVE) {
+          if (slice && slice->result->reason==KU_TASK_SLICE_CONTINUE)
+            slice->result->reason=KU_TASK_SLICE_CANCEL;
+          stop=1;
+        }
+      }
+      if (stop) break;
       uint64_t now=ku_task_driver_now_ms();
       if (now==UINT64_MAX || now<started) { segment_clock_fault=1; break; }
-      if (now-started>=1u) break;
+      if (now-started>=1u) {
+        if (slice) slice->result->reason=ku_task_driver_slice_time_reason(slice);
+        break;
+      }
     } while (1);
     ku_task_driver_execution=previous_execution;
 
@@ -2915,6 +2973,10 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot = &driver->slots[index];
     if (segment_clock_fault) ku_task_driver_enter_clock_fault(driver);
     if (!slot->intent && context.default_yield) slot->intent=KU_TASK_DRIVER_YIELD;
+    if (slice && slice->result->reason==KU_TASK_SLICE_BOUNDARY && context.intent_touched) {
+      if (slot->intent==KU_TASK_DRIVER_WAIT) slice->result->reason=KU_TASK_SLICE_WAIT;
+      else if (slot->intent==KU_TASK_DRIVER_YIELD) slice->result->reason=KU_TASK_SLICE_YIELD;
+    }
     driver->polls=polls>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+polls;
     driver->running--; slot->executor_worker = 0;
     worker->polls=polls>UINT64_MAX-worker->polls ? UINT64_MAX : worker->polls+polls;
@@ -2983,7 +3045,19 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
       if (registry.control) ku_task_control_lease_release(&registry);
       if (ku_task_driver_lock(driver)) return -1;
     }
+  if (slice) {
+    slice->result->resume_calls+=resume_calls;
+    if (segment_clock_fault || driver->fault) slice->result->reason=KU_TASK_SLICE_FAULT;
+    else if (slice->result->reason==KU_TASK_SLICE_CONTINUE
+        && slot->generation==context.generation && slot->driver_lease.control
+        && ku_task_control_atomic_load(&slot->driver_lease.control->phase)!=KU_TASK_CONTROL_LIVE)
+      slice->result->reason=KU_TASK_SLICE_CANCEL;
+  }
   return (int)quanta;
+}
+/* Exact/public modes keep their original per-selection time origin. */
+static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta) {
+  return ku_task_driver_run_one_mode_locked(worker,max_quanta,NULL);
 }
 static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
   KuTaskDriverV1* driver = worker->driver;
@@ -3268,6 +3342,87 @@ static uint32_t ku_task_driver_pump(KuTaskDriverV1* driver, size_t owner,
      * the owner if it arrives between this return and the caller's OS wait. */
   }
   checked=driver->fault ? driver->fault : count ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
+  ku_task_driver_signal(driver);
+  ku_task_driver_unlock(driver); return checked;
+}
+/* Private HTTP-only compute slice. The caller has just serviced current I/O
+ * and observed an empty nonblocking OS probe, with no partial/queued/network
+ * work and a finite real HTTP deadline minimum (not the ready-work zero hint).
+ * The hook is an atomic-only wake observation: it must not lock, allocate,
+ * wait or reenter driver. It does not clear the publisher's wake state.
+ * Every selection still rotates the original fixed-owner FIFO after <=32
+ * credits; all selections and frame banks share the SAME origin and 1ms cap.
+ * A boundary/time stop ends this entire call, never a renewed inner slice.
+ * The HTTP caller must rebuild/serve I/O before another call or OS sleep. */
+static uint32_t ku_task_driver_compute_slice(KuTaskDriverV1* driver,size_t owner,
+    size_t max_work_credits,uint64_t origin_ms,uint64_t external_deadline,
+    int (*interrupted)(void*),void* interrupt_context,KuTaskDriverSliceResultV1* output) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!driver->external_loops || !driver->fixed_owner || owner>=driver->workers_created
+      || !max_work_credits || max_work_credits>KU_TASK_DRIVER_SLICE_MAX_CREDITS
+      || origin_ms>=UINT64_MAX-1u
+      || !ku_task_driver_external_storage(driver,output,sizeof(*output),
+          KU_TASK_FRAME_ALIGNOF(KuTaskDriverSliceResultV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverWorkerV1* worker=&driver->workers[owner];
+  if (worker->pumping || worker->state==KU_TASK_DRIVER_WORKER_EXITED) {
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+#if defined(_WIN32)
+  DWORD thread=GetCurrentThreadId();
+  if (worker->owner_bound && worker->owner_thread!=thread) {
+#else
+  pthread_t thread=pthread_self();
+  if (worker->owner_bound && !pthread_equal(worker->owner_thread,thread)) {
+#endif
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+  *output=(KuTaskDriverSliceResultV1){UINT64_MAX,0,0,0,KU_TASK_SLICE_CONTINUE};
+  KuTaskDriverSliceV1 slice={origin_ms,ku_task_driver_min(origin_ms+1u,external_deadline),
+      external_deadline,interrupted,interrupt_context,output};
+  worker->owner_bound=1; worker->owner_thread=thread; worker->pumping=1;
+  if (worker->state==KU_TASK_DRIVER_WORKER_WAITING) driver->workers_waiting--;
+  worker->state=KU_TASK_DRIVER_WORKER_ACTIVE;
+  while (output->work_credits<max_work_credits && output->reason==KU_TASK_SLICE_CONTINUE) {
+    uint64_t now=ku_task_driver_now_ms();
+    if (now==UINT64_MAX || now<origin_ms) {
+      ku_task_driver_enter_clock_fault(driver); output->reason=KU_TASK_SLICE_FAULT; break;
+    }
+    if (driver->fault) { output->reason=KU_TASK_SLICE_FAULT; break; }
+    if (driver->closing) { output->reason=KU_TASK_SLICE_CANCEL; break; }
+    if (now>=slice.stop_at_ms) { output->reason=ku_task_driver_slice_time_reason(&slice); break; }
+    if (interrupted && interrupted(interrupt_context)) { output->reason=KU_TASK_SLICE_WAKE; break; }
+    if (driver->next_deadline!=UINT64_MAX && now>=driver->next_deadline)
+      ku_task_driver_deadlines_locked(driver,now);
+    if (driver->fault) { output->reason=KU_TASK_SLICE_FAULT; break; }
+    if (driver->closing) { output->reason=KU_TASK_SLICE_CANCEL; break; }
+    if (!worker->local_queued) { output->reason=KU_TASK_SLICE_IDLE; break; }
+    size_t remaining=max_work_credits-output->work_credits;
+    int advanced=ku_task_driver_run_one_mode_locked(worker,remaining<32u ? remaining : 32u,&slice);
+    if (advanced<0) {
+      output->reason=KU_TASK_SLICE_FAULT;
+      return KU_TASK_DRIVER_INTERNAL; /* Quarantined broken mutex/storage. */
+    }
+    if (!advanced) {
+      if (driver->fault) output->reason=KU_TASK_SLICE_FAULT;
+      else if (driver->closing) output->reason=KU_TASK_SLICE_CANCEL;
+      else if (output->reason==KU_TASK_SLICE_CONTINUE) output->reason=KU_TASK_SLICE_IDLE;
+      break;
+    }
+    output->segments++;
+    output->work_credits+=(size_t)advanced;
+  }
+  if (output->reason==KU_TASK_SLICE_CONTINUE) output->reason=KU_TASK_SLICE_WORK_CAP;
+  output->next_deadline=worker->local_queued ? 0 : driver->next_deadline;
+  worker->pumping=0;
+  if (driver->closing && !driver->resident && !driver->running && !driver->queued) {
+    worker->state=KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
+  } else {
+    worker->state=KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
+  }
+  checked=driver->fault ? driver->fault
+      : output->work_credits ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
   ku_task_driver_signal(driver);
   ku_task_driver_unlock(driver); return checked;
 }

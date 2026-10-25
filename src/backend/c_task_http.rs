@@ -302,6 +302,22 @@ static uint32_t ku_http_task_pump(void* raw,size_t owner,size_t batch,uint64_t* 
   if(!raw) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   return ku_task_driver_pump(&((KuHttpTaskRuntime*)raw)->driver,owner,batch,next_deadline);
 }
+static uint32_t ku_http_task_compute_slice(void* raw,size_t owner,size_t credits,
+    uint64_t origin_ms,uint64_t external_deadline,int (*interrupted)(void*),void* context,
+    uint64_t* next_deadline,int* force_io) {
+  *force_io=0;
+  if (!raw) { *next_deadline=UINT64_MAX; return KU_TASK_DRIVER_PENDING; }
+  KuTaskDriverSliceResultV1 result={0};
+  uint32_t status=ku_task_driver_compute_slice(&((KuHttpTaskRuntime*)raw)->driver,owner,
+      credits,origin_ms,external_deadline,interrupted,context,&result);
+  if (status<=KU_TASK_DRIVER_PENDING) {
+    *next_deadline=result.next_deadline;
+    /* IDLE with no work must permit normal sleeping after this actual probe;
+     * time/wake/boundary exits require a new full I/O opportunity first. */
+    *force_io=result.work_credits!=0 || result.reason!=KU_TASK_SLICE_IDLE;
+  }
+  return status;
+}
 /* Per-owner actual Task states. Queue delay begins at ready publication, not
  * HTTP acceptance or time spent waiting for a dependency. */
 static void ku_http_task_metrics(void* raw,size_t owner,uint64_t output[8]) {

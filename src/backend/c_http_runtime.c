@@ -2818,6 +2818,20 @@ typedef struct {
   uint64_t probe_generation;
   int probe_count, probe_accept_turn;
 } KuHttpTaskIoBatch;
+/* A slice owes one real I/O turn, including when its own ready work did not
+ * publish a wake byte. This owner-local obligation survives EINTR and every
+ * early maintenance continue; it is not a reusable "no readiness" fact. */
+typedef struct { int force_io; uint64_t next_deadline; } KuHttpTaskSliceTurn;
+static int ku_http_task_slice_needs_pump(const KuHttpTaskSliceTurn* turn,uint64_t* deadline) {
+  if (!turn->force_io) return 1;
+  *deadline=turn->next_deadline; return 0;
+}
+static int ku_http_task_slice_wait_ms(const KuHttpTaskSliceTurn* turn,int wait_ms) {
+  return turn->force_io ? 0 : wait_ms;
+}
+static void ku_http_task_slice_observed_io(KuHttpTaskSliceTurn* turn,int selected) {
+  if (selected>=0) turn->force_io=0;
+}
 /* Rebuilt by this turn's existing poll-interest traversal. No connection or
  * generation fact survives admission, I/O dispatch or the next owner turn. */
 typedef struct {
@@ -2881,6 +2895,13 @@ static int ku_http_task_io_batch_continue(KuHttpTaskIoBatch* batch,
   ku_http_task_io_batch_reset(batch); return 0;
 }
 /* End bounded HTTP Task/I/O batch. */
+static int ku_http_task_slice_interrupted(void* raw) {
+#if !defined(_WIN32)
+  return atomic_load_explicit(&((KuHttpWake*)raw)->pending,memory_order_acquire)!=0;
+#else
+  (void)raw; return 1; /* Keep the original UDP wake path until separately covered. */
+#endif
+}
 #endif
 static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpLoopGroup* group = owner->group;
@@ -2981,6 +3002,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   uint64_t next_cpu_sample_ms=0;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
   KuHttpTaskIoBatch task_io_batch={0};
+  KuHttpTaskSliceTurn task_io_slice_turn={0,UINT64_MAX};
 #endif
   const char* listen_failure = spawned == nworkers ? NULL : "handler thread startup failed";
   ku_http_mutex_lock(&group->lock);
@@ -3043,7 +3065,13 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     }
     uint64_t task_deadline = UINT64_MAX;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-    uint32_t pumped = ku_http_task_pump(group->tasks,(size_t)owner->index,32u,&task_deadline);
+    /* A finished private slice owes I/O a full turn. In particular, do not
+     * execute another early pump before rebuilding and probing its interests.
+     * Carry its real ready/deadline receipt and force one nonblocking probe;
+     * an own ready continuation deliberately did not write a wake byte. */
+    uint32_t pumped=0;
+    if (ku_http_task_slice_needs_pump(&task_io_slice_turn,&task_deadline))
+      pumped=ku_http_task_pump(group->tasks,(size_t)owner->index,32u,&task_deadline);
     if (pumped > 1u && !listen_failure) listen_failure = "HTTP Task event loop failed";
 #endif
     unsigned long long now = ku_http_now_ms();
@@ -3141,6 +3169,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     KuHttpTaskIoEligibility task_io_eligibility={~0ULL,
         task_deadline==0u && active.count!=0,task_deadline==0u && active.count!=0,0};
+    unsigned long long task_io_slice_deadline=health_deadline;
+    if (accept_retry_deadline>now && accept_retry_deadline<task_io_slice_deadline)
+      task_io_slice_deadline=accept_retry_deadline;
 #endif
     for (int position=0;position<active.count;position++) {
       int index=active.indices[position];
@@ -3155,6 +3186,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       if (watch_peer && connection->peer_read_paused && connection->peer_error_probe_deadline
           && connection->peer_error_probe_deadline<nearest)
         nearest=connection->peer_error_probe_deadline;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+      if (watch_peer && connection->peer_read_paused && connection->peer_error_probe_deadline
+          && connection->peer_error_probe_deadline<task_io_slice_deadline)
+        task_io_slice_deadline=connection->peer_error_probe_deadline;
+#endif
 #endif
       if (connection->phase == KU_HTTP_IO_JOB && connection->job && connection->job->request_deadline < nearest)
         nearest = connection->job->request_deadline;
@@ -3253,8 +3289,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     }
     int task_io_probe_can_bootstrap=task_io_eligibility.has_idle
         && !task_io_structural_urgent;
-    if (ku_http_task_io_batch_continue(&task_io_batch,batch_now,
+    if (!task_io_slice_turn.force_io && ku_http_task_io_batch_continue(&task_io_batch,batch_now,
         task_io_ready,task_io_urgent)) continue;
+    if (task_io_slice_turn.force_io) {
+      ku_http_task_io_batch_reset(&task_io_batch);
+    }
+    wait_ms=ku_http_task_slice_wait_ms(&task_io_slice_turn,wait_ms);
 #endif
     /* No global wake tick: progress blocks until readiness, worker publication
        or the nearest deadline (including only Darwin's paused-handler error probe). */
@@ -3269,6 +3309,28 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       else { fputs("http reactor wait repeatedly failed\n", stderr); exit(1); }
       continue;
     }
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    /* Only a real, successful OS return pays the owed I/O turn. EINTR or
+     * earlier maintenance continues preserve the obligation above. A zero
+     * result can now grant a NEW bounded computation slice, never renew the
+     * old no-readiness observation inside that slice. */
+    ku_http_task_slice_observed_io(&task_io_slice_turn,selected);
+    int task_slice_allowed=!selected && !task_io_structural_urgent;
+#if defined(KU_HTTP_HAS_TASK_NET)
+    if (net_count || net_deadline!=UINT64_MAX) task_slice_allowed=0;
+#endif
+    if (task_io_eligibility.deadline<task_io_slice_deadline)
+      task_io_slice_deadline=task_io_eligibility.deadline;
+    if (task_slice_allowed && task_io_slice_deadline>batch_now
+        && !ku_http_task_slice_interrupted(&wake)) {
+      ku_http_task_io_batch_reset(&task_io_batch);
+      uint32_t sliced=ku_http_task_compute_slice(group->tasks,(size_t)owner->index,
+          KU_TASK_DRIVER_SLICE_MAX_CREDITS,batch_now,task_io_slice_deadline,
+          ku_http_task_slice_interrupted,&wake,&task_io_slice_turn.next_deadline,&task_io_slice_turn.force_io);
+      if (sliced>1u && !listen_failure) listen_failure="HTTP Task computation slice failed";
+      continue; /* Fresh maintenance/interests before any subsequent OS wait. */
+    }
+#endif
     if (!selected) continue;
 #if defined(KU_HTTP_HAS_TASK_NET)
     for (size_t i=0;i<net_count;i++) {
