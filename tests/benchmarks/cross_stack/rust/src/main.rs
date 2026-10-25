@@ -1,3 +1,4 @@
+mod cpu_work;
 mod pg_mode;
 
 use axum::{
@@ -30,6 +31,9 @@ use tokio::{
 use tokio_postgres::{types::Type, NoTls};
 
 const DEADLINE: Duration = Duration::from_secs(45);
+const CPU_DEADLINE: Duration = Duration::from_secs(3);
+#[derive(Clone, Copy)]
+struct RequestDeadline(Instant);
 struct Counters {
     active: AtomicUsize,
     waiting_timer: AtomicUsize,
@@ -82,6 +86,8 @@ struct App {
     pending: Arc<Semaphore>,
     cpu: Arc<Semaphore>,
     cpu_pending: Arc<Semaphore>,
+    cpu_config: cpu_work::Config,
+    cpu_trace: Arc<cpu_work::Trace>,
     counters: Counters,
     db: Option<Pool>,
     pg_mode: pg_mode::Mode,
@@ -152,14 +158,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let workers = bounded("BENCH_WORKERS", 1, 1, 4);
     let cpu_workers = bounded("BENCH_CPU_WORKERS", workers, 1, 4);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let cpu_config = cpu_work::Config::from_env()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .worker_threads(workers)
         .max_blocking_threads(cpu_workers)
-        .enable_all()
-        .build()?;
-    runtime.block_on(serve(cpu_workers))
+        .enable_all();
+    if let Some(interval) = cpu_config.event_interval {
+        builder.event_interval(interval);
+    }
+    let runtime = builder.build()?;
+    runtime.block_on(serve(cpu_workers, cpu_config))
 }
-async fn serve(cpu_workers: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(
+    cpu_workers: usize,
+    cpu_config: cpu_work::Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
     let active = bounded("BENCH_MAX_ACTIVE", 1024, 1, 65536);
     let pending = bounded("BENCH_MAX_PENDING", 128, 1, 65536);
@@ -188,6 +202,8 @@ async fn serve(cpu_workers: usize) -> Result<(), Box<dyn std::error::Error>> {
         pending: Arc::new(Semaphore::new(pending)),
         cpu: Arc::new(Semaphore::new(cpu_workers)),
         cpu_pending: Arc::new(Semaphore::new(pending)),
+        cpu_config,
+        cpu_trace: Arc::new(cpu_work::Trace::new(cpu_config.trace)),
         counters: Counters::new(),
         pg_mode,
         db,
@@ -209,7 +225,7 @@ async fn serve(cpu_workers: usize) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&address).await?;
     eprintln!(
         "{}",
-        json!({"ready":true,"stack":"rust","async_workers":bounded("BENCH_WORKERS",1,1,4),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending})
+        json!({"ready":true,"stack":"rust","async_workers":bounded("BENCH_WORKERS",1,1,4),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
     );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown())
@@ -232,10 +248,19 @@ async fn shutdown() {
         tokio::signal::ctrl_c().await.expect("signal");
     }
 }
-async fn admission(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+async fn admission(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
     if request.uri().path() == "/metrics" {
         return next.run(request).await;
     }
+    // One absolute deadline includes both admission queues and execution. It is
+    // never renewed when a CPU permit becomes available.
+    let deadline = if app.cpu_config.mode == cpu_work::Mode::Legacy {
+        None
+    } else {
+        let deadline = Instant::now() + CPU_DEADLINE;
+        request.extensions_mut().insert(RequestDeadline(deadline));
+        Some(deadline)
+    };
     let operation = async {
         let permit: OwnedSemaphorePermit =
             if let Ok(permit) = app.active.clone().try_acquire_owned() {
@@ -254,12 +279,24 @@ async fn admission(State(app): State<Arc<App>>, request: Request, next: Next) ->
         drop(permit);
         response
     };
-    timeout(DEADLINE, operation)
-        .await
-        .unwrap_or_else(|_| text(StatusCode::GATEWAY_TIMEOUT, "request deadline"))
+    let response = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await
+    } else {
+        timeout(DEADLINE, operation).await
+    };
+    response.unwrap_or_else(|_| text(StatusCode::GATEWAY_TIMEOUT, "request deadline"))
 }
 async fn metrics(State(app): State<Arc<App>>) -> Response {
-    encoded(app.counters.snapshot())
+    let mut snapshot = app.counters.snapshot();
+    snapshot["cpu_mode"] = json!(app.cpu_config.mode.name());
+    snapshot["cpu_chunk"] = json!(app.cpu_config.chunk);
+    snapshot["event_interval"] = json!(app.cpu_config.event_interval);
+    snapshot["cpu_permits_available"] = json!(app.cpu.available_permits());
+    snapshot["cpu_pending_permits_available"] = json!(app.cpu_pending.available_permits());
+    snapshot["active_permits_available"] = json!(app.active.available_permits());
+    snapshot["pending_permits_available"] = json!(app.pending.available_permits());
+    snapshot["cpu_trace"] = app.cpu_trace.snapshot();
+    encoded(snapshot)
 }
 async fn handler(State(app): State<Arc<App>>, request: Request) -> Response {
     match execute(app, request).await {
@@ -322,6 +359,42 @@ async fn execute(app: Arc<App>, request: Request) -> Result<Response, Failure> {
                 .ok_or_else(|| invalid("invalid seed"))?
                 .len() as i64;
             let _count = Count::new(&app.counters.waiting_cpu);
+            if app.cpu_config.mode != cpu_work::Mode::Legacy {
+                let deadline = request
+                    .extensions()
+                    .get::<RequestDeadline>()
+                    .ok_or_else(|| failure("missing absolute request deadline"))?
+                    .0;
+                let checksum = cpu_work::run(cpu_work::Input {
+                    rid: &rid,
+                    iterations: work,
+                    seed,
+                    deadline,
+                    config: app.cpu_config,
+                    cpu: app.cpu.clone(),
+                    pending: app.cpu_pending.clone(),
+                    actual: app.counters.actual_cpu_jobs.clone(),
+                    trace: app.cpu_trace.clone(),
+                })
+                .await
+                .map_err(|error| match error {
+                    cpu_work::Failure::QueueFull => {
+                        (StatusCode::SERVICE_UNAVAILABLE, "CPU queue full".into())
+                    }
+                    cpu_work::Failure::Closed => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "CPU service stopping".into(),
+                    ),
+                    cpu_work::Failure::Deadline => {
+                        (StatusCode::GATEWAY_TIMEOUT, "CPU deadline".into())
+                    }
+                    cpu_work::Failure::Cancelled => {
+                        (StatusCode::REQUEST_TIMEOUT, "CPU cancelled".into())
+                    }
+                    cpu_work::Failure::Worker => failure("CPU worker failed"),
+                })?;
+                return Ok(text(StatusCode::OK, format!("{rid}:{checksum:08}")));
+            }
             let queue = app
                 .cpu_pending
                 .clone()

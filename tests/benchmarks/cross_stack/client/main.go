@@ -69,6 +69,9 @@ type config struct {
 	address, workload, protocolPath, corporaDir, corpusPath, output, events string
 	duration, timeout, idle                                                 time.Duration
 	rate                                                                    float64
+	cpuRate, taskMixShortSLOMS                                              float64
+	cpuCancelEvery                                                          uint64
+	cpuCancelDelay                                                          time.Duration
 	concurrency, queue                                                      int
 	prefix                                                                  uint64
 	protocol                                                                protocol
@@ -77,9 +80,11 @@ type config struct {
 	checksums                                                               map[string]string
 }
 type job struct {
-	index     uint64
-	kind, rid string
-	scheduled time.Time
+	index       uint64
+	streamIndex uint64
+	cpuCancel   bool
+	kind, rid   string
+	scheduled   time.Time
 }
 type result struct {
 	category, stage, detail               string
@@ -89,6 +94,7 @@ type result struct {
 	sent, completed                       time.Time
 	bytesWritten, bytesRead               int64
 	writeComplete, responseComplete, late bool
+	cancelDue, cancelIssued               time.Time
 }
 type histogram struct {
 	bins  []uint64
@@ -180,6 +186,9 @@ type stats struct {
 	transportCounts                                   map[string]uint64
 	sentErrors                                        uint64
 	http500                                           uint64
+	plannedCancels, cancelSent, cancelIssued          uint64
+	normalCorrect, normalSentErrors, timelyWindow     uint64
+	cancelResults                                     map[string]uint64
 }
 
 func newStats() *stats {
@@ -208,6 +217,31 @@ func (s *stats) view(duration float64) map[string]any {
 	return map[string]any{"planned": s.Planned, "attempted": s.Attempted, "sent": s.Sent, "terminal": terminal, "results": s.Results, "planned_reconciled": terminal == s.Planned, "correct_in_window": s.CorrectWindow, "goodput_rps": float64(s.CorrectWindow) / duration, "correct_total": correct, "failure_fraction_planned": failurePlanned, "failure_fraction_sent": failureSent, "correct_over_slo": s.SLOFailed, "http_500_total": s.http500, "late_response_events": s.Late, "request_bytes_written": s.Written, "response_bytes_read": s.Read, "correct_scheduled_to_complete": s.correctScheduled.value(), "correct_sent_to_complete": s.correctSent.value(), "all_scheduled_to_terminal": s.allScheduled.value(), "scheduled_to_sent": s.lag.value(), "scheduled_to_attempt": s.queueDelay.value(), "dial_duration": s.dialDelay.value(), "cold_connection_scheduled_to_complete": s.coldLatency.value(), "reused_connection_scheduled_to_complete": s.reusedLatency.value(), "transport_counts": s.transportCounts}
 }
 
+func (s *stats) taskMixView(duration, slo float64) map[string]any {
+	v := s.view(duration)
+	normalPlanned, normalSent := s.Planned-s.plannedCancels, s.Sent-s.cancelSent
+	v["normal_planned"] = normalPlanned
+	v["normal_sent"] = normalSent
+	v["normal_correct"] = s.normalCorrect
+	v["normal_failure_fraction_planned"] = nil
+	v["normal_failure_fraction_sent"] = nil
+	if normalPlanned > 0 {
+		v["normal_failure_fraction_planned"] = float64(normalPlanned-s.normalCorrect) / float64(normalPlanned)
+	}
+	if normalSent > 0 {
+		v["normal_failure_fraction_sent"] = float64(s.normalSentErrors) / float64(normalSent)
+	}
+	v["SLO_ms"] = slo
+	v["correct_within_SLO_in_window"] = s.timelyWindow
+	v["SLO_goodput_rps"] = float64(s.timelyWindow) / duration
+	cancelResults := s.cancelResults
+	if cancelResults == nil {
+		cancelResults = map[string]uint64{}
+	}
+	v["planned_cancellation"] = map[string]any{"planned": s.plannedCancels, "sent": s.cancelSent, "reset_issued": s.cancelIssued, "results": cancelResults, "scope": "planned reset is not correctness, server-stop, cleanup or resource-reuse proof"}
+	return v
+}
+
 type secondStats struct {
 	planned, attempted, sent, correct uint64
 	results                           map[string]uint64
@@ -225,8 +259,11 @@ type ledger struct {
 	origin, cutoff                                                    time.Time
 	lastActualSent, lastActualCompleted, lastCompleteResponse         time.Time
 	lastActualSentRID, lastActualCompletedRID                         string
+	lastTerminal                                                      time.Time
+	lastTerminalRID                                                   string
 	active, peakActive, live, peakLive, dials, peakQueue, poolExpired uint64
 	samples                                                           []map[string]any
+	cancelSamples                                                     []map[string]any
 	events                                                            *eventWriter
 }
 
@@ -243,6 +280,10 @@ func (l *ledger) plan(j job) {
 	defer l.mu.Unlock()
 	l.all.Planned++
 	l.typed(j.kind).Planned++
+	if j.cpuCancel {
+		l.all.plannedCancels++
+		l.typed(j.kind).plannedCancels++
+	}
 	i := int(j.scheduled.Sub(l.origin) / time.Second)
 	if i >= len(l.seconds) {
 		i = len(l.seconds) - 1
@@ -259,6 +300,9 @@ func sloMS(kind string, c config) float64 {
 	key := "json_p99_ms"
 	switch kind {
 	case "ok":
+		if c.workload == "task_mix" {
+			return c.taskMixShortSLOMS
+		}
 		key = "ok_p99_ms"
 	case "cpu":
 		key = "cpu_p99_ms"
@@ -284,6 +328,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	if attempted {
 		l.active--
 	}
+	if r.completed.After(l.lastTerminal) {
+		l.lastTerminal, l.lastTerminalRID = r.completed, j.rid
+	}
 	if sent {
 		if r.sent.After(l.lastActualSent) {
 			l.lastActualSent, l.lastActualSentRID = r.sent, j.rid
@@ -297,6 +344,18 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	}
 	for _, s := range []*stats{l.all, l.typed(j.kind)} {
 		s.Results[r.category]++
+		if j.cpuCancel {
+			if s.cancelResults == nil {
+				s.cancelResults = map[string]uint64{}
+			}
+			s.cancelResults[r.category]++
+			if sent {
+				s.cancelSent++
+			}
+			if !r.cancelIssued.IsZero() {
+				s.cancelIssued++
+			}
+		}
 		if r.status == 500 {
 			s.http500++
 		}
@@ -322,6 +381,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 			s.Sent++
 			if r.category != "correct" {
 				s.sentErrors++
+				if c.workload == "task_mix" && !j.cpuCancel {
+					s.normalSentErrors++
+				}
 			}
 			s.lag.add(r.sent.Sub(j.scheduled), &l.budget)
 		}
@@ -332,6 +394,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 		s.Read += r.bytesRead
 		s.allScheduled.add(r.completed.Sub(j.scheduled), &l.budget)
 		if r.category == "correct" {
+			if c.workload == "task_mix" && !j.cpuCancel {
+				s.normalCorrect++
+			}
 			s.correctScheduled.add(r.completed.Sub(j.scheduled), &l.budget)
 			if r.reused {
 				s.reusedLatency.add(r.completed.Sub(j.scheduled), &l.budget)
@@ -343,6 +408,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 			}
 			if !r.completed.After(l.cutoff) {
 				s.CorrectWindow++
+				if c.workload == "task_mix" && float64(r.completed.Sub(j.scheduled))/1e6 <= sloMS(j.kind, c) {
+					s.timelyWindow++
+				}
 			}
 			if float64(r.completed.Sub(j.scheduled))/1e6 > sloMS(j.kind, c) {
 				s.SLOFailed++
@@ -379,8 +447,16 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 			completed.completedKinds[j.kind]++
 		}
 	}
-	if r.category != "correct" && len(l.samples) < 24 {
-		l.samples = append(l.samples, map[string]any{"rid": j.rid, "index": j.index, "type": j.kind, "terminal": r.category, "status": r.status, "stage": r.stage, "detail": truncate(r.detail), "reused_connection": r.reused, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "completed_ns": r.completed.Sub(l.origin).Nanoseconds(), "bytes_written": r.bytesWritten, "bytes_read": r.bytesRead})
+	if r.category == "planned_reset" && len(l.cancelSamples) < 24 {
+		l.cancelSamples = append(l.cancelSamples, map[string]any{"rid": j.rid, "cpu_sequence": j.streamIndex, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "reset_due_ns": offset(r.cancelDue, l.origin), "reset_issued_ns": offset(r.cancelIssued, l.origin), "terminal_ns": r.completed.Sub(l.origin).Nanoseconds()})
+	}
+	if r.category != "correct" && r.category != "planned_reset" && len(l.samples) < 24 {
+		sample := map[string]any{"rid": j.rid, "index": j.index, "type": j.kind, "terminal": r.category, "status": r.status, "stage": r.stage, "detail": truncate(r.detail), "reused_connection": r.reused, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "completed_ns": r.completed.Sub(l.origin).Nanoseconds(), "bytes_written": r.bytesWritten, "bytes_read": r.bytesRead}
+		if c.workload == "task_mix" {
+			sample["stream_index"], sample["planned_cpu_cancel"] = j.streamIndex, j.cpuCancel
+			sample["reset_due_ns"], sample["reset_issued_ns"] = offset(r.cancelDue, l.origin), offset(r.cancelIssued, l.origin)
+		}
+		l.samples = append(l.samples, sample)
 	}
 	if l.events != nil {
 		l.events.offer(event{j: j, began: began, result: r, origin: l.origin})
@@ -419,7 +495,7 @@ type eventWriter struct {
 	path    string
 }
 
-func openEvents(path string) (*eventWriter, error) {
+func openEvents(path string, taskMix ...bool) (*eventWriter, error) {
 	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if e != nil {
 		return nil, e
@@ -429,7 +505,12 @@ func openEvents(path string) (*eventWriter, error) {
 		defer close(w.done)
 		z, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
 		csvw := csv.NewWriter(z)
-		err := csvw.Write([]string{"rid", "type", "index", "scheduled_ns", "sent_ns", "completed_ns", "attempt_started_ns", "terminal", "status", "request_bytes_written", "response_bytes_read", "late_response", "reused_connection", "dial_duration_ns", "stage"})
+		header := []string{"rid", "type", "index", "scheduled_ns", "sent_ns", "completed_ns", "attempt_started_ns", "terminal", "status", "request_bytes_written", "response_bytes_read", "late_response", "reused_connection", "dial_duration_ns", "stage"}
+		mixed := len(taskMix) > 0 && taskMix[0]
+		if mixed {
+			header = append(header, "stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed")
+		}
+		err := csvw.Write(header)
 		var total int64
 		for row := range w.queue {
 			if err != nil {
@@ -442,6 +523,9 @@ func openEvents(path string) (*eventWriter, error) {
 				return strconv.FormatInt(t.Sub(row.origin).Nanoseconds(), 10)
 			}
 			record := []string{row.j.rid, row.j.kind, strconv.FormatUint(row.j.index, 10), format(row.j.scheduled), format(row.result.sent), format(row.result.completed), format(row.began), row.result.category, strconv.Itoa(row.result.status), strconv.FormatInt(row.result.bytesWritten, 10), strconv.FormatInt(row.result.bytesRead, 10), strconv.FormatBool(row.result.late), strconv.FormatBool(row.result.reused), strconv.FormatInt(row.result.dialTime.Nanoseconds(), 10), row.result.stage}
+			if mixed {
+				record = append(record, strconv.FormatUint(row.j.streamIndex, 10), strconv.FormatBool(row.j.cpuCancel), format(row.result.cancelDue), format(row.result.cancelIssued), strconv.FormatBool(row.result.writeComplete))
+			}
 			for _, v := range record {
 				total += int64(len(v) + 1)
 			}
@@ -521,11 +605,12 @@ func newConnectionPool(c config, l *ledger) *connectionPool {
 	return &connectionPool{capacity: c.concurrency, timeout: c.idle, l: l}
 }
 
-func (p *connectionPool) discard(connection *idleConnection) {
-	_ = connection.conn.Close()
+func (p *connectionPool) discard(connection *idleConnection) error {
+	err := connection.conn.Close()
 	p.l.mu.Lock()
 	p.l.live--
 	p.l.mu.Unlock()
+	return err
 }
 
 func (p *connectionPool) take() (*idleConnection, bool) {
@@ -656,6 +741,9 @@ func (w *worker) request(j job, began time.Time) (r result) {
 				r.stage = "completed_after_absolute_deadline"
 			}
 		}
+		if !r.cancelIssued.IsZero() && r.completed.After(deadline) {
+			r.category, r.stage = "timeout", "planned_reset_after_absolute_deadline"
+		}
 		if !r.responseComplete || r.category == "timeout" || r.category == "connection_error" || r.category == "protocol_error" || r.category == "body_error" {
 			discard()
 		} else if lease != nil {
@@ -736,6 +824,37 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		return
 	}
 	r.writeComplete = true
+	if j.cpuCancel {
+		// One worker owns this socket. Wait after the complete write without a
+		// second goroutine or a response read; RST does not prove server stop.
+		r.cancelDue = connection.first.Add(w.c.cpuCancelDelay)
+		if r.cancelDue.After(deadline) {
+			r.category, r.stage = "timeout", "reset_due_after_absolute_deadline"
+			return
+		}
+		if delay := time.Until(r.cancelDue); delay > 0 {
+			time.Sleep(delay)
+		}
+		tcp, ok := connection.Conn.(*net.TCPConn)
+		if !ok {
+			r.category, r.stage = "cancel_issue_error", "reset_requires_TCP"
+			return
+		}
+		if e := tcp.SetLinger(0); e != nil {
+			r.category, r.stage, r.detail = "cancel_issue_error", "reset_linger", e.Error()
+			return
+		}
+		issued := time.Now()
+		e := w.pool.discard(lease)
+		lease = nil // retired exactly once, including a Close failure
+		if e != nil {
+			r.category, r.stage, r.detail = "cancel_issue_error", "reset_close", e.Error()
+			return
+		}
+		r.cancelIssued = issued
+		r.category, r.stage = "planned_reset", "TCP_linger0_close"
+		return
+	}
 	response, e := readResponse(lease.reader, req)
 	if e != nil {
 		fail("read_parse_header", e)
@@ -801,8 +920,80 @@ func kindAt(workload string, index uint64) string {
 		return "cpu"
 	}
 }
+
+// Merge two independent absolute arrival plans without allocating a plan slice.
+// Short wins an exact timestamp tie; CPU inputs/cancellation use its own ordinal.
+type taskMixPlan struct {
+	origin                           time.Time
+	shortRate, cpuRate               float64
+	shortTotal, cpuTotal, short, cpu uint64
+	index, prefix, cancelEvery       uint64
+}
+
+func newTaskMixPlan(c config, origin time.Time) taskMixPlan {
+	return taskMixPlan{origin: origin, shortRate: c.rate, cpuRate: c.cpuRate,
+		shortTotal: uint64(math.Ceil(c.duration.Seconds() * c.rate)),
+		cpuTotal:   uint64(math.Ceil(c.duration.Seconds() * c.cpuRate)),
+		prefix:     c.prefix, cancelEvery: c.cpuCancelEvery}
+}
+
+func (p *taskMixPlan) next() (job, bool) {
+	if p.short == p.shortTotal && p.cpu == p.cpuTotal {
+		return job{}, false
+	}
+	var shortOffset, cpuOffset time.Duration
+	if p.short < p.shortTotal {
+		shortOffset = time.Duration(float64(p.short) / p.shortRate * float64(time.Second))
+	}
+	if p.cpu < p.cpuTotal {
+		cpuOffset = time.Duration(float64(p.cpu) / p.cpuRate * float64(time.Second))
+	}
+	short := p.short < p.shortTotal && (p.cpu == p.cpuTotal || shortOffset <= cpuOffset)
+	j := job{index: p.index, rid: fmt.Sprintf("%09d%07d", p.prefix, p.index)}
+	if short {
+		j.kind, j.streamIndex, j.scheduled = "ok", p.short, p.origin.Add(shortOffset)
+		p.short++
+	} else {
+		j.kind, j.streamIndex, j.scheduled = "cpu", p.cpu, p.origin.Add(cpuOffset)
+		j.cpuCancel = p.cancelEvery > 0 && (p.cpu+1)%p.cancelEvery == 0
+		p.cpu++
+	}
+	p.index++
+	return j, true
+}
+
+func validateTaskMix(c config) error {
+	if c.duration < time.Millisecond || c.duration > time.Hour || math.IsNaN(c.rate) || math.IsInf(c.rate, 0) || c.rate <= 0 || c.timeout < time.Millisecond || c.timeout > time.Minute || c.concurrency < 1 || c.concurrency > 16384 || c.queue < 0 || c.queue > 65536 || c.prefix == 0 || c.prefix > 999999999 {
+		return fmt.Errorf("invalid bounded task_mix configuration")
+	}
+	if math.IsNaN(c.cpuRate) || math.IsInf(c.cpuRate, 0) || c.cpuRate <= 0 || c.cpuRate > 1000000 || c.rate+c.cpuRate > 1000000 {
+		return fmt.Errorf("task_mix requires positive bounded independent --cpu-rate")
+	}
+	shortPlans, cpuPlans := math.Ceil(c.duration.Seconds()*c.rate), math.Ceil(c.duration.Seconds()*c.cpuRate)
+	if shortPlans < 1 || cpuPlans < 1 || shortPlans+cpuPlans > 10000000 {
+		return fmt.Errorf("combined task_mix plans exceed10000000")
+	}
+	cpu, ok := c.protocol.Endpoints["cpu"]
+	short, hasShort := c.protocol.Endpoints["ok"]
+	if !ok || !hasShort || cpu.Method != "GET" || short.Method != "GET" || len(cpu.Work) != 1 || cpu.Work[0] != 512 || len(cpu.Seeds) != 2 || cpu.Seeds[0] != 3 || cpu.Seeds[1] != 11 {
+		return fmt.Errorf("task_mix requires GET ok/cpu and frozen CPU work_units[512],seed_lengths[3,11]")
+	}
+	if math.IsNaN(c.taskMixShortSLOMS) || math.IsInf(c.taskMixShortSLOMS, 0) || c.taskMixShortSLOMS <= 0 || c.taskMixShortSLOMS > 1000 {
+		return fmt.Errorf("invalid task_mix_short_p99_ms")
+	}
+	if c.cpuCancelEvery != 0 && c.cpuCancelEvery != 10 {
+		return fmt.Errorf("task_mix cancellation is disabled or every10CPU plans")
+	}
+	if c.cpuCancelEvery != 0 && (c.cpuCancelDelay < time.Microsecond || c.cpuCancelDelay > time.Second || c.cpuCancelDelay >= c.timeout) {
+		return fmt.Errorf("invalid CPU cancel delay or original request deadline")
+	}
+	return nil
+}
 func inputAt(c config, j job) (int, int) {
 	e := c.protocol.Endpoints["cpu"]
+	if c.workload == "task_mix" {
+		return e.Work[j.streamIndex%uint64(len(e.Work))], e.Seeds[(j.streamIndex/uint64(len(e.Work)))%uint64(len(e.Seeds))]
+	}
 	return e.Work[j.index%uint64(len(e.Work))], e.Seeds[(j.index/uint64(len(e.Work)))%uint64(len(e.Seeds))]
 }
 func requestSpec(c config, j job) (string, string, []byte) {
@@ -959,12 +1150,26 @@ func load(c *config) error {
 			return fmt.Errorf("invalid endpoint path")
 		}
 	}
+	if c.workload == "task_mix" {
+		c.taskMixShortSLOMS = 20
+		if raw, ok := c.protocol.SLO["task_mix_short_p99_ms"]; ok {
+			if e := json.Unmarshal(raw, &c.taskMixShortSLOMS); e != nil {
+				return e
+			}
+		}
+		return validateTaskMix(*c)
+	}
 	return nil
 }
 func run(c config) (map[string]any, error) {
+	if c.workload == "task_mix" {
+		if e := validateTaskMix(c); e != nil {
+			return nil, e
+		}
+	}
 	l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, int(math.Ceil(c.duration.Seconds())))}
 	if c.events != "" {
-		w, e := openEvents(c.events)
+		w, e := openEvents(c.events, c.workload == "task_mix")
 		if e != nil {
 			return nil, e
 		}
@@ -990,18 +1195,33 @@ func run(c config) (map[string]any, error) {
 	l.cutoff = l.origin.Add(c.duration)
 	close(gate)
 	planned := uint64(math.Ceil(c.duration.Seconds() * c.rate))
+	if c.workload == "task_mix" {
+		planned += uint64(math.Ceil(c.duration.Seconds() * c.cpuRate))
+	}
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
 	}
-	for index := uint64(0); index < planned; index++ {
-		j := job{index: index, kind: kindAt(c.workload, index), rid: fmt.Sprintf("%09d%07d", c.prefix, index), scheduled: l.origin.Add(time.Duration(float64(index) / c.rate * float64(time.Second)))}
-		l.plan(j)
-		if delay := time.Until(j.scheduled); delay > 0 {
-			timer.Reset(delay)
-			<-timer.C
+	if c.workload == "task_mix" {
+		plan := newTaskMixPlan(c, l.origin)
+		for j, ok := plan.next(); ok; j, ok = plan.next() {
+			l.plan(j)
+			if delay := time.Until(j.scheduled); delay > 0 {
+				timer.Reset(delay)
+				<-timer.C
+			}
+			enqueuePlanned(c, l, j, queue, time.Now())
 		}
-		enqueuePlanned(c, l, j, queue, time.Now())
+	} else {
+		for index := uint64(0); index < planned; index++ {
+			j := job{index: index, kind: kindAt(c.workload, index), rid: fmt.Sprintf("%09d%07d", c.prefix, index), scheduled: l.origin.Add(time.Duration(float64(index) / c.rate * float64(time.Second)))}
+			l.plan(j)
+			if delay := time.Until(j.scheduled); delay > 0 {
+				timer.Reset(delay)
+				<-timer.C
+			}
+			enqueuePlanned(c, l, j, queue, time.Now())
+		}
 	}
 	timer.Stop()
 	if delay := time.Until(l.cutoff); delay > 0 {
@@ -1025,6 +1245,9 @@ func run(c config) (map[string]any, error) {
 	byType := map[string]any{}
 	for kind, s := range l.types {
 		byType[kind] = s.view(c.duration.Seconds())
+		if c.workload == "task_mix" {
+			byType[kind] = s.taskMixView(c.duration.Seconds(), sloMS(kind, c))
+		}
 	}
 	seconds := make([]map[string]any, len(l.seconds))
 	for i, s := range l.seconds {
@@ -1052,18 +1275,36 @@ func run(c config) (map[string]any, error) {
 	clocks["last_actual_completed_rid"] = l.lastActualCompletedRID
 	clocks["last_complete_response_offset_ns"] = offset(l.lastCompleteResponse, l.origin)
 	clocks["last_complete_response_unix_ns"] = unixNano(l.lastCompleteResponse)
+	clocks["last_terminal_offset_ns"] = offset(l.lastTerminal, l.origin)
+	clocks["last_terminal_unix_ns"] = unixNano(l.lastTerminal)
+	clocks["last_terminal_monotonic_ns"] = anchor.at(offset(l.lastTerminal, l.origin))
+	clocks["last_terminal_rid"] = l.lastTerminalRID
+	clocks["last_terminal_definition"] = "last terminal among all plans, including unsent/not-started plans and planned resets; not server physical completion"
 	anchor.annotate(clocks)
 	clocks["last_actual_completed_definition"] = "last terminal timestamp among actually sent plans, including timeout/transport errors; full response tracked separately"
 	clocks["tail_policy"] = "planned arrivals may start after cutoff only before their original scheduled_at+timeout; late window completions never increase window goodput"
 	clocks["actual_clock_frozen"] = "after all planned requests reached one terminal state; does not renew the planned cutoff or request deadlines"
+	if c.workload == "task_mix" {
+		clocks["cpu_rate"] = c.cpuRate
+		clocks["task_mix_short_SLO_ms"] = c.taskMixShortSLOMS
+		clocks["cpu_cancel_every"] = c.cpuCancelEvery
+		clocks["cpu_cancel_delay_us"] = c.cpuCancelDelay.Microseconds()
+		out["task_mix"] = map[string]any{"short_type": "ok", "long_type": "cpu", "short_rate": c.rate, "cpu_rate": c.cpuRate, "short_SLO_ms": c.taskMixShortSLOMS, "arrival_plan": "independent absolute streams, same-time short first; CPU sequence selects seeds[3,11]; optional reset every10th CPU plan", "normal_long_denominator": "CPU planned minus predesignated cancellation plans; all cancelled/unsent/error rows remain in full ledger and planned_cancellation", "reset_samples": l.cancelSamples, "reset_scope": "full request write then sent+delay TCP SetLinger(0)+Close; timestamp precedes successful Close, not proof peer receipt, execution stop or resource reuse", "cancel_seed_scope": "with alternating[3,11] and every10th plan, predesignated resets use seed11", "CSV_extra_fields": []string{"stream_index", "planned_cpu_cancel", "reset_due_ns", "reset_issued_ns", "request_write_completed"}}
+	}
+	runEnd := time.Now()
+	clocks["run_end_offset_ns"] = offset(runEnd, l.origin)
+	clocks["run_end_unix_ns"] = unixNano(runEnd)
+	clocks["run_end_monotonic_ns"] = anchor.at(offset(runEnd, l.origin))
+	clocks["run_end_definition"] = "after terminal accounting, connection retirement and CSV flush; before final JSON serialization/process exit"
 	return out, nil
 }
 func parse() (config, error) {
 	c := config{}
 	var duration, timeout float64
 	var idleMS int
+	var cancelDelayUS int64
 	flag.StringVar(&c.address, "address", "", "HTTP host:port")
-	flag.StringVar(&c.workload, "workload", "ok", "ok/json_object/json_array/json_escape/cpu/timer/wait/tcp/db/mixed")
+	flag.StringVar(&c.workload, "workload", "ok", "ok/json_object/json_array/json_escape/cpu/timer/wait/tcp/db/mixed/task_mix")
 	flag.StringVar(&c.protocolPath, "protocol", "tests/benchmarks/cross_stack/protocol.json", "frozen protocol JSON")
 	flag.StringVar(&c.corporaDir, "corpora-dir", "", "optional corpus directory, frozen hashes still verified")
 	flag.StringVar(&c.corpusPath, "corpus", "", "override selected JSON corpus path, frozen hash still verified")
@@ -1071,6 +1312,9 @@ func parse() (config, error) {
 	flag.StringVar(&c.events, "events", "", "exclusive-create streaming gzip CSV, queue 8192; overflow invalidates run")
 	flag.Float64Var(&duration, "duration", 30, "arrival window seconds (0..3600)")
 	flag.Float64Var(&c.rate, "rate", 100, "open arrivals per second (positive, total <=10000000)")
+	flag.Float64Var(&c.cpuRate, "cpu-rate", 0, "task_mix independent CPU arrivals/sec; --rate is short arrivals/sec")
+	flag.Uint64Var(&c.cpuCancelEvery, "cpu-cancel-every", 0, "task_mix:0 disabled or10 for every10th CPU plan, normal denominator excludes these plans")
+	flag.Int64Var(&cancelDelayUS, "cpu-cancel-delay-us", 250, "planned CPU RST due microseconds after first positive request write")
 	flag.IntVar(&c.concurrency, "concurrency", 128, "maximum in-flight requests and idle pool capacity (1..16384)")
 	flag.IntVar(&c.queue, "queue", 256, "bounded pending plan descriptors (0..65536)")
 	flag.Float64Var(&timeout, "timeout", 3, "absolute seconds from scheduled_at, including queue/dial/write/read")
@@ -1086,6 +1330,13 @@ func parse() (config, error) {
 	c.duration = time.Duration(duration * float64(time.Second))
 	c.timeout = time.Duration(timeout * float64(time.Second))
 	c.idle = time.Duration(idleMS) * time.Millisecond
+	if math.IsNaN(c.cpuRate) || math.IsInf(c.cpuRate, 0) || c.cpuRate < 0 || c.cpuRate > 1000000 || cancelDelayUS < 1 || cancelDelayUS > 1000000 {
+		return c, fmt.Errorf("invalid bounded CPU arrival/cancel configuration")
+	}
+	if c.workload != "task_mix" && (c.cpuRate != 0 || c.cpuCancelEvery != 0) {
+		return c, fmt.Errorf("independent CPU arrival/cancellation requires task_mix")
+	}
+	c.cpuCancelDelay = time.Duration(cancelDelayUS) * time.Microsecond
 	if c.prefix == 0 {
 		var raw [8]byte
 		if _, e := rand.Read(raw[:]); e != nil {
@@ -1096,7 +1347,7 @@ func parse() (config, error) {
 	if e := load(&c); e != nil {
 		return c, e
 	}
-	if _, ok := c.protocol.Endpoints[c.workload]; !ok {
+	if _, ok := c.protocol.Endpoints[c.workload]; !ok && c.workload != "task_mix" {
 		return c, fmt.Errorf("unsupported workload")
 	}
 	return c, nil

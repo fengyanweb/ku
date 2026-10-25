@@ -105,7 +105,12 @@ def measurement_clock(configuration):
     return {'available':True,'origin_ns':origin,'uncertainty_ns':uncertainty,
             'clock':'Linux CLOCK_MONOTONIC; Unix timestamps are display only'}
 
-def quiet_metrics(stack, value):
+def quiet_metrics(stack, value, require_database_metrics=True):
+    """Observed quiet counters; absent legacy task_driver does not prove its residency.
+
+    A no-database fixture may explicitly omit database metrics. Present metrics
+    are always validated, including an optional task_driver residency counter.
+    """
     def zero(mapping, fields):
         return isinstance(mapping,dict) and all(type(mapping.get(k)) is int and mapping[k]==0 for k in fields)
     if not isinstance(value,dict):
@@ -123,7 +128,9 @@ def quiet_metrics(stack, value):
             return False
     if not zero(value.get('task_blocking'),('resident','queued','running','net_wait','net_step','cancelled_still_running','output_charge_bytes')):
         return False
-    if not zero(value.get('database'),('pending_operations','pending_bytes')):
+    if 'task_driver' in value and not zero(value['task_driver'],('resident',)):
+        return False
+    if (require_database_metrics or 'database' in value) and not zero(value.get('database'),('pending_operations','pending_bytes')):
         return False
     if not zero(value,('buffer_bytes',)):
         return False

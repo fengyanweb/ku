@@ -488,7 +488,7 @@ func TestLateWindowCompletionAndBoundedCSVLedger(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if len(rows) != 2 || rows[1][7] != "correct" || rows[1][3] == "" || rows[1][4] == "" || rows[1][5] == "" {
+	if len(rows) != 2 || len(rows[0]) != 15 || rows[1][7] != "correct" || rows[1][3] == "" || rows[1][4] == "" || rows[1][5] == "" {
 		t.Fatal(rows)
 	}
 	if _, e = openEvents(c.events); e == nil {
@@ -688,5 +688,211 @@ func TestTailSamplesAndIdleDiagnosticCounters(t *testing.T) {
 		if (v["p99_ms"] != nil) != (count >= 100) || (v["p999_ms"] != nil) != (count >= 1000) {
 			t.Fatal(count, v)
 		}
+	}
+}
+
+func taskMixTestConfig(t *testing.T) config {
+	c := testConfig(t)
+	c.workload, c.duration, c.rate, c.cpuRate = "task_mix", time.Second, 4, 2
+	c.taskMixShortSLOMS, c.cpuCancelDelay = 20, 250*time.Microsecond
+	e := c.protocol.Endpoints["cpu"]
+	e.Work, e.Seeds = []int{512}, []int{3, 11}
+	c.protocol.Endpoints["cpu"] = e
+	if err := validateTaskMix(c); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestTaskMixPlansIndependentStreamsAndOriginalInputs(t *testing.T) {
+	c := taskMixTestConfig(t)
+	origin := time.Unix(100, 0)
+	plan := newTaskMixPlan(c, origin)
+	wantKinds := []string{"ok", "cpu", "ok", "ok", "cpu", "ok"}
+	wantOffsets := []time.Duration{0, 0, 250 * time.Millisecond, 500 * time.Millisecond, 500 * time.Millisecond, 750 * time.Millisecond}
+	var cpuJobs []job
+	for index := range wantKinds {
+		j, ok := plan.next()
+		if !ok || j.index != uint64(index) || j.kind != wantKinds[index] || j.scheduled.Sub(origin) != wantOffsets[index] {
+			t.Fatalf("plan %d: %+v", index, j)
+		}
+		if j.kind == "cpu" {
+			units, seed := inputAt(c, j)
+			if units != 512 || seed != []int{3, 11}[len(cpuJobs)] {
+				t.Fatalf("CPU ordinal lost: %+v input=%d/%d", j, units, seed)
+			}
+			cpuJobs = append(cpuJobs, j)
+		}
+	}
+	if _, ok := plan.next(); ok {
+		t.Fatal("extra plan")
+	}
+	// Changing short traffic must not change CPU timestamps, ordinal or inputs.
+	c.rate = 9
+	plan = newTaskMixPlan(c, origin)
+	count := 0
+	for j, ok := plan.next(); ok; j, ok = plan.next() {
+		if j.kind == "cpu" {
+			if j.streamIndex != cpuJobs[count].streamIndex || j.scheduled != cpuJobs[count].scheduled {
+				t.Fatal("CPU stream depended on short arrival rate")
+			}
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatal(count)
+	}
+	// The original per-workload index selection and70/20/9/1 mixture stay intact.
+	c.workload = "cpu"
+	e := c.protocol.Endpoints["cpu"]
+	e.Work, e.Seeds = []int{480, 512, 544, 576}, []int{1, 3, 7, 11}
+	c.protocol.Endpoints["cpu"] = e
+	if units, seed := inputAt(c, job{index: 5, streamIndex: 0}); units != 512 || seed != 3 {
+		t.Fatal("old CPU selection changed", units, seed)
+	}
+}
+
+func TestTaskMixCancellationPlanAndNormalDenominators(t *testing.T) {
+	c := taskMixTestConfig(t)
+	c.rate, c.cpuRate, c.cpuCancelEvery = 17, 20, 10
+	origin := time.Unix(100, 0)
+	plan := newTaskMixPlan(c, origin)
+	l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, 1), origin: origin, cutoff: origin.Add(time.Second)}
+	seen := map[string]bool{}
+	counts := map[string]int{}
+	var resets []uint64
+	for j, ok := plan.next(); ok; j, ok = plan.next() {
+		if seen[j.rid] {
+			t.Fatal("duplicate merged RID", j.rid)
+		}
+		seen[j.rid] = true
+		counts[j.kind]++
+		l.plan(j)
+		l.start()
+		r := result{category: "correct", sent: j.scheduled.Add(time.Microsecond), completed: j.scheduled.Add(time.Millisecond), responseComplete: true}
+		if j.cpuCancel {
+			resets = append(resets, j.streamIndex)
+			r.category, r.responseComplete = "planned_reset", false
+			r.cancelDue, r.cancelIssued = r.sent.Add(c.cpuCancelDelay), r.sent.Add(c.cpuCancelDelay+time.Microsecond)
+		}
+		l.finish(j, j.scheduled, r, c)
+	}
+	if counts["ok"] != 17 || counts["cpu"] != 20 || len(resets) != 2 || resets[0] != 9 || resets[1] != 19 {
+		t.Fatal(counts, resets)
+	}
+	view := l.types["cpu"].taskMixView(1, 1000)
+	if view["planned"] != uint64(20) || view["normal_planned"] != uint64(18) || view["normal_correct"] != uint64(18) || view["normal_failure_fraction_planned"] != float64(0) || l.types["cpu"].Results["planned_reset"] != 2 || len(l.samples) != 0 || len(l.cancelSamples) != 2 {
+		t.Fatal(view, l.samples, l.cancelSamples)
+	}
+	// A predesignated but unsent cancellation remains visible; it is not a
+	// successful reset, and run's original not_started gate still invalidates it.
+	j := job{kind: "cpu", cpuCancel: true, streamIndex: 29, rid: "unsent", scheduled: origin}
+	l.plan(j)
+	l.finish(j, time.Time{}, result{category: "not_started_queue", completed: origin.Add(time.Second)}, c)
+	view = l.types["cpu"].taskMixView(1, 1000)
+	cancel := view["planned_cancellation"].(map[string]any)
+	if view["normal_planned"] != uint64(18) || cancel["planned"] != uint64(3) || cancel["reset_issued"] != uint64(2) || len(l.samples) != 1 || l.all.Results["not_started_queue"] != 1 {
+		t.Fatal(view, l.samples)
+	}
+	path := filepath.Join(t.TempDir(), "task-mix.csv.gz")
+	events, err := openEvents(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events.offer(event{j: job{kind: "cpu", rid: "reset", streamIndex: 9, cpuCancel: true, scheduled: origin}, origin: origin, result: result{category: "planned_reset", sent: origin, completed: origin.Add(time.Millisecond), cancelDue: origin.Add(250 * time.Microsecond), cancelIssued: origin.Add(300 * time.Microsecond), writeComplete: true}})
+	events.close()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	z, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer z.Close()
+	rows, err := csv.NewReader(z).ReadAll()
+	if err != nil || len(rows) != 2 || len(rows[0]) != 20 || rows[1][7] != "planned_reset" || rows[1][15] != "9" || rows[1][16] != "true" || rows[1][17] != "250000" || rows[1][18] != "300000" || rows[1][19] != "true" {
+		t.Fatal(rows, err)
+	}
+}
+
+func TestTaskMixRejectsUnfrozenProtocolAndBadBounds(t *testing.T) {
+	c := testConfig(t)
+	c.workload, c.cpuRate, c.taskMixShortSLOMS = "task_mix", 1, 20
+	if validateTaskMix(c) == nil {
+		t.Fatal("accepted original multi-input protocol as frozen task_mix")
+	}
+	c = taskMixTestConfig(t)
+	c.cpuRate = math.NaN()
+	if validateTaskMix(c) == nil {
+		t.Fatal("accepted NaN CPU rate")
+	}
+	c = taskMixTestConfig(t)
+	c.cpuCancelEvery, c.cpuCancelDelay = 10, c.timeout
+	if validateTaskMix(c) == nil {
+		t.Fatal("renewed original deadline for reset")
+	}
+}
+
+func TestTaskMixResetRetiresExactlyOneTCPLease(t *testing.T) {
+	c := taskMixTestConfig(t)
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	c.address = listener.Addr().String()
+	done := make(chan error, 1)
+	go func() {
+		_ = listener.SetDeadline(time.Now().Add(time.Second))
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				done <- err
+			} else {
+				// The reset may discard data before the peer parsed HTTP.
+				done <- nil
+			}
+			return
+		}
+		_ = req.Body.Close()
+		if req.URL.Query().Get("rid") != "reset" || len(req.URL.Query().Get("work")) != 512 || len(req.URL.Query().Get("seed")) != 11 {
+			done <- fmt.Errorf("unexpected reset request")
+			return
+		}
+		var probe [1]byte
+		_, err = conn.Read(probe[:])
+		if err == nil {
+			err = fmt.Errorf("request replayed on reset socket")
+		} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+			// A peer that merely reached its deadline did not observe closure.
+		} else {
+			err = nil // peer stream ended; wire RST receipt itself is not asserted
+		}
+		done <- err
+	}()
+	l := testLedger()
+	w := testWorker(c, l)
+	j := job{kind: "cpu", streamIndex: 9, cpuCancel: true, rid: "reset", scheduled: time.Now()}
+	r := w.request(j, j.scheduled)
+	w.pool.close()
+	if r.category != "planned_reset" || !r.writeComplete || r.sent.IsZero() || r.cancelIssued.IsZero() || r.cancelDue.Sub(r.sent) != c.cpuCancelDelay || r.cancelIssued.Before(r.cancelDue) || r.responseComplete || l.live != 0 || l.dials != 1 || len(w.pool.idle) != 0 {
+		t.Fatalf("reset changed ownership/accounting: %+v live=%d dials=%d", r, l.live, l.dials)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("owned reset peer failed to exit")
 	}
 }

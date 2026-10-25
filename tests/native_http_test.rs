@@ -4152,6 +4152,26 @@ fn native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait()
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"Task I/O batch line %d: %s\n",__LINE__,#c); return 97; } } while(0)
 int main(void) {
   KuHttpTaskIoBatch batch={0};
+  /* A ready Task makes the shared nearest deadline zero. The same-turn
+   * eligibility reduction must retain the real request deadline separately,
+   * including connections whose paused peer supplies no poll interest. */
+  KuHttpTaskIoEligibility eligibility={UINT64_MAX,1};
+  ku_http_task_io_eligibility_observe(&eligibility,1,1050u);
+  ku_http_task_io_eligibility_observe(&eligibility,1,1030u);
+  ku_http_task_io_eligibility_observe(&eligibility,1,1040u);
+  CHECK(eligibility.all_async && eligibility.deadline==1030u);
+  CHECK(!(1029u>=eligibility.deadline));
+  CHECK(1030u>=eligibility.deadline); /* The late clock, not scan time. */
+  ku_http_task_io_eligibility_observe(&eligibility,0,UINT64_MAX);
+  CHECK(!eligibility.all_async); /* Read/write, closed, missing or cancelled. */
+  ku_http_task_io_eligibility_observe(&eligibility,1,1100u);
+  CHECK(!eligibility.all_async); /* Later valid members cannot undo urgency. */
+  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,0};
+  CHECK(!eligibility.all_async); /* An empty active set cannot defer I/O. */
+  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,1};
+  ku_http_task_io_eligibility_observe(&eligibility,1,2000u);
+  CHECK(eligibility.all_async && eligibility.deadline==2000u);
+  /* Rebuilding on the next traversal discards the old expiry/cancellation. */
   /* Frozen time cannot turn ready computation into an unbounded I/O skip.
    * Each caller turn still has its original pump(32) logical-poll limit. */
   unsigned int skipped=0,logical_polls=0;

@@ -1,10 +1,13 @@
 //! Real source -> verified Task IR -> generated factories/continuations/root.
 //! No fixture callback supplies Start, Await or scope cleanup on its behalf.
+#[path = "support/native_allocation_harness.rs"]
+mod native_allocation_harness;
 #[allow(dead_code)]
 #[path = "support/native_pg_harness.rs"]
 mod native_harness;
 
 use ku::{backend::c, checker::Checker, ir::task_lower, lexer::Lexer, parser::Parser};
+use native_allocation_harness::ALLOCATION_HOOK;
 use native_harness::{
     compile_harness, run_bounded, TempDir, BUILD_LIMITS, BUILD_TIMEOUT,
     NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS, RUN_TIMEOUT,
@@ -955,6 +958,124 @@ int main(void) {
 }
 
 #[test]
+fn native_task_scalar_empty_scope_publishes_pending_before_host_allocation() {
+    let tasks = task_lower::lower_program(&checked(
+        "async fn Work(): str! { i=0; total=0; while(i<2) { total=total+i+1; i=i+1 } text=str(total); return ok(text) } async fn main(): null! { return ok(null) }",
+    ))
+    .unwrap();
+    let work = &tasks.tasks.functions[0];
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!("{ALLOCATION_HOOK}\nstatic size_t fixture_steps,fixture_entry_seen,fixture_host_calls,fixture_bad_pending,fixture_bad_first_quantum,fixture_terminal_calls,fixture_bad_terminal;\nstatic uint32_t fixture_entry_status=UINT32_MAX,fixture_host_status=UINT32_MAX;\ntypedef struct KuString {{"),
+        1,
+    );
+    let begin = generated
+        .find("static uint32_t ku_task_frame_0_drive(")
+        .unwrap();
+    let end = begin
+        + generated[begin..]
+            .find("static uint32_t ku_task_frame_0_resume(")
+            .unwrap();
+    let mut drive = generated[begin..end].to_owned();
+    for state in 0..work.states.len() {
+        for label in [
+            format!("ku_task_state_{state}:;"),
+            format!("ku_task_range_state_{state}:;"),
+        ] {
+            if drive.contains(&label) {
+                // Observe actual state entry; never canonicalize the header.
+                drive = drive.replacen(&label, &format!("{label}\n  if(!fixture_entry_seen++) fixture_entry_status=frame->header.status;\n  fixture_steps++;\n"), 1);
+            }
+        }
+    }
+    generated.replace_range(begin..end, &drive);
+    let reconcile = "static uint32_t ku_task_0_reconcile_charge(void* raw) {";
+    assert_eq!(generated.matches(reconcile).count(), 1);
+    generated = generated.replacen(
+        reconcile,
+        &format!(r#"{reconcile}
+  KuTaskInstance_0* observed=(KuTaskInstance_0*)raw;
+  if(observed->frame.header.running) {{
+    if(!fixture_host_calls++) fixture_host_status=observed->frame.header.status;
+    fixture_bad_pending+=observed->frame.header.status!=KU_TASK_FRAME_PENDING;
+    fixture_bad_first_quantum+=fixture_steps>=64u || observed->ticket.driver->polls!=0u;
+  }} else if(observed->frame.header.result_initialized) {{
+    fixture_terminal_calls++;
+    fixture_bad_terminal+=observed->frame.header.status!=KU_TASK_FRAME_READY && observed->frame.header.status!=KU_TASK_FRAME_EXIT_STAGED;
+  }}"#),
+        1,
+    );
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int ku_unused_source_main(void) {",
+        1,
+    ) + r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"short pending line %d: %s; entry=%u host=%u steps=%zu calls=%zu bad=%zu terminal_bad=%zu\n",__LINE__,#c,fixture_entry_status,fixture_host_status,fixture_steps,fixture_host_calls,fixture_bad_pending,fixture_bad_terminal); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+int main(void) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX,deadline=ku_task_driver_now_ms()+2000u;
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+4096u,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_0_start_value(&driver,&task)==KU_TASK_DRIVER_OK);
+  KuTaskDriverTicketV1 old=task.ticket;
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+  CHECK(instance->frame.header.status==KU_TASK_FRAME_OK);
+  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(fixture_entry_seen && fixture_entry_status==KU_TASK_FRAME_OK);
+  CHECK(fixture_host_calls && !fixture_bad_pending && !fixture_bad_first_quantum);
+  for(size_t turn=0;turn<16u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_COMPLETED);
+  CHECK(fixture_terminal_calls && !fixture_bad_terminal);
+  KuTaskAdapterOutcomeV1 outcome={0};
+  CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.result_kind==4u && outcome.value.string.ok);
+  KuString text=outcome.value.string.value;
+  CHECK(text.storage==KU_STRING_OWNED && text.len==1u && text.ptr && text.ptr[0]=='3');
+  ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK && !task.owner.lease.control);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
+  CHECK(!slots[0].binding && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(ku_perf_calls>=2u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  printf("short-scalar-pending-host-ok entry=%u host=%u steps=%zu callbacks=%zu terminal=%zu\n",fixture_entry_status,fixture_host_status,fixture_steps,fixture_host_calls,fixture_terminal_calls);
+  return 0;
+}
+"#;
+    let directory = TempDir::new("task-short-pending");
+    let path = directory.path().join("pending_publication.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "pending_publication") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(
+        stdout.starts_with("short-scalar-pending-host-ok entry=0 host=1 "),
+        "{stdout}"
+    );
+    assert!(output.stderr.is_empty());
+    eprint!("{stdout}");
+}
+
+#[test]
 fn native_task_scalar_quantum_reconciles_owned_changes_children_and_cleanup() {
     let source = r#"
 import fs from "std.fs"
@@ -1076,6 +1197,11 @@ async fn main(): null! { return ok(null) }
             ))
             .unwrap();
         let body = begin + generated[begin..].find(") {\n").unwrap() + 4;
+        let helper_end = body + generated[body..].find("\n}\n").unwrap();
+        let body = body
+            + generated[body..helper_end]
+                .find("  if (copy_active)")
+                .expect("scalar spill must still merge Copy initialization bits");
         let finish = body + generated[body..].find('\n').unwrap() + 1;
         let merge = generated[body..finish].to_owned();
         assert!(merge.contains("if (copy_active)"));

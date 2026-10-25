@@ -2771,6 +2771,17 @@ typedef struct {
   unsigned long long started_ms;
   unsigned int turns;
 } KuHttpTaskIoBatch;
+/* Rebuilt by this turn's existing poll-interest traversal. No connection or
+ * generation fact survives admission, I/O dispatch or the next owner turn. */
+typedef struct {
+  unsigned long long deadline;
+  int all_async;
+} KuHttpTaskIoEligibility;
+static void ku_http_task_io_eligibility_observe(KuHttpTaskIoEligibility* eligibility,
+    int eligible,unsigned long long deadline) {
+  if (!eligible) eligibility->all_async=0;
+  else if (deadline<eligibility->deadline) eligibility->deadline=deadline;
+}
 static void ku_http_task_io_batch_reset(KuHttpTaskIoBatch* batch) {
   batch->started_ms=0; batch->turns=0;
 }
@@ -3032,6 +3043,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       }
     }
     int connection_poll_base=poll_count,connection_poll_count=0;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    KuHttpTaskIoEligibility task_io_eligibility={~0ULL,task_deadline==0u && active.count!=0};
+#endif
     for (int position=0;position<active.count;position++) {
       int index=active.indices[position];
       KuHttpConnection* connection = &connections[index];
@@ -3045,6 +3059,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         nearest = connection->job->request_deadline;
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
         nearest = connection->async_deadline;
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+      if (task_io_eligibility.all_async)
+        ku_http_task_io_eligibility_observe(&task_io_eligibility,
+            connection->phase==KU_HTTP_IO_ASYNC && connection->async_task && !connection->async_cancelled,
+            connection->async_deadline);
+#endif
       if (!events) continue;
       connection->poll_index = poll_count;
       poll_connections[connection_poll_count++]=(KuHttpPollConnection){index,connection->connection_generation};
@@ -3096,12 +3116,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_NET)
     if (net_count) task_io_urgent=1;
 #endif
-    for (int position=0;position<active.count && !task_io_urgent;position++) {
-      KuHttpConnection* connection=&connections[active.indices[position]];
-      if (connection->phase!=KU_HTTP_IO_ASYNC || !connection->async_task
-          || connection->async_cancelled || now>=connection->async_deadline)
-        task_io_urgent=1;
-    }
+    /* The owner has not admitted, dispatched or retired a connection since
+     * the interest pass. Reuse its structural facts, but test the minimum
+     * deadline against this original late sample, never the earlier scan. */
+    if (!task_io_eligibility.all_async || now>=task_io_eligibility.deadline)
+      task_io_urgent=1;
 #if !defined(_WIN32)
     /* An already-published wake is an immediate reason to service the pipe.
      * This is only an acquire observation: the original drain/clear and the

@@ -10,7 +10,7 @@ import types
 from pathlib import Path
 from unittest import mock
 
-from linux_harness import (arrival_cpu, business_send_end, measurement_clock,
+from linux_harness import (arrival_cpu, business_send_end, measurement_clock, quiet_metrics,
                            qualification, recovery_probe_views, upper_point, aggregate_rounds,
                            histogram_bucket, paired_interval, interleaved_orders,
                            overload_boundary, full_lifecycle_cost, Case, Harness, write_json, read_json,
@@ -27,6 +27,51 @@ def clock(origin=100_000_000_000, uncertainty=1000):
 def event(rid, planned, completed, terminal='correct'):
     return {'rid': rid, 'scheduled_ns': str(planned), 'completed_ns': str(completed),
             'terminal': terminal}
+
+
+class QuietMetricsTest(unittest.TestCase):
+    def quiet_no_database(self):
+        return {'loops': [dict.fromkeys(('queued', 'running', 'resident', 'pending', 'connections'), 0)],
+                'tasks': [dict.fromkeys(('ready', 'waiting', 'running', 'resident', 'timers'), 0)],
+                'task_blocking': dict.fromkeys(('resident', 'queued', 'running', 'net_wait', 'net_step',
+                                               'cancelled_still_running', 'output_charge_bytes'), 0),
+                'buffer_bytes': 0}
+
+    def test_database_metrics_optional_only_when_absent(self):
+        value = self.quiet_no_database()
+        self.assertFalse(quiet_metrics('ku', value))
+        self.assertTrue(quiet_metrics('ku', value, require_database_metrics=False))
+        value['database'] = {'pending_operations': 0, 'pending_bytes': 0}
+        self.assertTrue(quiet_metrics('ku', value))
+        self.assertTrue(quiet_metrics('ku', value, require_database_metrics=False))
+
+    def test_present_database_metrics_are_never_ignored(self):
+        for database in ({'pending_operations': 1, 'pending_bytes': 0},
+                         {'pending_operations': 0, 'pending_bytes': 1}, {}, None):
+            with self.subTest(database=database):
+                value = self.quiet_no_database()
+                value['database'] = database
+                self.assertFalse(quiet_metrics('ku', value, require_database_metrics=False))
+
+    def test_missing_or_empty_task_owner_lists_are_not_quiet(self):
+        for field in ('loops', 'tasks'):
+            for missing, rows in ((True, None), (False, None), (False, [])):
+                with self.subTest(field=field, missing=missing, rows=rows):
+                    value = self.quiet_no_database()
+                    if missing:
+                        value.pop(field)
+                    else:
+                        value[field] = rows
+                    self.assertFalse(quiet_metrics('ku', value, require_database_metrics=False))
+
+    def test_present_task_driver_requires_zero_resident(self):
+        value = self.quiet_no_database()
+        value['task_driver'] = {'resident': 0}
+        self.assertTrue(quiet_metrics('ku', value, require_database_metrics=False))
+        for task_driver in ({'resident': 1}, {'resident': None}, {}, None):
+            with self.subTest(task_driver=task_driver):
+                value['task_driver'] = task_driver
+                self.assertFalse(quiet_metrics('ku', value, require_database_metrics=False))
 
 
 class ClockAndRecoveryTest(unittest.TestCase):

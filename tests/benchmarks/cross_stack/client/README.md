@@ -21,7 +21,7 @@ go build -o /absolute/outside-repository/cross-stack-client .
 ```
 
 Supported workloads: `ok`, `json_object`, `json_array`, `json_escape`, `cpu`,
-`timer`, `wait`, `tcp`, `db`, `mixed`. `--timeout` is in seconds and is a single
+`timer`, `wait`, `tcp`, `db`, `mixed`, `task_mix`. `--timeout` is in seconds and is a single
 absolute deadline from **scheduled arrival**, including the client queue, dial,
 write and complete response. Long waiting uses its separately frozen deadline.
 All corpus bytes are checked against the protocol SHA-256; responses are fully
@@ -29,6 +29,63 @@ read and checked, including nested JSON, the dynamic request ID and SQL fields.
 CPU expected values are calculated before the measurement window. Request IDs
 are unique within a window; the orchestrator should assign distinct numeric
 `--rid-prefix` values across windows. Without it a random prefix is recorded.
+
+## Independent short/CPU arrivals
+
+`task_mix` merges two independent absolute plans: `--rate` supplies GET `ok`
+requests/second and `--cpu-rate` supplies CPU requests/second. It uses the same
+bounded queue, workers, connection pool, oracle and deadline handling. A short
+plan wins an exact timestamp tie. Global RIDs remain unique; each stream has
+its own zero-based `stream_index`, so changing short traffic does not change CPU
+timestamps, inputs or cancellation selection. Total plans remain at most10million.
+
+Freeze a separate protocol copy with CPU `work_units:[512]` and
+`seed_lengths:[3,11]`; do not edit the public default. Set
+`slo.task_mix_short_p99_ms:20` explicitly in that copy (20ms if absent). This is
+the experiment's planned-send-to-complete SLO, not a shortened request timeout
+or a language guarantee. The original `ok` workload keeps its original SLO.
+Pass `--corpora-dir` when the copied protocol is outside the original corpus
+directory; unchanged corpus hashes are still checked before measurement.
+
+```sh
+cross-stack-client --protocol /absolute/frozen-task-mix.json \
+  --corpora-dir /absolute/repository/tests/benchmarks/cross_stack/corpora \
+  --address 127.0.0.1:8080 --workload task_mix --duration 30 \
+  --rate 100 --cpu-rate 20 --concurrency 128 --queue 256 --timeout 3 \
+  --rid-prefix 1 --output /absolute/new/report.json \
+  --events /absolute/new/events.csv.gz
+```
+
+Optional `--cpu-cancel-every 10 --cpu-cancel-delay-us 250` predesignates CPU
+ordinals9,19,... (each complete group of10 has one reset). With alternating
+seeds[3,11], these cancellation plans use seed11; normal CPU plans use both.
+After the full request write, its existing worker waits until the first
+positive write timestamp plus250us, then calls TCP `SetLinger(0)` and `Close`.
+There is no per-request cancellation goroutine, deadline renewal or replay.
+Actual issue time and scheduling delay remain observable: a late wake is not
+backdated. Failed writes, reset setup/close errors and deadline expiry stay
+explicit. Socket retirement decrements the existing live count exactly once.
+
+`planned_reset` is a separate terminal outcome, never a correct response or
+proof the server received the request, started/stopped computation, ran drops,
+or made resources reusable. A successful local write may still contain unsent
+kernel-buffer data, which a reset may discard; the server may also have
+completed before reset. Qualification must correlate service RID events.
+The original full ledger keeps all planned outcomes; task_mix `by_type.cpu`
+adds `normal_planned`, `normal_correct`, normal failure fractions and a separate
+`planned_cancellation` ledger. Predesignated cancellations are excluded only
+from the normal CPU denominator. Unsent/failed cancellation plans remain in
+that partition; original `not_started_*` still invalidates the driver window.
+Expected resets have separate bounded samples and cannot fill `first_errors`.
+`SLO_goodput_rps` counts only correct, in-window, within-SLO responses, by type.
+
+Only task_mix CSVs append `stream_index`, `planned_cpu_cancel`, `reset_due_ns`,
+`reset_issued_ns` and `request_write_completed`; original workload columns are
+unchanged. These offsets use the existing Go monotonic origin and its one-time
+kernel anchor/uncertainty, without per-request kernel-clock reads. All modes
+also record `last_terminal_*` including unsent plans and `run_end_*` after
+workers, socket retirement and CSV flush; JSON serialization/process exit are
+outside that end timestamp. Neither timestamp means server physical completion.
 
 One planned request has exactly one terminal category: correct, explicit
 503/429 rejection, other HTTP, timeout, connection error, protocol error, wrong

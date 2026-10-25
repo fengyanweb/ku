@@ -225,6 +225,30 @@ jobs:
             native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait \
             -- --exact --nocapture --test-threads=1
 
+      - name: Install the pinned comparison driver toolchain
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+
+      - name: Check the finite CPU comparison fixtures without a database
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests/benchmarks/cross_stack -p test_linux_harness.py
+          (
+            cd tests/benchmarks/cross_stack/client
+            go vet ./...
+            go test -race ./...
+            go build -trimpath -mod=readonly -o "$RUNNER_TEMP/task-mix-driver" .
+          )
+          (
+            cd tests/benchmarks/cross_stack/rust
+            cargo fmt --all -- --check
+            cargo test --release --locked cpu_work:: -- --nocapture
+          )
+
   full-tests:
     if: github.event_name != 'workflow_dispatch' || inputs.scope != 'task-main-path'
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
