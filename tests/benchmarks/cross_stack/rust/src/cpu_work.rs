@@ -4,12 +4,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
-    io,
+    io::{self, Write},
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -94,6 +95,8 @@ struct Events {
     rows: VecDeque<Event>,
     dropped: u64,
     sequence: u64,
+    drained_events: u64,
+    drained_through: u64,
 }
 pub struct Trace {
     enabled: bool,
@@ -111,6 +114,8 @@ impl Trace {
                 },
                 dropped: 0,
                 sequence: 0,
+                drained_events: 0,
+                drained_through: 0,
             }),
         }
     }
@@ -122,6 +127,10 @@ impl Trace {
             let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let count = events.rows.len().min(TRACE_PAGE);
             let rows = events.rows.drain(..count).collect::<Vec<_>>();
+            events.drained_events = events.drained_events.saturating_add(rows.len() as u64);
+            if let Some(last) = rows.last() {
+                events.drained_through = last.sequence;
+            }
             (rows, events.rows.len(), events.dropped, events.sequence)
         };
         json!({"enabled":true,"events":rows,"pending":pending,"dropped":dropped,
@@ -191,6 +200,162 @@ impl Trace {
             cpu_permits_available: None,
             actual_cpu_jobs: None,
         });
+    }
+}
+
+/// Captured only after axum's graceful serve future completed. The caller must
+/// drop the entire Tokio runtime before consuming this receipt: a numeric zero
+/// in `actual` alone precedes the final `reusable` event in Resources::drop.
+pub struct FinalReceipt {
+    trace: Arc<Trace>,
+    actual: Arc<AtomicUsize>,
+    mode: Mode,
+}
+#[derive(Serialize)]
+struct FinalTrace {
+    schema: &'static str,
+    enabled: bool,
+    cpu_mode: &'static str,
+    cpu_entry_trace_covered: bool,
+    sealed: bool,
+    complete: bool,
+    graceful_complete: bool,
+    runtime_drop_completed: bool,
+    pid: u32,
+    clock: &'static str,
+    exported_monotonic_ns: Option<u64>,
+    exported_unix_ns: Option<u64>,
+    actual_cpu_jobs: usize,
+    trace_arc_owners: usize,
+    actual_counter_arc_owners: usize,
+    dropped: u64,
+    final_sequence: u64,
+    prefix_drained_events: u64,
+    prefix_drained_through_sequence: u64,
+    remaining_events: usize,
+    suffix_first_sequence: Option<u64>,
+    suffix_last_sequence: Option<u64>,
+    sequence_complete: bool,
+    export_limit_bytes: usize,
+    events: Vec<Event>,
+}
+const FINAL_TRACE_BYTES: usize = 16 * 1024 * 1024;
+impl FinalReceipt {
+    pub fn after_graceful(trace: Arc<Trace>, actual: Arc<AtomicUsize>, mode: Mode) -> Self {
+        Self {
+            trace,
+            actual,
+            mode,
+        }
+    }
+    fn seal_after_runtime(self) -> FinalTrace {
+        let trace_arc_owners = Arc::strong_count(&self.trace);
+        let actual_counter_arc_owners = Arc::strong_count(&self.actual);
+        let actual_cpu_jobs = self.actual.load(Ordering::Acquire);
+        let (rows, dropped, sequence, drained_events, drained_through) = {
+            let mut events = self.trace.events.lock().unwrap_or_else(|e| e.into_inner());
+            let rows = events.rows.drain(..).collect::<Vec<_>>();
+            (
+                rows,
+                events.dropped,
+                events.sequence,
+                events.drained_events,
+                events.drained_through,
+            )
+        };
+        let sequence_complete = dropped == 0
+            && sequence != u64::MAX
+            && drained_events == drained_through
+            && drained_events.checked_add(rows.len() as u64) == Some(sequence)
+            && rows.iter().enumerate().all(|(index, row)| {
+                drained_through.checked_add(index as u64 + 1) == Some(row.sequence)
+            });
+        let complete = self.trace.enabled
+            && self.mode != Mode::Legacy
+            && actual_cpu_jobs == 0
+            && trace_arc_owners == 1
+            && actual_counter_arc_owners == 1
+            && Arc::weak_count(&self.trace) == 0
+            && Arc::weak_count(&self.actual) == 0
+            && sequence_complete;
+        FinalTrace {
+            schema: "ku-cross-stack-rust-cpu-final-v1",
+            enabled: self.trace.enabled,
+            cpu_mode: self.mode.name(),
+            cpu_entry_trace_covered: self.mode != Mode::Legacy,
+            sealed: true,
+            complete,
+            graceful_complete: true,
+            runtime_drop_completed: true,
+            pid: std::process::id(),
+            clock: "CLOCK_MONOTONIC ns on Linux/macOS; null is unavailable",
+            exported_monotonic_ns: monotonic_ns(),
+            exported_unix_ns: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|value| value.as_nanos().try_into().ok()),
+            actual_cpu_jobs,
+            trace_arc_owners,
+            actual_counter_arc_owners,
+            dropped,
+            final_sequence: sequence,
+            prefix_drained_events: drained_events,
+            prefix_drained_through_sequence: drained_through,
+            remaining_events: rows.len(),
+            suffix_first_sequence: rows.first().map(|row| row.sequence),
+            suffix_last_sequence: rows.last().map(|row| row.sequence),
+            sequence_complete,
+            export_limit_bytes: FINAL_TRACE_BYTES,
+            events: rows,
+        }
+    }
+    /// Diagnostic-only final suffix. No file exists on the trace-disabled path.
+    /// An old file is never overwritten; partial writes are removed. A valid
+    /// but incomplete receipt is retained and returns failure, never success.
+    pub fn export_after_runtime(self, path: &Path) -> io::Result<()> {
+        let snapshot = self.seal_after_runtime();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let written = (|| -> io::Result<()> {
+            {
+                let mut output = LimitedWriter {
+                    inner: &mut file,
+                    remaining: FINAL_TRACE_BYTES,
+                };
+                serde_json::to_writer(&mut output, &snapshot).map_err(io::Error::other)?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+            }
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        if !snapshot.complete {
+            return Err(io::Error::other("final CPU trace is incomplete"));
+        }
+        Ok(())
+    }
+}
+struct LimitedWriter<'a> {
+    inner: &'a mut std::fs::File,
+    remaining: usize,
+}
+impl Write for LimitedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::other("final CPU trace exceeds byte limit"));
+        }
+        let count = self.inner.write(bytes)?;
+        self.remaining -= count;
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -519,6 +684,130 @@ pub async fn run(input: Input<'_>) -> Result<i64, Failure> {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn final_trace_keeps_late_cpu_and_http_drop_after_an_empty_prefix() {
+        for mode in [Mode::Cooperative, Mode::Pool] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let trace = Arc::new(Trace::new(true));
+            let actual = Arc::new(AtomicUsize::new(0));
+            let cpu = Arc::new(Semaphore::new(1));
+            let pending = Arc::new(Semaphore::new(1));
+            let prefix = trace.snapshot();
+            assert_eq!(prefix["last_sequence"], 0);
+            assert_eq!(prefix["pending"], 0);
+            assert_eq!(prefix["dropped"], 0);
+            assert_eq!(actual.load(Ordering::Relaxed), 0);
+            // An earlier empty page is not a lifetime receipt: real work may
+            // still enter later and must appear in the final suffix.
+            let value = runtime
+                .block_on(run(Input {
+                    rid: "late-cpu",
+                    iterations: 1024,
+                    seed: 3,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    config: Config {
+                        mode,
+                        chunk: 128,
+                        event_interval: None,
+                        trace: true,
+                    },
+                    cpu: cpu.clone(),
+                    pending: pending.clone(),
+                    actual: actual.clone(),
+                    trace: trace.clone(),
+                }))
+                .unwrap();
+            assert_eq!(value, crate::compute(1024, 3));
+            let request = RequestTrace::new(trace.clone(), "late-http-drop").unwrap();
+            drop(runtime.spawn(async move {
+                let _request = request;
+                std::future::pending::<()>().await;
+            }));
+            let receipt = FinalReceipt::after_graceful(trace, actual, mode);
+            drop(runtime); // Drops the queued HTTP future, joins blocking CPU.
+            let final_trace = receipt.seal_after_runtime();
+            assert!(final_trace.sealed && final_trace.complete && final_trace.sequence_complete);
+            assert!(final_trace.cpu_entry_trace_covered);
+            assert_eq!(final_trace.cpu_mode, mode.name());
+            assert!(final_trace.graceful_complete && final_trace.runtime_drop_completed);
+            assert_eq!(final_trace.actual_cpu_jobs, 0);
+            assert_eq!(final_trace.dropped, 0);
+            assert_eq!(final_trace.prefix_drained_events, 0);
+            for name in ["queued", "started", "stopped", "reusable"] {
+                assert!(final_trace
+                    .events
+                    .iter()
+                    .any(|row| row.rid == "late-cpu" && row.event == name));
+            }
+            assert!(final_trace
+                .events
+                .iter()
+                .any(|row| { row.rid == "late-http-drop" && row.event == "http_future_dropped" }));
+            for (index, row) in final_trace.events.iter().enumerate() {
+                assert_eq!(row.sequence, index as u64 + 1);
+            }
+            assert_eq!(cpu.available_permits(), 1);
+            assert_eq!(pending.available_permits(), 1);
+        }
+    }
+
+    #[test]
+    fn final_trace_seals_zero_jobs_and_drops_without_polling_a_cpu_future() {
+        for mode in [Mode::Cooperative, Mode::Pool] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let trace = Arc::new(Trace::new(true));
+            let actual = Arc::new(AtomicUsize::new(0));
+            let cpu = Arc::new(Semaphore::new(1));
+            let pending = Arc::new(Semaphore::new(1));
+            let mut request = RequestTrace::new(trace.clone(), "prefix-only").unwrap();
+            request.response_ready(503);
+            drop(request);
+            let prefix = trace.snapshot();
+            assert_eq!(prefix["events"].as_array().unwrap().len(), 2);
+            // Current-thread runtime is never driven again. Constructing or
+            // dropping an unpolled async run must not claim a CPU entry.
+            drop(runtime.spawn(run(Input {
+                rid: "never-polled",
+                iterations: 1024,
+                seed: 3,
+                deadline: Instant::now() + Duration::from_secs(3),
+                config: Config {
+                    mode,
+                    chunk: 128,
+                    event_interval: None,
+                    trace: true,
+                },
+                cpu: cpu.clone(),
+                pending: pending.clone(),
+                actual: actual.clone(),
+                trace: trace.clone(),
+            })));
+            let receipt = FinalReceipt::after_graceful(trace, actual, mode);
+            drop(runtime);
+            let final_trace = receipt.seal_after_runtime();
+            assert!(final_trace.sealed && final_trace.complete && final_trace.sequence_complete);
+            assert!(final_trace.cpu_entry_trace_covered);
+            assert_eq!(final_trace.cpu_mode, mode.name());
+            assert_eq!(final_trace.actual_cpu_jobs, 0);
+            assert_eq!(final_trace.dropped, 0);
+            assert_eq!(final_trace.final_sequence, 2);
+            assert_eq!(final_trace.prefix_drained_events, 2);
+            assert_eq!(final_trace.prefix_drained_through_sequence, 2);
+            assert_eq!(final_trace.remaining_events, 0);
+            assert!(final_trace.events.is_empty());
+            assert_eq!(final_trace.trace_arc_owners, 1);
+            assert_eq!(final_trace.actual_counter_arc_owners, 1);
+            assert_eq!(cpu.available_permits(), 1);
+            assert_eq!(pending.available_permits(), 1);
+        }
+    }
 
     #[test]
     fn http_trace_distinguishes_response_from_future_drop_without_cpu_receipt() {

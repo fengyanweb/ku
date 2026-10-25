@@ -161,17 +161,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workers = bounded("BENCH_WORKERS", 1, 1, 4);
     let cpu_workers = bounded("BENCH_CPU_WORKERS", workers, 1, 4);
     let cpu_config = cpu_work::Config::from_env()?;
+    // This is an optional diagnostic receipt, never a normal request path.
+    // Do not even read/allocate a path when tracing is disabled.
+    let final_trace_path = if cpu_config.trace {
+        std::env::var_os("BENCH_CPU_TRACE_PATH")
+    } else {
+        None
+    };
     let runtime_name = std::env::var("BENCH_RUNTIME").ok();
     let plan = runtime_config::Plan::parse(runtime_name.as_deref(), workers, cpu_workers)?;
     let listen_plan = runtime_config::ListenPlan::from_env()?;
     let runtime = plan.build(cpu_config.event_interval)?;
-    runtime.block_on(serve(plan, cpu_config, listen_plan))
+    let served = runtime.block_on(serve(
+        plan,
+        cpu_config,
+        listen_plan,
+        final_trace_path.is_some(),
+    ));
+    // Runtime drop joins blocking CPU work and drops pending async/HTTP
+    // futures. A preceding management snapshot or actual_cpu_jobs==0 does not
+    // supply this barrier (Resources::drop records reusable after decrement).
+    drop(runtime);
+    if let Some(path) = final_trace_path {
+        served?
+            .ok_or_else(|| std::io::Error::other("missing graceful CPU trace receipt"))?
+            .export_after_runtime(std::path::Path::new(&path))?;
+    } else {
+        let _ = served?;
+    }
+    Ok(())
 }
 async fn serve(
     runtime_plan: runtime_config::Plan,
     cpu_config: cpu_work::Config,
     listen_plan: runtime_config::ListenPlan,
-) -> Result<(), Box<dyn std::error::Error>> {
+    final_export: bool,
+) -> Result<Option<cpu_work::FinalReceipt>, Box<dyn std::error::Error>> {
     let cpu_workers = runtime_plan.cpu_workers;
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
     let active = bounded("BENCH_MAX_ACTIVE", 1024, 1, 65536);
@@ -234,7 +259,13 @@ async fn serve(
     if let Some(db) = &app.db {
         db.close();
     }
-    Ok(())
+    Ok(final_export.then(|| {
+        cpu_work::FinalReceipt::after_graceful(
+            app.cpu_trace.clone(),
+            app.counters.actual_cpu_jobs.clone(),
+            cpu_config.mode,
+        )
+    }))
 }
 async fn shutdown() {
     #[cfg(unix)]
