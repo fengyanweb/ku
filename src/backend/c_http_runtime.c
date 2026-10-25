@@ -2770,20 +2770,60 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
 typedef struct {
   unsigned long long started_ms;
   unsigned int turns;
+  int probe_clean;
+  uint64_t probe_generation;
+  int probe_count, probe_accept_turn;
 } KuHttpTaskIoBatch;
 /* Rebuilt by this turn's existing poll-interest traversal. No connection or
  * generation fact survives admission, I/O dispatch or the next owner turn. */
 typedef struct {
   unsigned long long deadline;
   int all_async;
+  int all_batchable, has_idle;
 } KuHttpTaskIoEligibility;
 static void ku_http_task_io_eligibility_observe(KuHttpTaskIoEligibility* eligibility,
     int eligible,unsigned long long deadline) {
   if (!eligible) eligibility->all_async=0;
   else if (deadline<eligibility->deadline) eligibility->deadline=deadline;
 }
+/* Isolated candidate: ordinary first-use/partial reads never reuse a probe. */
+static int ku_http_task_io_idle_eligible(const KuHttpConnection* connection) {
+  return connection->phase==KU_HTTP_IO_HEADER && connection->reused
+      && !connection->buffered && !connection->carry_length
+      && !connection->job && !connection->async_task
+      && !connection->request_deadline
+      && connection->deadline!=0 && connection->deadline!=~0ULL
+      && connection->socket_value!=KU_HTTP_INVALID_SOCKET;
+}
+static void ku_http_task_io_eligibility_observe_idle(KuHttpTaskIoEligibility* eligibility,
+    int async_eligible,int idle_eligible,unsigned long long deadline) {
+  ku_http_task_io_eligibility_observe(eligibility,async_eligible,deadline);
+  if (!async_eligible && !idle_eligible) eligibility->all_batchable=0;
+  if (idle_eligible) eligibility->has_idle=1;
+  if ((async_eligible || idle_eligible) && deadline<eligibility->deadline)
+    eligibility->deadline=deadline;
+}
 static void ku_http_task_io_batch_reset(KuHttpTaskIoBatch* batch) {
-  batch->started_ms=0; batch->turns=0;
+  batch->started_ms=0; batch->turns=0; batch->probe_clean=0;
+  batch->probe_generation=0; batch->probe_count=0; batch->probe_accept_turn=0;
+}
+static int ku_http_task_io_batch_probe_matches(const KuHttpTaskIoBatch* batch,
+    uint64_t generation,int count,int accept_turn) {
+  return batch->probe_clean && generation!=UINT64_MAX && count>0
+      && batch->probe_generation==generation && batch->probe_count==count
+      && batch->probe_accept_turn==accept_turn;
+}
+/* Called only after continue() reset the batch before a real OS poll. The
+ * pre-poll clock and this turn remain charged: the next begin cannot renew
+ * an old zero-readiness observation after a stall or a clock tick. */
+static void ku_http_task_io_batch_probe_result(KuHttpTaskIoBatch* batch,
+    int wait_ms,int selected,int can_bootstrap,unsigned long long pre_poll_ms,
+    uint64_t generation,int count,int accept_turn) {
+  if (wait_ms!=0 || selected!=0 || !can_bootstrap || pre_poll_ms==~0ULL
+      || generation==UINT64_MAX || count<=0) return;
+  batch->started_ms=pre_poll_ms; batch->turns=1; batch->probe_clean=1;
+  batch->probe_generation=generation; batch->probe_count=count;
+  batch->probe_accept_turn=accept_turn;
 }
 static void ku_http_task_io_batch_begin(KuHttpTaskIoBatch* batch,unsigned long long now) {
   if (!batch->turns) batch->started_ms=now;
@@ -2912,6 +2952,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     size_t occupied_connections=active.sockets;
     uint64_t sampled_cpu_ns=0, sampled_cpu_ms=ku_http_now_ms();
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    int task_io_pending_seen=pending.count!=0;
     ku_http_task_io_batch_begin(&task_io_batch,sampled_cpu_ms);
 #endif
     int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
@@ -3044,7 +3085,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     }
     int connection_poll_base=poll_count,connection_poll_count=0;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-    KuHttpTaskIoEligibility task_io_eligibility={~0ULL,task_deadline==0u && active.count!=0};
+    KuHttpTaskIoEligibility task_io_eligibility={~0ULL,
+        task_deadline==0u && active.count!=0,task_deadline==0u && active.count!=0,0};
 #endif
     for (int position=0;position<active.count;position++) {
       int index=active.indices[position];
@@ -3060,10 +3102,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
         nearest = connection->async_deadline;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-      if (task_io_eligibility.all_async)
-        ku_http_task_io_eligibility_observe(&task_io_eligibility,
-            connection->phase==KU_HTTP_IO_ASYNC && connection->async_task && !connection->async_cancelled,
-            connection->async_deadline);
+      if (task_io_eligibility.all_batchable) {
+        int async_eligible=connection->phase==KU_HTTP_IO_ASYNC && connection->async_task && !connection->async_cancelled;
+        int idle_eligible=ku_http_task_io_idle_eligible(connection);
+        ku_http_task_io_eligibility_observe_idle(&task_io_eligibility,
+            async_eligible,idle_eligible,idle_eligible ? connection->deadline : connection->async_deadline);
+      }
 #endif
       if (!events) continue;
       connection->poll_index = poll_count;
@@ -3106,40 +3150,58 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     /* Only already-ready computation can defer an empty nonblocking probe.
      * Every subturn above still observes group close, Task deadlines, response
-     * completion and finite cleanup. HTTP reads/writes, pending admission and
-     * registered Task-network interests retain their original I/O turn.
+     * completion and finite cleanup. Initial/partial reads, writes, pending
+     * admission and Task-network interests retain their original I/O turn.
+     * Strict idle reused reads may share only a same-interest zero-poll proof;
+     * this cooperative window is not a hard wall-clock response guarantee.
      * Fresh listener/peer readiness can wait only for this bounded batch;
      * its bytes and every wake publication remain registered and unconsumed. */
     int task_io_ready=task_deadline==0u && wait_ms==0 && active.count;
-    int task_io_urgent=!task_io_ready || !started || !listening || listen_failure || pending.count
+    int task_io_structural_urgent=!task_io_ready || !started || !listening || listen_failure
+        || pending.count
         || rejection.phase!=KU_HTTP_IO_FREE || now>=health_deadline;
 #if defined(KU_HTTP_HAS_TASK_NET)
-    if (net_count) task_io_urgent=1;
+    if (net_count) task_io_structural_urgent=1;
 #endif
     /* The owner has not admitted, dispatched or retired a connection since
      * the interest pass. Reuse its structural facts, but test the minimum
      * deadline against this original late sample, never the earlier scan. */
-    if (!task_io_eligibility.all_async || now>=task_io_eligibility.deadline)
-      task_io_urgent=1;
+    if (!task_io_eligibility.all_batchable || now>=task_io_eligibility.deadline
+        || (task_io_eligibility.has_idle && owner->connection_generation==UINT64_MAX))
+      task_io_structural_urgent=1;
+    if (task_io_eligibility.has_idle && task_io_pending_seen) task_io_structural_urgent=1;
 #if !defined(_WIN32)
     /* An already-published wake is an immediate reason to service the pipe.
      * This is only an acquire observation: the original drain/clear and the
      * producer's byte publication remain the no-lost-wakeup protocol. */
-    if (atomic_load_explicit(&wake.pending,memory_order_acquire)) task_io_urgent=1;
+    if (atomic_load_explicit(&wake.pending,memory_order_acquire)) task_io_structural_urgent=1;
 #else
     /* Windows' UDP wake has no coalescing marker. Keep its original I/O turn
      * rather than adding a new notification protocol to this optimization. */
-    task_io_urgent=1;
+    task_io_structural_urgent=1;
 #endif
+    int task_io_proof_missing=task_io_eligibility.has_idle
+        && !ku_http_task_io_batch_probe_matches(&task_io_batch,
+            owner->connection_generation,active.count,accept_turn);
+    int task_io_urgent=task_io_structural_urgent || task_io_proof_missing;
     /* Eligibility scans/locks can consume time too. Never use the earlier
      * deadline sample to extend the OS-service batch past its time bound. */
     unsigned long long batch_now=task_io_urgent ? now : ku_http_now_ms();
+    if (task_io_eligibility.has_idle && batch_now>=task_io_eligibility.deadline) {
+      task_io_structural_urgent=1; task_io_urgent=1;
+    }
+    int task_io_probe_can_bootstrap=task_io_eligibility.has_idle
+        && !task_io_structural_urgent;
     if (ku_http_task_io_batch_continue(&task_io_batch,batch_now,
         task_io_ready,task_io_urgent)) continue;
 #endif
     /* No periodic wake tick: idle/read/write/job progress blocks in one OS
        poll until actual readiness, worker publication, or the nearest old D. */
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    ku_http_task_io_batch_probe_result(&task_io_batch,wait_ms,selected,
+        task_io_probe_can_bootstrap,batch_now,owner->connection_generation,active.count,accept_turn);
+#endif
     if (selected < 0) {
       if (ku_http_socket_error_interrupted(ku_http_socket_last_error())) continue;
       if (!listen_failure) listen_failure = "reactor wait failed";

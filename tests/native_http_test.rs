@@ -4143,19 +4143,138 @@ fn native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait()
         + start;
     let batch = &runtime[start..end];
     let checks = r#"
-#include <stdio.h>
+/* Exact production helpers with a field-only connection model. */
 #include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#define KU_HTTP_INVALID_SOCKET (-1)
+enum {
+  KU_HTTP_IO_FREE = 0, KU_HTTP_IO_HEADER = 1, KU_HTTP_IO_BODY = 2,
+  KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
+  KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7,
+  KU_HTTP_IO_ASYNC = 8, KU_HTTP_IO_CLOSED_ASYNC = 9
+};
+/* Classifier needs only these fields, no socket, heap or Task is created. */
+typedef struct {
+  int phase,reused,socket_value;
+  size_t buffered,carry_length;
+  void *job,*async_task;
+  unsigned long long deadline,request_deadline;
+} KuHttpConnection;
 "#
     .to_owned()
         + batch
         + r#"
 #define CHECK(c) do { if(!(c)) { fprintf(stderr,"Task I/O batch line %d: %s\n",__LINE__,#c); return 97; } } while(0)
+static void clean_probe(KuHttpTaskIoBatch* b,unsigned long long t) {
+  ku_http_task_io_batch_reset(b); /* Real-loop continue(false), before OS call. */
+  ku_http_task_io_batch_probe_result(b,0,0,1,t,10u,33,1);
+}
+static int idle_probe_checks(void) {
+  KuHttpTaskIoBatch b={0};
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,10u,33,1));
+  ku_http_task_io_batch_begin(&b,1000u);
+  CHECK(!ku_http_task_io_batch_continue(&b,1000u,1,1)); /* Missing first proof. */
+  CHECK(!b.probe_clean && !b.turns);
+  clean_probe(&b,1000u);
+  CHECK(b.probe_clean && b.started_ms==1000u && b.turns==1u);
+  CHECK(ku_http_task_io_batch_probe_matches(&b,10u,33,1));
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,11u,33,1));
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,10u,32,1));
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,10u,33,0));
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,UINT64_MAX,33,1));
+  CHECK(!ku_http_task_io_batch_probe_matches(&b,10u,0,1));
+
+  /* A zero poll charges its own turn; the next begin retains its old age. */
+  ku_http_task_io_batch_begin(&b,1100u);
+  CHECK(b.started_ms==1000u && b.turns==2u);
+  CHECK(!ku_http_task_io_batch_continue(&b,1100u,1,0));
+  CHECK(!b.probe_clean && !b.turns && !b.started_ms);
+  clean_probe(&b,1000u);
+  ku_http_task_io_batch_begin(&b,1001u);
+  CHECK(!ku_http_task_io_batch_continue(&b,1001u,1,0));
+  clean_probe(&b,1000u);
+  ku_http_task_io_batch_begin(&b,999u);
+  CHECK(!ku_http_task_io_batch_continue(&b,999u,1,0));
+  clean_probe(&b,1000u);
+  unsigned int skips=0,pumps=1;
+  for(unsigned int i=0;i<32;i++) {
+    ku_http_task_io_batch_begin(&b,1000u); pumps++;
+    if(!ku_http_task_io_batch_continue(&b,1000u,1,0)) break;
+    skips++;
+  }
+  CHECK(skips==6u && pumps==8u && !b.probe_clean && !b.turns);
+  ku_http_task_io_batch_reset(&b);
+  skips=0;pumps=0;
+  for(unsigned int i=0;i<32;i++) { /* Original pure-ASYNC entry remains unchanged. */
+    ku_http_task_io_batch_begin(&b,1000u);pumps++;
+    if(!ku_http_task_io_batch_continue(&b,1000u,1,0)) break;
+    skips++;
+  }
+  CHECK(skips==7u && pumps==8u);
+
+  /* Caller clears before every real result. Positive, error/EINTR, blocking
+     timeout and structurally urgent zero cannot grant a new proof. */
+  int waits[]={0,1,-1}; int selecteds[]={0,1,-1,-4};
+  for(size_t i=0;i<3;i++) for(size_t j=0;j<4;j++) {
+    clean_probe(&b,1000u);
+    CHECK(!ku_http_task_io_batch_continue(&b,1000u,1,1));
+    ku_http_task_io_batch_probe_result(&b,waits[i],selecteds[j],1,1000u,10u,33,1);
+    CHECK(b.probe_clean==(waits[i]==0 && selecteds[j]==0));
+  }
+  for(int reason=0;reason<8;reason++) { /* pending-seen,wake,NET,drain,
+      no-ready,rejection,deadline,noneligible share structural urgency. */
+    clean_probe(&b,1000u);
+    CHECK(!ku_http_task_io_batch_continue(&b,1000u,reason!=4,1));
+    ku_http_task_io_batch_probe_result(&b,0,0,0,1000u,10u,33,1);
+    CHECK(!b.probe_clean && !b.turns);
+  }
+  ku_http_task_io_batch_reset(&b);
+  ku_http_task_io_batch_probe_result(&b,0,0,1,1000u,UINT64_MAX,33,1);
+  CHECK(!b.probe_clean);
+  ku_http_task_io_batch_probe_result(&b,0,0,1,~0ULL,10u,33,1);
+  CHECK(!b.probe_clean);
+
+  KuHttpConnection c={.phase=KU_HTTP_IO_HEADER,.reused=1,.socket_value=9,.deadline=1020u};
+  CHECK(ku_http_task_io_idle_eligible(&c));
+  c.request_deadline=1010u;CHECK(!ku_http_task_io_idle_eligible(&c));c.request_deadline=0;
+  c.deadline=0;CHECK(!ku_http_task_io_idle_eligible(&c));
+  c.deadline=~0ULL;CHECK(!ku_http_task_io_idle_eligible(&c));c.deadline=1020u;
+  CHECK(ku_http_task_io_idle_eligible(&c));
+  c.reused=0;CHECK(!ku_http_task_io_idle_eligible(&c));c.reused=1;
+  c.buffered=1;CHECK(!ku_http_task_io_idle_eligible(&c));c.buffered=0;
+  c.carry_length=1;CHECK(!ku_http_task_io_idle_eligible(&c));c.carry_length=0;
+  c.job=&c;CHECK(!ku_http_task_io_idle_eligible(&c));c.job=NULL;
+  c.async_task=&c;CHECK(!ku_http_task_io_idle_eligible(&c));c.async_task=NULL;
+  c.socket_value=-1;CHECK(!ku_http_task_io_idle_eligible(&c));c.socket_value=9;
+  int phases[]={KU_HTTP_IO_BODY,KU_HTTP_IO_WRITE,KU_HTTP_IO_JOB,
+      KU_HTTP_IO_REUSE_WAIT,KU_HTTP_IO_CLOSED_ASYNC,KU_HTTP_IO_CLOSED_JOB};
+  for(size_t i=0;i<6;i++) {c.phase=phases[i];CHECK(!ku_http_task_io_idle_eligible(&c));}
+  c.phase=KU_HTTP_IO_HEADER;
+  KuHttpTaskIoEligibility e={~0ULL,1,1,0};
+  ku_http_task_io_eligibility_observe_idle(&e,1,0,1100u);
+  ku_http_task_io_eligibility_observe_idle(&e,0,ku_http_task_io_idle_eligible(&c),c.deadline);
+  CHECK(!e.all_async && e.all_batchable && e.has_idle && e.deadline==1020u);
+  CHECK(!(1019u>=e.deadline) && 1020u>=e.deadline);
+  CHECK(c.deadline==1020u); /* Qualification cannot renew the original D. */
+  ku_http_task_io_eligibility_observe_idle(&e,0,0,0u);
+  CHECK(!e.all_batchable);
+  ku_http_task_io_eligibility_observe_idle(&e,1,0,1200u);
+  CHECK(!e.all_batchable); /* A later valid member cannot undo an invalid one. */
+  e=(KuHttpTaskIoEligibility){~0ULL,1,1,0};
+  ku_http_task_io_eligibility_observe_idle(&e,1,0,1050u);
+  ku_http_task_io_eligibility_observe_idle(&e,1,0,1030u);
+  CHECK(e.all_async && e.all_batchable && !e.has_idle && e.deadline==1030u);
+  return 0;
+}
+
 int main(void) {
   KuHttpTaskIoBatch batch={0};
   /* A ready Task makes the shared nearest deadline zero. The same-turn
    * eligibility reduction must retain the real request deadline separately,
    * including connections whose paused peer supplies no poll interest. */
-  KuHttpTaskIoEligibility eligibility={UINT64_MAX,1};
+  KuHttpTaskIoEligibility eligibility={UINT64_MAX,1,1,0};
   ku_http_task_io_eligibility_observe(&eligibility,1,1050u);
   ku_http_task_io_eligibility_observe(&eligibility,1,1030u);
   ku_http_task_io_eligibility_observe(&eligibility,1,1040u);
@@ -4166,9 +4285,9 @@ int main(void) {
   CHECK(!eligibility.all_async); /* Read/write, closed, missing or cancelled. */
   ku_http_task_io_eligibility_observe(&eligibility,1,1100u);
   CHECK(!eligibility.all_async); /* Later valid members cannot undo urgency. */
-  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,0};
+  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,0,0,0};
   CHECK(!eligibility.all_async); /* An empty active set cannot defer I/O. */
-  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,1};
+  eligibility=(KuHttpTaskIoEligibility){UINT64_MAX,1,1,0};
   ku_http_task_io_eligibility_observe(&eligibility,1,2000u);
   CHECK(eligibility.all_async && eligibility.deadline==2000u);
   /* Rebuilding on the next traversal discards the old expiry/cancellation. */
@@ -4213,6 +4332,7 @@ int main(void) {
   ku_http_task_io_batch_begin(&batch,0u);
   CHECK(ku_http_task_io_batch_continue(&batch,0u,1,0));
   CHECK(!ku_http_task_io_batch_continue(&batch,1u,1,0));
+  CHECK(idle_probe_checks()==0);
   puts("http-task-io-batch-bounds-reset-ok"); return 0;
 }
 "#;
@@ -4860,6 +4980,249 @@ fn main(): null! {
     assert_status(&response, "HTTP/1.1 200 OK");
     let exit = watchdog.wait_for_natural_exit(Duration::from_secs(5));
     assert!(exit.success(), "async service drain exit: {exit}");
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_async_idle_probe_preserves_reuse_partial_pipeline_and_half_close() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import "std.http"
+async fn burn(): HttpResponse! {
+    index=0
+    total=0
+    while(index<250000) {
+        total=total+1
+        index=index+1
+    }
+    return ok(http.text(str(total)))
+}
+async fn echo(req: HttpRequest): HttpResponse! {
+    return ok(http.text(req.params.id + ":" + req.body))
+}
+fn main(): null! {
+    app=http.server({max_active_requests:16,max_pending_requests:16,max_connections:32,
+        idle_timeout_ms:5000,read_header_timeout_ms:1000,read_body_timeout_ms:1000,
+        write_timeout_ms:2000,handler_timeout_ms:5000})
+    app.get("/ok",fn() { return http.text("ok") })
+    app.get("/burn",burn)
+    app.post("/echo/{id}",echo)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let management_address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "async-idle-probe",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "1"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_SERVICE_CONTROL_TOKEN", "idle-probe-regression"),
+            ("KU_SERVICE_PROBE_ADDR", &management_address),
+        ],
+    ) else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    // Use the existing absolute-deadline socket reader one byte at a time for
+    // headers, then exactly the framed body: never consume the next pipeline
+    // response while verifying the first one.
+    let read_chunk = |stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant| loop {
+        match read_http_chunk_until(stream, buffer, deadline) {
+            Ok(read) => break read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) && deadline.saturating_duration_since(Instant::now())
+                    >= Duration::from_millis(1) => {}
+            Err(error) => panic!("framed HTTP read before absolute deadline: {error}"),
+        }
+    };
+    let read_frame = |stream: &mut TcpStream| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            assert!(response.len() < 65536, "bounded response header");
+            let mut byte = [0];
+            assert_eq!(
+                read_chunk(stream, &mut byte, deadline),
+                1,
+                "complete response header"
+            );
+            response.push(byte[0]);
+        }
+        let total = http_response_expected_total(&response, response.len() - 4)
+            .unwrap()
+            .expect("framed HTTP response");
+        assert!(total <= MAX_HTTP_TEST_RESPONSE_BYTES);
+        let mut offset = response.len();
+        response.resize(total, 0);
+        while offset < total {
+            let read = read_chunk(stream, &mut response[offset..], deadline);
+            assert!(read > 0, "complete response body");
+            offset += read;
+        }
+        String::from_utf8(response).unwrap()
+    };
+    let metrics_request = "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: idle-probe-regression\r\nConnection: close\r\n\r\n";
+    assert_status(
+        &http_response(&management_address, metrics_request, Duration::from_secs(3)),
+        "HTTP/1.1 200 OK",
+    );
+    let mut idle = Vec::new();
+    for _ in 0..4 {
+        let mut stream = connect_with_retry(&address, Duration::from_secs(3));
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let response = read_frame(&mut stream);
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with("ok"));
+        assert!(response
+            .to_ascii_lowercase()
+            .contains("connection: keep-alive\r\n"));
+        idle.push(stream);
+    }
+    // Real ready computation coexists with already-reused idle sockets. The
+    // helper regression proves the zero-poll/count/time bounds; this socket
+    // test checks framing and lifecycle without a microsecond timing claim.
+    let mut cpu = connect_with_retry(&address, Duration::from_secs(3));
+    cpu.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    cpu.write_all(b"GET /burn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let admitted_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let metrics = http_response(&management_address, metrics_request, Duration::from_secs(3));
+        let tasks = metrics
+            .split_once("\"tasks\":[")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        let polls = tasks
+            .split_once("\"polls\":")
+            .unwrap()
+            .1
+            .split(|character: char| !character.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        if polls > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < admitted_deadline,
+            "CPU Task never ran: {metrics}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    idle[0]
+        .write_all(b"POST /echo/partial HTTP/1.1\r\nHost:")
+        .unwrap();
+    idle[1]
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = read_frame(&mut idle[1]);
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("ok"));
+    idle[0]
+        .write_all(b" localhost\r\nContent-Length: 3\r\n\r\nx")
+        .unwrap();
+    idle[2]
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let response = read_frame(&mut idle[2]);
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("ok"));
+    idle[0]
+        .write_all(b"yzGET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    idle[0].shutdown(std::net::Shutdown::Write).unwrap();
+    for body in ["partial:xyz", "ok"] {
+        let response = read_frame(&mut idle[0]);
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with(body), "{response}");
+    }
+    let mut byte = [0];
+    assert_eq!(
+        read_chunk(
+            &mut idle[0],
+            &mut byte,
+            Instant::now() + Duration::from_secs(3)
+        ),
+        0,
+        "half-close preserves both responses before the connection closes"
+    );
+    let response = read_frame(&mut cpu);
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("250000"), "{response}");
+    // A reused connection with an incomplete body retains its existing finite
+    // deadline. Batch eligibility must not turn it back into an idle socket.
+    idle[3]
+        .write_all(b"POST /echo/timeout HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nx")
+        .unwrap();
+    assert_status(&read_frame(&mut idle[3]), "HTTP/1.1 408 Request Timeout");
+    drop(idle);
+    drop(cpu);
+    let recovered = http_response(
+        &address,
+        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&recovered, "HTTP/1.1 200 OK");
+    assert!(recovered.ends_with("ok"));
+    let reclaimed_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let metrics = http_response(&management_address, metrics_request, Duration::from_secs(3));
+        let section = |name: &str, end: char| {
+            metrics
+                .split_once(name)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0
+        };
+        if section("\"tasks\":[", ']').contains("\"resident\":0")
+            && section("\"tasks\":[", ']').contains("\"timers\":0")
+            && section("\"task_driver\":{", '}').contains("\"resident\":0")
+            && section("\"loops\":[", ']').contains("\"connections\":0")
+            && section("\"loops\":[", ']').contains("\"pending\":0")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < reclaimed_deadline,
+            "resources not reclaimed: {metrics}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let response = http_response(
+        &management_address,
+        "POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: idle-probe-regression\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
     assert!(!watchdog.timed_out());
 }
 
