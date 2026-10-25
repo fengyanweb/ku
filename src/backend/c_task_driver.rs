@@ -12,9 +12,19 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
     // silently being reused by a longer same-drive computation.
     out.push_str(&format!(
         "#define KU_TASK_DRIVER_COMPUTE_BANK_STATES ((size_t){}u)\n\
-         #define KU_TASK_DRIVER_COMPUTE_MAX_BANKS ((size_t){}u)\n",
+         #define KU_TASK_DRIVER_COMPUTE_MAX_BANKS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_PHASE_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS ((size_t){}u)\n",
         super::task_range::COMPUTE_BANK_STATES,
         super::task_range::COMPUTE_MAX_BANKS,
+        super::task_range::COMPUTE_MAX_OPERATIONS,
+        super::task_range::COMPUTE_RESERVATION_CREDITS,
+        super::task_range::COMPUTE_RESERVATION_STATES,
+        super::task_range::COMPUTE_PHASE_STATES,
+        super::task_range::COMPUTE_PHASE_OPERATIONS,
     ));
     out.push_str(DRIVER_ABI);
     out.check()
@@ -394,6 +404,10 @@ typedef struct KuTaskDriverComputeBudgetV1 {
   size_t credit_limit, credits_used, states_used;
   uint64_t started_ms;
   uint32_t active, open, reported, invalid, clock_fault, time_exhausted;
+  size_t reservation_capacity, operations_used;
+  uint64_t last_observed_ms;
+  uint32_t reserved;
+  size_t reservation_credit_limit;
 } KuTaskDriverComputeBudgetV1;
 typedef struct KuTaskDriverExecutionV1 {
   KuTaskDriverV1* driver;
@@ -402,6 +416,8 @@ typedef struct KuTaskDriverExecutionV1 {
   KuTaskControlV1* control;
   uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum, pure_ready;
   KuTaskDriverComputeBudgetV1 compute;
+  uint64_t compute_stop_at_ms;
+  uint32_t reservation_allowed;
 } KuTaskDriverExecutionV1;
 static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
 /* Called immediately after an existing mutex-owned explicit intent write.
@@ -1834,7 +1850,7 @@ static uint32_t ku_task_driver_begin_quantum(const KuTaskDriverTicketV1* ticket,
   }
   return ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_YIELD);
 }
-/* Only the actual 64-dispatch exhaustion branch emits this witness. Pending
+/* Only a generated bounded fuel/operation stop emits this witness. Pending
  * from timers, I/O, child waits, cleanup or a raw callback is not cooperative
  * ready work and must return through the original locked commit path. */
 static void ku_task_driver_note_quantum_yield(const KuTaskDriverTicketV1* ticket,
@@ -1890,7 +1906,7 @@ static void ku_task_driver_compute_begin(const KuTaskDriverTicketV1* ticket,
 static uint32_t ku_task_driver_compute_borrow_bank(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control) {
   KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
-  if (!budget || !budget->active || !budget->open || budget->invalid
+  if (!budget || !budget->active || !budget->open || budget->invalid || budget->reserved
       || budget->credits_used>=budget->credit_limit
       || ku_task_driver_execution->intent_touched) return 0;
   uint64_t now=ku_task_driver_now_ms();
@@ -1917,7 +1933,7 @@ static void ku_task_driver_compute_report_states(const KuTaskDriverTicketV1* tic
     KuTaskControlV1* control,size_t used_in_current_bank) {
   KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
   if (!budget || !budget->active) return;
-  if (used_in_current_bank>KU_TASK_DRIVER_COMPUTE_BANK_STATES
+  if (budget->reserved || used_in_current_bank>KU_TASK_DRIVER_COMPUTE_BANK_STATES
       || !budget->credits_used || budget->credits_used>budget->credit_limit) {
     budget->invalid=1; budget->reported=0; budget->open=0; return;
   }
@@ -1925,10 +1941,76 @@ static void ku_task_driver_compute_report_states(const KuTaskDriverTicketV1* tic
       +used_in_current_bank;
   budget->reported=1;
 }
+/* A private HTTP slice may reserve finite compute CAPACITY, never charge it.
+ * Fresh clock decisions retain the slice's immutable origin/real deadline.
+ * The post-clock acquire observes cancellation published during that read. */
+static int ku_task_driver_compute_observe(KuTaskDriverComputeBudgetV1* budget,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  uint64_t now=ku_task_driver_now_ms();
+  size_t phase=ku_task_control_atomic_load(&control->phase);
+  if (now==UINT64_MAX || now<budget->started_ms
+      || (budget->last_observed_ms && now<budget->last_observed_ms)) {
+    budget->clock_fault=1; budget->open=0; return 0;
+  }
+  budget->last_observed_ms=now;
+  if (now>=execution->compute_stop_at_ms) {
+    budget->time_exhausted=1; budget->open=0; return 0;
+  }
+  if (phase!=KU_TASK_CONTROL_LIVE) { budget->open=0; return 0; }
+  return 1;
+}
+static size_t ku_task_driver_compute_reserve_begin(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !ku_task_driver_execution->reservation_allowed
+      || budget->invalid || budget->reserved || ku_task_driver_execution->intent_touched)
+    return 0;
+  if (budget->credit_limit>KU_TASK_DRIVER_COMPUTE_MAX_BANKS
+      || !budget->reservation_credit_limit
+      || budget->reservation_credit_limit>KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS) {
+    budget->invalid=1; budget->open=0; return SIZE_MAX;
+  }
+  budget->reserved=1;
+  budget->credit_limit=budget->reservation_credit_limit;
+  budget->reservation_capacity=budget->credit_limit*KU_TASK_DRIVER_COMPUTE_BANK_STATES;
+  if (budget->reservation_capacity>KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES) {
+    budget->invalid=1; budget->open=0; return SIZE_MAX;
+  }
+  budget->open=1;
+  if (!ku_task_driver_compute_observe(budget,control)) return SIZE_MAX;
+  return budget->reservation_capacity;
+}
+static void ku_task_driver_compute_report_reservation(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t states,size_t operations) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->reserved) return;
+  size_t credits=states ? 1u+(states-1u)/KU_TASK_DRIVER_COMPUTE_BANK_STATES : 1u;
+  if (states>budget->reservation_capacity || operations>KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS
+      || credits>budget->credit_limit || states<budget->states_used
+      || operations<budget->operations_used) {
+    budget->invalid=1; budget->reported=0; budget->open=0; return;
+  }
+  budget->states_used=states; budget->operations_used=operations;
+  budget->credits_used=credits; budget->reported=1;
+}
+static int ku_task_driver_compute_reservation_boundary(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t states,size_t operations) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->reserved) return 0;
+  ku_task_driver_compute_report_reservation(ticket,control,states,operations);
+  budget->open=0;
+  if (budget->invalid) return 0;
+  return ku_task_driver_compute_observe(budget,control);
+}
 static int ku_task_driver_compute_end(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control) {
   KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
   if (!budget) return 1;
+  if (budget->reserved) {
+    if (!budget->reported) budget->invalid=1;
+    if (!budget->invalid) (void)ku_task_driver_compute_observe(budget,control);
+  }
   /* R2 may invoke cleanup after resume returns. Its drive must never replace
    * the normal callback's fuel report, even when it uses the same host. */
   budget->active=0; budget->open=0;
@@ -2798,8 +2880,9 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
 /* This stack-only record is private to the sole RUNNING executor. Pure ready
  * continuations need not release/reclaim R2 executor between dispatch budgets:
  * no ownership or host observation can occur in the witnessed quantum. Every
- * actual resume consumes at least one pump credit; each borrowed 64-state
- * bank consumes another. pump(1) cannot borrow or run a second resume.
+ * actual resume consumes at least one pump credit; B2 borrowed banks consume
+ * another. A private reserved callback settles only ceil(actual states/64).
+ * Public pump(1) cannot borrow or run a second resume and cannot reserve.
  * No phase/time sample is cached across a boundary or used as a deadline
  * decision. Ordinary/raw callbacks continue through the full control poll. */
 typedef struct KuTaskDriverSegmentV1 {
@@ -2836,8 +2919,10 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
   do {
     size_t remaining=segment->max_quanta-segment->quanta;
     execution->compute=(KuTaskDriverComputeBudgetV1){
-      remaining<KU_TASK_DRIVER_COMPUTE_MAX_BANKS ? remaining : KU_TASK_DRIVER_COMPUTE_MAX_BANKS,
-      1u,0u,segment->started,0,0,0,0,0,0};
+      .credit_limit=remaining<KU_TASK_DRIVER_COMPUTE_MAX_BANKS ? remaining : KU_TASK_DRIVER_COMPUTE_MAX_BANKS,
+      .credits_used=1u,.started_ms=segment->started,
+      .reservation_credit_limit=execution->reservation_allowed
+        ? (remaining<KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS ? remaining : KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS) : 0u};
     outcome=execution->control->operations.resume(execution->control->context);
     execution->compute.active=0; execution->compute.open=0;
     segment->polls++;
@@ -2856,9 +2941,14 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
         || segment->quanta>=segment->max_quanta || segment->clock_fault || segment->time_exhausted
         || ku_task_control_atomic_load(&execution->control->phase)!=KU_TASK_CONTROL_LIVE)
       break;
-    uint64_t now=ku_task_driver_now_ms();
-    if (now==UINT64_MAX || now<segment->started) { segment->clock_fault=1; break; }
-    if (now-segment->started>=1u) { segment->time_exhausted=1; break; }
+    if (!execution->compute.reserved) {
+      uint64_t now=ku_task_driver_now_ms();
+      if (now==UINT64_MAX || now<segment->started) { segment->clock_fault=1; break; }
+      if (now-segment->started>=1u) { segment->time_exhausted=1; break; }
+    }
+    /* Reserved callbacks have just made a fresh finish observation; their
+     * NEXT frame makes another fresh entry observation before computation.
+     * No old timestamp authorizes that next zone or renews the slice origin. */
     execution->default_yield=0; execution->cooperative_yield=0;
     execution->intent_touched=0; execution->scalar_quantum=0; execution->pure_ready=0;
   } while (1);
@@ -2866,9 +2956,12 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
 }
 /* One owner segment, consuming at most max_quanta 64-state work credits (<=32).
  * Enter and return with the publication mutex held. User callbacks/drop run
- * unlocked. Only pure generated dispatch-budget yields may share the live
- * RUNNING execution lease. Time is checked after each 64-dispatch boundary,
- * inside a multi-bank frame or between registered resumes. Actual poll
+ * unlocked. Only pure generated bounded yields may share the live RUNNING
+ * execution lease. Public/B2 reads keep their old bank boundaries. The private
+ * reservation has fresh entry/finish/nonpure observations and a <=1024-state,
+ * <=8192-pure-operation zone. Generated private phase chunks are bounded by
+ * <=256 states AND <=1024 operations; neither bound promises sub-ms realtime.
+ * Actual poll
  * metrics count registered-resume/control attempts, not borrowed banks:
  * the 1ms segment budget can overrun by one quantum/expensive operation. */
 static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta,
@@ -2916,7 +3009,9 @@ static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
-    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0,{0}};
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0,{0},0,0};
+    context.reservation_allowed=slice!=NULL;
+    context.compute_stop_at_ms=slice ? slice->stop_at_ms : 0;
     KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 

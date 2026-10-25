@@ -18,7 +18,14 @@ use std::cell::Cell;
 pub(super) const MAX_EXTRA_SOURCE_BYTES: usize = 256 * 1024;
 pub(super) const COMPUTE_BANK_STATES: usize = 64;
 pub(super) const COMPUTE_MAX_BANKS: usize = 4;
-pub(super) const COMPUTE_PROOF_STATES: usize = COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS;
+// A single finite certificate covers the entire extended private invocation.
+// It is never restarted from an old guard with nonzero temporary locals.
+pub(super) const COMPUTE_PROOF_STATES: usize = 1024;
+pub(super) const COMPUTE_RESERVATION_CREDITS: usize = 16;
+pub(super) const COMPUTE_RESERVATION_STATES: usize = 1024;
+pub(super) const COMPUTE_MAX_OPERATIONS: usize = 8192;
+pub(super) const COMPUTE_PHASE_STATES: usize = 256;
+pub(super) const COMPUTE_PHASE_OPERATIONS: usize = 1024;
 const MAX_WORK: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
@@ -479,15 +486,20 @@ mod tests {
 
     #[test]
     fn range_proof_covers_every_borrowed_bank_without_restarting_local_facts() {
+        assert_eq!(COMPUTE_MAX_BANKS, 4);
         assert_eq!(
-            COMPUTE_PROOF_STATES,
-            COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS
+            COMPUTE_BANK_STATES * COMPUTE_RESERVATION_CREDITS,
+            COMPUTE_RESERVATION_STATES
         );
-        let increment = i64::MAX / 128;
-        // This is safe throughout one old bank, yet not throughout all four.
-        // Reusing a64-state certificate across loans would certify signed UB.
+        assert!(COMPUTE_PROOF_STATES >= COMPUTE_RESERVATION_STATES);
+        assert!(COMPUTE_PROOF_STATES >= COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS);
+        let increment = i64::MAX / 512;
+        // Safe over the complete old256-state callback, but not the new one.
+        // Renewing an old certificate without reconstructing local facts
+        // would certify signed UB after the first old horizon.
         let first = i32::MAX as i128;
         assert!(first + increment as i128 * COMPUTE_BANK_STATES as i128 <= i64::MAX as i128);
+        assert!(first + increment as i128 * 256i128 <= i64::MAX as i128);
         assert!(first + increment as i128 * COMPUTE_PROOF_STATES as i128 > i64::MAX as i128);
         let grows = repeated(TaskBinaryOp::Add, Some(increment));
         assert!(RangePlan::build(

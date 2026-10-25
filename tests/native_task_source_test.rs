@@ -42,10 +42,114 @@ fn scalar_state_labels(drive: &str, state: usize) -> Vec<(String, bool)> {
                 || (line.ends_with(&suffix)
                     && (line.starts_with("ku_task_range_")
                         || line.starts_with("ku_task_region_")
+                        || line.starts_with("ku_task_outline_")
                         || line.starts_with("ku_task_loop_")))
         })
         .map(|label| (label.to_owned(), label.contains("_range_")))
         .collect()
+}
+
+fn frame_probe_begin(generated: &str, id: usize) -> usize {
+    generated
+        .find(&format!("/* outlined Task loops for frame {id} */"))
+        .unwrap_or_else(|| {
+            generated
+                .find(&format!("static uint32_t ku_task_frame_{id}_drive("))
+                .unwrap()
+        })
+}
+
+#[test]
+fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and_caps() {
+    let mut generated=native("async fn Work(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=7; index=index+1 } return ok(value) } async fn main():null! { return ok(null) }");
+    let marker = "/* outlined Task loops for frame 0 */";
+    assert!(
+        generated.contains(marker),
+        "a fully proved linear loop should have the small helper"
+    );
+    generated = generated.replacen(
+        marker,
+        &format!("static size_t fixture_helper_entries;\n{marker}"),
+        1,
+    );
+    let helper = generated
+        .find("static KU_TASK_LOOP_NOINLINE ku_task_frame_0_loop_")
+        .unwrap();
+    let body = helper + generated[helper..].find(") {").unwrap() + 3;
+    let end = body + generated[body..].find("\n}\n").unwrap();
+    let helper_text = &generated[helper..end];
+    assert!(
+        !helper_text.contains("frame->")
+            && !helper_text.contains("clock")
+            && !helper_text.contains("KuTaskDriver")
+            && !helper_text.contains("ku_int_")
+    );
+    generated.insert_str(body, "\n  fixture_helper_entries++;");
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    generated=generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now(void) {",1);
+    let source = generated.replacen(
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+        1,
+    ) + r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"outline line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int64_t limit,int private_mode) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0),1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  int64_t seed=3; KuTaskValueV1 task={0};
+  CHECK(ku_task_0_start_value(&driver,&limit,&seed,&task)==KU_TASK_DRIVER_OK);
+  fixture_helper_entries=0; uint64_t next=UINT64_MAX; KuTaskDriverSliceResultV1 sliced={0};
+  for(size_t turn=0;turn<256u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++) {
+    CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,32u,1000u,2000u,NULL,NULL,&sliced)
+        :ku_task_driver_pump(&driver,0u,1u,&next))<=KU_TASK_DRIVER_PENDING);
+    if(private_mode) CHECK(sliced.work_credits<=32u);
+  }
+  CHECK(private_mode ? fixture_helper_entries>0u : fixture_helper_entries==0u);
+  KuTaskAdapterOutcomeV1 outcome={0}; CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.value.integer.ok && outcome.value.integer.value==(limit ? 7 : seed));
+  ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_value_drop(&task,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.running && !driver.queued && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,2000u)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  return 0;
+}
+int main(void) {
+  const int64_t limits[]={0,1,8,9,1000};
+  for(int private_mode=0;private_mode<2;private_mode++)
+    for(size_t i=0;i<sizeof(limits)/sizeof(limits[0]);i++) CHECK(!fixture_case(limits[i],private_mode));
+  puts("task-outlined-private-linear-zero-output-ok"); return 0;
+}
+"#;
+    let directory = TempDir::new("task-outline-linear");
+    let path = directory.path().join("outline.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "outline") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute outlined Task loops"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-outlined-private-linear-zero-output-ok\n"
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -635,9 +739,7 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
         "single-state arithmetic intermediates must not become persistent frame fields"
     );
     let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
-    let begin = generated
-        .find("static uint32_t ku_task_frame_0_drive(")
-        .unwrap();
+    let begin = frame_probe_begin(&generated, 0);
     let end = begin
         + generated[begin..]
             .find("static uint32_t ku_task_frame_0_resume(")
@@ -653,11 +755,12 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
     for state in 0..work.states.len() {
         for (label, fast) in scalar_state_labels(&drive, state) {
             assert_eq!(drive.matches(&label).count(), 1);
-            let loop_step = if label.starts_with("ku_task_loop_") {
-                "fixture_loop_steps++; "
-            } else {
-                ""
-            };
+            let loop_step =
+                if label.starts_with("ku_task_loop_") || label.starts_with("ku_task_outline_") {
+                    "fixture_loop_steps++; "
+                } else {
+                    ""
+                };
             let fast_step = if fast { "fixture_fast_steps++; " } else { "" };
             drive = drive.replacen(&label, &format!("{label}\n  {loop_step}{fast_step}fixture_steps++;\n  if(fixture_cancel_at==SIZE_MAX && fixture_loop_steps==1u) fixture_cancel_at=fixture_steps;\n  if(fixture_cancel_at && fixture_steps==fixture_cancel_at) fixture_cancel_result=ku_task_control_request_cancel(fixture_cancel_lease,KU_TASK_CONTROL_CANCELLED,fixture_deadline);"), 1);
         }
@@ -687,6 +790,12 @@ static uint32_t ku_task_0_resume(void* raw) {
 static uint32_t fixture_original_resume(void* raw) {"#,
         1,
     );
+    // Exact accounting/ordering is independent from elapsed cancellation.
+    // Freeze this fixture clock so a millisecond tick at private reserve entry
+    // cannot replace the deliberately exact first-bank oracle.
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(clock).count(), 1);
+    generated=generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_unused_original_now(void) {",1);
     let expected = (0..5000).fold(3i64, |total, index| (total * 33 + index + 3) % 100000000);
     let source = generated.replacen(
         "int main(void) {",
@@ -696,7 +805,7 @@ static uint32_t fixture_original_resume(void* raw) {"#,
         + r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"scalar edges line %d: %s\n",__LINE__,#c); return 1; } } while (0)
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
-static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_slow,int loop_slow) {
+static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_slow,int loop_slow,int private_mode) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
@@ -709,8 +818,13 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   int64_t seed=overflow==2?INT64_MIN:overflow?INT64_MAX:3,divisor=divide_zero?0:1;
   CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
   fixture_cancel_lease=&task.owner.lease;
-  CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
-  if(cancel_at) CHECK(fixture_cancel_at!=SIZE_MAX && fixture_steps>=fixture_cancel_at && fixture_steps<=64u && fixture_cancel_result==KU_TASK_CONTROL_OK);
+  KuTaskDriverSliceResultV1 sliced={0};
+  size_t first_credits=private_mode && cancel_at>64u && cancel_at!=SIZE_MAX ? 16u : 1u;
+  CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,first_credits,1000u,fixture_deadline,NULL,NULL,&sliced)
+      :ku_task_driver_pump(&driver,0u,1u,&next))==KU_TASK_DRIVER_OK);
+  if(cancel_at) CHECK(fixture_cancel_at!=SIZE_MAX && fixture_steps>=fixture_cancel_at
+      && fixture_steps<=first_credits*64u && fixture_steps-fixture_cancel_at<=256u
+      && fixture_cancel_result==KU_TASK_CONTROL_OK);
   else if(!overflow) CHECK(fixture_steps==64u && driver.polls==1u && driver.queued==1u);
   if(force_slow) CHECK(!fixture_fast_steps);
   else if(!overflow) CHECK(fixture_fast_steps>0);
@@ -718,7 +832,8 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   else if(!cancel_at && !overflow) CHECK(fixture_loop_steps>0);
   if(overflow) CHECK(!fixture_fast_steps);
   for(size_t turn=0;turn<2000u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
-    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+    CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,32u,1000u,fixture_deadline,NULL,NULL,&sliced)
+        :ku_task_driver_pump(&driver,0u,32u,&next))<=KU_TASK_DRIVER_PENDING);
   CHECK(!fixture_bad_prefix);
   if(cancel_at) CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
   else {
@@ -743,19 +858,24 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   return 0;
 }
 int main(void) {
-  for(int loop_slow=0;loop_slow<2;loop_slow++) for(int force_slow=0;force_slow<2;force_slow++) {
-    CHECK(!fixture_case(0,0,0,force_slow,loop_slow));
+  for(int private_mode=0;private_mode<2;private_mode++) for(int loop_slow=0;loop_slow<2;loop_slow++) for(int force_slow=0;force_slow<2;force_slow++) {
+    CHECK(!fixture_case(0,0,0,force_slow,loop_slow,private_mode));
     /* Publish inside every original state position in both numeric paths.
      * Observation may finish its bounded region, never exceed this exact
      * 64-state poll. Dispatch entry is charged exactly once in either path. */
     for(size_t cancel_at=1u;cancel_at<=64u;cancel_at++)
-      CHECK(!fixture_case(cancel_at,0,0,force_slow,loop_slow));
-    CHECK(!fixture_case(0,1,0,force_slow,loop_slow));
-    CHECK(!fixture_case(0,2,0,force_slow,loop_slow));
-    CHECK(!fixture_case(0,0,1,force_slow,loop_slow));
+      CHECK(!fixture_case(cancel_at,0,0,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(0,1,0,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(0,2,0,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(0,0,1,force_slow,loop_slow,private_mode));
     /* Publication inside the chunk precedes an arithmetic failure in that
      * same iteration: the original control cancellation arbitration wins. */
-    if(!loop_slow) CHECK(!fixture_case(SIZE_MAX,1,0,force_slow,loop_slow));
+    if(!loop_slow) CHECK(!fixture_case(SIZE_MAX,1,0,force_slow,loop_slow,private_mode));
+    if(private_mode) {
+      const size_t later_positions[]={65u,255u,256u,257u,1023u,1024u};
+      for(size_t i=0;i<sizeof(later_positions)/sizeof(later_positions[0]);i++)
+        CHECK(!fixture_case(later_positions[i],0,0,force_slow,loop_slow,private_mode));
+    }
   }
   puts("task-scalar-exact-quantum-cancel-errors-ok"); return 0;
 }
@@ -941,12 +1061,7 @@ async fn main():null! { return ok(null) }
         "__ku_range_fast=!fixture_range_slow && !cleanup && (",
     );
     for function in &tasks.tasks.functions[..2] {
-        let begin = generated
-            .find(&format!(
-                "static uint32_t ku_task_frame_{}_drive(",
-                function.id.0
-            ))
-            .unwrap();
+        let begin = frame_probe_begin(&generated, function.id.0);
         let end = begin
             + generated[begin..]
                 .find(&format!(
@@ -1192,12 +1307,10 @@ fn native_task_scalar_empty_scope_publishes_pending_before_host_allocation() {
     let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
     generated = generated.replacen(
         "typedef struct KuString {",
-        &format!("{ALLOCATION_HOOK}\nstatic size_t fixture_steps,fixture_entry_seen,fixture_host_calls,fixture_bad_pending,fixture_bad_first_quantum,fixture_terminal_calls,fixture_bad_terminal;\nstatic uint32_t fixture_entry_status=UINT32_MAX,fixture_host_status=UINT32_MAX;\ntypedef struct KuString {{"),
+        &format!("{ALLOCATION_HOOK}\nstatic size_t fixture_steps,fixture_entry_seen,fixture_host_calls,fixture_bad_pending,fixture_bad_first_quantum,fixture_terminal_calls,fixture_bad_terminal;\nstatic uint32_t fixture_entry_status=UINT32_MAX,fixture_host_status=UINT32_MAX;\nstatic void* fixture_observed_header;\ntypedef struct KuString {{"),
         1,
     );
-    let begin = generated
-        .find("static uint32_t ku_task_frame_0_drive(")
-        .unwrap();
+    let begin = frame_probe_begin(&generated, 0);
     let end = begin
         + generated[begin..]
             .find("static uint32_t ku_task_frame_0_resume(")
@@ -1206,10 +1319,20 @@ fn native_task_scalar_empty_scope_publishes_pending_before_host_allocation() {
     for state in 0..work.states.len() {
         for (label, _) in scalar_state_labels(&drive, state) {
             // Observe actual state entry; never canonicalize the header.
-            drive = drive.replacen(&label, &format!("{label}\n  if(!fixture_entry_seen++) fixture_entry_status=frame->header.status;\n  fixture_steps++;\n"), 1);
+            drive = drive.replacen(&label, &format!("{label}\n  if(!fixture_entry_seen++) fixture_entry_status=((KuTaskFrameHeaderV1*)fixture_observed_header)->status;\n  fixture_steps++;\n"), 1);
         }
     }
     generated.replace_range(begin..end, &drive);
+    // The helper intentionally has no frame argument. Test-only observation
+    // captures the real outer drive's header before ANY actual state executes;
+    // both helper and ordinary state probes retain the same first-state oracle.
+    let outer="static uint32_t ku_task_frame_0_drive(KuTaskFrame_0* frame, const KuTaskFrameClockV1* clock, int cleanup) {";
+    assert_eq!(generated.matches(outer).count(), 1);
+    generated = generated.replacen(
+        outer,
+        &format!("{outer}\n  fixture_observed_header=&frame->header;"),
+        1,
+    );
     let reconcile = "static uint32_t ku_task_0_reconcile_charge(void* raw) {";
     assert_eq!(generated.matches(reconcile).count(), 1);
     generated = generated.replacen(

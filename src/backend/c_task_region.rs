@@ -36,6 +36,63 @@ pub(super) struct ScalarLoop {
     pub max_path_states: usize,
     pub max_path_operations: usize,
     pub max_iterations: usize,
+    pub private_max_iterations: usize,
+}
+
+pub(super) struct LinearLoop {
+    pub body: Vec<usize>,
+    pub exit: usize,
+    pub body_when_true: bool,
+}
+
+impl ScalarLoop {
+    /// The small outlined form has one conditional header and a single linear
+    /// successful path. Every other shape keeps the existing bounded CFG.
+    pub fn linear(&self, function: &TaskFunction) -> Option<LinearLoop> {
+        let TaskTerminator::Branch {
+            then_state,
+            else_state,
+            ..
+        } = function.states[self.header].terminator
+        else {
+            return None;
+        };
+        let inside = |s: usize| s != self.header && self.states.binary_search(&s).is_ok();
+        let (mut next, exit, body_when_true) = match (inside(then_state.0), inside(else_state.0)) {
+            (true, false) if self.states.binary_search(&else_state.0).is_err() => {
+                (then_state.0, else_state.0, true)
+            }
+            (false, true) if self.states.binary_search(&then_state.0).is_err() => {
+                (else_state.0, then_state.0, false)
+            }
+            _ => return None,
+        };
+        let mut body = Vec::new();
+        while body.len() < self.states.len() {
+            if !inside(next) || body.contains(&next) {
+                return None;
+            }
+            body.push(next);
+            match function.states[next].terminator {
+                TaskTerminator::Jump { target }
+                | TaskTerminator::ScopeDrain { ready: target, .. } => next = target.0,
+                TaskTerminator::Suspend { resume, .. }
+                    if next == self.latch && resume.0 == self.header =>
+                {
+                    break
+                }
+                _ => return None,
+            }
+        }
+        if body.last().copied() != Some(self.latch) || body.len() + 1 != self.states.len() {
+            return None;
+        }
+        Some(LinearLoop {
+            body,
+            exit,
+            body_when_true,
+        })
+    }
 }
 
 impl ScalarLoops {
@@ -181,6 +238,9 @@ impl ScalarLoops {
             if max_iterations < 2 {
                 continue;
             }
+            let private_max_iterations = (super::super::task_range::COMPUTE_PHASE_STATES
+                / max_path_states)
+                .min(super::super::task_range::COMPUTE_PHASE_OPERATIONS / max_path_operations);
 
             // Maximal linear blocks give a constant successful-path debit.
             // Branch joins carry only a small actual-prefix counter; checked
@@ -239,6 +299,7 @@ impl ScalarLoops {
                 max_path_states,
                 max_path_operations,
                 max_iterations,
+                private_max_iterations,
             });
         }
         plan
@@ -540,7 +601,23 @@ mod tests {
         assert_eq!(region.max_path_states, 5);
         assert_eq!(region.max_path_operations, 5);
         assert_eq!(region.max_iterations, 8);
+        assert!(
+            region.private_max_iterations * region.max_path_states
+                <= super::super::super::task_range::COMPUTE_PHASE_STATES
+        );
+        assert!(
+            region.private_max_iterations * region.max_path_operations
+                <= super::super::super::task_range::COMPUTE_PHASE_OPERATIONS
+        );
         assert_eq!(region.blocks, vec![vec![1], vec![2], vec![3], vec![4, 5]]);
+        assert!(region.linear(&f).is_none()); // The body has another branch.
+        let mut linear = f.clone();
+        linear.states[2].terminator = jump(3);
+        let p = ScalarLoops::build(&linear, &[true, true, true, true, true, true, false, false]);
+        let shape = p.at_header(1).unwrap().linear(&linear).unwrap();
+        assert_eq!(shape.body, vec![2, 3, 4, 5]);
+        assert_eq!(shape.exit, 6);
+        assert!(shape.body_when_true);
         // A side entry into the body defeats dominance, even when every node
         // is individually scalar. No cyclic path can avoid a chunk boundary.
         let mut side = f.clone();

@@ -611,9 +611,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     });
     let compute_banks = !blocking
         && !finally
-        && !function.slots.iter().any(|slot| {
-            matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. })
-        });
+        && !function
+            .slots
+            .iter()
+            .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }));
     let mut exit_deadline = String::new();
     if scope_exits {
         exit_deadline.push_str(EXIT_DEADLINE);
@@ -1256,6 +1257,8 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
     if (ku_task_driver_begin_quantum(&instance->ticket,&instance->control)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
+    /* The same complete eligibility gates B2 loans and private slice capacity;
+     * the frame still proves a bounded pure entry before reserving any zone. */
     ku_task_driver_compute_begin(&instance->ticket,&instance->control,(@COMPUTE_BANKS_ALLOWED@));
     status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
     if (!ku_task_driver_compute_end(&instance->ticket,&instance->control)) return KU_TASK_CONTROL_INVALID_STATE;

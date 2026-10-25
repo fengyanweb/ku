@@ -32,6 +32,15 @@ struct CopyInitTransfer {
     local_kill: u64,
 }
 
+struct LoopOutline {
+    linear: scalar_region::LinearLoop,
+    inputs: Vec<SlotId>,
+    outputs: Vec<SlotId>,
+    locals: Vec<SlotId>,
+    header_init: CopyInitTransfer,
+    iteration_init: CopyInitTransfer,
+}
+
 impl CopyInitTransfer {
     fn record(&mut self, bit: u64, cached: bool, initialized: bool) {
         let (gen, kill) = if cached {
@@ -297,6 +306,8 @@ struct FrameEmitter<'a> {
     loop_active: Cell<bool>,
     loop_error_prefix: Cell<Option<usize>>,
     loop_init_transfer: Cell<Option<CopyInitTransfer>>,
+    reservation_error_operations: Cell<Option<usize>>,
+    outline_active: Cell<bool>,
     range_plan: Option<super::task_range::RangePlan>,
     range_active: Cell<bool>,
     range_fast: Cell<bool>,
@@ -454,6 +465,8 @@ impl<'a> FrameEmitter<'a> {
             loop_active: Cell::new(false),
             loop_error_prefix: Cell::new(None),
             loop_init_transfer: Cell::new(None),
+            reservation_error_operations: Cell::new(None),
+            outline_active: Cell::new(false),
             range_plan: None,
             range_active: Cell::new(false),
             range_fast: Cell::new(false),
@@ -1086,6 +1099,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
              }}\n"
         ));
+        self.emit_reservation_operation_guard(out, state);
         out.push_str(&format!(
             "  if (!__ku_dispatch_budget) {{\n\
                KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host;\n\
@@ -1112,10 +1126,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 // the original phase-before-unit precise fallback below.
                 let mask = self.scalar_cache_mask.get();
                 out.push_str(&format!(
-                    "  if (__ku_dispatch_budget>={}u) {{\n\
+                    "  if (__ku_dispatch_budget>={}u && (!__ku_reservation_open || __ku_reservation_ops<=KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-{}u)) {{\n\
                        if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n\
                        goto ku_task_region_{label}_state_{state};\n  }}\n",
-                    region.max_path_states
+                    region.max_path_states, region.operations+region.states.len()
                 ));
             }
         }
@@ -1130,7 +1144,59 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_compute_report(&self, out: &mut COutput) {
         if self.cooperative && self.hosted {
-            out.push_str("  if (!cleanup && clock->host && remaining_budget<=64u) { KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host; ku_task_driver_compute_report_states(bank_host->ticket,bank_host->control,64u-remaining_budget); }\n");
+            out.push_str("  if (!cleanup && clock->host) { KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host; if (reservation_mode) ku_task_driver_compute_report_reservation(bank_host->ticket,bank_host->control,reservation_units,reservation_operations); else if (remaining_budget<=64u) ku_task_driver_compute_report_states(bank_host->ticket,bank_host->control,64u-remaining_budget); }\n");
+        }
+    }
+
+    fn reservation_supported(&self) -> bool {
+        self.cooperative && self.hosted && self.scalar_cache_active.get()
+    }
+
+    fn emit_reservation_yield(&self, out: &mut COutput, state: Option<usize>) {
+        if let Some(state) = state {
+            out.push_str(&format!("  frame->header.state={state}u;\n"));
+        }
+        out.push_str("  { KuTaskAdapterHostV1* reserve_host=(KuTaskAdapterHostV1*)clock->host; ku_task_driver_note_quantum_yield(reserve_host->ticket,reserve_host->control,__ku_charge_unchanged); }\n  frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n");
+    }
+
+    fn emit_reservation_operation_guard(&self, out: &mut COutput, state: usize) {
+        if !self.reservation_supported() {
+            return;
+        }
+        let operations = self.function.states[state].operations.len() + 1;
+        out.push_str(&format!("  if (__ku_reservation_open && ({}u>KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS || __ku_reservation_ops>KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-{}u)) {{\n",operations,operations));
+        // A bounded operation-cap yield can continue into another reservation
+        // only when that next state is itself reservable. An oversized pure
+        // state would skip reserve_begin's fresh check on the next callback;
+        // end the whole private slice before handing it to the exact fallback.
+        out.push_str(&format!(
+            "  if ({operations}u>KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS) __ku_charge_unchanged=0;\n"
+        ));
+        self.emit_reservation_yield(out, Some(state));
+        out.push_str("  }\n");
+    }
+
+    fn emit_reservation_close(&self, out: &mut COutput, error: bool) {
+        if !self.reservation_supported() {
+            return;
+        }
+        out.push_str("  if (__ku_reservation_open) {\n    size_t used=__ku_reservation_base+__ku_reservation_limit-__ku_dispatch_budget;\n    KuTaskAdapterHostV1* reserve_host=(KuTaskAdapterHostV1*)clock->host;\n    int observed=ku_task_driver_compute_reservation_boundary(reserve_host->ticket,reserve_host->control,used,__ku_reservation_ops);\n    __ku_reservation_open=0; __ku_reservation_base=used;\n    __ku_reservation_limit=used ? (used%64u ? 64u-used%64u : 0u) : 64u;\n    __ku_dispatch_budget=__ku_reservation_limit;\n");
+        if error {
+            out.push_str("    (void)observed; /* An existing arithmetic error is not replaced by a later clock/phase observation. */\n");
+        } else {
+            out.push_str("    __ku_charge_unchanged=0; /* A real nonpure boundary ends this entire private slice even when its exact bank tail is zero. */\n");
+            out.push_str("    if (!observed || !__ku_dispatch_budget) {\n");
+            self.emit_reservation_yield(out, None);
+            out.push_str("    }\n");
+        }
+        out.push_str("  }\n");
+    }
+
+    fn emit_reservation_state_operations(&self, out: &mut COutput, operations: usize) {
+        if self.reservation_supported() {
+            out.push_str(&format!(
+                "  if (__ku_reservation_open) __ku_reservation_ops+={operations}u;\n"
+            ));
         }
     }
 
@@ -1178,7 +1244,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         let mask = self.scalar_cache_mask.get();
         let minimum = region.max_path_states * 2 - usize::from(charged);
         out.push_str(&format!(
-            "  if (!cleanup && __ku_dispatch_budget>={minimum}u) {{\n"
+            "  if (!cleanup && __ku_dispatch_budget>={minimum}u && (!__ku_reservation_open || __ku_reservation_ops<=KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-{}u)) {{\n", region.max_path_operations*2
         ));
         if charged {
             out.push_str("  ++__ku_dispatch_budget;\n");
@@ -1251,6 +1317,278 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
     }
 
+    fn outline_plan(&self, region: &scalar_region::ScalarLoop) -> Option<LoopOutline> {
+        if !self.loop_active.get() || !self.range_active.get() {
+            return None;
+        }
+        let linear = region.linear(self.function)?;
+        let range = self.range_plan.as_ref()?;
+        let count = self.function.slots.len();
+        let mut touched = vec![false; count];
+        let mut written = vec![false; count];
+        let mut inputs = vec![false; count];
+        let mut transfer = CopyInitTransfer::default();
+        let mut header_init = transfer;
+        for state in std::iter::once(region.header).chain(linear.body.iter().copied()) {
+            if !range.states[state] {
+                return None;
+            }
+            for (operation_id, operation) in
+                self.function.states[state].operations.iter().enumerate()
+            {
+                let (reads, writes, clears) = match *operation {
+                    TaskOp::Init { dst, .. } => (vec![], vec![dst], vec![]),
+                    TaskOp::Copy { dst, src } => (vec![src], vec![dst], vec![]),
+                    TaskOp::Move { dst, src } => (vec![src], vec![dst], vec![src]),
+                    TaskOp::Unary { dst, src, op } => {
+                        if op == TaskUnaryOp::Negate && !range.proves(state, operation_id) {
+                            return None;
+                        }
+                        (vec![src], vec![dst], vec![])
+                    }
+                    TaskOp::Binary {
+                        dst,
+                        left,
+                        right,
+                        op,
+                    } => {
+                        if matches!(
+                            op,
+                            TaskBinaryOp::Add
+                                | TaskBinaryOp::Subtract
+                                | TaskBinaryOp::Multiply
+                                | TaskBinaryOp::Divide
+                                | TaskBinaryOp::Remainder
+                        ) && !range.proves(state, operation_id)
+                        {
+                            return None;
+                        }
+                        (vec![left, right], vec![dst], vec![])
+                    }
+                    TaskOp::Read { slot } => (vec![slot], vec![], vec![]),
+                    TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
+                        (vec![], vec![], vec![slot])
+                    }
+                    TaskOp::ScopeEnter { ref tasks, .. } if tasks.is_empty() => {
+                        (vec![], vec![], vec![])
+                    }
+                    _ => return None,
+                };
+                for slot in reads {
+                    touched[slot.0] = true;
+                    if !written[slot.0] {
+                        if !self.cached_scalar(slot) {
+                            return None;
+                        }
+                        inputs[slot.0] = true;
+                    }
+                }
+                for slot in clears {
+                    transfer.record(1u64 << slot.0, self.cached_scalar(slot), false);
+                }
+                for slot in writes {
+                    touched[slot.0] = true;
+                    written[slot.0] = true;
+                    transfer.record(1u64 << slot.0, self.cached_scalar(slot), true);
+                }
+            }
+            if state == region.header {
+                let TaskTerminator::Branch { condition, .. } =
+                    self.function.states[state].terminator
+                else {
+                    return None;
+                };
+                touched[condition.0] = true;
+                if !written[condition.0] {
+                    if !self.cached_scalar(condition) {
+                        return None;
+                    }
+                    inputs[condition.0] = true;
+                }
+                header_init = transfer;
+            }
+        }
+        // Existing cooperative liveness persists every value crossing a
+        // verified normal state edge. Nonpersistent locals therefore need no
+        // outgoing value; the scan above still rejects a noncached live-in.
+        let outputs = (0..count)
+            .filter(|&slot| written[slot] && self.cached_scalar(SlotId(slot)))
+            .map(SlotId)
+            .collect::<Vec<_>>();
+        // A zero-iteration/false-header exit must preserve an output that its
+        // body has not assigned, even if that value is otherwise dead on the
+        // successful path. These are Copy values, never owned transfers.
+        for slot in &outputs {
+            inputs[slot.0] = true;
+        }
+        let locals = (0..count)
+            .filter(|&slot| touched[slot] && !inputs[slot])
+            .map(SlotId)
+            .collect();
+        let inputs = (0..count)
+            .filter(|&slot| inputs[slot])
+            .map(SlotId)
+            .collect::<Vec<_>>();
+        if inputs.len() > 16 || outputs.len() > 16 {
+            return None;
+        }
+        Some(LoopOutline {
+            linear,
+            inputs,
+            outputs,
+            locals,
+            header_init,
+            iteration_init: transfer,
+        })
+    }
+
+    fn emit_outline_helpers(&self, out: &mut COutput) -> KuResult<()> {
+        if !self.range_active.get() || !self.loop_active.get() {
+            return Ok(());
+        }
+        let plans = self
+            .scalar_loops
+            .loops
+            .iter()
+            .filter_map(|region| self.outline_plan(region).map(|plan| (region, plan)))
+            .collect::<Vec<_>>();
+        if plans.is_empty() {
+            return Ok(());
+        }
+        out.push_str(&format!(
+            "/* outlined Task loops for frame {} */\n",
+            self.function.id.0
+        ));
+        out.push_str("#ifndef KU_TASK_LOOP_NOINLINE\n#if defined(_MSC_VER)\n#define KU_TASK_LOOP_NOINLINE __declspec(noinline)\n#elif defined(__GNUC__) || defined(__clang__)\n#define KU_TASK_LOOP_NOINLINE __attribute__((noinline))\n#else\n#define KU_TASK_LOOP_NOINLINE\n#endif\n#endif\n");
+        let previous_range = self.range_fast.replace(true);
+        let previous_init = self.scalar_init_cache_active.replace(true);
+        let previous_transfer = self
+            .loop_init_transfer
+            .replace(Some(CopyInitTransfer::default()));
+        let previous_outline = self.outline_active.replace(true);
+        let result = (|| {
+            for (region, plan) in plans {
+                let name = format!("{}_loop_{}", self.prefix, region.header);
+                out.push_str(&format!(
+                    "typedef struct {name}_output {{\n  size_t iterations; int false_header;\n"
+                ));
+                for slot in &plan.outputs {
+                    out.push_str(&format!(
+                        "  {} s_{};\n",
+                        c_type(self.slot_type(*slot)?)?,
+                        slot.0
+                    ));
+                }
+                out.push_str(&format!("}} {name}_output;\nstatic KU_TASK_LOOP_NOINLINE {name}_output {name}(size_t max_iterations"));
+                for slot in &plan.inputs {
+                    out.push_str(&format!(
+                        ", {} {}",
+                        c_type(self.slot_type(*slot)?)?,
+                        self.place(*slot)
+                    ));
+                }
+                out.push_str(&format!(") {{\n  {name}_output result={{0}};\n"));
+                for slot in &plan.locals {
+                    out.push_str(&format!(
+                        "  {} {}={};\n",
+                        c_type(self.slot_type(*slot)?)?,
+                        self.place(*slot),
+                        c_zero_initializer(self.slot_type(*slot)?)?
+                    ));
+                }
+                out.push_str("  for (;result.iterations<max_iterations;result.iterations++) {\n");
+                for state in std::iter::once(region.header).chain(plan.linear.body.iter().copied())
+                {
+                    out.push_str(&format!(
+                        "ku_task_outline_range_{}_state_{state}:;\n",
+                        region.header
+                    ));
+                    for (opid, operation) in
+                        self.function.states[state].operations.iter().enumerate()
+                    {
+                        self.emit_operation(out, operation, state, opid)?;
+                    }
+                    if state == region.header {
+                        let TaskTerminator::Branch { condition, .. } =
+                            self.function.states[state].terminator
+                        else {
+                            unreachable!()
+                        };
+                        out.push_str(&format!(
+                            "  if ({}{}) {{ result.false_header=1; break; }}\n",
+                            if plan.linear.body_when_true { "!" } else { "" },
+                            self.place(condition)
+                        ));
+                    }
+                }
+                out.push_str("  }\n");
+                for slot in &plan.outputs {
+                    out.push_str(&format!("  result.s_{}={};\n", slot.0, self.place(*slot)));
+                }
+                out.push_str("  return result;\n}\n");
+            }
+            out.check()
+        })();
+        self.range_fast.set(previous_range);
+        self.scalar_init_cache_active.set(previous_init);
+        self.loop_init_transfer.set(previous_transfer);
+        self.outline_active.set(previous_outline);
+        result
+    }
+
+    fn emit_outline_call(
+        &self,
+        out: &mut COutput,
+        region: &scalar_region::ScalarLoop,
+        plan: &LoopOutline,
+    ) {
+        let name = format!("{}_loop_{}", self.prefix, region.header);
+        out.push_str(&format!(
+            "  if (__ku_reservation_open) {{\n    {name}_output chunk={name}(__ku_loop_iterations"
+        ));
+        for slot in &plan.inputs {
+            out.push_str(&format!(",{}", self.place(*slot)));
+        }
+        out.push_str(");\n");
+        for slot in &plan.outputs {
+            out.push_str(&format!("    {}=chunk.s_{};\n", self.place(*slot), slot.0));
+        }
+        out.push_str("    if (chunk.iterations) {\n");
+        self.emit_loop_init_transfer(out, plan.iteration_init);
+        let pending = plan.linear.body.iter().any(|&state| {
+            matches!(
+                self.function.states[state].terminator,
+                TaskTerminator::ScopeDrain { .. }
+            )
+        });
+        if pending {
+            out.push_str("      __ku_region_pending=1;\n");
+        }
+        let TaskTerminator::Suspend { cleanup, .. } = self.function.states[region.latch].terminator
+        else {
+            unreachable!()
+        };
+        out.push_str(&format!("      __ku_region_cleanup_state={}u; __ku_region_cleanup_dirty=1;\n    }}\n    if (chunk.false_header) {{\n",cleanup.0));
+        self.emit_loop_init_transfer(out, plan.header_init);
+        out.push_str("    }\n");
+        out.push_str(&format!("    __ku_dispatch_budget-=chunk.iterations*{}u+(size_t)chunk.false_header;\n    __ku_reservation_ops+=chunk.iterations*{}u+(size_t)chunk.false_header*{}u;\n    if (chunk.false_header) {{\n",region.max_path_states,region.max_path_operations,self.function.states[region.header].operations.len()+1));
+        if self.scalar_direct_state(plan.linear.exit)
+            && !self.range_plan.as_ref().unwrap().states[plan.linear.exit]
+        {
+            out.push_str(&format!(
+                "    goto ku_task_scalar_check_{};\n",
+                plan.linear.exit
+            ));
+        } else {
+            self.emit_transition(out, plan.linear.exit);
+        }
+        out.push_str("    }\n");
+        out.push_str(&format!(
+            "    goto ku_task_range_check_{};\n  }}\n",
+            region.header
+        ));
+    }
+
     fn emit_scalar_loops(&self, out: &mut COutput) -> KuResult<()> {
         if !self.loop_active.get() || !self.scalar_cache_active.get() {
             return Ok(());
@@ -1267,21 +1605,28 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     continue;
                 }
                 out.push_str(&format!(
-                    "  /* typed native loop: header {}, latch {}, <= {} iterations,\n   * <= {} states/{} operations per iteration; exact taken-prefix debit.\n   * A chunk never crosses a bank, host, owner or real WAIT boundary. */\n\
+                    "  /* typed native loop: header {}, latch {}, public <= {} iterations,\n   * <= {} states/{} operations per iteration; exact taken-prefix debit.\n   * Private chunks span accounting banks, but acquire phase within256\n   * states/1024 pure operations. These work bounds are not realtime bounds.\n   * No host, owner or real WAIT boundary is crossed. */\n\
                      ku_task_loop_{label}_{}:;\n  {{\n\
                      size_t __ku_loop_iterations=__ku_dispatch_budget/{}u;\n\
-                     if (__ku_loop_iterations>{}u) __ku_loop_iterations={}u;\n\
-                     for (;__ku_loop_iterations;--__ku_loop_iterations) {{\n\
-                     size_t __ku_loop_cost=0;\n\
-                     goto ku_task_loop_{label}_{}_state_{};\n",
+                     size_t __ku_loop_iteration_cap=__ku_reservation_open ? {}u : {}u;\n\
+                     if (__ku_loop_iterations>__ku_loop_iteration_cap) __ku_loop_iterations=__ku_loop_iteration_cap;\n\
+                     if (__ku_reservation_open && __ku_loop_iterations>(KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-__ku_reservation_ops)/{}u) __ku_loop_iterations=(KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-__ku_reservation_ops)/{}u;\n\
+                     ",
                     region.header, region.latch, region.max_iterations,
                     region.max_path_states, region.max_path_operations,
-                    region.header, region.max_path_states, region.max_iterations,
-                    region.max_iterations, region.header, region.header
+                    region.header, region.max_path_states, region.private_max_iterations,
+                    region.max_iterations, region.max_path_operations,region.max_path_operations
                 ));
+                if range_fast {
+                    if let Some(plan) = self.outline_plan(region) {
+                        self.emit_outline_call(out, region, &plan);
+                    }
+                }
+                out.push_str(&format!("for (;__ku_loop_iterations;--__ku_loop_iterations) {{\nsize_t __ku_loop_cost=0;\ngoto ku_task_loop_{label}_{}_state_{};\n",region.header,region.header));
                 for block in &region.blocks {
                     self.loop_init_transfer
                         .set(Some(CopyInitTransfer::default()));
+                    let mut operations = 0usize;
                     for (position, &index) in block.iter().enumerate() {
                         out.check()?;
                         self.loop_error_prefix.set(Some(position + 1));
@@ -1291,8 +1636,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ));
                         let state = &self.function.states[index];
                         for (operation_id, operation) in state.operations.iter().enumerate() {
+                            self.reservation_error_operations
+                                .set(Some(operations + operation_id + 1));
                             self.emit_operation(out, operation, index, operation_id)?;
                         }
+                        operations += state.operations.len() + 1;
                         if let TaskTerminator::ScopeDrain { .. } = state.terminator {
                             out.push_str("  __ku_region_pending=1; __ku_region_cleanup_state=UINT32_MAX; __ku_region_cleanup_dirty=1;\n");
                         } else if let TaskTerminator::Suspend { cleanup, .. } = state.terminator {
@@ -1302,6 +1650,8 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             ));
                         }
                     }
+                    self.reservation_error_operations.set(None);
+                    self.emit_reservation_state_operations(out, operations);
                     self.loop_error_prefix.set(None);
                     self.emit_loop_init_transfer(out, self.loop_init_transfer.take().unwrap());
                     let last = *block.last().unwrap();
@@ -1418,11 +1768,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             // entry state. Refund that local unit only when handing it to the
             // region, whose first block charges it exactly once again.
             out.push_str(&format!(
-                "  if (!cleanup && __ku_dispatch_budget>={}u{guard}) {{\n\
+                "  if (!cleanup && __ku_dispatch_budget>={}u{guard} && (!__ku_reservation_open || __ku_reservation_ops<=KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-{}u)) {{\n\
                    ++__ku_dispatch_budget;\n\
                    if (!__ku_copy_init_active) {{ __ku_copy_initialized=frame->header.initialized & UINT64_C({mask}); __ku_copy_init_active=1; }}\n\
                    goto ku_task_region_{label}_state_{state};\n  }}\n",
-                region.max_path_states - 1
+                region.max_path_states - 1, region.operations+region.states.len()
             ));
         }
     }
@@ -1458,8 +1808,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         "ku_task_region_{label}_state_{index}:;\n  --__ku_dispatch_budget;\n"
                     ));
                     for (operation_id, operation) in state.operations.iter().enumerate() {
+                        self.reservation_error_operations
+                            .set(Some(operation_id + 1));
                         self.emit_operation(out, operation, index, operation_id)?;
                     }
+                    self.reservation_error_operations.set(None);
+                    self.emit_reservation_state_operations(out, state.operations.len() + 1);
                     match state.terminator {
                         TaskTerminator::Jump { target } => {
                             self.emit_scalar_region_transition(out, region, target.0);
@@ -1519,8 +1873,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
         if self.cooperative && self.hosted {
             out.push_str(&format!(
-                "typedef char {}_compute_proof_matches_driver[(KU_TASK_DRIVER_COMPUTE_BANK_STATES==64u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_MAX_BANKS<={}u) ? 1 : -1];\n",
+                "typedef char {}_compute_proof_matches_driver[(KU_TASK_DRIVER_COMPUTE_BANK_STATES==64u && KU_TASK_DRIVER_COMPUTE_MAX_BANKS==4u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_MAX_BANKS<={}u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS==KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES && KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES<={}u) ? 1 : -1];\n",
                 self.prefix,
+                super::task_range::COMPUTE_PROOF_STATES,
                 super::task_range::COMPUTE_PROOF_STATES
             ));
         }
@@ -1547,17 +1902,32 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             let body = body.finish()?;
             let helper = format!("{}_report_compute_return", self.prefix);
             out.push_str(&format!(
-                "static uint32_t {helper}(const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget, uint32_t result) {{\n"
+                "static uint32_t {helper}(const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget, size_t reservation_units, size_t reservation_operations, int reservation_mode, uint32_t result) {{\n"
             ));
             self.emit_compute_report(out);
             out.push_str("  return result;\n}\n");
             emit_scalar_spill_returns(
                 out,
                 &body,
-                &format!("{helper}(clock,cleanup,__ku_dispatch_budget"),
+                &format!("{helper}(clock,cleanup,__ku_dispatch_budget,(__ku_reservation_mode ? __ku_reservation_base+__ku_reservation_limit-__ku_dispatch_budget : 0u),__ku_reservation_ops,__ku_reservation_mode"),
             )?;
             return out.check();
         }
+        out.push_str(&format!(
+            "static size_t {}_pure_operations(uint32_t state) {{\n  switch(state) {{\n",
+            self.prefix
+        ));
+        for (state, body) in self.function.states.iter().enumerate() {
+            if self.scalar_direct_state(state)
+                && body.operations.len() < super::task_range::COMPUTE_PHASE_OPERATIONS
+            {
+                out.push_str(&format!(
+                    "  case {state}u: return {}u;\n",
+                    body.operations.len() + 1
+                ));
+            }
+        }
+        out.push_str("  default: return 0u;\n  }\n}\n");
         // Only verified Copy scalars get a private invocation-local cache.
         // Owning headers and control/lease storage stay in the original frame.
         // Only pure segments cache Copy initialization bits; every observable
@@ -1632,6 +2002,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         self.loop_active.set(false);
         self.loop_error_prefix.set(None);
         self.loop_init_transfer.set(None);
+        self.reservation_error_operations.set(None);
         out.push_str(chosen.as_deref().unwrap_or(&baseline));
         out.check()
     }
@@ -1643,9 +2014,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         body: &str,
         scalar_mask: u64,
     ) -> KuResult<()> {
+        self.emit_outline_helpers(out)?;
         let helper = format!("{}_spill_scalars", self.prefix);
         out.push_str(&format!(
-            "static uint32_t {helper}({}* frame, const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget",
+            "static uint32_t {helper}({}* frame, const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget, size_t reservation_units, size_t reservation_operations, int reservation_mode",
             self.frame_type
         ));
         for slot in slots {
@@ -1663,7 +2035,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         }
         self.emit_compute_report(out);
         out.push_str("  return result;\n}\n");
-        let mut call = format!("{helper}(frame,clock,cleanup,__ku_dispatch_budget");
+        let mut call = format!("{helper}(frame,clock,cleanup,__ku_dispatch_budget,(__ku_reservation_mode ? __ku_reservation_base+__ku_reservation_limit-__ku_dispatch_budget : 0u),__ku_reservation_ops,__ku_reservation_mode");
         for slot in slots {
             call.push_str(&format!(",cached_{}", slot.0));
         }
@@ -1677,12 +2049,14 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         self.loop_init_transfer.set(None);
         self.scalar_init_cache_active.set(false);
         self.range_fast.set(false);
+        self.reservation_error_operations.set(None);
         out.push_str(&format!(
             "static uint32_t {}_drive({}* frame, const KuTaskFrameClockV1* clock, int cleanup) {{\n  uint64_t local_initialized = 0;\n",
             self.prefix, self.frame_type
         ));
         if self.cooperative {
             out.push_str("  size_t __ku_dispatch_budget=64u;\n  int __ku_charge_unchanged=1;\n");
+            out.push_str("  size_t __ku_reservation_base=0,__ku_reservation_limit=0,__ku_reservation_ops=0;\n  int __ku_reservation_mode=0,__ku_reservation_open=0;\n");
         }
         if self.scalar_cache_active.get() {
             out.push_str("  uint64_t __ku_copy_initialized=0;\n  int __ku_copy_init_active=0;\n  KuAtomicRefcount* __ku_scalar_phase=NULL;\n");
@@ -1710,10 +2084,23 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
             }
         }
+        if self.reservation_supported() {
+            out.push_str(&format!("  if (!cleanup && clock->host && {}_pure_operations(frame->header.state)) {{\n    KuTaskAdapterHostV1* reserve_host=(KuTaskAdapterHostV1*)clock->host;\n    size_t capacity=ku_task_driver_compute_reserve_begin(reserve_host->ticket,reserve_host->control);\n    if (capacity) {{\n      __ku_reservation_mode=1;\n      __ku_reservation_limit=capacity==SIZE_MAX ? 0u : capacity;\n      __ku_dispatch_budget=__ku_reservation_limit;\n      __ku_reservation_open=capacity!=SIZE_MAX;\n      if (capacity==SIZE_MAX) {{\n",self.prefix));
+            self.emit_reservation_yield(out, None);
+            out.push_str("      }\n    }\n  }\n");
+        }
         out.push_str("  goto ku_task_dispatch;\nku_task_dispatch:;\n");
         // A general dispatcher may call a clock/check/host helper. Its view
         // must include every prior Copy initialization before that call.
         self.emit_scalar_init_flush(out);
+        if self.reservation_supported() {
+            out.push_str(&format!("  if (__ku_reservation_open) {{\n    size_t operations={}_pure_operations(frame->header.state);\n    if (!operations) {{\n", self.prefix));
+            self.emit_reservation_close(out, false);
+            out.push_str("    } else if (operations>KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS || __ku_reservation_ops>KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS-operations) {\n");
+            out.push_str("      if (operations>KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS) __ku_charge_unchanged=0;\n");
+            self.emit_reservation_yield(out, None);
+            out.push_str("    }\n  }\n");
+        }
         out.push_str(
             "  if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
                  frame->header.cleanup_timed_out = 1;\n\
@@ -1818,8 +2205,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             }
             for (operation_id, operation) in state.operations.iter().enumerate() {
                 out.check()?;
+                self.reservation_error_operations
+                    .set(Some(operation_id + 1));
                 self.emit_operation(out, operation, index, operation_id)?;
             }
+            self.reservation_error_operations.set(None);
+            self.emit_reservation_state_operations(out, state.operations.len() + 1);
             match &state.terminator {
                 TaskTerminator::Jump { target } => {
                     self.emit_transition(out, target.0);
@@ -2868,27 +3259,36 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_runtime_error(&self, out: &mut COutput, error: &str) -> KuResult<()> {
+        if self.outline_active.get() {
+            return Err(unsupported("unproved runtime error in outlined Task loop"));
+        }
         // A loop block has reserved capacity, not charged future work. A
         // failing operation settles the states actually entered up to and
         // including this state, and publishes only its preceding Copy effects.
         // Later operations in that same state have not run.
         let prefix = self.loop_error_prefix.take();
         let transfer = self.loop_init_transfer.take();
+        let operations = self.reservation_error_operations.take();
         if let Some(prefix) = prefix {
             out.push_str(&format!(
                 "  __ku_dispatch_budget-=__ku_loop_cost+{prefix}u;\n"
             ));
             self.emit_loop_init_transfer(out, transfer.unwrap());
         }
+        if let Some(operations) = operations {
+            self.emit_reservation_state_operations(out, operations);
+        }
         let result = self.emit_runtime_error_body(out, error);
         self.loop_error_prefix.set(prefix);
         self.loop_init_transfer.set(transfer);
+        self.reservation_error_operations.set(operations);
         result
     }
 
     fn emit_runtime_error_body(&self, out: &mut COutput, error: &str) -> KuResult<()> {
         self.emit_compute_close(out);
         self.emit_scalar_region_header_flush(out);
+        self.emit_reservation_close(out, true);
         let IrType::Result(inner) = &self.function.result else {
             return Err(unsupported("runtime exit requires Result"));
         };

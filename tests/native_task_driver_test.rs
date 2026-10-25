@@ -73,6 +73,304 @@ fn fixture_source_with_backedge(backedge: bool) -> String {
 }
 
 #[test]
+fn native_task_driver_compute_reservation_preserves_prefix_clocks_and_host_tail() {
+    let ast=Parser::new(Lexer::new("async fn Work(seed:int):int! { text=str(seed) return ok(9) } async fn main():null! { return ok(null) }").lex().unwrap()).parse_program().unwrap();
+    Checker::new().check(&ast).unwrap();
+    let mut tasks = ir::task_lower::lower_program(&ast).unwrap();
+    let function = &mut tasks.tasks.functions[0];
+    let original_entry = function.entry.0;
+    let prefix_base = function.states.len();
+    let mut previous = function.entry;
+    // Typed, bounded exact-cost fixture: every selected prefix state has one
+    // unit and no operation, then reaches the real owned allocation boundary.
+    for _ in 0..128 {
+        let state = StateId(function.states.len());
+        function.states.push(TaskState {
+            operations: vec![],
+            terminator: TaskTerminator::Jump { target: previous },
+        });
+        previous = state;
+    }
+    let heavy_entry = function.states.len();
+    function.states.push(TaskState {
+        operations: vec![
+            TaskOp::Read {
+                slot: function.parameters[0]
+            };
+            1023
+        ],
+        terminator: TaskTerminator::Jump { target: previous },
+    });
+    previous = StateId(heavy_entry);
+    let oversized_entry = function.states.len();
+    function.states.push(TaskState {
+        operations: vec![
+            TaskOp::Read {
+                slot: function.parameters[0]
+            };
+            1024
+        ],
+        terminator: TaskTerminator::Jump { target: previous },
+    });
+    let fallback_start = function.states.len();
+    function.states.push(TaskState {
+        operations: vec![
+            TaskOp::Read {
+                slot: function.parameters[0]
+            };
+            1023
+        ],
+        terminator: TaskTerminator::Jump {
+            target: StateId(oversized_entry),
+        },
+    });
+    previous = StateId(fallback_start);
+    function.entry = previous;
+    let operation_cleanup = StateId(function.states.len());
+    function.states.push(TaskState {
+        operations: (0..function.slots.len())
+            .map(|slot| TaskOp::DropIfInit { slot: SlotId(slot) })
+            .collect(),
+        terminator: TaskTerminator::Terminate,
+    });
+    let operation_loop = function.states.len();
+    function.states.push(TaskState {
+        operations: vec![
+            TaskOp::Read {
+                slot: function.parameters[0]
+            };
+            128
+        ],
+        terminator: TaskTerminator::Suspend {
+            resume: StateId(operation_loop),
+            cleanup: operation_cleanup,
+        },
+    });
+    let mut generated = c::generate_native_task_c_source(&tasks, &Default::default()).unwrap();
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    let host="static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1* host,\n    KuString left, KuString right, KuString* output) {";
+    for (old,new) in [
+        ("typedef struct KuString {",format!("{ALLOCATION_HOOK}\nstatic uint64_t fixture_clock=1000u;\nstatic size_t fixture_hosts,fixture_last_units,fixture_last_operations,fixture_oversized_entries;\nstatic int fixture_expire_boundary,fixture_cancel_on_clock,fixture_expire_after_finish;\nstatic void* fixture_clock_control;\ntypedef struct KuString {{")),
+        (clock,format!("{clock}\n  if(fixture_cancel_on_clock && fixture_clock_control) ku_task_control_atomic_store(&((KuTaskControlV1*)fixture_clock_control)->phase,KU_TASK_CONTROL_REQUESTED_CANCEL);\n  return fixture_clock;\n}}\nstatic uint64_t fixture_original_now(void) {{")),
+        (host,format!("{host}\n  fixture_hosts++;")),
+        ("static int ku_task_driver_compute_reservation_boundary(const KuTaskDriverTicketV1* ticket,\n    KuTaskControlV1* control,size_t states,size_t operations) {", "static int ku_task_driver_compute_reservation_boundary(const KuTaskDriverTicketV1* ticket,\n    KuTaskControlV1* control,size_t states,size_t operations) {\n  if(fixture_expire_boundary) fixture_clock++;".to_string()),
+        ("static uint32_t ku_task_0_resume(void* raw) {", "static uint32_t fixture_real_resume(void* raw);\nstatic uint32_t ku_task_0_resume(void* raw) {\n  uint32_t result=fixture_real_resume(raw);\n  if(ku_task_driver_execution && ku_task_driver_execution->compute.reported) {\n    fixture_last_units=ku_task_driver_execution->compute.states_used;\n    fixture_last_operations=ku_task_driver_execution->compute.operations_used;\n    if(fixture_expire_after_finish && ku_task_driver_execution->compute.reserved && fixture_last_units==1u && fixture_last_operations==1024u) { fixture_clock++; fixture_expire_after_finish=0; }\n  }\n  return result;\n}\nstatic uint32_t fixture_real_resume(void* raw) {".to_string()),
+        ("int main(void) {","static int fixture_original_main(void) {".to_string()),
+    ] {
+        assert_eq!(generated.matches(old).count(),1,"reservation hook {old}");
+        generated=generated.replacen(old,&new,1);
+    }
+    // Count actual entry into the large pure fallback state, rather than a
+    // pre-entry control/poll call. No synthetic callback supplies pure_ready.
+    for label in [
+        format!("ku_task_state_{oversized_entry}:;"),
+        format!("ku_task_range_state_{oversized_entry}:;"),
+    ] {
+        if generated.contains(&label) {
+            assert_eq!(generated.matches(&label).count(), 1);
+            generated = generated.replacen(
+                &label,
+                &format!("{label}\n  fixture_oversized_entries++;"),
+                1,
+            );
+        }
+    }
+    generated.push_str(&format!("\n#define FIXTURE_ORIGINAL_ENTRY {original_entry}u\n#define FIXTURE_PREFIX_BASE {prefix_base}u\n#define FIXTURE_HEAVY_ENTRY {heavy_entry}u\n#define FIXTURE_OPERATION_LOOP {operation_loop}u\n"));
+    generated.push_str(r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"reservation line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_accounting(void) {
+  KuTaskDriverV1 driver={0}; KuTaskControlV1 control={0};
+  KuTaskDriverTicketV1 ticket={&driver,0u,1u};
+  for(size_t credits=1u;credits<=16u;credits++) for(size_t index=0u;index<13u;index++) {
+    const size_t prefixes[]={0u,1u,63u,64u,65u,127u,128u,255u,256u,511u,512u,1023u,1024u};
+    size_t used=prefixes[index]; if(used>credits*64u) continue;
+    ku_task_control_atomic_init(&control.phase,KU_TASK_CONTROL_LIVE);
+    KuTaskDriverExecutionV1 execution={0};
+    execution.driver=&driver; execution.generation=1u; execution.control=&control;
+    execution.reservation_allowed=1u; execution.compute_stop_at_ms=1001u;
+    execution.compute.credit_limit=credits<4u ? credits : 4u;
+    execution.compute.reservation_credit_limit=credits;
+    execution.compute.credits_used=1u; execution.compute.started_ms=1000u;
+    ku_task_driver_execution=&execution; fixture_clock=1000u;
+    ku_task_driver_compute_begin(&ticket,&control,1);
+    CHECK(ku_task_driver_compute_reserve_begin(&ticket,&control)==credits*64u);
+    CHECK(!ku_task_driver_compute_borrow_bank(&ticket,&control));
+    ku_task_driver_compute_report_reservation(&ticket,&control,used,used);
+    CHECK(execution.compute.reported && !execution.compute.invalid && execution.compute.states_used==used
+        && execution.compute.credits_used==(used ? 1u+(used-1u)/64u : 1u));
+    CHECK(ku_task_driver_compute_end(&ticket,&control));
+    CHECK(!execution.compute.active && !execution.compute.open && !execution.compute.clock_fault);
+    ku_task_driver_execution=NULL;
+  }
+  for(int mode=0;mode<6;mode++) {
+    ku_task_control_atomic_store(&control.phase,KU_TASK_CONTROL_LIVE);
+    KuTaskDriverExecutionV1 execution={0};
+    execution.driver=&driver; execution.generation=1u; execution.control=&control;
+    execution.reservation_allowed=1u; execution.compute_stop_at_ms=1001u;
+    execution.compute.credit_limit=4u; execution.compute.credits_used=1u; execution.compute.started_ms=1000u;
+    execution.compute.reservation_credit_limit=4u;
+    ku_task_driver_execution=&execution; fixture_clock=1000u;
+    ku_task_driver_compute_begin(&ticket,&control,1);
+    if(mode==0) fixture_clock=UINT64_MAX;
+    if(mode==1) fixture_clock=999u;
+    if(mode==2) fixture_clock=1001u;
+    if(mode==3) { fixture_clock_control=&control; fixture_cancel_on_clock=1; }
+    size_t capacity=ku_task_driver_compute_reserve_begin(&ticket,&control);
+    fixture_cancel_on_clock=0; fixture_clock_control=NULL;
+    if(mode<4) {
+      CHECK(capacity==SIZE_MAX && !execution.compute.open);
+      CHECK((mode<2)==(execution.compute.clock_fault!=0));
+      CHECK((mode==2)==(execution.compute.time_exhausted!=0));
+      ku_task_driver_compute_report_reservation(&ticket,&control,0u,0u);
+    } else {
+      CHECK(capacity==256u);
+      ku_task_driver_compute_report_reservation(&ticket,&control,65u,100u);
+      if(mode==4) fixture_clock=999u;
+      else ku_task_driver_compute_report_reservation(&ticket,&control,66u,8193u);
+    }
+    int valid=ku_task_driver_compute_end(&ticket,&control);
+    CHECK(mode==5 ? !valid && execution.compute.invalid : valid);
+    if(mode==4) CHECK(execution.compute.clock_fault);
+    ku_task_driver_execution=NULL;
+  }
+  return 0;
+}
+static int fixture_host_tail(size_t prefix,int expire) {
+  fixture_clock=1000u; fixture_hosts=fixture_last_units=fixture_last_operations=0; fixture_expire_boundary=expire;
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+4096u,1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 work={0}; int64_t seed=7;
+  CHECK(ku_task_0_start_value(&driver,&seed,&work)==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)work.owner.lease.control->context;
+  instance->frame.header.state=(uint32_t)(prefix==129u ? FIXTURE_HEAVY_ENTRY : prefix ? FIXTURE_PREFIX_BASE+prefix-1u : FIXTURE_ORIGINAL_ENTRY);
+  KuTaskDriverSliceResultV1 sliced={0};
+  CHECK(ku_task_driver_compute_slice(&driver,0u,prefix==129u ? 1u : 4u,1000u,2000u,NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  if(prefix==129u) {
+    CHECK(!fixture_hosts && fixture_last_units==64u && fixture_last_operations==1087u
+        && sliced.work_credits==1u && sliced.resume_calls==1u && sliced.reason==KU_TASK_SLICE_WORK_CAP);
+  } else if(prefix && (expire || prefix%64u==0u)) {
+    CHECK(!fixture_hosts && sliced.resume_calls==1u);
+    CHECK(sliced.work_credits==(prefix ? 1u+(prefix-1u)/64u : 1u));
+    CHECK(sliced.reason==(expire ? KU_TASK_SLICE_TIME : KU_TASK_SLICE_BOUNDARY));
+  } else CHECK(fixture_hosts==1u);
+  fixture_expire_boundary=0;
+  uint64_t next=UINT64_MAX;
+  for(size_t turn=0;turn<32u && ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(fixture_hosts==1u);
+  KuTaskAdapterOutcomeV1 outcome={0}; CHECK(ku_task_value_take(&work,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.value.integer.ok && outcome.value.integer.value==9); ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_value_drop(&work,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,2000u)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+static int fixture_fallback_expiry(void) {
+  fixture_clock=1000u; fixture_hosts=fixture_oversized_entries=0;
+  fixture_expire_boundary=0; fixture_expire_after_finish=1;
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+4096u,1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 work={0}; int64_t seed=7;
+  CHECK(ku_task_0_start_value(&driver,&seed,&work)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSliceResultV1 sliced={0};
+  CHECK(ku_task_driver_compute_slice(&driver,0u,4u,1000u,2000u,NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  if(fixture_oversized_entries || (sliced.reason!=KU_TASK_SLICE_TIME && sliced.reason!=KU_TASK_SLICE_BOUNDARY))
+    fprintf(stderr,"fallback expiry clock=%llu large_entries=%zu calls=%zu credits=%zu reason=%u\n",
+        (unsigned long long)fixture_clock,fixture_oversized_entries,sliced.resume_calls,sliced.work_credits,sliced.reason);
+  CHECK(fixture_clock==1001u && !fixture_expire_after_finish);
+  CHECK(!fixture_oversized_entries && !fixture_hosts
+      && (sliced.reason==KU_TASK_SLICE_TIME || sliced.reason==KU_TASK_SLICE_BOUNDARY));
+  CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING);
+  /* The HTTP caller now gets its I/O opportunity. A later exact owner turn
+   * may execute the fallback state exactly once, without replaying the prefix. */
+  uint64_t next=UINT64_MAX;
+  for(size_t turn=0;turn<32u && ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(fixture_oversized_entries==1u && fixture_hosts==1u);
+  KuTaskAdapterOutcomeV1 outcome={0}; CHECK(ku_task_value_take(&work,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  CHECK(outcome.value.integer.ok && outcome.value.integer.value==9); ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_value_drop(&work,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,2000u)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+static int fixture_operation_capacity(void) {
+  fixture_clock=1000u; fixture_hosts=fixture_last_units=fixture_last_operations=0;
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+4096u,1u,2000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 work={0}; int64_t seed=7;
+  CHECK(ku_task_0_start_value(&driver,&seed,&work)==KU_TASK_DRIVER_OK);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)work.owner.lease.control->context;
+  instance->frame.header.state=FIXTURE_OPERATION_LOOP;
+  KuTaskDriverSliceResultV1 sliced={0};
+  CHECK(ku_task_driver_compute_slice(&driver,0u,16u,1000u,2000u,NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
+  /*129 operations per actual state:63 states use8127, the64th would exceed
+   *8192 and must not be entered/charged. Fractional callback tails settle
+   *independently instead of consuming reserved16 credits prospectively. */
+  CHECK(fixture_last_units==63u && fixture_last_operations==8127u && !fixture_hosts
+      && sliced.work_credits==16u && sliced.resume_calls==16u && sliced.reason==KU_TASK_SLICE_WORK_CAP);
+  CHECK(ku_task_value_drop(&work,2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,2000u)==KU_TASK_DRIVER_OK);
+  uint64_t next=UINT64_MAX;
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,2000u)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  CHECK(!fixture_accounting());
+  const size_t prefixes[]={0u,1u,63u,64u,65u,127u,128u};
+  for(size_t i=0;i<sizeof(prefixes)/sizeof(prefixes[0]);i++) CHECK(!fixture_host_tail(prefixes[i],0));
+  CHECK(!fixture_host_tail(129u,0));
+  CHECK(!fixture_host_tail(63u,1));
+  CHECK(!fixture_fallback_expiry());
+  CHECK(!fixture_operation_capacity());
+  puts("task-reservation-prefix-clock-host-tail-ok"); return 0;
+}
+"#);
+    let directory = TempDir::new("task-driver-reservation");
+    let path = directory.path().join("reservation.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "reservation") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires reservation C regression"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-reservation-prefix-clock-host-tail-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
     let ast = Parser::new(
         Lexer::new("import time from \"std.time\"\nasync fn Work(): int! { index=0; while(index<500000) { index=index+1 } return ok(index) } async fn Wait(): int! { time.sleep(100)? return ok(9) } async fn Marker(): int! { return ok(17) } async fn main(): null! { return ok(null) }")
@@ -193,7 +491,7 @@ int main(void) {
   CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
       NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(sliced.reason==KU_TASK_SLICE_COMPLETE && sliced.segments==2u
-      && sliced.work_credits==33u && sliced.resume_calls==9u);
+      && sliced.work_credits==33u && sliced.resume_calls==3u);
   CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_PENDING);
   KuTaskAdapterOutcomeV1 mark={0}; CHECK(ku_task_value_take(&marker,NULL,&mark)==KU_TASK_CONTROL_OK);
   CHECK(mark.value.integer.ok && mark.value.integer.value==17); ku_task_outcome_drop(&mark);
@@ -206,16 +504,16 @@ int main(void) {
   CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
       NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(sliced.reason==KU_TASK_SLICE_WORK_CAP && sliced.work_credits==4096u
-      && sliced.resume_calls==1024u && sliced.segments==128u);
+      && sliced.resume_calls==256u && sliced.segments==128u);
   CHECK(fixture_credits==4096u && fixture_states==262144u && !fixture_unreported);
-  CHECK(fixture_claims==128u && driver.polls-before_slice_polls==1024u && driver.queued==1u);
+  CHECK(fixture_claims==128u && driver.polls-before_slice_polls==256u && driver.queued==1u);
   /* A tick inside selection two must stop the entire API. It cannot start
    * another Task/segment with a newly minted 1ms origin. */
-  fixture_resumes=0; fixture_tick_at=9u;
+  fixture_resumes=0; fixture_tick_at=3u;
   CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
       NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(sliced.reason==KU_TASK_SLICE_TIME && sliced.segments==2u
-      && sliced.work_credits==33u && sliced.resume_calls==9u);
+      && sliced.work_credits==33u && sliced.resume_calls==3u);
   fixture_tick_at=0;
   /* Publication at a real resume boundary must stop the private segment and
    * enter the existing cancellation cleanup arbitration with the original D. */
@@ -224,12 +522,12 @@ int main(void) {
   CHECK(ku_task_control_lease_retain(&work.owner.lease,&cancel.lease)==KU_TASK_CONTROL_OK);
   KuTestThread thread; CHECK(ku_test_thread_start(&thread,fixture_cancel_worker,&cancel));
   uint64_t before_cancel_polls=driver.polls;
-  fixture_claims=fixture_resumes=0; fixture_cancel_at=3u;
+  fixture_claims=fixture_resumes=0; fixture_cancel_at=2u;
   CHECK(ku_task_driver_compute_slice(&driver,0u,4096u,fixture_clock,2000u,
       NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_thread_join(&thread,2000u) && thread.outcome==0 && cancel.result==KU_TASK_CONTROL_OK);
-  CHECK(sliced.reason==KU_TASK_SLICE_CANCEL && sliced.resume_calls==3u);
-  CHECK(fixture_resumes==3u && fixture_claims>=1u && fixture_claims<=2u);
+  CHECK(sliced.reason==KU_TASK_SLICE_CANCEL && sliced.resume_calls==2u);
+  CHECK(fixture_resumes==2u && fixture_claims>=1u && fixture_claims<=2u);
   /* A concurrent wrapper may leave its one notification for a terminal
    * observation. Count that zero-resume poll exactly instead of discarding it. */
   CHECK(driver.polls==before_cancel_polls+fixture_resumes+fixture_claims-1u);
@@ -263,7 +561,7 @@ int main(void) {
       NULL,NULL,&sliced)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_thread_join(&thread,2000u) && !thread.outcome && raced_cancel.result==KU_TASK_CONTROL_OK);
   CHECK(sliced.reason==KU_TASK_SLICE_CANCEL && sliced.segments==1u
-      && sliced.work_credits==32u && sliced.resume_calls==8u);
+      && sliced.work_credits==32u && sliced.resume_calls==2u);
   CHECK(ku_task_control_status(&race_marker.owner.lease)==KU_TASK_CONTROL_PENDING);
   CHECK(ku_task_control_lease_release(&raced_cancel.lease)==KU_TASK_CONTROL_OK);
   CHECK(ku_test_event_destroy(&fixture_cancel_entered) && ku_test_event_destroy(&fixture_cancel_release));
@@ -2386,7 +2684,8 @@ fn native_task_driver_hot_yield_services_marker_before_cancellation() {
     let clock_entry = "static uint64_t ku_task_driver_now_ms(void) {";
     let lock_entry = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
     let unlock_entry = "static int ku_task_driver_unlock(KuTaskDriverV1* driver) {";
-    let poll = "outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);";
+    let poll =
+        "outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);";
     let published = "driver->building--;\n    slot->state = KU_TASK_DRIVER_PARKED;\n    if (source && !driver->closing) {\n      ku_task_driver_enqueue_local(driver, ticket->slot, parent->executor_worker);\n    } else ku_task_driver_enqueue(driver, ticket->slot);";
     for unique in [
         "typedef struct KuString {",

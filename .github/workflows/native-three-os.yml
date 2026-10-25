@@ -207,6 +207,24 @@ jobs:
           cargo test --release --locked --lib backend::c::task_range::tests:: \
             -- --nocapture --test-threads=1
 
+      - name: Verify bounded scalar regions, loop chunks and Copy initialization proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for task_filter in \
+            backend::c::task::scalar_region::tests::regions_ \
+            backend::c::task::scalar_region::tests::loops_ \
+            backend::c::task::scalar_spill_tests::loop_copy_transfer_
+          do
+            task_test_list="$RUNNER_TEMP/ku-${task_filter##*::}.list"
+            cargo test --release --locked --lib "$task_filter" \
+              -- --list > "$task_test_list"
+            cat "$task_test_list"
+            test "$(grep -c "^${task_filter}.*: test$" "$task_test_list")" -gt 0
+            cargo test --release --locked --lib "$task_filter" \
+              -- --nocapture --test-threads=1
+          done
+
       - name: Run affected native HTTP and Task regressions serially
         shell: bash
         run: |
