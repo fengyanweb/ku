@@ -229,6 +229,15 @@ static void ku_http_task_handle_release(KuHttpTaskRuntime* runtime,KuHttpTaskHan
    * Frame cancellation may already have dropped its local capture token. */
   if(environment) ((KuEnvHeader*)environment)->release(environment);
 }
+/* The factory cannot return an owner for partial resources. Match the
+ * native HTTP group's existing irrecoverable-cleanup policy; never orphan
+ * live worker/storage and report an ordinary reusable allocation failure. */
+static void ku_http_task_init_cleanup_failed(const char* reason) {
+  /* Keep fatal termination independent of a full stderr pipe or stdio lock.
+   * Exit80 is the existing externally observable native teardown failure. */
+  (void)reason;
+  _Exit(80);
+}
 static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_limit,
     void* event_context,void(*event_wake)(void*,size_t),uint64_t startup_deadline) {
   if(!capacity || capacity>KU_TASK_DRIVER_MAX_SLOTS) return NULL;
@@ -236,7 +245,9 @@ static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_l
   if(task_capacity<1024u)task_capacity=1024u;
   /* Exclusive setup: reject known fixed storage before any backing allocation.
      attach_blocking and each reactor still take their actual budget receipts. */
-  size_t startup_fixed=sizeof(KuHttpTaskRuntime)+task_capacity*(sizeof(KuTaskDriverSlotV1)+sizeof(size_t))
+  size_t driver_fixed=ku_task_driver_fixed_storage_bytes(task_capacity);
+  if(!driver_fixed)return NULL;
+  size_t startup_fixed=driver_fixed+sizeof(KuHttpTaskRuntime)-sizeof(KuTaskDriverV1)
       +capacity*sizeof(KuHttpTaskHandle)@BLOCKING_PREFLIGHT@;
   if(startup_fixed>byte_limit)return NULL;
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)calloc(1,sizeof(*runtime));
@@ -275,8 +286,15 @@ ku_http_task_init_failed:
       runtime->fixed_reserved=0;
     }
     (void)ku_task_driver_join(&runtime->driver,startup_deadline);
-    if(ku_task_driver_destroy(&runtime->driver)!=KU_TASK_DRIVER_OK) return NULL; /* Quarantine. */
-  } else if(runtime->driver.initialized!=KU_TASK_DRIVER_STORAGE_ZERO) return NULL;
+    if(ku_task_driver_destroy(&runtime->driver)!=KU_TASK_DRIVER_OK)
+      ku_http_task_init_cleanup_failed("driver resources remain");
+  } else if(runtime->driver.initialized==KU_TASK_DRIVER_STORAGE_REAPING) {
+    /* Init stopped before any worker/Task was published. Destroy records and
+     * retries each actual native resource before the enclosing storage is freed. */
+    if(ku_task_driver_destroy(&runtime->driver)!=KU_TASK_DRIVER_OK)
+      ku_http_task_init_cleanup_failed("driver resources remain");
+  } else if(runtime->driver.initialized!=KU_TASK_DRIVER_STORAGE_ZERO)
+    ku_http_task_init_cleanup_failed("unexpected driver state");
   free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return NULL;
 }
 /* Token-authenticated management reads this bounded snapshot without the
@@ -471,7 +489,8 @@ const BLOCKING_INIT: &str = r#"
   if(!runtime->blocking) goto ku_http_task_init_failed;
   status=ku_task_blocking_init(runtime->blocking,runtime->driver.capacity,1u,startup_deadline);
   if(status==KU_TASK_DRIVER_OK) {
-    if(ku_task_blocking_lock(runtime->blocking)) return NULL;
+    if(ku_task_blocking_lock(runtime->blocking))
+      ku_http_task_init_cleanup_failed("blocking pool lock failed");
     runtime->blocking->retirement_context=runtime;
     runtime->blocking->retirement_notify=ku_http_task_blocking_retired;
     ku_task_blocking_unlock(runtime->blocking);
@@ -481,7 +500,8 @@ const BLOCKING_INIT: &str = r#"
       runtime->blocking->storage,runtime->blocking->storage_bytes);
   if(status!=KU_TASK_DRIVER_OK) {
     (void)ku_task_blocking_finish(runtime->blocking,startup_deadline);
-    if(runtime->blocking->initialized!=KU_TASK_DRIVER_STORAGE_ZERO) return NULL;
+    if(runtime->blocking->initialized!=KU_TASK_DRIVER_STORAGE_ZERO)
+      ku_http_task_init_cleanup_failed("blocking resources remain at original deadline");
     free(runtime->blocking); runtime->blocking=NULL;
     goto ku_http_task_init_failed;
   }

@@ -244,6 +244,19 @@ jobs:
             --test native_task_await_progress_test \
             --test native_task_runtime_deadline_test \
             --test native_task_publishing_deadline_test \
+            --test native_task_exit_bridge_test \
+            --test native_task_expression_pending_test \
+            --test native_task_expression_safety_test \
+            --test native_task_join_retry_test \
+            --test native_task_receipt_test \
+            --test native_task_scope_session_test \
+            --test native_task_short_circuit_owner_test \
+            --test native_task_source_safety_test \
+            --test native_task_start_alias_test \
+            --test native_task_start_charge_test \
+            --test native_task_start_failure_test \
+            --test native_task_start_parameters_test \
+            --test native_task_wait_test \
             -- --nocapture --test-threads=1
 
       - name: Check scalar growth, retained banks, async I/O and reset cleanup with Linux detectors
@@ -270,6 +283,15 @@ jobs:
             -- --exact --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test \
             native_http_reset_retires_async_work_but_write_half_close_keeps_response \
+            -- --exact --nocapture --test-threads=1
+
+          cargo test --release --locked --test native_task_driver_test \
+            -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
+            native_http_task_runtime_partial_init_reclaims_binding_and_native_resources \
+            -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
+            native_http_task_runtime_blocking_init_timeout_preserves_cleanup_owner \
             -- --exact --nocapture --test-threads=1
 
       - name: Install the pinned comparison driver toolchain

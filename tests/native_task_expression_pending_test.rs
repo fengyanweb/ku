@@ -375,7 +375,7 @@ int main(void) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(2,sizeof(*slots));
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
   size_t output_bytes=FIXTURE_CONCAT&&!FIXTURE_FAILURE ? 6u : 0u;
   uint64_t startup_now=ku_task_driver_now_ms();
@@ -406,7 +406,7 @@ int main(void) {
   CHECK(ku_task_control_lease_retain(&child_slot->driver_lease,&observer)==KU_TASK_CONTROL_OK);
   CHECK(!ku_task_driver_unlock(driver));
   fixture_wait(parent,&wait,&child);
-  FixtureLedger before=fixture_ledger(); CHECK(before.allocations==5u && before.bytes==fixed+instances);
+  FixtureLedger before=fixture_ledger(); CHECK(before.allocations==6u && before.bytes==fixed+instances);
   uint64_t polls=parked.polls;
   /* Exactly three independent notifications, each followed by the real
    * worker's condition-wait acknowledgement; no sleep or busy polling. */
@@ -600,7 +600,7 @@ async fn main(): null! { return ok(null) }
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 5u",
         "#define KU_TASK_CONTROL_ABI_VERSION 2u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 11u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 12u",
     ] {
         assert!(generated.contains(required));
     }
@@ -887,7 +887,7 @@ static void if_case(unsigned mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(3u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
@@ -1043,7 +1043,7 @@ static void if_case(unsigned mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==11u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
   ku_task_control_atomic_init(&if_release_ready,0); ku_task_control_atomic_init(&if_release_child,0);
   ku_task_control_atomic_init(&if_release_parent,0);
   if_case(IF_FALSE); if_case(IF_NORMAL); if_case(IF_CANCEL);

@@ -337,7 +337,7 @@ static uint32_t ku_task_1_try_start_impl(KuTaskDriverV1* driver,
     CHECK(!driver->building && driver->resident==1u && driver->reserved_bytes==parent->charged_bytes);
     fixture_sum_locked(driver); CHECK(!ku_task_driver_unlock(driver));
     FixtureLedger ledger=fixture_ledger();
-    CHECK(ledger.allocations==4u+fixture_input_buffers && ledger.bytes==fixture_fixed+sizeof(KuTaskInstance_0)+31u);
+    CHECK(ledger.allocations==5u+fixture_input_buffers && ledger.bytes==fixture_fixed+sizeof(KuTaskInstance_0)+31u);
     fixture_barrier(FIXTURE_AFTER_ROLLBACK);
   } else CHECK(fixture_empty_result(*input) && output->owner.lease.control);
   return status;
@@ -406,7 +406,7 @@ static void fixture_begin(FixtureRuntime* runtime,unsigned fault,unsigned pause)
   runtime->slots=(KuTaskDriverSlotV1*)calloc(4,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(4,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  fixture_fixed=sizeof(*runtime->driver)+4u*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
+  fixture_fixed=ku_task_driver_fixed_storage_bytes(4u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -534,7 +534,7 @@ static void fixture_fatal_idle(FixtureRuntime* runtime,const KuTaskValueV1* root
   CHECK(fixture_factory_calls==1u && fixture_reserves==1u && !fixture_child_resumes);
   CHECK(fixture_argument); fixture_same_result(*fixture_argument,original);
   FixtureLedger ledger=fixture_ledger();
-  CHECK(ledger.allocations==4u+fixture_input_buffers);
+  CHECK(ledger.allocations==5u+fixture_input_buffers);
   CHECK(ledger.bytes==fixture_fixed+sizeof(KuTaskInstance_0)+31u && !ledger.overflow);
 }
 static void fixture_fatal_root_cleanup_case(unsigned fault,int error) {
@@ -632,7 +632,7 @@ static void fixture_cancel_case(unsigned point,unsigned action,int error) {
   CHECK(fixture_cleanup_reason==KU_TASK_CONTROL_CANCELLED && fixture_cleanup_deadline==deadline);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==11u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==12u);
   ku_task_control_atomic_init(&fixture_bad_clock,0);
   for (int error=0;error<2;error++) {
     for (unsigned fault=FIXTURE_CONTROL_ABI;fault<=FIXTURE_SECOND_RETAIN;fault++) fixture_fault_case(fault,error);

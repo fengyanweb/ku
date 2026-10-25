@@ -194,7 +194,7 @@ const DRIVER_ABI: &str = r#"
  * and keep healthy workers for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 11u
+#define KU_TASK_DRIVER_ABI_VERSION 12u
 #define KU_TASK_DRIVER_GLOBAL_BURST ((size_t)8u)
 #define KU_TASK_DRIVER_MAX_SLOTS ((size_t)16384u)
 #define KU_TASK_DRIVER_MAX_WORKERS ((size_t)32u)
@@ -389,6 +389,10 @@ struct KuTaskDriverV1 {
   uint32_t (*blocking_ready)(void*);
   KuTaskDriverSlotV1* slots;
   size_t* ring;
+  /* Driver-owned pointer identities, never leases. One compact allocation at
+   * init; only the publication mutex changes cells/count. No tombstones. */
+  KuTaskControlV1** binding_keys;
+  size_t binding_cells, binding_count;
   KuTaskDriverMutexV1 mutex;
   KuTaskDriverConditionV1 condition, work_condition;
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -396,6 +400,14 @@ struct KuTaskDriverV1 {
 #endif
   KuTaskDriverWorkerV1 workers[KU_TASK_DRIVER_MAX_WORKERS];
 };
+/* Includes every fixed index cell, independently from sparse resident Tasks.
+ * Callers use this same checked total for preflight and exact byte budgets. */
+static size_t ku_task_driver_fixed_storage_bytes(size_t capacity) {
+  const size_t per_slot=sizeof(KuTaskDriverSlotV1)+sizeof(size_t)+2u*sizeof(KuTaskControlV1*);
+  if (!capacity || capacity>KU_TASK_DRIVER_MAX_SLOTS
+      || capacity>(SIZE_MAX-sizeof(KuTaskDriverV1))/per_slot) return 0;
+  return sizeof(KuTaskDriverV1)+capacity*per_slot;
+}
 /* Only the trusted HTTP factory uses this scoped, thread-local entry hint.
  * Existing hosted children inherit their parent's immutable owner instead. */
 static KU_THREAD_LOCAL size_t ku_task_driver_entry_owner;
@@ -656,6 +668,55 @@ static uint32_t ku_task_driver_check_ticket(const KuTaskDriverTicketV1* ticket) 
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
   return ku_task_driver_check(ticket->driver);
 }
+/* Exact2*capacity cells keep load<=1/2. Expected short lookup is not a
+ * worst-case constant-time claim: every collision walk is bounded by cells.
+ * Hashing/comparing identities never dereferences a stored control. */
+static size_t ku_task_driver_binding_home(KuTaskControlV1* control,size_t cells) {
+  uintptr_t key=(uintptr_t)control;
+#if UINTPTR_MAX>UINT32_MAX
+  key^=key>>30; key*=UINT64_C(0xbf58476d1ce4e5b9);
+  key^=key>>27; key*=UINT64_C(0x94d049bb133111eb); key^=key>>31;
+#else
+  key^=key>>16; key*=UINT32_C(0x7feb352d);
+  key^=key>>15; key*=UINT32_C(0x846ca68b); key^=key>>16;
+#endif
+  return (size_t)(key%cells);
+}
+/* Requires mutex. Returns1 for duplicate,0 with an empty insertion cell,-1
+ * for malformed storage. A failed/retryable commit does not change the set. */
+static int ku_task_driver_binding_find(KuTaskDriverV1* driver,KuTaskControlV1* control,
+    size_t* position) {
+  if (!control || !driver->capacity || driver->capacity>KU_TASK_DRIVER_MAX_SLOTS
+      || !driver->binding_keys || driver->binding_cells!=2u*driver->capacity
+      || driver->binding_count>driver->capacity) return -1;
+  size_t cell=ku_task_driver_binding_home(control,driver->binding_cells);
+  for(size_t probes=0;probes<driver->binding_cells;probes++) {
+    KuTaskControlV1* key=driver->binding_keys[cell];
+    if (!key) { *position=cell; return 0; }
+    if (key==control) { *position=cell; return 1; }
+    cell=cell+1u==driver->binding_cells ? 0u:cell+1u;
+  }
+  return -1;
+}
+/* Requires mutex and the still-live registry lease. Backshift deletion keeps
+ * probe chains searchable without accumulating tombstones across slot reuse.
+ * Deletion must finish before binding retirement can release/free control. */
+static int ku_task_driver_binding_remove(KuTaskDriverV1* driver,KuTaskControlV1* control) {
+  size_t hole=0;
+  if (!driver->binding_count || ku_task_driver_binding_find(driver,control,&hole)!=1) return 0;
+  size_t cells=driver->binding_cells;
+  size_t scan=hole+1u==cells ? 0u:hole+1u;
+  for(size_t probes=0;probes<cells;probes++) {
+    KuTaskControlV1* key=driver->binding_keys[scan];
+    if (!key) { driver->binding_keys[hole]=NULL; driver->binding_count--; return 1; }
+    size_t home=ku_task_driver_binding_home(key,cells);
+    size_t to_hole=hole>=home ? hole-home:cells-home+hole;
+    size_t to_scan=scan>=home ? scan-home:cells-home+scan;
+    if (to_hole<to_scan) { driver->binding_keys[hole]=key; hole=scan; }
+    scan=scan+1u==cells ? 0u:scan+1u;
+  }
+  return 0; /* Corrupt/full set: caller quarantines, never releases a binding. */
+}
 static int ku_task_driver_external_storage(
     KuTaskDriverV1* driver, const void* pointer, size_t size, size_t alignment) {
   return ku_task_frame_storage_valid(pointer, size, size, alignment)
@@ -664,6 +725,8 @@ static int ku_task_driver_external_storage(
                                        driver->capacity * sizeof(*driver->slots))
       && !ku_task_frame_ranges_overlap(pointer, size, driver->ring,
                                        driver->capacity * sizeof(*driver->ring))
+      && (!driver->binding_keys || !ku_task_frame_ranges_overlap(pointer,size,
+          driver->binding_keys,driver->binding_cells*sizeof(*driver->binding_keys)))
       && (!driver->blocking_pool || !ku_task_frame_ranges_overlap(pointer,size,
           driver->blocking_pool,driver->blocking_pool_bytes))
       && (!driver->blocking_storage || !ku_task_frame_ranges_overlap(pointer,size,
@@ -2720,10 +2783,12 @@ static uint32_t ku_task_driver_commit_impl(
           || !slot->charged_bytes || slot->charged_bytes > driver->reserved_bytes)) {
     driver->fault = KU_TASK_DRIVER_INTERNAL; result = KU_TASK_DRIVER_INTERNAL;
   }
+  size_t binding_cell=0;
   if (result == KU_TASK_DRIVER_OK) {
-    for (size_t i = 0; i < driver->capacity; i++) {
-      if (driver->slots[i].binding == registry.control) { result = KU_TASK_DRIVER_INVALID_STATE; break; }
-    }
+    int found=ku_task_driver_binding_find(driver,registry.control,&binding_cell);
+    if (found<0 || (!found && driver->binding_count>=driver->capacity)) {
+      driver->fault=KU_TASK_DRIVER_INTERNAL; result=KU_TASK_DRIVER_INTERNAL;
+    } else if (found) result=KU_TASK_DRIVER_INVALID_STATE;
   }
   if (result == KU_TASK_DRIVER_OK && source) {
     if (source->parent.driver != driver || source->parent.slot == ticket->slot)
@@ -2752,6 +2817,10 @@ static uint32_t ku_task_driver_commit_impl(
     slot->driver_lease = registry; registry.control = NULL;
     slot->execution_lease = execution; execution.control = NULL;
     slot->binding = slot->driver_lease.control;
+    /* No callbacks or other publication can change the located empty cell
+     * while this mutex is held. Every fallible validation/owner move preceded
+     * publication; duplicate/failure paths never insert or consume an owner. */
+    driver->binding_keys[binding_cell]=slot->binding; driver->binding_count++;
     if (mode == KU_TASK_DRIVER_ABORT) {
       slot->owner_location = KU_TASK_DRIVER_OWNER_DEFERRED;
       slot->cancel_pending = 1; slot->cancel_deadline = deadline;
@@ -3105,6 +3174,11 @@ static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_
        * A faulted child's enqueue is disabled; this wakes its parent instead. */
       ku_task_driver_wait_publish_locked(driver, index);
       if (ack != KU_TASK_DRIVER_CLEANUP_ACK) retire = 0;
+      else if (!ku_task_driver_binding_remove(driver,slot->binding)) {
+        slot->cleanup_fault=KU_TASK_DRIVER_INTERNAL; driver->fault=KU_TASK_DRIVER_INTERNAL;
+        ku_task_driver_wait_publish_locked(driver,index);
+        retire=0; /* Keep all registry/executor references and charged storage. */
+      }
     }
     if (retire) {
       registry = slot->driver_lease; slot->driver_lease.control = NULL;
@@ -3232,10 +3306,9 @@ static uint32_t ku_task_driver_init_impl(
     return KU_TASK_DRIVER_LIMIT;
   if (startup_deadline == UINT64_MAX) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   if (external && !event_wake) return KU_TASK_DRIVER_INVALID_ARGUMENT;
-  if (capacity > (SIZE_MAX - sizeof(*driver)) / (sizeof(*slots) + sizeof(*ring)))
-    return KU_TASK_DRIVER_LIMIT;
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
+  if (!fixed) return KU_TASK_DRIVER_LIMIT;
   size_t slot_bytes = capacity * sizeof(*slots), ring_bytes = capacity * sizeof(*ring);
-  size_t fixed = sizeof(*driver) + slot_bytes + ring_bytes;
   if (byte_limit < fixed) return KU_TASK_DRIVER_LIMIT;
   if (!ku_task_frame_storage_valid(driver, bytes, sizeof(*driver), KU_TASK_FRAME_ALIGNOF(KuTaskDriverV1))
       || !ku_task_frame_storage_valid(slots, slot_bytes, slot_bytes, KU_TASK_FRAME_ALIGNOF(KuTaskDriverSlotV1))
@@ -3248,6 +3321,11 @@ static uint32_t ku_task_driver_init_impl(
   uint64_t now = ku_task_driver_now_ms();
   if (now == UINT64_MAX) return KU_TASK_DRIVER_INTERNAL;
   if (now >= startup_deadline) return KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;
+  /* Allocation failure leaves the caller's all-zero storage retryable and
+   * acquires no OS resources. Once recorded below, REAPING/destroy owns it. */
+  size_t binding_cells=2u*capacity;
+  KuTaskControlV1** binding_keys=(KuTaskControlV1**)calloc(binding_cells,sizeof(*binding_keys));
+  if (!binding_keys) return KU_TASK_DRIVER_INTERNAL;
 
   /* Record each native resource before the next fallible acquisition. REAPING
    * blocks ordinary APIs if a later initializer fails. No worker exists yet. */
@@ -3255,6 +3333,7 @@ static uint32_t ku_task_driver_init_impl(
   driver->initialized = KU_TASK_DRIVER_STORAGE_REAPING;
   driver->storage_size = sizeof(*driver); driver->capacity = capacity;
   driver->slots = slots; driver->ring = ring; driver->fixed_bytes = fixed;
+  driver->binding_keys=binding_keys; driver->binding_cells=binding_cells;
   driver->byte_limit = byte_limit; driver->worker_target = worker_count;
   driver->external_loops=external!=0; driver->fixed_owner=external!=0;
   driver->event_context=event_context; driver->event_wake=event_wake;
@@ -3762,6 +3841,10 @@ static uint32_t ku_task_driver_destroy(KuTaskDriverV1* driver) {
   if (driver->workers_joined != driver->workers_created) return KU_TASK_DRIVER_PENDING;
   for (size_t index = 0; index < driver->workers_created; index++)
     if (!driver->workers[index].closed) return KU_TASK_DRIVER_PENDING;
+  if (!driver->binding_keys || driver->binding_cells!=2u*driver->capacity
+      || driver->binding_count) return KU_TASK_DRIVER_INTERNAL;
+  for(size_t cell=0;cell<driver->binding_cells;cell++)
+    if(driver->binding_keys[cell]) return KU_TASK_DRIVER_INTERNAL;
   /* All OS threads are reaped, and the caller excludes all other APIs. Keep
    * each successful destructor recorded so a retry never uses a dead primitive. */
   driver->initialized = KU_TASK_DRIVER_STORAGE_REAPING;
@@ -3794,6 +3877,8 @@ static uint32_t ku_task_driver_destroy(KuTaskDriverV1* driver) {
     driver->sync_resources &= ~KU_TASK_DRIVER_SYNC_MUTEX;
   }
 #endif
+  free(driver->binding_keys); driver->binding_keys=NULL;
+  driver->binding_cells=0; driver->binding_count=0;
   driver->initialized = KU_TASK_DRIVER_STORAGE_ZERO;
   return KU_TASK_DRIVER_OK;
 }

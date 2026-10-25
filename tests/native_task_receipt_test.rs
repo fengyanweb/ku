@@ -345,7 +345,7 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->slots = (KuTaskDriverSlotV1*)calloc(capacity, sizeof(*runtime->slots));
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
+  size_t fixed = ku_task_driver_fixed_storage_bytes(capacity);
   uint64_t startup_now = ku_task_driver_now_ms();
   CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
   uint64_t startup_deadline = startup_now + 1000u;
@@ -793,7 +793,7 @@ static void fixture_corrupt_ack_process(void) {
   CHECK(!ku_task_driver_unlock(runtime->driver));
   CHECK(fixture_count(&roles[0].frame_drops) == 1u && fixture_count(&roles[0].payload_drops) == 1u);
   CHECK(!fixture_count(&roles[0].acks) && !fixture_count(&roles[0].disposes));
-  CHECK(fixture_ledger().bytes == before.bytes - 7u && fixture_ledger().allocations == 4u);
+  CHECK(fixture_ledger().bytes == before.bytes - 7u && fixture_ledger().allocations == 5u);
   for (size_t i = 0; i < 8; ++i) {
     CHECK(ku_task_driver_wake(&roles[0].ticket) == KU_TASK_DRIVER_INTERNAL);
     CHECK(ku_task_driver_cleanup_receipt_read(&roles[0].receipt) == KU_TASK_DRIVER_INTERNAL);
@@ -803,14 +803,14 @@ static void fixture_corrupt_ack_process(void) {
   CHECK(ku_task_driver_shutdown(runtime->driver, 0) == KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
   CHECK(ku_task_driver_destroy(runtime->driver) == KU_TASK_DRIVER_PENDING);
   CHECK(fixture_snapshot(runtime, KU_TASK_DRIVER_INTERNAL).reserved_bytes == charge);
-  CHECK(fixture_ledger().allocations == 4u && fixture_ledger().bytes != 0u);
+  CHECK(fixture_ledger().allocations == 5u && fixture_ledger().bytes != 0u);
   /* Do not clear fault/refs, manually free the task, disable LSan, or use
    * _Exit. The explicit live root remains until normal process termination;
    * OS reclamation is intentionally not counted as native cleanup success. */
   puts("task-receipt-corruption-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 11u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 12u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 5u);
   ku_task_control_atomic_init(&fixture_bad_clock, 0);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }

@@ -201,7 +201,7 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 5u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 11u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 12u",
         "KU_TASK_FRAME_SCOPE_REQUEST = 12u",
     ] {
         assert!(generated.contains(required));
@@ -621,7 +621,7 @@ static void fixture_case(unsigned mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(5,sizeof(*slots));
   size_t* ring=(size_t*)calloc(5,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+5u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(5u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -880,7 +880,7 @@ static void fixture_case(unsigned mode) {
   for (size_t i=0;i<FIXTURE_PUBLICATION_EVENTS;i++) CHECK(ku_test_event_destroy(&fixture_publication_events[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==11u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==12u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_release_children,0);
   ku_task_control_atomic_init(&fixture_release_continuations,0);
@@ -1054,7 +1054,7 @@ fn native_task_scope_adapter_same_scope_two_rounds_and_second_round_cancel_in_c(
     }
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
     assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 5u"));
-    assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 11u"));
+    assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 12u"));
     for forbidden in ["run_source", "const SOURCE"] {
         assert!(!generated.contains(forbidden));
     }
@@ -1367,7 +1367,7 @@ static void loop_case(unsigned mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(3u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -1496,7 +1496,7 @@ static void loop_case(unsigned mode) {
   for (size_t i=0;i<2u;i++) CHECK(ku_test_event_destroy(&loop_closed_event[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==11u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==12u && KU_TASK_CONTROL_ABI_VERSION==2u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&loop_release,0); ku_task_control_atomic_init(&loop_allow,0);
   loop_case(0u); loop_case(1u); puts("task-scope-loop-ok"); return 0;
@@ -1723,7 +1723,7 @@ static void exit_case(unsigned mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(3u);
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,3,ring,3,
       fixed+sizeof(KuTaskInstance_0)+2u*sizeof(KuTaskInstance_1)+64u,1u,exit_deadline)==KU_TASK_DRIVER_OK);
   KuResult_null returned={0}; returned.ok=true;

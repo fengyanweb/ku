@@ -150,7 +150,7 @@ fn native_task_scalar_outlined_private_loop_preserves_zero_iteration_outputs_and
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 static int fixture_case(int64_t limit,int private_mode,int variant) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   size_t task_bytes=sizeof(KuTaskInstance_0);
   if(task_bytes<sizeof(KuTaskInstance_1)) task_bytes=sizeof(KuTaskInstance_1);
   if(task_bytes<sizeof(KuTaskInstance_2)) task_bytes=sizeof(KuTaskInstance_2);
@@ -257,7 +257,7 @@ static void owner_wake(void* context,size_t owner) { (void)context; if(owner<2u)
 int main(void) {
   KuTaskDriverV1 driver={0};
   KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   uint64_t deadline=ku_task_driver_now_ms()+1000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,4u,ring,4u,fixed+4u*sizeof(KuTaskInstance_0),2u,deadline,NULL,owner_wake)==KU_TASK_DRIVER_OK);
@@ -589,7 +589,7 @@ int main(void) {
   for(size_t i=0;i<2u;i++)
     CHECK(ku_test_event_init(&fixture_probes[i].entered) && ku_test_event_init(&fixture_probes[i].ran)
       && ku_test_event_init(&fixture_probes[i].retired));
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   uint64_t deadline=ku_task_driver_now_ms()+5000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,2u,ring,2u,fixed+2u*sizeof(KuTaskInstance_0),2u,deadline,NULL,fixture_owner_wake)==KU_TASK_DRIVER_OK);
@@ -717,7 +717,7 @@ static int fixture_case(int invalid) {
   KuTaskDriverV1 driver={0};
   KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   uint64_t deadline=ku_task_driver_now_ms()+1000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),
@@ -876,7 +876,7 @@ static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_slow,int loop_slow,int private_mode) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   fixture_steps=fixture_fast_steps=fixture_loop_steps=fixture_bad_prefix=0;
   fixture_force_slow=force_slow; fixture_force_loop_slow=loop_slow;
   fixture_cancel_at=cancel_at; fixture_cancel_result=UINT32_MAX;
@@ -1170,7 +1170,7 @@ static int fixture_case(int variant,int slow) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX;
   uint64_t deadline=ku_task_driver_now_ms()+2000u;
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   fixture_range_steps=0; fixture_range_slow=slow;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),1u,
@@ -1289,7 +1289,7 @@ static int fixture_case(int mode) {
   KuTaskDriverV1 driver={0};
   KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   uint64_t deadline=fixture_clock+1000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1),
@@ -1427,7 +1427,7 @@ static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 int main(void) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
   KuTaskValueV1 task={0}; uint64_t next=UINT64_MAX,deadline=ku_task_driver_now_ms()+2000u;
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+4096u,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_0_start_value(&driver,&task)==KU_TASK_DRIVER_OK);
@@ -1454,7 +1454,7 @@ int main(void) {
   CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
   CHECK(!slots[0].binding && ku_task_driver_wake(&old)==KU_TASK_DRIVER_STALE);
   CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
-  CHECK(ku_perf_calls>=2u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  CHECK(ku_perf_calls>=3u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   printf("short-scalar-pending-host-ok entry=%u host=%u steps=%zu callbacks=%zu terminal=%zu\n",fixture_entry_status,fixture_host_status,fixture_steps,fixture_host_calls,fixture_terminal_calls);
   return 0;
 }
@@ -1666,7 +1666,7 @@ static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 static int fixture_case(size_t id,int cancel) {
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[4]={0}; size_t ring[4]={0};
   KuTaskValueV1 task={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   uint64_t deadline=ku_task_driver_now_ms()+2000u, next=UINT64_MAX;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,4u,ring,4u,fixed+131072u,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);

@@ -494,7 +494,7 @@ static void fixture_case(int mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(3u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
@@ -548,14 +548,14 @@ static void fixture_case(int mode) {
   CHECK(!ku_task_driver_unlock(driver));
   FixtureLedger ready=fixture_ledger();
   CHECK(ready.calls==before_calls+3u);
-  CHECK(ready.allocations==6u+(FIXTURE_KIND>=3 && FIXTURE_KIND<=5 ? 0u : fixture_buffers_count)
+  CHECK(ready.allocations==7u+(FIXTURE_KIND>=3 && FIXTURE_KIND<=5 ? 0u : fixture_buffers_count)
       && ready.bytes==fixed+instances+remaining_charge);
   KuTaskAdapterOutcomeV1 output={0};
   CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_OK);
   fixture_validate(&output,mode);
   CHECK(fixture_ledger().calls==ready.calls);
   ku_task_outcome_drop(&output);
-  CHECK(fixture_ledger().allocations==6u && fixture_ledger().bytes==fixed+instances);
+  CHECK(fixture_ledger().allocations==7u && fixture_ledger().bytes==fixed+instances);
   uint64_t cleanup_now=ku_task_driver_now_ms();
   CHECK(cleanup_now!=UINT64_MAX && cleanup_now<UINT64_MAX-1000u);
   uint64_t cleanup_deadline=cleanup_now+1000u;

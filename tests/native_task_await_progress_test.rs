@@ -361,13 +361,13 @@ static KuTaskDriverSnapshotV1 fixture_source_idle(KuTaskDriverV1* driver,uint64_
   CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created); return snapshot;
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==11u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   CHECK(ku_test_event_init(&fixture_two_polls) && ku_test_event_init(&fixture_release));
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(1,sizeof(*slots));
   size_t* ring=(size_t*)calloc(1,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+sizeof(*slots)+sizeof(*ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(1u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -393,7 +393,7 @@ int main(void) {
       && !ku_task_control_atomic_load(&fixture_parent->control.executor));
   CHECK(fixture_parent->frame.header.status==KU_TASK_FRAME_PENDING);
   @COUNTER_CHECK@
-  CHECK(fixture_ledger().allocations==4u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().allocations==5u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
   uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-1000u);
   uint64_t deadline=now+1000u;
   /* R2 returned Pending, but this slot is still RUNNING: the real wrapper
@@ -469,13 +469,13 @@ static KuTaskDriverSnapshotV1 fixture_idle(KuTaskDriverV1* driver,uint64_t deadl
   CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created); return snapshot;
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==11u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   CHECK(ku_test_event_init(&fixture_second_start) && ku_test_event_init(&fixture_release));
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(1,sizeof(*slots));
   size_t* ring=(size_t*)calloc(1,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+sizeof(*slots)+sizeof(*ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(1u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -496,7 +496,7 @@ int main(void) {
   CHECK(blocked.running==1u && !blocked.queued && !blocked.building && blocked.resident==1u
       && blocked.reserved_bytes==sizeof(KuTaskInstance_0) && !blocked.fault && !blocked.clock_fault);
   CHECK(ku_task_control_atomic_load(&fixture_parent->control.phase)==KU_TASK_CONTROL_LIVE);
-  CHECK(fixture_ledger().allocations==4u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().allocations==5u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
   uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-1000u);
   uint64_t cleanup_deadline=now+1000u;
   CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_CANCELLED,cleanup_deadline)==KU_TASK_CONTROL_OK);

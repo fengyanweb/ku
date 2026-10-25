@@ -771,6 +771,7 @@ static int ku_task_adapter_string_overlaps_runtime(KuString value, KuTaskDriverV
   return ku_task_adapter_string_overlaps(value, driver, sizeof(*driver))
       || ku_task_adapter_string_overlaps(value, driver->slots, driver->capacity * sizeof(*driver->slots))
       || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring))
+      || (driver->binding_keys && ku_task_adapter_string_overlaps(value,driver->binding_keys,driver->binding_cells*sizeof(*driver->binding_keys)))
       || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes))
       || (driver->blocking_storage && ku_task_adapter_string_overlaps(value,driver->blocking_storage,driver->blocking_storage_bytes));
 }

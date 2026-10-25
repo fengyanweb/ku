@@ -14,6 +14,8 @@
 //!
 //! When no C compiler is present every test skips cleanly instead of failing.
 
+#[path = "support/native_allocation_harness.rs"]
+mod native_allocation_harness;
 #[allow(dead_code)]
 #[path = "support/native_pg_harness.rs"]
 mod native_c_harness;
@@ -7002,4 +7004,585 @@ int main(int argc,char** argv) {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn native_http_task_runtime_partial_init_reclaims_binding_and_native_resources() {
+    if !cfg!(unix) {
+        return; // Windows condition initialization has no fallible pthread edge.
+    }
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-task-partial-init");
+    let source = r#"
+import "std.http"
+async fn ready(): HttpResponse! { return ok(http.text("ready")) }
+fn main(): null! {
+    app = http.server()
+    app.get("/", ready)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#;
+    fs::write(directory.path().join("runtime.ku"), source).unwrap();
+    // Emit through the normal CLI, but never execute the Ku application main.
+    let output = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(directory.path())
+            .args(["build", "--native", "runtime.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "C emission failed: {text}");
+    let emitted = text
+        .lines()
+        .find_map(|line| line.strip_prefix("native c ok: "))
+        .expect("CLI reports emitted native C");
+    let emitted = PathBuf::from(emitted);
+    let emitted = if emitted.is_absolute() {
+        emitted
+    } else {
+        directory.path().join(emitted)
+    };
+    let mut generated = fs::read_to_string(emitted).unwrap();
+    assert_eq!(generated.matches("int main(void) {").count(), 1);
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_unused_application_main(void) {",
+        1,
+    );
+    let allocator = r#"
+static size_t fixture_calloc_attempts,fixture_calloc_fail_at;
+static void* fixture_runtime_calloc(size_t count,size_t bytes) {
+  fixture_calloc_attempts++;
+  if(fixture_calloc_fail_at && fixture_calloc_attempts==fixture_calloc_fail_at) return NULL;
+  return ku_perf_calloc(count,bytes);
+}
+#undef calloc
+#define calloc fixture_runtime_calloc
+"#;
+    assert_eq!(generated.matches("typedef struct KuString {").count(), 1);
+    generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!(
+            "{}\n{allocator}\ntypedef struct KuString {{",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    // Only driver acquisition/destruction is intercepted. HTTP/Task semantics
+    // and the actual platform primitives are otherwise the production ones.
+    for (before, after, count) in [
+        (
+            "pthread_mutex_init(&driver->mutex, NULL)",
+            "fixture_driver_mutex_init(&driver->mutex, NULL)",
+            1,
+        ),
+        (
+            "pthread_mutex_destroy(&driver->mutex)",
+            "fixture_driver_mutex_destroy(&driver->mutex)",
+            1,
+        ),
+        (
+            "pthread_cond_init(&driver->condition, NULL)",
+            "fixture_driver_cond_init(&driver->condition, NULL)",
+            1,
+        ),
+        (
+            "pthread_cond_init(&driver->work_condition, NULL)",
+            "fixture_driver_cond_init(&driver->work_condition, NULL)",
+            1,
+        ),
+        (
+            "pthread_cond_init(&driver->condition, &driver->condition_attributes)",
+            "fixture_driver_cond_init(&driver->condition, &driver->condition_attributes)",
+            1,
+        ),
+        (
+            "pthread_cond_init(&driver->work_condition, &driver->condition_attributes)",
+            "fixture_driver_cond_init(&driver->work_condition, &driver->condition_attributes)",
+            1,
+        ),
+        (
+            "pthread_cond_destroy(&driver->condition)",
+            "fixture_driver_cond_destroy(&driver->condition)",
+            1,
+        ),
+        (
+            "pthread_cond_destroy(&driver->work_condition)",
+            "fixture_driver_cond_destroy(&driver->work_condition)",
+            1,
+        ),
+        (
+            "pthread_condattr_init(&driver->condition_attributes)",
+            "fixture_driver_attr_init(&driver->condition_attributes)",
+            1,
+        ),
+        (
+            "pthread_condattr_destroy(&driver->condition_attributes)",
+            "fixture_driver_attr_destroy(&driver->condition_attributes)",
+            2,
+        ),
+    ] {
+        assert_eq!(
+            generated.matches(before).count(),
+            count,
+            "unique driver edge: {before}"
+        );
+        generated = generated.replace(before, after);
+    }
+    let hooks = r#"
+static size_t fixture_mutex_inits,fixture_mutex_drops,fixture_cond_inits,fixture_cond_drops;
+static size_t fixture_attr_inits,fixture_attr_drops,fixture_cond_attempts,fixture_cond_fail_at;
+static int fixture_driver_mutex_init(pthread_mutex_t* value,const pthread_mutexattr_t* attributes) {
+  int status=pthread_mutex_init(value,attributes); if(!status)fixture_mutex_inits++; return status;
+}
+static int fixture_driver_mutex_destroy(pthread_mutex_t* value) {
+  int status=pthread_mutex_destroy(value); if(!status)fixture_mutex_drops++; return status;
+}
+static int fixture_driver_cond_init(pthread_cond_t* value,const pthread_condattr_t* attributes) {
+  fixture_cond_attempts++;
+  if(fixture_cond_fail_at && fixture_cond_attempts==fixture_cond_fail_at)return ENOMEM;
+  int status=pthread_cond_init(value,attributes); if(!status)fixture_cond_inits++; return status;
+}
+static int fixture_driver_cond_destroy(pthread_cond_t* value) {
+  int status=pthread_cond_destroy(value); if(!status)fixture_cond_drops++; return status;
+}
+static int fixture_driver_attr_init(pthread_condattr_t* value) {
+  int status=pthread_condattr_init(value); if(!status)fixture_attr_inits++; return status;
+}
+static int fixture_driver_attr_destroy(pthread_condattr_t* value) {
+  int status=pthread_condattr_destroy(value); if(!status)fixture_attr_drops++; return status;
+}
+"#;
+    let edge = "/* On post-resource failure this object remains LIVE or REAPING.";
+    assert_eq!(generated.matches(edge).count(), 1);
+    generated = generated.replacen(edge, &format!("{hooks}\n{edge}"), 1);
+    generated.push_str(r#"
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"HTTP runtime init line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static void fixture_wake(void* context,size_t owner) {(void)context;(void)owner;}
+static void fixture_reset(size_t allocation,size_t condition) {
+  fixture_calloc_attempts=0;fixture_calloc_fail_at=allocation;
+  fixture_cond_attempts=0;fixture_cond_fail_at=condition;
+  fixture_mutex_inits=fixture_mutex_drops=fixture_cond_inits=fixture_cond_drops=0;
+  fixture_attr_inits=fixture_attr_drops=0;
+}
+static uint64_t fixture_deadline(void) {return ku_task_driver_now_ms()+2000u;}
+static int fixture_normal(void) {
+  fixture_reset(0,0);
+  uint64_t deadline=fixture_deadline();
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,deadline);
+  CHECK(runtime && runtime->capacity==1u && runtime->driver.external_loops);
+  CHECK(fixture_calloc_attempts==5u && ku_perf_live_allocations==5u);
+  CHECK(runtime->driver.binding_keys && runtime->driver.binding_cells==2u*runtime->driver.capacity);
+  CHECK(!runtime->driver.resident && !runtime->active_handles && runtime->fixed_reserved
+      && runtime->driver.reserved_bytes==runtime->extra_fixed);
+  CHECK(ku_http_task_runtime_close(runtime,deadline)==KU_TASK_DRIVER_OK);
+  uint64_t next=UINT64_MAX;
+  for(size_t turn=0;turn<8u && runtime->driver.workers_exited!=runtime->driver.workers_created;turn++)
+    CHECK(ku_http_task_pump(runtime,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(runtime->driver.workers_exited==runtime->driver.workers_created);
+  CHECK(ku_http_task_runtime_free(runtime,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  CHECK(fixture_mutex_inits==1u && fixture_mutex_drops==1u && fixture_cond_inits==2u && fixture_cond_drops==2u);
+  CHECK(fixture_attr_inits==fixture_attr_drops);
+  return 0;
+}
+int main(void) {
+  CHECK(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes);
+  /* Every runtime/table calloc can fail before native acquisition. A following
+   * normal creation/free proves this failure did not leave retained backing. */
+  for(size_t allocation=1u;allocation<=5u;allocation++) {
+    fixture_reset(allocation,0);
+    CHECK(!ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,fixture_deadline()));
+    CHECK(fixture_calloc_attempts==((allocation>=2u && allocation<=4u) ? 4u : allocation));
+    CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+    CHECK(!fixture_mutex_inits && !fixture_cond_attempts && !fixture_attr_inits);
+    CHECK(!fixture_normal());
+  }
+  int failures=0;
+  for(size_t round=0;round<3u;round++) {
+    size_t failed_condition=1u+round%2u;fixture_reset(0,failed_condition);
+    CHECK(!ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,fixture_deadline()));
+    CHECK(fixture_calloc_attempts==5u && fixture_cond_attempts==failed_condition);
+    CHECK(fixture_mutex_inits==1u && fixture_cond_inits==failed_condition-1u);
+    int reclaimed=!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow
+      && fixture_mutex_drops==fixture_mutex_inits && fixture_cond_drops==fixture_cond_inits
+      && fixture_attr_drops==fixture_attr_inits;
+    if(!reclaimed) {
+      fprintf(stderr,"partial-init round=%zu cond=%zu live_allocations=%zu live_bytes=%zu mutex=%zu/%zu condition=%zu/%zu attributes=%zu/%zu\n",
+        round,failed_condition,ku_perf_live_allocations,ku_perf_live_bytes,fixture_mutex_drops,fixture_mutex_inits,
+        fixture_cond_drops,fixture_cond_inits,fixture_attr_drops,fixture_attr_inits);
+      failures++;
+    }
+  }
+  CHECK(!failures);
+  CHECK(!fixture_normal());
+  puts("http-task-partial-init-reclaimed-ok");return 0;
+}
+"#);
+    let path = directory.path().join("partial-init.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) =
+        native_c_harness::compile_harness(directory.path(), &path, "partial-init")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a C compiler"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "status={:?}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"http-task-partial-init-reclaimed-ok\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_http_task_runtime_blocking_init_timeout_preserves_cleanup_owner() {
+    if !cfg!(unix) {
+        return; // This actual-thread creation gate targets POSIX pthreads.
+    }
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-task-blocking-init-owner");
+    fs::write(
+        directory.path().join("runtime.ku"),
+        r#"
+import { http, fs } from "std"
+async fn ready(): HttpResponse! {
+    exists = fs.exists("not-executed-by-this-fixture")
+    if(exists) { return ok(http.text("present")) }
+    return ok(http.text("absent"))
+}
+fn main(): null! {
+    app = http.server()
+    app.get("/", ready)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#,
+    )
+    .unwrap();
+    let emission = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(directory.path())
+            .args(["build", "--native", "runtime.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&emission.stdout),
+        String::from_utf8_lossy(&emission.stderr)
+    );
+    assert!(
+        emission.status.success(),
+        "blocking fixture C emission failed: {text}"
+    );
+    let emitted = PathBuf::from(
+        text.lines()
+            .find_map(|line| line.strip_prefix("native c ok: "))
+            .expect("emitted C path"),
+    );
+    let emitted = if emitted.is_absolute() {
+        emitted
+    } else {
+        directory.path().join(emitted)
+    };
+    let mut generated = fs::read_to_string(emitted).unwrap();
+    assert_eq!(generated.matches("int main(void) {").count(), 1);
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_unused_application_main(void) {",
+        1,
+    );
+    let records = r#"
+/* A bounded identity ledger distinguishes an old allocation from address reuse.
+ * The fs helper definitions precede this hook; their libc realpath allocations
+ * and corresponding frees are consistently outside this narrow factory ledger. */
+typedef struct {void* pointer;uint64_t serial;} FixtureAllocation;
+static FixtureAllocation fixture_allocations[64];
+static uint64_t fixture_allocation_serial;
+static pthread_mutex_t fixture_record_mutex=PTHREAD_MUTEX_INITIALIZER;
+static size_t fixture_record_find(void* pointer) {
+  for(size_t i=0;i<64u;i++)if(fixture_allocations[i].pointer==pointer)return i;
+  return SIZE_MAX;
+}
+static void fixture_record_add(void* pointer) {
+  if(!pointer)return;
+  for(size_t i=0;i<64u;i++)if(!fixture_allocations[i].pointer) {
+    if(fixture_allocation_serial==UINT64_MAX)abort();
+    fixture_allocations[i]=(FixtureAllocation){pointer,++fixture_allocation_serial};return;
+  }
+  abort();
+}
+#undef malloc
+#undef calloc
+#undef realloc
+#undef free
+static void* fixture_malloc(size_t bytes) {
+  if(pthread_mutex_lock(&fixture_record_mutex))abort();
+  void* pointer=ku_perf_malloc(bytes);fixture_record_add(pointer);
+  if(pthread_mutex_unlock(&fixture_record_mutex))abort();return pointer;
+}
+static void* fixture_calloc(size_t count,size_t bytes) {
+  if(pthread_mutex_lock(&fixture_record_mutex))abort();
+  void* pointer=ku_perf_calloc(count,bytes);fixture_record_add(pointer);
+  if(pthread_mutex_unlock(&fixture_record_mutex))abort();return pointer;
+}
+static void* fixture_realloc(void* old,size_t bytes) {
+  if(pthread_mutex_lock(&fixture_record_mutex))abort();
+  size_t index=old ? fixture_record_find(old):SIZE_MAX;
+  if(old && index==SIZE_MAX)abort();
+  void* pointer=ku_perf_realloc(old,bytes);
+  if(pointer || !bytes) {
+    if(old)fixture_allocations[index]=(FixtureAllocation){0};fixture_record_add(pointer);
+  }
+  if(pthread_mutex_unlock(&fixture_record_mutex))abort();return pointer;
+}
+static void fixture_free(void* pointer) {
+  if(!pointer)return;
+  if(pthread_mutex_lock(&fixture_record_mutex))abort();
+  size_t index=fixture_record_find(pointer);if(index==SIZE_MAX)abort();
+  fixture_allocations[index]=(FixtureAllocation){0};ku_perf_free(pointer);
+  if(pthread_mutex_unlock(&fixture_record_mutex))abort();
+}
+static uint64_t fixture_serial(void* pointer) {
+  if(pthread_mutex_lock(&fixture_record_mutex))abort();
+  size_t index=fixture_record_find(pointer);uint64_t serial=index==SIZE_MAX ? 0:fixture_allocations[index].serial;
+  if(pthread_mutex_unlock(&fixture_record_mutex))abort();return serial;
+}
+#define malloc fixture_malloc
+#define calloc fixture_calloc
+#define realloc fixture_realloc
+#define free fixture_free
+static void *fixture_saved_runtime,*fixture_saved_pool;
+static uint64_t fixture_runtime_serial,fixture_pool_serial,fixture_original_deadline;
+static uint32_t fixture_init_status,fixture_finish_status;
+static int fixture_gate_enabled;
+"#;
+    // These runtime definitions follow the already-emitted fs helpers. No
+    // original application main, filesystem job or HTTP listener is executed.
+    let ledger_edge = "#define KU_TASK_DRIVER_COMPUTE_BANK_STATES";
+    assert_eq!(generated.matches(ledger_edge).count(), 1);
+    generated = generated.replacen(
+        ledger_edge,
+        &format!(
+            "{}\n{}\n{records}\n{ledger_edge}",
+            native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    for (before, after) in [
+        (
+            "pthread_create(&worker->thread,&attributes,ku_task_blocking_thread,worker)",
+            "fixture_blocking_create(&worker->thread,&attributes,ku_task_blocking_thread,worker)",
+        ),
+        (
+            "pthread_join(worker->thread,NULL)",
+            "fixture_blocking_join(worker->thread,NULL)",
+        ),
+    ] {
+        assert_eq!(
+            generated.matches(before).count(),
+            1,
+            "unique blocking edge {before}"
+        );
+        generated = generated.replacen(before, after, 1);
+    }
+    let gates = r#"
+static KuTestEvent fixture_entered,fixture_release,fixture_returned;
+static _Atomic size_t fixture_gate_failed;
+static size_t fixture_real_creates,fixture_real_joins;
+static void* (*fixture_original_start)(void*);
+static void* fixture_original_argument;
+static void* fixture_blocking_trampoline(void* argument) {
+  (void)argument;
+  if(!ku_test_event_set(&fixture_entered))atomic_store(&fixture_gate_failed,1u);
+  if(!ku_test_event_wait(&fixture_release,2000u))atomic_store(&fixture_gate_failed,1u);
+  void* result=fixture_original_start(fixture_original_argument);
+  if(!ku_test_event_set(&fixture_returned))atomic_store(&fixture_gate_failed,1u);
+  return result;
+}
+static int fixture_blocking_create(pthread_t* thread,const pthread_attr_t* attributes,
+                                   void* (*start)(void*),void* argument) {
+  if(!fixture_gate_enabled) {
+    int status=pthread_create(thread,attributes,start,argument);if(!status)fixture_real_creates++;return status;
+  }
+  fixture_original_start=start;fixture_original_argument=argument;
+  int status=pthread_create(thread,attributes,fixture_blocking_trampoline,NULL);
+  if(status)return status;
+  fixture_real_creates++;
+  if(!ku_test_event_wait(&fixture_entered,1000u))atomic_store(&fixture_gate_failed,1u);
+  /* Delay only the successful create return, while real init owns pool.mutex.
+   * No fake thread, clock, deadline, EXITED store or destructor error exists. */
+  size_t turns=0;
+  while(ku_test_real_now_ms()<fixture_original_deadline && turns++<2048u) {
+    struct timespec pause={0,1000000L};(void)nanosleep(&pause,NULL);
+  }
+  if(ku_test_real_now_ms()<fixture_original_deadline)atomic_store(&fixture_gate_failed,1u);
+  return status;
+}
+static int fixture_blocking_join(pthread_t thread,void** result) {
+  int status=pthread_join(thread,result);if(!status)fixture_real_joins++;return status;
+}
+"#;
+    let init_edge =
+        "static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacity,";
+    assert_eq!(generated.matches(init_edge).count(), 1);
+    generated = generated.replacen(init_edge, &format!("{gates}\n{init_edge}"), 1);
+    let pool_init = "status=ku_task_blocking_init(runtime->blocking,runtime->driver.capacity,1u,startup_deadline);";
+    assert_eq!(generated.matches(pool_init).count(), 1);
+    generated = generated.replacen(pool_init,&format!(r#"
+  if(fixture_gate_enabled) {{
+    fixture_saved_runtime=runtime;fixture_saved_pool=runtime->blocking;
+    fixture_runtime_serial=fixture_serial(runtime);fixture_pool_serial=fixture_serial(runtime->blocking);
+  }}
+  {pool_init}
+  if(fixture_gate_enabled)fixture_init_status=status;
+"#),1);
+    let finish_edge = "(void)ku_task_blocking_finish(runtime->blocking,startup_deadline);";
+    assert_eq!(generated.matches(finish_edge).count(), 1);
+    generated = generated.replacen(finish_edge,r#"uint32_t fixture_actual_finish=ku_task_blocking_finish(runtime->blocking,startup_deadline);
+    if(fixture_gate_enabled)fixture_finish_status=fixture_actual_finish;"#,1);
+    generated.push_str(r#"
+#define EXPECT(c) do {if(!(c)){fprintf(stderr,"blocking init owner line %d: %s\n",__LINE__,#c);failed=1;}}while(0)
+static void fixture_wake(void* context,size_t owner){(void)context;(void)owner;}
+static int fixture_release_runtime(KuHttpTaskRuntime* runtime,uint64_t deadline) {
+  if(ku_http_task_runtime_close(runtime,deadline)!=KU_TASK_DRIVER_OK)return 0;
+  for(size_t turn=0;turn<2048u;turn++) {
+    uint64_t next=UINT64_MAX;
+    if(runtime->driver.workers_exited!=runtime->driver.workers_created
+        && ku_http_task_pump(runtime,0u,32u,&next)>KU_TASK_DRIVER_PENDING)return 0;
+    uint32_t status=ku_http_task_runtime_free(runtime,deadline);
+    if(status==KU_TASK_DRIVER_OK)return 1;
+    if(status!=KU_TASK_DRIVER_PENDING || ku_test_real_now_ms()>=deadline)return 0;
+    struct timespec pause={0,1000000L};(void)nanosleep(&pause,NULL);
+  }
+  return 0;
+}
+int main(void) {
+  int failed=0,returned=0;
+  size_t initial_allocations=0,initial_bytes=0,initial_created=0,initial_exited=0;
+  uint32_t initial_storage=0;
+  size_t returned_exited=0,returned_joined=0;
+  EXPECT(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes);
+  if(!ku_test_event_init(&fixture_entered)||!ku_test_event_init(&fixture_release)||!ku_test_event_init(&fixture_returned))return 2;
+  fixture_gate_enabled=1;fixture_original_deadline=ku_test_real_now_ms()+100u;
+  void* initial=ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,fixture_original_deadline);
+  fixture_gate_enabled=0;
+  EXPECT(!initial && fixture_real_creates==1u && !atomic_load(&fixture_gate_failed));
+  EXPECT(fixture_init_status==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT && fixture_finish_status==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  EXPECT(ku_test_real_now_ms()>=fixture_original_deadline);
+  int saved_live=fixture_runtime_serial && fixture_pool_serial
+      && fixture_serial(fixture_saved_runtime)==fixture_runtime_serial && fixture_serial(fixture_saved_pool)==fixture_pool_serial;
+  EXPECT(saved_live);
+  if(saved_live) {
+    KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)fixture_saved_runtime;
+    KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)fixture_saved_pool;
+    initial_allocations=ku_perf_live_allocations;initial_bytes=ku_perf_live_bytes;
+    initial_created=pool->workers_created;initial_exited=pool->workers_exited;initial_storage=pool->initialized;
+    EXPECT(pool==runtime->blocking && pool->initialized==KU_TASK_DRIVER_STORAGE_LIVE && pool->closing
+        && pool->fault==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT && pool->workers_created==1u
+        && !pool->workers_exited && !pool->workers_joined && !pool->resident && !pool->queued && !pool->running);
+    EXPECT(runtime->driver.initialized==KU_TASK_DRIVER_STORAGE_LIVE && runtime->fixed_reserved
+        && !runtime->driver.blocking_pool && runtime->driver.shutdown_deadline==UINT64_MAX);
+    EXPECT(ku_perf_live_allocations==7u && ku_perf_live_bytes==runtime->driver.fixed_bytes+runtime->extra_fixed
+        +ku_task_blocking_fixed_bytes(runtime->driver.capacity));
+  }
+  EXPECT(ku_test_event_set(&fixture_release));
+  if(fixture_real_creates) {
+    returned=ku_test_event_wait(&fixture_returned,2000u);EXPECT(returned);
+  }
+  EXPECT(!atomic_load(&fixture_gate_failed));
+  if(returned && fixture_serial(fixture_saved_pool)==fixture_pool_serial) {
+    KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)fixture_saved_pool;
+    returned_exited=pool->workers_exited;returned_joined=pool->workers_joined;
+    EXPECT(returned_exited==1u && !returned_joined);
+  }
+  /* A new, separate normal initializer has its own D. It must also reap any
+   * retained previous failed-init owner; the first initializer's D is never
+   * extended. No test rescue runs until this actual product check has failed. */
+  uint64_t normal_deadline=ku_test_real_now_ms()+2000u;
+  KuHttpTaskRuntime* normal=(KuHttpTaskRuntime*)ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,normal_deadline);
+  EXPECT(normal);
+  if(normal)EXPECT(fixture_release_runtime(normal,normal_deadline));
+  int product_reclaimed=!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow;
+  if(!product_reclaimed) {
+    fprintf(stderr,"factory NULL at original D=%llu: init=%u finish=%u storage=%u created=%zu exited=%zu allocations=%zu bytes=%zu\n",
+      (unsigned long long)fixture_original_deadline,fixture_init_status,fixture_finish_status,initial_storage,
+      initial_created,initial_exited,initial_allocations,initial_bytes);
+    fprintf(stderr,"failed-init owner retained after actual worker return and normal new/free: old_exited=%zu old_joined=%zu allocations=%zu bytes=%zu joins=%zu/%zu\n",
+      returned_exited,returned_joined,ku_perf_live_allocations,ku_perf_live_bytes,fixture_real_joins,fixture_real_creates);
+  }
+  EXPECT(product_reclaimed);
+  /* Only the failed oracle permits test-owned rescue. Matching allocation
+   * serials are required before dereferencing pointers a product fix may free. */
+  if(returned && fixture_runtime_serial && fixture_pool_serial
+      && fixture_serial(fixture_saved_runtime)==fixture_runtime_serial
+      && fixture_serial(fixture_saved_pool)==fixture_pool_serial) {
+    KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)fixture_saved_runtime;
+    KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)fixture_saved_pool;
+    uint32_t rescued=ku_task_blocking_finish(pool,fixture_original_deadline);
+    EXPECT(rescued==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT && pool->initialized==KU_TASK_DRIVER_STORAGE_ZERO);
+    if(pool->initialized==KU_TASK_DRIVER_STORAGE_ZERO) {
+      free(pool);runtime->blocking=NULL;
+      EXPECT(fixture_release_runtime(runtime,fixture_original_deadline));
+      fprintf(stderr,"test-only rescue (does not satisfy product oracle): allocations=%zu bytes=%zu joins=%zu/%zu recorded_failure=%d\n",
+        ku_perf_live_allocations,ku_perf_live_bytes,fixture_real_joins,fixture_real_creates,failed);
+    }
+  }
+  EXPECT(fixture_real_creates==2u && fixture_real_joins==2u);
+  EXPECT(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  EXPECT(ku_test_event_destroy(&fixture_entered));EXPECT(ku_test_event_destroy(&fixture_release));EXPECT(ku_test_event_destroy(&fixture_returned));
+  if(failed)return 1;
+  puts("http-blocking-init-owner-reclaimed-ok");return 0;
+}
+"#);
+    let path = directory.path().join("blocking-init-owner.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) =
+        native_c_harness::compile_harness(directory.path(), &path, "blocking-init-owner")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a C compiler"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    // Native HTTP already fail-stops with 80 when live teardown cannot
+    // complete by its original deadline. It must not return an ordinary NULL
+    // and lose the still-live pool owner. The old path prints its actual leak
+    // and test-only rescue evidence, then exits 1 instead of passing.
+    assert_eq!(
+        output.status.code(), Some(80),
+        "live blocking init timeout must use native HTTP teardown exit 80; status={:?}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

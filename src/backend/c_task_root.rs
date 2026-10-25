@@ -139,7 +139,11 @@ const NETWORK_REFUND: &str = r#"
 "#;
 
 const ROOT_BODY: &str = r#"
-  size_t fixed = sizeof(ku_task_root_driver) + sizeof(ku_task_root_slots) + sizeof(ku_task_root_ring)@BLOCKING_FIXED@@NETWORK_FIXED@;
+  size_t driver_fixed = ku_task_driver_fixed_storage_bytes(KU_TASK_ROOT_CAPACITY);
+  if (!driver_fixed) {
+    fputs("native Task storage exceeds its bounded layout\n", stderr); return 1;
+  }
+  size_t fixed = driver_fixed@BLOCKING_FIXED@@NETWORK_FIXED@;
   if (maximum_instance > (SIZE_MAX - fixed) / KU_TASK_ROOT_CAPACITY) {
     fputs("native Task storage exceeds its bounded layout\n", stderr); return 1;
   }

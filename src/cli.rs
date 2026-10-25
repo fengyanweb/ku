@@ -11256,7 +11256,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_nanos();
-        let dir = env::temp_dir().join(format!("ku-native-target-c-{}-{nonce}", std::process::id()));
+        let dir =
+            env::temp_dir().join(format!("ku-native-target-c-{}-{nonce}", std::process::id()));
         let source_dir = dir.join("source");
         let retained_dir = dir.join("retained-c");
         fs::create_dir_all(&source_dir).expect("create native-target source fixture");
@@ -12629,14 +12630,13 @@ mod tests {
             "x86_64-windows",
             "aarch64-darwin",
         ]
-            .into_iter()
-            .map(|name| {
-                resolve_build_target(Some(name))
-                    .expect("supported target")
-                    .expect("explicit target")
-            })
-            .find(BuildTarget::matches_host)
-        else {
+        .into_iter()
+        .map(|name| {
+            resolve_build_target(Some(name))
+                .expect("supported target")
+                .expect("explicit target")
+        })
+        .find(BuildTarget::matches_host) else {
             eprintln!("skip: this host architecture has no first-stage explicit target");
             return;
         };
@@ -13293,14 +13293,14 @@ fn main(): null! {
             "x86_64-windows",
             "aarch64-darwin",
         ]
-            .into_iter()
-            .map(|name| {
-                resolve_build_target(Some(name))
-                    .expect("supported target")
-                    .expect("explicit target")
-            })
-            .find(|target| !target.matches_host())
-            .expect("at least one target differs from this host");
+        .into_iter()
+        .map(|name| {
+            resolve_build_target(Some(name))
+                .expect("supported target")
+                .expect("explicit target")
+        })
+        .find(|target| !target.matches_host())
+        .expect("at least one target differs from this host");
         assert!(c_compiler_supports_explicit_target(
             &candidates[0],
             &cross_target
