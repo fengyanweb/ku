@@ -7,6 +7,15 @@ use crate::error::KuResult;
 
 pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
     out.check()?;
+    // The same constants bound the finite numeric proof and the runtime loan.
+    // Emitting their values here prevents an unchecked 64-step proof from
+    // silently being reused by a longer same-drive computation.
+    out.push_str(&format!(
+        "#define KU_TASK_DRIVER_COMPUTE_BANK_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_MAX_BANKS ((size_t){}u)\n",
+        super::task_range::COMPUTE_BANK_STATES,
+        super::task_range::COMPUTE_MAX_BANKS,
+    ));
     out.push_str(DRIVER_ABI);
     out.check()
 }
@@ -380,12 +389,18 @@ static KU_THREAD_LOCAL size_t ku_task_driver_entry_owner;
  * run_one owns the stack record and its live execution lease, saving/restoring
  * an outer record around nested execution. Shared slot intent stays mutex-owned.
  * A real WAIT/YIELD publication during the callback takes precedence. */
+typedef struct KuTaskDriverComputeBudgetV1 {
+  size_t credit_limit, credits_used, states_used;
+  uint64_t started_ms;
+  uint32_t active, open, reported, invalid, clock_fault, time_exhausted;
+} KuTaskDriverComputeBudgetV1;
 typedef struct KuTaskDriverExecutionV1 {
   KuTaskDriverV1* driver;
   size_t slot;
   uint64_t generation;
   KuTaskControlV1* control;
   uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum, pure_ready;
+  KuTaskDriverComputeBudgetV1 compute;
 } KuTaskDriverExecutionV1;
 static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
 /* Called immediately after an existing mutex-owned explicit intent write.
@@ -1851,6 +1866,73 @@ static void ku_task_driver_note_pure_ready(const KuTaskDriverTicketV1* ticket,
       && execution->generation==ticket->generation && execution->control==control)
     execution->pure_ready=1;
 }
+/* One callback-scoped work allowance, not another lease or shared clock.
+ * Complete generated adapters opt in; raw frame/control callers have none.
+ * Each borrowed bank keeps the original 64-state fuel unit. Its successful
+ * grant spends one pump credit, independently from actual resume-call metrics.
+ * No pointer to this stack record may escape the registered resume callback. */
+static KuTaskDriverComputeBudgetV1* ku_task_driver_compute_budget(
+    const KuTaskDriverTicketV1* ticket,KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (!execution || !ticket || execution->driver!=ticket->driver || execution->slot!=ticket->slot
+      || execution->generation!=ticket->generation || execution->control!=control
+      || !execution->compute.credit_limit) return NULL;
+  return &execution->compute;
+}
+static void ku_task_driver_compute_begin(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,int allowed) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget) return;
+  budget->active=allowed && ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE;
+  budget->open=budget->active && budget->credit_limit>1u;
+}
+static uint32_t ku_task_driver_compute_borrow_bank(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->open || budget->invalid
+      || budget->credits_used>=budget->credit_limit
+      || ku_task_driver_execution->intent_touched) return 0;
+  uint64_t now=ku_task_driver_now_ms();
+  if (now==UINT64_MAX || now<budget->started_ms) {
+    budget->clock_fault=1; budget->open=0; return 0;
+  }
+  if (now-budget->started_ms>=1u) {
+    budget->time_exhausted=1; budget->open=0; return 0;
+  }
+  /* A request may publish while the real clock is being read. Observe it
+   * before granting the next bank, never reuse the pre-clock phase value. */
+  if (ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE) {
+    budget->open=0; return 0;
+  }
+  budget->credits_used++;
+  return 1;
+}
+static void ku_task_driver_compute_close_banks(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (budget) budget->open=0; /* Retain report scope through this bank's tail. */
+}
+static void ku_task_driver_compute_report_states(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t used_in_current_bank) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active) return;
+  if (used_in_current_bank>KU_TASK_DRIVER_COMPUTE_BANK_STATES
+      || !budget->credits_used || budget->credits_used>budget->credit_limit) {
+    budget->invalid=1; budget->reported=0; budget->open=0; return;
+  }
+  budget->states_used=KU_TASK_DRIVER_COMPUTE_BANK_STATES*(budget->credits_used-1u)
+      +used_in_current_bank;
+  budget->reported=1;
+}
+static int ku_task_driver_compute_end(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget) return 1;
+  /* R2 may invoke cleanup after resume returns. Its drive must never replace
+   * the normal callback's fuel report, even when it uses the same host. */
+  budget->active=0; budget->open=0;
+  return !budget->invalid;
+}
 static uint32_t ku_task_driver_wrapper_begin(
     const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
   uint32_t checked = ku_task_driver_check_ticket(ticket);
@@ -2715,12 +2797,13 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
 /* This stack-only record is private to the sole RUNNING executor. Pure ready
  * continuations need not release/reclaim R2 executor between dispatch budgets:
  * no ownership or host observation can occur in the witnessed quantum. Every
- * actual resume still consumes one pump credit; pump(1) cannot run a second
- * one. No phase/time sample is cached across a boundary or used as a deadline
+ * actual resume consumes at least one pump credit; each borrowed 64-state
+ * bank consumes another. pump(1) cannot borrow or run a second resume.
+ * No phase/time sample is cached across a boundary or used as a deadline
  * decision. Ordinary/raw callbacks continue through the full control poll. */
 typedef struct KuTaskDriverSegmentV1 {
   KuTaskDriverExecutionV1* execution;
-  size_t max_quanta, quanta;
+  size_t max_quanta, quanta, polls;
   uint64_t started;
   int clock_fault, time_exhausted;
 } KuTaskDriverSegmentV1;
@@ -2729,11 +2812,26 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
   KuTaskDriverExecutionV1* execution=segment->execution;
   uint32_t outcome;
   do {
+    size_t remaining=segment->max_quanta-segment->quanta;
+    execution->compute=(KuTaskDriverComputeBudgetV1){
+      remaining<KU_TASK_DRIVER_COMPUTE_MAX_BANKS ? remaining : KU_TASK_DRIVER_COMPUTE_MAX_BANKS,
+      1u,0u,segment->started,0,0,0,0,0,0};
     outcome=execution->control->operations.resume(execution->control->context);
-    segment->quanta++;
+    execution->compute.active=0; execution->compute.open=0;
+    segment->polls++;
+    size_t used=execution->compute.credits_used;
+    if (!used || used>execution->compute.credit_limit) {
+      outcome=KU_TASK_CONTROL_INVALID_STATE;
+      used=1u;
+    } else if (execution->compute.invalid) {
+      outcome=KU_TASK_CONTROL_INVALID_STATE;
+    }
+    segment->quanta+=used;
+    segment->clock_fault|=execution->compute.clock_fault;
+    segment->time_exhausted|=execution->compute.time_exhausted;
     if (outcome!=KU_TASK_CONTROL_PENDING || !execution->cooperative_yield
         || !execution->pure_ready || execution->intent_touched
-        || segment->quanta>=segment->max_quanta || segment->clock_fault
+        || segment->quanta>=segment->max_quanta || segment->clock_fault || segment->time_exhausted
         || ku_task_control_atomic_load(&execution->control->phase)!=KU_TASK_CONTROL_LIVE)
       break;
     uint64_t now=ku_task_driver_now_ms();
@@ -2744,10 +2842,12 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
   } while (1);
   return outcome;
 }
-/* One owner segment, consuming at most max_quanta logical control polls (<=32).
+/* One owner segment, consuming at most max_quanta 64-state work credits (<=32).
  * Enter and return with the publication mutex held. User callbacks/drop run
  * unlocked. Only pure generated dispatch-budget yields may share the live
- * RUNNING execution lease. Time is checked after each 64-dispatch boundary:
+ * RUNNING execution lease. Time is checked after each 64-dispatch boundary,
+ * inside a multi-bank frame or between registered resumes. Actual poll
+ * metrics count registered-resume/control attempts, not borrowed banks:
  * the 1ms segment budget can overrun by one quantum/expensive operation. */
 static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta) {
   KuTaskDriverV1* driver=worker->driver;
@@ -2781,7 +2881,7 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
-    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0};
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0,{0}};
     KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 
@@ -2789,16 +2889,18 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     if (cancel) request = ku_task_control_request_cancel(&execution, KU_TASK_CONTROL_CANCELLED, deadline);
     if (owner.lease.control) dropped = ku_task_control_owner_drop(&owner, deadline);
     ku_task_driver_execution=&context;
-    size_t quanta=0;
+    size_t quanta=0, polls=0;
     uint32_t outcome=KU_TASK_CONTROL_PENDING;
     int segment_clock_fault=started==UINT64_MAX;
     do {
       context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0; context.pure_ready=0;
-      KuTaskDriverSegmentV1 segment={&context,max_quanta-quanta,0u,started,segment_clock_fault,0};
+      context.compute=(KuTaskDriverComputeBudgetV1){0};
+      KuTaskDriverSegmentV1 segment={&context,max_quanta-quanta,0u,0u,started,segment_clock_fault,0};
       outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);
       /* A terminal/cancelled/contended control poll may not invoke resume. It
        * still spends one exact pump credit, as before this private batching. */
       quanta+=segment.quanta ? segment.quanta : 1u;
+      polls+=segment.polls ? segment.polls : 1u;
       segment_clock_fault=segment.clock_fault;
       if (outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
           || quanta>=max_quanta || segment_clock_fault || segment.time_exhausted
@@ -2813,9 +2915,9 @@ static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max
     slot = &driver->slots[index];
     if (segment_clock_fault) ku_task_driver_enter_clock_fault(driver);
     if (!slot->intent && context.default_yield) slot->intent=KU_TASK_DRIVER_YIELD;
-    driver->polls=quanta>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+quanta;
+    driver->polls=polls>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+polls;
     driver->running--; slot->executor_worker = 0;
-    worker->polls=quanta>UINT64_MAX-worker->polls ? UINT64_MAX : worker->polls+quanta;
+    worker->polls=polls>UINT64_MAX-worker->polls ? UINT64_MAX : worker->polls+polls;
     if (slot->owner_location == KU_TASK_DRIVER_OWNER_WORKER) {
       if (owner.lease.control) {
         slot->deferred_owner = owner; owner.lease.control = NULL;
@@ -3107,7 +3209,11 @@ static uint32_t ku_task_driver_set_fixed_owner(KuTaskDriverV1* driver) {
   if (checked==KU_TASK_DRIVER_OK) driver->fixed_owner=1;
   ku_task_driver_unlock(driver); return checked;
 }
-/* Poll a finite batch on its fixed event-loop owner, without sleeping. All
+/* Poll a finite work-credit batch on its fixed event-loop owner, without sleeping.
+ * One credit permits at most the original 64-state bank. Pure hosted frames
+ * may borrow up to four banks in one resume, spending each credit only at the
+ * exhausted-bank boundary. max_quanta==1 remains an exact single-poll entry.
+ * All
  * accepted wakes are retained in the slot's one queue node, even at capacity.
  * next_deadline is absolute monotonic ms. UINT64_MAX permits an indefinite
  * event wait; a finite due value or remaining ready work requires another

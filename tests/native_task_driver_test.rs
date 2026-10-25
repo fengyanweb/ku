@@ -87,7 +87,7 @@ fn native_task_driver_pure_segment_keeps_executor_and_exact_pump_credits() {
     for (old, new) in [
         (
             "typedef struct KuString {",
-            format!("{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\nstatic size_t fixture_claims,fixture_resumes,fixture_cancel_at;\nstatic uint64_t fixture_clock=1000u;\nstatic KuTestEvent fixture_cancel_entered,fixture_cancel_release;\ntypedef struct KuString {{"),
+            format!("{ALLOCATION_HOOK}\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\nstatic size_t fixture_claims,fixture_resumes,fixture_cancel_at;\nstatic size_t fixture_credits,fixture_states,fixture_unreported;\nstatic uint64_t fixture_clock=1000u;\nstatic KuTestEvent fixture_cancel_entered,fixture_cancel_release;\ntypedef struct KuString {{"),
         ),
         (
             "static uint64_t ku_task_driver_now_ms(void) {",
@@ -112,7 +112,13 @@ static uint32_t ku_task_0_resume(void* raw) {
     if(!ku_test_event_set(&fixture_cancel_entered)
         || !ku_test_event_wait(&fixture_cancel_release,2000u)) abort();
   }
-  return fixture_original_resume(raw);
+  uint32_t result=fixture_original_resume(raw);
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if(!execution || execution->control!=&instance->control) abort();
+  fixture_credits+=execution->compute.credits_used;
+  if(execution->compute.reported) fixture_states+=execution->compute.states_used;
+  else fixture_unreported++;
+  return result;
 }
 static uint32_t fixture_original_resume(void* raw) {"#.to_string(),
         ),
@@ -151,9 +157,11 @@ int main(void) {
   uint64_t next=UINT64_MAX;
   CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
   CHECK(driver.polls==1u && fixture_resumes==1u && fixture_claims==1u && next==0u);
-  fixture_claims=fixture_resumes=0;
+  CHECK(fixture_credits==1u && fixture_states==64u && !fixture_unreported);
+  fixture_claims=fixture_resumes=fixture_credits=fixture_states=fixture_unreported=0;
   CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
-  CHECK(driver.polls==33u && fixture_resumes==32u && fixture_claims==1u);
+  CHECK(fixture_credits==32u && fixture_states==2048u && !fixture_unreported);
+  CHECK(fixture_resumes==8u && driver.polls==1u+fixture_resumes && fixture_claims==1u);
   CHECK(driver.queued==1u && next==0u && !ku_task_driver_execution);
   /* Publication at a real resume boundary must stop the private segment and
    * enter the existing cancellation cleanup arbitration with the original D. */
@@ -161,13 +169,14 @@ int main(void) {
   FixtureCancel cancel={0}; cancel.ticket=work.ticket;
   CHECK(ku_task_control_lease_retain(&work.owner.lease,&cancel.lease)==KU_TASK_CONTROL_OK);
   KuTestThread thread; CHECK(ku_test_thread_start(&thread,fixture_cancel_worker,&cancel));
+  uint64_t before_cancel_polls=driver.polls;
   fixture_claims=fixture_resumes=0; fixture_cancel_at=3u;
   CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_thread_join(&thread,2000u) && thread.outcome==0 && cancel.result==KU_TASK_CONTROL_OK);
   CHECK(fixture_resumes==3u && fixture_claims>=1u && fixture_claims<=2u);
   /* A concurrent wrapper may leave its one notification for a terminal
    * observation. Count that zero-resume poll exactly instead of discarding it. */
-  CHECK(driver.polls==33u+fixture_resumes+fixture_claims-1u);
+  CHECK(driver.polls==before_cancel_polls+fixture_resumes+fixture_claims-1u);
   CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_CANCELLED);
   CHECK(ku_task_control_cleanup_deadline(work.owner.lease.control)==1042u);
   CHECK(!driver.queued && !ku_task_driver_execution);

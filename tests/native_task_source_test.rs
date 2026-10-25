@@ -33,6 +33,26 @@ fn native(source: &str) -> String {
 #[test]
 fn native_task_external_owner_pump_preserves_affinity_wakes_and_retirement() {
     let generated=native("async fn Ready(value: int): int! { return ok(value) } async fn main(): null! { return ok(null) } async fn Work(): int! { index=0; while(index<5000) {index=index+1} return ok(index) }");
+    let resume = "static uint32_t ku_task_2_resume(void* raw) {";
+    assert_eq!(generated.matches(resume).count(), 1);
+    let generated = generated.replacen(
+        resume,
+        r#"static uint64_t fixture_work_credits,fixture_work_units;
+static size_t fixture_work_calls,fixture_work_unreported;
+static uint32_t fixture_work_resume(void* raw);
+static uint32_t ku_task_2_resume(void* raw) {
+  uint32_t outcome=fixture_work_resume(raw);
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if(!execution || !execution->compute.credits_used) abort();
+  fixture_work_calls++;
+  fixture_work_credits+=execution->compute.credits_used;
+  if(execution->compute.reported) fixture_work_units+=execution->compute.states_used;
+  else fixture_work_unreported++;
+  return outcome;
+}
+static uint32_t fixture_work_resume(void* raw) {"#,
+        1,
+    );
     let generated = generated.replacen(
         "int main(void) {",
         "static int ku_unused_source_main(void) {",
@@ -98,7 +118,19 @@ int main(void) {
   }
   CHECK(ku_task_control_status(&work.owner.lease)==KU_TASK_CONTROL_COMPLETED);
   uint64_t used_polls=driver.workers[work_owner].polls-before_polls;
-  CHECK(used_polls>100u && notifications[work_owner]==before_notifications);
+  size_t work_notifications_after=notifications[work_owner];
+  /* The fixed Work still spans many exact64-unit credits; B2 may use up
+   * to four of them inside one registered callback. Keep real owner-wake
+   * behavior independent from this implementation-dependent callback count. */
+  if(notifications[work_owner]!=before_notifications || fixture_work_unreported
+      || !used_polls || fixture_work_credits<=100u || used_polls>fixture_work_credits)
+    fprintf(stderr,"external owner work: polls=%llu callbacks=%zu credits=%llu units=%llu unreported=%zu notifications=%zu before=%zu\n",
+      (unsigned long long)used_polls,fixture_work_calls,(unsigned long long)fixture_work_credits,
+      (unsigned long long)fixture_work_units,fixture_work_unreported,notifications[work_owner],before_notifications);
+  CHECK(notifications[work_owner]==before_notifications);
+  CHECK(!fixture_work_unreported && fixture_work_credits>100u);
+  CHECK(used_polls>0u && used_polls>=fixture_work_calls && used_polls<=fixture_work_credits);
+  CHECK(fixture_work_units>=10000u && fixture_work_units<=fixture_work_credits*64u);
   KuTaskAdapterOutcomeV1 work_result={0};
   CHECK(ku_task_value_take(&work,NULL,&work_result)==KU_TASK_CONTROL_OK);
   CHECK(work_result.value.integer.ok && work_result.value.integer.value==5000);
@@ -143,7 +175,10 @@ int main(void) {
   CHECK(driver.workers_exited==2u && !driver.resident);
   CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
-  puts("external-task-owners-ok"); return 0;
+  printf("external-task-owners-ok polls=%llu callbacks=%zu credits=%llu units=%llu notifications=%zu before=%zu\n",
+    (unsigned long long)used_polls,fixture_work_calls,(unsigned long long)fixture_work_credits,
+    (unsigned long long)fixture_work_units,work_notifications_after,before_notifications);
+  return 0;
 }
 "#
     );
@@ -165,10 +200,14 @@ int main(void) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
-        "external-task-owners-ok\n"
+    let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(
+        stdout.starts_with("external-task-owners-ok polls="),
+        "{stdout}"
     );
+    assert_eq!(stdout.lines().count(), 1, "bounded owner-work diagnostic");
+    assert!(output.stderr.is_empty());
+    eprint!("{stdout}");
 }
 
 #[test]
@@ -716,7 +755,18 @@ async fn Region(limit:int, seed:int, divisor:int):int! {
     total=seed
     while(index<limit) {
         if(index%2==0) { total=total+3 } else { total=total*2 }
-        total=total/divisor
+        denominator=divisor
+        if(index==20) { denominator=0 }
+        total=total/denominator
+        index=index+1
+    }
+    return ok(total)
+}
+async fn Growth(seed:int):int! {
+    index=0
+    total=seed
+    while(index<30) {
+        total=total+461168601842738790
         index=index+1
     }
     return ok(total)
@@ -740,6 +790,20 @@ async fn Region(limit:int, seed:int, divisor:int):int! {
         (
             2,
             "async fn main():null! { value=(await Region(5,9223372036854775807,0))? println(value) return ok(null) }",
+            "",
+            "integer overflow\n",
+            false,
+        ),
+        (
+            3,
+            "async fn main():null! { value=(await Region(40,3,1))? println(value) return ok(null) }",
+            "",
+            "division by zero\n",
+            false,
+        ),
+        (
+            4,
+            "async fn main():null! { value=(await Growth(3))? println(value) return ok(null) }",
             "",
             "integer overflow\n",
             false,
@@ -921,7 +985,7 @@ fn native_task_segments_keep_quantum_limits_and_explicit_intent_boundaries() {
     // deterministic. Real wall-clock fairness remains a separate HTTP gate.
     generated = generated.replacen(
         clock,
-        "static uint64_t fixture_clock=1000u;\nstatic size_t fixture_lock_entries,fixture_calls,fixture_last_lock,fixture_same_segment;\nstatic int fixture_mode,fixture_touch_seen,fixture_touch_boundary;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {",
+        "static uint64_t fixture_clock=1000u;\nstatic size_t fixture_lock_entries,fixture_calls,fixture_last_lock,fixture_same_segment,fixture_credits,fixture_state_units;\nstatic int fixture_mode,fixture_touch_seen,fixture_touch_boundary;\nstatic uint64_t ku_task_driver_now_ms(void) { return fixture_clock; }\nstatic uint64_t fixture_original_now_ms(void) {",
         1,
     );
     let lock = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
@@ -940,6 +1004,10 @@ static uint32_t ku_task_{id}_resume(void* raw) {{
     fixture_touch_boundary=fixture_lock_entries>fixture_last_lock;
   fixture_calls++;
   uint32_t result=ku_task_{id}_resume_inner(raw);
+  if(!ku_task_driver_execution) abort();
+  fixture_credits+=ku_task_driver_execution->compute.credits_used;
+  if(ku_task_driver_execution->compute.reported)
+    fixture_state_units+=ku_task_driver_execution->compute.states_used;
   if({id}u==1u && fixture_calls==1u)
     fixture_touch_seen=ku_task_driver_execution && ku_task_driver_execution->intent_touched
       && ku_task_driver_execution->cooperative_yield;
@@ -962,6 +1030,7 @@ static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
 static int fixture_case(int mode) {
   fixture_mode=mode;
   fixture_calls=fixture_last_lock=fixture_same_segment=0;
+  fixture_credits=fixture_state_units=0;
   fixture_touch_seen=fixture_touch_boundary=0;
   KuTaskDriverV1 driver={0};
   KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
@@ -977,21 +1046,29 @@ static int fixture_case(int mode) {
   if(mode==0) {
     CHECK(ku_task_driver_pump(&driver,0u,1u,&next)==KU_TASK_DRIVER_OK);
     CHECK(driver.polls==1u && driver.workers[0].polls==1u && fixture_calls==1u);
+    CHECK(fixture_credits==1u && fixture_state_units==64u);
     CHECK(driver.queued==1u && next==0u);
   }
+  /* Work credits remain exact even when one callback retains four banks.
+   * Raw/pump(1) above still has one64-state bank; a real timer/intent forces
+   * a separate ordinary boundary. Clock advances after each callback in mode2,
+   * so no two callbacks can share a1ms segment there. */
   uint64_t before_polls=driver.polls;
   size_t before_calls=fixture_calls, before_locks=fixture_lock_entries;
+  size_t before_credits=fixture_credits,before_states=fixture_state_units;
   CHECK(ku_task_driver_pump(&driver,0u,32u,&next)==KU_TASK_DRIVER_OK);
-  CHECK(driver.polls-before_polls==32u && fixture_calls-before_calls==32u);
+  size_t actual_calls=fixture_calls-before_calls;
+  CHECK(fixture_credits-before_credits==32u && fixture_state_units-before_states==2048u);
+  CHECK(driver.polls-before_polls==actual_calls && actual_calls==(mode==1 ? 9u : 8u));
   CHECK(driver.workers[0].polls==driver.polls && driver.queued==1u && next==0u);
   if(mode==0) {
-    CHECK(fixture_same_segment==31u);
+    CHECK(fixture_same_segment==actual_calls-1u);
     CHECK(fixture_lock_entries-before_locks==2u);
   } else if(mode==1) {
     CHECK(fixture_touch_seen && fixture_touch_boundary);
-    CHECK(fixture_same_segment==30u);
+    CHECK(fixture_same_segment==actual_calls-2u);
   } else {
-    CHECK(!fixture_same_segment && fixture_lock_entries-before_locks==33u);
+    CHECK(!fixture_same_segment && fixture_lock_entries-before_locks==actual_calls+1u);
   }
   CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);

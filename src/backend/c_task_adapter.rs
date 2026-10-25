@@ -609,6 +609,11 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             .iter()
             .any(|op| matches!(op, TaskOp::FinallyEnter { .. }))
     });
+    let compute_banks = !blocking
+        && !finally
+        && !function.slots.iter().any(|slot| {
+            matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. })
+        });
     let mut exit_deadline = String::new();
     if scope_exits {
         exit_deadline.push_str(EXIT_DEADLINE);
@@ -658,6 +663,9 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@SCALAR_RECONCILE_SKIP@", if blocking || finally { "0" } else {
             "status==KU_TASK_FRAME_PENDING && instance->frame_initialized && !instance->payload_initialized\n    && !instance->frame.header.result_initialized && !(instance->frame.header.initialized & UINT64_C(@TASK_MASK@))\n    && !instance->receipt_mask && !instance->wait.driver && !instance->drain_started\n    && ku_task_driver_scalar_quantum(&instance->ticket,&instance->control)"
         })
+        .replace("@COMPUTE_BANKS_ALLOWED@", if compute_banks {
+            "instance->frame_initialized && !instance->payload_initialized\n    && !instance->frame.header.result_initialized && !(instance->frame.header.initialized & UINT64_C(@TASK_MASK@))\n    && !instance->receipt_mask && !instance->wait.driver && !instance->timer.driver && !instance->drain_started"
+        } else { "0" })
         .replace("@RECONCILE_DRAIN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;" } else { "" })
         .replace("@RECONCILE_TAKE@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
         .replace("@RECONCILE_DROP@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) ku_task_adapter_fault(instance->ticket.driver,0);" } else { "" })
@@ -1248,7 +1256,9 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
     if (ku_task_driver_begin_quantum(&instance->ticket,&instance->control)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
+    ku_task_driver_compute_begin(&instance->ticket,&instance->control,(@COMPUTE_BANKS_ALLOWED@));
     status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
+    if (!ku_task_driver_compute_end(&instance->ticket,&instance->control)) return KU_TASK_CONTROL_INVALID_STATE;
   }
   /* One complete adapter proof serves both charge reconciliation and the
    * private executor segment. A frame's charge-only witness alone does not

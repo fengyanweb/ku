@@ -1023,16 +1023,10 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_scalar_checkpoint(&self, out: &mut COutput, state: usize) {
-        let (phase, budget) = if self.scalar_cache_active.get() {
-            (
-                "if (!__ku_scalar_phase) __ku_scalar_phase=&((KuTaskAdapterHostV1*)clock->host)->control->phase;\nif (ku_task_control_atomic_load(__ku_scalar_phase)!=KU_TASK_CONTROL_LIVE)",
-                "if (!__ku_dispatch_budget--)",
-            )
+        let phase = if self.scalar_cache_active.get() {
+            "if (!__ku_scalar_phase) __ku_scalar_phase=&((KuTaskAdapterHostV1*)clock->host)->control->phase;\nif (ku_task_control_atomic_load(__ku_scalar_phase)!=KU_TASK_CONTROL_LIVE)"
         } else {
-            (
-                "if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE)",
-                "if (clock->host && !__ku_dispatch_budget--)",
-            )
+            "if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE)"
         };
         let label = if self.range_fast.get() {
             "range"
@@ -1047,6 +1041,15 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                frame->header.state={state}u; frame->header.cleanup_state=UINT32_MAX;\n\
                frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
              }}\n"
+        ));
+        out.push_str(&format!(
+            "  if (!__ku_dispatch_budget) {{\n\
+               KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host;\n\
+               if (!ku_task_driver_compute_borrow_bank(bank_host->ticket,bank_host->control)) {{\n\
+                 frame->header.state={state}u;\n\
+                 ku_task_driver_note_quantum_yield(bank_host->ticket,bank_host->control,__ku_charge_unchanged);\n\
+                 frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
+               }}\n  __ku_dispatch_budget=64u;\n  }}\n"
         ));
         if self.scalar_cache_active.get() {
             if let Some(region) = self.scalar_regions.at_entry(state).filter(|region| {
@@ -1071,14 +1074,19 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
             }
         }
-        out.push_str(&format!(
-            "  {budget} {{\n\
-               frame->header.state={state}u;\n\
-               KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n\
-               ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n\
-               frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n\
-             }}\n"
-        ));
+        out.push_str("  --__ku_dispatch_budget;\n");
+    }
+
+    fn emit_compute_close(&self, out: &mut COutput) {
+        if self.cooperative && self.hosted {
+            out.push_str("  if (!cleanup && clock->host) { KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host; ku_task_driver_compute_close_banks(bank_host->ticket,bank_host->control); }\n");
+        }
+    }
+
+    fn emit_compute_report(&self, out: &mut COutput) {
+        if self.cooperative && self.hosted {
+            out.push_str("  if (!cleanup && clock->host && remaining_budget<=64u) { KuTaskAdapterHostV1* bank_host=(KuTaskAdapterHostV1*)clock->host; ku_task_driver_compute_report_states(bank_host->ticket,bank_host->control,64u-remaining_budget); }\n");
+        }
     }
 
     fn emit_scalar_region_header_flush(&self, out: &mut COutput) {
@@ -1241,6 +1249,13 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
+        if self.cooperative && self.hosted {
+            out.push_str(&format!(
+                "typedef char {}_compute_proof_matches_driver[(KU_TASK_DRIVER_COMPUTE_BANK_STATES==64u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_MAX_BANKS<={}u) ? 1 : -1];\n",
+                self.prefix,
+                super::task_range::COMPUTE_PROOF_STATES
+            ));
+        }
         let slots = (0..self.function.slots.len())
             .map(SlotId)
             .filter(|slot| self.cached_scalar(*slot))
@@ -1256,7 +1271,24 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 .any(|slot| matches!(slot.ty, TaskSlotType::Value { borrowed: true, .. }))
             && (0..self.function.states.len()).any(|state| self.scalar_direct_state(state));
         if !enabled {
-            return self.emit_drive_body(out);
+            if !self.cooperative || !self.hosted {
+                return self.emit_drive_body(out);
+            }
+            let mut body = COutput::new(out.remaining());
+            self.emit_drive_body(&mut body)?;
+            let body = body.finish()?;
+            let helper = format!("{}_report_compute_return", self.prefix);
+            out.push_str(&format!(
+                "static uint32_t {helper}(const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget, uint32_t result) {{\n"
+            ));
+            self.emit_compute_report(out);
+            out.push_str("  return result;\n}\n");
+            emit_scalar_spill_returns(
+                out,
+                &body,
+                &format!("{helper}(clock,cleanup,__ku_dispatch_budget"),
+            )?;
+            return out.check();
         }
         // Only verified Copy scalars get a private invocation-local cache.
         // Owning headers and control/lease storage stay in the original frame.
@@ -1317,7 +1349,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     ) -> KuResult<()> {
         let helper = format!("{}_spill_scalars", self.prefix);
         out.push_str(&format!(
-            "static uint32_t {helper}({}* frame",
+            "static uint32_t {helper}({}* frame, const KuTaskFrameClockV1* clock, int cleanup, size_t remaining_budget",
             self.frame_type
         ));
         for slot in slots {
@@ -1333,8 +1365,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         for slot in slots {
             out.push_str(&format!("  frame->s_{}=cached_{};\n", slot.0, slot.0));
         }
+        self.emit_compute_report(out);
         out.push_str("  return result;\n}\n");
-        let mut call = format!("{helper}(frame");
+        let mut call = format!("{helper}(frame,clock,cleanup,__ku_dispatch_budget");
         for slot in slots {
             call.push_str(&format!(",cached_{}", slot.0));
         }
@@ -1410,7 +1443,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                             mask
                         }
                     });
-            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget--) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  }}\n"));
+            out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  --__ku_dispatch_budget;\n  }}\n"));
         }
         if self.range_active.get() {
             let guard = self
@@ -1479,6 +1512,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 self.emit_scalar_init_flush(out);
             }
             if self.cooperative && !self.scalar_charge_state(state) {
+                self.emit_compute_close(out);
                 out.push_str("  __ku_charge_unchanged=0;\n");
             }
             for (operation_id, operation) in state.operations.iter().enumerate() {
@@ -2532,6 +2566,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     }
 
     fn emit_runtime_error(&self, out: &mut COutput, error: &str) -> KuResult<()> {
+        self.emit_compute_close(out);
         self.emit_scalar_region_header_flush(out);
         let IrType::Result(inner) = &self.function.result else {
             return Err(unsupported("runtime exit requires Result"));

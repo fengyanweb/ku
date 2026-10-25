@@ -1,7 +1,11 @@
 //! Optional, bounded numeric proof over already verified typed Task states.
 //!
 //! This is not a loop invariant or an AST analysis. Each invocation is guarded
-//! afresh and executes at most 64 original state bodies. The finite product
+//! afresh and executes at most COMPUTE_PROOF_STATES original state bodies.
+//! This horizon includes every bank a private hosted invocation may borrow.
+//! It is shared with the driver's generated cap, never treated as a loop
+//! invariant or restarted with nonzero temporary locals at a bank boundary.
+//! The finite product
 //! graph (state, bodies remaining) proves individual operations; all other
 //! operations retain their original checked helpers.
 
@@ -12,7 +16,9 @@ use crate::ir::{
 use std::cell::Cell;
 
 pub(super) const MAX_EXTRA_SOURCE_BYTES: usize = 256 * 1024;
-const QUANTUM: usize = 64;
+pub(super) const COMPUTE_BANK_STATES: usize = 64;
+pub(super) const COMPUTE_MAX_BANKS: usize = 4;
+pub(super) const COMPUTE_PROOF_STATES: usize = COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS;
 const MAX_WORK: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
@@ -305,7 +311,7 @@ impl RangePlan {
             .iter()
             .map(|yes| yes.then(|| initial.clone()))
             .collect();
-        for _remaining in (1..=QUANTUM).rev() {
+        for _remaining in (1..=COMPUTE_PROOF_STATES).rev() {
             let mut next: Vec<Option<Vec<Interval>>> = vec![None; states.len()];
             for (state, input) in layer.iter().enumerate() {
                 let Some(input) = input else { continue };
@@ -469,6 +475,35 @@ mod tests {
             &mut WorkBudget(0)
         )
         .is_none());
+    }
+
+    #[test]
+    fn range_proof_covers_every_borrowed_bank_without_restarting_local_facts() {
+        assert_eq!(
+            COMPUTE_PROOF_STATES,
+            COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS
+        );
+        let increment = i64::MAX / 128;
+        // This is safe throughout one old bank, yet not throughout all four.
+        // Reusing a64-state certificate across loans would certify signed UB.
+        let first = i32::MAX as i128;
+        assert!(first + increment as i128 * COMPUTE_BANK_STATES as i128 <= i64::MAX as i128);
+        assert!(first + increment as i128 * COMPUTE_PROOF_STATES as i128 > i64::MAX as i128);
+        let grows = repeated(TaskBinaryOp::Add, Some(increment));
+        assert!(RangePlan::build(
+            &grows,
+            vec![true],
+            |_| true,
+            |_| false,
+            &mut WorkBudget::default(),
+        )
+        .is_none());
+        // Exhausting the finite analysis budget remains an unknown proof,
+        // never an instruction to emit unchecked arithmetic.
+        assert!(
+            RangePlan::build(&grows, vec![true], |_| true, |_| false, &mut WorkBudget(0),)
+                .is_none()
+        );
     }
 
     #[test]
