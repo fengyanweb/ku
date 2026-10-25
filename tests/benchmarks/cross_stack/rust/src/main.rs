@@ -25,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
@@ -163,12 +163,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_config = cpu_work::Config::from_env()?;
     let runtime_name = std::env::var("BENCH_RUNTIME").ok();
     let plan = runtime_config::Plan::parse(runtime_name.as_deref(), workers, cpu_workers)?;
+    let listen_plan = runtime_config::ListenPlan::from_env()?;
     let runtime = plan.build(cpu_config.event_interval)?;
-    runtime.block_on(serve(plan, cpu_config))
+    runtime.block_on(serve(plan, cpu_config, listen_plan))
 }
 async fn serve(
     runtime_plan: runtime_config::Plan,
     cpu_config: cpu_work::Config,
+    listen_plan: runtime_config::ListenPlan,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cpu_workers = runtime_plan.cpu_workers;
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
@@ -220,10 +222,11 @@ async fn serve(
         .layer(middleware::from_fn_with_state(app.clone(), admission))
         .with_state(app.clone());
     let address = std::env::var("BENCH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let listener = TcpListener::bind(&address).await?;
+    let listener = listen_plan.bind(&address).await?;
+    let listen_address = listener.local_addr()?;
     eprintln!(
         "{}",
-        json!({"ready":true,"stack":"rust","runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
+        json!({"ready":true,"stack":"rust","runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"listen_address":listen_address,"listen_backlog_requested":listen_plan.requested_backlog(),"listen_backlog_explicit":listen_plan.explicit(),"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
     );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown())

@@ -1,5 +1,88 @@
 use std::io;
 
+/// Listener policy is independent of executor/CPU topology. Omitting the
+/// setting retains the exact historical Tokio/Mio bind path (backlog128 on
+/// the supported Linux/macOS/Windows targets); explicit values use TcpSocket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenPlan {
+    backlog: u32,
+    explicit: bool,
+}
+
+impl ListenPlan {
+    pub fn parse(value: Option<&str>) -> io::Result<Self> {
+        let backlog = match value {
+            None => 128,
+            Some(value) => value.parse::<u32>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "BENCH_LISTEN_BACKLOG must be 1..65535",
+                )
+            })?,
+        };
+        if !(1..=65535).contains(&backlog) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BENCH_LISTEN_BACKLOG must be 1..65535",
+            ));
+        }
+        Ok(Self {
+            backlog,
+            explicit: value.is_some(),
+        })
+    }
+
+    pub fn from_env() -> io::Result<Self> {
+        match std::env::var("BENCH_LISTEN_BACKLOG") {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BENCH_LISTEN_BACKLOG must be valid UTF-8 digits",
+            )),
+        }
+    }
+
+    pub fn requested_backlog(self) -> u32 {
+        self.backlog
+    }
+
+    pub fn explicit(self) -> bool {
+        self.explicit
+    }
+
+    pub async fn bind(self, address: &str) -> io::Result<tokio::net::TcpListener> {
+        if !self.explicit {
+            return tokio::net::TcpListener::bind(address).await;
+        }
+        // Match TcpListener::bind's address-resolution and ordered fallback
+        // behavior, then register the same Tokio async listener with Axum.
+        let mut last_error = None;
+        for address in tokio::net::lookup_host(address).await? {
+            let result = (|| {
+                let socket = if address.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                socket.set_reuseaddr(true)?;
+                socket.bind(address)?;
+                socket.listen(self.backlog)
+            })();
+            match result {
+                Ok(listener) => return Ok(listener),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any address",
+            )
+        }))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Topology {
     MultiThread,
@@ -79,6 +162,78 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_backlog_defaults_bounds_and_invalid_inputs() {
+        let default = ListenPlan::parse(None).unwrap();
+        assert_eq!(default.requested_backlog(), 128);
+        assert!(!default.explicit());
+        for value in ["1", "128", "4096", "65535"] {
+            let plan = ListenPlan::parse(Some(value)).unwrap();
+            assert_eq!(plan.requested_backlog(), value.parse::<u32>().unwrap());
+            assert!(plan.explicit());
+        }
+        for value in [
+            "",
+            "0",
+            "65536",
+            "-1",
+            " 128",
+            "1.5",
+            "invalid",
+            "4294967296",
+        ] {
+            assert_eq!(
+                ListenPlan::parse(Some(value)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn listener_default_and_explicit_ephemeral_sockets_accept_and_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let runtime = Plan::parse(Some("current-thread"), 1, 1)
+            .unwrap()
+            .build(None)
+            .unwrap();
+        runtime.block_on(async {
+            for value in [None, Some("1"), Some("4096"), Some("65535")] {
+                let listener = ListenPlan::parse(value)
+                    .unwrap()
+                    .bind("127.0.0.1:0")
+                    .await
+                    .unwrap();
+                let address = listener.local_addr().unwrap();
+                assert_ne!(address.port(), 0);
+                let mut client = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(address),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let (mut server, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                client.write_all(b"x").await.unwrap();
+                let mut byte = [0];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    server.read_exact(&mut byte),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(byte, *b"x");
+                drop(server);
+                drop(client);
+                drop(listener);
+            }
+        });
+    }
 
     #[test]
     fn default_keeps_existing_multi_thread_reference() {
