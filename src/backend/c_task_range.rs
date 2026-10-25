@@ -490,17 +490,23 @@ mod tests {
 
     #[test]
     fn range_proof_covers_every_borrowed_bank_without_restarting_local_facts() {
+        // These bounds couple the finite proof to every executable allowance;
+        // reject an incompatible constant change at compile time as well.
+        const {
+            assert!(COMPUTE_RESERVATION_CREDITS <= COMPUTE_PRIVATE_SELECTION_CREDITS);
+            assert!(COMPUTE_PROOF_STATES >= COMPUTE_RESERVATION_STATES);
+            assert!(COMPUTE_PROOF_STATES >= COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS);
+            assert!(
+                COMPUTE_PROOF_STATES >= COMPUTE_BANK_STATES * COMPUTE_PRIVATE_SELECTION_CREDITS
+            );
+        }
         assert_eq!(COMPUTE_MAX_BANKS, 4);
         assert_eq!(COMPUTE_PUBLIC_SELECTION_CREDITS, 32);
         assert_eq!(COMPUTE_PRIVATE_SELECTION_CREDITS, 128);
-        assert!(COMPUTE_RESERVATION_CREDITS <= COMPUTE_PRIVATE_SELECTION_CREDITS);
         assert_eq!(
             COMPUTE_BANK_STATES * COMPUTE_RESERVATION_CREDITS,
             COMPUTE_RESERVATION_STATES
         );
-        assert!(COMPUTE_PROOF_STATES >= COMPUTE_RESERVATION_STATES);
-        assert!(COMPUTE_PROOF_STATES >= COMPUTE_BANK_STATES * COMPUTE_MAX_BANKS);
-        assert!(COMPUTE_PROOF_STATES >= COMPUTE_BANK_STATES * COMPUTE_PRIVATE_SELECTION_CREDITS);
         let increment = i64::MAX / 4096;
         // Safe over the complete old1024-state callback, but not the new one.
         // Renewing an old certificate without reconstructing local facts

@@ -466,7 +466,7 @@ impl ScalarRegions {
                     .unwrap_or(0);
             }
             let max_path_states = cost[entry];
-            if max_path_states < 2 || max_path_states > MAX_REGION_STATES {
+            if !(2..=MAX_REGION_STATES).contains(&max_path_states) {
                 continue;
             }
             states.sort_unstable();

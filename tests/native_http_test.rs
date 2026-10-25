@@ -282,7 +282,11 @@ fn spawn_native_server_settings(
             dir: Some(dir.clone()),
             c_source: c_source.clone(),
         };
-        let generated = fs::read_to_string(&c_source).expect("read native HTTP C");
+        // include_str! preserves the runtime file's checkout line endings.
+        // Normalize only this temporary witness copy before exact gate matching.
+        let generated = fs::read_to_string(&c_source)
+            .expect("read native HTTP C")
+            .replace("\r\n", "\n");
         let mut witnessed = generated;
         if settings
             .iter()
