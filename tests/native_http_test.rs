@@ -192,7 +192,51 @@ fn spawn_native_server_settings(
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .unwrap_or_else(|| panic!("native HTTP build did not report C output:\n{combined}"));
-    let exe = dir.join(&out);
+    let exe = if settings
+        .iter()
+        .any(|(name, _)| *name == "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE")
+    {
+        // Observe the real positive MSG_PEEK -> pause transition without reading
+        // pipeline bytes or changing any transport decision. This generated-C
+        // witness is used only by the reset regression below, never shipped.
+        // Retain cleanup ownership even if witness compilation panics.
+        let mut artifacts = NativeHttpServer {
+            child: None,
+            service: None,
+            dir: Some(dir.clone()),
+            c_source: c_source.clone(),
+        };
+        let generated = fs::read_to_string(&c_source).expect("read native HTTP C");
+        let assignment = "connection->peer_read_paused=1;";
+        assert_eq!(
+            generated.matches(assignment).count(),
+            1,
+            "unique peer pause transition"
+        );
+        let witnessed = generated.replacen(
+            assignment,
+            &format!(
+                r#"int ku_test_was_paused=connection->peer_read_paused; {assignment}
+          if(received>0 && !ku_test_was_paused) {{
+            const char* witness=getenv("KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE");
+            if(witness) {{
+              FILE* file=fopen(witness,"wb");
+              if(file) {{ (void)fwrite(&byte,1,1,file); (void)fclose(file); }}
+            }}
+          }}"#
+            ),
+            1,
+        );
+        let witness_source = dir.join("server-peer-pause-witness.c");
+        fs::write(&witness_source, witnessed).expect("write temporary peer pause witness");
+        let executable =
+            native_c_harness::compile_harness(&dir, &witness_source, "server-peer-pause-witness")
+                .expect("the native server compiler must also build its read-only witness");
+        artifacts.dir = None;
+        executable
+    } else {
+        dir.join(&out)
+    };
     if observed {
         let mut command = Command::new(&exe);
         command.current_dir(&dir);
@@ -5584,25 +5628,41 @@ fn main(): null! {
     assert!(!watchdog.timed_out());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn native_http_reset_retires_async_work_but_write_half_close_keeps_response() {
     use std::io::Read;
+    #[cfg(unix)]
     use std::os::fd::AsRawFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsRawSocket;
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"
 import {http,time} from "std"
 async fn slow(): HttpResponse! { time.sleep(5000)? return ok(http.text("late")) }
+async fn pipeline_slow(): HttpResponse! { time.sleep(1000)? return ok(http.text("pipeline-late")) }
+fn job_slow(): HttpResponse {
+    started=time.steady_millis()
+    while(time.steady_millis()-started<200) {}
+    return http.text("job-late")
+}
 async fn brief(): HttpResponse! { time.sleep(20)? return ok(http.text("half-close-ok")) }
 fn main(): null! {
     app=http.server({max_active_requests:16,max_pending_requests:16,max_connections:64,handler_timeout_ms:10000})
     app.get("/slow",slow)
+    app.get("/pipeline-slow",pipeline_slow)
+    app.post("/job-slow",job_slow)
     app.get("/short",brief)
     app.listen("__ADDRESS__")?
     return ok(null)
 }
 "#;
     let address = unused_local_address();
+    let management_address = unused_local_address();
+    assert_ne!(address, management_address);
+    let witness_directory = native_c_harness::TempDir::new("http-peer-pause-witness");
+    let witness_path = witness_directory.path().join("paused-byte");
+    let witness_path_text = witness_path.to_str().expect("UTF-8 temporary witness path");
     let Some(mut server) = spawn_native_server_settings(
         "reset-vs-half-close",
         source,
@@ -5613,6 +5673,8 @@ fn main(): null! {
             ("KU_EVENT_LOOPS", "1"),
             ("KU_BLOCKING_THREADS", "2"),
             ("KU_SERVICE_CONTROL_TOKEN", "reset-witness"),
+            ("KU_SERVICE_PROBE_ADDR", &management_address),
+            ("KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE", witness_path_text),
         ],
     ) else {
         return;
@@ -5621,7 +5683,7 @@ fn main(): null! {
     let metrics_request="GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nConnection: close\r\n\r\n";
     // Wait for real startup using the existing bounded socket reader.
     assert_status(
-        &http_response(&address, metrics_request, Duration::from_secs(3)),
+        &http_response(&management_address, metrics_request, Duration::from_secs(3)),
         "HTTP/1.1 200 OK",
     );
     let mut peer = TcpStream::connect(&address).unwrap();
@@ -5629,7 +5691,7 @@ fn main(): null! {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        let metrics = http_response(&address, metrics_request, Duration::from_secs(3));
+        let metrics = http_response(&management_address, metrics_request, Duration::from_secs(3));
         let tasks = metrics
             .split("\"tasks\":[")
             .nth(1)
@@ -5646,26 +5708,76 @@ fn main(): null! {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let linger = libc::linger {
-        l_onoff: 1,
-        l_linger: 0,
+    let reset_peer = |peer: TcpStream| {
+        #[cfg(unix)]
+        {
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        peer.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        (&linger as *const libc::linger).cast(),
+                        std::mem::size_of_val(&linger) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+        }
+        #[cfg(windows)]
+        {
+            // Winsock LINGER contains two u_short fields, unlike POSIX linger.
+            #[repr(C)]
+            struct WinLinger {
+                onoff: u16,
+                seconds: u16,
+            }
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn setsockopt(
+                    socket: std::os::windows::io::RawSocket,
+                    level: i32,
+                    name: i32,
+                    value: *const i8,
+                    length: i32,
+                ) -> i32;
+                #[link_name = "WSAGetLastError"]
+                fn wsa_get_last_error() -> i32;
+            }
+            const SOL_SOCKET: i32 = 0xffff;
+            const SO_LINGER: i32 = 0x0080;
+            let linger = WinLinger {
+                onoff: 1,
+                seconds: 0,
+            };
+            let result = unsafe {
+                setsockopt(
+                    peer.as_raw_socket(),
+                    SOL_SOCKET,
+                    SO_LINGER,
+                    (&linger as *const WinLinger).cast(),
+                    std::mem::size_of_val(&linger) as i32,
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "SO_LINGER reset setup failed: WSA error {}",
+                unsafe { wsa_get_last_error() }
+            );
+        }
+        let issued = Instant::now();
+        drop(peer);
+        issued
     };
-    assert_eq!(
-        unsafe {
-            libc::setsockopt(
-                peer.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                (&linger as *const libc::linger).cast(),
-                std::mem::size_of_val(&linger) as libc::socklen_t,
-            )
-        },
-        0
-    );
-    drop(peer); // A confirmed RST, not an ambiguous FIN or caller-side timer.
+    reset_peer(peer); // A confirmed RST, not an ambiguous FIN or caller-side timer.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        let metrics = http_response(&address, metrics_request, Duration::from_secs(3));
+        let metrics = http_response(&management_address, metrics_request, Duration::from_secs(3));
         let tasks = metrics
             .split("\"tasks\":[")
             .nth(1)
@@ -5682,6 +5794,252 @@ fn main(): null! {
         );
         thread::sleep(Duration::from_millis(5));
     }
+    // A pending pipelined byte is legal future input. First witness that the
+    // owner actually paused read interest on that byte, then send a real RST.
+    // The byte stays unread: consuming it would hide the transport error case.
+    let section = |metrics: &str, name: &str, end: char| {
+        metrics
+            .split_once(name)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0
+            .to_owned()
+    };
+    let counter = |value: &str, name: &str| -> u64 {
+        let prefix = format!("\"{name}\":");
+        value
+            .split_once(&prefix)
+            .unwrap()
+            .1
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let baseline = http_response(&management_address, metrics_request, Duration::from_secs(3));
+    assert_eq!(
+        counter(&section(&baseline, "\"tasks\":[", ']'), "resident"),
+        0,
+        "idle Task baseline: {baseline}"
+    );
+    assert_eq!(
+        counter(&section(&baseline, "\"task_driver\":{", '}'), "resident"),
+        0,
+        "idle driver baseline: {baseline}"
+    );
+    assert_eq!(
+        counter(&section(&baseline, "\"loops\":[", ']'), "connections"),
+        0,
+        "idle connection baseline: {baseline}"
+    );
+    let baseline_reserved = counter(
+        &section(&baseline, "\"task_driver\":{", '}'),
+        "reserved_bytes",
+    );
+    let baseline_resets = counter(&section(&baseline, "\"counts\":{", '}'), "peer_reset");
+    let mut peer = TcpStream::connect(&address).unwrap();
+    peer.write_all(
+        b"GET /pipeline-slow HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let metrics = http_response(
+            &management_address,
+            metrics_request,
+            Duration::from_millis(100),
+        );
+        let tasks = section(&metrics, "\"tasks\":[", ']');
+        assert!(
+            Instant::now() < deadline,
+            "pipeline request never reached timer: {metrics}"
+        );
+        if counter(&tasks, "resident") == 1 && counter(&tasks, "timers") == 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    peer.write_all(b"G").unwrap();
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        if fs::read(&witness_path).ok().as_deref() == Some(b"G") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owner did not witness the pending pipeline byte"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    let before_reset = http_response(
+        &management_address,
+        metrics_request,
+        Duration::from_millis(100),
+    );
+    assert_eq!(
+        counter(&section(&before_reset, "\"tasks\":[", ']'), "timers"),
+        1,
+        "timer must still be pending when RST is sent: {before_reset}"
+    );
+    let reset_at = reset_peer(peer);
+    let deadline = reset_at + Duration::from_millis(500);
+    let mut last_metrics = before_reset;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_millis(5),
+            "paused pipeline RST was not physically reclaimed within 500ms (less than5ms left, no tiny-deadline metrics request); expected reserved={baseline_reserved}, peer_reset={}; last metrics: {last_metrics}",
+            baseline_resets + 1
+        );
+        let metrics = http_response(
+            &management_address,
+            metrics_request,
+            remaining.min(Duration::from_millis(100)),
+        );
+        last_metrics = metrics.clone();
+        let tasks = section(&metrics, "\"tasks\":[", ']');
+        let driver = section(&metrics, "\"task_driver\":{", '}');
+        let loops = section(&metrics, "\"loops\":[", ']');
+        // Check the observation time as well: the 1s natural timer completion
+        // must never masquerade as prompt cancellation or a transport receipt.
+        assert!(
+            Instant::now() < deadline,
+            "paused pipeline RST exceeded its reclamation bound: {metrics}"
+        );
+        if counter(&section(&metrics, "\"counts\":{", '}'), "peer_reset") == baseline_resets + 1
+            && counter(&tasks, "resident") == 0
+            && counter(&tasks, "timers") == 0
+            && counter(&driver, "resident") == 0
+            && counter(&driver, "reserved_bytes") == baseline_reserved
+            && counter(&loops, "connections") == 0
+            && counter(&loops, "pending") == 0
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    // The same paused-read branch also owns synchronous JOB sockets. A
+    // bounded 200ms handler keeps a real worker reference alive after RST:
+    // transport detection must be prompt, physical retirement must wait.
+    fs::remove_file(&witness_path).unwrap();
+    let job_baseline = http_response(
+        &management_address,
+        metrics_request,
+        Duration::from_millis(100),
+    );
+    let job_resets = counter(&section(&job_baseline, "\"counts\":{", '}'), "peer_reset");
+    let job_buffer_baseline = counter(&job_baseline, "buffer_bytes");
+    let body = "x".repeat(4096);
+    let mut peer = TcpStream::connect(&address).unwrap();
+    peer.write_all(format!("POST /job-slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let mut job_last_metrics = loop {
+        let metrics = http_response(
+            &management_address,
+            metrics_request,
+            Duration::from_millis(50),
+        );
+        let loops = section(&metrics, "\"loops\":[", ']');
+        assert!(
+            Instant::now() < deadline,
+            "synchronous worker did not start: {metrics}"
+        );
+        if counter(&loops, "running") == 1 && counter(&loops, "resident") == 1 {
+            assert!(
+                counter(&metrics, "buffer_bytes") > job_buffer_baseline,
+                "live JOB must retain its actual input charge: {metrics}"
+            );
+            break metrics;
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+    peer.write_all(b"G").unwrap();
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        if fs::read(&witness_path).ok().as_deref() == Some(b"G") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "JOB did not pause on its unconsumed pipeline byte"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let reset_at = reset_peer(peer);
+    let deadline = reset_at + Duration::from_millis(100);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_millis(5),
+            "paused JOB RST was not observed within 100ms (no tiny-deadline request); last metrics: {job_last_metrics}"
+        );
+        let metrics = http_response(
+            &management_address,
+            metrics_request,
+            remaining.min(Duration::from_millis(25)),
+        );
+        assert!(
+            Instant::now() < deadline,
+            "paused JOB reset receipt arrived after 100ms: {metrics}"
+        );
+        job_last_metrics = metrics.clone();
+        let loops = section(&metrics, "\"loops\":[", ']');
+        if counter(&section(&metrics, "\"counts\":{", '}'), "peer_reset") == job_resets + 1
+            && counter(&loops, "connections") == 0
+        {
+            assert_eq!(
+                counter(&loops, "running"),
+                1,
+                "fixture must witness the still-running worker: {metrics}"
+            );
+            assert_eq!(
+                counter(&loops, "resident"),
+                1,
+                "live worker reference returned early: {metrics}"
+            );
+            assert!(
+                counter(&metrics, "buffer_bytes") > job_buffer_baseline,
+                "live worker input charge returned early: {metrics}"
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = reset_at + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_millis(5),
+            "JOB failed to retire after its bounded work finished (no tiny-deadline request); last metrics: {job_last_metrics}"
+        );
+        let metrics = http_response(
+            &management_address,
+            metrics_request,
+            remaining.min(Duration::from_millis(50)),
+        );
+        job_last_metrics = metrics.clone();
+        let loops = section(&metrics, "\"loops\":[", ']');
+        assert!(
+            Instant::now() < deadline,
+            "JOB physical retirement exceeded 500ms: {metrics}"
+        );
+        if counter(&loops, "running") == 0
+            && counter(&loops, "resident") == 0
+            && counter(&loops, "queued") == 0
+            && counter(&loops, "connections") == 0
+            && counter(&metrics, "buffer_bytes") == job_buffer_baseline
+            && counter(
+                &section(&metrics, "\"task_driver\":{", '}'),
+                "reserved_bytes",
+            ) == baseline_reserved
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
     let mut peer = TcpStream::connect(&address).unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     peer.write_all(b"GET /short HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -5691,7 +6049,7 @@ fn main(): null! {
     peer.read_to_string(&mut response).unwrap();
     assert_status(&response, "HTTP/1.1 200 OK");
     assert!(response.ends_with("half-close-ok"), "{response}");
-    let response=http_response(&address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    let response=http_response(&management_address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
     assert_status(&response, "HTTP/1.1 200 OK");
     assert!(watchdog
         .wait_for_natural_exit(Duration::from_secs(5))

@@ -4,6 +4,7 @@
 #endif
 #if defined(__APPLE__)
 #include <sys/select.h>
+#define KU_HTTP_PAUSED_PEER_PROBE_MS 25u
 #endif
 #define KU_HTTP_MAX_SEGS 64
 /* Longest accepted request target, pinned to the interpreter's
@@ -1736,6 +1737,9 @@ typedef struct KuHttpConnection {
   void* async_task;
   int async_cancelled, peer_read_paused;
   unsigned long long async_deadline, async_cleanup_deadline;
+#if defined(__APPLE__)
+  unsigned long long peer_error_probe_deadline;
+#endif
   KuHttpOutput output;
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
@@ -1817,6 +1821,9 @@ static int ku_http_async_retire(KuHttpConnection*);
 static void ku_http_count_response(int);
 static void ku_http_count_admitted(void);
 static void ku_http_connection_close(KuHttpConnection* connection) {
+#if defined(__APPLE__)
+  connection->peer_error_probe_deadline=0;
+#endif
   if (connection->socket_value != KU_HTTP_INVALID_SOCKET) {
     if(connection->active_set) {
       if(!connection->active_set->sockets) { fputs("http active socket accounting failed\n",stderr); exit(1); }
@@ -1856,6 +1863,9 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   connection->active_set=active; connection->active_position=-1; connection->free_next=free_next;
 }
 static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
+#if defined(__APPLE__)
+  connection->peer_error_probe_deadline=0;
+#endif
   free(connection->header); connection->header = NULL;
   ku_http_buffer_refund(connection->budget, connection->capacity); connection->capacity = 0;
   ku_http_input_drop(&connection->input);
@@ -1946,6 +1956,9 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   if(connection->request_sequence!=UINT64_MAX) connection->request_sequence++;
   connection->request_id_length=0; connection->request_id_truncated=0;
   connection->peer_read_paused=0;
+#if defined(__APPLE__)
+  connection->peer_error_probe_deadline=0;
+#endif
   connection->failure=(KuHttpFailure){0};
   connection->request_deadline = 0;
   connection->buffered = 0; connection->body_received = 0;
@@ -2549,19 +2562,50 @@ static int ku_http_async_observe(KuHttpConnection* connection, KuHttpServer* ser
   (void)connection; (void)server; return 0;
 #endif
 }
-/* Observe only a real readiness event while work owns the response. A FIN
- * is a legal request write-half-close and pipeline bytes belong to the next
- * request: neither means that this response is undeliverable. Pause that read
- * interest after observing either, avoiding a level-triggered busy loop. A
- * failed peek (for example ECONNRESET) is a concrete transport failure. The
- * ordinary close path requests cancellation but retains the physical Task/job
- * lease, buffers and active slot until actual retirement. */
-static void ku_http_connection_observe_peer(KuHttpConnection* connection) {
+/* Observe real readiness or an explicit Darwin probe while work owns the response.
+ * FIN and queued
+ * pipeline bytes are legal: pause READ after peeking either, but keep the
+ * socket registered for errors. Buffered bytes can mask a later reset in
+ * MSG_PEEK, so inspect SO_ERROR first on error/hangup readiness. A zero error
+ * plus FIN is still a legal request write-half-close, not cancellation. The
+ * ordinary close path retains the physical Task/job lease until retirement. */
+static void ku_http_connection_observe_peer(KuHttpConnection* connection,short events,int force_error_check) {
   char byte;
-  int received=recv(connection->socket_value,&byte,1,MSG_PEEK);
-  if(received>=0) { connection->peer_read_paused=1; return; }
-  int error=ku_http_socket_last_error();
+  int received, error=0;
+#if defined(__APPLE__)
+  /* Darwin poll(events=0) can hide a reset behind queued bytes. Only these
+     paused, live handlers receive a bounded fallback; this is not an OS event
+     or a renewal of the request/handler deadline. Retry transient errors on
+     the next finite probe rather than spinning on an already-due deadline. */
+  if(force_error_check) connection->peer_error_probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+#endif
+  if(force_error_check || (events & (POLLERR | POLLHUP))) {
+#if defined(_WIN32)
+    int length=(int)sizeof(error);
+    if(getsockopt(connection->socket_value,SOL_SOCKET,SO_ERROR,(char*)&error,&length))
+      error=ku_http_socket_last_error();
+#else
+    socklen_t length=(socklen_t)sizeof(error);
+    if(getsockopt(connection->socket_value,SOL_SOCKET,SO_ERROR,&error,&length))
+      error=ku_http_socket_last_error();
+#endif
+    if(error) {
+      if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
+      goto peer_failed;
+    }
+  }
+  if(force_error_check) return; /* SO_ERROR was read once; future bytes remain untouched. */
+  received=recv(connection->socket_value,&byte,1,MSG_PEEK);
+  if(received>=0) {
+    connection->peer_read_paused=1;
+#if defined(__APPLE__)
+    connection->peer_error_probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+#endif
+    return;
+  }
+  error=ku_http_socket_last_error();
   if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return;
+peer_failed:
   connection->failure.reason=KU_HTTP_ERROR_PEER_RESET;
   connection->failure.stage=5;
   ku_http_record_failure(connection,0); /* No response can be delivered. */
@@ -3017,6 +3061,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_close(connection); continue;
       }
       ku_http_connection_observe_job(connection, server);
+#if defined(__APPLE__)
+      if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
+          && connection->peer_read_paused && connection->peer_error_probe_deadline
+          && now>=connection->peer_error_probe_deadline)
+        ku_http_connection_observe_peer(connection,0,1);
+#endif
       if (connection->request_deadline && (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_WRITE)
           && connection->deadline > connection->request_deadline) connection->deadline = connection->request_deadline;
       if (connection->async_task && connection->async_cancelled && now >= connection->async_cleanup_deadline)
@@ -3058,6 +3108,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_connection_close(&rejection);
     }
     if (!listen_failure) ku_http_pending_activate(&pending, &active, server);
+    /* Maintenance may close a socket while a worker still owns its job.
+       Refresh the already-published membership snapshot before a blocking wait;
+       one extra turn suffices unless physical membership changes again. */
+    if (active.sockets != occupied_connections) continue;
     int occupied = rejection.phase != KU_HTTP_IO_FREE || active.count;
     if (!listening && !occupied && !pending.count && !ku_http_queue_resident(&queue)) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
@@ -3093,10 +3147,15 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       KuHttpConnection* connection = &connections[index];
       connection->poll_index = -1;
       short events = 0;
+      int watch_peer=connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB;
       if (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) events = KU_HTTP_POLL_READ;
       else if (connection->phase == KU_HTTP_IO_WRITE) events = KU_HTTP_POLL_WRITE;
-      else if ((connection->phase == KU_HTTP_IO_ASYNC || connection->phase == KU_HTTP_IO_JOB)
-          && !connection->peer_read_paused) events=KU_HTTP_POLL_READ;
+      else if (watch_peer && !connection->peer_read_paused) events=KU_HTTP_POLL_READ;
+#if defined(__APPLE__)
+      if (watch_peer && connection->peer_read_paused && connection->peer_error_probe_deadline
+          && connection->peer_error_probe_deadline<nearest)
+        nearest=connection->peer_error_probe_deadline;
+#endif
       if (connection->phase == KU_HTTP_IO_JOB && connection->job && connection->job->request_deadline < nearest)
         nearest = connection->job->request_deadline;
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
@@ -3109,7 +3168,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
             async_eligible,idle_eligible,idle_eligible ? connection->deadline : connection->async_deadline);
       }
 #endif
-      if (!events) continue;
+      /* poll/WSAPoll return ERR/HUP/NVAL even with events=0. Pausing READ
+         must not remove a live handler socket from transport-error observation. */
+      if (!events && !watch_peer) continue;
       connection->poll_index = poll_count;
       poll_connections[connection_poll_count++]=(KuHttpPollConnection){index,connection->connection_generation};
       ku_http_poll_add(poll_items, &poll_count, connection->socket_value, events);
@@ -3195,8 +3256,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     if (ku_http_task_io_batch_continue(&task_io_batch,batch_now,
         task_io_ready,task_io_urgent)) continue;
 #endif
-    /* No periodic wake tick: idle/read/write/job progress blocks in one OS
-       poll until actual readiness, worker publication, or the nearest old D. */
+    /* No global wake tick: progress blocks until readiness, worker publication
+       or the nearest deadline (including only Darwin's paused-handler error probe). */
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     ku_http_task_io_batch_probe_result(&task_io_batch,wait_ms,selected,
@@ -3243,7 +3304,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
         ku_http_connection_write(connection, server);
       else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
-          && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection);
+          && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection,events,0);
     }
     if (rejection.poll_index >= 0) {
       short events = poll_items[rejection.poll_index].revents;
