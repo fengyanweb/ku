@@ -995,6 +995,7 @@ fn http_response_bytes(address: &str, request: &[u8], timeout: Duration) -> Stri
             Ok(mut stream) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining < Duration::from_millis(1) {
+                    last = format!("TCP connect to {address} consumed the response deadline");
                     break;
                 }
                 stream
@@ -1003,7 +1004,8 @@ fn http_response_bytes(address: &str, request: &[u8], timeout: Duration) -> Stri
                 stream
                     .set_write_timeout(Some(remaining.min(Duration::from_millis(700))))
                     .expect("write timeout");
-                if stream.write_all(request).is_err() {
+                if let Err(error) = stream.write_all(request) {
+                    last = format!("HTTP request write to {address}: {error}");
                     thread::sleep(Duration::from_millis(30));
                     continue;
                 }
@@ -6475,6 +6477,14 @@ fn main(): null! {
     };
     let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
     let metrics_request="GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: raw-retirement\r\nConnection: close\r\n\r\n";
+    // Match the first server's startup barrier before applying the short
+    // state/retirement observation budgets. Process spawn is not socket readiness.
+    eprintln!("retained JOB/RAW regression: waiting for second server management readiness");
+    assert_status(
+        &http_response(&management_address, metrics_request, Duration::from_secs(3)),
+        "HTTP/1.1 200 OK",
+    );
+    eprintln!("retained JOB/RAW regression: management ready; checking initial snapshot");
     let snapshot = || {
         http_response(
             &management_address,
@@ -6500,6 +6510,9 @@ fn main(): null! {
         }
     };
     let wait_state = |connections: u64, pending: u64, active: u64, resident: u64| {
+        eprintln!(
+            "retained JOB/RAW regression: waiting for connections={connections}, pending={pending}, active={active}, resident={resident}"
+        );
         let deadline = Instant::now() + Duration::from_millis(700);
         loop {
             let metrics = snapshot();
