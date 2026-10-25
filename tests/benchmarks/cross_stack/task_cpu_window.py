@@ -198,8 +198,17 @@ def run(spec):
     result = {"spec": spec, "started_ns": time.monotonic_ns(), "phases": [],
               "harness": helper_identity,
               "diagnostic_only": spec.get("diagnostic_only", False), "errors": []}
+    trace_pages = []
+    trace_enabled = spec["stack"] == "rust" and spec.get("env", {}).get("BENCH_CPU_TRACE") == "1"
+    if trace_enabled and not result["diagnostic_only"]:
+        raise ValueError("Rust trace must be a separate diagnostic window")
     service = None
     held = []
+    def metrics():
+        value = service.metrics()
+        if trace_enabled:
+            trace_pages.append(value.get("cpu_trace", {}))
+        return value
     try:
         service = harness.start(spec["stack"], 2, h.GIB, output/"service", spec.get("env", {}))
         result["startup"] = service.startup
@@ -223,7 +232,7 @@ def run(spec):
                         raise RuntimeError("idle holder response incomplete")
                     data += chunk
             result["held_idle_connections"] = count
-        result["metrics_before"] = service.metrics()
+        result["metrics_before"] = metrics()
         for index, phase in enumerate(spec["phases"]):
             profile = None
             log = None
@@ -259,18 +268,34 @@ def run(spec):
                                            stdout=log, stderr=subprocess.STDOUT, timeout=30)
                         if p.returncode:
                             result["errors"].append("perf_"+name+"_export_failed")
-        result["metrics_with_holders_after"] = service.metrics()
+        result["metrics_with_holders_after"] = metrics()
         for sock in held:
             sock.close()
         held.clear()
         deadline = time.monotonic()+5
         while time.monotonic() < deadline:
-            value = service.metrics()
+            value = metrics()
             if h.quiet_metrics(spec["stack"], value, require_database_metrics=False):
                 break
             time.sleep(.05)
         result["metrics_after"] = value
         result["quiet_after"] = h.quiet_metrics(spec["stack"], value, require_database_metrics=False)
+        if trace_enabled:
+            # Metrics drains at most 256 entries. Capture every page, including
+            # snapshots already consumed above, after the scored arrival window.
+            for _ in range(128):
+                if trace_pages[-1].get("pending") == 0:
+                    break
+                metrics()
+            events = [event for page in trace_pages for event in page.get("events", [])]
+            sequences = [event["sequence"] for event in events]
+            complete = (bool(trace_pages) and trace_pages[-1].get("pending") == 0
+                        and all(page.get("enabled") and page.get("dropped") == 0 for page in trace_pages)
+                        and sequences == list(range(1, trace_pages[-1].get("last_sequence", -1)+1)))
+            h.write_json(output/"rust-trace.json", {"pages": trace_pages, "complete": complete})
+            result["rust_trace"] = {"complete": complete, "pages": len(trace_pages), "events": len(events)}
+            if not complete:
+                result["errors"].append("rust_trace_incomplete")
     except BaseException as error:
         result["errors"].append(repr(error))
         raise

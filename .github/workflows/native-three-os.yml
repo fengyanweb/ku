@@ -196,6 +196,17 @@ jobs:
           cargo check --locked --workspace --all-targets
           cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Verify all eight guarded-range proof contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --lib backend::c::task_range::tests:: \
+            -- --list > "$RUNNER_TEMP/ku-range-tests.list"
+          cat "$RUNNER_TEMP/ku-range-tests.list"
+          test "$(grep -c '^backend::c::task_range::tests::.*: test$' "$RUNNER_TEMP/ku-range-tests.list")" -eq 8
+          cargo test --release --locked --lib backend::c::task_range::tests:: \
+            -- --nocapture --test-threads=1
+
       - name: Run affected native HTTP and Task regressions serially
         shell: bash
         run: |
@@ -206,9 +217,18 @@ jobs:
             --test native_task_control_test \
             --test native_task_driver_test \
             --test native_task_frame_c_test \
+            --test native_task_adapter_test \
+            --test native_task_cleanup_wait_test \
+            --test native_task_cleanup_commit_test \
+            --test native_task_scope_frame_test \
+            --test native_task_scope_adapter_test \
+            --test native_task_empty_scope_adapter_test \
+            --test native_task_await_progress_test \
+            --test native_task_runtime_deadline_test \
+            --test native_task_publishing_deadline_test \
             -- --nocapture --test-threads=1
 
-      - name: Check selected scalar, async I/O and batch boundaries with Linux detectors
+      - name: Check scalar growth, retained banks, async I/O and reset cleanup with Linux detectors
         if: runner.os == 'Linux'
         shell: bash
         env:
@@ -224,6 +244,15 @@ jobs:
           cargo test --release --locked --test native_http_test \
             native_http_task_io_batch_bounds_frozen_clocks_and_resets_before_every_wait \
             -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_task_source_test \
+            native_task_guarded_ranges_keep_growth_failures_and_original_error_order \
+            -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_task_source_test \
+            native_task_segments_keep_quantum_limits_and_explicit_intent_boundaries \
+            -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
+            native_http_reset_retires_async_work_but_write_half_close_keeps_response \
+            -- --exact --nocapture --test-threads=1
 
       - name: Install the pinned comparison driver toolchain
         if: runner.os == 'Linux'
@@ -236,6 +265,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          unset BENCH_PG_TEST_URL BENCH_DB_URL
           python3 -m unittest discover -s tests/benchmarks/cross_stack -p test_linux_harness.py
           (
             cd tests/benchmarks/cross_stack/client
@@ -244,10 +274,86 @@ jobs:
             go build -trimpath -mod=readonly -o "$RUNNER_TEMP/task-mix-driver" .
           )
           (
+            cd tests/benchmarks/cross_stack/go
+            go vet -mod=readonly ./...
+            go test -race -mod=readonly -timeout 60s ./...
+            go build -trimpath -mod=readonly -o "$RUNNER_TEMP/go-reference" .
+          )
+          (
             cd tests/benchmarks/cross_stack/rust
             cargo fmt --all -- --check
-            cargo test --release --locked cpu_work:: -- --nocapture
+            # The two private live-DB tests stay explicitly ignored.
+            cargo test --release --locked -- --nocapture --test-threads=1
           )
+
+  task-main-path-linux-arm64:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path'
+    name: Linux ARM64 normal CLI and matching native link
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_CC: "clang"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain and require a native Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustc --version --verbose
+          test "$(uname -m)" = aarch64
+          command -v clang
+          clang --version
+
+      - name: Build the normal CLI and verify its target resolver and host linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin ku
+          cargo test --release --locked --lib cli::tests::build_target_resolver_ \
+            -- --list > "$RUNNER_TEMP/ku-arm64-resolver-tests.list"
+          cat "$RUNNER_TEMP/ku-arm64-resolver-tests.list"
+          grep -Fx 'cli::tests::build_target_resolver_accepts_host_and_supported_targets: test' "$RUNNER_TEMP/ku-arm64-resolver-tests.list"
+          grep -Fx 'cli::tests::build_target_resolver_rejects_path_escape_and_unknown_targets: test' "$RUNNER_TEMP/ku-arm64-resolver-tests.list"
+          cargo test --release --locked --lib cli::tests::build_target_resolver_ \
+            -- --nocapture --test-threads=1
+          cargo test --release --locked --lib \
+            cli::tests::explicit_matching_host_target_links_when_a_native_toolchain_is_available \
+            -- --list > "$RUNNER_TEMP/ku-arm64-host-link-tests.list"
+          cat "$RUNNER_TEMP/ku-arm64-host-link-tests.list"
+          grep -Fx 'cli::tests::explicit_matching_host_target_links_when_a_native_toolchain_is_available: test' "$RUNNER_TEMP/ku-arm64-host-link-tests.list"
+          cargo test --release --locked --lib \
+            cli::tests::explicit_matching_host_target_links_when_a_native_toolchain_is_available \
+            -- --exact --nocapture --test-threads=1
+
+      - name: Compile and execute an ARM64 program through the normal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp -d "$RUNNER_TEMP/ku-task-arm64.XXXXXX")
+          trap 'rm -rf "$fixture"' EXIT
+          printf 'fn main(): null! { println(42) return ok(null) }\n' > "$fixture/main.ku"
+          target/release/ku --version
+          target/release/ku build --native --profile release --target aarch64-linux \
+            --offline "$fixture/main.ku" -o "$fixture/program"
+          python3 - "$fixture/program" <<'PYCODE'
+          import sys
+          with open(sys.argv[1], 'rb') as binary:
+              header = binary.read(20)
+          assert header[:6] == b'\x7fELF\x02\x01', 'expected ELF64 little-endian'
+          assert int.from_bytes(header[18:20], 'little') == 183, 'expected AArch64 ELF'
+          PYCODE
+          "$fixture/program" > "$fixture/actual.txt"
+          printf '42\n' | diff -u - "$fixture/actual.txt"
 
   full-tests:
     if: github.event_name != 'workflow_dispatch' || inputs.scope != 'task-main-path'
