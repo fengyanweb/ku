@@ -11,8 +11,8 @@
 #endif
 #if defined(__APPLE__)
 #include <sys/select.h>
-#define KU_HTTP_PAUSED_PEER_PROBE_MS 25u
 #endif
+#define KU_HTTP_PAUSED_PEER_PROBE_MS 25u
 #define KU_HTTP_MAX_SEGS 64
 /* Longest accepted request target, pinned to the interpreter's
    MAX_REQUEST_TARGET_BYTES (src/stdlib/http.rs). A longer target is answered with
@@ -1164,10 +1164,10 @@ static KuResult_null ku_http_listen_err(KuHttpServer* server, const char* messag
   ku_http_server_free(server);
   return (KuResult_null){ false, 0, ku_error_make(ku_string_static((const uint8_t*)"http", 4), ku_string_static((const uint8_t*)"listen_failed", 13), ku_string_static((const uint8_t*)message, strlen(message))) };
 }
-/* One shared socket owner, bounded input slots, and handler-only workers.
-   A slot remains charged while its independent job has any worker/queue owner,
-   even after its socket closes. Thus at most max_active slot/job obligations
-   coexist, plus max_pending accepted sockets and one bounded 503 owner. */
+/* C bounds stable/lazily touched connection records. A request lease is held
+   from first-byte admission through wire completion AND physical job/Task
+   retirement. Idle transports do not own A. Raw transports and existing
+   request identities share one bounded P FIFO and the existing 503 owner. */
 #define KU_HTTP_WORKER_CAP 64
 #define KU_HTTP_ACCEPT_PEER_BACKOFF_CAP_MS 8
 #define KU_HTTP_ACCEPT_RESOURCE_RETRY_CAP 8
@@ -1717,13 +1717,16 @@ enum {
   KU_HTTP_IO_FREE = 0, KU_HTTP_IO_HEADER = 1, KU_HTTP_IO_BODY = 2,
   KU_HTTP_IO_JOB = 3, KU_HTTP_IO_WRITE = 4, KU_HTTP_IO_CLOSED_JOB = 5,
   KU_HTTP_IO_REJECT = 6, KU_HTTP_IO_REUSE_WAIT = 7,
-  KU_HTTP_IO_ASYNC = 8, KU_HTTP_IO_CLOSED_ASYNC = 9
+  KU_HTTP_IO_ASYNC = 8, KU_HTTP_IO_CLOSED_ASYNC = 9,
+  KU_HTTP_IO_REQUEST_WAIT = 10
 };
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
   int* indices;
   int count,capacity,free_head,high_water;
   size_t sockets;
+  int request_limit,request_active,request_peak;
+  struct KuHttpPending* pending;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   struct KuHttpReactor* reactor;
 #endif
@@ -1738,6 +1741,8 @@ typedef struct KuHttpConnection {
   int work_position,idle_position;
 #endif
   int phase; int poll_index; int management;
+  int request_lease,request_queued,pending_index,header_started;
+  unsigned long long request_wait_probe_deadline;
   uint64_t connection_slot,connection_generation,request_sequence;
   unsigned char request_id[48]; uint32_t request_id_length,request_id_truncated;
   KuHttpFailure failure;
@@ -1758,6 +1763,22 @@ typedef struct KuHttpConnection {
   size_t rejected_bytes; size_t rejected_seen; unsigned char rejected_window[4];
 } KuHttpConnection;
 typedef struct { int slot; uint64_t generation; } KuHttpPollConnection;
+static int ku_http_request_prepare(KuHttpConnection*,KuHttpServer*);
+static void ku_http_request_cancel_pending(KuHttpConnection*);
+static int ku_http_request_lease_take(KuHttpConnection* connection) {
+  KuHttpActiveSet* active=connection->active_set;
+  if(!active || connection->management || connection->request_lease) return 1;
+  if(active->request_active>=active->request_limit) return 0;
+  connection->request_lease=1;active->request_active++;
+  if(active->request_active>active->request_peak) active->request_peak=active->request_active;
+  return 1;
+}
+static void ku_http_request_lease_release(KuHttpConnection* connection) {
+  if(!connection->request_lease) return;
+  KuHttpActiveSet* active=connection->active_set;
+  if(!active || active->request_active<=0) {fputs("http request lease refund invariant failed\n",stderr);exit(1);}
+  connection->request_lease=0;active->request_active--;
+}
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
 static void ku_http_reactor_admit(KuHttpActiveSet*,KuHttpConnection*);
 static void ku_http_reactor_retire(KuHttpConnection*);
@@ -1846,6 +1867,7 @@ static int ku_http_async_retire(KuHttpConnection*);
 static void ku_http_count_response(int);
 static void ku_http_count_admitted(void);
 static void ku_http_connection_close(KuHttpConnection* connection) {
+  ku_http_request_cancel_pending(connection);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   /* Delete the old full-generation registration before close can recycle fd. */
   ku_http_reactor_forget(connection);
@@ -1884,6 +1906,8 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
     return;
   }
   if (connection->job) ku_http_job_release(connection->job);
+  /* No queued/worker reference and no Task handle survives this boundary. */
+  ku_http_request_lease_release(connection);
   ku_http_active_retire(connection);
   KuHttpActiveSet* active=connection->active_set;
   int free_next=connection->free_next;
@@ -1893,11 +1917,13 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
   memset(connection, 0, sizeof(*connection));
   connection->socket_value = KU_HTTP_INVALID_SOCKET;
   connection->active_set=active; connection->active_position=-1; connection->free_next=free_next;
+  connection->pending_index=-1;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   connection->reactor=reactor; connection->work_position=-1; connection->idle_position=-1;
 #endif
 }
 static void ku_http_connection_response(KuHttpConnection* connection, KuHttpServer* server, KuStruct___ku_http_response response, size_t response_charge, int admitted) {
+  ku_http_request_cancel_pending(connection);
 #if defined(__APPLE__)
   connection->peer_error_probe_deadline=0;
 #endif
@@ -1964,6 +1990,7 @@ static void ku_http_connection_start(KuHttpConnection* connection, KuHttpActiveS
 #endif
   memset(connection, 0, sizeof(*connection));
   connection->active_set=active; connection->active_position=position;
+  connection->pending_index=-1;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   connection->reactor=active?active->reactor:NULL;
   connection->work_position=work_position; connection->idle_position=-1;
@@ -1974,11 +2001,7 @@ static void ku_http_connection_start(KuHttpConnection* connection, KuHttpActiveS
   ku_http_connection_identity(connection);
   connection->request_sequence=1;
   connection->request_deadline = ku_http_deadline_ms(server->request_timeout_ms);
-  if (!ku_http_buffer_reserve(connection->budget, 1024)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection, server, 503); return; }
-  connection->capacity = 1024;
-  connection->header = (char*)malloc(connection->capacity);
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); }
 }
 /* A response may be published before the worker releases its real reference.
    Reuse the physical slot only after that owner retires, exactly as close does. */
@@ -1991,11 +2014,14 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
     connection->phase = KU_HTTP_IO_REUSE_WAIT; connection->deadline = 0; return;
   }
   if (connection->job) { ku_http_job_release(connection->job); connection->job = NULL; }
+  ku_http_request_lease_release(connection);
   ku_drop_struct___ku_http_response(&connection->output.response);
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
   memset(&connection->output, 0, sizeof(connection->output));
   connection->keep_alive = 0; connection->reused = 1;
-  if(connection->request_sequence!=UINT64_MAX) connection->request_sequence++;
+  if(connection->request_sequence==UINT64_MAX) {ku_http_connection_close(connection);return;}
+  connection->request_sequence++;
+  connection->header_started=0;connection->request_wait_probe_deadline=0;
   connection->request_id_length=0; connection->request_id_truncated=0;
   connection->peer_read_paused=0;
 #if defined(__APPLE__)
@@ -2004,12 +2030,8 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   connection->failure=(KuHttpFailure){0};
   connection->request_deadline = 0;
   connection->buffered = 0; connection->body_received = 0;
-  if (!ku_http_buffer_reserve(connection->budget, 1024)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection, server, 503); return; }
-  connection->capacity = 1024;
-  connection->header = (char*)malloc(connection->capacity);
   connection->phase = KU_HTTP_IO_HEADER;
   connection->deadline = ku_http_deadline_ms((uint32_t)(server->idle_timeout_ms > 0 ? server->idle_timeout_ms : 5000));
-  if (!connection->header) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); }
 }
 static int ku_http_control_request(KuHttpConnection*, KuHttpServer*);
 static void ku_http_count_request(void);
@@ -2046,6 +2068,13 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 }
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
+  if (!ku_http_request_prepare(connection,server)) return;
+  /* Empty C-only sockets do not allocate input backing or consume A. */
+  if (!connection->header) {
+    if (!ku_http_buffer_reserve(connection->budget,1024u)) {connection->failure.reason=KU_HTTP_ERROR_PROJECTION;ku_http_connection_status(connection,server,503);return;}
+    connection->capacity=1024u;connection->header=(char*)malloc(connection->capacity);
+    if (!connection->header) {connection->failure.reason=KU_HTTP_ERROR_ALLOCATION;ku_http_connection_status(connection,server,500);return;}
+  }
   char incoming[KU_HTTP_READ_CHUNK];
   int received;
   if (connection->carry_length) {
@@ -2093,7 +2122,10 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   memcpy(connection->header + scan_from, incoming, (size_t)received);
   connection->buffered = needed;
   if (!scan_from && !connection->request_deadline) connection->request_deadline = ku_http_deadline_ms(server->request_timeout_ms);
-  if (!scan_from) connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_header_timeout_ms > 0 ? server->read_header_timeout_ms : 5000));
+  if (!scan_from && !connection->header_started) {
+    connection->header_started=1;
+    connection->deadline = ku_http_deadline_ms((uint32_t)(server->read_header_timeout_ms > 0 ? server->read_header_timeout_ms : 5000));
+  }
   long long max_header = server->max_header_bytes > 0 ? server->max_header_bytes : (16 * 1024);
   for (size_t index = scan_from; index < needed; index++) {
     const char* header = connection->header;
@@ -2252,29 +2284,255 @@ static void ku_http_reject_read(KuHttpConnection* connection, KuHttpServer* serv
     if (done) { ku_http_connection_status(connection, server, 503); return; }
   }
 }
-/* Pending sockets carry permits, but no input allocation, job, or worker. */
-typedef struct { KuHttpSocket socket_value; unsigned long long deadline; } KuHttpPendingItem;
-typedef struct { KuHttpPendingItem* items; int cap; int head; int tail; int count; } KuHttpPending;
-static void ku_http_pending_activate(KuHttpPending* pending, KuHttpActiveSet* active, KuHttpServer* server) {
-  while (pending->count) {
-    int slot = ku_http_free_slot(active);
-    if (slot < 0) break;
-    KuHttpPendingItem item = pending->items[pending->head];
-    KuHttpSocket socket_value = item.socket_value;
-    pending->head = (pending->head + 1) % pending->cap;
-    pending->count--;
-    ku_http_connection_start(&active->connections[slot], active, socket_value, server);
-    active->connections[slot].request_deadline = item.deadline;
+/* One indexed P FIFO owns either a raw accepted fd or one existing request
+ * identity. Existing-connection nodes never own/close that connection's fd.
+ * Doubly linked fixed nodes allow middle cancellation to refund P once. */
+enum { KU_HTTP_PENDING_FREE=0,KU_HTTP_PENDING_RAW=1,KU_HTTP_PENDING_REQUEST=2 };
+typedef struct {
+  int kind,previous,next,slot,poll_index,probe_only;
+  KuHttpSocket socket_value;
+  uint64_t queue_generation,connection_generation,request_sequence;
+  unsigned long long deadline,probe_deadline;
+} KuHttpPendingItem;
+typedef struct KuHttpPending {
+  KuHttpPendingItem* items;
+  int cap,head,tail,free_head,count,raw_count;
+  uint64_t generation;
+  KuHttpActiveSet* active;
+} KuHttpPending;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+static void ku_http_reactor_pending_forget(KuHttpActiveSet*,int);
+static void ku_http_reactor_refresh(KuHttpConnection*);
+#endif
+static void ku_http_connection_observe_peer(KuHttpConnection*,short,int);
+static void ku_http_pending_init(KuHttpPending* pending,KuHttpActiveSet* active) {
+  pending->head=pending->tail=-1;pending->free_head=pending->cap?0:-1;pending->active=active;
+  active->pending=pending;
+  for(int i=0;i<pending->cap;i++) pending->items[i].next=i+1<pending->cap?i+1:-1;
+}
+static int ku_http_pending_append(KuHttpPending* pending) {
+  if(pending->count>=pending->cap || pending->free_head<0 || pending->generation==UINT64_MAX) return -1;
+  int index=pending->free_head;KuHttpPendingItem* item=&pending->items[index];
+  pending->free_head=item->next;
+  *item=(KuHttpPendingItem){.previous=pending->tail,.next=-1,.slot=-1,.poll_index=-1,
+      .socket_value=KU_HTTP_INVALID_SOCKET,.queue_generation=++pending->generation};
+  if(pending->tail>=0) pending->items[pending->tail].next=index;else pending->head=index;
+  pending->tail=index;pending->count++;return index;
+}
+static void ku_http_pending_unlink(KuHttpPending* pending,int index) {
+  if(index<0 || index>=pending->cap || pending->items[index].kind==KU_HTTP_PENDING_FREE) {
+    fputs("http pending identity refund invariant failed\n",stderr);exit(1);
+  }
+  KuHttpPendingItem* item=&pending->items[index];
+  if(item->kind==KU_HTTP_PENDING_RAW) {
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_pending_forget(pending->active,index);
+#endif
+    pending->raw_count--;
+  }
+  if(item->previous>=0) pending->items[item->previous].next=item->next;else pending->head=item->next;
+  if(item->next>=0) pending->items[item->next].previous=item->previous;else pending->tail=item->previous;
+  *item=(KuHttpPendingItem){.kind=KU_HTTP_PENDING_FREE,.next=pending->free_head};
+  pending->free_head=index;pending->count--;
+}
+static KuHttpConnection* ku_http_pending_connection(KuHttpPending* pending,int index) {
+  if(index<0 || index>=pending->cap) return NULL;
+  const KuHttpPendingItem* item=&pending->items[index];
+  if(item->kind!=KU_HTTP_PENDING_REQUEST || item->slot<0 || item->slot>=pending->active->high_water) return NULL;
+  KuHttpConnection* connection=&pending->active->connections[item->slot];
+  if(connection->active_set!=pending->active || connection->active_position<0
+      || !connection->request_queued || connection->pending_index!=index
+      || connection->connection_generation!=item->connection_generation
+      || connection->request_sequence!=item->request_sequence) return NULL;
+  return connection;
+}
+static void ku_http_request_cancel_pending(KuHttpConnection* connection) {
+  if(!connection->request_queued) return;
+  KuHttpPending* pending=connection->active_set?connection->active_set->pending:NULL;
+  if(pending && ku_http_pending_connection(pending,connection->pending_index)==connection)
+    ku_http_pending_unlink(pending,connection->pending_index);
+  connection->request_queued=0;connection->pending_index=-1;connection->request_wait_probe_deadline=0;
+}
+static void ku_http_pending_bind_request(KuHttpPending* pending,int index,KuHttpConnection* connection) {
+  KuHttpPendingItem* item=&pending->items[index];
+  item->kind=KU_HTTP_PENDING_REQUEST;item->socket_value=KU_HTTP_INVALID_SOCKET;
+  item->slot=(int)(connection-pending->active->connections);
+  item->connection_generation=connection->connection_generation;item->request_sequence=connection->request_sequence;
+  connection->request_queued=1;connection->pending_index=index;connection->phase=KU_HTTP_IO_REQUEST_WAIT;
+#if defined(__APPLE__)
+  connection->request_wait_probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+#endif
+}
+static int ku_http_pending_push_request(KuHttpPending* pending,KuHttpConnection* connection) {
+  if(connection->request_queued) return 1;
+  int index=ku_http_pending_append(pending);if(index<0) return 0;
+  pending->items[index].deadline=connection->request_deadline<connection->deadline?connection->request_deadline:connection->deadline;
+  ku_http_pending_bind_request(pending,index,connection);return 1;
+}
+static int ku_http_pending_push_raw(KuHttpPending* pending,KuHttpSocket fd,unsigned long long deadline) {
+  int index=ku_http_pending_append(pending);if(index<0) return 0;
+  KuHttpPendingItem* item=&pending->items[index];
+  item->kind=KU_HTTP_PENDING_RAW;item->socket_value=fd;item->deadline=deadline;pending->raw_count++;
+#if defined(__APPLE__)
+  item->probe_only=1;item->probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+#endif
+  return 1;
+}
+/* A single nonconsuming observation establishes the first-byte deadline.
+ * Queuing and later A transfer never refresh either original absolute D. */
+static int ku_http_request_observe_start(KuHttpConnection* connection,KuHttpServer* server) {
+  int available=connection->carry_length!=0;
+  if(!available) {
+    char byte;int count=recv(connection->socket_value,&byte,1,MSG_PEEK);
+    if(count<0) {
+      int error=ku_http_socket_last_error();
+      if(ku_http_socket_would_block(error) || ku_http_socket_error_interrupted(error)) return 0;
+      ku_http_connection_close(connection);return 0;
+    }
+    if(!count) {
+      if(connection->reused) ku_http_connection_close(connection);
+      else ku_http_connection_status(connection,server,400);
+      return 0;
+    }
+  }
+  if(!connection->header_started) {
+    connection->header_started=1;
+    if(!connection->request_deadline) connection->request_deadline=ku_http_deadline_ms(server->request_timeout_ms);
+    connection->deadline=ku_http_deadline_ms((uint32_t)(server->read_header_timeout_ms>0?server->read_header_timeout_ms:5000));
+    if(connection->request_deadline<connection->deadline) connection->deadline=connection->request_deadline;
+  }
+  return 1;
+}
+static int ku_http_request_prepare(KuHttpConnection* connection,KuHttpServer* server) {
+  if(connection->management || !connection->active_set || connection->request_lease) return 1;
+  if(connection->request_queued) return 0;
+  if(connection->reused && !ku_http_reused_request_admit()) {ku_http_connection_close(connection);return 0;}
+  if(!ku_http_request_observe_start(connection,server)) return 0;
+  KuHttpPending* pending=connection->active_set->pending;
+  if(!pending->count && ku_http_request_lease_take(connection)) return 1;
+  if(!ku_http_pending_push_request(pending,connection)) {
+    connection->failure.reason=KU_HTTP_ERROR_QUEUE;ku_http_connection_status(connection,server,503);
+  }
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+  ku_http_reactor_refresh(connection);
+#endif
+  return 0;
+}
+static void ku_http_pending_raw_close(KuHttpPending* pending,int index) {
+  KuHttpSocket fd=pending->items[index].socket_value;
+  ku_http_pending_unlink(pending,index);ku_http_socket_close(fd);ku_http_atomic_decrement(&ku_http_active_conns);
+}
+static int ku_http_pending_peer_error(KuHttpSocket fd) {
+  int error=0;
+#if defined(_WIN32)
+  int length=(int)sizeof(error);
+  if(getsockopt(fd,SOL_SOCKET,SO_ERROR,(char*)&error,&length)) error=ku_http_socket_last_error();
+#else
+  socklen_t length=(socklen_t)sizeof(error);
+  if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&length)) error=ku_http_socket_last_error();
+#endif
+  return error && !ku_http_socket_would_block(error) && !ku_http_socket_error_interrupted(error);
+}
+static unsigned long long ku_http_pending_maintain(KuHttpPending* pending,KuHttpServer* server,unsigned long long now) {
+  unsigned long long nearest=UINT64_MAX;
+  for(int index=pending->head;index>=0;) {
+    KuHttpPendingItem item=pending->items[index];int next=item.next;
+    if(item.kind==KU_HTTP_PENDING_REQUEST) {
+      KuHttpConnection* connection=ku_http_pending_connection(pending,index);
+      if(!connection) {ku_http_pending_unlink(pending,index);index=next;continue;}
+      if(now>=item.deadline) {ku_http_connection_status(connection,server,408);index=next;continue;}
+      if(connection->request_wait_probe_deadline && now>=connection->request_wait_probe_deadline) {
+        connection->request_wait_probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+        ku_http_connection_observe_peer(connection,0,1);
+        if(!connection->request_queued) {index=next;continue;}
+      }
+      if(connection->request_wait_probe_deadline && connection->request_wait_probe_deadline<nearest)
+        nearest=connection->request_wait_probe_deadline;
+    } else if(item.kind==KU_HTTP_PENDING_RAW) {
+      if(now>=item.deadline || (item.probe_deadline && now>=item.probe_deadline && ku_http_pending_peer_error(item.socket_value))) {
+        ku_http_pending_raw_close(pending,index);index=next;continue;
+      }
+      if(item.probe_deadline && now>=item.probe_deadline)
+        pending->items[index].probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+      if(pending->items[index].probe_deadline && pending->items[index].probe_deadline<nearest)
+        nearest=pending->items[index].probe_deadline;
+    }
+    if(item.deadline<nearest) nearest=item.deadline;
+    index=next;
+  }
+  return nearest;
+}
+static int ku_http_pending_activate(KuHttpPending* pending,KuHttpActiveSet* active,KuHttpServer* server) {
+  int revisit=0;
+  for(int turn=0;turn<64 && pending->count;turn++) {
+    int index=pending->head;KuHttpPendingItem item=pending->items[index];
+    if(item.kind==KU_HTTP_PENDING_RAW) {
+      int slot=ku_http_free_slot(active);if(slot<0) break;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+      ku_http_reactor_pending_forget(active,index);
+#endif
+      if(ku_http_now_ms()>=item.deadline) {ku_http_pending_raw_close(pending,index);continue;}
+      pending->raw_count--;
+      ku_http_connection_start(&active->connections[slot],active,item.socket_value,server);
+      KuHttpConnection* connection=&active->connections[slot];
+      connection->request_deadline=item.deadline;
+      if(item.deadline<connection->deadline) connection->deadline=item.deadline;
+      ku_http_pending_bind_request(pending,index,connection);
+      connection->phase=KU_HTTP_IO_HEADER;
+      if(!ku_http_request_observe_start(connection,server)) {
+        if(connection->request_queued) ku_http_request_cancel_pending(connection);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+        ku_http_reactor_refresh(connection);
+#endif
+        revisit=1;continue;
+      }
+      connection->phase=KU_HTTP_IO_REQUEST_WAIT;
+      if(connection->deadline<pending->items[index].deadline) pending->items[index].deadline=connection->deadline;
+    }
+    KuHttpConnection* connection=ku_http_pending_connection(pending,index);
+    if(!connection) {ku_http_pending_unlink(pending,index);continue;}
+    unsigned long long now=ku_http_now_ms();
+    if(now>=pending->items[index].deadline) {ku_http_connection_status(connection,server,408);revisit=1;continue;}
+    if(!ku_http_request_lease_take(connection)) break;
+    ku_http_pending_unlink(pending,index);
+    connection->request_queued=0;connection->pending_index=-1;connection->request_wait_probe_deadline=0;
+    connection->phase=KU_HTTP_IO_HEADER;
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_refresh(connection);
+#endif
+    if(connection->carry_length) revisit=1;
+  }
+  return revisit;
+}
+/* Waiting requests never subscribe to READ: queued bytes are retained without
+ * level-triggered spinning. A legal FIN is kept; after HUP use bounded error
+ * probes so a later RST cannot hide behind the retained pipeline bytes. */
+static void ku_http_pending_ready(KuHttpPending* pending,int index,short events) {
+  KuHttpPendingItem* item=&pending->items[index];
+  if(item->kind!=KU_HTTP_PENDING_RAW || !events) return;
+  if((events&POLLNVAL) || ku_http_pending_peer_error(item->socket_value)) {
+    ku_http_pending_raw_close(pending,index);return;
+  }
+  if(events&(POLLERR|POLLHUP)) {
+    char byte;int received=recv(item->socket_value,&byte,1,MSG_PEEK);
+    if(!received || (received<0 && !ku_http_socket_would_block(ku_http_socket_last_error())
+        && !ku_http_socket_error_interrupted(ku_http_socket_last_error()))) {
+      ku_http_pending_raw_close(pending,index);return;
+    }
+    item->probe_only=1;item->probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
+    ku_http_reactor_pending_forget(pending->active,index);
+#endif
   }
 }
 static void ku_http_pending_close(KuHttpPending* pending) {
-  while (pending->count) {
-    KuHttpPendingItem item = pending->items[pending->head];
-    KuHttpSocket socket_value = item.socket_value;
-    pending->head = (pending->head + 1) % pending->cap;
-    pending->count--;
-    ku_http_socket_close(socket_value);
-    ku_http_atomic_decrement(&ku_http_active_conns);
+  while(pending->count) {
+    int index=pending->head;
+    if(pending->items[index].kind==KU_HTTP_PENDING_RAW) ku_http_pending_raw_close(pending,index);
+    else {
+      KuHttpConnection* connection=ku_http_pending_connection(pending,index);
+      if(connection) ku_http_connection_close(connection);else ku_http_pending_unlink(pending,index);
+    }
   }
 }
 static void ku_http_poll_add(KuHttpPollFd* items, int* count, KuHttpSocket socket_value, short events) {
@@ -2317,12 +2575,13 @@ static int ku_http_parse_ipv4(const char* text, unsigned long* network_order) {
 typedef struct KuHttpLoopGroup KuHttpLoopGroup;
 typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
-  int index, slots, pending, workers, ready, exited, drained;
+  int index, slots, request_limit, pending, workers, ready, exited, drained;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
   KuHttpConnection* connection_base; uint64_t connection_generation;
   uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
   unsigned long long transport_closes[KU_HTTP_CLOSE_REASON_COUNT];
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
+  size_t active_requests,peak_active_requests;
   KuHttpWake* wake;
 #if defined(_WIN32)
   HANDLE thread;
@@ -2697,8 +2956,9 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
       KuHttpLoopOwner* owner = &group->loops[i];
       uint64_t sampled_now=ku_http_now_ms();
       uint64_t sample_age=sampled_now>=owner->cpu_sample_ms ? sampled_now-owner->cpu_sample_ms : 0;
-      n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
+      n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"active_requests\":%llu,\"peak_active_requests\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
         i?",":"",i,owner->accepted,owner->requests,(unsigned long long)owner->queued,(unsigned long long)owner->running,(unsigned long long)owner->resident,(unsigned long long)owner->connections,(unsigned long long)owner->pending_count,
+        (unsigned long long)owner->active_requests,(unsigned long long)owner->peak_active_requests,
         (unsigned long long)owner->cpu_ns,(unsigned long long)owner->cpu_sample_ms,(unsigned long long)sample_age,(unsigned long long)owner->cpu_clock_errors);
       if (n<0 || (size_t)n>=management_capacity-used) _Exit(79);
       used+=(size_t)n;
@@ -2972,8 +3232,8 @@ typedef struct {
   short events;
 } KuHttpReadyEvent;
 typedef struct KuHttpReactor {
-  int descriptor,fault,slots,work_count,idle_count;
-  size_t capacity,hash_capacity,old_net_count,ready_count;
+  int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
+  size_t capacity,hash_capacity,old_net_count,ready_count,pending_base;
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
@@ -3000,6 +3260,12 @@ static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
   return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
       +ku_http_reactor_hash_capacity(capacity)*sizeof(KuHttpRegistrationHash)
       +slots*2u*sizeof(int);
+}
+static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size_t pending) {
+  size_t before=slots+3u+net,after=before+pending;
+  return ku_http_reactor_storage_bytes(slots,net)
+      +pending*sizeof(KuHttpRegistration)
+      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*sizeof(KuHttpRegistrationHash);
 }
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
   token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
@@ -3130,8 +3396,8 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
 }
 static int ku_http_reactor_idle(const KuHttpConnection* c) {
-  return c->phase==KU_HTTP_IO_HEADER && c->reused && !c->buffered && !c->carry_length
-      && !c->job && !c->async_task && !c->request_deadline
+  return c->phase==KU_HTTP_IO_HEADER && !c->request_lease && !c->request_queued && !c->buffered && !c->carry_length
+      && !c->job && !c->async_task
       && c->deadline && c->deadline!=UINT64_MAX && c->socket_value!=KU_HTTP_INVALID_SOCKET;
 }
 static short ku_http_reactor_connection_events(const KuHttpConnection* c) {
@@ -3141,10 +3407,14 @@ static short ku_http_reactor_connection_events(const KuHttpConnection* c) {
     return KU_HTTP_POLL_READ;
   return 0;
 }
+static unsigned long long ku_http_reactor_connection_idle_deadline(const KuHttpConnection* c) {
+  return c->request_deadline && c->request_deadline<c->deadline?c->request_deadline:c->deadline;
+}
 static int ku_http_reactor_heap_before(KuHttpReactor* r,int left,int right) {
   const KuHttpConnection* a=&r->active->connections[left];
   const KuHttpConnection* b=&r->active->connections[right];
-  return a->deadline<b->deadline || (a->deadline==b->deadline && left<right);
+  unsigned long long ad=ku_http_reactor_connection_idle_deadline(a),bd=ku_http_reactor_connection_idle_deadline(b);
+  return ad<bd || (ad==bd && left<right);
 }
 static void ku_http_reactor_heap_swap(KuHttpReactor* r,int a,int b) {
   int slot=r->idle_heap[a];r->idle_heap[a]=r->idle_heap[b];r->idle_heap[b]=slot;
@@ -3167,6 +3437,7 @@ static void ku_http_reactor_heap_fix(KuHttpReactor* r,int position) {
 static void ku_http_reactor_idle_remove(KuHttpReactor* r,KuHttpConnection* c) {
   int position=c->idle_position;if(position<0) return;
   if(position>=r->idle_count || &r->active->connections[r->idle_heap[position]]!=c) {r->fault=1;return;}
+  if(!c->reused) r->idle_initial_count--;
   int last=r->idle_heap[--r->idle_count];c->idle_position=-1;
   if(position<r->idle_count) {
     r->idle_heap[position]=last;r->active->connections[last].idle_position=position;
@@ -3200,26 +3471,31 @@ static void ku_http_reactor_forget(KuHttpConnection* c) {
     ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_add(r,c);
   }
 }
+static void ku_http_reactor_pending_forget(KuHttpActiveSet* active,int index) {
+  if(active && active->reactor) ku_http_reactor_delete(active->reactor,active->reactor->pending_base+(size_t)index);
+}
 static void ku_http_reactor_refresh(KuHttpConnection* c) {
   KuHttpReactor* r=c->reactor;
   if(!r || !c->active_set || c->active_position<0) return;
-  if(ku_http_reactor_idle(c)) {
+  if(!r->draining && ku_http_reactor_idle(c)) {
     ku_http_reactor_work_remove(r,c);
     if(c->idle_position<0) {
       if(r->idle_count>=r->slots) {r->fault=1;return;}
       c->idle_position=r->idle_count;r->idle_heap[r->idle_count++]=(int)(c-r->active->connections);
+      if(!c->reused) r->idle_initial_count++;
     }
     ku_http_reactor_heap_fix(r,c->idle_position);
   } else {
     ku_http_reactor_idle_remove(r,c);ku_http_reactor_work_add(r,c);
   }
-  int watch=c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB;
+  int watch=c->phase==KU_HTTP_IO_ASYNC || c->phase==KU_HTTP_IO_JOB
+      || (c->phase==KU_HTTP_IO_REQUEST_WAIT && !c->request_wait_probe_deadline);
   ku_http_reactor_interest(r,(size_t)(c-r->active->connections),
       (watch || ku_http_reactor_connection_events(c))?c->socket_value:KU_HTTP_INVALID_SOCKET,
       ku_http_reactor_connection_events(c),c->connection_generation,-1);
 }
 static unsigned long long ku_http_reactor_idle_deadline(const KuHttpReactor* r) {
-  return r->idle_count?r->active->connections[r->idle_heap[0]].deadline:UINT64_MAX;
+  return r->idle_count?ku_http_reactor_connection_idle_deadline(&r->active->connections[r->idle_heap[0]]):UINT64_MAX;
 }
 static int ku_http_reactor_event_valid(const KuHttpReactor* r,const KuHttpReadyEvent* event) {
   if(event->entry>=r->capacity) return 0;
@@ -3263,9 +3539,10 @@ static void ku_http_reactor_destroy(KuHttpReactor* r) {
   free(r->registrations);free(r->hash);free(r->work);free(r->idle_heap);
   r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->work=NULL;r->idle_heap=NULL;
 }
-static int ku_http_reactor_init(KuHttpReactor* r,KuHttpActiveSet* active,size_t net) {
+static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active,size_t net,size_t pending) {
   memset(r,0,sizeof(*r));r->descriptor=-1;r->slots=active->capacity;r->active=active;
-  r->capacity=(size_t)r->slots+3u+net;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
+  r->pending_base=(size_t)r->slots+3u+net;
+  r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
   r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
@@ -3275,10 +3552,13 @@ static int ku_http_reactor_init(KuHttpReactor* r,KuHttpActiveSet* active,size_t 
   r->descriptor=kqueue();
   if(r->descriptor>=0 && fcntl(r->descriptor,F_SETFD,FD_CLOEXEC)<0) {close(r->descriptor);r->descriptor=-1;}
 #endif
-  if(r->descriptor<0 || !r->registrations || !r->hash || !r->work || !r->idle_heap) {
+  if(r->descriptor<0 || !r->registrations || !r->hash || (r->slots && (!r->work || !r->idle_heap))) {
     ku_http_reactor_destroy(r);return 0;
   }
   active->reactor=r;return 1;
+}
+static int ku_http_reactor_init(KuHttpReactor* r,KuHttpActiveSet* active,size_t net) {
+  return ku_http_reactor_init_pending(r,active,net,0);
 }
 #endif
 /* End persistent owner reactor. */
@@ -3289,8 +3569,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   long max_conn = (long)server->max_connections;
   int max_pending = owner->pending;
   int slot_count = owner->slots;
+  int request_limit = owner->request_limit;
   int nworkers = owner->workers;
-  size_t poll_capacity=(size_t)slot_count+3u,net_capacity=0,net_bytes=0;
+  size_t poll_capacity=(size_t)slot_count+(size_t)max_pending+3u,net_capacity=0,net_bytes=0;
 #if defined(KU_HTTP_HAS_TASK_NET)
   net_capacity=ku_http_task_net_capacity(group->tasks);
   if(!net_capacity || net_capacity>KU_TASK_NET_POLL_CAPACITY)return "Task network capacity invalid";
@@ -3299,10 +3580,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   /* Configuration limits bound all products below on every supported target.
      One receipt includes every owner array; no Task/connection consumes an
      independent copy of the service's configured byte budget. */
-  size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int)+sizeof(KuHttpPollConnection)+sizeof(KuHttpJob*))
+  size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int)+sizeof(KuHttpPollConnection))
+      +(size_t)request_limit*sizeof(KuHttpJob*)
       +poll_capacity*sizeof(KuHttpPollFd)+(size_t)max_pending*sizeof(KuHttpPendingItem)+net_bytes;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-  fixed_bytes+=ku_http_reactor_storage_bytes((size_t)slot_count,net_capacity);
+  fixed_bytes+=ku_http_reactor_pending_storage_bytes((size_t)slot_count,net_capacity,(size_t)max_pending);
 #endif
 #if defined(_WIN32)
   fixed_bytes+=(size_t)nworkers*sizeof(HANDLE);
@@ -3321,19 +3603,21 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
 #endif
-  KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count,.free_head=-1};
+  KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count,.free_head=-1,.request_limit=request_limit};
   KuHttpPending pending={0};pending.cap=max_pending;
   pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));
-  if(!connections || !poll_items || !pending.items || !active_indices || !poll_connections || (net_bytes && !net_storage)) {
+  if((slot_count && (!connections || !active_indices || !poll_connections))
+      || !poll_items || !pending.items || (net_bytes && !net_storage)) {
     free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
     return "reactor allocation failed";
   }
+  ku_http_pending_init(&pending,&active);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   KuHttpReactor reactor;
-  if(!ku_http_reactor_init(&reactor,&active,net_capacity)) {
+  if(!ku_http_reactor_init_pending(&reactor,&active,net_capacity,(size_t)max_pending)) {
     free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
@@ -3358,9 +3642,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     return "reactor wake initialization failed";
   }
   KuHttpQueue queue;
-  /* At most one job per active slot; socket pending is a separate FIFO whose
-     original max_pending bound is not duplicated by another pending job pool. */
-  if (!ku_http_queue_init(&queue, slot_count, &wake)) {
+  /* Jobs and Task slots remain bounded by A, independently of C records.
+     Raw sockets and existing waiting requests share the single P FIFO. */
+  if (!ku_http_queue_init(&queue, request_limit, &wake)) {
     ku_http_wake_close(&wake);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     ku_http_reactor_destroy(&reactor);
@@ -3416,7 +3700,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     size_t queued = (size_t)queue.count, running = queue.running, resident = queue.resident;
     size_t queued_bytes=queue.queued_bytes, peak_queued_bytes=queue.peak_queued_bytes;
     ku_http_mutex_unlock(&queue.lock);
-    size_t occupied_connections=active.sockets;
+    size_t occupied_connections=active.sockets+(size_t)pending.raw_count;
+    int occupied_requests=active.request_active;
     uint64_t sampled_cpu_ns=0, sampled_cpu_ms=ku_http_now_ms();
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     int task_io_pending_seen=pending.count!=0;
@@ -3430,6 +3715,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     owner->queued = queued; owner->running = running; owner->resident = resident;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
+    owner->active_requests=(size_t)active.request_active;owner->peak_active_requests=(size_t)active.request_peak;
     owner->heartbeat = ku_http_now_ms();
     if (owner->heartbeat >= health_deadline) {
       unsigned long long lag=owner->heartbeat-health_deadline;
@@ -3476,13 +3762,16 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     if (pumped > 1u && !listen_failure) listen_failure = "HTTP Task event loop failed";
 #endif
     unsigned long long now = ku_http_now_ms();
+    unsigned long long pending_deadline=ku_http_pending_maintain(&pending,server,now);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     /* Idle sockets are touched only for a due deadline, bounded admission
      * pressure, drain or actual kernel readiness. Move candidates to the work
      * list before its reverse pass; list/heap storage never duplicates slots. */
+    reactor.draining=!listening || listen_failure;
     for(unsigned int turn=0;turn<64u && reactor.idle_count;turn++) {
-      if(listening && !listen_failure && !pending.count && ku_http_reactor_idle_deadline(&reactor)>now) break;
+      int connection_pressure=pending.raw_count && ku_http_free_slot(&active)<0;
       KuHttpConnection* idle=&connections[reactor.idle_heap[0]];
+      if(!reactor.draining && !connection_pressure && ku_http_reactor_idle_deadline(&reactor)>now) break;
       ku_http_reactor_idle_remove(&reactor,idle);ku_http_reactor_work_add(&reactor,idle);
     }
     int maintenance_count=reactor.work_count;
@@ -3498,10 +3787,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       int index=active.indices[position];
 #endif
       KuHttpConnection* connection = &connections[index];
-      /* This is reuse admission at the response boundary. A keep-alive header
-         already sent is a snapshot, not a promise to retain a pressured idle
-         connection. Preserve pending FIFO priority, including pipeline bytes. */
-      if (!listening || listen_failure || pending.count) connection->keep_alive = 0;
+      /* A response releases A only after real work retirement. Queued peers
+         take their FIFO turn; they no longer evict an idle C record for A. */
+      if (!listening || listen_failure) connection->keep_alive = 0;
       if (!listening && connection->phase == KU_HTTP_IO_HEADER && connection->reused && !connection->buffered && !connection->carry_length) {
         ku_http_count_transport_close(connection,KU_HTTP_CLOSE_DRAIN_IDLE);
         ku_http_connection_close(connection); continue;
@@ -3513,7 +3801,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
           && now>=connection->peer_error_probe_deadline)
         ku_http_connection_observe_peer(connection,0,1);
 #endif
-      if (connection->request_deadline && (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_WRITE)
+      if (connection->request_deadline && (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_WRITE || connection->phase == KU_HTTP_IO_REQUEST_WAIT)
           && connection->deadline > connection->request_deadline) connection->deadline = connection->request_deadline;
       if (connection->async_task && connection->async_cancelled && now >= connection->async_cleanup_deadline)
         listen_failure = "asynchronous native work exceeded its cleanup deadline";
@@ -3526,10 +3814,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       }
       if (connection->phase == KU_HTTP_IO_HEADER && connection->carry_length)
         ku_http_connection_read_header(connection, server, &queue, spawned);
-      /* Under pressure a genuinely idle persistent socket yields its slot.
-         Partial requests keep their original byte ownership and deadline. */
-      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&
-          connection->reused && !connection->buffered && !connection->carry_length) {
+      /* Only real C-record exhaustion can retire a reused idle connection.
+         Waiting for A alone must preserve idle connections and their bytes. */
+      if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&
+          !connection->request_lease && !connection->buffered && !connection->carry_length) {
         /* An empty user buffer is not idle when the next request is already
            waiting in the socket. A single peek never consumes bytes or renews D. */
         char next_byte;
@@ -3540,7 +3828,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
           ku_http_connection_close(connection);
         }
       }
-      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)
+      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_REQUEST_WAIT) && now >= connection->deadline)
         ku_http_connection_status(connection, server, 408);
       else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline) {
         ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
@@ -3556,11 +3844,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_count_transport_close(&rejection,KU_HTTP_CLOSE_WRITE_DEADLINE);
       ku_http_connection_close(&rejection);
     }
-    if (!listen_failure) ku_http_pending_activate(&pending, &active, server);
+    int revisit_pending=!listen_failure && ku_http_pending_activate(&pending,&active,server);
     /* Maintenance may close a socket while a worker still owns its job.
        Refresh the already-published membership snapshot before a blocking wait;
        one extra turn suffices unless physical membership changes again. */
-    if (active.sockets != occupied_connections) continue;
+    if (revisit_pending || active.sockets+(size_t)pending.raw_count != occupied_connections
+        || active.request_active!=occupied_requests) continue;
     int occupied = rejection.phase != KU_HTTP_IO_FREE || active.count;
     if (!listening && !occupied && !pending.count && !ku_http_queue_resident(&queue)) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
@@ -3577,6 +3866,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_poll_add(poll_items, &poll_count, wake.read_socket, KU_HTTP_POLL_READ);
     int listener_index = -1;
     unsigned long long nearest = health_deadline;
+    if(pending_deadline<nearest) nearest=pending_deadline;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     unsigned long long idle_deadline=ku_http_reactor_idle_deadline(&reactor);
     if(idle_deadline<nearest) nearest=idle_deadline;
@@ -3600,6 +3890,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     task_io_eligibility.deadline=idle_deadline;
     task_io_eligibility.has_idle=reactor.idle_count!=0;
     if(reactor.idle_count) task_io_eligibility.all_async=0;
+    if(reactor.idle_initial_count) task_io_eligibility.all_batchable=0;
 #endif
     unsigned long long task_io_slice_deadline=health_deadline;
     if (accept_retry_deadline>now && accept_retry_deadline<task_io_slice_deadline)
@@ -3619,10 +3910,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       KuHttpConnection* connection = &connections[index];
       connection->poll_index = -1;
       short events = 0;
-      int watch_peer=connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB;
+      int watch_peer=connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB
+          || (connection->phase==KU_HTTP_IO_REQUEST_WAIT && !connection->request_wait_probe_deadline);
       if (connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) events = KU_HTTP_POLL_READ;
       else if (connection->phase == KU_HTTP_IO_WRITE) events = KU_HTTP_POLL_WRITE;
-      else if (watch_peer && !connection->peer_read_paused) events=KU_HTTP_POLL_READ;
+      else if (watch_peer && connection->phase!=KU_HTTP_IO_REQUEST_WAIT && !connection->peer_read_paused) events=KU_HTTP_POLL_READ;
 #if defined(__APPLE__)
       if (watch_peer && connection->peer_read_paused && connection->peer_error_probe_deadline
           && connection->peer_error_probe_deadline<nearest)
@@ -3645,6 +3937,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
             async_eligible,idle_eligible,idle_eligible ? connection->deadline : connection->async_deadline);
       }
 #endif
+      if(connection->phase==KU_HTTP_IO_REQUEST_WAIT) {
+        if(connection->deadline<nearest) nearest=connection->deadline;
+        if(connection->request_wait_probe_deadline && connection->request_wait_probe_deadline<nearest)
+          nearest=connection->request_wait_probe_deadline;
+      }
       /* poll/WSAPoll return ERR/HUP/NVAL even with events=0. Pausing READ
          must not remove a live handler socket from transport-error observation. */
       if (!events && !watch_peer) continue;
@@ -3655,6 +3952,13 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_poll_add(poll_items, &poll_count, connection->socket_value, events);
       if ((connection->phase==KU_HTTP_IO_HEADER || connection->phase==KU_HTTP_IO_BODY || connection->phase==KU_HTTP_IO_WRITE)
           && connection->deadline < nearest) nearest = connection->deadline;
+    }
+    for(int node=pending.head;node>=0;node=pending.items[node].next) {
+      KuHttpPendingItem* item=&pending.items[node];item->poll_index=-1;
+      if(item->kind==KU_HTTP_PENDING_RAW && !item->probe_only) {
+        item->poll_index=poll_count;
+        ku_http_poll_add(poll_items,&poll_count,item->socket_value,0);
+      }
     }
     rejection.poll_index = -1;
     if (rejection.phase == KU_HTTP_IO_REJECT || rejection.phase == KU_HTTP_IO_WRITE) {
@@ -3766,7 +4070,15 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     }
     reactor.old_net_count=net_count;
 #endif
-    if(reactor.idle_count && (!listening || listen_failure || pending.count)) wait_ms=0;
+    for(int node=pending.head;node>=0;node=pending.items[node].next) {
+      KuHttpPendingItem* item=&pending.items[node];
+      if(item->kind==KU_HTTP_PENDING_RAW)
+        ku_http_reactor_interest(&reactor,reactor.pending_base+(size_t)node,
+            item->poll_index>=0?item->socket_value:KU_HTTP_INVALID_SOCKET,0,
+            item->queue_generation,item->poll_index);
+    }
+    if(reactor.idle_count && (reactor.draining
+        || (pending.raw_count && ku_http_free_slot(&active)<0))) wait_ms=0;
     int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);
 #else
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
@@ -3818,6 +4130,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         listen_failure="Task network readiness dispatch failed";
     }
 #endif
+    for(int node=pending.head;node>=0;) {
+      KuHttpPendingItem* item=&pending.items[node];int next=item->next;
+      if(item->kind==KU_HTTP_PENDING_RAW && item->poll_index>=0)
+        ku_http_pending_ready(&pending,node,poll_items[item->poll_index].revents);
+      node=next;
+    }
     short wake_events = poll_items[wake_index].revents;
     if (wake_events & POLLNVAL) { fputs("http reactor wake socket invalid\n", stderr); exit(1); }
     if (wake_events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)) ku_http_wake_drain(&wake);
@@ -3849,6 +4167,11 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_write(connection, server);
       else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
           && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP))) ku_http_connection_observe_peer(connection,events,0);
+      else if(connection->phase==KU_HTTP_IO_REQUEST_WAIT && (events&(POLLERR|POLLHUP))) {
+        ku_http_connection_observe_peer(connection,events,0);
+        if(connection->phase==KU_HTTP_IO_REQUEST_WAIT)
+          connection->request_wait_probe_deadline=ku_http_deadline_ms(KU_HTTP_PAUSED_PEER_PROBE_MS);
+      }
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
       ku_http_reactor_refresh(connection);
 #endif
@@ -3874,7 +4197,12 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       int accept_error = cli == KU_HTTP_INVALID_SOCKET ? ku_http_socket_last_error() : 0;
       if (cli != KU_HTTP_INVALID_SOCKET) {
         group->accepted++; owner->accepted++;
-        group->accept_turn = (owner->index+1) % group->count;
+        /* Explicit loops may exceed C. Zero-C owners retain Task/net/wake
+         * duties but never accept a transport they cannot record. */
+        for(int step=1;step<=group->count;step++) {
+          int next=(owner->index+step)%group->count;
+          if(group->loops[next].slots) {group->accept_turn=next;break;}
+        }
         KuHttpWake* next_wake = group->loops[group->accept_turn].wake;
         if (next_wake) ku_http_wake_notify(next_wake);
         if (group->max_requests && group->accepted >= group->max_requests) {
@@ -3909,13 +4237,15 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 
       long live = ku_http_atomic_increment(&ku_http_active_conns);
       int slot = ku_http_free_slot(&active);
-      if (live > max_conn) ku_http_reject_start(&rejection, cli);
-      else if (slot >= 0 && !pending.count) ku_http_connection_start(&connections[slot], &active, cli, server);
-      else if (pending.count < pending.cap) {
-        pending.items[pending.tail] = (KuHttpPendingItem){cli,ku_http_deadline_ms(server->request_timeout_ms)};
-        pending.tail = (pending.tail + 1) % pending.cap;
-        pending.count++;
-      } else ku_http_reject_start(&rejection, cli);
+      /* C permits are partitioned with their stable owner records. A raw P
+       * fd is allowed only while a closed job/Task still occupies a record;
+       * accepting past local live C could otherwise strand a raw FIFO head
+       * behind existing queued records with no record capable of retiring. */
+      if (live > max_conn || active.sockets+(size_t)pending.raw_count>=(size_t)slot_count)
+        ku_http_reject_start(&rejection, cli);
+      else if (slot >= 0) ku_http_connection_start(&connections[slot], &active, cli, server);
+      else if(!ku_http_pending_push_raw(&pending,cli,ku_http_deadline_ms(server->request_timeout_ms)))
+        ku_http_reject_start(&rejection,cli);
 
     }
   }
@@ -4118,6 +4448,7 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
   blocking -= (int)ku_http_task_blocking_threads((size_t)blocking);
 #endif
   if (!getenv("KU_EVENT_LOOPS")) {
+    if (group.count > server->max_connections) group.count = (int)server->max_connections;
     if (group.count > server->max_active_requests) group.count = (int)server->max_active_requests;
     if (group.count > server->max_pending_requests) group.count = (int)server->max_pending_requests;
     if (group.count > blocking) group.count = blocking;
@@ -4154,10 +4485,11 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
 #endif
   for (int i=0; i<group.count; i++) {
     KuHttpLoopOwner* owner = &group.loops[i]; owner->group = &group; owner->index = i;
-    owner->slots = (int)(server->max_active_requests/group.count) + (i < server->max_active_requests%group.count);
+    owner->slots = (int)(server->max_connections/group.count) + (i < server->max_connections%group.count);
+    owner->request_limit = (int)(server->max_active_requests/group.count) + (i < server->max_active_requests%group.count);
     owner->pending = (int)(server->max_pending_requests/group.count) + (i < server->max_pending_requests%group.count);
     owner->workers = blocking/group.count + (i < blocking%group.count);
-    if (owner->workers > owner->slots) owner->workers = owner->slots;
+    if (owner->workers > owner->request_limit) owner->workers = owner->request_limit;
 #if defined(_WIN32)
     uintptr_t thread = _beginthreadex(NULL, (unsigned)ku_runtime_thread_stack_bytes(), ku_http_loop_thread, owner, 0, NULL);
     if (!thread) break;

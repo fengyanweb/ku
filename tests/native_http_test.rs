@@ -44,6 +44,78 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(20);
 const BUILD_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 * 1024);
 const RUN_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
 
+#[cfg(any(unix, windows))]
+fn reset_http_peer(peer: TcpStream) -> Instant {
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsRawSocket;
+    #[cfg(unix)]
+    {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of_val(&linger) as libc::socklen_t,
+                )
+            },
+            0
+        );
+    }
+    #[cfg(windows)]
+    {
+        // Winsock LINGER contains two u_short fields, unlike POSIX linger.
+        #[repr(C)]
+        struct WinLinger {
+            onoff: u16,
+            seconds: u16,
+        }
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn setsockopt(
+                socket: std::os::windows::io::RawSocket,
+                level: i32,
+                name: i32,
+                value: *const i8,
+                length: i32,
+            ) -> i32;
+            #[link_name = "WSAGetLastError"]
+            fn wsa_get_last_error() -> i32;
+        }
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_LINGER: i32 = 0x0080;
+        let linger = WinLinger {
+            onoff: 1,
+            seconds: 0,
+        };
+        let result = unsafe {
+            setsockopt(
+                peer.as_raw_socket(),
+                SOL_SOCKET,
+                SO_LINGER,
+                (&linger as *const WinLinger).cast(),
+                std::mem::size_of_val(&linger) as i32,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "SO_LINGER reset setup failed: WSA error {}",
+            unsafe { wsa_get_last_error() }
+        );
+    }
+    let issued = Instant::now();
+    drop(peer);
+    issued
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -192,10 +264,12 @@ fn spawn_native_server_settings(
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .unwrap_or_else(|| panic!("native HTTP build did not report C output:\n{combined}"));
-    let exe = if settings
-        .iter()
-        .any(|(name, _)| *name == "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE")
-    {
+    let exe = if settings.iter().any(|(name, _)| {
+        matches!(
+            *name,
+            "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE" | "KU_NATIVE_HTTP_TEST_JOB_GATE"
+        )
+    }) {
         // Observe the real positive MSG_PEEK -> pause transition without reading
         // pipeline bytes or changing any transport decision. This generated-C
         // witness is used only by the reset regression below, never shipped.
@@ -207,16 +281,21 @@ fn spawn_native_server_settings(
             c_source: c_source.clone(),
         };
         let generated = fs::read_to_string(&c_source).expect("read native HTTP C");
-        let assignment = "connection->peer_read_paused=1;";
-        assert_eq!(
-            generated.matches(assignment).count(),
-            1,
-            "unique peer pause transition"
-        );
-        let witnessed = generated.replacen(
-            assignment,
-            &format!(
-                r#"int ku_test_was_paused=connection->peer_read_paused; {assignment}
+        let mut witnessed = generated;
+        if settings
+            .iter()
+            .any(|(name, _)| *name == "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE")
+        {
+            let assignment = "connection->peer_read_paused=1;";
+            assert_eq!(
+                witnessed.matches(assignment).count(),
+                1,
+                "unique peer pause transition"
+            );
+            witnessed = witnessed.replacen(
+                assignment,
+                &format!(
+                    r#"int ku_test_was_paused=connection->peer_read_paused; {assignment}
           if(received>0 && !ku_test_was_paused) {{
             const char* witness=getenv("KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE");
             if(witness) {{
@@ -224,9 +303,122 @@ fn spawn_native_server_settings(
               if(file) {{ (void)fwrite(&byte,1,1,file); (void)fclose(file); }}
             }}
           }}"#
-            ),
-            1,
-        );
+                ),
+                1,
+            );
+        }
+        if settings
+            .iter()
+            .any(|(name, _)| *name == "KU_NATIVE_HTTP_TEST_JOB_GATE")
+        {
+            // Gate only the temporary diagnostic native worker's real retained
+            // job reference AFTER the actual handler returned. RST cannot
+            // short-circuit this gate as it can a cooperative Ku sleep. The
+            // release file is the barrier; the finite 3s wait is only a guard.
+            let anchor = "  KuHttpFailure failure=ku_http_failure_current;\n  failure.stage=2;";
+            assert_eq!(
+                witnessed.matches(anchor).count(),
+                1,
+                "unique worker completion gate"
+            );
+            witnessed = witnessed.replacen(
+                anchor,
+                &format!(
+                    r#"
+  const char* ku_test_gate=getenv("KU_NATIVE_HTTP_TEST_JOB_GATE");
+  if(ku_test_gate) {{
+    char path[1024];
+    int n=snprintf(path,sizeof(path),"%s.started",ku_test_gate);
+    if(n<0 || (size_t)n>=sizeof(path)) _Exit(91);
+    FILE* file=fopen(path,"wb");if(!file) _Exit(91);
+    if(fputs("worker-retains-real-job\n",file)<0 || fclose(file)) _Exit(91);
+    n=snprintf(path,sizeof(path),"%s.release",ku_test_gate);
+    if(n<0 || (size_t)n>=sizeof(path)) _Exit(91);
+    unsigned long long stop=ku_http_deadline_ms(3000u);
+    for(;;) {{
+      file=fopen(path,"rb");if(file) {{fclose(file);break;}}
+      if(ku_http_now_ms()>=stop) _Exit(92);
+#if defined(_WIN32)
+      Sleep(1);
+#else
+      struct timespec pause={{0,1000000L}};nanosleep(&pause,NULL);
+#endif
+    }}
+  }}
+{anchor}"#
+                ),
+                1,
+            );
+            let raw="  item->kind=KU_HTTP_PENDING_RAW;item->socket_value=fd;item->deadline=deadline;pending->raw_count++;";
+            assert_eq!(witnessed.matches(raw).count(), 1, "unique raw P insertion");
+            witnessed = witnessed.replacen(
+                raw,
+                &format!(
+                    r#"{raw}
+  const char* ku_test_gate=getenv("KU_NATIVE_HTTP_TEST_JOB_GATE");
+  if(ku_test_gate) {{
+    char path[1024];int n=snprintf(path,sizeof(path),"%s.raw",ku_test_gate);
+    if(n<0 || (size_t)n>=sizeof(path)) _Exit(91);
+    FILE* file=fopen(path,"wb");if(!file) _Exit(91);
+    if(fprintf(file,"%llu %llu\n",deadline,ku_http_now_ms())<0 || fclose(file)) _Exit(91);
+  }}"#
+                ),
+                1,
+            );
+            let raw_peek = "      if(!ku_http_request_observe_start(connection,server)) {";
+            assert_eq!(
+                witnessed.matches(raw_peek).count(),
+                1,
+                "unique raw nonconsuming peek"
+            );
+            witnessed = witnessed.replacen(
+                raw_peek,
+                r#"
+      int ku_test_raw_ready=ku_http_request_observe_start(connection,server);
+      int ku_test_raw_error=ku_http_socket_last_error();
+      if(!ku_test_raw_ready) {"#,
+                1,
+            );
+            let transfer="        revisit=1;continue;\n      }\n      connection->phase=KU_HTTP_IO_REQUEST_WAIT;";
+            assert_eq!(
+                witnessed.matches(transfer).count(),
+                1,
+                "unique empty RAW to C transfer"
+            );
+            witnessed = witnessed.replacen(
+                transfer,
+                r#"
+        const char* ku_test_gate=getenv("KU_NATIVE_HTTP_TEST_JOB_GATE");
+        if(ku_test_gate && connection->phase==KU_HTTP_IO_HEADER
+            && connection->socket_value!=KU_HTTP_INVALID_SOCKET) {
+          char path[1024];int n=snprintf(path,sizeof(path),"%s.transfer",ku_test_gate);
+          if(n<0 || (size_t)n>=sizeof(path)) _Exit(91);
+          FILE* file=fopen(path,"wb");if(!file) _Exit(91);
+          if(fprintf(file,"%llu %llu %llu %d %d %d\n",connection->request_deadline,
+              connection->deadline,ku_http_now_ms(),connection->request_lease,
+              connection->header_started,ku_http_socket_would_block(ku_test_raw_error))<0 || fclose(file)) _Exit(91);
+        }
+        revisit=1;continue;
+      }
+      connection->phase=KU_HTTP_IO_REQUEST_WAIT;"#,
+                1,
+            );
+            let status="static void ku_http_connection_status(KuHttpConnection* connection, KuHttpServer* server, int status) {";
+            assert_eq!(
+                witnessed.matches(status).count(),
+                1,
+                "unique status boundary"
+            );
+            witnessed=witnessed.replacen(status,&format!(r#"{status}
+  const char* ku_test_gate=getenv("KU_NATIVE_HTTP_TEST_JOB_GATE");
+  if(ku_test_gate && status==408 && connection->phase==KU_HTTP_IO_HEADER && !connection->request_lease) {{
+    char path[1024];int n=snprintf(path,sizeof(path),"%s.timeout",ku_test_gate);
+    if(n<0 || (size_t)n>=sizeof(path)) _Exit(91);
+    FILE* file=fopen(path,"wb");if(!file) _Exit(91);
+    if(fprintf(file,"%llu %llu %llu\n",connection->request_deadline,connection->deadline,
+        ku_http_now_ms())<0 || fclose(file)) _Exit(91);
+  }}"#),1);
+        }
         let witness_source = dir.join("server-peer-pause-witness.c");
         fs::write(&witness_source, witnessed).expect("write temporary peer pause witness");
         let executable =
@@ -3504,8 +3696,8 @@ fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() 
         "typedef struct KuHttpActiveSet {",
     );
     let pressure = region(
-        "      if (pending.count && connection->phase == KU_HTTP_IO_HEADER &&",
-        "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)",
+        "      if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&",
+        "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_REQUEST_WAIT) && now >= connection->deadline)",
     );
     let header = r#"
 #include <stdint.h>
@@ -3534,7 +3726,9 @@ typedef struct { int unused; } KuStruct___ku_http_response;
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr,"gather check failed at %d: %s\n",__LINE__,#condition); return 97; } } while (0)
 static int fixture_mode, fixture_error, fixture_completed, fixture_closed, fixture_close_reason;
 static int fixture_peeks, fixture_peek_result, fixture_peek_error;
-static struct { int count; } pending;
+static struct { int count,raw_count; } pending;
+static int active;
+static int ku_http_free_slot(const int* value) {(void)value;return -1;}
 static size_t fixture_calls, fixture_emitted, fixture_expected_length, fixture_max_bytes, fixture_max_vectors;
 static unsigned long long fixture_now;
 static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_body[300000];
@@ -3542,7 +3736,7 @@ static unsigned char fixture_wire[300032], fixture_expected[300032], fixture_bod
     let edges = r#"
 typedef struct {
   KuHttpSocket socket_value; unsigned long long deadline; KuHttpOutput output;
-  int phase,reused; size_t buffered,carry_length;
+  int phase,reused,request_lease; size_t buffered,carry_length;
 } KuHttpConnection;
 typedef struct { int unused; } KuHttpServer;
 enum { KU_HTTP_CLOSE_WRITE_DEADLINE=1, KU_HTTP_CLOSE_PEER_WRITE=2, KU_HTTP_CLOSE_IDLE_PRESSURE=3 };
@@ -3612,7 +3806,7 @@ static void fixture_reset(KuHttpConnection* connection,int mode) {
   memset(connection,0,sizeof(*connection));
   connection->socket_value=(KuHttpSocket)42; connection->deadline=1000;
   fixture_now=100; fixture_mode=mode; fixture_error=0; fixture_completed=fixture_closed=fixture_close_reason=0;
-  fixture_peeks=0; fixture_peek_result=-1; fixture_peek_error=FIXTURE_WOULD_BLOCK; pending.count=1;
+  fixture_peeks=0; fixture_peek_result=-1; fixture_peek_error=FIXTURE_WOULD_BLOCK; pending.count=pending.raw_count=1;
   connection->phase=KU_HTTP_IO_WRITE; connection->reused=1;
   fixture_calls=fixture_emitted=fixture_max_bytes=fixture_max_vectors=0;
   fixture_expected_length=0;
@@ -3691,9 +3885,12 @@ int main(void) {
   /* A fully read previous response may become idle, but a successor already
      queued in the kernel must survive the pressure decision without a read. */
   fixture_reset(&connection,0); connection.phase=KU_HTTP_IO_HEADER; connection.reused=1;
-  pending.count=0; fixture_pressure(&connection);
+  pending.count=pending.raw_count=0; fixture_pressure(&connection);
   CHECK(!fixture_peeks && !fixture_closed);
-  pending.count=1; fixture_peek_result=1; fixture_pressure(&connection);
+  /* A-only request pressure cannot evict an idle C record. */
+  pending.count=1; pending.raw_count=0;fixture_pressure(&connection);
+  CHECK(!fixture_peeks && !fixture_closed);
+  pending.raw_count=1; fixture_peek_result=1; fixture_pressure(&connection);
   CHECK(fixture_peeks==1 && !fixture_closed && connection.phase==KU_HTTP_IO_HEADER);
   CHECK(!connection.buffered && !connection.carry_length && connection.deadline==1000);
   fixture_peek_result=-1; fixture_peek_error=FIXTURE_INTERRUPTED; fixture_pressure(&connection);
@@ -3755,6 +3952,127 @@ int main(void) {
 }
 
 #[test]
+fn native_http_request_leases_and_shared_pending_fifo_preserve_full_identity() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let leases = runtime
+        .split_once("static int ku_http_request_lease_take(")
+        .unwrap()
+        .1
+        .split_once("#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)")
+        .unwrap()
+        .0;
+    let pending = runtime
+        .split_once("enum { KU_HTTP_PENDING_FREE=0")
+        .unwrap()
+        .1
+        .split_once("/* A single nonconsuming observation")
+        .unwrap()
+        .0;
+    let header = r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define KU_HTTP_INVALID_SOCKET (-1)
+#define KU_HTTP_PAUSED_PEER_PROBE_MS 25u
+#define KU_HTTP_IO_REQUEST_WAIT 10
+#define CHECK(c) do {if(!(c)){fprintf(stderr,"request lease/P FIFO line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+typedef int KuHttpSocket;
+struct KuHttpConnection;
+struct KuHttpPending;
+typedef struct {
+  struct KuHttpConnection* connections;
+  struct KuHttpPending* pending;
+  int high_water,request_limit,request_active,request_peak;
+} KuHttpActiveSet;
+typedef struct KuHttpConnection {
+  KuHttpActiveSet* active_set;
+  int management,request_lease,request_queued,pending_index,active_position,phase;
+  uint64_t connection_generation,request_sequence;
+  unsigned long long request_deadline,deadline,request_wait_probe_deadline;
+} KuHttpConnection;
+static unsigned long long ku_http_deadline_ms(unsigned int delta) {return 100u+delta;}
+"#;
+    let checks = r#"
+int main(void) {
+  KuHttpConnection connections[4]={{0}};
+  KuHttpActiveSet active={.connections=connections,.high_water=4,.request_limit=1};
+  for(int i=0;i<4;i++) {
+    connections[i].active_set=&active;connections[i].active_position=i;
+    connections[i].connection_generation=UINT64_MAX-100u+(uint64_t)i;
+    connections[i].request_sequence=UINT64_MAX-200u+(uint64_t)i;
+    connections[i].request_deadline=700u;connections[i].deadline=500u;connections[i].pending_index=-1;
+  }
+  KuHttpPendingItem items[3]={{0}};
+  KuHttpPending pending={.items=items,.cap=3};ku_http_pending_init(&pending,&active);
+  CHECK(ku_http_request_lease_take(&connections[0]));
+  CHECK(ku_http_request_lease_take(&connections[0]) && active.request_active==1);
+  CHECK(!ku_http_request_lease_take(&connections[1]) && active.request_peak==1);
+  CHECK(ku_http_pending_push_raw(&pending,100,600u));int raw=pending.head;
+  CHECK(ku_http_pending_push_request(&pending,&connections[1]));int middle=connections[1].pending_index;
+  CHECK(ku_http_pending_push_request(&pending,&connections[2]));int tail=connections[2].pending_index;
+  CHECK(pending.count==3 && pending.raw_count==1 && !ku_http_pending_push_raw(&pending,101,800u));
+  CHECK(pending.items[raw].next==middle && pending.items[middle].next==tail);
+  CHECK(pending.items[middle].deadline==500u && connections[1].request_deadline==700u);
+  ku_http_request_cancel_pending(&connections[1]);
+  CHECK(pending.count==2 && pending.raw_count==1 && pending.items[raw].next==tail);
+  CHECK(pending.items[tail].previous==raw && connections[1].pending_index==-1);
+  ku_http_request_cancel_pending(&connections[1]);CHECK(pending.count==2);
+  CHECK(ku_http_pending_push_request(&pending,&connections[3]));
+  CHECK(connections[3].pending_index==middle && pending.tail==middle && pending.items[tail].next==middle);
+  /* A node's old slot cannot refund or identify a recycled generation or a
+     successor request. The same full-width IDs, not numeric fd, are required. */
+  CHECK(ku_http_pending_connection(&pending,tail)==&connections[2]);
+  connections[2].connection_generation++;
+  CHECK(!ku_http_pending_connection(&pending,tail));connections[2].connection_generation--;
+  connections[2].request_sequence++;
+  CHECK(!ku_http_pending_connection(&pending,tail));connections[2].request_sequence--;
+  CHECK(ku_http_pending_connection(&pending,tail)==&connections[2]);
+  ku_http_pending_unlink(&pending,raw);CHECK(pending.head==tail && pending.raw_count==0 && pending.count==2);
+  ku_http_request_cancel_pending(&connections[2]);ku_http_request_cancel_pending(&connections[3]);
+  CHECK(!pending.count && pending.head==-1 && pending.tail==-1);
+  ku_http_request_lease_release(&connections[0]);ku_http_request_lease_release(&connections[0]);
+  CHECK(!active.request_active && active.request_peak==1);
+  CHECK(ku_http_request_lease_take(&connections[1]));ku_http_request_lease_release(&connections[1]);
+  for(int i=0;i<128;i++) {
+    CHECK(ku_http_pending_push_raw(&pending,200+i,900u));int node=pending.head;
+    uint64_t generation=pending.items[node].queue_generation;
+    CHECK(generation>3u);ku_http_pending_unlink(&pending,node);
+    CHECK(!pending.count && !pending.raw_count && pending.free_head==node);
+  }
+  pending.generation=UINT64_MAX;CHECK(!ku_http_pending_push_raw(&pending,999,900u));
+  puts("http-request-lease-shared-pending-identity-ok");return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-request-leases");
+    let path = directory.path().join("leases.c");
+    fs::write(&path, format!("{header}static int ku_http_request_lease_take({leases}enum {{ KU_HTTP_PENDING_FREE=0{pending}{checks}")).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "leases")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires native request lease regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("http-request-lease-shared-pending-identity-ok"));
+}
+
+#[test]
 fn native_http_reuses_framed_requests_and_yields_idle_connections() {
     use std::io::Read;
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3763,7 +4081,7 @@ fn native_http_reuses_framed_requests_and_yields_idle_connections() {
 import "std.http"
 fn main(): null! {
     app = http.server({max_connections: 8, max_active_requests: 1, max_pending_requests: 4,
-        idle_timeout_ms: 1000, read_header_timeout_ms: 200, read_body_timeout_ms: 1000,
+        idle_timeout_ms: 3000, read_header_timeout_ms: 2000, read_body_timeout_ms: 1000,
         write_timeout_ms: 2000, handler_timeout_ms: 2000})
     app.post("/echo/{id}", fn(req) { return http.text(req.params.id + ":" + req.body) })
     app.get("/ok", fn() { return http.text("ok") })
@@ -3792,6 +4110,60 @@ fn main(): null! {
         return;
     };
     let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let metrics_request="GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: keepalive-regression\r\nConnection: close\r\n\r\n";
+    let snapshot = || http_response(&management_address, metrics_request, Duration::from_secs(3));
+    let loop_count = |metrics: &str, key: &str| -> u64 {
+        metrics
+            .split_once("\"loops\":[")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0
+            .split_once(&format!("\"{key}\":"))
+            .unwrap()
+            .1
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let wait_counts = |active: u64, pending: u64| {
+        let deadline = Instant::now() + Duration::from_millis(700);
+        loop {
+            let metrics = snapshot();
+            if loop_count(&metrics, "active_requests") == active
+                && loop_count(&metrics, "pending") == pending
+            {
+                return metrics;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "A/P transition did not complete: {metrics}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    };
+    // A=1 must not be consumed by three untouched first-accept C records.
+    let mut initial_idle = Vec::new();
+    for _ in 0..3 {
+        initial_idle.push(connect_with_retry(&address, Duration::from_secs(3)));
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let metrics = snapshot();
+        if loop_count(&metrics, "connections") == 3 {
+            assert_eq!(loop_count(&metrics, "active_requests"), 0, "{metrics}");
+            assert_eq!(loop_count(&metrics, "pending"), 0, "{metrics}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial idle C records absent: {metrics}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
     let mut stream = connect_with_retry(&address, Duration::from_secs(3));
     // Read exactly one frame; a pipelined successor must remain in the socket.
     let read_frame = |stream: &mut TcpStream| {
@@ -3824,6 +4196,12 @@ fn main(): null! {
         stream.read_exact(&mut bytes[start..]).unwrap();
         String::from_utf8(bytes).unwrap()
     };
+    for peer in &mut initial_idle {
+        peer.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        assert_status(&read_frame(peer), "HTTP/1.1 200 OK");
+    }
+    drop(initial_idle);
     // The first read contains both a body and a complete following request.
     stream.write_all(b"POST /echo/first HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nonePOST /echo/second HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\ntwo").unwrap();
     for body in ["first:one", "second:two"] {
@@ -3859,28 +4237,10 @@ fn main(): null! {
         Duration::from_millis(700),
     );
     assert_status(&response, "HTTP/1.1 200 OK");
-    assert_eq!(
-        idle.read(&mut [0; 1]).unwrap(),
-        0,
-        "idle reuse yields its active slot"
-    );
-    // The old connection cannot acquire a new request after its observed
-    // pressure close. TCP may accept the local write before reporting FIN/RST.
-    let after_close = idle
-        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        .and_then(|()| idle.read(&mut [0; 1]));
-    match after_close {
-        Ok(0) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::NotConnected
-            ) => {}
-        other => panic!("closed idle socket must not process a successor: {other:?}"),
-    }
+    idle.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    assert_status(&read_frame(&mut idle), "HTTP/1.1 200 OK");
+    drop(idle); // A-only pressure must leave the prior keep-alive usable.
 
     // Fill the pending FIFO while one body is incomplete. Observing the
     // over-limit 503 is a real admission barrier, without scheduling sleeps.
@@ -3888,12 +4248,27 @@ fn main(): null! {
     pipelined
         .write_all(b"POST /echo/pressure HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n")
         .unwrap();
+    wait_counts(1, 0); // Actual partial-body lease, not an accept-only guess.
     let mut pending = Vec::new();
-    for _ in 0..4 {
+    for ordinal in 0..4 {
         let mut peer = connect_with_retry(&address, Duration::from_secs(3));
         peer.write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .unwrap();
         pending.push(peer);
+        wait_counts(1, ordinal + 1);
+    }
+    // Remove a middle P node by an actual RST, then reuse its bounded node
+    // and C slot. The head and tail requests must retain their identities.
+    #[cfg(any(unix, windows))]
+    {
+        reset_http_peer(pending.remove(1));
+        wait_counts(1, 3);
+        let mut replacement = connect_with_retry(&address, Duration::from_secs(3));
+        replacement
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        pending.push(replacement);
+        wait_counts(1, 4);
     }
     let rejected = http_response(
         &address,
@@ -3907,19 +4282,14 @@ fn main(): null! {
     let response = read_frame(&mut pipelined);
     assert_status(&response, "HTTP/1.1 200 OK");
     assert!(response.ends_with("pressure:one"));
-    // Closing with unconsumed pipeline bytes can report TCP reset rather than
-    // FIN. Neither a timeout nor another response counts as yielding the slot.
-    match pipelined.read(&mut [0; 1]) {
-        Ok(0) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-        outcome => panic!("pending peers must win at response boundary: {outcome:?}"),
-    }
+    // The four already queued requests keep FIFO priority, including over
+    // a pipelined successor. Its bytes survive while that successor waits.
     for mut peer in pending {
         assert_status(&read_frame(&mut peer), "HTTP/1.1 200 OK");
     }
-    // The controlled sequence witnessed a real idle-pressure close, while
-    // every pending peer received a complete response. Queue admission was
-    // not the cause: capacity pressure does not close the worker queue.
+    assert_status(&read_frame(&mut pipelined), "HTTP/1.1 200 OK");
+    drop(pipelined);
+    // The A limit was never raised to accommodate C-only idle connections.
     let metrics = http_response(&management_address,
         "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: keepalive-regression\r\nConnection: close\r\n\r\n",
         Duration::from_secs(3));
@@ -3942,7 +4312,8 @@ fn main(): null! {
             .parse()
             .unwrap()
     };
-    assert!(count("idle_pressure") >= 1);
+    assert_eq!(count("idle_pressure"), 0);
+    assert!(metrics.contains("\"peak_active_requests\":1"), "{metrics}");
     assert!(count("response_policy") >= 1);
     assert_eq!(count("queue_not_admitted"), 0);
 
@@ -4175,6 +4546,57 @@ fn main(): null! {
             }
         }
     }
+    // An explicit loop count may exceed C: the empty-C owner still hosts its
+    // Task/net/wake resources, while accept rotation skips it without spending
+    // an extra C permit or rejecting every other sequential request.
+    let source = source
+        .replace("max_active_requests\\\":8256", "max_active_requests\\\":2")
+        .replace("max_pending_requests\\\":128", "max_pending_requests\\\":2")
+        .replace("max_connections\\\":8320", "max_connections\\\":1");
+    let address = unused_local_address();
+    let management = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "zero-connection-owner",
+        &source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "4"),
+            ("KU_SERVICE_CONTROL_TOKEN", "regression-token"),
+            ("KU_SERVICE_PROBE_ADDR", &management),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for _ in 0..4 {
+        let response = http_response(
+            &address,
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with("ready"));
+    }
+    let metrics=http_response(&management,"GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&metrics, "HTTP/1.1 200 OK");
+    assert!(
+        metrics
+            .contains("\"max_active_requests\":2,\"max_connections\":1,\"max_pending_requests\":2"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("\"id\":1,"),
+        "zero-C owner must remain alive: {metrics}"
+    );
+    let drain=http_response(&management,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&drain, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
 }
 
 #[test]
@@ -5648,10 +6070,6 @@ fn main(): null! {
 #[test]
 fn native_http_reset_retires_async_work_but_write_half_close_keeps_response() {
     use std::io::Read;
-    #[cfg(unix)]
-    use std::os::fd::AsRawFd;
-    #[cfg(windows)]
-    use std::os::windows::io::AsRawSocket;
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"
 import {http,time} from "std"
@@ -5724,72 +6142,7 @@ fn main(): null! {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let reset_peer = |peer: TcpStream| {
-        #[cfg(unix)]
-        {
-            let linger = libc::linger {
-                l_onoff: 1,
-                l_linger: 0,
-            };
-            assert_eq!(
-                unsafe {
-                    libc::setsockopt(
-                        peer.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_LINGER,
-                        (&linger as *const libc::linger).cast(),
-                        std::mem::size_of_val(&linger) as libc::socklen_t,
-                    )
-                },
-                0
-            );
-        }
-        #[cfg(windows)]
-        {
-            // Winsock LINGER contains two u_short fields, unlike POSIX linger.
-            #[repr(C)]
-            struct WinLinger {
-                onoff: u16,
-                seconds: u16,
-            }
-            #[link(name = "ws2_32")]
-            unsafe extern "system" {
-                fn setsockopt(
-                    socket: std::os::windows::io::RawSocket,
-                    level: i32,
-                    name: i32,
-                    value: *const i8,
-                    length: i32,
-                ) -> i32;
-                #[link_name = "WSAGetLastError"]
-                fn wsa_get_last_error() -> i32;
-            }
-            const SOL_SOCKET: i32 = 0xffff;
-            const SO_LINGER: i32 = 0x0080;
-            let linger = WinLinger {
-                onoff: 1,
-                seconds: 0,
-            };
-            let result = unsafe {
-                setsockopt(
-                    peer.as_raw_socket(),
-                    SOL_SOCKET,
-                    SO_LINGER,
-                    (&linger as *const WinLinger).cast(),
-                    std::mem::size_of_val(&linger) as i32,
-                )
-            };
-            assert_eq!(
-                result,
-                0,
-                "SO_LINGER reset setup failed: WSA error {}",
-                unsafe { wsa_get_last_error() }
-            );
-        }
-        let issued = Instant::now();
-        drop(peer);
-        issued
-    };
+    let reset_peer = reset_http_peer;
     reset_peer(peer); // A confirmed RST, not an ambiguous FIN or caller-side timer.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
@@ -6016,6 +6369,11 @@ fn main(): null! {
                 1,
                 "live worker reference returned early: {metrics}"
             );
+            assert_eq!(
+                counter(&loops, "active_requests"),
+                1,
+                "closed fd must retain A until the real worker retires: {metrics}"
+            );
             assert!(
                 counter(&metrics, "buffer_bytes") > job_buffer_baseline,
                 "live worker input charge returned early: {metrics}"
@@ -6046,6 +6404,7 @@ fn main(): null! {
             && counter(&loops, "resident") == 0
             && counter(&loops, "queued") == 0
             && counter(&loops, "connections") == 0
+            && counter(&loops, "active_requests") == 0
             && counter(&metrics, "buffer_bytes") == job_buffer_baseline
             && counter(
                 &section(&metrics, "\"task_driver\":{", '}'),
@@ -6067,6 +6426,163 @@ fn main(): null! {
     assert!(response.ends_with("half-close-ok"), "{response}");
     let response=http_response(&management_address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: reset-witness\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
     assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+    // One real closed JOB consumes the only physical record and A lease even
+    // though its fd has gone away. A new empty accepted transport therefore
+    // enters RAW P, then moves into C only after the actual worker is released.
+    // This is the whole OS path missing from the field-only FIFO regression.
+    let address = unused_local_address();
+    let management_address = unused_local_address();
+    let gate_directory = native_c_harness::TempDir::new("http-raw-retained-job");
+    let gate = gate_directory.path().join("worker");
+    let gate_text = gate.to_str().expect("UTF-8 temporary gate path");
+    let source = r#"
+import http from "std.http"
+fn held(): HttpResponse {return http.text("real-handler-complete")}
+fn main(): null! {
+    app=http.server({max_connections:1,max_active_requests:1,max_pending_requests:2,
+        idle_timeout_ms:5000,handler_timeout_ms:10000})
+    app.get("/held",held)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server_settings(
+        "raw-after-retained-job",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "1"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_SERVICE_CONTROL_TOKEN", "raw-retirement"),
+            ("KU_SERVICE_PROBE_ADDR", &management_address),
+            ("KU_HTTP_REQUEST_TIMEOUT_MS", "2000"),
+            ("KU_NATIVE_HTTP_TEST_JOB_GATE", gate_text),
+        ],
+    ) else {
+        panic!("native compiler was already available");
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let metrics_request="GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: raw-retirement\r\nConnection: close\r\n\r\n";
+    let snapshot = || {
+        http_response(
+            &management_address,
+            metrics_request,
+            Duration::from_millis(500),
+        )
+    };
+    let witness = |suffix: &str| {
+        let path = gate.with_extension(suffix);
+        let deadline = Instant::now() + Duration::from_millis(700);
+        loop {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if text.ends_with('\n') {
+                    return text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing bounded worker/raw witness {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let wait_state = |connections: u64, pending: u64, active: u64, resident: u64| {
+        let deadline = Instant::now() + Duration::from_millis(700);
+        loop {
+            let metrics = snapshot();
+            let loops = section(&metrics, "\"loops\":[", ']');
+            if counter(&loops, "connections") == connections
+                && counter(&loops, "pending") == pending
+                && counter(&loops, "active_requests") == active
+                && counter(&loops, "resident") == resident
+            {
+                return metrics;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained JOB/RAW-P state missing: {metrics}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    assert_status(&snapshot(), "HTTP/1.1 200 OK");
+    let mut held = TcpStream::connect(&address).unwrap();
+    held.write_all(b"GET /held HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    assert_eq!(witness("started"), "worker-retains-real-job\n");
+    wait_state(1, 0, 1, 1);
+    reset_http_peer(held);
+    let held_metrics = wait_state(0, 0, 1, 1);
+    assert_eq!(
+        counter(&section(&held_metrics, "\"loops\":[", ']'), "running"),
+        1,
+        "RST must not release the gated physical worker: {held_metrics}"
+    );
+    let raw = TcpStream::connect(&address).unwrap(); // Intentionally send NO bytes.
+    wait_state(1, 1, 1, 1);
+    let accepted: Vec<u64> = witness("raw")
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(accepted.len(), 2);
+    let original_deadline = accepted[0];
+    assert!(original_deadline > accepted[1] && original_deadline <= accepted[1] + 2000);
+    // Opening the gate, rather than a chosen sleep duration, makes the worker
+    // reference and A/C record physically reusable in the actual owner path.
+    fs::write(gate.with_extension("release"), b"release\n").unwrap();
+    let transfer: Vec<u64> = witness("transfer")
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(transfer.len(), 6);
+    assert_eq!(
+        transfer[0], original_deadline,
+        "RAW transfer renewed request D"
+    );
+    assert_eq!(
+        transfer[1], original_deadline,
+        "empty RAW transfer must clamp its idle D before heap insertion"
+    );
+    assert!(
+        transfer[2] < original_deadline,
+        "raw must still be alive at transfer"
+    );
+    assert_eq!(
+        &transfer[3..],
+        &[0, 0, 1],
+        "actual RAW peek must be EAGAIN, without acquiring A or starting the header"
+    );
+    let transferred = wait_state(1, 0, 0, 0);
+    assert_eq!(
+        counter(
+            &section(&transferred, "\"loops\":[", ']'),
+            "peak_active_requests"
+        ),
+        1
+    );
+    let response = read_http_stream(raw, Duration::from_secs(3));
+    assert_status(&response, "HTTP/1.1 408 Request Timeout");
+    let expired: Vec<u64> = witness("timeout")
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(expired.len(), 3);
+    assert_eq!(expired[0], original_deadline);
+    assert_eq!(expired[1], original_deadline);
+    assert!(
+        expired[2] >= original_deadline && expired[2] - original_deadline < 1000,
+        "408 must use original request D, not the new 5s idle interval: {expired:?}"
+    );
+    wait_state(0, 0, 0, 0);
+    let drain=http_response(&management_address,"POST /__ku/drain HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: raw-retirement\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&drain, "HTTP/1.1 200 OK");
     assert!(watchdog
         .wait_for_natural_exit(Duration::from_secs(5))
         .success());
@@ -6196,7 +6712,6 @@ fn main(): null! {{
     assert!(!watchdog.timed_out());
 }
 
-
 #[test]
 fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines() {
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -6206,7 +6721,8 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
     let begin = runtime.find("/* Persistent owner reactor.").unwrap();
     let end = runtime[begin..]
         .find("/* End persistent owner reactor. */")
-        .unwrap() + begin;
+        .unwrap()
+        + begin;
     // Compile actual production registry/heap/kernel helpers with a model of
     // only their borrowed connection fields. Real socketpair readiness and fd
     // recycling exercise the OS backend; no alternate event algorithm exists.
@@ -6233,7 +6749,7 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
 #define KU_HTTP_POLL_WRITE POLLOUT
 typedef int KuHttpSocket;
 typedef struct pollfd KuHttpPollFd;
-enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8 };
+enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8,KU_HTTP_IO_REQUEST_WAIT=10 };
 struct KuHttpConnection;
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
@@ -6244,10 +6760,10 @@ typedef struct KuHttpConnection {
   KuHttpActiveSet* active_set;
   struct KuHttpReactor* reactor;
   int work_position,idle_position,active_position;
-  int phase,reused,peer_read_paused,socket_value;
+  int phase,reused,peer_read_paused,socket_value,request_lease,request_queued;
   size_t buffered,carry_length;
   void* job;void* async_task;
-  uint64_t request_deadline,deadline,connection_generation;
+  uint64_t request_deadline,deadline,connection_generation,request_wait_probe_deadline;
 } KuHttpConnection;
 "#;
     let checks = r#"
@@ -6372,6 +6888,18 @@ int main(int argc,char** argv) {
   connections[0].deadline=3000u;ku_http_reactor_refresh(&connections[0]);
   CHECK(ku_http_reactor_idle_deadline(&reactor)==2000u);
   CHECK(reactor.registrations[0].token==stable);
+  /* RAW-P transfer can leave an untouched first request in the idle heap.
+   * Its original accepted-request D, not a later idle timer, wins even before
+   * any maintenance worklist pass. No A lease is needed for this empty C. */
+  ku_http_reactor_idle_remove(&reactor,&connections[0]);
+  connections[0].reused=0;connections[0].request_deadline=750u;
+  ku_http_reactor_refresh(&connections[0]);
+  CHECK(reactor.idle_initial_count==1 && ku_http_reactor_idle_deadline(&reactor)==750u);
+  CHECK(!connections[0].request_lease && connections[0].deadline==3000u);
+  ku_http_reactor_idle_remove(&reactor,&connections[0]);
+  connections[0].reused=1;connections[0].request_deadline=0;
+  ku_http_reactor_refresh(&connections[0]);
+  CHECK(!reactor.idle_initial_count && ku_http_reactor_idle_deadline(&reactor)==2000u);
   connections[0].buffered=1u;ku_http_reactor_refresh(&connections[0]);
   CHECK(reactor.work_count==3 && reactor.idle_count==1 && connections[0].idle_position==-1);
   KuHttpPollFd items[8]={{0}};
@@ -6426,11 +6954,19 @@ int main(int argc,char** argv) {
     fs::write(&path, format!("{header}{}{checks}", &runtime[begin..end])).unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "persistent")
     else {
-        assert!(env::var_os("GITHUB_ACTIONS").is_none(), "CI requires a native C compiler");
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
         return;
     };
     fs::remove_file(path).unwrap();
-    let output = run_bounded(&mut Command::new(&executable), RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
+    let output = run_bounded(
+        &mut Command::new(&executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "status={:?}; stdout={}; stderr={}",

@@ -418,9 +418,9 @@ v0.0.18 开发分支的解释器 HTTP 已将 socket 读取、等待 handler、�
 
 解释器各读取、handler、写出阶段沿用一次创建的期限；读取请求后转交原有字符串，响应头与 body 分段持有。每个请求有独立一次性返回通道；连接超时或关闭后迟到结果只释放数据，槽位复用以 generation 区分。
 
-native C HTTP 也已接通 Linux/macOS 的 poll 与 Windows 的 WSAPoll。调用 listen 的线程独占接受连接、请求读取、分段响应写出及 socket 关闭；完整请求输入独立持有后交给既有的最多64个 handler worker，等待读写不占用 handler worker。连接槽位在队列/worker 的实际 job 引用归还后才复用，部分读写不会刷新原阶段绝对期限。native handler 的期限仍从实际调用时建立，沿原协作检查与清理路径返回；阻塞系统/FFI 调用不会被 I/O 线程强制打断。若所有 worker 都创建失败，保留原 inline 降级，此时执行 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，实际排空已接受的读取、job、响应及引用，再 join worker 并退出。
+native C HTTP 使用 Linux epoll、macOS kqueue 的持久兴趣注册，Windows 保留 WSAPoll。每个 owner 独占其连接的读取、分段响应写出及关闭；完整请求输入独立持有后交给有界 handler worker，等待读写不占用 handler worker。连接记录 C（max_connections）、已接纳请求租约 A（max_active_requests）和共享 FIFO 等待名额 P（max_pending_requests）分别计量：首次观察到请求字节后才取得 A，空闲连接不占 A，也不预分配 header 缓冲；A 从接纳持续到响应完成和实际 Task/job 引用退役。原始等待 socket 和已有连接的后续请求共用一个 P 队列，按完整连接代次与请求序号识别；取消或超时归还各自名额，部分读写与等待接纳不刷新原绝对期限。native handler 的期限仍从实际调用时建立，沿原协作检查与清理路径返回；阻塞系统/FFI 调用不会被 I/O 线程强制打断。若所有 worker 都创建失败，保留原 inline 降级，此时执行 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，实际排空已接受的读取、job、响应及引用，再 join worker 并退出。
 
-两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。解释器仍沿用原空闲连接让出活动槽的策略。native 中仅 A/P 压力不关闭空闲 keep-alive；后续请求与已等待请求按同一 FIFO 竞争 A，连接记录 C 真正耗尽时仍可回收空闲连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
 
 `max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
 
@@ -467,8 +467,8 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 HTTP server 当前提供：
 
 - `max_connections`：同时在线连接上限。
-- `max_active_requests`：同时处理的活动请求槽位上限；native handler worker 另有既有的64线程上限。
-- `max_pending_requests`：等待队列上限。
+- `max_active_requests`：native 已接纳请求租约 A 的上限，覆盖读取、handler、响应写出及实际 Task/job 退役；空闲连接不占用。解释器保留原活动连接规则。
+- `max_pending_requests`：有界共享 FIFO 上限 P；native 的原始等待 socket 与已有连接的新请求共用该限额，队列中的请求不占 A。
 - `max_buffer_bytes`：HTTP transport 保留额度，默认64 MiB，最大1 GiB，必须为正整数；不表示整体进程内存上限。
 - `handler_timeout_ms`：handler 执行超时返回 504。
 - `idle_timeout_ms`：连接首字节等待超时。

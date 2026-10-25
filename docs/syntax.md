@@ -1862,8 +1862,8 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 当前 runtime 使用有界接纳与单 I/O 线程推进连接；listen/run 对调用者仍是阻塞入口：
 
 - `max_connections` 表示同时在线连接上限；超过时立即返回 503。
-- `max_active_requests` 控制同时处理的活动请求槽位数；native handler worker 另有既有的64线程上限。
-- `max_pending_requests` 是有界等待队列；队列满时立即返回 503，不无限排队。
+- `max_active_requests` 控制 native 已接纳请求租约 A：首次观察请求字节后取得，直到响应完成且实际 Task/job 退役才归还；空闲连接仅占 `max_connections` 的 C 记录。解释器保留原活动连接规则。
+- `max_pending_requests` 是有界等待队列 P；native 的原始等待 socket 与已有连接的后续请求共用一个 FIFO。队列满时返回 503，不无限排队，不续期原请求期限。
 - `max_buffer_bytes` 默认 67108864（64 MiB），必须为正整数，最大 1073741824（1 GiB）。它限制每个 HTTP listener 的 transport 保留额度，覆盖受控 header/body/carry、请求与响应字符串缓冲及保守的临时预占；额度不足返回 503 并关闭连接。该额度不等于整体 Ku 堆、allocator 元数据、容器桶、线程栈、内核 socket 缓冲、外部库内存或进程 RSS 的上限，也不提供公开 stats 方法。
 - `handler_timeout_ms` 到时返回 504。解释器逐步检查 deadline；native 在循环回边和 Ku 调用返回点插入协作式 safepoint。
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
@@ -1912,13 +1912,13 @@ fn main(): null! {
 
 ### HTTP 与 native C 后端
 
-`ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
+`ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳超限返回 503，以及请求级限制 400/413/414/431/408。native 将连接 C、请求租约 A 与共享 FIFO P 分开，空闲 keep-alive 不占 A；接纳时机与解释器原活动连接策略有所不同；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
 
-解释器的 socket 读取、handler 等待和响应写出由单 I/O 线程推进，Ku handler 仍串行执行。native C 已接通 poll（Linux/macOS）与 WSAPoll（Windows）：调用 listen 的线程独占 socket 接受、读写和关闭，完整请求输入独立持有后交给既有的最多64个 handler worker，等待连接不创建逐连接线程，也不占用 handler worker。槽位等实际 job 引用归还后才复用，部分读写不刷新原阶段期限。
+解释器的 socket 读取、handler 等待和响应写出由单 I/O 线程推进，Ku handler 仍串行执行。native C 使用 epoll（Linux）、kqueue（macOS）和 WSAPoll（Windows）：每个 owner 独占其 socket 的读写和关闭，完整请求输入独立持有后交给既有的最多64个 handler worker，等待连接不创建逐连接线程，也不占用 handler worker。槽位等实际 job 引用归还后才复用，部分读写不刷新原阶段期限。
 
 native handler 仍在执行线程按原期限协作检查与清理，阻塞系统/FFI 调用不会被 I/O 线程强制打断；全部 worker 创建失败时保留原 inline 降级，此时 handler 仍会阻塞 I/O 线程。有限 KU_HTTP_MAX_REQUESTS 达到接受数量后停止监听，真实排空已接受的读取、job、响应及引用，join worker 后退出。
 
-两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。已有 pending 时，纯空闲复用连接让出活动槽，响应边界也可主动关闭连接，客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
+两端默认复用 HTTP/1.1 连接；HTTP/1.0 仍拒绝。每连接仅执行一个 handler，最多保留一次 socket 读取产生的 8192 字节后续请求，按顺序处理流水线；显式 Connection: close（大小写无关的完整 token）、错误/超时及 1xx 响应结束连接。解释器保留原空闲连接让出活动槽的策略；native 不因 A/P 压力关闭空闲 keep-alive，后续请求进入共享 FIFO，C 记录耗尽时仍可回收空闲连接。客户端须处理服务端关闭。各请求沿用原 header/body/handler/write 绝对期限，复用空闲等待使用 idle_timeout_ms，不增加 handler worker。
 
 通用 Task 网络等待、跨模块完整资源预算/指标和正式长期负载验收仍未完成。
 
