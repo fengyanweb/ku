@@ -2020,8 +2020,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
     fn emit_drive(&self, out: &mut COutput) -> KuResult<()> {
         if self.cooperative && self.hosted {
             out.push_str(&format!(
-                "typedef char {}_compute_proof_matches_driver[(KU_TASK_DRIVER_COMPUTE_BANK_STATES==64u && KU_TASK_DRIVER_COMPUTE_MAX_BANKS==4u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_MAX_BANKS<={}u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS==KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES && KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES<={}u) ? 1 : -1];\n",
+                "typedef char {}_compute_proof_matches_driver[(KU_TASK_DRIVER_COMPUTE_BANK_STATES==64u && KU_TASK_DRIVER_COMPUTE_MAX_BANKS==4u && KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS==32u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_MAX_BANKS<={}u && KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS<=KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS<={}u && KU_TASK_DRIVER_COMPUTE_BANK_STATES*KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS==KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES && KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES<={}u) ? 1 : -1];\n",
                 self.prefix,
+                super::task_range::COMPUTE_PROOF_STATES,
                 super::task_range::COMPUTE_PROOF_STATES,
                 super::task_range::COMPUTE_PROOF_STATES
             ));

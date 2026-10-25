@@ -887,7 +887,7 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
   fixture_cancel_lease=&task.owner.lease;
   KuTaskDriverSliceResultV1 sliced={0};
-  size_t first_credits=private_mode && cancel_at>64u && cancel_at!=SIZE_MAX ? 16u : 1u;
+  size_t first_credits=private_mode && cancel_at>64u && cancel_at!=SIZE_MAX ? 128u : 1u;
   CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,first_credits,1000u,fixture_deadline,NULL,NULL,&sliced)
       :ku_task_driver_pump(&driver,0u,1u,&next))==KU_TASK_DRIVER_OK);
   if(cancel_at) CHECK(fixture_cancel_at!=SIZE_MAX && fixture_steps>=fixture_cancel_at
@@ -940,7 +940,7 @@ int main(void) {
      * same iteration: the original control cancellation arbitration wins. */
     if(!loop_slow) CHECK(!fixture_case(SIZE_MAX,1,0,force_slow,loop_slow,private_mode));
     if(private_mode) {
-      const size_t later_positions[]={65u,255u,256u,257u,1023u,1024u};
+      const size_t later_positions[]={65u,255u,256u,257u,1023u,1024u,8191u,8192u};
       for(size_t i=0;i<sizeof(later_positions)/sizeof(later_positions[0]);i++)
         CHECK(!fixture_case(later_positions[i],0,0,force_slow,loop_slow,private_mode));
     }

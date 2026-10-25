@@ -13,6 +13,8 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
     out.push_str(&format!(
         "#define KU_TASK_DRIVER_COMPUTE_BANK_STATES ((size_t){}u)\n\
          #define KU_TASK_DRIVER_COMPUTE_MAX_BANKS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS ((size_t){}u)\n\
          #define KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS ((size_t){}u)\n\
          #define KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS ((size_t){}u)\n\
          #define KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES ((size_t){}u)\n\
@@ -20,6 +22,8 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
          #define KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS ((size_t){}u)\n",
         super::task_range::COMPUTE_BANK_STATES,
         super::task_range::COMPUTE_MAX_BANKS,
+        super::task_range::COMPUTE_PUBLIC_SELECTION_CREDITS,
+        super::task_range::COMPUTE_PRIVATE_SELECTION_CREDITS,
         super::task_range::COMPUTE_MAX_OPERATIONS,
         super::task_range::COMPUTE_RESERVATION_CREDITS,
         super::task_range::COMPUTE_RESERVATION_STATES,
@@ -2954,16 +2958,17 @@ static uint32_t ku_task_driver_resume_segment(void* raw) {
   } while (1);
   return outcome;
 }
-/* One owner segment, consuming at most max_quanta 64-state work credits (<=32).
+/* One owner segment, consuming at most max_quanta 64-state work credits:
+ * public/B2 selections keep32; only a private HTTP slice may select128.
  * Enter and return with the publication mutex held. User callbacks/drop run
  * unlocked. Only pure generated bounded yields may share the live RUNNING
  * execution lease. Public/B2 reads keep their old bank boundaries. The private
- * reservation has fresh entry/finish/nonpure observations and a <=1024-state,
- * <=8192-pure-operation zone. Generated private phase chunks are bounded by
+ * reservation has fresh entry/finish/nonpure observations and a <=8192-state,
+ * <=65536-pure-operation zone. Generated private phase chunks are bounded by
  * <=256 states AND <=1024 operations; neither bound promises sub-ms realtime.
  * Actual poll
  * metrics count registered-resume/control attempts, not borrowed banks:
- * the 1ms segment budget can overrun by one quantum/expensive operation. */
+ * the 1ms segment budget can overrun by a finite reservation/expensive operation. */
 static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta,
     KuTaskDriverSliceV1* slice) {
   KuTaskDriverV1* driver=worker->driver;
@@ -3420,7 +3425,8 @@ static uint32_t ku_task_driver_pump(KuTaskDriverV1* driver, size_t owner,
         && now>=driver->next_deadline) ku_task_driver_deadlines_locked(driver,now);
     if (!worker->local_queued) break;
     size_t remaining=max_quanta-count;
-    int advanced=ku_task_driver_run_one_locked(worker,remaining<32u ? remaining : 32u);
+    int advanced=ku_task_driver_run_one_locked(worker,remaining<KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS
+        ? remaining : KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS);
     if (advanced<0) return KU_TASK_DRIVER_INTERNAL; /* Quarantined storage. */
     if (!advanced) break;
     count+=(size_t)advanced;
@@ -3445,7 +3451,7 @@ static uint32_t ku_task_driver_pump(KuTaskDriverV1* driver, size_t owner,
  * work and a finite real HTTP deadline minimum (not the ready-work zero hint).
  * The hook is an atomic-only wake observation: it must not lock, allocate,
  * wait or reenter driver. It does not clear the publisher's wake state.
- * Every selection still rotates the original fixed-owner FIFO after <=32
+ * Private selections rotate the original fixed-owner FIFO after <=128
  * credits; all selections and frame banks share the SAME origin and 1ms cap.
  * A boundary/time stop ends this entire call, never a renewed inner slice.
  * The HTTP caller must rebuild/serve I/O before another call or OS sleep. */
@@ -3494,7 +3500,8 @@ static uint32_t ku_task_driver_compute_slice(KuTaskDriverV1* driver,size_t owner
     if (driver->closing) { output->reason=KU_TASK_SLICE_CANCEL; break; }
     if (!worker->local_queued) { output->reason=KU_TASK_SLICE_IDLE; break; }
     size_t remaining=max_work_credits-output->work_credits;
-    int advanced=ku_task_driver_run_one_mode_locked(worker,remaining<32u ? remaining : 32u,&slice);
+    int advanced=ku_task_driver_run_one_mode_locked(worker,remaining<KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS
+        ? remaining : KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS,&slice);
     if (advanced<0) {
       output->reason=KU_TASK_SLICE_FAULT;
       return KU_TASK_DRIVER_INTERNAL; /* Quarantined broken mutex/storage. */
