@@ -3044,6 +3044,11 @@ static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
 }
 static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
     KuHttpSocket fd,short events,uint64_t token,int remove) {
+  /* Task-net owns its sockets and can close one during pump/interests, before
+   * the owner reconciles the previous snapshot. That removes its old kernel
+   * interest automatically. Never interpret a closed event source as this
+   * benign target-fd retirement. Fresh interests still require a live target. */
+  if(!remove && !entry->registered && fcntl(fd,F_GETFD)<0) return 0;
 #if defined(__linux__)
   struct epoll_event event={0};
   if(events&KU_HTTP_POLL_READ) event.events|=EPOLLIN|EPOLLRDHUP;
@@ -3053,7 +3058,9 @@ static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
   int status;
   do { status=epoll_ctl(r->descriptor,operation,fd,remove?NULL:&event); }
   while(status<0 && errno==EINTR);
-  return !status || (remove && errno==ENOENT);
+  int error=errno;
+  return !status || (remove && (error==ENOENT
+      || (error==EBADF && r->descriptor>=0 && fcntl(r->descriptor,F_GETFD)>=0)));
 #else
   /* READ is removed while a live handler pauses it. Its real 25ms SO_ERROR
    * deadline remains in the owner maintenance loop; FIN is not cancellation. */
@@ -3062,14 +3069,22 @@ static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
   const int16_t filters[2]={EVFILT_READ,EVFILT_WRITE};
   for(size_t i=0;i<2u;i++) {
     int had=(previous&masks[i])!=0,want=!remove && (events&masks[i])!=0;
-    if(had==want) continue;
+    /* A fresh identity exclusively owns both filters for this numeric fd.
+     * Clear any unwanted old filter too; a kqueue ADD replaces one filter,
+     * unlike epoll ADD which rejects an existing live-fd registration. */
+    if(had==want && (entry->registered || remove || want)) continue;
     struct kevent change;
     EV_SET(&change,(uintptr_t)fd,filters[i],want?(EV_ADD|EV_ENABLE):EV_DELETE,0,0,
         (void*)(uintptr_t)token);
     int status;
     do { status=kevent(r->descriptor,&change,1,NULL,0,NULL); }
     while(status<0 && errno==EINTR);
-    if(status<0 && !(had && !want && errno==ENOENT)) return 0;
+    if(status<0) {
+      int error=errno;
+      if(!want && error==ENOENT) continue;
+      if(remove && error==EBADF && r->descriptor>=0 && fcntl(r->descriptor,F_GETFD)>=0) continue;
+      return 0;
+    }
   }
   return 1;
 #endif
@@ -3081,6 +3096,19 @@ static void ku_http_reactor_delete(KuHttpReactor* r,size_t index) {
   if(!ku_http_reactor_kernel(r,entry,entry->fd,0,entry->token,1)) r->fault=1;
   ku_http_reactor_hash_remove(r,entry->token);
   *entry=(KuHttpRegistration){0};
+}
+static void ku_http_reactor_retire_fd_aliases(KuHttpReactor* r,size_t current,KuHttpSocket fd) {
+  /* This scan runs only after a NEW kernel registration succeeded, never on
+   * stable turns or ordinary MOD. The OS accepted the current identity; an
+   * older snapshot with the same number is logically retired WITHOUT DEL,
+   * which would otherwise delete the new fd owner. Tokens/generations remain
+   * full-width, so already-returned events for the old identity are rejected. */
+  for(size_t i=0;i<r->capacity;i++) {
+    KuHttpRegistration* old=&r->registrations[i];
+    if(i==current || !old->registered || old->fd!=fd) continue;
+    ku_http_reactor_hash_remove(r,old->token);
+    *old=(KuHttpRegistration){0};
+  }
 }
 static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
     KuHttpSocket fd,short events,uint64_t generation,int poll_index) {
@@ -3098,6 +3126,7 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   if(!ku_http_reactor_kernel(r,entry,fd,events,token,0)) {
     ku_http_reactor_hash_remove(r,token);r->fault=1;return;
   }
+  ku_http_reactor_retire_fd_aliases(r,index,fd);
   *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
 }
 static int ku_http_reactor_idle(const KuHttpConnection* c) {

@@ -6252,7 +6252,7 @@ typedef struct KuHttpConnection {
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
-static int fixture_external_net_close(int reuse) {
+static int fixture_external_net_close(int reuse,int both_filters) {
   KuHttpConnection connections[1]={{0}};
   KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
   CHECK(ku_http_reactor_init(&reactor,&active,1u));
@@ -6260,7 +6260,7 @@ static int fixture_external_net_close(int reuse) {
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,retired));
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
   int fd=retired[0];size_t old_net=4u;
-  ku_http_reactor_interest(&reactor,old_net,fd,KU_HTTP_POLL_READ,UINT64_MAX-300u,-1);
+  ku_http_reactor_interest(&reactor,old_net,fd,(short)(KU_HTTP_POLL_READ|(both_filters?KU_HTTP_POLL_WRITE:0)),UINT64_MAX-300u,-1);
   CHECK(!reactor.fault && reactor.registrations[old_net].registered);
   /* The net owner closes during pump/interests before HTTP reconciles the
    * previous compact snapshot. No HTTP close hook runs on that resource. */
@@ -6288,6 +6288,8 @@ static int fixture_external_net_close(int reuse) {
     }
     CHECK(found);
     char byte;CHECK(read(fd,&byte,1)==1 && byte=='r');
+    /* No retired WRITE filter/token may remain ready after READ was drained. */
+    CHECK(ku_http_reactor_wait(&reactor,items,0)==0);
     ku_http_reactor_delete(&reactor,0u);CHECK(!close(fd));
   }
   CHECK(!close(retired[1]));
@@ -6296,9 +6298,55 @@ static int fixture_external_net_close(int reuse) {
   puts(reuse?"http-external-net-reuse-preserves-current-registration-ok":"http-external-net-close-retirement-ok");
   return 0;
 }
+static int fixture_filter_masks(void) {
+  KuHttpConnection connections[1]={{0}};
+  KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_init(&reactor,&active,1u));
+  int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+  KuHttpPollFd items[8]={{0}};size_t net=4u;
+  ku_http_reactor_interest(&reactor,net,pair[0],KU_HTTP_POLL_READ|KU_HTTP_POLL_WRITE,123u,0);
+  uint64_t token=reactor.registrations[net].token;
+  CHECK(!reactor.fault && write(pair[1],"m",1)==1);
+  CHECK(ku_http_reactor_wait(&reactor,items,1000)>0);
+  CHECK((items[0].revents&(KU_HTTP_POLL_READ|KU_HTTP_POLL_WRITE))==(KU_HTTP_POLL_READ|KU_HTTP_POLL_WRITE));
+  char byte;CHECK(read(pair[0],&byte,1)==1 && byte=='m');
+  items[0].revents=0;
+  ku_http_reactor_interest(&reactor,net,pair[0],KU_HTTP_POLL_READ,123u,0);
+  CHECK(!reactor.fault && reactor.registrations[net].token==token);
+  CHECK(ku_http_reactor_wait(&reactor,items,0)==0 && !items[0].revents);
+  ku_http_reactor_interest(&reactor,net,pair[0],KU_HTTP_POLL_WRITE,123u,0);
+  CHECK(!reactor.fault && ku_http_reactor_wait(&reactor,items,1000)>0);
+  CHECK(items[0].revents&KU_HTTP_POLL_WRITE);
+  items[0].revents=0;
+  ku_http_reactor_interest(&reactor,net,pair[0],0,123u,0);
+  CHECK(!reactor.fault && ku_http_reactor_wait(&reactor,items,0)==0 && !items[0].revents);
+  ku_http_reactor_interest(&reactor,net,pair[0],KU_HTTP_POLL_READ,123u,0);
+  CHECK(write(pair[1],"n",1)==1 && ku_http_reactor_wait(&reactor,items,1000)>0);
+  CHECK(items[0].revents&KU_HTTP_POLL_READ);
+  CHECK(read(pair[0],&byte,1)==1 && byte=='n');
+  ku_http_reactor_delete(&reactor,net);CHECK(!reactor.fault);
+  CHECK(!close(pair[0]) && !close(pair[1]));ku_http_reactor_destroy(&reactor);
+  puts("http-persistent-dual-filter-mask-transitions-ok");return 0;
+}
+static int fixture_closed_event_source(void) {
+  KuHttpConnection connections[1]={{0}};
+  KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_init(&reactor,&active,1u));
+  int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+  ku_http_reactor_interest(&reactor,4u,pair[0],KU_HTTP_POLL_READ,99u,-1);
+  CHECK(!reactor.fault);
+  CHECK(!close(reactor.descriptor) && !close(pair[0]));
+  ku_http_reactor_delete(&reactor,4u);
+  CHECK(reactor.fault); /* EBADF must not hide failure of the event source. */
+  reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
+  puts("http-persistent-closed-event-source-fault-ok");return 0;
+}
 int main(int argc,char** argv) {
-  if(argc>1 && !strcmp(argv[1],"external-net-close")) return fixture_external_net_close(0);
-  if(argc>1 && !strcmp(argv[1],"external-net-reuse")) return fixture_external_net_close(1);
+  if(argc>1 && !strcmp(argv[1],"external-net-close")) return fixture_external_net_close(0,0);
+  if(argc>1 && !strcmp(argv[1],"external-net-reuse")) return fixture_external_net_close(1,0);
+  if(argc>1 && !strcmp(argv[1],"external-net-reuse-both")) return fixture_external_net_close(1,1);
+  if(argc>1 && !strcmp(argv[1],"filter-masks")) return fixture_filter_masks();
+  if(argc>1 && !strcmp(argv[1],"closed-event-source")) return fixture_closed_event_source();
   KuHttpConnection connections[4]={{0}};
   KuHttpActiveSet active={connections,4,NULL};KuHttpReactor reactor;
   CHECK(ku_http_reactor_storage_bytes(4u,0u)>sizeof(reactor));
@@ -6383,13 +6431,25 @@ int main(int argc,char** argv) {
     };
     fs::remove_file(path).unwrap();
     let output = run_bounded(&mut Command::new(&executable), RUN_TIMEOUT, RUN_OUTPUT_LIMITS).unwrap();
-    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.status.success(),
+        "status={:?}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.stdout, b"http-persistent-owner-generation-idle-ok\n");
     // Run both independent external-close counterexamples even if the first
     // fails, so retained output distinguishes stale-fd fault from a lost new
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
-    for scenario in ["external-net-close", "external-net-reuse"] {
+    for scenario in [
+        "external-net-close",
+        "external-net-reuse",
+        "external-net-reuse-both",
+        "filter-masks",
+        "closed-event-source",
+    ] {
         let output = run_bounded(
             Command::new(&executable).arg(scenario),
             RUN_TIMEOUT,
@@ -6397,7 +6457,12 @@ int main(int argc,char** argv) {
         )
         .unwrap();
         if !output.status.success() {
-            failures.push(format!("{scenario}: {output:?}"));
+            failures.push(format!(
+                "{scenario}: status={:?}; stdout={}; stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
