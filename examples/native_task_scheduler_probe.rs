@@ -123,8 +123,10 @@ fn emit(path: PathBuf) -> Result<(), Box<dyn Error>> {
         native_task_ledger::LOCKED_ALLOCATIONS,
     );
     let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    // Pump credits and returned polls can differ for private compute regions.
+    // Observe the same returned-poll count that the driver actually publishes.
     let returned =
-        "driver->polls=quanta>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+quanta;";
+        "driver->polls=polls>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+polls;";
     for unique in [
         "typedef struct KuString {",
         "int main(void) {",
@@ -147,7 +149,7 @@ fn emit(path: PathBuf) -> Result<(), Box<dyn Error>> {
         )
         .replacen(
             returned,
-            &format!("{returned}\n#if KU_BENCH_OBSERVE\n    bench_returned_locked(worker, index, quanta);\n#endif"),
+            &format!("{returned}\n#if KU_BENCH_OBSERVE\n    bench_returned_locked(worker, index, polls);\n#endif"),
             1,
         );
     source.push_str(HARNESS);
@@ -449,7 +451,7 @@ static size_t bench_argument(const char* input, size_t maximum) {
   CHECK(result && result <= maximum); return result;
 }
 int main(int argc, char** argv) {
-  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 11u && KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
+  CHECK(argc == 4 && KU_TASK_DRIVER_ABI_VERSION == 12u && KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   size_t workers = bench_argument(argv[1], BENCH_MAX_WORKERS);
   bench_count = bench_argument(argv[2], BENCH_MAX_TASKS);
   size_t quanta = bench_argument(argv[3], 65536);
@@ -459,7 +461,8 @@ int main(int argc, char** argv) {
   KuTaskDriverSlotV1* slots = (KuTaskDriverSlotV1*)calloc(bench_count, sizeof(*slots));
   size_t* ring = (size_t*)calloc(bench_count, sizeof(*ring));
   CHECK(driver && slots && ring);
-  size_t fixed = sizeof(*driver) + bench_count * (sizeof(*slots) + sizeof(*ring));
+  size_t fixed = ku_task_driver_fixed_storage_bytes(bench_count);
+  CHECK(fixed != SIZE_MAX); /* Includes the driver's owned lookup storage. */
   size_t task_bytes = sizeof(BenchTask) + 8;
   CHECK(task_bytes <= (SIZE_MAX - fixed) / bench_count);
   KuTaskControlOwnerV1 owners[BENCH_MAX_TASKS] = {0};
