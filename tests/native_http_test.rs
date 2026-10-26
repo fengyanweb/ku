@@ -4486,6 +4486,247 @@ fn main(): null! {
 }
 
 #[test]
+fn native_http_accept_fd_wait_does_not_hold_admission_lock_and_drain_closes_returned_fd() {
+    if !cfg!(unix) {
+        return; // The controlled kernel-wait edge uses pthread trylock and fcntl.
+    }
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-accept-lock");
+    let address = unused_local_address();
+    let port = address.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
+    let source = r#"
+import "std.http"
+fn main(): null! {
+    app = http.server({max_connections:16,max_active_requests:4,max_pending_requests:4})
+    app.get("/ok", fn() { return http.text("ready") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    fs::write(directory.path().join("accept.ku"), source).unwrap();
+    let emission = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(directory.path())
+            .args(["build", "--native", "accept.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&emission.stdout),
+        String::from_utf8_lossy(&emission.stderr)
+    );
+    assert!(emission.status.success(), "C emission failed: {text}");
+    let emitted = text
+        .lines()
+        .find_map(|line| line.strip_prefix("native c ok: "))
+        .expect("CLI reports emitted native C");
+    let emitted = PathBuf::from(emitted);
+    let emitted = if emitted.is_absolute() {
+        emitted
+    } else {
+        directory.path().join(emitted)
+    };
+    let mut generated = fs::read_to_string(emitted).unwrap();
+    assert_eq!(generated.matches("int main(void) {").count(), 1);
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_application_main(void) {",
+        1,
+    );
+    let hooks = r#"
+static pthread_mutex_t fixture_lock=PTHREAD_MUTEX_INITIALIZER;
+static KuTestEvent fixture_entered,fixture_release;
+static KuHttpLoopGroup* fixture_group;
+static int fixture_owner,fixture_calls,fixture_inflight,fixture_peak,fixture_gate_failed;
+static int fixture_submits,fixture_exits,fixture_returned_fd=-1;
+static unsigned long long fixture_accepted,fixture_owner_accepted[2];
+static size_t fixture_remaining;
+static void fixture_note_submit(void) {
+  pthread_mutex_lock(&fixture_lock);fixture_submits++;pthread_mutex_unlock(&fixture_lock);
+}
+/* The actual generated accept call stays on its real owner OS thread. The
+ * call boundary is gated; accept still returns a real connected descriptor. */
+static KuHttpSocket fixture_accept(KuHttpLoopGroup* group,KuHttpLoopOwner* owner,KuHttpSocket listener) {
+  pthread_mutex_lock(&fixture_lock);
+  int first=++fixture_calls==1;
+  fixture_inflight++;if(fixture_inflight>fixture_peak)fixture_peak=fixture_inflight;
+  if(first) {fixture_group=group;fixture_owner=owner->index;}
+  pthread_mutex_unlock(&fixture_lock);
+  if(first) {
+    if(!ku_test_event_set(&fixture_entered) || !ku_test_event_wait(&fixture_release,2000u)) {
+      pthread_mutex_lock(&fixture_lock);fixture_gate_failed=1;pthread_mutex_unlock(&fixture_lock);
+    }
+  }
+  KuHttpSocket result=accept(listener,NULL,NULL);
+  int saved_errno=errno;
+  pthread_mutex_lock(&fixture_lock);
+  fixture_inflight--;if(result!=KU_HTTP_INVALID_SOCKET)fixture_returned_fd=result;
+  pthread_mutex_unlock(&fixture_lock);
+  errno=saved_errno;return result;
+}
+/* Called under the original group lock before the group's stack can retire. */
+static void fixture_note_exit(KuHttpLoopOwner* owner) {
+  pthread_mutex_lock(&fixture_lock);
+  fixture_exits++;fixture_accepted=owner->group->accepted;
+  fixture_owner_accepted[owner->index]=owner->accepted;
+  fixture_remaining+=owner->resident+owner->connections+owner->active_requests;
+  pthread_mutex_unlock(&fixture_lock);
+}
+"#;
+    let loop_edge = "static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {";
+    assert_eq!(generated.matches(loop_edge).count(), 1);
+    generated = generated.replacen(
+        loop_edge,
+        &format!(
+            "{}\n{hooks}\n{loop_edge}",
+            native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS
+        ),
+        1,
+    );
+    let submit_edge = "static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {";
+    assert_eq!(generated.matches(submit_edge).count(), 1);
+    generated = generated.replacen(
+        submit_edge,
+        &format!("static void fixture_note_submit(void);\n{submit_edge}\n  fixture_note_submit();"),
+        1,
+    );
+    let accept_edge = "KuHttpSocket cli = accept(srv, NULL, NULL);";
+    assert_eq!(generated.matches(accept_edge).count(), 1);
+    generated = generated.replacen(
+        accept_edge,
+        "KuHttpSocket cli = fixture_accept(group,owner,srv);",
+        1,
+    );
+    let exit_edge = "owner->ready = 0; owner->exited = 1;";
+    assert_eq!(generated.matches(exit_edge).count(), 1);
+    generated = generated.replacen(
+        exit_edge,
+        &format!("{exit_edge}\n  fixture_note_exit(owner);"),
+        1,
+    );
+    generated.push_str(&format!("\n#define FIXTURE_PORT {port}\n"));
+    generated.push_str(r#"
+#define EXPECT(c) do {if(!(c)){fprintf(stderr,"accept lock line %d: %s\n",__LINE__,#c);failed=1;}}while(0)
+static void fixture_pause(void) {struct timespec pause={0,1000000L};nanosleep(&pause,NULL);}
+static int fixture_application(void* unused) {(void)unused;return fixture_application_main();}
+static int fixture_connect(void) {
+  unsigned long long end=ku_test_real_now_ms()+2000u;
+  while(ku_test_real_now_ms()<end) {
+    int fd=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    if(fd<0)return -1;
+    struct sockaddr_in endpoint={0};endpoint.sin_family=AF_INET;
+    endpoint.sin_addr.s_addr=htonl(INADDR_LOOPBACK);endpoint.sin_port=htons(FIXTURE_PORT);
+    if(!ku_http_socket_nonblocking(fd) || ku_http_socket_suppress_sigpipe(fd)) {close(fd);return -1;}
+    int connected=connect(fd,(struct sockaddr*)&endpoint,sizeof(endpoint))==0;
+    if(!connected && errno==EINPROGRESS) {
+      struct pollfd poller={fd,POLLOUT,0};int error=0;socklen_t length=sizeof(error);
+      connected=poll(&poller,1,10)>0 && !getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&length) && !error;
+    }
+    if(connected) {
+      const char request[]="GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+      if(send(fd,request,sizeof(request)-1,0)==(ssize_t)(sizeof(request)-1))return fd;
+    }
+    close(fd);fixture_pause();
+  }
+  return -1;
+}
+int main(int argc,char** argv) {
+  int failed=0,drain=argc>1 && !strcmp(argv[1],"drain");
+  setenv("KU_EVENT_LOOPS","2",1);setenv("KU_BLOCKING_THREADS","2",1);
+  setenv("KU_THREAD_BUDGET","64",1);setenv("KU_HTTP_MAX_REQUESTS","2",1);
+  unsetenv("KU_SERVICE_PROBE_ADDR");unsetenv("KU_SERVICE_CONTROL_TOKEN");
+  if(!ku_test_event_init(&fixture_entered) || !ku_test_event_init(&fixture_release))return 96;
+  KuTestThread application;
+  if(!ku_test_thread_start(&application,fixture_application,NULL))return 96;
+  int first=fixture_connect(),second=fixture_connect();
+  EXPECT(first>=0 && second>=0);
+  int entered=ku_test_event_wait(&fixture_entered,1500u);EXPECT(entered);
+  KuHttpLoopGroup* group=fixture_group;
+  int admitted=0,other_progress=0;
+  int unlocked=0;
+  unsigned long long lock_deadline=ku_test_real_now_ms()+100u;
+  while(entered && !unlocked && ku_test_real_now_ms()<lock_deadline) {
+    unlocked=!pthread_mutex_trylock(&group->lock);
+    if(!unlocked)fixture_pause();
+  }
+  if(unlocked) {
+    int other=1-fixture_owner;
+    unsigned long long heartbeat=group->loops[other].heartbeat;
+    EXPECT(group->accept_turn==fixture_owner && !group->accepted);
+    KuHttpWake* wake=group->loops[other].wake;
+    if(wake)ku_http_wake_notify(wake); /* Lifetime remains under group.lock. */
+    ku_http_mutex_unlock(&group->lock);
+    ku_http_current_loop=&group->loops[other];
+    admitted=ku_http_reused_request_admit();ku_http_current_loop=NULL;
+    unsigned long long end=ku_test_real_now_ms()+500u;
+    while(ku_test_real_now_ms()<end && !other_progress) {
+      if(!pthread_mutex_trylock(&group->lock)) {
+        other_progress=group->loops[other].heartbeat>heartbeat;
+        ku_http_mutex_unlock(&group->lock);
+      }
+      if(!other_progress)fixture_pause();
+    }
+    pthread_mutex_lock(&fixture_lock);
+    EXPECT(fixture_calls==1 && fixture_inflight==1 && fixture_peak==1);
+    pthread_mutex_unlock(&fixture_lock);
+    if(drain) {
+      ku_http_mutex_lock(&group->lock);
+      group->draining=1;group->drain_deadline=ku_http_deadline_ms(2000u);
+      ku_http_mutex_unlock(&group->lock);
+      ku_http_group_notify(group);
+    }
+  }
+  /* Old code fails these bounded assertions, then is released to finish N=2.
+   * No failed trylock path blocks trying to acquire the accept-held mutex. */
+  EXPECT(admitted && other_progress);
+  EXPECT(ku_test_event_set(&fixture_release));
+  int joined=ku_test_thread_join(&application,3000u);EXPECT(joined);
+  if(!joined)return 96; /* Process exit bounds even a broken native teardown. */
+  EXPECT(application.outcome==0 && !fixture_gate_failed && fixture_exits==2);
+  EXPECT(fixture_peak==1 && !fixture_inflight && !fixture_remaining);
+  EXPECT(atomic_load_explicit(&ku_http_active_conns,memory_order_relaxed)==0);
+  if(drain && admitted) {
+    EXPECT(fixture_calls==1 && fixture_accepted==0 && fixture_submits==0);
+    EXPECT(fixture_returned_fd>=0 && fcntl(fixture_returned_fd,F_GETFD)==-1 && errno==EBADF);
+  } else if(!drain) {
+    EXPECT(fixture_accepted==2 && fixture_submits==2);
+    EXPECT(fixture_owner_accepted[0]==1 && fixture_owner_accepted[1]==1);
+  }
+  if(first>=0)close(first);if(second>=0)close(second);
+  EXPECT(ku_test_event_destroy(&fixture_entered) && ku_test_event_destroy(&fixture_release));
+  if(failed)return 1;
+  puts("http-accept-fd-wait-lock-turn-drain-ok");return 0;
+}
+"#);
+    let path = directory.path().join("accept-lock.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) =
+        native_c_harness::compile_harness(directory.path(), &path, "accept-lock")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires accept lock regression"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    for mode in ["normal", "drain"] {
+        let output = run_bounded(
+            Command::new(&executable).arg(mode),
+            RUN_TIMEOUT,
+            RUN_OUTPUT_LIMITS,
+        )
+        .unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert_eq!(output.stdout, b"http-accept-fd-wait-lock-turn-drain-ok\n");
+        assert!(output.stderr.is_empty(), "{mode}: {output:?}");
+    }
+}
+
+#[test]
 fn native_http_fixed_loops_share_limits_authenticate_control_and_drain() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"

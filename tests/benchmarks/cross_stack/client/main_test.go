@@ -184,6 +184,56 @@ func TestSharedPoolReusesAcrossWorkersAtLowArrivalRate(t *testing.T) {
 	}
 }
 
+func TestHistoricalLedgerDoesNotBlockRequestResourceAccounting(t *testing.T) {
+	c := testConfig(t)
+	var requests atomic.Uint32
+	seen := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case seen <- r.URL.Query().Get("rid"):
+		default:
+		}
+		_, _ = io.WriteString(w, "ok:"+r.URL.Query().Get("rid"))
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	l := testLedger()
+	l.origin = time.Now()
+	l.cutoff = l.origin.Add(c.duration)
+	l.seconds = make([]secondStats, 1)
+	j := job{kind: "ok", rid: "1", scheduled: l.origin}
+	w := testWorker(c, l)
+	defer w.pool.close()
+	done := make(chan struct{})
+	l.mu.Lock()
+	var unlock sync.Once
+	release := func() { unlock.Do(l.mu.Unlock) }
+	defer release()
+	go func() { l.plan(j); w.execute(j); close(done) }()
+	progress := false
+	select {
+	case rid := <-seen:
+		progress = rid == j.rid
+	case <-time.After(250 * time.Millisecond):
+	}
+	// Completion history may intentionally wait for this lock. Always release
+	// it before joining, including on the old implementation's red path.
+	release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not retire after the historical lock was released")
+	}
+	w.pool.close()
+	if requests.Load() != 1 || l.all.Planned != 1 || l.all.Attempted != 1 || l.all.Sent != 1 || l.all.Results["correct"] != 1 || l.active != 0 || l.live != 0 || l.dials != 1 {
+		t.Fatalf("resource/history reconciliation changed: requests=%d stats=%+v active=%d live=%d dials=%d", requests.Load(), l.all, l.active, l.live, l.dials)
+	}
+	if !progress {
+		t.Fatal("historical ledger lock prevented the real HTTP request from being sent")
+	}
+}
+
 func TestWorkersFinishConstructionBeforeArrivalOrigin(t *testing.T) {
 	c := testConfig(t)
 	c.concurrency, c.queue = 8, 8

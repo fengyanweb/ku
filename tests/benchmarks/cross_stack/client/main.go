@@ -252,7 +252,13 @@ type secondStats struct {
 	completedCorrect                  uint64
 	completedKinds                    map[string]uint64
 }
+
+// Completion history, producer counts/type registration, and resources have
+// separate lock domains. Only finish nests locks: mu -> planMu or resourceMu,
+// never the reverse. Resource sections contain scalar updates/copies only.
 type ledger struct {
+	planMu                                                            sync.Mutex
+	resourceMu                                                        sync.Mutex
 	mu                                                                sync.Mutex
 	all                                                               *stats
 	types                                                             map[string]*stats
@@ -269,7 +275,24 @@ type ledger struct {
 	events                                                            *eventWriter
 }
 
+type ledgerResourceSnapshot struct {
+	active, peakActive, live, peakLive, dials, peakQueue, poolExpired uint64
+}
+
+func (l *ledger) resourceSnapshot() ledgerResourceSnapshot {
+	l.resourceMu.Lock()
+	defer l.resourceMu.Unlock()
+	return ledgerResourceSnapshot{l.active, l.peakActive, l.live, l.peakLive, l.dials, l.peakQueue, l.poolExpired}
+}
+
 func (l *ledger) typed(kind string) *stats {
+	l.planMu.Lock()
+	defer l.planMu.Unlock()
+	return l.typedLocked(kind)
+}
+
+// Caller holds planMu. Completion fields in the returned stats still require mu.
+func (l *ledger) typedLocked(kind string) *stats {
 	s := l.types[kind]
 	if s == nil {
 		s = newStats()
@@ -278,13 +301,14 @@ func (l *ledger) typed(kind string) *stats {
 	return s
 }
 func (l *ledger) plan(j job) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.planMu.Lock()
+	defer l.planMu.Unlock()
 	l.all.Planned++
-	l.typed(j.kind).Planned++
+	kind := l.typedLocked(j.kind)
+	kind.Planned++
 	if j.cpuCancel {
 		l.all.plannedCancels++
-		l.typed(j.kind).plannedCancels++
+		kind.plannedCancels++
 	}
 	i := int(j.scheduled.Sub(l.origin) / time.Second)
 	if i >= len(l.seconds) {
@@ -293,10 +317,10 @@ func (l *ledger) plan(j job) {
 	l.seconds[i].planned++
 }
 func (l *ledger) start() {
-	l.mu.Lock()
+	l.resourceMu.Lock()
 	l.active++
 	l.peakActive = max(l.peakActive, l.active)
-	l.mu.Unlock()
+	l.resourceMu.Unlock()
 }
 func sloMS(kind string, c config) float64 {
 	key := "json_p99_ms"
@@ -328,7 +352,9 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if attempted {
+		l.resourceMu.Lock()
 		l.active--
+		l.resourceMu.Unlock()
 	}
 	if r.completed.After(l.lastTerminal) {
 		l.lastTerminal, l.lastTerminalRID = r.completed, j.rid
@@ -612,9 +638,9 @@ func newConnectionPool(c config, l *ledger) *connectionPool {
 
 func (p *connectionPool) discard(connection *idleConnection) error {
 	err := connection.conn.Close()
-	p.l.mu.Lock()
+	p.l.resourceMu.Lock()
 	p.l.live--
-	p.l.mu.Unlock()
+	p.l.resourceMu.Unlock()
 	return err
 }
 
@@ -632,9 +658,9 @@ func (p *connectionPool) take() (*idleConnection, bool) {
 		p.idle = p.idle[:index]
 		p.mu.Unlock()
 		if p.timeout > 0 && time.Since(connection.last) >= p.timeout {
-			p.l.mu.Lock()
+			p.l.resourceMu.Lock()
 			p.l.poolExpired++
-			p.l.mu.Unlock()
+			p.l.resourceMu.Unlock()
 			p.discard(connection)
 			continue
 		}
@@ -727,9 +753,9 @@ func enqueuePlanned(c config, l *ledger, j job, queue chan<- job, now time.Time)
 	}
 	select {
 	case queue <- j:
-		l.mu.Lock()
+		l.resourceMu.Lock()
 		l.peakQueue = max(l.peakQueue, uint64(len(queue)))
-		l.mu.Unlock()
+		l.resourceMu.Unlock()
 	default:
 		l.finish(j, time.Time{}, result{category: "not_started_queue", completed: now}, c)
 	}
@@ -823,9 +849,9 @@ func (w *worker) request(j job, began time.Time) (r result) {
 	}
 	r.reused = lease != nil
 	if lease == nil {
-		w.l.mu.Lock()
+		w.l.resourceMu.Lock()
 		w.l.dials++
-		w.l.mu.Unlock()
+		w.l.resourceMu.Unlock()
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		dialStart := time.Now()
 		conn, e := (&net.Dialer{FallbackDelay: -1}).DialContext(ctx, "tcp", w.c.address)
@@ -837,10 +863,10 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		}
 		counted := &countedConn{Conn: conn}
 		lease = &idleConnection{conn: counted, reader: bufio.NewReaderSize(counted, 8192)}
-		w.l.mu.Lock()
+		w.l.resourceMu.Lock()
 		w.l.live++
 		w.l.peakLive = max(w.l.peakLive, w.l.live)
-		w.l.mu.Unlock()
+		w.l.resourceMu.Unlock()
 	}
 	connection = lease.conn
 	before = connection.written
@@ -1222,7 +1248,8 @@ func run(c config) (map[string]any, error) {
 	pool := newConnectionPool(c, l)
 	var workers sync.WaitGroup
 	preparation := prepareRequestWorkers(c, l, pool, queue, &workers, nil)
-	preparationDials, preparationConnections := l.dials, l.live
+	preparationResources := l.resourceSnapshot()
+	preparationDials, preparationConnections := preparationResources.dials, preparationResources.live
 	var anchor monotonicAnchor
 	l.origin, anchor = captureMonotonicAnchor(time.Now, readKernelMonotonic)
 	l.cutoff = l.origin.Add(c.duration)
@@ -1266,7 +1293,8 @@ func run(c config) (map[string]any, error) {
 	if l.events != nil {
 		l.events.close()
 	}
-	valid := !l.budget.overflow && l.active == 0 && l.live == 0
+	finalResources := l.resourceSnapshot()
+	valid := !l.budget.overflow && finalResources.active == 0 && finalResources.live == 0
 	notStarted := uint64(0)
 	for k, n := range l.all.Results {
 		if strings.HasPrefix(k, "not_started_") {
@@ -1294,7 +1322,7 @@ func run(c config) (map[string]any, error) {
 	for name, data := range c.corpora {
 		hashes[name] = data.hash
 	}
-	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "pool_idle_expirations": l.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(l.dials, 1)), "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
+	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": finalResources.dials, "pool_idle_expirations": finalResources.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(finalResources.dials, 1)), "peak_connections": finalResources.peakLive, "connections_after_cleanup": finalResources.live, "peak_inflight": finalResources.peakActive, "active_after_cleanup": finalResources.active, "queue_peak": finalResources.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
 	out["worker_preparation"] = map[string]any{

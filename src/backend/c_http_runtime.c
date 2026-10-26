@@ -2573,9 +2573,9 @@ static int ku_http_parse_ipv4(const char* text, unsigned long* network_order) {
 
 #define KU_HTTP_MAX_LOOPS 32
 /* All loop storage survives until every socket/job owner and OS thread retires.
- * Only the caller owns/closes the shared nonblocking listener. A short accept
- * mutex transfers each new socket directly to exactly one loop; reads, writes,
- * parser state and completion observation never move between loops. */
+ * Only the caller owns/closes the shared nonblocking listener. The current
+ * accept turn belongs to one single-threaded owner until it publishes success;
+ * reads, writes, parser state and completion never move between loops. */
 typedef struct KuHttpLoopGroup KuHttpLoopGroup;
 typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
@@ -4211,8 +4211,22 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       if (group->draining || group->failure || group->accept_turn != owner->index) {
         ku_http_mutex_unlock(&group->lock); break;
       }
+      /* Only this owner can advance its turn, and it cannot reenter accept.
+       * Even a nonblocking listener may sleep in kernel FD allocation: do not
+       * hold the lifecycle/admission mutex across that syscall. The listener
+       * itself survives until all owner threads have joined. */
+      ku_http_mutex_unlock(&group->lock);
       KuHttpSocket cli = accept(srv, NULL, NULL);
       int accept_error = cli == KU_HTTP_INVALID_SOCKET ? ku_http_socket_last_error() : 0;
+      ku_http_mutex_lock(&group->lock);
+      /* Drain/failure may have linearized while accept was outside the lock.
+       * Such a socket never receives C/A/P ownership or a handler submission.
+       * Close outside the group lock, just as the ordinary socket paths do. */
+      if (group->draining || group->failure || group->accept_turn != owner->index) {
+        ku_http_mutex_unlock(&group->lock);
+        if (cli != KU_HTTP_INVALID_SOCKET) ku_http_socket_close(cli);
+        break;
+      }
       if (cli != KU_HTTP_INVALID_SOCKET) {
         group->accepted++; owner->accepted++;
         /* Explicit loops may exceed C. Zero-C owners retain Task/net/wake
