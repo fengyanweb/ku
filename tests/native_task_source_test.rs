@@ -221,6 +221,264 @@ int main(void) {
 }
 
 #[test]
+fn native_task_modular_pairs_preserve_original_iterations_fees_and_guard_fallbacks() {
+    fn helper(source: &str, id: usize) -> &str {
+        let start = source
+            .find(&format!(
+                "static KU_TASK_LOOP_NOINLINE ku_task_frame_{id}_loop_"
+            ))
+            .expect("ordinary proved outline exists");
+        let end = start + source[start..].find("\n}\n").unwrap() + 3;
+        &source[start..end]
+    }
+    let marker = "/* pair-composed affine remainder; logical iterations are unchanged */";
+    let mut generated = native(
+        r#"
+async fn Affine(limit:int,seed:int):int! {
+    value=seed; index=0
+    while(index<limit) { value=(value*5+index*2+seed*3+7)%97; index=index+1 }
+    return ok(value)
+}
+async fn Prefix(limit:int,seed:int):int! {
+    bound=limit+2147483652; value=seed+2147483648; index=2147483648
+    while(index<bound) { value=(value*5+index*2+seed*3+7)%97; index=index+1 }
+    return ok(value)
+}
+async fn main():null! { return ok(null) }
+"#,
+    );
+    assert!(helper(&generated, 0).contains(marker));
+    assert!(helper(&generated, 1).contains(marker));
+    for source in [
+        "async fn Extra(limit:int,seed:int):int! { value=seed; index=0; extra=0; while(index<limit) { extra=extra+index; value=(value*5+index+seed+7)%97; index=index+1 } return ok(value+extra) } async fn main():null! { return ok(null) }",
+        "async fn Wide(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=(value*1000000000+index+seed+7)%97; index=index+1 } return ok(value) } async fn main():null! { return ok(null) }",
+        "async fn Negative(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=(value* -5+index+seed+7)%97; index=index+1 } return ok(value) } async fn main():null! { return ok(null) }",
+        "async fn Subtract(limit:int,seed:int):int! { value=seed; index=0; while(index<limit) { value=(value*5-index+seed+7)%97; index=index+1 } return ok(value) } async fn main():null! { return ok(null) }",
+    ] {
+        let declined = native(source);
+        assert!(helper(&declined, 0).contains("canonical private trip"));
+        assert!(!helper(&declined, 0).contains(marker));
+    }
+    let outlined = helper(&generated, 0);
+    let name = outlined
+        .split_once("(size_t max_iterations")
+        .unwrap()
+        .0
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    let recurrence = outlined
+        .lines()
+        .find(|line| line.contains("% UINT64_C(97)"))
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .0
+        .trim()
+        .to_owned();
+    let index = outlined
+        .lines()
+        .find(|line| line.ends_with("+INT64_C(2);"))
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .0
+        .trim()
+        .to_owned();
+    let bound = outlined
+        .lines()
+        .find(|line| line.contains("__ku_trip_span=(uint64_t)"))
+        .unwrap()
+        .trim()
+        .strip_prefix("if (")
+        .unwrap()
+        .split_once('>')
+        .unwrap()
+        .0
+        .to_owned();
+    let parameters = outlined
+        .split_once("(size_t max_iterations")
+        .unwrap()
+        .1
+        .split_once(") {")
+        .unwrap()
+        .0
+        .split(',')
+        .filter_map(|parameter| parameter.split_whitespace().last())
+        .collect::<Vec<_>>();
+    assert_eq!(parameters.len(), 4);
+    let call_arguments = parameters
+        .iter()
+        .map(|parameter| {
+            if *parameter == recurrence {
+                "value"
+            } else if *parameter == index {
+                "index"
+            } else if *parameter == bound {
+                "limit"
+            } else {
+                "seed"
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let value_field = format!("s_{}", recurrence.strip_prefix("cached_").unwrap());
+    let index_field = format!("s_{}", index.strip_prefix("cached_").unwrap());
+    generated = generated.replacen(
+        "/* outlined Task loops for frame 0 */",
+        "static size_t fixture_pairs,fixture_states,fixture_operations,fixture_credits;\nstatic int fixture_disable_pairs;\n/* outlined Task loops for frame 0 */",
+        1,
+    );
+    // These probes count actual pair-loop executions and real driver reports;
+    // no labels or fictitious intermediate register states are introduced.
+    generated = generated.replace(
+        "size_t __ku_pair_iterations=(",
+        "size_t __ku_pair_iterations=fixture_disable_pairs ? 0u : (",
+    );
+    generated = generated.replace(
+        "for (;result.iterations<__ku_pair_iterations;result.iterations+=2u) {",
+        "for (;result.iterations<__ku_pair_iterations;result.iterations+=2u) { fixture_pairs++;",
+    );
+    for id in [0, 1] {
+        let resume = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        generated = generated.replacen(
+            &resume,
+            &format!(
+                "static uint32_t fixture_resume_{id}(void* raw);\n{resume}\n  uint32_t result=fixture_resume_{id}(raw);\n  if(ku_task_driver_execution && ku_task_driver_execution->compute.reported) {{\n    fixture_states+=ku_task_driver_execution->compute.states_used;\n    fixture_operations+=ku_task_driver_execution->compute.operations_used;\n    fixture_credits+=ku_task_driver_execution->compute.credits_used;\n  }}\n  return result;\n}}\nstatic uint32_t fixture_resume_{id}(void* raw) {{"
+            ),
+            1,
+        );
+    }
+    let clock = "static uint64_t ku_task_driver_now_ms(void) {";
+    generated=generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now(void) {",1);
+    let mut source = generated.replacen(
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+        1,
+    );
+    source.push_str(&format!(
+        "\n#define FIXTURE_HELPER {name}\n#define FIXTURE_HELPER_OUTPUT {name}_output\n#define FIXTURE_ARGUMENTS {call_arguments}\n#define FIXTURE_VALUE {value_field}\n#define FIXTURE_INDEX {index_field}\n"
+    ));
+    source.push_str(r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"modular pair line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static int64_t oracle(int64_t value,int64_t index,int64_t limit,int64_t seed,size_t count) {
+  for(size_t i=0;i<count && index<limit;i++,index++) value=(value*5+index*2+seed*3+7)%97;
+  return value;
+}
+static int fixture_helper_case(size_t cap,int64_t value,int64_t index,int64_t limit,int64_t seed) {
+  uint64_t span=limit>index ? (uint64_t)limit-(uint64_t)index : 0;
+  size_t iterations=span<(uint64_t)cap ? (size_t)span : cap;
+  int64_t expected=oracle(value,index,limit,seed,iterations);
+  for(int disabled=0;disabled<2;disabled++) {
+    fixture_disable_pairs=disabled;fixture_pairs=0;
+    FIXTURE_HELPER_OUTPUT result=FIXTURE_HELPER(cap,FIXTURE_ARGUMENTS);
+    CHECK(result.iterations==iterations && result.false_header==(span<(uint64_t)cap));
+    CHECK(result.FIXTURE_VALUE==expected && result.FIXTURE_INDEX==index+(int64_t)iterations);
+    int eligible=value>=0 && value<=INT32_MAX && index>=0 && index<=INT32_MAX
+      && limit>=0 && limit<=INT32_MAX && seed>=0 && seed<=INT32_MAX;
+    CHECK(fixture_pairs==(!disabled && eligible ? iterations/2u : 0u));
+  }
+  return 0;
+}
+typedef struct { int64_t value;size_t states,operations,credits; } Observation;
+static void fixture_wake(void* raw,size_t owner) { (void)raw;(void)owner; }
+static int fixture_task(int private_mode,int prefix,int64_t limit,int64_t seed,int disabled,int cancel,Observation* observed) {
+  KuTaskDriverV1 driver={0};KuTaskDriverSlotV1 slots[1]={0};size_t ring[1]={0};KuTaskValueV1 task={0};
+  size_t task_bytes=sizeof(KuTaskInstance_0)>sizeof(KuTaskInstance_1)?sizeof(KuTaskInstance_0):sizeof(KuTaskInstance_1);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(1u);uint64_t next=UINT64_MAX;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+task_bytes,1u,3000u,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  fixture_disable_pairs=disabled;fixture_pairs=fixture_states=fixture_operations=fixture_credits=0;
+  CHECK((prefix ? ku_task_1_start_value(&driver,&limit,&seed,&task)
+    :ku_task_0_start_value(&driver,&limit,&seed,&task))==KU_TASK_DRIVER_OK);
+  KuTaskDriverSliceResultV1 sliced={0};
+  for(size_t turn=0;turn<2000u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++) {
+    CHECK((private_mode ? ku_task_driver_compute_slice(&driver,0u,1u,1000u,3000u,NULL,NULL,&sliced)
+      :ku_task_driver_pump(&driver,0u,1u,&next))<=KU_TASK_DRIVER_PENDING);
+    if(private_mode) CHECK(sliced.work_credits<=1u);
+    if(cancel && !turn) {
+      CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING);
+      if(private_mode) CHECK(fixture_states==64u);
+      CHECK(ku_task_control_request_cancel(&task.owner.lease,KU_TASK_CONTROL_CANCELLED,3000u)==KU_TASK_CONTROL_OK);
+    }
+  }
+  if(cancel) CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  else {
+    KuTaskAdapterOutcomeV1 outcome={0};CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==1u && outcome.value.integer.ok);
+    observed->value=outcome.value.integer.value;
+    int64_t start=prefix ? seed+INT64_C(2147483648) : seed;
+    int64_t first=prefix ? INT64_C(2147483648) : 0;
+    int64_t bound=prefix ? limit+INT64_C(2147483652) : limit;
+    CHECK(observed->value==oracle(start,first,bound,seed,10000u));
+    ku_task_outcome_drop(&outcome);
+  }
+  if(!private_mode || disabled || prefix || seed<0 || seed>INT32_MAX || limit<0) CHECK(!fixture_pairs);
+  else if(limit>=2) CHECK(fixture_pairs>0);
+  CHECK(ku_task_value_drop(&task,3000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,3000u)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,3000u)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  observed->states=fixture_states;observed->operations=fixture_operations;observed->credits=fixture_credits;
+  if(private_mode) CHECK(observed->states && observed->credits);
+  return 0;
+}
+int main(void) {
+  /* Independent original int64 steps, every cap 0..17 (including odd tails),
+     zero trips and separate R/index/bound/invariant guard failures. */
+  for(size_t cap=0;cap<=17u;cap++) for(int64_t limit=0;limit<=19;limit++)
+    CHECK(!fixture_helper_case(cap,3,0,limit,2));
+  const int64_t outside=INT64_C(2147483648);
+  CHECK(!fixture_helper_case(3u,outside,0,9,2));
+  CHECK(!fixture_helper_case(3u,3,0,outside,2));
+  CHECK(!fixture_helper_case(3u,3,outside,outside+4,2));
+  CHECK(!fixture_helper_case(3u,3,0,9,outside));
+  CHECK(!fixture_helper_case(3u,-3,0,9,2));
+  CHECK(!fixture_helper_case(3u,3,-1,9,2));
+  CHECK(!fixture_helper_case(3u,3,-4,-1,2));
+  CHECK(!fixture_helper_case(3u,3,0,9,-3));
+  for(int private_mode=0;private_mode<2;private_mode++) {
+    const int64_t seeds[]={-3,0,2,INT64_C(2147483648)};
+    const int64_t limits[]={-1,0,1,3,9};
+    for(size_t s=0;s<sizeof(seeds)/sizeof(seeds[0]);s++) for(size_t l=0;l<sizeof(limits)/sizeof(limits[0]);l++) {
+      Observation paired={0},original={0};
+      CHECK(!fixture_task(private_mode,0,limits[l],seeds[s],0,0,&paired));
+      CHECK(!fixture_task(private_mode,0,limits[l],seeds[s],1,0,&original));
+      CHECK(paired.value==original.value && paired.states==original.states
+        && paired.operations==original.operations && paired.credits==original.credits);
+    }
+    for(int prefix=0;prefix<2;prefix++) {
+      Observation paired={0},original={0};int cancel=!prefix;
+      CHECK(!fixture_task(private_mode,prefix,prefix?0:2000,2,0,cancel,&paired));
+      CHECK(!fixture_task(private_mode,prefix,prefix?0:2000,2,1,cancel,&original));
+      CHECK(paired.states==original.states && paired.operations==original.operations && paired.credits==original.credits);
+      if(prefix) CHECK(paired.value==original.value);
+    }
+  }
+  puts("task-modular-pairs-original-oracle-fees-guards-ok");return 0;
+}
+"#);
+    let directory = TempDir::new("task-modular-pairs");
+    let path = directory.path().join("pairs.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "pairs") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires modular pair regression"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("task-modular-pairs-original-oracle-fees-guards-ok"));
+}
+
+#[test]
 fn native_task_external_owner_pump_preserves_affinity_wakes_and_retirement() {
     let generated=native("async fn Ready(value: int): int! { return ok(value) } async fn main(): null! { return ok(null) } async fn Work(): int! { index=0; while(index<5000) {index=index+1} return ok(index) }");
     let resume = "static uint32_t ku_task_2_resume(void* raw) {";
@@ -816,7 +1074,23 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
     assert!(drive.contains("goto ku_task_scalar_check_"));
     assert!(drive.contains("goto ku_task_range_state_"));
     assert!(drive.contains("__ku_range_fast=!cleanup && ("));
+    assert!(drive.contains(">=INT64_C(-2147483648)"));
+    assert_eq!(
+        drive
+            .matches("static KU_TASK_LOOP_NOINLINE ku_task_frame_0_loop_")
+            .count(),
+        1,
+        "the entry-domain proof must not clone the arithmetic helper"
+    );
     assert!(drive.contains("/* typed native loop:"));
+    // This pre-existing oracle injects cancellation at real uncombined C
+    // state labels. Keep that physical path here; composition has no such
+    // intermediate state and is checked separately against actual helper
+    // iterations, the driver's fee reports and original external cuts.
+    drive = drive.replace(
+        "size_t __ku_pair_iterations=(",
+        "size_t __ku_pair_iterations=0u && (",
+    );
     // Fuel remains exact per executed typed state, including empty drains and
     // latches. Cancellation observes the next bounded region/chunk cut;
     // the instrumented request may finish that chunk, within this exact bank.
@@ -841,7 +1115,7 @@ fn native_task_scalar_edges_preserve_exact_quantum_cancel_and_error_boundaries()
         "if (!cleanup && __ku_dispatch_budget>=",
         "if (!fixture_force_loop_slow && !cleanup && __ku_dispatch_budget>=",
     );
-    let globals = "static size_t fixture_steps,fixture_fast_steps,fixture_loop_steps,fixture_cancel_at,fixture_bad_prefix;\nstatic int fixture_force_slow,fixture_force_loop_slow;\nstatic uint32_t fixture_cancel_result;\nstatic uint64_t fixture_deadline;\nstatic KuTaskControlLeaseV1* fixture_cancel_lease;\n";
+    let globals = "static size_t fixture_steps,fixture_fast_steps,fixture_loop_steps,fixture_cancel_at,fixture_bad_prefix;\nstatic int fixture_force_slow,fixture_force_loop_slow,fixture_negative_seed;\nstatic uint32_t fixture_cancel_result;\nstatic uint64_t fixture_deadline;\nstatic KuTaskControlLeaseV1* fixture_cancel_lease;\n";
     generated.replace_range(begin..end, &(globals.to_owned() + &drive));
     let resume = "static uint32_t ku_task_0_resume(void* raw) {";
     assert_eq!(generated.matches(resume).count(), 1);
@@ -865,11 +1139,13 @@ static uint32_t fixture_original_resume(void* raw) {"#,
     assert_eq!(generated.matches(clock).count(), 1);
     generated=generated.replacen(clock,"static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_unused_original_now(void) {",1);
     let expected = (0..5000).fold(3i64, |total, index| (total * 33 + index + 3) % 100000000);
+    let negative_expected =
+        (0..5000).fold(-3i64, |total, index| (total * 33 + index - 3) % 100000000);
     let source = generated.replacen(
         "int main(void) {",
         "static int ku_unused_source_main(void) {",
         1,
-    ) + &format!("\n#define FIXTURE_EXPECTED INT64_C({expected})\n")
+    ) + &format!("\n#define FIXTURE_EXPECTED INT64_C({expected})\n#define FIXTURE_NEGATIVE_EXPECTED INT64_C({negative_expected})\n")
         + r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"scalar edges line %d: %s\n",__LINE__,#c); return 1; } } while (0)
 static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
@@ -883,7 +1159,7 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
   fixture_deadline=ku_task_driver_now_ms()+2000u;
   CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
     slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0),1u,fixture_deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
-  int64_t seed=overflow==2?INT64_MIN:overflow?INT64_MAX:3,divisor=divide_zero?0:1;
+  int64_t seed=overflow==2?INT64_MIN:overflow?INT64_MAX:fixture_negative_seed?-3:3,divisor=divide_zero?0:1;
   CHECK(ku_task_0_start_value(&driver,&seed,&divisor,&task)==KU_TASK_DRIVER_OK);
   fixture_cancel_lease=&task.owner.lease;
   KuTaskDriverSliceResultV1 sliced={0};
@@ -913,7 +1189,8 @@ static int fixture_case(size_t cancel_at,int overflow,int divide_zero,int force_
       KuString message=outcome.value.integer.error.message;
       const char* expected=overflow?"integer overflow":"division by zero";
       CHECK(message.len==strlen(expected) && !memcmp(message.ptr,expected,message.len));
-    } else CHECK(outcome.value.integer.ok && outcome.value.integer.value==FIXTURE_EXPECTED);
+    } else CHECK(outcome.value.integer.ok && outcome.value.integer.value==
+        (fixture_negative_seed ? FIXTURE_NEGATIVE_EXPECTED : FIXTURE_EXPECTED));
     ku_task_outcome_drop(&outcome);
   }
   CHECK(ku_task_value_drop(&task,fixture_deadline)==KU_TASK_DRIVER_OK);
@@ -943,6 +1220,20 @@ int main(void) {
       const size_t later_positions[]={65u,255u,256u,257u,1023u,1024u,8191u,8192u};
       for(size_t i=0;i<sizeof(later_positions)/sizeof(later_positions[0]);i++)
         CHECK(!fixture_case(later_positions[i],0,0,force_slow,loop_slow,private_mode));
+    }
+  }
+  /* Negative live-ins keep the original signed fast coverage, while the
+   * forced checked path supplies the same independent comparison. Neither
+   * path may change first-bank fees, error order or cancellation positions. */
+  fixture_negative_seed=1;
+  for(int private_mode=0;private_mode<2;private_mode++) for(int loop_slow=0;loop_slow<2;loop_slow++) for(int force_slow=0;force_slow<2;force_slow++) {
+    CHECK(!fixture_case(0,0,0,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(0,0,1,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(1u,0,0,force_slow,loop_slow,private_mode));
+    CHECK(!fixture_case(64u,0,0,force_slow,loop_slow,private_mode));
+    if(private_mode) {
+      CHECK(!fixture_case(257u,0,0,force_slow,loop_slow,private_mode));
+      CHECK(!fixture_case(8192u,0,0,force_slow,loop_slow,private_mode));
     }
   }
   puts("task-scalar-exact-quantum-cancel-errors-ok"); return 0;

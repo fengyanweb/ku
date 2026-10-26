@@ -5,7 +5,10 @@
 //! Hosted frames use generated child Start/Await and adapter-owned scope drain.
 //! User cleanup remains finite and cannot await; source admission stays separate.
 
-use std::{cell::Cell, collections::HashSet};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+};
 
 use crate::error::KuResult;
 use crate::ir::task::{
@@ -46,6 +49,94 @@ struct LoopOutline {
 struct CanonicalTrip {
     index: SlotId,
     bound: SlotId,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AffineLoopExpression {
+    coefficients: Vec<i128>,
+    constant: i128,
+}
+
+impl AffineLoopExpression {
+    fn constant(count: usize, constant: i128) -> Self {
+        Self {
+            coefficients: vec![0; count],
+            constant,
+        }
+    }
+
+    fn input(count: usize, slot: SlotId) -> Self {
+        let mut value = Self::constant(count, 0);
+        value.coefficients[slot.0] = 1;
+        value
+    }
+
+    fn as_constant(&self) -> Option<i128> {
+        self.coefficients
+            .iter()
+            .all(|coefficient| *coefficient == 0)
+            .then_some(self.constant)
+    }
+
+    fn add(&self, other: &Self) -> Option<Self> {
+        Some(Self {
+            coefficients: self
+                .coefficients
+                .iter()
+                .zip(&other.coefficients)
+                .map(|(left, right)| left.checked_add(*right))
+                .collect::<Option<_>>()?,
+            constant: self.constant.checked_add(other.constant)?,
+        })
+    }
+
+    fn scale(&self, constant: i128) -> Option<Self> {
+        Some(Self {
+            coefficients: self
+                .coefficients
+                .iter()
+                .map(|coefficient| coefficient.checked_mul(constant))
+                .collect::<Option<_>>()?,
+            constant: self.constant.checked_mul(constant)?,
+        })
+    }
+
+    fn maximum(&self, recurrence: SlotId, recurrence_maximum: i128) -> Option<i128> {
+        self.coefficients.iter().enumerate().try_fold(
+            self.constant,
+            |total, (slot, coefficient)| {
+                let bound = if slot == recurrence.0 {
+                    recurrence_maximum
+                } else {
+                    i32::MAX as i128
+                };
+                total.checked_add(coefficient.checked_mul(bound)?)
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+enum AffineLoopValue {
+    Linear(AffineLoopExpression),
+    Remainder(AffineLoopExpression, i64),
+}
+
+impl AffineLoopValue {
+    fn linear(&self) -> Option<&AffineLoopExpression> {
+        match self {
+            Self::Linear(value) => Some(value),
+            Self::Remainder(..) => None,
+        }
+    }
+}
+
+struct ModularLoopComposition {
+    recurrence: SlotId,
+    index: SlotId,
+    modulus: i64,
+    recurrence_maximum: i64,
+    expression: AffineLoopExpression,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,7 +341,7 @@ pub(super) fn emit_frames(
         uses_postgres(tasks),
     )?;
     super::task_adapter::emit_host(out, tasks)?;
-    let mut range_work = super::task_range::WorkBudget::default();
+    let range_work = RefCell::new(super::task_range::WorkBudget::default());
     for function in &tasks.functions {
         out.check()?;
         let frame = plan
@@ -289,9 +380,10 @@ pub(super) fn emit_frames(
                     .collect(),
                 |slot| emitter.cached_scalar(SlotId(slot)),
                 |slot| !emitter.persistent.contains(&slot),
-                &mut range_work,
+                &mut range_work.borrow_mut(),
             );
         }
+        emitter.range_work = Some(&range_work);
         emitter.emit(out)?;
     }
     super::task_adapter::emit_adapters(out, tasks)?;
@@ -323,6 +415,7 @@ struct FrameEmitter<'a> {
     reservation_error_operations: Cell<Option<usize>>,
     outline_active: Cell<bool>,
     range_plan: Option<super::task_range::RangePlan>,
+    range_work: Option<&'a RefCell<super::task_range::WorkBudget>>,
     range_active: Cell<bool>,
     range_fast: Cell<bool>,
 }
@@ -482,6 +575,7 @@ impl<'a> FrameEmitter<'a> {
             reservation_error_operations: Cell::new(None),
             outline_active: Cell::new(false),
             range_plan: None,
+            range_work: None,
             range_active: Cell::new(false),
             range_fast: Cell::new(false),
         })
@@ -1562,6 +1656,211 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         })
     }
 
+    fn modular_loop_composition(
+        &self,
+        region: &scalar_region::ScalarLoop,
+        plan: &LoopOutline,
+    ) -> Option<ModularLoopComposition> {
+        let range = self.range_plan.as_ref()?;
+        let trip = plan.trip?;
+        if plan.outputs.len() != 2
+            || !plan.outputs.contains(&trip.index)
+            || !plan.inputs.contains(&trip.index)
+            || !plan.inputs.contains(&trip.bound)
+        {
+            return None;
+        }
+        let recurrence = *plan.outputs.iter().find(|slot| **slot != trip.index)?;
+        if !plan.inputs.contains(&recurrence)
+            || plan
+                .inputs
+                .iter()
+                .any(|slot| self.slot_type(*slot).ok() != Some(&IrType::Int))
+        {
+            return None;
+        }
+        let count = self.function.slots.len();
+        // The same program-wide budget pays for this bounded symbolic walk.
+        // Declining this reservation keeps the already-certified signed helper.
+        let work = region
+            .max_path_operations
+            .checked_add(plan.inputs.len())?
+            .checked_add(16)?
+            .checked_mul(count)?
+            .checked_mul(4)?;
+        self.range_work?.borrow_mut().spend_optional(work)?;
+        let mut values = vec![None; count];
+        for slot in &plan.inputs {
+            values[slot.0] = Some(AffineLoopValue::Linear(AffineLoopExpression::input(
+                count, *slot,
+            )));
+        }
+        for slot in &plan.locals {
+            if self.slot_type(*slot).ok() == Some(&IrType::Int) {
+                values[slot.0] = Some(AffineLoopValue::Linear(AffineLoopExpression::constant(
+                    count, 0,
+                )));
+            }
+        }
+        let mut remainders = 0usize;
+        for state in std::iter::once(region.header).chain(plan.linear.body.iter().copied()) {
+            for (opid, operation) in self.function.states[state].operations.iter().enumerate() {
+                match *operation {
+                    TaskOp::Init {
+                        dst,
+                        value: TaskConstant::Int(value),
+                    } if value >= 0 => {
+                        values[dst.0] = Some(AffineLoopValue::Linear(
+                            AffineLoopExpression::constant(count, value as i128),
+                        ));
+                    }
+                    TaskOp::Copy { dst, src } => values[dst.0] = values[src.0].clone(),
+                    TaskOp::Move { dst, src } if !self.cached_scalar(src) => {
+                        values[dst.0] = values[src.0].clone();
+                        values[src.0] = None;
+                    }
+                    TaskOp::Binary {
+                        dst,
+                        op: TaskBinaryOp::Less,
+                        ..
+                    } if state == region.header => values[dst.0] = None,
+                    TaskOp::Binary {
+                        dst,
+                        op,
+                        left,
+                        right,
+                    } if range.proves(state, opid) => {
+                        let left = values[left.0].as_ref()?.linear()?;
+                        let right = values[right.0].as_ref()?.linear()?;
+                        values[dst.0] = Some(match op {
+                            TaskBinaryOp::Add => AffineLoopValue::Linear(left.add(right)?),
+                            TaskBinaryOp::Multiply => AffineLoopValue::Linear(
+                                if let Some(constant) = left.as_constant() {
+                                    right.scale(constant)?
+                                } else {
+                                    left.scale(right.as_constant()?)?
+                                },
+                            ),
+                            TaskBinaryOp::Remainder => {
+                                remainders += 1;
+                                if remainders != 1 {
+                                    return None;
+                                }
+                                let modulus = i64::try_from(right.as_constant()?).ok()?;
+                                if modulus <= 0 {
+                                    return None;
+                                }
+                                AffineLoopValue::Remainder(left.clone(), modulus)
+                            }
+                            _ => return None,
+                        });
+                    }
+                    TaskOp::Read { .. } => {}
+                    TaskOp::Drop { slot } | TaskOp::DropIfInit { slot }
+                        if !self.cached_scalar(slot) =>
+                    {
+                        values[slot.0] = None;
+                    }
+                    TaskOp::ScopeEnter { ref tasks, .. } if tasks.is_empty() => {}
+                    _ => return None,
+                }
+            }
+        }
+        let AffineLoopValue::Remainder(original, modulus) = values[recurrence.0].as_ref()? else {
+            return None;
+        };
+        let expected_index = AffineLoopExpression::input(count, trip.index)
+            .add(&AffineLoopExpression::constant(count, 1))?;
+        if values[trip.index.0].as_ref()?.linear()? != &expected_index
+            || original.constant < 0
+            || original
+                .coefficients
+                .iter()
+                .any(|coefficient| *coefficient < 0)
+        {
+            return None;
+        }
+        for slot in &plan.inputs {
+            if *slot != recurrence
+                && *slot != trip.index
+                && values[slot.0].as_ref()?.linear()? != &AffineLoopExpression::input(count, *slot)
+            {
+                return None;
+            }
+        }
+        let a = original.coefficients[recurrence.0];
+        let b = original.coefficients[trip.index.0];
+        let mut composed = original.scale(a.checked_add(1)?)?;
+        composed.coefficients[recurrence.0] = a.checked_mul(a)?;
+        composed.constant = composed.constant.checked_add(b)?;
+        let recurrence_maximum = (i32::MAX as i128).max(*modulus as i128 - 1);
+        // The helper's separate actual-input guard supplies this nonnegative
+        // domain; no sign fact is borrowed from the full signed range plan.
+        // Nonnegative coefficients make every original intermediate/product
+        // bounded by these totals. The first remainder is then in [0,m-1],
+        // invariants stay fixed, and unit-step trip bounds keep I in-domain.
+        // Both original steps and the composition must fit signed i64.
+        if original.maximum(recurrence, recurrence_maximum)? > i64::MAX as i128
+            || composed.maximum(recurrence, recurrence_maximum)? > i64::MAX as i128
+        {
+            return None;
+        }
+        Some(ModularLoopComposition {
+            recurrence,
+            index: trip.index,
+            modulus: *modulus,
+            recurrence_maximum: i64::try_from(recurrence_maximum).ok()?,
+            expression: composed,
+        })
+    }
+
+    fn emit_modular_loop_composition(
+        &self,
+        out: &mut COutput,
+        plan: &LoopOutline,
+        composition: &ModularLoopComposition,
+    ) {
+        let guard = plan
+            .inputs
+            .iter()
+            .map(|slot| {
+                let maximum = if *slot == composition.recurrence {
+                    composition.recurrence_maximum
+                } else {
+                    i32::MAX as i64
+                };
+                format!(
+                    "({}>=0 && {}<=INT64_C({maximum}))",
+                    self.place(*slot),
+                    self.place(*slot)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let mut terms = composition
+            .expression
+            .coefficients
+            .iter()
+            .enumerate()
+            .filter(|(_, coefficient)| **coefficient != 0)
+            .map(|(slot, coefficient)| {
+                format!("(INT64_C({coefficient})*{})", self.place(SlotId(slot)))
+            })
+            .collect::<Vec<_>>();
+        terms.push(format!("INT64_C({})", composition.expression.constant));
+        out.push_str(&format!(
+            "  /* pair-composed affine remainder; logical iterations are unchanged */\n  size_t __ku_pair_iterations=({guard}) ? (__ku_trip_iterations & ~(size_t)1u) : 0u;\n  for (;result.iterations<__ku_pair_iterations;result.iterations+=2u) {{\n"
+        ));
+        out.push_str(&format!(
+            "  {}=(int64_t)((uint64_t)({}) % UINT64_C({}));\n  {}={}+INT64_C(2);\n  }}\n",
+            self.place(composition.recurrence),
+            terms.join("+"),
+            composition.modulus,
+            self.place(composition.index),
+            self.place(composition.index)
+        ));
+    }
+
     fn emit_outline_helpers(&self, out: &mut COutput) -> KuResult<()> {
         if !self.range_active.get() || !self.loop_active.get() {
             return Ok(());
@@ -1621,10 +1920,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     // then represents even the full i64 endpoint span. The
                     // cast back is made only below the bounded size_t cap.
                     out.push_str(&format!(
-                        "  /* canonical private trip; logical header entries remain exact */\n  uint64_t __ku_trip_span=0u;\n  if ({}>{}) __ku_trip_span=(uint64_t){}-(uint64_t){};\n  size_t __ku_trip_iterations=max_iterations;\n  if (__ku_trip_span<(uint64_t)max_iterations) __ku_trip_iterations=(size_t)__ku_trip_span;\n  for (;result.iterations<__ku_trip_iterations;result.iterations++) {{\n",
+                        "  /* canonical private trip; logical header entries remain exact */\n  uint64_t __ku_trip_span=0u;\n  if ({}>{}) __ku_trip_span=(uint64_t){}-(uint64_t){};\n  size_t __ku_trip_iterations=max_iterations;\n  if (__ku_trip_span<(uint64_t)max_iterations) __ku_trip_iterations=(size_t)__ku_trip_span;\n",
                         self.place(trip.bound), self.place(trip.index),
                         self.place(trip.bound), self.place(trip.index),
                     ));
+                    if let Some(composition) = self.modular_loop_composition(region, &plan) {
+                        self.emit_modular_loop_composition(out, &plan, &composition);
+                    }
+                    out.push_str(
+                        "  for (;result.iterations<__ku_trip_iterations;result.iterations++) {\n",
+                    );
                 } else {
                     out.push_str(
                         "  for (;result.iterations<max_iterations;result.iterations++) {\n",
@@ -2281,13 +2586,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             out.push_str(&format!("  if (!cleanup && clock->host && !(local_initialized & UINT64_C({borrowed}))) {{\n  if (!__ku_dispatch_budget) {{\n    KuTaskAdapterHostV1* yield_host=(KuTaskAdapterHostV1*)clock->host;\n    ku_task_driver_note_quantum_yield(yield_host->ticket,yield_host->control,__ku_charge_unchanged);\n    frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING;\n  }}\n  --__ku_dispatch_budget;\n  }}\n"));
         }
         if self.range_active.get() {
-            let guard = self
-                .range_plan
-                .as_ref()
-                .unwrap()
+            let range = self.range_plan.as_ref().unwrap();
+            let (guard_low, guard_high) = range.guard_bounds();
+            let guard = range
                 .guard_slots
                 .iter()
-                .map(|slot| format!("(cached_{slot}>=INT32_MIN && cached_{slot}<=INT32_MAX)"))
+                .map(|slot| {
+                    format!(
+                        "(cached_{slot}>=INT64_C({guard_low}) && cached_{slot}<=INT64_C({guard_high}))"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" && ");
             // This selector follows the original phase and budget checks. The
@@ -2818,12 +3126,31 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         TaskBinaryOp::Remainder => "%",
                         _ => unreachable!(),
                     };
-                    out.push_str(&format!(
-                        "  {} = ({} {operator} {});\n",
-                        self.place(*dst),
-                        self.place(*left),
-                        self.place(*right)
-                    ));
+                    if *op == TaskBinaryOp::Remainder
+                        && self
+                            .range_plan
+                            .as_ref()
+                            .unwrap()
+                            .proves_unsigned_remainder(state, operation_id)
+                    {
+                        // The ordinary signed entry domain supplies the real
+                        // guard and operand proof. Only this specific operation
+                        // is certified nonnegative with a positive divisor;
+                        // the rest of the frame retains its signed fast path.
+                        out.push_str(&format!(
+                            "  {} = (int64_t)((uint64_t){} % (uint64_t){});\n",
+                            self.place(*dst),
+                            self.place(*left),
+                            self.place(*right)
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "  {} = ({} {operator} {});\n",
+                            self.place(*dst),
+                            self.place(*left),
+                            self.place(*right)
+                        ));
+                    }
                     self.set_init(out, *dst, true);
                 } else if let Some(helper) = helper {
                     self.emit_checked_integer(

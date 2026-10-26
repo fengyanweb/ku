@@ -133,6 +133,14 @@ impl Default for WorkBudget {
 }
 
 impl WorkBudget {
+    pub(super) fn spend_optional(&mut self, count: usize) -> Option<()> {
+        // A declined optional proof must not consume the already-valid range
+        // plan or starve later functions merely because its reservation fails.
+        let remaining = self.0.checked_sub(count)?;
+        self.0 = remaining;
+        Some(())
+    }
+
     fn spend(&mut self, count: usize) -> Option<()> {
         if let Some(remaining) = self.0.checked_sub(count) {
             self.0 = remaining;
@@ -236,15 +244,28 @@ impl Interval {
     }
 }
 
+const PROVES_NO_FAULT: u8 = 1;
+const PROVES_UNSIGNED_REMAINDER: u8 = 2;
+
 pub(super) struct RangePlan {
     pub(super) guard_slots: Vec<usize>,
     pub(super) states: Vec<bool>,
-    operations: Vec<Vec<bool>>,
+    operations: Vec<Vec<u8>>,
 }
 
 impl RangePlan {
+    pub(super) fn guard_bounds(&self) -> (i64, i64) {
+        let interval = Interval::GUARDED;
+        (interval.low, interval.high)
+    }
+
     pub(super) fn proves(&self, state: usize, operation: usize) -> bool {
-        self.operations[state][operation]
+        self.operations[state][operation] & PROVES_NO_FAULT != 0
+    }
+
+    pub(super) fn proves_unsigned_remainder(&self, state: usize, operation: usize) -> bool {
+        let required = PROVES_NO_FAULT | PROVES_UNSIGNED_REMAINDER;
+        self.operations[state][operation] & required == required
     }
 
     pub(super) fn build(
@@ -289,7 +310,7 @@ impl RangePlan {
                 }
             })
             .collect();
-        let mut operations: Vec<Vec<bool>> = function
+        let mut operations: Vec<Vec<u8>> = function
             .states
             .iter()
             .enumerate()
@@ -297,7 +318,7 @@ impl RangePlan {
                 body.operations
                     .iter()
                     .map(|operation| {
-                        states[state]
+                        let arithmetic = states[state]
                             && matches!(
                                 operation,
                                 TaskOp::Unary {
@@ -311,7 +332,23 @@ impl RangePlan {
                                         | TaskBinaryOp::Remainder,
                                     ..
                                 }
-                            )
+                            );
+                        if arithmetic {
+                            PROVES_NO_FAULT
+                                | if matches!(
+                                    operation,
+                                    TaskOp::Binary {
+                                        op: TaskBinaryOp::Remainder,
+                                        ..
+                                    }
+                                ) {
+                                    PROVES_UNSIGNED_REMAINDER
+                                } else {
+                                    0
+                                }
+                        } else {
+                            0
+                        }
                     })
                     .collect()
             })
@@ -330,8 +367,24 @@ impl RangePlan {
                 let mut values = input.clone();
                 for (index, operation) in function.states[state].operations.iter().enumerate() {
                     budget.spend(1)?;
+                    // Read operand facts BEFORE transfer overwrites dst, which
+                    // may alias either operand. AND over every layer/entry,
+                    // rather than trusting the last or a favorable iteration.
+                    let unsigned_remainder = match operation {
+                        TaskOp::Binary {
+                            op: TaskBinaryOp::Remainder,
+                            left,
+                            right,
+                            ..
+                        } => values[left.0].low >= 0 && values[right.0].low > 0,
+                        _ => false,
+                    };
                     let proven = transfer(&mut values, operation)?;
-                    operations[state][index] &= proven;
+                    if !proven {
+                        operations[state][index] = 0;
+                    } else if !unsigned_remainder {
+                        operations[state][index] &= !PROVES_UNSIGNED_REMAINDER;
+                    }
                 }
                 let successors = match function.states[state].terminator {
                     TaskTerminator::Jump { target } => [Some(target), None],
@@ -361,11 +414,15 @@ impl RangePlan {
             }
             layer = next;
         }
-        operations.iter().flatten().any(|yes| *yes).then_some(Self {
-            guard_slots,
-            states,
-            operations,
-        })
+        operations
+            .iter()
+            .flatten()
+            .any(|facts| facts & PROVES_NO_FAULT != 0)
+            .then_some(Self {
+                guard_slots,
+                states,
+                operations,
+            })
     }
 }
 
@@ -553,6 +610,34 @@ mod tests {
         assert!(
             RangePlan::build(&increment, vec![true], |_| true, |_| false, &mut shared).is_none()
         );
+        // The extra per-operation sign facts use the same single signed-domain
+        // finite walk, not another proof or a narrowed runtime entry guard.
+        let mut signed_work = WorkBudget::default();
+        let mut remainder_work = WorkBudget::default();
+        let divide = RangePlan::build(
+            &repeated(TaskBinaryOp::Divide, Some(7)),
+            vec![true],
+            |_| true,
+            |_| false,
+            &mut signed_work,
+        )
+        .unwrap();
+        let remainder = RangePlan::build(
+            &repeated(TaskBinaryOp::Remainder, Some(7)),
+            vec![true],
+            |_| true,
+            |_| false,
+            &mut remainder_work,
+        )
+        .unwrap();
+        assert_eq!(divide.guard_bounds(), (i32::MIN as i64, i32::MAX as i64));
+        assert_eq!(remainder.guard_bounds(), divide.guard_bounds());
+        assert_eq!(signed_work.0, remainder_work.0);
+        let mut optional = WorkBudget(5);
+        assert!(optional.spend_optional(6).is_none());
+        assert_eq!(optional.0, 5);
+        assert!(optional.spend_optional(5).is_some());
+        assert_eq!(optional.0, 0);
         let _scope = GenerationScope::new();
         assert!(claim_extra(100_000));
         assert!(claim_extra(100_000));
@@ -614,6 +699,83 @@ mod tests {
                 .1
         );
         assert!(!Interval::FULL.binary(TaskBinaryOp::Add, Interval::FULL).1);
+
+        let build = |function: &TaskFunction| {
+            RangePlan::build(
+                function,
+                vec![true],
+                |_| true,
+                |_| false,
+                &mut WorkBudget::default(),
+            )
+        };
+        let positive = repeated(TaskBinaryOp::Remainder, Some(7));
+        let plan = build(&positive).unwrap();
+        assert_eq!(plan.guard_bounds(), (i32::MIN as i64, i32::MAX as i64));
+        assert!(plan.proves(0, 1));
+        assert!(!plan.proves_unsigned_remainder(0, 1));
+        // A positive divisor alone does not make a signed dividend positive.
+        // A fact established by the actual earlier typed operation does.
+        let mut known_positive = positive.clone();
+        known_positive.states[0].operations.insert(
+            0,
+            TaskOp::Init {
+                dst: SlotId(0),
+                value: TaskConstant::Int(5),
+            },
+        );
+        let known_positive = build(&known_positive).unwrap();
+        assert!(known_positive.proves_unsigned_remainder(0, 2));
+        let negative_divisor = build(&repeated(TaskBinaryOp::Remainder, Some(-7))).unwrap();
+        assert_eq!(
+            negative_divisor.guard_bounds(),
+            (i32::MIN as i64, i32::MAX as i64)
+        );
+        assert!(negative_divisor.proves(0, 1));
+        assert!(!negative_divisor.proves_unsigned_remainder(0, 1));
+        assert!(build(&repeated(TaskBinaryOp::Remainder, Some(0))).is_none());
+
+        // Even a separately known zero-on-entry local is not an invariant.
+        // A later visit with -1 must revoke the remainder certificate.
+        let mut later_negative = positive.clone();
+        later_negative.parameters = vec![SlotId(1)];
+        later_negative.states[0].operations.push(TaskOp::Init {
+            dst: SlotId(0),
+            value: TaskConstant::Int(-1),
+        });
+        let later_negative = RangePlan::build(
+            &later_negative,
+            vec![true],
+            |slot| slot == 1,
+            |slot| slot != 1,
+            &mut WorkBudget::default(),
+        )
+        .unwrap();
+        assert!(later_negative.proves(0, 1));
+        assert!(!later_negative.proves_unsigned_remainder(0, 1));
+
+        // Check operand facts before writing an aliasing destination. Here
+        // the signed result is zero, but the actual dividend was negative.
+        let mut aliased = positive;
+        aliased.states[0].operations = vec![
+            TaskOp::Init {
+                dst: SlotId(0),
+                value: TaskConstant::Int(-4),
+            },
+            TaskOp::Init {
+                dst: SlotId(1),
+                value: TaskConstant::Int(2),
+            },
+            TaskOp::Binary {
+                dst: SlotId(0),
+                op: TaskBinaryOp::Remainder,
+                left: SlotId(0),
+                right: SlotId(1),
+            },
+        ];
+        let aliased = build(&aliased).unwrap();
+        assert!(aliased.proves(0, 2));
+        assert!(!aliased.proves_unsigned_remainder(0, 2));
     }
 
     #[test]

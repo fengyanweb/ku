@@ -2181,18 +2181,19 @@ static void ku_http_connection_read_body(KuHttpConnection* connection, KuHttpSer
   connection->body_received += (size_t)received;
   if (connection->body_received == connection->input.body_len) ku_http_connection_submit(connection, server, queue, workers);
 }
-static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer* server) {
+static void ku_http_connection_write_limited(KuHttpConnection* connection, KuHttpServer* server,
+    int turn_limit,size_t byte_limit) {
   KuHttpOutput* output = &connection->output;
   size_t bytes = 0;
   /* Each readiness turn is finite even for a peer that remains writable and a
      very large Ku response. Neither partial sends nor EINTR refresh write D. */
-  for (int turn = 0; turn < 32 && bytes < (size_t)262144; turn++) {
+  for (int turn = 0; turn < turn_limit && bytes < byte_limit; turn++) {
     if (ku_http_now_ms() >= connection->deadline) {
       ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
       ku_http_connection_close(connection); return;
     }
     if (output->part >= output->count) { ku_http_connection_next_request(connection, server); return; }
-    size_t remaining=(size_t)262144-bytes;
+    size_t remaining=byte_limit-bytes;
     int sent=ku_http_output_send(connection->socket_value,output,remaining);
     if (sent < 0) {
       int error = ku_http_socket_last_error();
@@ -2214,6 +2215,9 @@ static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer*
     }
   }
   if (output->part >= output->count) ku_http_connection_next_request(connection, server);
+}
+static void ku_http_connection_write(KuHttpConnection* connection, KuHttpServer* server) {
+  ku_http_connection_write_limited(connection,server,32,(size_t)262144);
 }
 static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpServer* server) {
   if (ku_http_async_observe(connection, server)) return;
@@ -3778,6 +3782,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #else
     int maintenance_count=active.count;
 #endif
+    unsigned int first_write_turns=0;
     /* Reverse traversal is intentional: swap-remove moves only a tail that
        this pass already observed. Admission runs strictly between passes. */
     for (int position=maintenance_count;position-->0;) {
@@ -3794,7 +3799,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_count_transport_close(connection,KU_HTTP_CLOSE_DRAIN_IDLE);
         ku_http_connection_close(connection); continue;
       }
+      int before_observe_phase=connection->phase;
       ku_http_connection_observe_job(connection, server);
+      int response_became_ready=before_observe_phase!=KU_HTTP_IO_WRITE
+          && connection->phase==KU_HTTP_IO_WRITE;
 #if defined(__APPLE__)
       if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
           && connection->peer_read_paused && connection->peer_error_probe_deadline
@@ -3833,6 +3841,16 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       else if (connection->phase == KU_HTTP_IO_WRITE && now >= connection->deadline) {
         ku_http_count_transport_close(connection,KU_HTTP_CLOSE_WRITE_DEADLINE);
         ku_http_connection_close(connection);
+      }
+      /* Newly published output may already fit a writable socket. Try only
+       * one nonblocking send, after the original request/write deadline clip,
+       * before changing its persistent interest. A partial send or EAGAIN
+       * keeps WRITE and its cursor for the ordinary readiness path; an old
+       * WRITE is never retried here. Bound the whole maintenance pass too.
+       * Completed output does not recursively consume a pipelined request. */
+      if(response_became_ready && connection->phase==KU_HTTP_IO_WRITE && first_write_turns<32u) {
+        first_write_turns++;
+        ku_http_connection_write_limited(connection,server,1,(size_t)16384);
       }
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
       ku_http_reactor_refresh(connection);

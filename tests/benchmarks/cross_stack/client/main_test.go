@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,6 +181,197 @@ func TestSharedPoolReusesAcrossWorkersAtLowArrivalRate(t *testing.T) {
 	resources := report["resources"].(map[string]any)
 	if report["schema"] != "ku-cross-stack-client-v5" || report["valid_driver"] != true || resources["dials"] != uint64(1) || resources["connections_after_cleanup"] != uint64(0) || resources["active_after_cleanup"] != uint64(0) {
 		t.Fatalf("run path did not share/close idle connections: %#v", report)
+	}
+}
+
+func TestWorkersFinishConstructionBeforeArrivalOrigin(t *testing.T) {
+	c := testConfig(t)
+	c.concurrency, c.queue = 8, 8
+	var requests atomic.Uint32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, "ok:"+r.URL.Query().Get("rid"))
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	l := testLedger()
+	queue := make(chan job, c.queue)
+	pool := newConnectionPool(c, l)
+	var workers sync.WaitGroup
+	entered := make(chan int, c.concurrency)
+	release := make(chan struct{})
+	var releaseOnce, closeQueueOnce sync.Once
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		closeQueueOnce.Do(func() { close(queue) })
+		done := make(chan struct{})
+		go func() { workers.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("request workers did not retire after queue close")
+		}
+		pool.close()
+	}()
+	var initialized atomic.Uint32
+	type prepared struct {
+		pool   workerPreparation
+		origin time.Time
+	}
+	completed := make(chan prepared, 1)
+	go func() {
+		p := prepareRequestWorkers(c, l, pool, queue, &workers, func(index int) {
+			if index == c.concurrency-1 {
+				entered <- index
+				<-release
+				initialized.Add(1)
+			} else {
+				initialized.Add(1)
+				entered <- index
+			}
+		})
+		origin, _ := captureMonotonicAnchor(time.Now, readKernelMonotonic)
+		completed <- prepared{p, origin}
+	}()
+	for i := 0; i < c.concurrency; i++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("worker construction did not reach the controlled readiness boundary")
+		}
+	}
+	// Hold one real worker before ready.Done. Merely launching all goroutines
+	// (the previous origin boundary) must not publish an arrival origin yet.
+	select {
+	case <-completed:
+		t.Fatal("origin established while a worker was still being constructed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if initialized.Load() != uint32(c.concurrency-1) || requests.Load() != 0 {
+		t.Fatalf("preparation crossed into business requests: ready=%d requests=%d", initialized.Load(), requests.Load())
+	}
+	releaseOnce.Do(func() { close(release) })
+	var got prepared
+	select {
+	case got = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("all-ready worker pool did not release the arrival clock")
+	}
+	if initialized.Load() != uint32(c.concurrency) || got.pool.workers != c.concurrency || got.pool.ready.Before(got.pool.started) || got.pool.ready.After(got.origin) {
+		t.Fatalf("worker readiness was not before the real origin: %+v initialized=%d", got, initialized.Load())
+	}
+	if l.dials != 0 || l.live != 0 || requests.Load() != 0 {
+		t.Fatal("worker preparation prewarmed a connection or issued a request")
+	}
+	// Nothing is broadcast at origin. A ready worker responds to the first
+	// actual queue item using its unchanged scheduled_at deadline.
+	l.origin, l.cutoff = got.origin, got.origin.Add(c.duration)
+	l.seconds = make([]secondStats, 1)
+	j := job{kind: "ok", rid: "1", scheduled: got.origin}
+	l.plan(j)
+	enqueuePlanned(c, l, j, queue, time.Now())
+	closeQueueOnce.Do(func() { close(queue) })
+	workers.Wait()
+	if requests.Load() != 1 || l.all.Planned != 1 || l.all.Results["correct"] != 1 || l.lastActualSent.Before(got.origin) || l.lastActualCompleted.Before(l.lastActualSent) {
+		t.Fatalf("first original plan was not really sent after readiness: %+v", l.all)
+	}
+}
+
+func TestPreparedTaskMixKeepsOriginalPlanAndClockLedger(t *testing.T) {
+	c := taskMixTestConfig(t)
+	c.duration, c.rate, c.cpuRate = 50*time.Millisecond, 200, 100
+	c.concurrency, c.queue = 32, 32
+	c.events = filepath.Join(t.TempDir(), "prepared-task-mix.csv.gz")
+	type received struct {
+		rid, path  string
+		work, seed int
+	}
+	requests := make(chan received, 32)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		rid := q.Get("rid")
+		if r.Header.Get("X-Request-ID") != rid || r.Header.Get("X-Cross-Stack-Request") != rid {
+			t.Error("request identity changed after worker preparation")
+		}
+		requests <- received{rid, r.URL.Path, len(q.Get("work")), len(q.Get("seed"))}
+		if r.URL.Path == c.protocol.Endpoints["cpu"].Path {
+			_, _ = io.WriteString(w, rid+":"+c.checksums[fmt.Sprintf("%d/%d", len(q.Get("work")), len(q.Get("seed")))])
+		} else {
+			_, _ = io.WriteString(w, "ok:"+rid)
+		}
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	report, err := run(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparation := report["worker_preparation"].(map[string]any)
+	if preparation["ready_workers"] != c.concurrency || preparation["configured_workers"] != c.concurrency || preparation["complete_before_origin"] != true || preparation["connections_dialed"] != uint64(0) || preparation["connections_live"] != uint64(0) || preparation["duration_ns"].(int64) < 0 || preparation["ready_offset_ns"].(int64) > 0 || preparation["origin_after_ready_ns"].(int64) < 0 {
+		t.Fatalf("startup was not reported separately at the real readiness boundary: %#v", preparation)
+	}
+	file, err := os.Open(c.events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	z, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer z.Close()
+	rows, err := csv.NewReader(z).ReadAll()
+	if err != nil || len(rows) != 16 || len(rows[0]) != 21 {
+		t.Fatalf("changed the finite plan or original event format: rows=%d error=%v", len(rows), err)
+	}
+	byRID := make(map[string][]string)
+	var latestSent, latestCompleted int64
+	for _, row := range rows[1:] {
+		if _, duplicate := byRID[row[0]]; duplicate {
+			t.Fatal("duplicate terminal for one plan", row)
+		}
+		byRID[row[0]] = row
+		var scheduled, sent, completed int64
+		if _, err := fmt.Sscan(row[3], &scheduled); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Sscan(row[4], &sent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Sscan(row[5], &completed); err != nil {
+			t.Fatal(err)
+		}
+		if row[7] != "correct" || row[19] != "true" || sent < scheduled || completed < sent || completed > scheduled+c.timeout.Nanoseconds() {
+			t.Fatal("worker preparation changed a request deadline or terminal", row)
+		}
+		latestSent, latestCompleted = max(latestSent, sent), max(latestCompleted, completed)
+	}
+	observed := make(map[string]received)
+	for len(requests) > 0 {
+		r := <-requests
+		observed[r.rid] = r
+	}
+	planOrigin := time.Unix(100, 0)
+	plan := newTaskMixPlan(c, planOrigin)
+	count := 0
+	for j, ok := plan.next(); ok; j, ok = plan.next() {
+		row, exists := byRID[j.rid]
+		r, received := observed[j.rid]
+		if !exists || !received || row[1] != j.kind || row[2] != fmt.Sprint(j.index) || row[3] != fmt.Sprint(j.scheduled.Sub(planOrigin).Nanoseconds()) || row[15] != fmt.Sprint(j.streamIndex) || row[16] != "false" || r.path != c.protocol.Endpoints[j.kind].Path {
+			t.Fatalf("original independent plan, RID or order changed: job=%+v row=%v received=%+v", j, row, r)
+		}
+		if j.kind == "cpu" {
+			work, seed := inputAt(c, j)
+			if r.work != work || r.seed != seed {
+				t.Fatal("CPU ordinal or seed changed", j, r)
+			}
+		}
+		count++
+	}
+	ledger := report["ledger"].(map[string]any)
+	clocks := report["configuration"].(map[string]any)
+	if count != 15 || len(observed) != count || report["valid_driver"] != true || ledger["planned"] != uint64(count) || ledger["correct_total"] != uint64(count) || clocks["planned_cutoff_offset_ns"] != c.duration.Nanoseconds() || clocks["last_actual_sent_offset_ns"] != latestSent || clocks["last_actual_completed_offset_ns"] != latestCompleted || clocks["run_end_offset_ns"].(int64) < latestCompleted || clocks["timeout_seconds"] != c.timeout.Seconds() {
+		t.Fatalf("preparation rewrote planned/actual clocks or hid a terminal: %#v", report)
 	}
 }
 

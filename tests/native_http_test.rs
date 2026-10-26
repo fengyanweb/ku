@@ -3696,7 +3696,7 @@ fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() 
         "\nenum {\n  KU_HTTP_IO_FREE",
     );
     let write = region(
-        "static void ku_http_connection_write(",
+        "static void ku_http_connection_write_limited(",
         "static void ku_http_connection_observe_job(",
     );
     let phases = region(
@@ -3845,6 +3845,29 @@ static void fixture_pressure(KuHttpConnection* connection) {
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
+  /* The first-write opportunity is one syscall and16KiB, not an unbounded
+     flush. The original readiness cursor/deadline must resume it exactly. */
+  for(size_t i=0;i<sizeof(fixture_body);i++) fixture_body[i]=(unsigned char)(i%251u);
+  fixture_reset(&connection,0); fixture_part(&connection,fixture_body,sizeof(fixture_body));
+  ku_http_connection_write_limited(&connection,&server,1,(size_t)16384);
+  CHECK(fixture_calls==1 && fixture_emitted==16384u && !fixture_completed && !fixture_closed);
+  CHECK(connection.output.part==0 && connection.output.offset==16384u && connection.deadline==1000);
+  ku_http_connection_write(&connection,&server);
+  ku_http_connection_write(&connection,&server);
+  CHECK(fixture_completed==1 && !fixture_closed && fixture_emitted==sizeof(fixture_body));
+  CHECK(!memcmp(fixture_wire,fixture_expected,fixture_expected_length));
+  fixture_reset(&connection,2); fixture_part(&connection,fixture_prefix_bytes,9);
+  ku_http_connection_write_limited(&connection,&server,1,(size_t)16384);
+  CHECK(fixture_calls==1 && !fixture_emitted && !fixture_completed && !fixture_closed);
+  CHECK(connection.deadline==1000 && !connection.output.part && !connection.output.offset);
+  fixture_reset(&connection,1); fixture_part(&connection,fixture_prefix_bytes,9);
+  fixture_calls=2; /* Already-writable observation can still race into EAGAIN. */
+  ku_http_connection_write_limited(&connection,&server,1,(size_t)16384);
+  CHECK(fixture_calls==3 && !fixture_emitted && !fixture_completed && !fixture_closed);
+  CHECK(connection.deadline==1000 && !connection.output.part && !connection.output.offset);
+  fixture_reset(&connection,0); fixture_part(&connection,fixture_prefix_bytes,9);fixture_now=1000;
+  ku_http_connection_write_limited(&connection,&server,1,(size_t)16384);
+  CHECK(!fixture_calls && fixture_closed==1 && fixture_close_reason==KU_HTTP_CLOSE_WRITE_DEADLINE);
   fixture_reset(&connection,0);
   for (size_t i=0;i<9;i++) fixture_part(&connection,fixture_prefix_bytes+i,1u);
   ku_http_connection_write(&connection,&server);

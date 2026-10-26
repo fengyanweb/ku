@@ -670,6 +670,38 @@ type worker struct {
 	pool *connectionPool
 }
 
+type workerPreparation struct {
+	started, ready time.Time
+	workers        int
+}
+
+// Construct every worker before establishing the arrival clock. The empty
+// request queue is the only wait point: closing a separate start gate would
+// make the entire pool runnable again at origin. beforeReady is an internal
+// construction seam for the lifecycle regression; normal runs pass nil.
+func prepareRequestWorkers(c config, l *ledger, pool *connectionPool, queue <-chan job, workers *sync.WaitGroup, beforeReady func(int)) workerPreparation {
+	preparation := workerPreparation{started: time.Now(), workers: c.concurrency}
+	var ready sync.WaitGroup
+	ready.Add(c.concurrency)
+	workers.Add(c.concurrency)
+	for i := 0; i < c.concurrency; i++ {
+		go func(index int) {
+			defer workers.Done()
+			w := worker{c: c, l: l, pool: pool}
+			if beforeReady != nil {
+				beforeReady(index)
+			}
+			ready.Done()
+			for j := range queue {
+				w.execute(j)
+			}
+		}(i)
+	}
+	ready.Wait()
+	preparation.ready = time.Now()
+	return preparation
+}
+
 func (w *worker) execute(j job) {
 	now := time.Now()
 	if !now.Before(j.scheduled.Add(w.c.timeout)) {
@@ -1186,25 +1218,14 @@ func run(c config) (map[string]any, error) {
 		}
 		l.events = w
 	}
-	gate := make(chan struct{})
 	queue := make(chan job, c.queue)
 	pool := newConnectionPool(c, l)
 	var workers sync.WaitGroup
-	for i := 0; i < c.concurrency; i++ {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			w := worker{c: c, l: l, pool: pool}
-			<-gate
-			for j := range queue {
-				w.execute(j)
-			}
-		}()
-	}
+	preparation := prepareRequestWorkers(c, l, pool, queue, &workers, nil)
+	preparationDials, preparationConnections := l.dials, l.live
 	var anchor monotonicAnchor
 	l.origin, anchor = captureMonotonicAnchor(time.Now, readKernelMonotonic)
 	l.cutoff = l.origin.Add(c.duration)
-	close(gate)
 	planned := uint64(math.Ceil(c.duration.Seconds() * c.rate))
 	if c.workload == "task_mix" {
 		planned += uint64(math.Ceil(c.duration.Seconds() * c.cpuRate))
@@ -1276,6 +1297,23 @@ func run(c config) (map[string]any, error) {
 	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": l.dials, "pool_idle_expirations": l.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(l.dials, 1)), "peak_connections": l.peakLive, "connections_after_cleanup": l.live, "peak_inflight": l.peakActive, "active_after_cleanup": l.active, "queue_peak": l.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
+	out["worker_preparation"] = map[string]any{
+		"ready_workers":          preparation.workers,
+		"configured_workers":     c.concurrency,
+		"started_unix_ns":        preparation.started.UnixNano(),
+		"ready_unix_ns":          preparation.ready.UnixNano(),
+		"duration_ns":            preparation.ready.Sub(preparation.started).Nanoseconds(),
+		"started_offset_ns":      preparation.started.Sub(l.origin).Nanoseconds(),
+		"ready_offset_ns":        preparation.ready.Sub(l.origin).Nanoseconds(),
+		"started_monotonic_ns":   anchor.at(preparation.started.Sub(l.origin).Nanoseconds()),
+		"ready_monotonic_ns":     anchor.at(preparation.ready.Sub(l.origin).Nanoseconds()),
+		"origin_after_ready_ns":  l.origin.Sub(preparation.ready).Nanoseconds(),
+		"complete_before_origin": !preparation.ready.After(l.origin),
+		"connections_dialed":     preparationDials,
+		"connections_live":       preparationConnections,
+		"readiness_boundary":     "all workers constructed immediately before reading the empty request queue; no origin broadcast; not a claim that every goroutine is already parked",
+		"preparation_accounting": "real driver-process startup outside the arrival window; no service reset, cgroup refund, connection prewarm or subtraction of startup CPU; report lifetime/startup costs separately",
+	}
 	clocks["planned_cutoff_offset_ns"] = c.duration.Nanoseconds()
 	clocks["planned_cutoff_unix_ns"] = l.cutoff.UnixNano()
 	clocks["last_actual_sent_offset_ns"] = offset(l.lastActualSent, l.origin)
