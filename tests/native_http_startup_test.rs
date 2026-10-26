@@ -129,8 +129,8 @@ fn native_http_early_loop_startup_failures_retire_on_the_original_thread() {
         ),
         (
             "queue",
-            "if (!ku_http_queue_init(&queue, slot_count, &wake)) {",
-            "if (owner->index == 0 || !ku_http_queue_init(&queue, slot_count, &wake)) {",
+            "if (!ku_http_queue_init(&queue, request_limit, &wake)) {",
+            "if (owner->index == 0 || !ku_http_queue_init(&queue, request_limit, &wake)) {",
             "handler queue initialization failed",
         ),
     ];

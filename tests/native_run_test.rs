@@ -731,9 +731,10 @@ fn main(): null! {
     )
     .expect("write pending ready HTTP source");
     let generated = native_emit_c(dir, "main.ku");
-    let start = "/* Under pressure a genuinely idle persistent socket yields its slot.";
-    let end = "if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)";
+    let start = "      if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&";
+    let end = "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_REQUEST_WAIT) && now >= connection->deadline)";
     assert_eq!(generated.matches(start).count(), 1);
+    assert_eq!(generated.matches(end).count(), 1);
     // Execute the actual emitted promotion branch, rather than reimplementing
     // its idle predicate in the fixture. Only its surrounding loop is removed.
     let branch = generated
@@ -786,7 +787,7 @@ failed:
   *peer = *accepted = KU_HTTP_INVALID_SOCKET;
   return 0;
 }
-static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte) {
+static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte, int connection_pressure) {
   KuHttpSocket peer, accepted;
   if (!ku_http_fixture_tcp_pair(&peer, &accepted)) return 0;
   if (with_byte) {
@@ -804,37 +805,49 @@ static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte)
   server.buffer_budget = budget;
   server.idle_timeout_ms = 1000;
   KuHttpConnection connection = {0};
+  int active_index = -1;
+  KuHttpActiveSet active = {.connections=&connection,.indices=&active_index,
+      .capacity=1,.free_head=-1,.request_limit=1};
   ku_http_atomic_store(&ku_http_active_conns, 1);
-  ku_http_connection_start(&connection, NULL, accepted, &server);
+  ku_http_connection_start(&connection, &active, accepted, &server);
   connection.reused = 1;
   char* original_header = connection.header;
   const size_t original_capacity = connection.capacity;
   const unsigned long long original_deadline = connection.deadline;
-  int passed = connection.phase == KU_HTTP_IO_HEADER && original_header
-      && original_capacity == 1024 && budget->current == original_capacity;
-  if (passed) ku_http_fixture_promote(&connection);
+  /* A real empty C record owns its socket but has neither input backing nor
+     an A lease. Keep that lazy-allocation boundary while exercising pressure. */
+  int passed = connection.phase == KU_HTTP_IO_HEADER && !original_header
+      && !original_capacity && !budget->current && active.count == 1
+      && active.sockets == 1 && active.high_water == 1 && !active.request_active
+      && !connection.request_lease;
+  if (passed) ku_http_fixture_promote(&connection, connection_pressure);
   const int observed_phase = connection.phase;
   const int same_socket = connection.socket_value == accepted;
-  if (with_byte) {
-    char byte = 0;
+  if (with_byte || !connection_pressure) {
     passed = passed && same_socket && connection.phase == KU_HTTP_IO_HEADER
         && connection.header == original_header && connection.capacity == original_capacity
         && connection.deadline == original_deadline && !connection.buffered
-        && budget->current == original_capacity
-        && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+        && budget->current == original_capacity && active.count == 1
+        && active.sockets == 1 && !active.request_active && !connection.request_lease;
+    if (with_byte) {
+      char byte = 0;
+      passed = passed && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+    }
   } else {
     passed = passed && connection.socket_value == KU_HTTP_INVALID_SOCKET
-        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current;
+        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current
+        && !active.count && !active.sockets && !active.request_active;
   }
   /* Retire the actual connection owner before reporting an intentional red
      result; the failing old branch has already retired this owner itself. */
   ku_http_connection_close(&connection);
   ku_http_socket_close(peer);
-  const int retired = budget->current == 0 && ku_http_active_conns == 0;
+  const int retired = budget->current == 0 && ku_http_active_conns == 0
+      && !active.count && !active.sockets && !active.request_active;
   if (!passed || !retired) {
     fprintf(stderr,
-      "HTTP pending reuse failed after cleanup: with_byte=%d phase=%d same_socket=%d retired=%d\n",
-      with_byte, observed_phase, same_socket, retired);
+      "HTTP pending reuse failed after cleanup: with_byte=%d C_pressure=%d phase=%d same_socket=%d retired=%d\n",
+      with_byte, connection_pressure, observed_phase, same_socket, retired);
     return 0;
   }
   return 1;
@@ -844,12 +857,13 @@ int main(void) {
   KuHttpBufferBudget budget = {0};
   budget.limit = 65536;
   if (!ku_http_mutex_init(&budget.lock)) { ku_http_net_cleanup(); return 21; }
-  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1);
-  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0);
+  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1, 1);
+  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0, 1);
+  const int request_pressure_passed = ku_http_fixture_reuse_case(&budget, 0, 0);
   const int budget_zero = budget.current == 0;
   ku_http_mutex_destroy(&budget.lock);
   ku_http_net_cleanup();
-  if (!ready_passed || !idle_passed || !budget_zero) return 1;
+  if (!ready_passed || !idle_passed || !request_pressure_passed || !budget_zero) return 1;
   puts("http-pending-ready-reuse-ok");
   return 0;
 }
@@ -858,7 +872,7 @@ int main(void) {
     fs::write(
         &harness,
         format!(
-            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  {start}{branch}\n}}\n{checks}"
+            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection, int connection_pressure) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  pending.raw_count = connection_pressure;\n  const KuHttpActiveSet active = *connection->active_set;\n  {start}{branch}\n}}\n{checks}"
         ),
     )
     .expect("write pending ready HTTP C harness");
@@ -959,6 +973,18 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
 static int ku_http_fixture_zero(void) {
   return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
 }
+static int ku_http_fixture_partial_header(KuHttpConnection* connection, const char* prefix, size_t length) {
+  if (!ku_http_buffer_reserve(connection->budget, length)) return 0;
+  connection->header = (char*)malloc(length);
+  if (!connection->header) {
+    ku_http_buffer_refund(connection->budget, length);
+    return 0;
+  }
+  connection->capacity = length;
+  memcpy(connection->header, prefix, length);
+  connection->buffered = length;
+  return 1;
+}
 static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budget, int kind, unsigned long long now) {
   KuHttpQueue queue;
   if (!ku_http_queue_init(&queue, 1, wake)) return 0;
@@ -971,6 +997,7 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   server.read_body_timeout_ms = 222;
   server.write_timeout_ms = 77;
   server.handler_timeout_ms = 100;
+  server.request_timeout_ms = 1000;
   KuHttpConnection connection = {0};
   connection.socket_value = KU_HTTP_INVALID_SOCKET;
   ku_http_fixture_now = now;
@@ -978,16 +1005,16 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   ku_http_fixture_would_block = now < 100;
   if (kind < 2) {
     ku_http_connection_start(&connection, NULL, KU_HTTP_INVALID_SOCKET, &server);
-    if (!connection.header) {
-      ku_http_queue_close(&queue, 0);
-      ku_http_connection_close(&connection);
-      ku_http_queue_free(&queue);
-      return 0;
-    }
+    /* HEADER starts without a backing allocation; only an already partial
+       request owns bytes, as after a real positive parser read. */
     if (kind == 1) {
       static const char prefix[] = "POST /ok HTTP/1.1\r\nHost: localhost\r\n";
-      memcpy(connection.header, prefix, sizeof(prefix) - 1);
-      connection.buffered = sizeof(prefix) - 1;
+      if (!ku_http_fixture_partial_header(&connection, prefix, sizeof(prefix) - 1)) {
+        ku_http_queue_close(&queue, 0);
+        ku_http_connection_close(&connection);
+        ku_http_queue_free(&queue);
+        return 0;
+      }
       ku_http_fixture_received = "Content-Length: 1\r\n\r\nx";
     } else {
       ku_http_fixture_received = "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
@@ -996,6 +1023,7 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     connection.budget = budget;
     connection.input.budget = budget;
+    connection.request_deadline = now + 1000;
     /* Match the real parser's retained body and target backing owners. */
     if (!ku_http_buffer_reserve(budget, 6)) {
       ku_http_queue_close(&queue, 0);
@@ -1047,8 +1075,9 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     passed = connection.phase == original_phase && connection.deadline == 100
       && ku_http_fixture_recv_calls == 1
-      && connection.header == original_header
-      && connection.capacity == original_capacity
+      && (kind == 0
+          ? connection.header != NULL && connection.capacity == 1024 && budget->current == 1024
+          : connection.header == original_header && connection.capacity == original_capacity)
       && connection.buffered == original_buffered
       && connection.input.body == original_body
       && connection.body_received == original_body_received
