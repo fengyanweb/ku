@@ -4535,10 +4535,13 @@ static int fixture_fcntl(int fd,int command,int minimum) {
     let body = r#"
 #undef fcntl
 #define CHECK(v) do { if (!(v)) { fprintf(stderr,"line %d: %s\n",__LINE__,#v); return 1; } } while(0)
+static int count_max_fd;
 static int fd_count(void) {
   DIR* d=opendir("/proc/self/fd"); if (!d) return -1;
-  int count=0; struct dirent* e;
-  while ((e=readdir(d))!=NULL) if (e->d_name[0]!='.') count++;
+  int count=0; struct dirent* e; count_max_fd=0;
+  while ((e=readdir(d))!=NULL) if (e->d_name[0]!='.') {
+    count++; int fd=atoi(e->d_name); if (fd>count_max_fd) count_max_fd=fd;
+  }
   closedir(d); return count;
 }
 static int fd_size(void) {
@@ -4549,17 +4552,25 @@ static int fd_size(void) {
 }
 int main(void) {
   int socket_fd=socket(AF_INET,SOCK_STREAM,0); CHECK(socket_fd>=0);
+  /* Exercise the launcher's sparse-descriptor case on every machine. */
+  int inherited_high=fcntl(socket_fd,F_DUPFD_CLOEXEC,64); CHECK(inherited_high>=64);
   int count=fd_count(); CHECK(count>0);
+  int initial_max_fd=count_max_fd; CHECK(initial_max_fd<INT_MAX-32);
   errno=EDOM; ku_http_prepare_fd_table(socket_fd,257,2);
   CHECK(errno==EDOM && calls==1 && returned_fd>=last_min);
   CHECK(fd_count()==count && fd_size()>last_min);
   CHECK(fcntl(returned_fd,F_GETFD)==-1 && errno==EBADF);
   CHECK(fcntl(socket_fd,F_GETFD)>=0);
   struct rlimit original; CHECK(!getrlimit(RLIMIT_NOFILE,&original));
-  struct rlimit limited=original; limited.rlim_cur=32;
+  /* Bounded-process/CI launchers may inherit a sparse FD above31. Lower the
+     soft limit relative to actual live FDs, so preparation really takes the
+     clamp branch instead of correctly skipping an already-larger table. */
+  struct rlimit limited=original;
+  rlim_t small_limit=(rlim_t)initial_max_fd+32;
+  if (limited.rlim_cur>small_limit) limited.rlim_cur=small_limit;
   CHECK(!setrlimit(RLIMIT_NOFILE,&limited));
   errno=ERANGE; ku_http_prepare_fd_table(socket_fd,LLONG_MAX,INT_MAX);
-  CHECK(errno==ERANGE && calls==2 && last_min==31 && fd_count()==count);
+  CHECK(errno==ERANGE && calls==2 && last_min==(int)(limited.rlim_cur-1) && fd_count()==count);
   CHECK(fcntl(returned_fd,F_GETFD)==-1 && errno==EBADF);
   fail_duplicate=1;
   errno=EINTR; ku_http_prepare_fd_table(socket_fd,257,2);
@@ -4569,8 +4580,8 @@ int main(void) {
   errno=EDOM; ku_http_prepare_fd_table(socket_fd,257,2);
   CHECK(errno==EDOM && calls==3);
   CHECK(!setrlimit(RLIMIT_NOFILE,&original));
-  CHECK(fd_count()==count && fcntl(socket_fd,F_GETFD)>=0);
-  close(socket_fd); puts("http-fd-table-preparation-ok"); return 0;
+  CHECK(fd_count()==count && fcntl(socket_fd,F_GETFD)>=0 && fcntl(inherited_high,F_GETFD)>=0);
+  close(inherited_high); close(socket_fd); puts("http-fd-table-preparation-ok"); return 0;
 }
 "#;
     let directory = native_c_harness::TempDir::new("http-fd-table");
