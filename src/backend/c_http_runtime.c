@@ -4,6 +4,8 @@
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
+#include <sys/resource.h>
+#include <dirent.h>
 #define KU_HTTP_PERSISTENT_EVENT_LOOP 1
 #elif defined(__APPLE__)
 #include <sys/event.h>
@@ -57,6 +59,57 @@ static void ku_http_atomic_decrement(KuHttpAtomicCounter* counter) { (void)atomi
 #endif
 
 static unsigned long long ku_http_now_ms(void) { return __ku_handler_now_ms(); }
+static void ku_http_socket_close(KuHttpSocket);
+/* Linux may wait for an RCU grace period while growing a shared FD table,
+   including inside nonblocking accept. Prepare the bounded HTTP connection
+   capacity before starting owners, rather than doing that work on a request.
+   This is opportunistic: it neither reserves open sockets nor limits other
+   libraries/Task networking, which can still grow the process table later. */
+static void ku_http_prepare_fd_table(KuHttpSocket listener, long long connections, int owners) {
+#if defined(__linux__) && defined(F_DUPFD_CLOEXEC)
+  int saved_errno=errno;
+  DIR* descriptors=NULL;
+  do {
+    struct rlimit limit;
+    if (listener<0 || connections<=0 || owners<=0 ||
+        getrlimit(RLIMIT_NOFILE,&limit) || !limit.rlim_cur) break;
+    uint64_t ceiling=(uint64_t)INT_MAX;
+    if (limit.rlim_cur!=RLIM_INFINITY && limit.rlim_cur-1<ceiling)
+      ceiling=(uint64_t)(limit.rlim_cur-1);
+    uint64_t highest=(uint64_t)listener;
+    descriptors=opendir("/proc/self/fd");
+    if (!descriptors) break;
+    struct dirent* entry;
+    errno=0;
+    while ((entry=readdir(descriptors))!=NULL) {
+      const unsigned char* name=(const unsigned char*)entry->d_name;
+      uint64_t fd=0;
+      int numeric=*name!=0;
+      for (;*name && numeric;name++) {
+        if (*name<'0' || *name>'9' || fd>((uint64_t)INT_MAX-(*name-'0'))/10u)
+          numeric=0;
+        else fd=fd*10u+(*name-'0');
+      }
+      if (numeric && fd>highest) highest=fd;
+    }
+    int read_error=errno;
+    closedir(descriptors); descriptors=NULL;
+    if (read_error || highest>=ceiling) break;
+    /* Public limits bound these operands; clamp before adding nevertheless. */
+    uint64_t room=ceiling-highest;
+    uint64_t requested=(uint64_t)connections;
+    uint64_t internal=(uint64_t)owners*8u+64u;
+    uint64_t extra=requested>room?room:requested;
+    extra=internal>room-extra?room:extra+internal;
+    int duplicate=fcntl(listener,F_DUPFD_CLOEXEC,(int)(highest+extra));
+    if (duplicate>=0) ku_http_socket_close(duplicate);
+  } while (0);
+  if (descriptors) closedir(descriptors);
+  errno=saved_errno;
+#else
+  (void)listener; (void)connections; (void)owners;
+#endif
+}
 /* CPU consumed by the calling event-owner OS thread only. This excludes
    coordinator/background workers and elapsed time spent sleeping or ready for
    CPU. Read at a bounded frequency, not at each Task dispatch. */
@@ -4489,6 +4542,7 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
     ku_http_socket_close(srv); ku_http_net_cleanup();
     return ku_http_listen_err(server, "event loops must fit active/pending limits and blocking_threads must cover every loop");
   }
+  ku_http_prepare_fd_table(srv,server->max_connections,group.count);
   if (!ku_http_mutex_init(&group.lock)) {
     ku_http_socket_close(srv); ku_http_net_cleanup(); return ku_http_listen_err(server, "loop group mutex initialization failed");
   }

@@ -4485,6 +4485,116 @@ fn main(): null! {
     drop(watchdog);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn native_http_fd_table_preparation_is_bounded_and_releases_its_duplicate() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let helper = format!(
+        "static void ku_http_prepare_fd_table{}",
+        runtime
+            .split_once("static void ku_http_prepare_fd_table")
+            .expect("production descriptor preparation")
+            .1
+            .split_once("/* CPU consumed")
+            .unwrap()
+            .0
+    );
+    let preparation = runtime
+        .find("  ku_http_prepare_fd_table(srv,server->max_connections,group.count);")
+        .expect("normal listen prepares its actual configured capacity");
+    assert!(
+        preparation
+            < runtime
+                .find("  if (!ku_http_mutex_init(&group.lock))")
+                .unwrap()
+    );
+    let header = r#"
+#define _GNU_SOURCE
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <limits.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef int KuHttpSocket;
+static void ku_http_socket_close(int fd) { (void)close(fd); }
+static int calls,last_min,returned_fd,fail_duplicate;
+static int fixture_fcntl(int fd,int command,int minimum) {
+  calls++; last_min=minimum;
+  if (fail_duplicate) { errno=EMFILE; return -1; }
+  returned_fd=fcntl(fd,command,minimum);
+  return returned_fd;
+}
+#define fcntl fixture_fcntl
+"#;
+    let body = r#"
+#undef fcntl
+#define CHECK(v) do { if (!(v)) { fprintf(stderr,"line %d: %s\n",__LINE__,#v); return 1; } } while(0)
+static int fd_count(void) {
+  DIR* d=opendir("/proc/self/fd"); if (!d) return -1;
+  int count=0; struct dirent* e;
+  while ((e=readdir(d))!=NULL) if (e->d_name[0]!='.') count++;
+  closedir(d); return count;
+}
+static int fd_size(void) {
+  FILE* f=fopen("/proc/self/status","r"); if (!f) return -1;
+  char line[256]; int size=-1;
+  while (fgets(line,sizeof(line),f)) if (sscanf(line,"FDSize: %d",&size)==1) break;
+  fclose(f); return size;
+}
+int main(void) {
+  int socket_fd=socket(AF_INET,SOCK_STREAM,0); CHECK(socket_fd>=0);
+  int count=fd_count(); CHECK(count>0);
+  errno=EDOM; ku_http_prepare_fd_table(socket_fd,257,2);
+  CHECK(errno==EDOM && calls==1 && returned_fd>=last_min);
+  CHECK(fd_count()==count && fd_size()>last_min);
+  CHECK(fcntl(returned_fd,F_GETFD)==-1 && errno==EBADF);
+  CHECK(fcntl(socket_fd,F_GETFD)>=0);
+  struct rlimit original; CHECK(!getrlimit(RLIMIT_NOFILE,&original));
+  struct rlimit limited=original; limited.rlim_cur=32;
+  CHECK(!setrlimit(RLIMIT_NOFILE,&limited));
+  errno=ERANGE; ku_http_prepare_fd_table(socket_fd,LLONG_MAX,INT_MAX);
+  CHECK(errno==ERANGE && calls==2 && last_min==31 && fd_count()==count);
+  CHECK(fcntl(returned_fd,F_GETFD)==-1 && errno==EBADF);
+  fail_duplicate=1;
+  errno=EINTR; ku_http_prepare_fd_table(socket_fd,257,2);
+  CHECK(errno==EINTR && calls==3 && fd_count()==count);
+  ku_http_prepare_fd_table(socket_fd,0,2); CHECK(calls==3);
+  limited.rlim_cur=0; CHECK(!setrlimit(RLIMIT_NOFILE,&limited));
+  errno=EDOM; ku_http_prepare_fd_table(socket_fd,257,2);
+  CHECK(errno==EDOM && calls==3);
+  CHECK(!setrlimit(RLIMIT_NOFILE,&original));
+  CHECK(fd_count()==count && fcntl(socket_fd,F_GETFD)>=0);
+  close(socket_fd); puts("http-fd-table-preparation-ok"); return 0;
+}
+"#;
+    let directory = native_c_harness::TempDir::new("http-fd-table");
+    let path = directory.path().join("fd-table.c");
+    fs::write(&path, format!("{header}\n{helper}\n{body}")).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "fd-table")
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires descriptor regression"
+        );
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"http-fd-table-preparation-ok\n");
+    assert!(output.stderr.is_empty());
+}
+
 #[test]
 fn native_http_accept_fd_wait_does_not_hold_admission_lock_and_drain_closes_returned_fd() {
     if !cfg!(unix) {
@@ -4543,7 +4653,11 @@ static KuHttpLoopGroup* fixture_group;
 static int fixture_owner,fixture_calls,fixture_inflight,fixture_peak,fixture_gate_failed;
 static int fixture_submits,fixture_exits,fixture_returned_fd=-1;
 static unsigned long long fixture_accepted,fixture_owner_accepted[2];
+static unsigned long long fixture_turns[2];
 static size_t fixture_remaining;
+static void fixture_note_turn(KuHttpLoopOwner* owner) {
+  pthread_mutex_lock(&fixture_lock);fixture_turns[owner->index]++;pthread_mutex_unlock(&fixture_lock);
+}
 static void fixture_note_submit(void) {
   pthread_mutex_lock(&fixture_lock);fixture_submits++;pthread_mutex_unlock(&fixture_lock);
 }
@@ -4584,6 +4698,13 @@ static void fixture_note_exit(KuHttpLoopOwner* owner) {
             "{}\n{hooks}\n{loop_edge}",
             native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS
         ),
+        1,
+    );
+    let turn_edge = "    owner->heartbeat = ku_http_now_ms();";
+    assert_eq!(generated.matches(turn_edge).count(), 1);
+    generated = generated.replacen(
+        turn_edge,
+        &format!("{turn_edge}\n    fixture_note_turn(owner);"),
         1,
     );
     let submit_edge = "static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {";
@@ -4654,7 +4775,9 @@ int main(int argc,char** argv) {
   }
   if(unlocked) {
     int other=1-fixture_owner;
-    unsigned long long heartbeat=group->loops[other].heartbeat;
+    pthread_mutex_lock(&fixture_lock);
+    unsigned long long turns=fixture_turns[other];
+    pthread_mutex_unlock(&fixture_lock);
     EXPECT(group->accept_turn==fixture_owner && !group->accepted);
     KuHttpWake* wake=group->loops[other].wake;
     if(wake)ku_http_wake_notify(wake); /* Lifetime remains under group.lock. */
@@ -4663,10 +4786,9 @@ int main(int argc,char** argv) {
     admitted=ku_http_reused_request_admit();ku_http_current_loop=NULL;
     unsigned long long end=ku_test_real_now_ms()+500u;
     while(ku_test_real_now_ms()<end && !other_progress) {
-      if(!pthread_mutex_trylock(&group->lock)) {
-        other_progress=group->loops[other].heartbeat>heartbeat;
-        ku_http_mutex_unlock(&group->lock);
-      }
+      pthread_mutex_lock(&fixture_lock);
+      other_progress=fixture_turns[other]>turns;
+      pthread_mutex_unlock(&fixture_lock);
       if(!other_progress)fixture_pause();
     }
     pthread_mutex_lock(&fixture_lock);
@@ -4681,6 +4803,9 @@ int main(int argc,char** argv) {
   }
   /* Old code fails these bounded assertions, then is released to finish N=2.
    * No failed trylock path blocks trying to acquire the accept-held mutex. */
+  if(!(admitted && other_progress))
+    fprintf(stderr,"accept gate entered=%d unlocked=%d admitted=%d other_progress=%d owner=%d\n",
+        entered,unlocked,admitted,other_progress,fixture_owner);
   EXPECT(admitted && other_progress);
   EXPECT(ku_test_event_set(&fixture_release));
   int joined=ku_test_thread_join(&application,3000u);EXPECT(joined);

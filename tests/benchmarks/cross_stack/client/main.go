@@ -79,6 +79,41 @@ type config struct {
 	corpora                                                                 map[string]corpus
 	checksums                                                               map[string]string
 }
+
+type descriptorPreparation struct {
+	supported                                         bool
+	method                                            string
+	configuredConnections                             int
+	maxOpenFD, targetFD, softLimit, runtimeReserveFDs uint64
+	limitClamped, duplicateClosed, sourceClosed       bool
+	duplicateFD                                       int
+	started, finished                                 time.Time
+}
+
+func (p descriptorPreparation) report(origin time.Time, anchor monotonicAnchor) map[string]any {
+	return map[string]any{
+		"supported":                       p.supported,
+		"method":                          p.method,
+		"configured_max_live_connections": p.configuredConnections,
+		"max_open_fd_before":              p.maxOpenFD,
+		"target_fd":                       p.targetFD,
+		"soft_limit":                      p.softLimit,
+		"runtime_reserve_fds":             p.runtimeReserveFDs,
+		"limit_clamped":                   p.limitClamped,
+		"duplicate_fd":                    p.duplicateFD,
+		"dup_closed":                      p.duplicateClosed,
+		"source_closed":                   p.sourceClosed,
+		"elapsed_ns":                      p.finished.Sub(p.started).Nanoseconds(),
+		"started_offset_ns":               p.started.Sub(origin).Nanoseconds(),
+		"completed_offset_ns":             p.finished.Sub(origin).Nanoseconds(),
+		"started_monotonic_ns":            anchor.at(p.started.Sub(origin).Nanoseconds()),
+		"completed_monotonic_ns":          anchor.at(p.finished.Sub(origin).Nanoseconds()),
+		"complete_before_origin":          !p.finished.After(origin),
+		"network_prewarm":                 false,
+		"preparation_accounting":          "one-time driver startup before workers and arrival origin; no requests, socket prewarm, rlimit change or startup CPU subtraction; unsupported platforms explicitly no-op",
+	}
+}
+
 type job struct {
 	index       uint64
 	streamIndex uint64
@@ -1236,6 +1271,10 @@ func run(c config) (map[string]any, error) {
 			return nil, e
 		}
 	}
+	descriptors, err := prepareDescriptorTable(c.concurrency)
+	if err != nil {
+		return nil, fmt.Errorf("descriptor preparation: %w", err)
+	}
 	l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, int(math.Ceil(c.duration.Seconds())))}
 	if c.events != "" {
 		w, e := openEvents(c.events, c.workload == "task_mix")
@@ -1325,6 +1364,7 @@ func run(c config) (map[string]any, error) {
 	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": finalResources.dials, "pool_idle_expirations": finalResources.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(finalResources.dials, 1)), "peak_connections": finalResources.peakLive, "connections_after_cleanup": finalResources.live, "peak_inflight": finalResources.peakActive, "active_after_cleanup": finalResources.active, "queue_peak": finalResources.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
+	out["descriptor_preparation"] = descriptors.report(l.origin, anchor)
 	out["worker_preparation"] = map[string]any{
 		"ready_workers":          preparation.workers,
 		"configured_workers":     c.concurrency,

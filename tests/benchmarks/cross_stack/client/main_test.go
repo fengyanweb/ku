@@ -356,6 +356,13 @@ func TestPreparedTaskMixKeepsOriginalPlanAndClockLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	descriptors := report["descriptor_preparation"].(map[string]any)
+	if descriptors["configured_max_live_connections"] != c.concurrency || descriptors["complete_before_origin"] != true || descriptors["elapsed_ns"].(int64) < 0 || descriptors["completed_offset_ns"].(int64) > 0 || descriptors["network_prewarm"] != false {
+		t.Fatalf("descriptor startup changed the arrival boundary: %#v", descriptors)
+	}
+	if descriptors["supported"] == true && (descriptors["dup_closed"] != true || descriptors["source_closed"] != true) {
+		t.Fatalf("descriptor preparation left owned descriptors open: %#v", descriptors)
+	}
 	preparation := report["worker_preparation"].(map[string]any)
 	if preparation["ready_workers"] != c.concurrency || preparation["configured_workers"] != c.concurrency || preparation["complete_before_origin"] != true || preparation["connections_dialed"] != uint64(0) || preparation["connections_live"] != uint64(0) || preparation["duration_ns"].(int64) < 0 || preparation["ready_offset_ns"].(int64) > 0 || preparation["origin_after_ready_ns"].(int64) < 0 {
 		t.Fatalf("startup was not reported separately at the real readiness boundary: %#v", preparation)
