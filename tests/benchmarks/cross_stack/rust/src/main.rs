@@ -1,4 +1,5 @@
 mod cpu_work;
+mod fd_table;
 mod pg_mode;
 mod runtime_config;
 
@@ -171,12 +172,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_name = std::env::var("BENCH_RUNTIME").ok();
     let plan = runtime_config::Plan::parse(runtime_name.as_deref(), workers, cpu_workers)?;
     let listen_plan = runtime_config::ListenPlan::from_env()?;
+    let descriptor_preparation = fd_table::prepare(fd_table::max_connections_from_env()?)?;
     let runtime = plan.build(cpu_config.event_interval)?;
     let served = runtime.block_on(serve(
         plan,
         cpu_config,
         listen_plan,
         final_trace_path.is_some(),
+        descriptor_preparation,
     ));
     // Runtime drop joins blocking CPU work and drops pending async/HTTP
     // futures. A preceding management snapshot or actual_cpu_jobs==0 does not
@@ -196,6 +199,7 @@ async fn serve(
     cpu_config: cpu_work::Config,
     listen_plan: runtime_config::ListenPlan,
     final_export: bool,
+    descriptor_preparation: fd_table::Preparation,
 ) -> Result<Option<cpu_work::FinalReceipt>, Box<dyn std::error::Error>> {
     let cpu_workers = runtime_plan.cpu_workers;
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
@@ -251,7 +255,7 @@ async fn serve(
     let listen_address = listener.local_addr()?;
     eprintln!(
         "{}",
-        json!({"ready":true,"stack":"rust","runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"listen_address":listen_address,"listen_backlog_requested":listen_plan.requested_backlog(),"listen_backlog_explicit":listen_plan.explicit(),"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
+        json!({"ready":true,"stack":"rust","descriptor_preparation":descriptor_preparation,"runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"listen_address":listen_address,"listen_backlog_requested":listen_plan.requested_backlog(),"listen_backlog_explicit":listen_plan.explicit(),"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
     );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown())
