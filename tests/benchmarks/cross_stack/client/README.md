@@ -84,8 +84,9 @@ Only task_mix CSVs append `stream_index`, `planned_cpu_cancel`, `reset_due_ns`,
 unchanged. These offsets use the existing Go monotonic origin and its one-time
 kernel anchor/uncertainty, without per-request kernel-clock reads. All modes
 also record `last_terminal_*` including unsent plans and `run_end_*` after
-workers, socket retirement and CSV flush; JSON serialization/process exit are
-outside that end timestamp. Neither timestamp means server physical completion.
+workers, socket retirement and EOF CSV export. Export timestamps are separate;
+JSON serialization/process exit are outside `run_end_*`.
+Neither timestamp means server physical completion.
 
 One planned request has exactly one terminal category: correct, explicit
 503/429 rejection, other HTTP, timeout, connection error, protocol error, wrong
@@ -155,13 +156,25 @@ they must never determine recovery or resource-window association. Other systems
 emit null anchor/derived values with an explicit unsupported-platform reason.
 macOS smoke results do not establish Linux cross-process timing accuracy.
 
-CSV output is streamed through an 8,192-record nonblocking queue to gzip, with a
-1-GiB uncompressed limit. Reports are capped at 16 MiB, error samples at 24, total
+CSV recording reserves a checked 128-byte slot per planned request plus a seen
+bitmap before arrivals, with a 256-MiB backing limit. Request completion stores
+one indexed record; it cannot overflow a streaming CSV queue. After requests
+and socket retirement, all records are exported in plan-index order using the
+existing formatter, gzip.BestSpeed and 1-GiB uncompressed limit. The original
+15/21 fields and their timestamps are preserved. The 900-second frozen stage
+requires about 236.64 MiB of backing; this is driver memory, not service memory.
+Unrepresentable counts, labels or worst-case output sizes fail before arrivals.
+Reports are capped at 16 MiB, error samples at 24, total
 plans at 10 million, workers at 16,384, response headers at 32 KiB and bodies at
-64 KiB. Output paths are exclusive-created to preserve prior evidence. CSV overflow or any client plan not started make `valid_driver=false`;
+64 KiB. Output paths are exclusive-created to preserve prior evidence. Duplicate,
+missing or rejected records, output errors, or any client plan not started make `valid_driver=false`;
 such a run cannot establish service capacity. Service refusals/timeouts alone
 do not make the driver invalid: they remain real failed capacity candidates.
-Queue loss is never silently deleted from the result. gzip.BestSpeed reduces output CPU while preserving all CSV rows.
+Failed records are never silently deleted from the result. The arrival CPU gate
+is retained, with an additional whole-driver-lifecycle gate covering startup,
+CSV/gzip and JSON through process exit. Its denominator remains the original
+arrival duration and the same 3CPU budget. Export CPU is a subset of this total,
+not an extra cost to add again. These changes do not establish a service speedup.
 
 The orchestrator separately records the entire driver's CPU/memory and event
 writer cost, and checks that the driver has headroom. Service cgroup cost never

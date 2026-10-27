@@ -106,6 +106,20 @@ def generation_gate(driver, cost, start, end):
             "scope": "dispatch gate is distinct from client queue/dial/Write/service backpressure; all service SLO failures remain"}
 
 
+def driver_lifecycle_cpu(before, after, arrival_seconds):
+    keys = ("usage_usec", "user_usec", "system_usec")
+    delta = {key: after.get("cpu_stat", {}).get(key, -1) - before.get("cpu_stat", {}).get(key, -1) for key in keys}
+    available = arrival_seconds > 0 and all(before.get("cpu_stat", {}).get(key, -1) >= 0 and after.get("cpu_stat", {}).get(key, -1) >= 0 and delta[key] >= 0 for key in keys)
+    elapsed = (after.get("monotonic_ns", 0) - before.get("monotonic_ns", 0)) / 1e9
+    available = available and elapsed > 0
+    fraction = delta["usage_usec"] / 1e6 / (3 * arrival_seconds) if available else None
+    return {"available": available, "CPU_seconds": {key: value / 1e6 if available else None for key, value in delta.items()},
+            "fraction_of_3CPU_original_arrival_duration": fraction, "passed": available and fraction < .9,
+            "original_arrival_seconds": arrival_seconds, "lifecycle_wall_seconds": elapsed,
+            "before": before, "after": after,
+            "scope": "Actual full driver cgroup before launch through process exit, including startup, CSV/gzip export and JSON; denominator is original planned arrival duration, never lengthened by export. This is an additional stricter gate; original arrival CPU gate is retained."}
+
+
 def client(harness, service, spec, output, phase):
     output.mkdir(exist_ok=False)
     os.chown(output, harness.uid, harness.gid)
@@ -129,6 +143,7 @@ def client(harness, service, spec, output, phase):
                         interval=spec.get("sample_seconds", .2), maximum=20000).start()
     process = None
     try:
+        lifecycle_before = domain.snapshot()
         process = harness.launch(command, Path(spec["root"]), env, domain, output/"driver.log")
         began = time.monotonic_ns()
         driver_identity = None
@@ -160,6 +175,7 @@ def client(harness, service, spec, output, phase):
               "driver_cgroup_removed": removed, "sampler_error": sampler.error,
               "sampler_overflow": sampler.overflow, "qualification": qualify(driver),
               "service_pid": service.process.pid}
+    result["driver_lifecycle_CPU"] = driver_lifecycle_cpu(lifecycle_before, last, phase["seconds"])
     if clock["available"]:
         start = clock["origin_ns"]
         end = max(start+int(phase["seconds"]*1e9),
@@ -168,6 +184,16 @@ def client(harness, service, spec, output, phase):
         result["service_CPU"] = cpu_window(samples, service.domain.label, start, end)
         result["driver_CPU"] = cpu_window(samples, domain.label, start, end)
         result["generation_gate"] = generation_gate(driver, result["driver_CPU"], start, end)
+        result["generation_gate"]["full_driver_lifecycle_CPU_passed"] = result["driver_lifecycle_CPU"]["passed"]
+        result["generation_gate"]["passed"] = result["generation_gate"]["passed"] and result["driver_lifecycle_CPU"]["passed"]
+        storage = driver.get("events", {}).get("planned_storage") or {}
+        export_start, export_end = storage.get("export_started_offset_ns"), storage.get("export_finished_offset_ns")
+        if isinstance(export_start, int) and isinstance(export_end, int) and 0 <= export_start < export_end:
+            result["driver_export_CPU"] = cpu_window(samples, domain.label, start + export_start, start + export_end)
+            result["driver_export_CPU"]["scope"] = "Sample-bracketed entire driver cgroup during EOF CSV/gzip export, including main and Go runtime; not pure compressor SELF CPU. Included in full-lifecycle gate, not added again."
+            result["driver_export_elapsed_seconds"] = (export_end - export_start) / 1e9
+        else:
+            result["driver_export_CPU"] = {"available": False, "reason": "No explicit completed EOF export interval"}
     h.write_json(output/"result.json", result)
     return result
 

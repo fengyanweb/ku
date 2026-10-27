@@ -9,7 +9,7 @@ import tempfile
 import types
 from pathlib import Path
 from unittest import mock
-from task_cpu_window import generation_gate
+from task_cpu_window import generation_gate, driver_lifecycle_cpu
 
 from linux_harness import (arrival_cpu, business_send_end, measurement_clock, quiet_metrics,
                            qualification, recovery_probe_views, upper_point, aggregate_rounds,
@@ -519,6 +519,33 @@ class ServiceTerminationTest(unittest.TestCase):
                                 (b'ready\n','missing'),(encoded+b'x'*9000+b'\n','missing')):
                 path.write_bytes(body)
                 self.assertEqual(java_shutdown_receipt(path)['status'],status)
+
+
+class DriverLifecycleCPUTest(unittest.TestCase):
+    def test_export_tail_keeps_original_arrival_duration_denominator(self):
+        before = {'monotonic_ns': 1000000000, 'cpu_stat': {'usage_usec': 0, 'user_usec': 0, 'system_usec': 0}}
+        after = {'monotonic_ns': 21000000000, 'cpu_stat': {'usage_usec': 28000000, 'user_usec': 20000000, 'system_usec': 8000000}}
+        result = driver_lifecycle_cpu(before, after, 10)
+        self.assertTrue(result['available'])
+        self.assertAlmostEqual(result['fraction_of_3CPU_original_arrival_duration'], 28/30)
+        self.assertFalse(result['passed'])
+
+    def test_startup_and_export_cost_remain_in_cgroup_delta(self):
+        before = {'monotonic_ns': 1000000000, 'cpu_stat': {'usage_usec': 10000, 'user_usec': 8000, 'system_usec': 2000}}
+        after = {'monotonic_ns': 13000000000, 'cpu_stat': {'usage_usec': 6010000, 'user_usec': 4008000, 'system_usec': 2002000}}
+        result = driver_lifecycle_cpu(before, after, 10)
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['CPU_seconds'], {'usage_usec': 6, 'user_usec': 4, 'system_usec': 2})
+        self.assertEqual(result['fraction_of_3CPU_original_arrival_duration'], .2)
+
+    def test_missing_reversed_and_zero_duration_cannot_pass(self):
+        before = {'monotonic_ns': 100, 'cpu_stat': {'usage_usec': 1, 'user_usec': 1, 'system_usec': 0}}
+        good = {'monotonic_ns': 200, 'cpu_stat': {'usage_usec': 2, 'user_usec': 1, 'system_usec': 1}}
+        for first, last, duration in [(before, {}, 10), (good, before, 10), (before, good, 0)]:
+            with self.subTest(first=first, last=last, duration=duration):
+                result = driver_lifecycle_cpu(first, last, duration)
+                self.assertFalse(result['available'])
+                self.assertFalse(result['passed'])
 
 
 if __name__ == '__main__':

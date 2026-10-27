@@ -553,12 +553,14 @@ type event struct {
 	result        result
 }
 type eventWriter struct {
-	queue   chan event
-	done    chan struct{}
-	dropped uint64
-	written uint64
-	err     string
-	path    string
+	queue                         chan event
+	done                          chan struct{}
+	dropped                       uint64
+	written                       uint64
+	err                           string
+	path                          string
+	planned                       *plannedEventStore
+	exportStarted, exportFinished time.Time
 }
 
 func openEvents(path string, taskMix ...bool) (*eventWriter, error) {
@@ -623,13 +625,24 @@ func openEvents(path string, taskMix ...bool) (*eventWriter, error) {
 
 // Called under the ledger mutex, so dropped has one writer at a time.
 func (w *eventWriter) offer(e event) {
+	if w.planned != nil {
+		w.planned.offer(e)
+		return
+	}
 	select {
 	case w.queue <- e:
 	default:
 		w.dropped++
 	}
 }
-func (w *eventWriter) close() { close(w.queue); <-w.done }
+func (w *eventWriter) close() {
+	if w.planned != nil {
+		w.exportPlanned()
+		return
+	}
+	close(w.queue)
+	<-w.done
+}
 
 type countedConn struct {
 	net.Conn
@@ -1275,9 +1288,13 @@ func run(c config) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("descriptor preparation: %w", err)
 	}
+	planned, planError := plannedEventCount(c)
+	if planError != nil {
+		return nil, planError
+	}
 	l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, int(math.Ceil(c.duration.Seconds())))}
 	if c.events != "" {
-		w, e := openEvents(c.events, c.workload == "task_mix")
+		w, e := openPlannedEvents(c.events, c, planned)
 		if e != nil {
 			return nil, e
 		}
@@ -1292,10 +1309,6 @@ func run(c config) (map[string]any, error) {
 	var anchor monotonicAnchor
 	l.origin, anchor = captureMonotonicAnchor(time.Now, readKernelMonotonic)
 	l.cutoff = l.origin.Add(c.duration)
-	planned := uint64(math.Ceil(c.duration.Seconds() * c.rate))
-	if c.workload == "task_mix" {
-		planned += uint64(math.Ceil(c.duration.Seconds() * c.cpuRate))
-	}
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -1355,6 +1368,8 @@ func run(c config) (map[string]any, error) {
 	events := map[string]any{"enabled": false}
 	if l.events != nil {
 		events = map[string]any{"enabled": true, "path": l.events.path, "rows": l.events.written, "dropped": l.events.dropped, "error": l.events.err, "queue_limit": 8192, "uncompressed_bytes_limit": maxEvents}
+		events["planned_storage"] = l.events.plannedReport(l.origin)
+		events["queue_scope"] = "EOF CSV exporter only; measured arrivals store indexed records and never enqueue CSV"
 		valid = valid && l.events.dropped == 0 && l.events.err == "" && l.events.written == planned
 	}
 	hashes := map[string]string{}
@@ -1427,7 +1442,7 @@ func parse() (config, error) {
 	flag.StringVar(&c.corporaDir, "corpora-dir", "", "optional corpus directory, frozen hashes still verified")
 	flag.StringVar(&c.corpusPath, "corpus", "", "override selected JSON corpus path, frozen hash still verified")
 	flag.StringVar(&c.output, "output", "", "exclusive-create JSON output, stdout if omitted")
-	flag.StringVar(&c.events, "events", "", "exclusive-create streaming gzip CSV, queue 8192; overflow invalidates run")
+	flag.StringVar(&c.events, "events", "", "exclusive-create finite planned CSV, 256MiB backing; export after request completion")
 	flag.Float64Var(&duration, "duration", 30, "arrival window seconds (0..3600)")
 	flag.Float64Var(&c.rate, "rate", 100, "open arrivals per second (positive, total <=10000000)")
 	flag.Float64Var(&c.cpuRate, "cpu-rate", 0, "task_mix independent CPU arrivals/sec; --rate is short arrivals/sec")
