@@ -8003,3 +8003,49 @@ int main(void) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn native_http_pure_native_routes_keep_error_fallback_and_exit() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import "std.http"
+async fn ready(): HttpResponse! { return ok(http.text("ready")) }
+fn main(): null! {
+    app=http.server({max_connections:16,max_active_requests:8,max_pending_requests:8})
+    app.get("/ok",ready)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server_settings(
+        "pure-native-error-fallback",
+        source,
+        &address,
+        false,
+        Some(3),
+        &[
+            ("KU_EVENT_LOOPS", "2"),
+            ("KU_BLOCKING_THREADS", "17"),
+            ("KU_THREAD_BUDGET", "64"),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (request,status,body) in [
+        ("GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", "HTTP/1.1 200 OK", Some("ready")),
+        ("GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", "HTTP/1.1 404 Not Found", None),
+        ("POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "HTTP/1.1 405 Method Not Allowed", None),
+    ] {
+        let mut stream=connect_with_retry(&address,Duration::from_secs(3));
+        stream.write_all(request.as_bytes()).expect("write exactly once");
+        let response=read_http_stream(stream,Duration::from_secs(3));
+        assert_status(&response,status);
+        if let Some(body)=body { assert!(response.ends_with(body),"{response}"); }
+    }
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}

@@ -296,6 +296,7 @@ typedef struct KuHttpNode {
 typedef struct KuHttpBufferBudget KuHttpBufferBudget;
 struct KuHttpServer {
   KuHttpNode* root;
+  int has_native_task_route, has_sync_route;
   KuHttpBufferBudget* buffer_budget;
   long long max_buffer_bytes;
   long long max_connections;
@@ -694,6 +695,8 @@ static KuHttpServer* ku_http_server_add_route(KuHttpServer* s, KuString method, 
   if (factory) { invoke = factory; returns_result = 2; }
 #endif
   h->invoke = invoke; h->env = env; h->arity = arity; h->returns_result = returns_result;
+  if (h->returns_result == 2) s->has_native_task_route = 1;
+  else s->has_sync_route = 1;
   ku_string_drop(&method); ku_string_drop(&path);
   free(pbuf);
   return s;
@@ -4569,12 +4572,13 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
     ku_http_socket_close(srv); ku_http_net_cleanup(); return ku_http_listen_err(server,"HTTP Task runtime startup failed; verify KU_TASK_MAX_BYTES against configured request capacity");
   }
 #endif
+  const int native_only_routes = server->has_native_task_route && !server->has_sync_route;
   for (int i=0; i<group.count; i++) {
     KuHttpLoopOwner* owner = &group.loops[i]; owner->group = &group; owner->index = i;
     owner->slots = (int)(server->max_connections/group.count) + (i < server->max_connections%group.count);
     owner->request_limit = (int)(server->max_active_requests/group.count) + (i < server->max_active_requests%group.count);
     owner->pending = (int)(server->max_pending_requests/group.count) + (i < server->max_pending_requests%group.count);
-    owner->workers = blocking/group.count + (i < blocking%group.count);
+    owner->workers = native_only_routes ? 1 : blocking/group.count + (i < blocking%group.count);
     if (owner->workers > owner->request_limit) owner->workers = owner->request_limit;
 #if defined(_WIN32)
     uintptr_t thread = _beginthreadex(NULL, (unsigned)ku_runtime_thread_stack_bytes(), ku_http_loop_thread, owner, 0, NULL);
