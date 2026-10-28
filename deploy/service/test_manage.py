@@ -411,6 +411,93 @@ class ResourceIdentityDiagnostics(unittest.TestCase):
         self.assertEqual(natives[1]["identity_status"], "unknown")
 
 
+class MetricsCollectorContracts(unittest.TestCase):
+    token = "metricsdeploytoken0123456789abcdef"
+
+    class Peer:
+        def __init__(self, response, fragment=4096, tick=None):
+            self.response = response
+            self.fragment = fragment
+            self.tick = tick
+            self.request = bytearray()
+            self.closed = False
+        def __enter__(self): return self
+        def __exit__(self, *_): self.closed = True
+        def settimeout(self, timeout): self.timeout = timeout
+        def send(self, data):
+            count = min(7, len(data))  # Partial writes must retain the deadline.
+            self.request.extend(data[:count])
+            return count
+        def recv(self, count):
+            if self.tick is not None: self.tick[0] += .03
+            count = min(count, self.fragment)
+            chunk, self.response = self.response[:count], self.response[count:]
+            return chunk
+
+    def collect(self, body, code=200, headers=None, fragment=4096):
+        raw = body.encode("utf-8")
+        header = headers or f"Content-Length: {len(raw)}\r\nConnection: close\r\n"
+        peer = self.Peer(f"HTTP/1.1 {code} Control\r\n{header}\r\n".encode()+raw, fragment)
+        with patch.object(M.socket, "create_connection", return_value=peer):
+            result = M.metrics({"_token": self.token}, {"control_addr": "127.0.0.1:19001"})
+        self.assertTrue(peer.closed)
+        return result, peer
+
+    def test_metrics_reads_large_current_generation_without_changing_call_bound(self):
+        body = json.dumps({"available": True, "generation": 7, "native": {"padding": "x"*10000}})
+        result, peer = self.collect(body)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["generation"], 7)
+        self.assertEqual(len(result["native"]["padding"]), 10000)
+        self.assertTrue(bytes(peer.request).startswith(b"GET /metrics HTTP/1.1\r\n"))
+        self.assertNotIn(self.token, json.dumps(result))
+        connection = Mock()
+        connection.getresponse.return_value.read.return_value = b"x"*8193
+        with patch.object(M.http.client, "HTTPConnection", return_value=connection):
+            with self.assertRaises(ValueError):
+                M.call("127.0.0.1:19001", "GET", "/status", self.token)
+        connection.getresponse.return_value.read.assert_called_once_with(8193)
+
+    def test_unavailable_native_is_unknown_and_recollected_not_cached(self):
+        available = json.dumps({"available": True, "generation": 2, "native": {"requests": 12}})
+        missing = json.dumps({"available": False, "generation": 3, "native": None, "reason": "no_native_instance"})
+        self.assertTrue(self.collect(available)[0]["available"])
+        actual, _ = self.collect(missing, code=503)
+        self.assertFalse(actual["available"])
+        self.assertIsNone(actual["native"])
+        self.assertEqual(actual["generation"], 3)
+        self.assertEqual(actual["reason"], "no_native_instance")
+
+    def test_metrics_rejects_oversize_framing_invalid_json_and_token_echo(self):
+        for body, headers in [("{}", "Content-Length: 65536\r\n"),
+                              ("{}", "Content-Length: 2\r\nContent-Length: 2\r\n"),
+                              ("{}", "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n"),
+                              ("{invalid}", None),
+                              (json.dumps({"available": True, "generation": 1, "native": {"secret": self.token}}), None)]:
+            with self.subTest(headers=headers):
+                actual, _ = self.collect(body, headers=headers)
+                self.assertFalse(actual["available"])
+                self.assertIsNone(actual["native"])
+                self.assertNotIn(self.token, json.dumps(actual))
+
+    def test_invalid_operator_token_is_reported_as_unavailable(self):
+        result, _ = self.collect("control token required\n", code=403)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["http_status"], 403)
+
+    def test_drip_read_has_one_absolute_collector_deadline(self):
+        clock = [1.0]
+        body = json.dumps({"available": True, "generation": 1, "native": {}}).encode()
+        peer = self.Peer(b"HTTP/1.1 200 Control\r\nContent-Length: "+str(len(body)).encode()+b"\r\n\r\n"+body, 1, clock)
+        with patch.object(M.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(M.socket, "create_connection", return_value=peer):
+            actual = M.metrics({"_token": self.token}, {"control_addr": "127.0.0.1:19001"}, timeout=.08)
+        self.assertFalse(actual["available"])
+        self.assertEqual(actual["error_type"], "TimeoutError")
+        self.assertLess(clock[0], 1.2)
+        self.assertTrue(peer.closed)
+
+
 class DeploymentContracts(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ku-deploy-regression-")

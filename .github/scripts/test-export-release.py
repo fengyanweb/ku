@@ -1034,5 +1034,270 @@ class InstalledPostgresOwnerTests(unittest.TestCase):
                 self.assertEqual(data["status"], "failed")
 
 
+class ProductionRCScopeTests(unittest.TestCase):
+    """A sample RC receipt must never silently authorize real deployment."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[2] / "deploy/production_rc.py"
+        spec = importlib.util.spec_from_file_location("ku_rc_regression", path)
+        cls.rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.rc)
+
+    def gate(self):
+        return {"rc_checks": {key: True for key in ("identity", "install", *self.rc.KINDS)},
+                "checks": {key: None for key in (*self.rc.REAL_CHECKS, "canary_actually_deployed")},
+                "overall": "in_progress", "new_evidence": [], "scope": {}}
+
+    def test_sample_completion_keeps_real_business_unknown(self):
+        gate = self.rc.derive_gate(self.gate())
+        self.assertEqual(gate["overall"], "rc_prepared")
+        self.assertIsNone(gate["checks"]["business_slo_passed"])
+        self.assertIsNone(gate["checks"]["canary_actually_deployed"])
+        gate["rc_checks"]["observability"] = None
+        self.assertEqual(self.rc.derive_gate(gate)["overall"], "in_progress")
+
+    def test_status_does_not_rewind_an_actual_running_canary(self):
+        gate = self.gate()
+        gate["checks"]["canary_actually_deployed"] = True
+        self.assertEqual(self.rc.derive_gate(gate)["overall"], "canary_observing")
+        self.assertIsNone(gate["checks"]["business_slo_passed"])
+
+    def test_interrupted_live_action_cannot_become_prepared_by_resume(self):
+        gate = self.gate(); gate["live_action_pending"] = {"action": "canary"}
+        self.assertEqual(self.rc.derive_gate(gate)["overall"], "blocked")
+        self.assertIn("never replays", gate["next_action"])
+
+    def test_receipt_for_another_candidate_does_not_advance_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); receipt = root / "receipt.json"
+            manifest = {key: "a" * (40 if key == "candidate_commit" else 64)
+                        for key in ("candidate_commit", "cli_sha256", "application_sha256",
+                                    "config_template_sha256", "archive_sha256")}
+            data = {"schema": "ku-production-rc-receipt-v1", "kind": "business",
+                    "binding": {**manifest, "application_sha256": "b" * 64}, "outcome": "passed", "observed": {"requests": 1}}
+            receipt.write_bytes(self.rc.encoded(data)); gate = self.gate(); gate["rc_checks"]["business"] = None
+            args = SimpleNamespace(state=root, receipt=receipt, command="verify", profile=None)
+            with mock.patch.object(self.rc, "state", return_value=(root, manifest, gate)), self.assertRaises(self.rc.RCError):
+                self.rc.attach(args)
+            self.assertIsNone(gate["rc_checks"]["business"])
+            self.assertFalse((root / "evidence").exists())
+
+    def test_failed_frozen_candidate_cannot_be_replaced_with_a_good_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); evidence = root / "actual.json"; evidence.write_text('{"result":"passed"}')
+            manifest = {key: "a" * (40 if key == "candidate_commit" else 64)
+                        for key in ("candidate_commit", "cli_sha256", "application_sha256",
+                                    "config_template_sha256", "archive_sha256")}
+            receipt = root / "receipt.json"
+            receipt.write_bytes(self.rc.encoded({"schema": "ku-production-rc-receipt-v1", "kind": "business",
+                "binding": manifest, "outcome": "passed", "observed": {"requests": 1},
+                "evidence": [{"path": str(evidence), "sha256": self.rc.digest(evidence)}]}))
+            gate = self.gate(); gate["rc_checks"]["business"] = False
+            args = SimpleNamespace(state=root, receipt=receipt, command="verify", profile=None)
+            with mock.patch.object(self.rc, "state", return_value=(root, manifest, gate)), self.assertRaises(self.rc.RCError):
+                self.rc.attach(args)
+            self.assertIs(gate["rc_checks"]["business"], False)
+
+    def receipt_fixture(self, root, kind, outcome):
+        evidence = root / "actual.json"; evidence.write_text('{"observed_requests":1}')
+        manifest = {key: "a" * (40 if key == "candidate_commit" else 64)
+                    for key in ("candidate_commit", "cli_sha256", "application_sha256",
+                                "config_template_sha256", "archive_sha256")}
+        data = {"schema": "ku-production-rc-receipt-v1", "kind": kind, "binding": manifest,
+            "outcome": outcome, "observed": {"requests": 1},
+            "evidence": [{"path": str(evidence), "sha256": self.rc.digest(evidence)}]}
+        receipt = root / "receipt.json"; receipt.write_bytes(self.rc.encoded(data))
+        return manifest, data, SimpleNamespace(state=root, receipt=receipt, command="verify", profile=None)
+
+    def test_unknown_receipt_cannot_erase_a_prior_candidate_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, data, args = self.receipt_fixture(root, "business", "unknown")
+            gate = self.gate(); gate["rc_checks"]["business"] = False
+            with mock.patch.object(self.rc, "state", return_value=(root, manifest, gate)):
+                self.assertEqual(self.rc.attach(args)["overall"], "blocked")
+                self.assertIs(gate["rc_checks"]["business"], False)
+                data["outcome"] = "passed"; args.receipt.write_bytes(self.rc.encoded(data))
+                with self.assertRaises(self.rc.RCError): self.rc.attach(args)
+
+    def test_invalid_target_receipt_does_not_leave_an_orphan_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, data, args = self.receipt_fixture(root, "target_preflight", "unknown")
+            with mock.patch.object(self.rc, "state", return_value=(root, manifest, self.gate())), self.assertRaises(self.rc.RCError):
+                self.rc.attach(args)
+            self.assertFalse((root / "evidence").exists())
+
+    def test_target_outcome_consistency_and_unknown_preserve_prior_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, data, args = self.receipt_fixture(root, "target_preflight", "unknown")
+            args.profile = root / "profile.json"
+            args.profile.write_bytes(self.rc.encoded({"application": "fixture", "deployment_target": {"name": "fixture"},
+                "business_contract_sha256": "b" * 64, "config_sha256": "c" * 64,
+                "rollback_object": {"kind": "same_cli_application"}, "candidate_binding": manifest}))
+            data["profile_sha256"] = self.rc.digest(args.profile)
+            data["checks"] = {key: True for key in self.rc.REAL_CHECKS}
+            args.receipt.write_bytes(self.rc.encoded(data)); gate = self.gate()
+            with mock.patch.object(self.rc, "state", return_value=(root, manifest, gate)):
+                with self.assertRaises(self.rc.RCError): self.rc.attach(args)
+                self.assertFalse((root / "evidence").exists())
+                gate["checks"]["target_preflight_passed"] = False
+                data["checks"] = {key: None for key in self.rc.REAL_CHECKS}
+                args.receipt.write_bytes(self.rc.encoded(data))
+                result = self.rc.attach(args)
+                self.assertIs(result["checks"]["target_preflight_passed"], False)
+                self.assertNotEqual(result["overall"], "ready_for_canary")
+
+    def test_credential_template_and_ambiguous_json_are_rejected(self):
+        with self.assertRaises(self.rc.RCError):
+            self.rc.no_secrets({"env": {"PGPASSWORD": "unused"}, "conninfo": "password=unused"})
+        with self.assertRaises(self.rc.RCError):
+            self.rc.no_secrets({"env": {"KU_SERVICE_CONTROL_TOKEN": "unused"}})
+        self.rc.no_secrets({"control_token_file": "/private/owned/service.token"})
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "input.json"
+            for value in ('{"passed":true,"passed":false}', '{"load":NaN}'):
+                path.write_text(value)
+                with self.subTest(value=value), self.assertRaises(self.rc.RCError):
+                    self.rc.load(path)
+
+    def test_missing_real_target_refuses_canary_before_any_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); path = root / "profile.json"; path.write_text('{"application":null}')
+            args = SimpleNamespace(state=root, profile=path, command="canary", config=root / "missing", execution_approval="")
+            with mock.patch.object(self.rc, "state", return_value=(root, {}, self.gate())), \
+                    mock.patch.object(self.rc.subprocess, "run") as launch, self.assertRaises(self.rc.RCError):
+                self.rc.live_action(args)
+            launch.assert_not_called()
+        with self.assertRaises(self.rc.RCError):
+            self.rc.observer_verified({}, {}, {})
+
+    def test_canary_only_accepts_exact_regular_slot_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); source = root / "app/service"; source.parent.mkdir()
+            source.write_bytes(b"inert candidate data"); expected = self.rc.digest(source)
+            slot = root / "runtime/slots/a/service"; slot.parent.mkdir(parents=True); slot.write_bytes(source.read_bytes())
+            self.assertEqual(self.rc.slot_program(root, slot, "a", expected), slot)
+            outside = root / "other"; outside.write_bytes(source.read_bytes())
+            with self.assertRaises(self.rc.RCError):
+                self.rc.slot_program(root, outside, "a", expected)
+            slot.unlink(); slot.symlink_to(source)
+            with self.assertRaises(self.rc.RCError):
+                self.rc.slot_program(root, slot, "a", expected)
+            cli = root / "bin/ku"; cli.parent.mkdir(); cli.write_bytes(b"inert compiler fixture")
+            manifest = {"cli_sha256": self.rc.digest(cli)}
+            self.assertEqual(self.rc.configured_cli({"ku": str(cli)}, root, manifest), cli)
+            outside.write_bytes(cli.read_bytes())
+            with self.assertRaises(self.rc.RCError):
+                self.rc.configured_cli({"ku": str(outside)}, root, manifest)
+            cli.write_bytes(b"changed installed CLI")
+            with self.assertRaises(self.rc.RCError):
+                self.rc.configured_cli({"ku": str(cli)}, root, manifest)
+
+
+class SystemdRCRenderTests(unittest.TestCase):
+    """Render inert fixtures only; no unit or external program is started."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parents[2]
+        path = cls.repo / "deploy/service/render-systemd.py"
+        spec = importlib.util.spec_from_file_location("ku_rc_render_regression", path)
+        cls.renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.renderer)
+
+    def fixture(self, temporary):
+        root = Path(temporary).resolve() / "installation with spaces"
+        root.mkdir()
+        config = json.loads((self.repo / "deploy/service/cluster.example.json").read_text())
+        ku = root / "bin/ku"; ku.parent.mkdir(); ku.write_bytes(b"inert, never executed\n"); ku.chmod(0o755)
+        manager = root / "tools/manage.py"; manager.parent.mkdir()
+        manager.write_bytes((self.repo / "deploy/service/manage.py").read_bytes())
+        token = root / "runtime/control.token"; token.parent.mkdir(); token.write_text("a" * 64); token.chmod(0o600)
+        config.update(ku=str(ku), control_token_file=str(token))
+        for slot in config["slots"]:
+            program = root / "runtime/slots" / slot["name"] / "service"
+            program.parent.mkdir(parents=True); program.write_bytes(b"inert native fixture\n"); program.chmod(0o755)
+            slot["program"] = str(program)
+            slot["manager_start"] = ["systemctl", "start", f"ku-rc-fixture-{slot['name']}.service"]
+            slot["manager_stop"] = ["systemctl", "stop", f"ku-rc-fixture-{slot['name']}.service"]
+        path = root / "runtime/cluster.json"; path.write_text(json.dumps(config))
+        args = SimpleNamespace(config=path, user="fixture", output=root / "units", unit_prefix="ku-rc-fixture",
+            manage=None, template=self.repo / "deploy/production-rc/ku-rc@.service", memory_max_bytes=268435456,
+            cpu_quota_percent=200, tasks_max=64, nofile=8192, timeout_stop_seconds=16)
+        account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        return args, config, account
+
+    def render(self, args, account):
+        renderer = self.renderer
+        with mock.patch.object(renderer.platform, "system", return_value="Linux"), \
+                mock.patch.object(renderer.pwd, "getpwnam", return_value=account), \
+                mock.patch.object(renderer.grp, "getgrgid", return_value=SimpleNamespace(gr_name="fixture")), \
+                mock.patch.object(renderer.os, "getgrouplist", return_value=[account.pw_gid]), \
+                mock.patch.object(renderer.os, "cpu_count", return_value=2):
+            return renderer.render(args)
+
+    def test_argument_rejects_directive_or_specifier_injection(self):
+        self.assertEqual(self.renderer.argument("/installation with spaces/manage.py"), '"/installation with spaces/manage.py"')
+        for value in ("a\nExecStart=/bin/anything", "a%h", "${HOME}", 'a"b', "a\\b", "a\x00b"):
+            with self.subTest(value=value), self.assertRaises(self.renderer.RenderError):
+                self.renderer.argument(value)
+
+    def test_stock_template_keeps_supervisor_drain_and_bounded_restart(self):
+        text = (self.repo / "deploy/service/ku-service@.service").read_text()
+        for line in ("KillMode=mixed", "Restart=on-abnormal", "RestartSec=5s", "TimeoutStopSec=16s"):
+            self.assertIn(line + "\n", text)
+
+    @unittest.skipUnless(os.name == "posix" and os.getuid() != 0, "fixture uses current non-root Unix ownership")
+    def test_render_is_bound_fresh_and_preserves_token_privacy(self):
+        with tempfile.TemporaryDirectory(prefix="ku-systemd-render-") as temporary:
+            args, config, account = self.fixture(temporary)
+            result = self.render(args, account)
+            self.assertEqual(result["status"], "rendered_not_installed")
+            self.assertEqual(result["config_sha256"], self.renderer.digest(args.config))
+            self.assertTrue(all(value is False for value in result["actions_performed"].values()))
+            self.assertFalse(result["business_deadlines_modified"])
+            for unit in result["units"]:
+                text = (args.output / unit["filename"]).read_text()
+                self.assertNotRegex(text, self.renderer.MARKER)
+                self.assertIn("KillMode=mixed\n", text)
+                self.assertIn("TimeoutStopSec=16s\n", text)
+                self.assertIn('ExecStart="/usr/bin/python3" "' + str(Path(config["ku"]).parent.parent / "tools/manage.py") + '"', text)
+                self.assertNotIn("a" * 64, text)
+            self.assertNotIn("a" * 64, (args.output / "render-receipt.json").read_text())
+            with self.assertRaises(self.renderer.RenderError):
+                self.render(args, account)
+
+    @unittest.skipUnless(os.name == "posix" and os.getuid() != 0, "fixture uses current non-root Unix ownership")
+    def test_renderer_refuses_wrong_owner_drain_or_external_hard_domain(self):
+        for changed in ("root", "token_mode", "drain", "external_domain", "worker-memory-bytes", "total-memory-bytes", "cgroup-root", "wrong_unit", "missing_manager", "arbitrary_sudo"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory(prefix="ku-systemd-render-") as temporary:
+                args, config, account = self.fixture(temporary)
+                if changed == "root": account.pw_uid = 0
+                elif changed == "token_mode": Path(config["control_token_file"]).chmod(0o644)
+                elif changed == "drain": config["service_options"]["drain_timeout_ms"] = 12000
+                elif changed == "external_domain": config["slots"][0]["memory_limit_bytes"] = 1
+                elif changed == "wrong_unit": config["slots"][0]["manager_start"] = ["systemctl", "start", "unrelated.service"]
+                elif changed == "missing_manager": del config["slots"][0]["manager_stop"]
+                elif changed == "arbitrary_sudo": config["slots"][0]["manager_start"] = ["sudo", "--preserve-env", "/usr/bin/systemctl", "start", "ku-rc-fixture-a.service"]
+                else: config["service_options"][changed] = 1
+                args.config.write_text(json.dumps(config))
+                with self.assertRaises(self.renderer.RenderError):
+                    self.render(args, account)
+                self.assertFalse(args.output.exists())
+
+    @unittest.skipUnless(os.name == "posix" and os.getuid() != 0, "fixture uses current non-root Unix ownership")
+    def test_exact_noninteractive_sudo_systemctl_is_supported(self):
+        with tempfile.TemporaryDirectory(prefix="ku-systemd-render-") as temporary:
+            args, config, account = self.fixture(temporary)
+            for slot in config["slots"]:
+                for operation in ("start", "stop"):
+                    slot["manager_" + operation] = ["sudo", "-n", "/usr/bin/systemctl", operation, f"ku-rc-fixture-{slot['name']}.service"]
+            args.config.write_text(json.dumps(config))
+            self.assertEqual(self.render(args, account)["status"], "rendered_not_installed")
+
+
 if __name__ == "__main__":
     unittest.main()

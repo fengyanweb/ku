@@ -132,6 +132,97 @@ def call(address, method, route, token=None, timeout=1):
         connection.close()
 
 
+def metrics(config, slot, timeout=1):
+    """Collect this generation once; unavailable is unknown, never a cached zero.
+
+    This separate response cap does not change call/status's 8192-byte body
+    contract. The collector owns one connect/write/read deadline; the Rust
+    supervisor independently limits accepted control requests to 200ms.
+    """
+    if not 0 < timeout <= 1:
+        raise ValueError("metrics collector deadline must be in (0,1] seconds")
+    began = time.monotonic()
+    deadline = began + timeout
+    unknown = {"available": False, "generation": None, "native": None}
+    try:
+        host, port = slot["control_addr"].rsplit(":", 1)
+        token = config["_token"]
+        if host != "127.0.0.1" or not 32 <= len(token) <= 128 or not token.isalnum():
+            raise ValueError("invalid fixed loopback metrics control configuration")
+        request = (f"GET /metrics HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                   f"X-Ku-Control-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").encode("ascii")
+        with socket.create_connection((host, int(port)), timeout=timeout) as stream:
+            sent = 0
+            while sent < len(request):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("metrics collector absolute deadline")
+                stream.settimeout(remaining)
+                count = stream.send(request[sent:])
+                if not count:
+                    raise ConnectionError("metrics control peer closed")
+                sent += count
+            data = bytearray()
+            offset = -1
+            end = None
+            status_code = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("metrics collector absolute deadline")
+                stream.settimeout(remaining)
+                capacity = (end if end is not None else 65536) - len(data)
+                if capacity <= 0:
+                    raise ValueError("metrics control response exceeded 65536 bytes")
+                chunk = stream.recv(min(4096, capacity))
+                if not chunk:
+                    raise ConnectionError("incomplete metrics control response")
+                data.extend(chunk)
+                if offset < 0:
+                    offset = data.find(b"\r\n\r\n")
+                    if (offset < 0 and len(data) >= 4096) or offset + 4 > 4096:
+                        raise ValueError("metrics control header bound exceeded")
+                    if offset >= 0:
+                        lines = bytes(data[:offset]).decode("ascii").split("\r\n")
+                        status_code = int(lines[0].split(" ", 2)[1])
+                        lengths = []
+                        for line in lines[1:]:
+                            name, value = line.split(":", 1)
+                            if name.lower() == "transfer-encoding":
+                                raise ValueError("metrics transfer encoding is unsupported")
+                            if name.lower() == "content-length":
+                                if not value.strip().isascii() or not value.strip().isdigit():
+                                    raise ValueError("invalid metrics response length")
+                                lengths.append(int(value.strip()))
+                        if len(lengths) != 1 or offset + 4 + lengths[0] > 65536:
+                            raise ValueError("metrics control response length bound exceeded")
+                        end = offset + 4 + lengths[0]
+                if end is not None and len(data) >= end:
+                    if len(data) != end:
+                        raise ValueError("unexpected extra metrics response bytes")
+                    raw = bytes(data[offset+4:end]).decode("utf-8")
+                    if token in raw:
+                        raise ValueError("metrics response must not echo the control token")
+                    if status_code not in (200, 503):
+                        return {**unknown, "reason": "control_http_error", "http_status": status_code}
+                    result = json.loads(raw)
+                    if not isinstance(result, dict) or type(result.get("available")) is not bool:
+                        raise ValueError("invalid metrics envelope")
+                    if result["available"]:
+                        if (status_code != 200 or type(result.get("generation")) is not int
+                                or result["generation"] < 1 or not isinstance(result.get("native"), dict)):
+                            raise ValueError("invalid available metrics generation or body")
+                    elif status_code != 503 or result.get("native") is not None:
+                        raise ValueError("invalid unavailable metrics envelope")
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("metrics collector absolute deadline")
+                    result.update(http_status=status_code, collector_elapsed_ms=(time.monotonic()-began)*1000)
+                    return result
+    except Exception as error:
+        return {**unknown, "reason": "collector_unavailable", "error_type": type(error).__name__,
+                "collector_elapsed_ms": (time.monotonic()-began)*1000}
+
+
 def windows_control_port_absent(address):
     """Prove vacancy without connecting, listening or reusing another socket.
 
@@ -551,12 +642,17 @@ def locked(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["check", "render", "run", "start", "status", "stop", "roll", "rollback"])
+    parser.add_argument("action", choices=["check", "render", "run", "start", "status", "metrics", "stop", "roll", "rollback"])
     parser.add_argument("config", type=Path)
     parser.add_argument("slots", nargs="*")
     parser.add_argument("--program")
     args = parser.parse_args()
     config = load(args.config)
+    if args.action == "metrics":
+        selected = [slot_named(config, name) for name in args.slots] if args.slots else config["slots"]
+        # Read-only collection does not hold the deployment mutation lock.
+        print(json.dumps({slot["name"]: metrics(config, slot) for slot in selected}, indent=2))
+        return
     if args.action == "render":
         print(render(config), end="")
         return
