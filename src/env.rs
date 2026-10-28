@@ -702,6 +702,42 @@ impl Env {
         ))
     }
 
+    /// Only the explicit KuValue.take receiver uses this transfer. Ordinary
+    /// reads keep their snapshot semantics; no borrowed or captured source is
+    /// detached. The caller immediately consumes this owner, including errors.
+    pub(crate) fn take_owned_json_value(&self, name: &str, span: Span) -> KuResult<Value> {
+        for scope in self.scopes.iter().rev() {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let mut binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.match_probe {
+                return Err(KuError::runtime(
+                    format!("cannot consume tentative JSON binding '{name}' in a match guard"),
+                    span,
+                ));
+            }
+            if !scope.owned_bindings.contains(name)
+                || Arc::strong_count(cell) != 1
+                || binding.borrowed_parameter
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+                || matches!(binding.value, Value::Borrowed(_))
+            {
+                return Err(KuError::runtime(
+                    format!("cannot move JSON value from captured or borrowed variable '{name}'"),
+                    span,
+                ));
+            }
+            return Ok(std::mem::replace(&mut binding.value, Value::Null));
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
     fn check_task_move(binding: &Binding, owned: bool, name: &str, span: Span) -> KuResult<()> {
         if binding.match_probe {
             return Err(KuError::runtime(
@@ -1075,6 +1111,40 @@ impl Default for Env {
 #[cfg(test)]
 mod owned_string_tests {
     use super::*;
+
+    #[test]
+    fn explicit_json_take_transfers_storage_and_rejects_shared_or_borrowed_sources() {
+        let span = Span::default();
+        let text = String::from("kept\0payload");
+        let pointer = text.as_ptr();
+        let mut env = Env::new();
+        env.define_owned(
+            "value".into(),
+            Value::Object(HashMap::from([("data".into(), Value::String(text))])),
+            true,
+            span,
+        )
+        .unwrap();
+        let captured = env.clone();
+        assert!(captured.take_owned_json_value("value", span).is_err());
+        assert!(env.take_owned_json_value("value", span).is_err());
+        drop(captured);
+        let (view, lease) = env.borrow("value", span).unwrap();
+        assert!(env.take_owned_json_value("value", span).is_err());
+        drop(view);
+        drop(lease);
+        let Value::Object(mut fields) = env.take_owned_json_value("value", span).unwrap() else {
+            panic!("object owner")
+        };
+        let Some(Value::String(text)) = fields.remove("data") else {
+            panic!("selected string")
+        };
+        assert_eq!(text.as_ptr(), pointer);
+        assert_eq!(text, "kept\0payload");
+        assert!(env
+            .with_value("value", span, |value| Ok(matches!(value, Value::Null)))
+            .unwrap());
+    }
 
     #[test]
     fn consuming_string_read_transfers_the_buffer_and_leaves_null() {

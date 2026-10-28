@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Un linguaggio in divenire",
-  "siteDescription": "Scopri Ku, un linguaggio di programmazione sperimentale. Esplora esempi reali, installazione, guide al linguaggio e supporto dei backend.",
+  "siteTitle": "Ku — Compilazione nativa e programmazione asincrona",
+  "siteDescription": "Ku è un linguaggio compilato per applicazioni native e servizi concorrenti, attento all’efficienza di esecuzione, alla programmazione asincrona e al controllo delle risorse.",
   "skip": "Vai al contenuto",
   "home": "Pagina iniziale Ku",
   "documentation": "Documentazione",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Sorgenti consultabili",
   "development": "Experimental prerelease",
   "heroTitle": ["Un'idea.", "Un po' di", "Ku."],
-  "heroDescription": "Un piccolo linguaggio con spazio per crescere. Sintassi leggibile, proprietà esplicita e una toolchain da esplorare fin dalla prima riga.",
+  "heroDescription": "Ku è un linguaggio compilato per applicazioni native e servizi concorrenti, attento all’efficienza di esecuzione, alla programmazione asincrona e al controllo delle risorse.",
   "start": "Inizia a scrivere Ku",
   "explore": "Esplora il linguaggio",
   "heroNote": "Alle prime fasi, per scelta. Esplora, sperimenta, condividi il tuo riscontro.",
@@ -38,24 +38,32 @@
   "approachDescription": "Conosci Ku attraverso il suo comportamento reale, tenendo sempre presenti i limiti attuali.",
   "features": [
     [
-      "Leggilo. Comprendilo.",
-      "Dichiara un binding alla prima assegnazione. Usa funzioni, valori strutturati e gestione esplicita degli errori per esprimere la tua idea.",
+      "Compila programmi nativi.",
+      "Crea eseguibili nativi con la CLI Ku. Verifica il sottoinsieme del linguaggio e le dipendenze supportate dalla piattaforma di destinazione.",
+      "Installazione e download",
+      "docs/install"
+    ],
+    [
+      "Scrivi con async/await.",
+      "Esprimi attività asincrone con async/await; il runtime ne gestisce esecuzione e pianificazione entro l’ambito supportato dal backend.",
       "Guida al linguaggio",
       "docs/guide/language"
     ],
     [
-      "Rendi esplicita la proprietà.",
-      "Sposta per impostazione predefinita, clona con intenzione e prendi in prestito in sola lettura nelle chiamate sincrone. Le regole attuali sono documentate insieme ai loro limiti.",
-      "Proprietà e limiti",
-      "docs/support"
-    ],
-    [
-      "Scegli il percorso di esecuzione.",
-      "Esegui con l'interprete, impacchetta un runner eseguibile o esplora C nativo. Controlla la matrice di supporto prima di scegliere un backend.",
-      "Esplora gli strumenti",
+      "Definisci limiti alle risorse.",
+      "Limita connessioni, richieste attive, code di attesa e buffer. I limiti del sistema operativo dipendono dalla piattaforma e dal deployment.",
+      "Matrice di supporto",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Osservazioni a carico fisso",
+  "performanceScope": "0.0.19: un solo ciclo sequenziale di sette linguaggi in una VM Linux ARM64, con quattro core CPU per servizio e 30 secondi per carico. I valori confrontano il tempo CPU del servizio per richiesta corretta (Ku/Rust), non la latenza delle richieste.",
+  "performanceMetrics": [
+    ["Carico CPU — costo CPU", "Circa il 32% in meno", "Ku/Rust ≈ 0.678"],
+    ["Carico JSON — costo CPU", "Circa il 26% in più", "Ku/Rust ≈ 1.260"],
+    ["Carico PG — costo CPU", "Circa il 35% in più", "Ku/Rust ≈ 1.350"]
+  ],
+  "performanceLimits": "Un solo ciclo non costituisce una verifica di capacità o stabilità a lungo termine. Restano la paginazione dell’host e le latenze di coda lunga. La semantica di reset dei pool PG è diversa. In questo ciclo è stata misurata la memoria cgroup, non RSS; non viene fornito un confronto RSS.",
   "practiceTitle": ["Dati familiari.", "Errori espliciti."],
   "practiceDescription": "Importa un modulo, crea un valore e codificalo come JSON. L'operatore ? propaga gli errori invece di nasconderli.",
   "jsonReference": "Leggi il riferimento JSON",
@@ -85,13 +93,13 @@
     ]
   ],
   "projectTitle": "Un lavoro in corso. Una storia da seguire.",
-  "projectDescription": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{releasedVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} è ancora in sviluppo. Un candidato di deployment Linux ARM64 è stato provato con un esempio isolato; l’uso in produzione per un’attività reale non è stato validato. Valuta i tuoi programmi e invia feedback. Gli artefatti pubblicati sono in GitHub Releases.",
   "github": "Esplora su GitHub",
-  "license": "Il codice sorgente è consultabile. Non è stata concessa una licenza open source.",
+  "license": "Licenza Apache-2.0. Consulta LICENSE e NOTICE.",
   "verified": "Verificato",
   "limitations": "Supporto e limiti",
   "version": "Versione della documentazione",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Istantanea {version}",
   "snapshotNotice": "Istantanea archiviata della documentazione. È conservata indipendentemente dalla documentazione di sviluppo attuale; non annuncia un rilascio di binari.",
   "nextNotice": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{currentVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",

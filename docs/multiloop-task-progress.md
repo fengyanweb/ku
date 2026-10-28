@@ -1,0 +1,196 @@
+# 多循环 Task 进度修复记录
+
+核对日期：2026-10-21。本记录只解释本次多循环实现出现的新回退；历史七次 HTTP 504 仍是“历史出现过、本轮旧路径短测未复现、根因未确认、原正式 30 分钟验收尚未通过”，不能由下列新路径修复倒推其原因。
+
+## 复现与实际原因
+
+`tests/fixtures/multiloop_service.ku` 的 `/cpu` 在 async 函数中执行 5,000 次整数循环并断言结果；`/hot` 执行 200,000 次循环。原 5 秒、100 次到达/秒、N=1 的混合短测出现 179 个 504、201 个压测端主动限流，故没有继续反复运行 30 分钟测试。先隔离单请求和无业务流量，得到两条独立的源码证据：
+
+1. HTTP 主协调器每轮无条件调用 `ku_http_group_notify()`，该函数同时通知各事件循环和协调器自己的 wake socket。主线程的下一次 `poll()` 因自己发出的通知立即返回，形成空闲忙转及广播。无业务请求、Task polls 始终为零时，约一秒实际消耗 1.30 秒进程 CPU。macOS 线程采样把主线程定位到 `ku_http_listen → ku_http_group_notify → ku_http_wake_notify → sendto`，事件循环反复排空通知。
+2. async lowering 的整数 for、数组 for 和 while 回边会产生 `Suspend`。原 HTTP emitter 对每个回边立即返回 Pending；没有子 Task 的作用域完成也再次让出。5,000 次循环实际产生 10,002 次调度 poll。它们是人为公平边界，并非定时器或真实 I/O 等待。每次让出都引入重新排队、跨线程通知和驱动成本。
+
+前者修复为只在启动完成、开始 drain、关闭 Task 等状态转换时广播；正常 Task 通知其归属循环，关闭期间才另通知协调器。后者在可保存状态的纯回边及空 Task 作用域内复用已有 64 次状态分发预算，预算耗尽才让出；真实 timer、I/O、子 Task 的完成确认以及清理期限继续使用原有等待/终结协议。没有提高请求期限、重做 M:N、改变 JSON 或启动暂停的全面分析。
+
+## 固定条件与对照
+
+- 同一台 macOS 26.5.2 / arm64，8 个物理和逻辑 CPU，8 GiB 内存；压测端同机 Python 3.9.6，无代理、TLS 和数据库。桌面及系统其他负载没有被隔离，因此数字只描述此短测。
+- 工作树基于 `f0bb31f3420cde8e95ba3569f0fbd1af933c27bf` 加本次未提交改动；每轮先复制并固定 CLI，再由该副本执行 `ku build --native ... -o ...` 的默认构建。CLI 摘要是复现身份，不能冒充最终提交号。
+- 相同 fixture、N=1、阻塞线程 5、总线程配置 16、Task 字节预算 16 MiB；独立 loopback 管理端口；业务 active 128、pending 128、connections 256、HTTP buffer 8 MiB。
+- handler、header、body、write、idle 期限均为 1,000ms；`/timer` 等待 25ms。单请求顺序 `/ok → /timer → /cpu → /hot → /cpu → /timer → /ok`，每次连接关闭；各次请求前后读同一组 Task 指标。
+- CPU 来自 `ps -o time=` 的进程累计 CPU 时间差，分辨率约 0.01 秒；0.00 只表示该分辨率下未见增长。poll 计数含该 Task 的执行与终结步骤。
+
+| 条件 | 修复前 | 两项修复集成后 |
+| --- | --- | --- |
+| 无业务约 1 秒 | 1.002 秒墙钟 / CPU +1.30 秒，0 polls | 1.010 秒墙钟 / CPU +0.00 秒，0 polls |
+| `/cpu` 5,000 次 | 100.95–105.20ms；每次 10,002 polls；200 | 1.83–3.59ms；每次 314 polls；200 |
+| `/hot` 200,000 次 | 999.99ms；100,769 polls 后 504 | 68.68ms；12,502 polls；200 |
+| `/timer` 25ms | 25.14–25.32ms；每次 3 polls；200 | 25.80–27.00ms；每次 3 polls；200 |
+| 收尾 | 请求完成后 Task/ready/waiting/timer 为零；进程退出 0 | 请求完成后 Task/ready/waiting/timer 为零；进程退出 0 |
+
+修复前 CLI SHA-256：`259d20bf8871734b97ee1d2a6153a0d0bd261f982c14f27881880edfe812c454`。
+
+集成后 CLI SHA-256：`503681ffa0efb57e4d3ba6de5c6a8a5abd8910f7fc61a45cb172374c7680ca12`。
+
+这是两项修复集成前后的对照，不把耗时改善分别归因成每项各自的独立收益。5,000 次循环结果断言正确、完成后计数归零，支持该样本持续推进；不据此声称所有状态机均无问题。新路径的正式混合验收、三平台 CI 与其他故障矩阵仍按主验收报告分别列结果，此记录不替代它们。
+
+## 保留证据与清理
+
+精简原始摘要保留在本机 `Downloads/Ku_多循环验收_2026-10-21/`：`short-load.json`、`task-progress-single.json`、`task-progress-idle.json`、`task-progress-idle-stack.txt`、`task-progress-single-fixed.json`、`task-progress-idle-fixed.json`。后两份没有覆盖失败样本。证据目录是本机交付资料；永久复现使用仓库中的 fixture、`multiloop_load.py` 以及相关回归，CI 产物独立归档。
+
+本轮临时 CLI 副本、native 产物、地址文件、运行日志及验证进程都在私有系统临时目录创建并在 `finally` 中清理，未向项目添加一次性探针脚本。
+
+## 多循环自通知成本的第二次定向修复
+
+在上述两项修复后，固定 8 个压测线程、每请求 5,000 次整数循环的短测仍显示 N=4 比 N=2 慢。另取 5 秒 N=4 样本，1,816 次请求全部正确，服务 CPU 增量 8.50 秒，Python 发生器 CPU 0.539 秒；因此该样本不能归因为 Python 已占满单核。1 秒线程采样中，一个事件线程的 389 个样本有 347 个位于 Task pump，其中 160 个位于 `reconcile_charge → driver mutex wait`、58 个位于 `run_one` 返回后的 driver 加锁、43 个位于 `enqueue_local → signal_owner → HTTP event_wake → sendto`。这些是包含等待时间的线程采样数，不是 CPU 百分比。
+
+实际原因之一是在归属线程正在 pump 时，每个公平量子重新入队仍持全局 driver 锁通知这个正在运行的线程，额外取得 HTTP group 锁并发送 UDP 自唤醒。修复保留同一 64-dispatch 预算，只在 external owner 正在 pump 时合并该通知；pump 返回后保留就绪状态/立即再推进，外部完成、取消和关闭继续发通知。
+
+相同 debug native 构建、相同固定 8 个客户端与 5 秒窗口下，独立短矩阵得到：
+
+| 事件循环 | 修复前请求/秒 | 修复后请求/秒 | 修复后 p99 |
+| --- | --- | --- | --- |
+| 1 | 549.44 | 1,969.97 | 5.7ms |
+| 2 | 660.50 | 2,496.15 | 4.4ms |
+| 4 | 398.08 | 2,028.79 | 5.7ms |
+
+前 CLI 为 `4dfa8b04db2c54220b6dcf4d4c4422902378ea6aca30a823c67e769ad79c10d4`，后 CLI 为 `0923e8db53dfb30ce689c91157edf54418f27d82b0052ea03a99016b1f4c3674`。原始 N=4 栈和摘要为本机证据目录的 `N4-CPU5000-driver-wake-stack.txt`、`N4-CPU5000-driver-wake.json`；同配置 1/2/4 前后矩阵已精简归档至 [runtime-matrix-macos.json](evidence/runtime-matrix-macos.json)。
+
+后续 release native 构建的完整**本机短矩阵**分别测得 4,177.73 / 3,982.90 / 2,177.21 请求/秒，该短矩阵列出的场景通过，不代表 A01—A18 及三平台、正式窗口全部完成。该组改变了构建 profile，不能当成上述通知修复的独立收益。N=4 在此短循环样本仍低于 N=1/2；N=1/2 的同机 Python 发生器约占用 4.3 秒 CPU/5 秒窗口，N=4 的服务端每请求 CPU 成本亦较高。不宣称线性扩展，也不把仍存在的共享管理成本包装成多核性能已全面收口；正式验收及剩余限制以[主验收表](multiloop-runtime.md)为准。
+
+## 无实测收益的局部优化已撤回
+
+曾尝试在 async frame 增加 dirty/copy-quantum 标记，跳过纯 Copy 量子的拥有字节重算。对应 release CPU5000 短测为 N=1/2/4 约 3085/3086/2085 请求/秒，没有证明端到端收益，因此定向撤回这两个标记及分支，不继续为选型追加优化。owned 赋值/子 Task 取消的必要永久回归保留。
+
+当前保留的是已有直接证据的固定 owner 定向 wake、pump 期间自通知合并、64-dispatch 协作预算、真实 TCP readiness/取消及正常归还账本。撤回不触碰通用 Value 复制/释放与 AST 两项全面分析，也没有改变 JSON 默认实现。
+
+## 集成时发现的部分启动退出问题
+
+独立复核对 N=1/2/4 的事件 owner 初始化分别注入 `calloc`、wake channel、queue 失败。原路径中已经创建但初始化失败的线程先退出，留下它名下的 Task 退休记录无人推进，可能把明确的启动错误转成 75/80。调用链是 HTTP owner 初始化 → wrapper 退出 → 主线程等待 Task 退休，并非历史请求停顿样本。
+
+最小修复在原 owner 的 OS 线程内标记失败/drain，触发幂等 close，继续绑定并推进本 owner 的正常退休流程，最后发布 exited；未启动 owner 仍由原有关闭路径处理。没有外部迁移正在执行的 Task、强行释放或提高期限。永久入口 [`native_http_startup_test.rs`](../tests/native_http_startup_test.rs) 的九项注入在本机通过，具体 listen 错误退出 1，正常 fixed-loop drain 同样通过；最终提交三平台结果仍待 CI。
+
+## PostgreSQL 短性能的证据边界
+
+早期经 Python 故障代理的 N=2 五秒性能轮次有 49 次 `JSONDecodeError`，当时没有保留响应 body。它们不能被补写为 acquire timeout、错误 JSON 或数据损坏；两次同参数有界诊断分别 10914/10914、11537/11537 成功，也不能倒推其根因或修复。没有复现证据支持修改生产 PG 池，因此未为此修改连接池或重放 SQL。
+
+诊断驱动现保留最多 12 个错误例子，区分字面 `error:<code>`、JSON 解析错误、字段不符、HTTP 状态和连接错误。性能模式去掉 Python 故障代理，使用直连私有 PG；第一次直连每请求新建连接在 16265 次成功后得到 1365 次压测端 `OSError errno 49`，尚未取得任何 HTTP body。其范围与 macOS 49152—65535 的 16384 个临时端口吻合，修正为固定 8 个持久 HTTP 客户端；失败请求仍计一次，不重发。生产 Ku 架构、PG 池、SQL 和期限未变，正常故障模式仍保留代理。
+
+最终直连短矩阵 N=1/2/4 分别 29048/28559/27274 次成功、错误 0、5808.41/5709.50/5450.24 请求/秒，p99 4.2/4.1/4.4ms。固定共享 PG 连接 4，收尾 pending/bytes 为零，正常退出后 PG 连接为零。各档每个 owner 都有实际 HTTP 请求量；没有线性扩展结论，也不能将代理/直连、每次建连/持久连接的不同拓扑当成 Ku 前后加速比。摘要和旧失败分别见 [PG 性能](evidence/pg-performance-macos.json)、[有界诊断](evidence/pg-performance-diagnostic-macos.json)。
+
+## 本轮最终收口位置
+
+[`multiloop-runtime.md`](multiloop-runtime.md) 集中列 W1—W7、A01—A19、三平台能力差异、实际使用入口、1/2/4 成本和冻结的正式 30 分钟参数。已有本机短结果与服务恢复有独立产物摘要；最终提交 CI、正式窗口和最终清理必须在实际执行后补结果，不能用本记录提前宣布通过。没有授权双宿主/入口/数据库故障域环境时，A19 真实演练保持未执行。
+
+macOS `final-preflight.json` 的 250 个请求中出现 2 个 `/hot` 504，短预检未通过。这个新样本保留并做有界诊断，根因尚未确认；不能把旧短矩阵的通过或上述修复替代该失败，也不能把它补写成历史七次 504 的原因。独立 Linux 正式窗口的实际进展见下文，不覆盖本机结果。
+
+本轮一次性验证均在系统临时目录执行并清理；必要永久回归、可复现驱动、配置和精简失败证据保留。当前仍在用的冻结 CLI 副本应在最终验收后由主执行者清理，不能在仍被验收使用时删除，也不能提前写成所有交付进程/产物已清理。
+
+## 最终提交前的集成回归修正
+
+首轮完整 CI（run 39680387424）揭示旧夹具的执行批次、生成 C 钩子和入口匹配假设。真实推进、取消、原期限、ACK 与账本归零断言保留，按 raw Frame / cooperative source 契约分别验证。生产修正为空 TaskProgram 早返到普通同步发射，避免没有 Task 仍附带运行时配置。Windows 的终止 CRLF、已关闭 peer 的 ConnectionAborted 按实际平台精确断言，中文和内嵌 NUL 正文没有归一化。
+
+TCP 迟到事件夹具原先把 1024 个 1064 字节 job 放在局部栈上，仅数组已超过 MSVC 默认 1 MiB；改为堆分配，保留代次、wrong-owner 与物理回收断言。旧 Windows 日志没有退出码，不能补写为唯一确认的栈溢出；新断言保留完整 ExitStatus 等待 CI。生产对应池原本为静态或堆对象。
+
+过载序列确认：pending FIFO 压力会关闭空闲持久连接，也可在完整响应后拒绝继续复用。1 MiB 响应内容完整，公平策略保留；内部指标新增固定 transport_closes 分支计数，不能将 response_policy 或传输关闭等同 HTTP 503，也不能倒推旧 24 次错误的唯一原因。慢体发生器同时限制连接数与补连速率为 280，避免立即收到拒绝后无限补连；压测端额度拒绝、服务直接终止传输和 HTTP 响应分别冻结、保留全部到达分母。
+
+本机原样长尾证据见 [short-tail-macos.json](evidence/short-tail-macos.json)：两个 hot 504 仍未证明修复；预启动 libproc 固定环只排除了采样跨度内持续长计算，不能把所有 off-CPU 时间认定为调度等候或锁。正式窗口使用[独立 CI 冻结计划](multiloop-formal-plan.md)，结果不能覆盖或解释本机失败。
+
+## Task 提取请求的新增字段顺序修复
+
+第二轮 CI（run 39685630202）的 ASan 在原有负例中捕获真实越界读：结果提取请求可与一字节字符串 backing 重叠，新增的 HTTP 交付计费字段却先于原有别名排除被读取。`ku_task_*_take_payload` 现先执行原有深层别名排除，再读取新增字段；不改变正常结果提取、所有权或原九项负例。修前在本机 ASan 重现，修后原目标以及完整 53 个 sanitizer 目标、171 项测试均通过，无忽略和 ASan/UBSan 诊断，详见 [精简检测记录](evidence/native-sanitizer-macos.json)。Linux 的泄漏检测仍以修后提交 CI 为准。
+
+该修改改变生成 C，因此主动取消了使用旧提交 `eafe8382354570c26715146794ea767798d413f5` 的正式运行 39685767469。保留的最后检查点是 warm 3000/3000、steady 前 150 秒 7504/7504 正确；它既没有完成过载与恢复，也没有完成 30 分钟，不能算正式通过。原 artifact `multiloop-sustained-pr-2-eafe8382354570c26715146794ea767798d413f5-1` 和本机证据目录的 `formal-cancelled-eafe838/` 保留原始中间结果。修后冻结提交必须重新完整执行。
+
+同轮普通套件在 macOS/Windows 各有一个相同 TCP 对端夹具失败，Linux 默认套件全部通过。对端从非阻塞 listener 接受 socket 后直接执行带超时的 `read_exact`，并未显式恢复阻塞模式；在本机最小复现中，旧模式在约 2µs 返回 WouldBlock，恢复阻塞后等待约 82ms 取得完整 `A\0B`。现只为夹具 peer 设置阻塞模式，保持 3 秒读写期限、部分响应、二进制字节和单执行器 timer 先行断言。普通 Task source 16/16、ASan/UBSan 对应 TCP 1/1 本机通过，Windows 修后结果仍由最终 CI 确认。此处没有证据要求修改生产 TCP reactor。
+
+Linux 服务内存验收的旧样本确实达到 64 MiB 并终止第一代，301ms 后替代可用、另一实例 10/10，清理后域为空；失败是 `memory_limit_observed=false`。原提供器仅读叶层，而私有总域也设置上限，遗漏了父层触发可能性。现记录本代开始前和退休后的私有域 `memory.events.local` 与叶层计数；配置域的新 oom 与该叶实际 oom_kill 同时成立才报告限制终止，单独主机 OOM 或历史事件不归因。纯计数 3 项与状态 7 项本机通过；旧记录没有父层事件，不能补写唯一原因，实际归因和恢复仍等新 CI 原始计数确认，见 [Linux 门禁记录](evidence/linux-memory-provider-gate.json)。
+
+## Windows 服务存在性检查的定向收尾
+
+提交 `d1738ef` 的三平台默认套件、工具检测、原生构建和安装检查通过；Linux/macOS 的真实 PG、服务替换、更新/回滚也通过。Windows 后续第一项在压力请求前报 `slot a already has a supervisor`，三个新 slot 最后均不可达。原报告未保留连接阶段和 errno，不能推断已有进程、端口冲突或超时中的唯一原因；后续 Windows 验收当时被跳过。
+
+管理端现保留分段错误和最后状态。仅 Windows 的连接异常可再使用 `SO_EXCLUSIVEADDRUSE` 绑定证明确切 loopback 端口空闲；不 listen、不复用地址，任何绑定失败（包括残留连接）保持不可达和预算。自有存活 supervisor 即使暂未监听也禁止重复启动。期限没有增加，业务 HTTP/SQL 没有重发。本机管理回归 10 项通过，1 项真实 Winsock 检查等待 Windows；真实无响应监听者仍为不可达。
+
+工作流新增显式 `workflow_dispatch` 的 `scope=windows-service`，只用于复验受影响的部署辅助代码，实际运行 Windows 限额、阻塞退役、短矩阵、PG 与 Task Scheduler。普通 push/PR 仍完整运行；已通过的 `d1738ef` 全量结果保留，不能把定向模式冒充新的全量测试。本轮 `src/`、Cargo 和原生生成链路没有变化，独立 Linux 正式窗口继续对应自己的冻结提交。
+
+## 修后冻结源的实际平台与正式窗口结果
+
+`d1738ef42ae82387815047c9f6d163917ae48f5d` 的 [全量 CI 39688666439](https://github.com/fengyanweb/ku/actions/runs/39688666439) 中，三平台默认 Rust/native 回归、源码独立构建与安装检测均通过，质量检查、Linux ASan/UBSan/泄漏及 TSAN 通过。Linux/macOS 的运行时矩阵、阻塞退役、真实 PG 和参考部署更新/回滚也实际通过。该 run 整体因 Windows 后续部署辅助步骤失败而失败，不能写成整轮绿色；PR merge tree 与源提交 tree 相同，保留各自身份。
+
+Linux 新结果补齐了内存归因证据：64 MiB 私有域 memory.events.local 从 max/oom/oom_kill=0/0/0 增至 20/1/0，叶层为 0/0/3，本代确认触发私有域限额并回收三个进程；不是三次超限重跑。替代可服务 294.52ms，另一实例 10/10，最终域为空、cleanup_errors=[]。macOS 在应用启动前拒绝硬模式，也按原保证通过；普通服务恢复已有实际结果。
+
+修后 [正式 run 39688747675](https://github.com/fengyanweb/ku/actions/runs/39688747675) 已完整通过 Linux 30 分钟固定窗口：普通阶段 88,500 次全部正确，撤载恢复 258.181ms，正常退出 0。具体分母、过载终止/拒绝分类、成本及采样边界见[正式报告](multiloop-formal-plan.md)。这不解释或覆盖 macOS 本机的两个 hot 504，后者保持本次新路径待查，不冒充历史问题已修复。
+
+## Windows 资源测量的缺失值修正
+
+辅助修正提交 `fcfce156e013470a417b65551ec834360ab763f1` 的 [定向 run 39692288889](https://github.com/fengyanweb/ku/actions/runs/39692288889) 中，11 项部署 Python 回归、Windows Job 64 MiB 提交限额以及原生长阻塞退役均实际通过。新 slot 的空闲端口连接约一秒超时，随后独占绑定确认空闲；旧报告没有相同记录，不能补写其唯一原因。提交限额峰值 63,438,848B，替代 484ms、另一实例 10/10、清理无错误；分配失败退出不冒称 OS 必然强杀。
+
+该轮随后在 A18 失败：N1 的 PowerShell 基线采样超时，旧脚本将缺失值按零相减，产生无效的 +83；N2/N4 冷态至收尾均 +10 个句柄。已有分阶段结果将增长定位至首次同步/timer 的 +8 和首次文件阻塞的 +2，此后既有等待/取消阶段未再增长，但这些相关性仍不能唯一认定句柄归属或永久上界。
+
+现改为直接 Win32 进程计数与 Toolhelp 线程快照，所有诊断句柄均显式关闭；采样错误、缺失或非有限字段明确失败。新入口保留 cold、首次各阶段、同进程三轮重复及全矩阵最终状态，不逐轮重置基线；重复与最终回收仍沿用原 +2 阈值，冷态 RSS 仍沿用 16 MiB 门槛。冷态新增句柄完整保留，不能写成冷态句柄全部归零或未经证明的系统缓存。6 项本机回归通过，2 项真实 Win32 采样检查等待 Windows 实际执行。
+
+Windows CI 分成资源/退役与 PG/Task Scheduler 两个定向组，以免不相关失败挡住各自执行；未运行的全量步骤明确跳过，不计通过。`src/` 与 Cargo 均未变化，Linux 正式驱动的负载逻辑、阶段及判定也未变化；资源采样只改 Windows 分支。
+
+## macOS 新热点路径的有界关联诊断与最小修复
+
+旧本机2/250预检缺少内部请求映射，原记录不覆盖、不补写唯一原因。本轮对同一新路径使用私有诊断产物及定长整数环，捕获一个新的完整504后停止采集：request1400的 `/hot`，submit入口至选择504为1000.259ms，所在owner实际CPU约20.846ms。绝对handler截止点至选择超时约0.083ms，不能将客户端1376.648ms全部算成handler执行；请求准入、响应交付和压测端调度分别保留。
+
+确认的可修改路径是driver mutex内的多余自唤醒：pump已把剩余ready表达为 `next_deadline=0`，尾部仍调用HTTP socket notifier。两段锁内通知调用区间墙钟69.973/80.264ms、线程CPU0.026/0.124ms；另一owner的driver取锁区间120.623ms并与之重叠。样本还包含poll(0)、poll后到下轮pump等显著off-CPU区间；不能将整次504唯一归因于通知，也不能将所有off-CPU时间写成持续可运行但没拿到CPU。
+
+最小修复只删除pump尾部通知，不改变请求期限、32量子批次、64dispatch预算或线程模型。最后检查与pumping标志在同一driver锁下：此前发布已体现在ready/deadline0；此后发布看到pumping=0仍通知目标owner。关闭/故障广播保留。既有external-owner永久回归新增无自通知、5000轮持续正确推进、外部新发布定向通知和关闭广播断言；旧代码在新断言失败，修后整个source目标16/16通过。
+
+私有候选仍观察到116ms请求总耗时，窗口在首个诊断触发后停止，不能拿其280/280与修前1403次作错误率对照。真正的修后短预检使用重建CLI生成的普通release产物、原N4/50RPS/32客户端/5秒完整窗口，没有诊断环、libproc或sample：250/250正确，错误/主动拒绝0，p99=28.5ms，loop delay峰3ms，退出0。它满足原短门槛，不代表每次超过100ms的墙钟空窗都已解释，也不替代最终三平台/正式窗口。
+
+精简时间线、身份/patch摘要与竞争说明见[诊断记录](evidence/mac-tail-notify-diagnostic.json)，有界原始窗口及5秒报告保留在本机证据目录。修后本机fmt、workspace/all-targets clippy拒绝warnings、15项辅助回归（12过、3Windows专用跳过）通过。因为这次确实修改运行时，新冻结提交必须重新执行对应三平台检查和同参数正式30分钟，原d173的通过不能冒充修后通过。
+
+Windows PG辅助复验另修两处明确失败：SDDL把当前SID合法缩写为LA，不能全文字符串判断，改用SecurityIdentifier和Modify/OI/CI位；从pwsh父进程调用Windows PowerShell时，只在子环境移除PSModulePath，让引擎建立匹配的默认模块路径，父环境及PATH/libpq保留。真正PG检查仍由新Windows实跑结果确认，不把ACL脚本通过当数据库通过。
+
+## Windows PG 启动后的测试输出回收修正
+
+`9ac5ed9` 的定向 run39696743372 已验证11项管理及15项辅助回归通过，私有目录ACL准备成功：当前用户Modify/OI/CI的结构化规则有效，owner/父ACL未变，子进程独立模块路径生效。PG步骤仍长时间无进展，达到十分钟无输出检查后取消，不计通过。取消时原始栈确认：`pg_ctl start -w -t20` 的60秒subprocess.run先超时，随后Windows分支的无期限二次communicate卡在stdout读取线程join；当时checks为空，不能补写SQL已跑或PG业务失败。
+
+修正仅限验收设施：命令输出用临时文件，Popen.wait仍60秒，直接子回收最多5秒；阶段/实际PID/输出尾原子保存，清理逐项执行且总能记录，只有私有临时目录清理后才标通过。即使启动工具没正常返回，只要独有data目录内postmaster.pid存在，仍尝试停止该私有库。没有重放SQL或提高服务期限。
+
+新增测试专用Cargo example `acceptance-runner`，复用已有tests/support/bounded_process.rs包住**整段Python夹具**，不是每次pg_ctl；私有数据库可以正常存活到业务验证结束。WindowsCI对整个夹具用180秒绝对期限和有限输出/收尾。该目标不安装为Ku命令，未新增依赖，Cargo.lock不变。本机继承输出的孙进程超时样本约1.016秒返回124，普通失败退出码7原样保留；19项辅助回归16过、3Windows专用跳过，fmt及workspace/all-targets clippy拒绝warnings通过。下一轮必须实际执行PG成功/故障链路，不能用辅助检查通过替代。
+
+取消轮次的精简栈与原报告保留在本机 `final-ci-9ac5ed9-windows-pg-host/`；原报告缺最终status，按未完成保留。运行时源码自9ac5ed9后没有再变；新冻结提交包含测试设施修正，正式窗口和全量CI必须保留各自实际head身份。
+
+## 最终正式窗口与Windows实际写入证据
+
+冻结源a31c113的正式run39699000190完整通过：普通88,500次全部正确，普通p99≤25.6ms、累计loop delay峰1ms，撤载189.279ms恢复；最终队列/Task/HTTP缓冲零、FD回到15、native退出0。过载、慢体、发生器额度与成本保留独立分母，见正式报告。后续Rust服务控制修复没有改C发射、native运行时、正式驱动或fixture，因此复用这条真实native链路结果；没有重跑无关30分钟或旧36次矩阵。
+
+最终a31全量的三平台默认回归、quality、native、CheckOnly、ASan/UBSan/泄漏与TSAN通过；整体仍因Mac服务辅助与Windows PG校验失败。5b78定向Windows run39702448682确认：psql的Unicode argv字面量实际hex为3f3f3f3f207061796c6f6164，而实库唯一一行payload为e4b8ade69687f09f9982207061796c6f6164（18字节），id为normal。旧谓词比较失真来自验证端；新全ASCII SQL保留全部字节/长度断言，HTTP RETURNING精确中文断言不变。实际PG成功、10000行、取消、断线、提交确认丢失后恰好1行、不重放、drain0/连接清零全部通过。真实LocalService宿主注册、退出75后的替代2781ms、停止0/进程清空也通过。
+
+## 控制连接重置导致协调器退出的局部修复
+
+5b78的Mac run39701941690首次给出完整阶段证据：a故障目标正确，新代次曾655.843ms ready，b的10次业务全部正确；随后rolling前a supervisor已退出1。这个CI样本当时没有stderr，不能补写唯一根因，也不能把原a31的无阶段连接拒绝合并为同一已证实原因。
+
+本机复用现有resident_process_fixture独立复现：第一代退出、第二代ready后，四条控制连接以SO_LINGER(1,0)重置，协调器退出1，stderr为Invalid argument(os error22)，业务监听被回收。OS分段12个样本均accept成功，Darwin接受socket继承nonblocking；RST后read/write timeout配置均EINVAL，显式清除nonblocking后活连接配置成功、RST连接仍EINVAL。因此只修已接受连接的配置错误传播，不无证据扩大listener.accept分类或child/waitid。
+
+7859fc5在service_stop中显式设置accepted socket为blocking；该单条连接的模式/读写期限设置失败时drop该peer并继续协调。原200ms上界、控制读取绝对期限、重启强度和HTTP/native路径不变。必要永久回归加入现有service_supervision_test，Unix与Windows同一用例：RST后同协调器/同代次、业务正确、正常stop0。旧实现永久回归0/1失败exit101并同报EINVAL；修后本机11/11、fmt和指定bin/test clippy拒绝warnings通过。精简复现/OS分段/源码摘要及清理收据保留于本机mac-control-rst-5b78-summary.json，最终三平台实际结果集中更新CI证据。
+
+服务验收仅新增固定stage、受限异常栈、进程回执及supervisor最后错误尾；匿名文件避免输出管道等待，native输出仍由service丢弃。没有增加业务请求次数、重试或期限。service-recovery run39703806250复验实际三平台服务控制/恢复，默认全量、旧内存/资源矩阵和正式窗口不重复执行，跳过项不新增通过。
+
+## 最终三平台服务/数据库收口
+
+7859的service-recovery run39703806250在Linux/Mac缺rustfmt组件，服务步骤未启动；补齐组件后不把旧跳过记作通过。Windows当轮服务10/10通过，但慢查询后的首个read发生JSONDecodeError且没有正文，不能唯一归因；67d只增加限2KiB正文/phase/12帧诊断，未修改生产src、期限、请求次数或SQL断言。旧失败保留，本轮通过不能补写该样本已修复。
+
+最终源67d78d9的run39705058328三平台整体success：Linux/Mac服务各11/11，Windows10/10，均实跑新控制RST回归。Linux/Mac HAProxy替代241.664/730.645ms、滚动523.164/1274.199ms、回滚486.591/1754.614ms，回滚内容各20/20正确，自有协调器退出0。Windows真实LocalService三个任务的SID/动作/恢复配置读回正确，受控等待1032ms返回504、旧exit75/gen1→2、替代2844ms、另一实例10/10；停止0、任务全部注销、临时树无进程。
+
+三平台PG逐字段、18字节UTF8写入、10000行、慢查询取消、连接中断及确认丢失后真实恰好1行、不重放均通过。压力分类Linux为5acquire+7unknown，Mac为4+8，Windows8+4；确认取消8/9/5。最终pending/bytes0、drain0、退出后DB连接0，全部cleanup_errors=[]。三个artifact下载摘要与ZIP CRC核对通过，保留精简原报告/历史失败；对应完整临时job日志已清理。[集中CI证据](evidence/multiloop-platform-ci.json)逐项保留执行和跳过，不声称旧全量run整体变绿。
+
+原生正式30分钟仍对应实际a31源（native最后修改9ac5），后续只变Rust协调器及验证设施，没有重跑无关负载或旧36次矩阵。最终文档提交不修改编译输入，复用这些明确源身份的结果。这轮实际覆盖的原生、服务与PG检查通过；随后任务对照另发现Windows A16代理更新缺口，补齐过程和最终结果见下节。A19的参考配置/完整步骤已提供，授权双宿主、入口切换、隔离PG复制与故障域缺失，真实演练未执行。官网和旧发布标签均未修改。
+
+## Windows原生代理更新/回滚缺口补齐
+
+最终任务对照发现A16不能只用Linux/macOS的HAProxy结果覆盖Windows：原manage只支持本机Unix Runtime socket，而Ku控制端口限制loopback，原“可使用远端Unix代理”的一句说明不足以运行该链路。方案一仅保留说明会继续缺验收；方案二在参考部署脚本增加成熟Windows原生Caddy适配，保留Unix的HAProxy和全部Ku运行时，因此选择方案二。范围仅manage/verify及现有部署回归与CI，不改Ku编译器、数据库或运行时源码。
+
+固定官方Caddy2.11.7及平台SHA，配置/管理仅loopback；原子load前核对代理配置归属，active health实际确认后才摘旧。固定slot健康映射、有界管理读与输出、两层业务重试关闭，代理真实线程/RSS纳入额外预留。34管理线程=代理声明32+Python主线程/有界输出reader各1；128MiB为准入预留，不冒充Go或OS硬限制；GOMAXPROCS1亦非OS线程上限。单独windows-roll模式只补代理更新/回滚，已通过的PG、内存、正式负载不重跑。实际结果须分别保留本机和Windows身份，未实跑前不标Windows通过。
+
+首次Windows原生Caddy run39708017769（源54706c2）真实失败于rolling_resource_snapshot，不能计更新或回滚通过。native退出替代391ms和另一实例10/10已通过；管理Python9+Caddy8=17线程/共存RSS70,774,784B均在34/128MiB内，实际全树稳态65线程、滚动89线程却超过原声明85。PPID分解各slot均为协调器6+launcher6+native12=24，原per_instance只声明17，确认平台辅助成本漏算，不能泛称Caddy失控或把未知7线程全部归因OS。全部协调器退出0、Windows明确终止代理回执1，cleanup空/采样PID清空，原artifact与失败保留。
+
+修正仅部署计费：Windows须显式platform_thread_reserve>=16，按event+blocking+9+reserve校验单实例及最多共存实例总额；16为覆盖观测额外7并留平台余量的保守预留，不是线程硬上界。普通4/4实例33、Caddy管理34，总声明133。native的KU_THREAD_BUDGET仍event+blocking+2，不增加任何执行线程，不改CPU负载/HTTP期限、不删除原失败。新的逐slot实际分解和检查使实例超额不能藏在管理余量中。真实修后结果另记新提交和唯一对应定向run。
+
+修正部署源e40ab1b的唯一Windows-roll run39709674234最终success。21项管理契约实跑计数及对应artifact见CI证据；原生/Cargo没有变化，旧547仍failure。真实Caddy退出替代219ms/另一实例10/10，更新17.031s，回滚15.969s/旧内容20次正确；15s是每个管理阶段的既有期限，不误写为整体动作墙钟限制。实际稳态8进程64线程/RSS103,043,072B，共存11进程88线程/RSS121,094,144B，回滚后8进程56线程/RSS105,902,080B；管理各16线程，slot24/收尾b16均在逐份33与全局133中，reservation_errors全空。四个协调器退出0，Windows显式终止代理回执1，sampledPIDs=[]/cleanup_errors=[]。A01—A18按列明范围通过，A19真实多主机演练仍因外部条件缺失未执行。
+
+最终清理核对：自有服务/数据库/代理/探针均已回收；Windows最终采样PID为空，fixture私有目录通过finally移除。自有本机Caddy下载、压缩包与探针目录已删除；此前复制CLI/适配产物43,826,760逻辑字节与本任务example的97项3,422,144逻辑字节已清理，项目target不存在，共享正常编译缓存保留。完整临时CI job日志清理，原始小型artifact/必要失败记录和永久回归保留。文档链接、JSON/Python块、git diff --check均通过。本次没有生产库变化或migration；主工作区原有未提交修改未覆盖，web/docs-site、JSON及暂停模块无改动，协作子任务全部完成或停止。最终文档提交只记录已经验收的源码，不新增编译输入，提交工具自身在远端核对后删除。

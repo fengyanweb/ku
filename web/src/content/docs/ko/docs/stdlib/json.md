@@ -1,7 +1,7 @@
 ---
 title: 'JSON 참조'
 description: 'Ku JSON 인코딩, 디코딩, KuValue 변환, 오류 코드 및 백엔드 지원.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## 값 인코딩 및 읽기
 
-다음은 완전한 기본 예시입니다. 개발 브랜치의 [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku)에 더 넓은 회귀 검증 예시가 있습니다.
+다음은 완전한 기본 예시입니다. 개발 브랜치의 [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku)에 더 넓은 회귀 검증 예시가 있습니다.
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 인터프리터, 기본 패키징 러너, 동기 네이티브 C 백엔드에 JSON 구현이 있습니다. **제한된 네이티브 Task 부분집합과 LLVM은 JSON을 지원하지 않습니다.** 기본 러너는 가져온 소스의 원래 위치에 여전히 의존합니다. JSON 지원이 완전히 독립적인 패키지를 뜻하지는 않습니다.
 
-이 페이지의 시그니처와 제한은 소스 및 계약과 대조했습니다. 실행 검증에는 버전, 커밋, 백엔드를 명시해야 합니다. 전체 [JSON 문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json)을 참고하세요.
+이 페이지의 시그니처와 제한은 소스 및 계약과 대조했습니다. 실행 검증에는 버전, 커밋, 백엔드를 명시해야 합니다. 전체 [JSON 문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json)을 참고하세요.

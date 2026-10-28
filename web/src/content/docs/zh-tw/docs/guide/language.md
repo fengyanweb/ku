@@ -1,7 +1,7 @@
 ---
 title: 語言指南
 description: 學習 Ku 的變數、函式、控制流、所有權、模組與可恢復錯誤。
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡介紹核心寫法，完整規則以倉庫[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)和[語義合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)為準。下列為教學片段，後端差異見[支援矩陣](/zh-tw/docs/support/)。
+本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡介紹核心寫法，完整規則以倉庫[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[語義合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)為準。下列為教學片段，後端差異見[支援矩陣](/zh-tw/docs/support/)。
 
 ## 變數與型別
 

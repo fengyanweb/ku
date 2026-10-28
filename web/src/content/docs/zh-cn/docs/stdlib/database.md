@@ -1,14 +1,18 @@
 ---
 title: 数据库客户端
 description: PostgreSQL、Redis、MySQL 与 MariaDB 的配置、查询、结果、错误和生命周期。
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/backend/c.rs',
     'src/cli.rs',
     'docs/protocol-foundation.md',
+    'src/backend/c_database_budget.c',
+    'src/backend/c_pg_async_runtime.c',
+    'src/backend/c_task_pg_runtime.c',
+    'src/ir/task_lower.rs',
   ]
 sidebar:
   order: 9
@@ -48,17 +52,20 @@ ku build --backend c -o database-example file.ku
 
 只填写对应 client 接受的字段。未知字段、错误类型或越界配置返回 `invalid_config`。池操作可能返回对应模块的 `pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`client_closed`、`out_of_memory`。期限不表示能硬中断所有同步 DNS 或外部库调用；单结果大小限制也不是进程内存上限。
 
+native 进程还在各 client 间共享数据库准入预算：`KU_DB_MAX_CONNECTIONS`（默认 256）、`KU_DB_MAX_WAITERS`（4096）、`KU_DB_MAX_PENDING_BYTES`（67,108,864 字节）。它们是环境变量，不是构造器字段。连接池槽位预留与等待操作存储分别计费，不代表全部结果字节、全部活对象或 OS 进程内存上限。
+
 ## PostgreSQL
 
 从 `std.pg` 导入 `pg`。除池字段外，`pg.client(config)` 必填 `conninfo:str`，接受 libpq 连接串或 URI。不提供另一套 `pg.connect` 或裸连接 API。
 
-| 方法                                      | 返回             | 含义                                        |
-| ----------------------------------------- | ---------------- | ------------------------------------------- |
-| `client.query(sql:str, parameters:[str])` | result 的 Result | 使用 `$1`、`$2` 等占位符；无参数也传 `[]`。 |
-| `result.rows()` / `result.cols()`         | `int`            | 脱离连接的结果行列数。                      |
-| `result.value(row:int, column:int)`       | `str!`           | 复制一个非 NULL 单元格为文本。              |
-| `result.is_null(row:int, column:int)`     | `bool!`          | 区分 SQL NULL 与空字符串。                  |
-| `client.close()`                          | `null`           | 消费并关闭 client。                         |
+| 方法                                      | 返回             | 含义                                                       |
+| ----------------------------------------- | ---------------- | ---------------------------------------------------------- |
+| `client.query(sql:str, parameters:[str])` | result 的 Result | 使用 `$1`、`$2` 等占位符；无参数也传 `[]`。                |
+| `result.rows()` / `result.cols()`         | `int`            | 脱离连接的结果行列数。                                     |
+| `result.value(row:int, column:int)`       | `str!`           | 复制一个非 NULL 单元格为文本。                             |
+| `result.value_int(row:int, column:int)`   | `int!`           | 将规范有符号 int64 文本读为整数，不做浮点/字符串隐式转换。 |
+| `result.is_null(row:int, column:int)`     | `bool!`          | 区分 SQL NULL 与空字符串。                                 |
+| `client.close()`                          | `null`           | 消费并关闭 client。                                        |
 
 将自己的连接串放到 `postgres.ku` 旁的私有 `db.conn`。本地测试填写本地 host、数据库与账号；远端连接应在 conninfo 中设置 `sslmode=verify-full` 和可信 `sslrootcert`。不要提交或打印此文件。
 
@@ -94,7 +101,47 @@ fn main(): null! {
 true
 ```
 
-`query` 返回独立拥有内容的结果，读取结果不会继续占用池连接。对 SQL NULL 调用 `value` 返回 `pg/null_value`；坐标越界也返回可恢复错误。此共享 client 不支持显式事务、会话状态、COPY 或独占连接。
+`query` 返回独立拥有内容的结果，读取结果不会继续占用池连接。对 SQL NULL 调用 `value` 返回 `pg/null_value`；坐标越界也返回可恢复错误。`value_int` 只接受规范有符号 int64 文本：不接受前导 `+`、空白、小数点，除单个 `0` 外不接受前导零；格式或范围错误为 `pg/integer_value_error`，SQL NULL 仍为 `pg/null_value`。此共享 client 不支持显式事务、会话状态、COPY 或独占连接。
+
+<a id="async-pg"></a>
+
+### Async HTTP handler 中的 PostgreSQL
+
+保存为 `async-pg.ku`，按上文准备私有 `db.conn` 与 libpq，执行 `ku build --backend c --profile release async-pg.ku -o async-pg`。8080 端口需空闲：
+
+```ku
+import http from "std.http"
+import pg from "std.pg"
+import fs from "std.fs"
+
+fn main(): null! {
+    client = pg.client({
+        conninfo: fs.read("db.conn")?,
+        max_connections: 4,
+        max_waiters: 8,
+        connect_timeout_ms: 2000,
+        acquire_timeout_ms: 100,
+        query_timeout_ms: 1000
+    })?
+    async fn read(): HttpResponse! {
+        result = client.query("SELECT $1::text", ["Ku"])?
+        return ok(http.text(result.value(0, 0)?))
+    }
+    app = http.service({
+        max_connections: 64,
+        max_active_requests: 16,
+        max_pending_requests: 32,
+        handler_timeout_ms: 2000
+    })
+    app.get("/read", read)
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+```
+
+启动程序后调用 `curl http://127.0.0.1:8080/read`，查询成功时返回 `Ku`。示例只读取数据。handler 通过 native handler 绑定只读使用受支持的 PG client 捕获，不移动或关闭共享 client。这是专门的捕获绑定，不是 async `&` 参数；不代表支持任意资源捕获、Task 内构造/关闭 client、Redis/MySQL Task 等待或通用数据库异步。
+
+此处 `client.query(...)?` 是 native 降低支持的挂起操作，返回 Result，不是再交给 `await` 的用户 Task。取连接、连接/查询进展与 reset 始终不超过原始 HTTP 请求/handler 截止期限，不会刷新期限或自动重试 SQL。发送后的超时仍可能存在数据库结果不确定。连接池/OS 清理及服务停止与返回 HTTP 响应是不同阶段。
 
 ## Redis
 
@@ -198,4 +245,4 @@ fn main(): null! {
 
 SQL client **不自动重试语句**。`execution_unknown` 表示已经发送语句，但最终结果不确定；`execution_completed_without_result` 表示已完成执行，但未能提供可用结果；`session_state_unsupported` 可在发送前或执行后产生，消息会区分阶段。不能根据超时、worker 退出、reset 或这些错误码推断已经回滚或可以重试。不确定的写入必须通过业务标识和数据库状态确认后，再决定是否人工重试。
 
-连接归还前的 reset 清理所支持的会话状态，不会撤销已提交写入或外部副作用。SQL 由应用控制，值用参数绑定，数据库账号仅授予必需权限。本页说明 v0.0.18 接口，不表示数据库完整平台矩阵已经完成。
+连接归还前的 reset 清理所支持的会话状态，不会撤销已提交写入或外部副作用。SQL 由应用控制，值用参数绑定，数据库账号仅授予必需权限。本页说明 v0.0.19 接口，不表示数据库完整平台矩阵已经完成。

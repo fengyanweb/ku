@@ -1,9 +1,21 @@
 ---
 title: HTTP reference
 description: Build an HTTP service, call endpoints, register routes, and handle request and response limits.
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
-sources: ['src/stdlib/http.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
+sources:
+  [
+    'src/stdlib/http.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'src/backend/c_http_runtime.c',
+    'src/backend/c_task_http.rs',
+    'src/ir/task_lower.rs',
+    'src/service_supervision.rs',
+    'src/ir/mod.rs',
+    'src/backend/c.rs',
+    'tests/native_http_test.rs',
+  ]
 sidebar:
   order: 8
 ---
@@ -182,18 +194,18 @@ Supply options at construction, for example `http.service({ max_body_bytes: 6553
 | `handler_timeout_ms`     |     15,000 |       300,000 | Handler deadline; see start point below                          |
 | `max_body_bytes`         |  1,000,000 |    16,777,216 | Request body                                                     |
 | `max_header_bytes`       |     16,384 |        65,536 | Request headers                                                  |
-| `max_connections`        |      1,024 |         4,096 | Open connections                                                 |
-| `max_active_requests`    |        256 |         1,024 | Active request slots                                             |
+| `max_connections`        |      1,024 |        32,768 | Open connections                                                 |
+| `max_active_requests`    |        256 |        16,384 | Active request slots                                             |
 | `max_pending_requests`   |      1,024 |         8,192 | Waiting requests                                                 |
 | `max_buffer_bytes`       | 67,108,864 | 1,073,741,824 | Per-listener controlled transport buffers                        |
 
-The interpreter starts `handler_timeout_ms` when a complete request becomes ready, so waiting for execution consumes this budget. Native C starts it immediately before calling the selected handler; its prior queue wait is not included. This is not an end-to-end client timeout.
+The interpreter starts `handler_timeout_ms` when a complete request becomes ready, including its wait for execution. Native C starts the handler phase budget before dispatch; the native runtime also has an outer request deadline from its first observation of a request byte. `KU_HTTP_REQUEST_TIMEOUT_MS` configures that native outer budget (default 30,000 ms, maximum 300,000 ms); it is an environment setting, not an `http.service` field. The effective async handler/PG deadline is clamped to the original request deadline and is not renewed by admission, queueing or connection acquisition. First-byte observation is not a packet-arrival timestamp or a client end-to-end clock.
 
 The native runtime additionally limits handler workers to 64. The transport buffer budget does not bound the entire process, user heap, thread stacks, kernel socket buffers, or external libraries.
 
 The runtime returns 400 for malformed requests, 404 for an unknown route, 405 for an unsupported method on an existing path, 413 for an oversized body, 414 for a target over 8,192 bytes, 431 for oversized headers, 503 for admission/buffer exhaustion, and 504 for a handler deadline. A native deadline is cooperative: loops and Ku call returns are checked; it cannot forcibly interrupt an arbitrary blocking foreign call. Increasing the deadline is not a fix for a stalled handler.
 
-HTTP/1.1 connections can be reused, with ordered pipelined responses. A request containing `Connection: close`, a 4xx/5xx response, a protocol error, or an expired idle deadline closes the connection. Streaming responses, SSE, WebSocket, and a public graceful-stop API are not implemented. See [supported execution paths and known issues](/en/docs/support/) before choosing a deployment path.
+HTTP/1.1 connections can be reused, with ordered pipelined responses. A request containing `Connection: close`, a 4xx/5xx response, a protocol error, or an expired idle deadline closes the connection. Streaming responses, SSE, WebSocket and a public `app.stop()` method are not implemented. Supervised native services can use authenticated health/drain control through `ku service`; this is separate from listener `close()`. See [supported execution paths and known issues](/en/docs/support/) before choosing a deployment path.
 
 ## Bind without starting
 
@@ -215,7 +227,7 @@ The listener holds the bound socket until it is run, explicitly closed, or its l
 
 ## Execution support
 
-`ku run` and the default packaged runner support the complete server/client examples above. Synchronous native C supports `app.listen(...)` with `text/html/empty/redirect` responses. It does not implement `http.json`, `http.statusText`, the module-level HTTP client, or `bind/run/close`. Native Task and LLVM do not provide this complete HTTP interface.
+`ku run` and the default packaged runner support the complete server/client examples above. Synchronous native C supports `app.listen(...)` with `text/html/json/empty/redirect` responses. `http.json(value)` and `http.json(status, value)` use the synchronous JSON writer and set `application/json; charset=utf-8`; they return a response, not a Result. Invalid status or unsupported encoding fails the handler (500), rather than becoming an ordinary recoverable Result. Native C does not implement `http.statusText`, the module-level HTTP client, or `bind/run/close`. Named async native handlers use the restricted path below; it does not provide the complete interface above. LLVM does not provide this HTTP library.
 
 For a server that can also be compiled to native C, save the following as `native-server.ku`. `/users/42` returns the plain text `42` in this version:
 
@@ -243,3 +255,35 @@ ku build --native native-server.ku -o native-server
 ```
 
 On Windows choose `-o native-server.exe` and run `.\native-server.exe`. Use the earlier curl commands to call it, then stop it with Ctrl+C. Do not run both examples on port 8080 simultaneously.
+
+## Named async native handlers
+
+This separate native example uses a named async handler. Save it as `async-server.ku`; check and compile it with the native C backend, rather than interpreting it:
+
+```ku
+import http from "std.http"
+
+fn main(): null! {
+    async fn health(): HttpResponse! {
+        return ok(http.text("ready"))
+    }
+    app = http.service({
+        max_connections: 64,
+        max_active_requests: 16,
+        max_pending_requests: 32
+    })
+    app.get("/health", health)
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+```
+
+```sh
+ku check async-server.ku
+ku build --backend c --profile release async-server.ku -o async-server
+./async-server
+```
+
+`curl http://127.0.0.1:8080/health` returns `ready`. Stop the binary with Ctrl+C before running another example on the same port. On Windows use an `.exe` output name.
+
+The supported handler annotations are `HttpRequest` and `HttpResponse` in this native HTTP path. A handler returning `HttpResponse!` uses Result propagation; the runtime owns admission, its Task and the response lifetime. This does not make arbitrary resource handles, dynamic closures or every standard-library operation valid in a Task. The interpreter rejects async HTTP handlers. Within these async handlers, supported response constructors are `text/html/empty/redirect`; use the [PG example](/en/docs/stdlib/database/#async-pg) for the limited read-only client capture path.

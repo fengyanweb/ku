@@ -1,7 +1,7 @@
 ---
 title: 'Standart kütüphane'
 description: 'Ku standart kütüphane modüllerini, temel imzaları ve arka uç sınırlarını bulun.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu temel giriş noktaları kaynak kodla karşılaştırıldı; kapsamlı bir API başvurusu değildir. Davranışı [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) tanımlar. Arka uç sınırları için [destek matrisine](/tr/docs/support/) bakın.
+Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu temel giriş noktaları kaynak kodla karşılaştırıldı; kapsamlı bir API başvurusu değildir. Davranışı [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) tanımlar. Arka uç sınırları için [destek matrisine](/tr/docs/support/) bakın.
 
 ## Modülleri içe aktarma
 
@@ -77,7 +77,7 @@ fn main(): null! {
 
 ## Başvurunun bakımı
 
-Açık arayüz metaverisi [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs) içindedir. Uygulamalar ve sözleşmelerle birlikte denetlenir. Bu site şu anda elle seçilmiş bir başvuru tutar; mevcut bir `ku doc` komutu doğrulanmamıştır.
+Açık arayüz metaverisi [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs) içindedir. Uygulamalar ve sözleşmelerle birlikte denetlenir. Bu site şu anda elle seçilmiş bir başvuru tutar; mevcut bir `ku doc` komutu doğrulanmamıştır.
 
 ## API reference (English)
 

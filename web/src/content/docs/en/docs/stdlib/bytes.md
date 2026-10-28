@@ -1,7 +1,7 @@
 ---
 title: Binary data
 description: Owned bytes, strict UTF-8 conversion, indices, and binary network payloads.
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'tests/native_net_test.rs']

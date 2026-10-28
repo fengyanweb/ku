@@ -302,7 +302,7 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->slots = (KuTaskDriverSlotV1*)calloc(capacity, sizeof(*runtime->slots));
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
+  size_t fixed = ku_task_driver_fixed_storage_bytes(capacity);
   uint64_t startup_now = ku_task_driver_now_ms();
   CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
   uint64_t startup_deadline = startup_now + 1000u;
@@ -846,7 +846,7 @@ static void fixture_headers_and_damaged_pair(void) {
 }
 
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 12u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 5u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();

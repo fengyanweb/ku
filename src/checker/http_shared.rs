@@ -18,6 +18,7 @@ const MAX_HTTP_SHARED_GRAPH_WORK: usize = 100_000;
 pub(super) struct HttpSharedCallable {
     pub(super) name: String,
     pub(super) registration: Span,
+    pub(super) postgres: bool,
 }
 
 type SharedOrigins = BTreeMap<BindingId, HttpSharedCallable>;
@@ -106,6 +107,7 @@ impl Checker {
         &mut self,
         provenance: &ClosureProvenance,
         span: Span,
+        postgres: bool,
     ) -> KuResult<()> {
         // A proven empty environment has no callable cell to freeze. Do not
         // scan unrelated bindings/edges for a capture-free or by-value handler.
@@ -120,7 +122,7 @@ impl Checker {
         }
         // Planning is read-only. A missing capture or exhausted budget must not
         // leave a partially frozen state in a speculative branch/loop pass.
-        let plan = self.http_shared_freeze_plan(provenance, span)?;
+        let plan = self.http_shared_freeze_plan(provenance, span, postgres)?;
         for binding in self.scopes.iter_mut().flat_map(|scope| scope.values_mut()) {
             if let Some(origins) = plan.get(&binding.binding_id) {
                 for (id, origin) in origins {
@@ -135,6 +137,7 @@ impl Checker {
         &self,
         provenance: &ClosureProvenance,
         span: Span,
+        postgres: bool,
     ) -> KuResult<BTreeMap<BindingId, SharedOrigins>> {
         let mut budget = GraphBudget {
             remaining: MAX_HTTP_SHARED_GRAPH_WORK,
@@ -204,7 +207,9 @@ impl Checker {
                     span,
                 ));
             }
-            if matches!(&binding.ty, Type::FunctionValue { .. }) {
+            let pg_capture = postgres
+                && matches!(&binding.ty, Type::Native(name) if name == crate::stdlib::metadata::PG_CLIENT);
+            if matches!(&binding.ty, Type::FunctionValue { .. }) || pg_capture {
                 if binding.closure_provenance.http_callable_body_uncertain {
                     return Err(proof_error(
                         "http handler cannot prove HTTP-shared function binding safety after an indirect replacement with an unproven body",
@@ -217,6 +222,7 @@ impl Checker {
                     .unwrap_or_else(|| HttpSharedCallable {
                         name: (*name).clone(),
                         registration: span,
+                        postgres: pg_capture,
                     });
                 retain_earliest(&mut origins, id, &origin);
             }
@@ -288,14 +294,13 @@ impl Checker {
             .filter_map(|binding| binding.closure_provenance.http_shared.get(&target))
             .min_by_key(|origin| origin_order(origin));
         if let Some(origin) = origin {
-            return Err(KuError::runtime(
-                format!(
-                    "cannot reassign HTTP-shared function binding '{}'; shared by HTTP registration at line {}, column {}",
-                    origin.name, origin.registration.start.line, origin.registration.start.column,
-                ),
-                span,
-            )
-            .with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
+            let message = if origin.postgres {
+                format!("cannot close, move or replace HTTP-shared PostgreSQL client binding '{}'; captured by async HTTP registration at line {}, column {}; release it with its owning scope",origin.name,origin.registration.start.line,origin.registration.start.column)
+            } else {
+                format!("cannot reassign HTTP-shared function binding '{}'; shared by HTTP registration at line {}, column {}",origin.name,origin.registration.start.line,origin.registration.start.column)
+            };
+            return Err(KuError::runtime(message, span)
+                .with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
         }
         Ok(())
     }

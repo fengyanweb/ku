@@ -1,12 +1,12 @@
 ---
 title: 'Plateformes et backends pris en charge'
 description: "Distinguez les plateformes publiées de Ku, l'interpréteur, le lanceur, C natif, le sous-ensemble Task et LLVM."
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'docs/syntax.md',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/protocol-foundation.md',
     '.github/workflows/native-three-os.yml',
@@ -36,7 +36,7 @@ Les compilations par défaut exigent la chaîne Rust correspondante et l'éditeu
 
 La branche de développement actuelle possède un chemin source restreint pour `async fn main(): null!`. Il couvre les primitives explicitement énumérées, chaînes, tableaux plats, Results à une couche, démarrage/déplacement/await de Task, une partie du contrôle et des opérations bornées sur les fichiers/répertoires en arrière-plan. Ce n'est pas un backend async complet dans le paquet publié v0.0.18.
 
-L'attente réseau Task générique, l'exécution M:N complète, les combinaisons arbitraires de tas dynamique, toutes les combinaisons captures/fonctions async et les tests d'endurance longue durée complets restent inachevés. Voir les sous-ensembles précisément acceptés et refusés dans le [contrat de concurrence](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md).
+L'attente réseau Task générique, l'exécution M:N complète, les combinaisons arbitraires de tas dynamique, toutes les combinaisons captures/fonctions async et les tests d'endurance longue durée complets restent inachevés. Voir les sous-ensembles précisément acceptés et refusés dans le [contrat de concurrence](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md).
 
 ## Limites des bases de données et du réseau
 
@@ -79,4 +79,4 @@ The coordinator itself has no OS memory hard limit. Its bounded admission/contro
 
 When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
 
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.

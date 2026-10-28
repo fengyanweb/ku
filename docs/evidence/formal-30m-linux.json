@@ -1,0 +1,854 @@
+{
+  "status": "passed",
+  "run_url": "https://github.com/fengyanweb/ku/actions/runs/39699000190",
+  "artifact_id": 12393191627,
+  "artifact_name": "multiloop-sustained-pr-2-a31c1135ca82e3e15c426a2ef522522038ea8735-1",
+  "artifact_expires_at": "2026-11-21T00:52:32Z",
+  "artifact_integrity": {
+    "size_bytes": 52922,
+    "zip_sha256": "85719675d5fac9bfd44ab5b36b6480e5150576c2c09636c4651981040564d206",
+    "github_digest_matches": true,
+    "zip_crc_passed": true
+  },
+  "source_commit": "a31c1135ca82e3e15c426a2ef522522038ea8735",
+  "source_dirty": false,
+  "workflow_source_commit": "cd49b394267fd2dcdb87b5c7d565314e64340b7e",
+  "cli_sha256": "bd5dc30a225f5dcd2558fe2bcad4c372ab08caa7986f741f9e2f0a5748655be2",
+  "native_sha256": "96e61062c3e7f9b49dbd8135aef418ee3cb06e8b776cc055ed965cc2120ab389",
+  "fixture_sha256": "859d539562d5a2fa1693e22fa56949daed1aeab3eeb3b0c149e7d5a8f3282460",
+  "driver_sha256": "70103e4a5ab9aa3ebb685342ae143d065b47e29e7c4c403938cce3c18f84a727",
+  "raw_report_sha256": "95bb8d440f1086bd67de56c2006b19978efe2c21c778f9d19b7c93cf46b7461e",
+  "input_checks": {
+    "driver_and_fixture_match_frozen_commit": true,
+    "cli_and_fixture_match_recorded_inputs": true
+  },
+  "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+  "logical_cpu_count": 4,
+  "machine_capacity": {
+    "nproc": {
+      "exit_code": 0,
+      "stdout": "4\n",
+      "stderr": ""
+    },
+    "affinity": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "logical_cpu_count": 4,
+    "cpu_quotas": [
+      {
+        "path": "/sys/fs/cgroup/system.slice/hosted-compute-agent.service/cpu.max",
+        "value": "max 100000",
+        "cpus": null
+      },
+      {
+        "path": "/sys/fs/cgroup/system.slice/cpu.max",
+        "value": "max 100000",
+        "cpus": null
+      }
+    ],
+    "errors": [],
+    "source_sha": "a31c1135ca82e3e15c426a2ef522522038ea8735",
+    "source_status": "",
+    "effective_cpu_capacity": 4
+  },
+  "environment": {
+    "runner": "ubuntu-24.04",
+    "exposed_topology": "2 cores x 2 SMT threads; four available logical CPUs, not four dedicated physical cores",
+    "python": "3.12.3",
+    "cc": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "rustc": "rustc 1.89.0 (29483883e 2025-08-04)\nbinary: rustc\ncommit-hash: 29483883eed69d5fb4db01964cdf2af4d86e9cb2\ncommit-date: 2025-08-04\nhost: x86_64-unknown-linux-gnu\nrelease: 1.89.0\nLLVM version: 20.1.7",
+    "cargo": "cargo 1.89.0 (c24e10642 2025-06-23)",
+    "runner_total_memory_bytes": null,
+    "runner_memory_limit_bytes": null
+  },
+  "parameters": {
+    "duration_seconds": 1800,
+    "arrival_rps": 50.0,
+    "loops": [
+      4
+    ],
+    "native_c_profile": "release",
+    "blocking_threads_total": 5,
+    "thread_budget": 16,
+    "normal_unexpected_errors": 0,
+    "normal_p99_ms": 250,
+    "pre_overload_peak_loop_delay_ms": 100,
+    "overload_http_statuses": [
+      200,
+      408,
+      503,
+      504
+    ],
+    "overload_unclassified_measured_errors": 0,
+    "overload_slow_peer_attempts_per_second": 280,
+    "overload_slow_peer_connections": 280,
+    "recovery_seconds": 5,
+    "formal_phases_seconds": {
+      "warm": 60,
+      "steady": 1470,
+      "overload": 30,
+      "recovery": 240
+    },
+    "overload_duration_reason": "280 slow peers over 30s fits the same-host 16384 ephemeral-port budget; service deadlines unchanged",
+    "queue_bytes": "fixed64 descriptors, no queued request bodies",
+    "timers": "25ms real async wait"
+  },
+  "tls": "none; direct loopback HTTP",
+  "load_generator": "same host, fixed32threads, max64inflight",
+  "normal_requests": 88500,
+  "total_measured_arrivals": 93000,
+  "measured_success": 89960,
+  "deliberate_partial_connections": 8099,
+  "actual_phase_duration_seconds": 1800.454978914,
+  "phases": [
+    {
+      "arrivals": 3000,
+      "completed": 3000,
+      "client_shed": 0,
+      "counts": {
+        "success": 3000
+      },
+      "peak_inflight": 2,
+      "p50_ms": 0.5,
+      "p95_ms": 25.5,
+      "p99_ms": 25.5,
+      "first_errors": [],
+      "duration_seconds": 60.08584123700001,
+      "target_rps": 50.0,
+      "overload": false,
+      "name": "warm",
+      "end_resources": {
+        "monotonic": 494.187910132,
+        "rss_bytes": 2584576,
+        "threads": 11,
+        "fds": 15
+      },
+      "end_loop_delay_ms": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "arrivals": 73500,
+      "completed": 73500,
+      "client_shed": 0,
+      "counts": {
+        "success": 73500
+      },
+      "peak_inflight": 2,
+      "p50_ms": 0.5,
+      "p95_ms": 25.5,
+      "p99_ms": 25.6,
+      "first_errors": [],
+      "duration_seconds": 1470.085832065,
+      "target_rps": 50.0,
+      "overload": false,
+      "name": "steady",
+      "end_resources": {
+        "monotonic": 1964.278394322,
+        "rss_bytes": 2600960,
+        "threads": 11,
+        "fds": 15
+      },
+      "end_loop_delay_ms": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "arrivals": 4500,
+      "completed": 1694,
+      "client_shed": 2806,
+      "counts": {
+        "success": 1460,
+        "server_transport_close": 19,
+        "http_503": 215
+      },
+      "peak_inflight": 64,
+      "p50_ms": 784.8,
+      "p95_ms": 917.8,
+      "p99_ms": 945.2,
+      "first_errors": [
+        {
+          "path": "/hot",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/ok",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/timer",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/hot",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/ok",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/timer",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/hot",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/ok",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/timer",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/ok",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/ok",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/hot",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/timer",
+          "error": "RemoteDisconnected",
+          "errno": null,
+          "detail": "Remote end closed connection without response"
+        },
+        {
+          "path": "/cpu",
+          "status": 503,
+          "body": "b'Service Unavailable'"
+        }
+      ],
+      "duration_seconds": 30.187919197999918,
+      "target_rps": 150.0,
+      "overload": true,
+      "deliberate_partial_body_peers": {
+        "counts": {
+          "connected": 8099,
+          "http_503": 4163,
+          "http_408": 3712,
+          "closed_by_generator_at_phase_end": 224
+        },
+        "peak_connections": 226,
+        "connection_limit": 280,
+        "maximum_connection_attempts_per_second": 280,
+        "classification": "408 body deadline and 503 admission are expected; statusless transport failures remain ambiguous"
+      },
+      "overload_removed_monotonic": 1994.313953955,
+      "name": "overload",
+      "end_resources": {
+        "monotonic": 1994.502353599,
+        "rss_bytes": 3244032,
+        "threads": 11,
+        "fds": 15
+      },
+      "overload_classification": {
+        "correct": 1460,
+        "explicit_admission_rejection": 215,
+        "explicit_deadline": 0,
+        "server_transport_close": 19,
+        "load_client_budget_refusal": 2806,
+        "unclassified_or_unexpected": {},
+        "meaning": "Direct-peer EOF/reset/broken-pipe is server transport termination, not an HTTP 503 or a uniquely identified close reason. Local queue refusals are load-client limits and remain in total arrivals. Other transport/client/protocol errors fail. Deliberate slow peers remain separate.",
+        "pressure_observed": true
+      },
+      "recovery_probe": {
+        "passed": true,
+        "seconds_since_overload_removal": 0.18927877400005855,
+        "metrics": {
+          "loops": [
+            {
+              "id": 0,
+              "accepted": 2881,
+              "requests": 19059,
+              "queued": 0,
+              "running": 0,
+              "resident": 0,
+              "connections": 0,
+              "pending": 0
+            },
+            {
+              "id": 1,
+              "accepted": 2880,
+              "requests": 14244,
+              "queued": 0,
+              "running": 0,
+              "resident": 0,
+              "connections": 0,
+              "pending": 0
+            },
+            {
+              "id": 2,
+              "accepted": 2880,
+              "requests": 21909,
+              "queued": 0,
+              "running": 0,
+              "resident": 0,
+              "connections": 0,
+              "pending": 0
+            },
+            {
+              "id": 3,
+              "accepted": 2880,
+              "requests": 22749,
+              "queued": 0,
+              "running": 0,
+              "resident": 0,
+              "connections": 0,
+              "pending": 0
+            }
+          ],
+          "accepted": 11521,
+          "draining": false,
+          "outcomes": [
+            {
+              "id": 0,
+              "admitted": 19059,
+              "success_responses": 19059,
+              "rejected_responses": 1115,
+              "timeout_responses": 1430,
+              "other_responses": 0,
+              "peak_loop_delay_ms": 1,
+              "queued_bytes": 0,
+              "peak_queued_bytes": 730
+            },
+            {
+              "id": 1,
+              "admitted": 14244,
+              "success_responses": 14244,
+              "rejected_responses": 1103,
+              "timeout_responses": 1437,
+              "other_responses": 0,
+              "peak_loop_delay_ms": 1,
+              "queued_bytes": 0,
+              "peak_queued_bytes": 730
+            },
+            {
+              "id": 2,
+              "admitted": 21909,
+              "success_responses": 21909,
+              "rejected_responses": 1076,
+              "timeout_responses": 1433,
+              "other_responses": 0,
+              "peak_loop_delay_ms": 1,
+              "queued_bytes": 0,
+              "peak_queued_bytes": 1460
+            },
+            {
+              "id": 3,
+              "admitted": 22749,
+              "success_responses": 22749,
+              "rejected_responses": 1084,
+              "timeout_responses": 1430,
+              "other_responses": 0,
+              "peak_loop_delay_ms": 1,
+              "queued_bytes": 0,
+              "peak_queued_bytes": 730
+            }
+          ],
+          "transport_closes": [
+            {
+              "id": 0,
+              "idle_pressure": 6,
+              "response_policy": 2717,
+              "write_deadline": 0,
+              "peer_write_error": 151,
+              "queue_not_admitted": 0,
+              "drain_idle": 0
+            },
+            {
+              "id": 1,
+              "idle_pressure": 6,
+              "response_policy": 2718,
+              "write_deadline": 0,
+              "peer_write_error": 148,
+              "queue_not_admitted": 0,
+              "drain_idle": 0
+            },
+            {
+              "id": 2,
+              "idle_pressure": 7,
+              "response_policy": 2730,
+              "write_deadline": 0,
+              "peer_write_error": 134,
+              "queue_not_admitted": 0,
+              "drain_idle": 0
+            },
+            {
+              "id": 3,
+              "idle_pressure": 2,
+              "response_policy": 2709,
+              "write_deadline": 0,
+              "peer_write_error": 158,
+              "queue_not_admitted": 0,
+              "drain_idle": 0
+            }
+          ],
+          "buffer_bytes": 0,
+          "peak_buffer_bytes": 603776,
+          "buffer_rejections": 0,
+          "output": {
+            "queued_records": 0,
+            "queued_bytes": 0,
+            "peak_bytes": 0,
+            "dropped_records": 0,
+            "dropped_bytes": 0,
+            "failures": 0,
+            "written_bytes": 0
+          },
+          "tasks": [
+            {
+              "id": 0,
+              "ready": 0,
+              "waiting": 0,
+              "running": 0,
+              "resident": 0,
+              "timers": 0,
+              "polls": 54872269,
+              "peak_ready_delay_ms": 1,
+              "exited": 0
+            },
+            {
+              "id": 1,
+              "ready": 0,
+              "waiting": 0,
+              "running": 0,
+              "resident": 0,
+              "timers": 0,
+              "polls": 33767292,
+              "peak_ready_delay_ms": 1,
+              "exited": 0
+            },
+            {
+              "id": 2,
+              "ready": 0,
+              "waiting": 0,
+              "running": 0,
+              "resident": 0,
+              "timers": 0,
+              "polls": 51044421,
+              "peak_ready_delay_ms": 1,
+              "exited": 0
+            },
+            {
+              "id": 3,
+              "ready": 0,
+              "waiting": 0,
+              "running": 0,
+              "resident": 0,
+              "timers": 0,
+              "polls": 65060442,
+              "peak_ready_delay_ms": 1,
+              "exited": 0
+            }
+          ],
+          "task_blocking": {
+            "resident": 0,
+            "queued": 0,
+            "running": 0,
+            "peak_resident": 0,
+            "peak_queued": 0,
+            "peak_running": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "finished": 0,
+            "output_charge_bytes": 0,
+            "workers_created": 0,
+            "workers_exited": 0,
+            "cancelled_still_running": 0,
+            "net_wait": 0,
+            "net_step": 0
+          }
+        }
+      },
+      "end_loop_delay_ms": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "arrivals": 12000,
+      "completed": 12000,
+      "client_shed": 0,
+      "counts": {
+        "success": 12000
+      },
+      "peak_inflight": 3,
+      "p50_ms": 0.5,
+      "p95_ms": 25.5,
+      "p99_ms": 25.6,
+      "first_errors": [],
+      "duration_seconds": 240.09538641400013,
+      "target_rps": 50.0,
+      "overload": false,
+      "name": "recovery",
+      "end_resources": {
+        "monotonic": 2234.633289825,
+        "rss_bytes": 3244032,
+        "threads": 11,
+        "fds": 15
+      },
+      "end_loop_delay_ms": [
+        1,
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "baseline": {
+    "monotonic": 434.098199214,
+    "rss_bytes": 2396160,
+    "threads": 11,
+    "fds": 15
+  },
+  "final_metrics": {
+    "loops": [
+      {
+        "id": 0,
+        "accepted": 2957,
+        "requests": 21896,
+        "queued": 0,
+        "running": 0,
+        "resident": 0,
+        "connections": 0,
+        "pending": 0
+      },
+      {
+        "id": 1,
+        "accepted": 2956,
+        "requests": 17354,
+        "queued": 0,
+        "running": 0,
+        "resident": 0,
+        "connections": 0,
+        "pending": 0
+      },
+      {
+        "id": 2,
+        "accepted": 2956,
+        "requests": 24670,
+        "queued": 0,
+        "running": 0,
+        "resident": 0,
+        "connections": 0,
+        "pending": 0
+      },
+      {
+        "id": 3,
+        "accepted": 2956,
+        "requests": 26041,
+        "queued": 0,
+        "running": 0,
+        "resident": 0,
+        "connections": 0,
+        "pending": 0
+      }
+    ],
+    "accepted": 11825,
+    "draining": false,
+    "outcomes": [
+      {
+        "id": 0,
+        "admitted": 21896,
+        "success_responses": 21896,
+        "rejected_responses": 1115,
+        "timeout_responses": 1503,
+        "other_responses": 0,
+        "peak_loop_delay_ms": 1,
+        "queued_bytes": 0,
+        "peak_queued_bytes": 730
+      },
+      {
+        "id": 1,
+        "admitted": 17354,
+        "success_responses": 17354,
+        "rejected_responses": 1103,
+        "timeout_responses": 1513,
+        "other_responses": 0,
+        "peak_loop_delay_ms": 1,
+        "queued_bytes": 0,
+        "peak_queued_bytes": 730
+      },
+      {
+        "id": 2,
+        "admitted": 24670,
+        "success_responses": 24670,
+        "rejected_responses": 1076,
+        "timeout_responses": 1507,
+        "other_responses": 0,
+        "peak_loop_delay_ms": 1,
+        "queued_bytes": 0,
+        "peak_queued_bytes": 1460
+      },
+      {
+        "id": 3,
+        "admitted": 26041,
+        "success_responses": 26041,
+        "rejected_responses": 1084,
+        "timeout_responses": 1504,
+        "other_responses": 0,
+        "peak_loop_delay_ms": 1,
+        "queued_bytes": 0,
+        "peak_queued_bytes": 730
+      }
+    ],
+    "transport_closes": [
+      {
+        "id": 0,
+        "idle_pressure": 6,
+        "response_policy": 2790,
+        "write_deadline": 0,
+        "peer_write_error": 151,
+        "queue_not_admitted": 0,
+        "drain_idle": 0
+      },
+      {
+        "id": 1,
+        "idle_pressure": 6,
+        "response_policy": 2794,
+        "write_deadline": 0,
+        "peer_write_error": 148,
+        "queue_not_admitted": 0,
+        "drain_idle": 0
+      },
+      {
+        "id": 2,
+        "idle_pressure": 7,
+        "response_policy": 2804,
+        "write_deadline": 0,
+        "peer_write_error": 134,
+        "queue_not_admitted": 0,
+        "drain_idle": 0
+      },
+      {
+        "id": 3,
+        "idle_pressure": 2,
+        "response_policy": 2783,
+        "write_deadline": 0,
+        "peer_write_error": 158,
+        "queue_not_admitted": 0,
+        "drain_idle": 0
+      }
+    ],
+    "buffer_bytes": 0,
+    "peak_buffer_bytes": 603776,
+    "buffer_rejections": 0,
+    "output": {
+      "queued_records": 0,
+      "queued_bytes": 0,
+      "peak_bytes": 0,
+      "dropped_records": 0,
+      "dropped_bytes": 0,
+      "failures": 0,
+      "written_bytes": 0
+    },
+    "tasks": [
+      {
+        "id": 0,
+        "ready": 0,
+        "waiting": 0,
+        "running": 0,
+        "resident": 0,
+        "timers": 0,
+        "polls": 59125077,
+        "peak_ready_delay_ms": 1,
+        "exited": 0
+      },
+      {
+        "id": 1,
+        "ready": 0,
+        "waiting": 0,
+        "running": 0,
+        "resident": 0,
+        "timers": 0,
+        "polls": 44152888,
+        "peak_ready_delay_ms": 1,
+        "exited": 0
+      },
+      {
+        "id": 2,
+        "ready": 0,
+        "waiting": 0,
+        "running": 0,
+        "resident": 0,
+        "timers": 0,
+        "polls": 57854472,
+        "peak_ready_delay_ms": 1,
+        "exited": 0
+      },
+      {
+        "id": 3,
+        "ready": 0,
+        "waiting": 0,
+        "running": 0,
+        "resident": 0,
+        "timers": 0,
+        "polls": 75131187,
+        "peak_ready_delay_ms": 1,
+        "exited": 0
+      }
+    ],
+    "task_blocking": {
+      "resident": 0,
+      "queued": 0,
+      "running": 0,
+      "peak_resident": 0,
+      "peak_queued": 0,
+      "peak_running": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "finished": 0,
+      "output_charge_bytes": 0,
+      "workers_created": 0,
+      "workers_exited": 0,
+      "cancelled_still_running": 0,
+      "net_wait": 0,
+      "net_step": 0
+    }
+  },
+  "native_exit_code": 0,
+  "outcome": {
+    "status": "passed",
+    "source_sha": "a31c1135ca82e3e15c426a2ef522522038ea8735",
+    "driver_exit": {
+      "status": "finished",
+      "command": [
+        "/usr/bin/time",
+        "-v",
+        "-o",
+        "/home/runner/work/_temp/ku-multiloop-sustained/invocation-cost.txt",
+        "python3",
+        "-u",
+        "-B",
+        "tests/acceptance/multiloop_load.py",
+        "--ku",
+        "target/release/ku",
+        "--loops",
+        "4",
+        "--duration",
+        "1800",
+        "--rps",
+        "50",
+        "--profile",
+        "release",
+        "--output",
+        "/home/runner/work/_temp/ku-multiloop-sustained/report.json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1804.4400415369998
+    },
+    "report_matches_frozen_plan": true,
+    "observed_native_peaks": {
+      "rss_bytes": 3244032,
+      "threads": 11,
+      "fds": 270
+    },
+    "cost_scope": "native peaks are sampled, not continuous maxima; GNU time invocation-cost.txt covers cumulative CPU and maximum individual-process RSS, not aggregate process-tree memory",
+    "passed": true
+  },
+  "process_cost": {
+    "scope": "GNU time whole invocation and waited descendants; not server-only CPU or aggregate concurrent RSS",
+    "user_seconds": 139.32,
+    "system_seconds": 29.0,
+    "elapsed_seconds": 1804.42,
+    "max_individual_process_rss_kib": 121696
+  },
+  "limits": [
+    "one Ubuntu runner window, not a cross-platform SLO",
+    "normal latency histogram uses 50001 fixed 0.1ms buckets; all request counts retained",
+    "sampled RSS/FD/thread peaks are not continuous maxima",
+    "19 peer transport terminations are not HTTP503 or uniquely attributed causes",
+    "2806 client refusals remain in offered arrivals",
+    "macOS preflight 2 hot504 remain unexplained; historical504 not solved",
+    "runner total RAM and memory.max were not collected by this frozen workflow; no whole-system memory-limit claim"
+  ],
+  "raw_evidence_directory": "/Users/mac/Downloads/Ku_多循环验收_2026-10-21/formal-a31c113/multiloop-sustained-pr-2-a31c1135ca82e3e15c426a2ef522522038ea8735-1",
+  "previous_run": {
+    "source_commit": "d1738ef42ae82387815047c9f6d163917ae48f5d",
+    "run_url": "https://github.com/fengyanweb/ku/actions/runs/39688747675",
+    "artifact_id": 12389980003,
+    "status": "passed",
+    "raw_evidence_directory": "/Users/mac/Downloads/Ku_多循环验收_2026-10-21/formal-d173-passed/multiloop-sustained-pr-2-d1738ef42ae82387815047c9f6d163917ae48f5d-1",
+    "meaning": "retained historical passing run; not a substitute because the runtime changed before a31c113"
+  }
+}

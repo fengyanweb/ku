@@ -1,22 +1,28 @@
 ---
 title: 'Notas de versão'
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku v0.0.19 experimental prerelease scope, downloads and known limitations.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/history.md',
     'Cargo.toml',
   ]
 ---
 
+## 0.0.19
+
+A documentação atual corresponde ao Ku 0.0.19, uma pré-versão experimental com a mesma versão da CLI e da extensão VS Code. A disponibilidade, os arquivos e as somas de verificação dependem do GitHub Release efetivo.
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/pt/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18 · Histórico
+
 Esta documentação descreve o escopo congelado da pré-versão experimental v0.0.18. A publicação efetiva e os downloads estão registrados no GitHub Releases.
 
 > As atualizações de v0.0.18 abaixo estão por enquanto em inglês; o restante da tradução foi preservado. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-## v0.0.18 release scope and known limits
 
 This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
 

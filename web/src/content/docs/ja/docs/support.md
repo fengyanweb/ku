@@ -1,12 +1,12 @@
 ---
 title: 'プラットフォームとバックエンドの対応範囲'
 description: 'Ku の公開プラットフォーム、インタープリター、ランナー、ネイティブ C、Task サブセット、LLVM の違い。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'docs/syntax.md',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/protocol-foundation.md',
     '.github/workflows/native-three-os.yml',
@@ -36,7 +36,7 @@ v0.0.18 実験的プレリリースは、Windows x64（MSVC）、Linux x64（GNU
 
 現在の開発ブランチには、制限付きの `async fn main(): null!` ソース経路があります。明記されたプリミティブ、文字列、フラットな配列、単層 Result、Task の開始・ムーブ・await、一部の制御フロー、上限付きファイル／ディレクトリのバックグラウンド操作に対応します。公開済み v0.0.18 パッケージの完全な async バックエンドではありません。
 
-汎用 Task ネットワーク待機、完全な M:N 実行、任意の動的ヒープの組み合わせ、すべての非同期キャプチャ／関数の組み合わせ、完全な長時間連続稼働検証は未完成です。受理および拒否する正確なサブセットは[並行処理仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md)を参照してください。
+汎用 Task ネットワーク待機、完全な M:N 実行、任意の動的ヒープの組み合わせ、すべての非同期キャプチャ／関数の組み合わせ、完全な長時間連続稼働検証は未完成です。受理および拒否する正確なサブセットは[並行処理仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md)を参照してください。
 
 ## データベースとネットワークの制約
 
@@ -79,4 +79,4 @@ The coordinator itself has no OS memory hard limit. Its bounded admission/contro
 
 When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
 
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.

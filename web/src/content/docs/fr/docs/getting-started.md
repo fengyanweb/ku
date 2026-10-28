@@ -1,9 +1,9 @@
 ---
 title: 'Premiers pas'
 description: 'Écrivez Hello Ku, vérifiez votre code et distinguez interprétation et compilation.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Cette page utilise la syntaxe de base et les commandes CLI déjà présentes dans v0.0.17. Commencez par [installer Ku](/fr/docs/install/) et vérifiez que `ku --version` fonctionne.

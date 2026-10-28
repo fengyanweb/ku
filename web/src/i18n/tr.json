@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Oluşmakta olan bir dil",
-  "siteDescription": "Deneysel programlama dili Ku ile tanışın. Gerçek örnekleri, kurulumu, dil kılavuzlarını ve arka uç desteğini keşfedin.",
+  "siteTitle": "Ku — Yerel derleme ve asenkron programlama",
+  "siteDescription": "Ku, yerel uygulamalar ve eşzamanlı servisler için yürütme verimliliğine, asenkron programlamaya ve kaynak denetimine odaklanan derlenen bir dildir.",
   "skip": "İçeriğe geç",
   "home": "Ku ana sayfa",
   "documentation": "Belgeler",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Kaynak görüntülenebilir",
   "development": "Experimental prerelease",
   "heroTitle": ["Bir fikir.", "Biraz", "Ku."],
-  "heroDescription": "Büyüme alanı olan küçük bir dil. Okunabilir sözdizimi, açık sahiplik ve ilk satırdan keşfedebileceğiniz araçlar.",
+  "heroDescription": "Ku, yerel uygulamalar ve eşzamanlı servisler için yürütme verimliliğine, asenkron programlamaya ve kaynak denetimine odaklanan derlenen bir dildir.",
   "start": "Ku yazmaya başlayın",
   "explore": "Dili keşfedin",
   "heroNote": "Erken aşamada olması tasarımın bir parçası. Keşfedin, deneyin, geri bildirim paylaşın.",
@@ -38,24 +38,40 @@
   "approachDescription": "Güncel sınırları göz önünde tutarak Ku dilini gerçek davranışı üzerinden tanıyın.",
   "features": [
     [
-      "Okuyun. Anlayın.",
-      "İlk atamada bağ bildirin. Fikrinizi işlevler, yapılandırılmış değerler ve açık hata yönetimiyle ifade edin.",
+      "Yerel programlar derleyin.",
+      "Ku CLI ile yerel çalıştırılabilir dosyalar oluşturun. Hedef platformun desteklediği dil alt kümesini ve bağımlılıklarını kontrol edin.",
+      "Kurulum ve indirmeler",
+      "docs/install"
+    ],
+    [
+      "async/await ile yazın.",
+      "Asenkron görevleri async/await ile ifade edin; çalışma zamanı seçilen arka ucun desteklediği kapsamda yürütme ve zamanlamayı yönetir.",
       "Dil kılavuzu",
       "docs/guide/language"
     ],
     [
-      "Sahipliği açık kılın.",
-      "Varsayılan olarak taşıyın, bilinçli klonlayın ve eşzamanlı çağrılarda salt okunur ödünç alın. Güncel kurallar sınırlarıyla birlikte belgelenir.",
-      "Sahiplik ve sınırlar",
-      "docs/support"
-    ],
-    [
-      "Yürütme yolunuzu seçin.",
-      "Yorumlayıcıyla çalıştırın, yürütülebilir çalıştırıcı paketleyin veya yerel C yolunu keşfedin. Arka uç seçmeden önce destek matrisini inceleyin.",
-      "Araçları keşfedin",
+      "Kaynak sınırlarını belirleyin.",
+      "Bağlantıları, etkin istekleri, bekleme kuyruklarını ve arabellekleri sınırlayın. İşletim sistemi sınırları platforma ve dağıtıma bağlıdır.",
+      "Destek matrisi",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Sabit yük gözlemleri",
+  "performanceScope": "0.0.19: Linux ARM64 VM üzerinde, her hizmete dört CPU çekirdeği ayrılarak ve iş yükü başına 30 saniye uygulanarak yedi dil sırayla tek turda çalıştırıldı. Değerler, doğru istek başına hizmet CPU süresini karşılaştırır (Ku/Rust); istek gecikmesini değil.",
+  "performanceMetrics": [
+    [
+      "CPU iş yükü — CPU maliyeti",
+      "Yaklaşık %32 daha düşük",
+      "Ku/Rust ≈ 0.678"
+    ],
+    [
+      "JSON iş yükü — CPU maliyeti",
+      "Yaklaşık %26 daha yüksek",
+      "Ku/Rust ≈ 1.260"
+    ],
+    ["PG iş yükü — CPU maliyeti", "Yaklaşık %35 daha yüksek", "Ku/Rust ≈ 1.350"]
+  ],
+  "performanceLimits": "Tek tur, kapasite veya uzun süreli kararlılık kabulü değildir. Ana makinede sayfalama ve uzun kuyruk gecikmeleri sürmektedir. PG bağlantı havuzlarının sıfırlama semantiği farklıdır. Bu turda RSS değil cgroup belleği ölçüldü; RSS karşılaştırması yapılmıyor.",
   "practiceTitle": ["Tanıdık veriler.", "Açık hatalar."],
   "practiceDescription": "Bir modül içe aktarın, değer oluşturun ve JSON olarak kodlayın. ? işleci hataları gizlemek yerine iletir.",
   "jsonReference": "JSON başvurusunu okuyun",
@@ -85,13 +101,13 @@
     ]
   ],
   "projectTitle": "Süren bir çalışma. İzlenecek bir hikâye.",
-  "projectDescription": "Bu belgeler v{releasedVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",
+  "projectDescription": "Ku v{releasedVersion} geliştirme aşamasındadır. Linux ARM64 dağıtım adayı yalıtılmış bir örnekle prova edildi; gerçek bir işin üretim kullanımı doğrulanmadı. Kendi programlarınızla değerlendirin ve geri bildirim gönderin. Yayımlanan dosyalar GitHub Releases’tedir.",
   "github": "GitHub üzerinde keşfedin",
-  "license": "Kaynak görüntülenebilir. Açık kaynak lisansı verilmemiştir.",
+  "license": "Apache-2.0 lisansı. LICENSE ve NOTICE dosyalarına bakın.",
   "verified": "Doğrulandı",
   "limitations": "Destek ve sınırlamalar",
   "version": "Belge sürümü",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "{version} anlık görüntüsü",
   "snapshotNotice": "Arşivlenmiş belge anlık görüntüsü. Güncel geliştirme belgelerinden bağımsız korunur; ikili sürüm duyurusu değildir.",
   "nextNotice": "Bu belgeler v{currentVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",

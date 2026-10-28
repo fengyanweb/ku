@@ -1,7 +1,7 @@
 ---
 title: '표준 라이브러리'
 description: 'Ku 표준 라이브러리 모듈, 주요 시그니처, 백엔드 제한.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 주요 진입점을 소스와 대조했으며 모든 API를 다루는 참조 문서는 아닙니다. 동작은 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)이 정의합니다. 백엔드 제한은 [지원 표](/ko/docs/support/)를 참고하세요.
+이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 주요 진입점을 소스와 대조했으며 모든 API를 다루는 참조 문서는 아닙니다. 동작은 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)이 정의합니다. 백엔드 제한은 [지원 표](/ko/docs/support/)를 참고하세요.
 
 ## 모듈 가져오기
 
@@ -77,7 +77,7 @@ fn main(): null! {
 
 ## 참조 문서 유지 관리
 
-공개 인터페이스 메타데이터는 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs)에 있습니다. 구현과 계약을 함께 대조합니다. 이 웹사이트는 현재 내용을 선별한 수동 참조 문서를 유지합니다. 기존 `ku doc` 명령은 확인되지 않았습니다.
+공개 인터페이스 메타데이터는 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs)에 있습니다. 구현과 계약을 함께 대조합니다. 이 웹사이트는 현재 내용을 선별한 수동 참조 문서를 유지합니다. 기존 `ku doc` 명령은 확인되지 않았습니다.
 
 ## API reference (English)
 

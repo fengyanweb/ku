@@ -1,25 +1,27 @@
 ---
 title: 'プロジェクトと貢献'
 description: 'Ku のプロジェクト状況、公開ソース、ライセンスの境界、再現可能な問題報告。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。プロジェクト名は **Ku programming language / Ku 编程语言**、CLI 名は `ku` です。Ku は開発中の小さなプログラミング言語とインタープリターです。現在の公開リリースは v0.0.18 実験的プレリリースです。
+現在のドキュメントは実験的プレリリース Ku 0.0.19 を対象とし、CLI と VS Code 拡張機能のバージョンも 0.0.19 です。公開状況、ファイル、チェックサムは実際の GitHub Release を確認してください。
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## ソースとライセンス
 
-[GitHub のソース](https://github.com/fengyanweb/ku)と[リリースページ](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)をご覧ください。ソースは公開閲覧できますが、Ku 自体のコードには**オープンソースライセンスの許諾がありません**。エディター拡張は `UNLICENSED` と表記されています。ソースやバイナリーの公開は、自動的なオープンソースライセンスの許諾にはなりません。
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-リリースアーカイブの第三者通知は、それぞれのコンポーネントにのみ適用されます。Ku 自体の使用、改変、再配布の許可を示すものではありません。必要な許可は、保守担当者が明示的に与える必要があります。このウェブサイトは新たなライセンス上の約束を作りません。
+Ku と VS Code 拡張機能は Apache License 2.0 で提供されます。[LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) と [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) を確認してください。サードパーティのコンポーネントには、それぞれの著作権表示とライセンスが適用されます。
 
 ## 問題を報告する
 
@@ -34,7 +36,7 @@ sources:
 
 ## 貢献する前に
 
-言語の挙動は[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)で定義されます。CI、実装、仕様を併せて確認してください。作業ログの目標は、実装済み機能ではありません。
+言語の挙動は[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)で定義されます。CI、実装、仕様を併せて確認してください。作業ログの目標は、実装済み機能ではありません。
 
 変更は限定し、再現方法、原因、範囲、検証を説明してください。ウェブサイトの内容は、対応するソースと併せてレビューします。既存テスト、作業ツリーの変更、固有の証拠を保全してください。貢献の受け入れとライセンスの取り決めは保守担当者が決定します。このウェブサイトは貢献契約を新設しません。
 

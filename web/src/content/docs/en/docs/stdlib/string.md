@@ -1,7 +1,7 @@
 ---
 title: Strings
 description: Unicode text, searching, slicing, transformations, and backend support.
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
@@ -75,4 +75,4 @@ slice_error
 
 ## Backend support
 
-The example works in the interpreter and synchronous native C. Unicode-aware `trim`, `lower`, and `upper` are interpreter operations in v0.0.18; native C rejects them. Other entries above have native C implementations. Do not infer general native Task or LLVM support from this synchronous example.
+The example works in the interpreter and synchronous native C. Unicode-aware `trim`, `lower`, and `upper` are interpreter operations in v0.0.19; native C rejects them. Other entries above have native C implementations. Do not infer general native Task or LLVM support from this synchronous example.

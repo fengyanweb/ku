@@ -1,7 +1,7 @@
 ---
 title: 'Erori și depanare'
 description: 'Diagnostichează erorile de instalare Ku, importuri, proprietate, JSON și capabilități ale backendurilor.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ Ieșirea este **JSON Lines**, cu un diagnostic pe linie. Câmpurile includ `leve
 | `E0913`    | Parametru async împrumutat                | Folosește un parametru deținut; clonează la apelant dacă originalul este necesar   |
 | `E0918`    | Scrierea `&value` la apel                 | Transmite un argument obișnuit; semnătura declară împrumutul                       |
 
-Acesta este un rezumat al diagnosticelor înregistrate, nu lista tuturor erorilor. Registrul normativ curent este [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+Acesta este un rezumat al diagnosticelor înregistrate, nu lista tuturor erorilor. Registrul normativ curent este [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs).
 
 ## Erorile de execuție au un contract separat
 
@@ -74,4 +74,4 @@ Trecerea `ku check` confirmă doar că verificarea frontendului a reușit. C nat
 
 Erorile de bază de date `execution_unknown` și `execution_completed_without_result` nu trebuie să declanșeze repetare automată. Păstrează dovezile cererii și operației de afaceri, apoi stabilește starea reală a execuției. Verificarea site-ului local nu necesită conectarea la o bază de date de producție.
 
-Pentru detalii, vezi [ghidul de diagnostic din depozit](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+Pentru detalii, vezi [ghidul de diagnostic din depozit](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).

@@ -1,7 +1,7 @@
 ---
 title: 'مرجع JSON'
 description: 'کدگذاری و کدگشایی JSON در Ku، تبدیل KuValue، کدهای خطا و پشتیبانی از مسیرهای اجرا.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## کدگذاری و خواندن مقدارها
 
-این یک نمونهٔ پایهٔ کامل است. شاخهٔ توسعه در [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku) نمونهٔ بازگشت‌سنجی گسترده‌تری دارد.
+این یک نمونهٔ پایهٔ کامل است. شاخهٔ توسعه در [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku) نمونهٔ بازگشت‌سنجی گسترده‌تری دارد.
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 مفسر، اجراکنندهٔ بسته‌بندی‌شدهٔ پیش‌فرض و مسیر C بومی همگام، پیاده‌سازی JSON دارند. **زیرمجموعهٔ محدود Task بومی و LLVM از JSON پشتیبانی نمی‌کنند.** واردسازی در اجراکنندهٔ پیش‌فرض همچنان به محل کد منبع وابسته است؛ پشتیبانی JSON به معنای بستهٔ کاملاً مستقل نیست.
 
-امضاها و محدودیت‌های این صفحه با کد منبع و قراردادها تطبیق داده شده‌اند. بررسی اجرا باید نسخه، commit و مسیر اجرا را مشخص کند. [قرارداد کامل نحو JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json) را ببینید.
+امضاها و محدودیت‌های این صفحه با کد منبع و قراردادها تطبیق داده شده‌اند. بررسی اجرا باید نسخه، commit و مسیر اجرا را مشخص کند. [قرارداد کامل نحو JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json) را ببینید.

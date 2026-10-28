@@ -1,7 +1,7 @@
 ---
 title: 'Référence JSON'
 description: "Encodage et décodage JSON dans Ku, conversion KuValue, codes d'erreur et prise en charge des backends."
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Encoder et lire des valeurs
 
-Voici un exemple élémentaire complet. La branche de développement contient un exemple de régression plus large dans [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Voici un exemple élémentaire complet. La branche de développement contient un exemple de régression plus large dans [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ Les erreurs récupérables utilisent le domaine `json`. Les codes courants sont 
 
 L'interpréteur, le lanceur empaqueté par défaut et le backend C natif synchrone possèdent des implémentations JSON. **Le sous-ensemble natif Task restreint et LLVM ne prennent pas en charge JSON.** Les importations du lanceur par défaut dépendent toujours de leur emplacement source ; la prise en charge de JSON n'implique pas un paquet entièrement indépendant.
 
-Les signatures et limites de cette page ont été vérifiées dans les sources et les contrats. Toute vérification d'exécution doit nommer la version, le commit et le backend. Voir le [contrat syntaxique JSON complet](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Les signatures et limites de cette page ont été vérifiées dans les sources et les contrats. Toute vérification d'exécution doit nommer la version, le commit et le backend. Voir le [contrat syntaxique JSON complet](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

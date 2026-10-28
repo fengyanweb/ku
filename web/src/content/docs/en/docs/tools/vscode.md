@@ -1,7 +1,7 @@
 ---
 title: VS Code
 description: Install the Ku extension and configure running, checking, formatting and completion.
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources:
   [
@@ -17,12 +17,12 @@ The Ku extension provides syntax highlighting, snippets, completion, formatting 
 
 ## Install
 
-Download your platform archive from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1), then extract it. Each archive contains `ku-language-0.0.18.vsix` alongside the CLI. The VSIX is inside the archive, rather than a separate Release asset.
+Download your platform archive from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19), then extract it. Each archive contains `ku-language-0.0.19.vsix` alongside the CLI. The VSIX is inside the archive, rather than a separate Release asset; consult that release page for actual availability.
 
 In VS Code, open **Extensions → … → Install from VSIX…**, select that file, then run **Developer: Reload Window**. You can also install from the extracted directory:
 
 ```sh
-code --install-extension ./ku-language-0.0.18.vsix
+code --install-extension ./ku-language-0.0.19.vsix
 ```
 
 This installation uses the released VSIX directly; it does not require a Marketplace listing.
@@ -71,4 +71,4 @@ Completion uses the extension's built-in API list and selected receiver names. I
 
 ## Update
 
-Install the VSIX from the version of Ku you use, then reload VS Code. The public v0.0.18 archive contains the extension shipped with that release. Later repository changes to completion and hover text take effect only after the extension is rebuilt and installed; they do not update an already downloaded VSIX automatically.
+Install the VSIX from the version of Ku you use, then reload VS Code. The public v0.0.19 archive contains the extension shipped with that release. Later repository changes to completion and hover text take effect only after the extension is rebuilt and installed; they do not update an already downloaded VSIX automatically.

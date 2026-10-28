@@ -1,7 +1,7 @@
 ---
 title: 標準函式庫概覽
 description: 按用途查找 Ku 標準函式庫、基礎介面與不同後端的使用邊界。
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡是經過原始碼核對的核心入口，不是全部 API 的完整參考。具體行為遵循[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)，後端範圍見[支援矩陣](/zh-tw/docs/support/)。
+本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡是經過原始碼核對的核心入口，不是全部 API 的完整參考。具體行為遵循[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)，後端範圍見[支援矩陣](/zh-tw/docs/support/)。
 
 ## 匯入模組
 
@@ -77,7 +77,7 @@ fn main(): null! {
 
 ## 參考如何維護
 
-目前公開介面元資料位於 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs)，實作與規範一起用於核查。本網站暫時維護人工整理的核心參考；目前沒有已確認的 `ku doc` 命令。
+目前公開介面元資料位於 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs)，實作與規範一起用於核查。本網站暫時維護人工整理的核心參考；目前沒有已確認的 `ku doc` 命令。
 
 ## API reference (English)
 

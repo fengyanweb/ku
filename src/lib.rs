@@ -1,4 +1,4 @@
-﻿pub mod ast;
+pub mod ast;
 pub mod backend;
 pub mod checker;
 pub mod cli;
@@ -13,6 +13,7 @@ pub mod process_execution;
 pub mod registry_admin;
 pub mod registry_server;
 pub mod runtime;
+pub mod service_supervision;
 pub mod span;
 pub mod stdlib;
 pub mod token;

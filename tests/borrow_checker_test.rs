@@ -60,6 +60,54 @@ fn borrow_checker_owning_arguments_still_move_including_function_values() {
 }
 
 #[test]
+fn borrow_checker_method_receiver_effects_are_checked_once() {
+    for source in [
+        r#"fn Make(text: str): str { return text } fn main() { text="Ku" println(Make(text).len()) }"#,
+        r#"fn Make(items: [str]): [str] { return items } fn main() { items=["Ku"] println(Make(items).len()) }"#,
+        r#"fn main() { text="Ku" println(({name:text}).get_or("name",null)) }"#,
+        r#"import json from "std.json"
+fn Make(text: str): str { return text }
+fn main(): null! { text="3" println((json.decode(Make(text))?).as_int()?) return ok(null) }"#,
+        r#"import json from "std.json"
+fn main(): null! { named=json.decode("{\"take\":3}")? println((named.take("take")?).as_int()?) return ok(null) }"#,
+        // A non-array .map, HTTP-spelled .run/.bind and ordinary callable
+        // fields all fall back after dispatch. Their factory must not move
+        // the same argument for each unsuccessful intrinsic candidate.
+        r#"struct Reader { label:str, run:fn():int, map:fn():int, bind:fn():int }
+fn Number():int { return 7 }
+fn Make(text:str):Reader { return Reader {label:text,run:Number,map:Number,bind:Number} }
+fn main() { a="a" println(Make(a).run()) b="b" println(Make(b).map()) c="c" println(Make(c).bind()) }"#,
+        // Type checking only: this source never binds a socket or runs a
+        // server during the test. Configuration evaluation still consumes x.
+        r#"import http from "std.http"
+fn Size(text:str):int { return text.len()+1 }
+fn main():null! { text="Ku" listener=http.server({max_connections:Size(text)}).bind("127.0.0.1:0")? listener.close()? return ok(null) }"#,
+    ] {
+        accepts(source);
+    }
+}
+
+#[test]
+fn borrow_checker_checked_receivers_keep_moves_views_and_argument_conflicts() {
+    accepts(r#"fn main() { text="Ku" println(text.len()) println(text) }"#);
+    rejects(
+        r#"fn Make(text:str):str { return text } fn main() { text="Ku" println(Make(text).len()) println(text) }"#,
+        "E0901",
+        "use of moved value",
+    );
+    rejects(
+        r#"import json from "std.json" fn main():null! { value=json.decode("1")? println(value.as_int()?) println(value) return ok(null) }"#,
+        "E0901",
+        "use of moved value",
+    );
+    rejects(
+        r#"fn Make(text:str):str { return text } fn Read(&text:str):int { return Make(text).len() } fn main() {}"#,
+        "E0915",
+        "cannot pass borrowed value",
+    );
+}
+
+#[test]
 fn borrow_checker_readonly_assignments_cover_roots_and_nested_places() {
     for statement in [
         "user = User { name: \"new\", age: 2, items: [1] }",
@@ -268,6 +316,28 @@ fn main(): null! {
 }
 
 #[test]
+fn borrow_checker_json_parser_aliases_accept_readonly_forwarding() {
+    accepts(
+        r#"
+struct Input { text: str }
+fn Decode(&text: str): str! { value = json.decode(text)? return json.encode(value) }
+fn Parse(&text: str): str! { value = json.parse(text)? return json.encode(value) }
+fn TryParse(&text: str): str! { value = json.try_parse(text)? return json.encode(value) }
+fn Forward(&input: Input): str! { return Decode(input.text) }
+fn Body(&req: HttpRequest): str! { value = json.decode(req.body)? return json.encode(value) }
+fn main(): null! {
+    input = Input { text: "{\"text\":\"中文😀\"}" }
+    if (Forward(input)? != Parse(input.text)? || Decode(input.text)? != TryParse(input.text)?) {
+        panic("JSON parser aliases disagree")
+    }
+    println(input.text)
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
 fn borrow_checker_consuming_iteration_match_destructure_result_boundaries() {
     rejects(
         "fn Read(&values: [str]) { for value in values { println(value) } } fn main() {}",
@@ -388,4 +458,31 @@ fn borrow_checker_json_lines_golden_and_success_silence() {
     );
     assert!(passed.stdout.is_empty());
     assert!(passed.stderr.is_empty());
+}
+
+#[test]
+fn borrow_checker_json_take_consumes_only_receiver_and_keeps_index_owned() {
+    accepts(
+        r#"
+fn main(): null! {
+    root = json.decode("{\"data\":{\"nested\":[1,true,null]},\"counter\":2}")?
+    before = root["data"]?
+    key = "data"
+    selected = root.take(key)?
+    if (key != "data" || json.encode(before)? != json.encode(selected)?) { panic("owned subtree") }
+    return ok(null)
+}
+"#,
+    );
+    for later_use in ["println(root)", "root[\"data\"]?", "root.take(\"data\")?"] {
+        rejects(
+            &format!(
+                r#"fn main(): null! {{ root = json.decode("{{\"data\":1}}")? selected = root.take("data")? {later_use} return ok(null) }}"#
+            ),
+            "E0901",
+            "use of moved value",
+        );
+    }
+    let borrowed = r#"fn Read(&value) { value.take("data") } fn main():null! { root=json.decode("{}")? Read(root) return ok(null) }"#;
+    assert!(check_source("borrow-take.ku", borrowed).is_err());
 }

@@ -1,9 +1,17 @@
 ---
 title: Time and timers
 description: Read clocks, format dates, calculate durations, and wait with std.time.
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
-sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
+sources:
+  [
+    'src/stdlib/time.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'src/ir/task_lower.rs',
+    'src/backend/c.rs',
+    'src/runtime/interpreter.rs',
+  ]
 sidebar:
   order: 6
 ---
@@ -138,3 +146,23 @@ Recoverable errors have domain `time`, with codes such as `invalid_date`, `inval
 ## Execution support
 
 The full calendar/duration API above is for `ku run` and the default packaged runner. Synchronous native C currently supports `now()`, `instant()`, `elapsed(Time)`, `millis()` / `millis(Time)` for values produced by `instant()`, and `steady_millis()`. Calendar parsing, formatting, configuration-like Time objects, and synchronous sleep are not part of that native subset. Native Task has its separately restricted integer sleep path; LLVM does not provide this complete library.
+
+<a id="native-task-wait"></a>
+
+## Native Task wait
+
+Save as `task-sleep.ku`. `ku check task-sleep.ku` and `ku build --backend c --profile release task-sleep.ku -o task-sleep` select the supported integer timer path:
+
+```ku
+import time from "std.time"
+
+async fn main(): null! {
+    time.sleep(10)?
+    println("awake")
+    return ok(null)
+}
+```
+
+Run the binary; it prints `awake` after the wait can complete. Ten milliseconds is a requested wait, not an exact scheduling or latency guarantee. Native Task accepts an integer millisecond argument here, not the general `Duration` object overload; this operation is not supported inside Task `finally`. It returns `null!` and needs `?`, not `await`. Cancellation and cleanup keep their existing absolute deadlines.
+
+Use wall-clock epoch values for interchange and monotonic differences for local elapsed time. Do not use `steady_millis` as a date, a cross-process timestamp or a native Task operation unless that lowering path explicitly supports it.

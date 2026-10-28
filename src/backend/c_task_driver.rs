@@ -7,12 +7,35 @@ use crate::error::KuResult;
 
 pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
     out.check()?;
+    // The same constants bound the finite numeric proof and the runtime loan.
+    // Emitting their values here prevents an unchecked 64-step proof from
+    // silently being reused by a longer same-drive computation.
+    out.push_str(&format!(
+        "#define KU_TASK_DRIVER_COMPUTE_BANK_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_MAX_BANKS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_PHASE_STATES ((size_t){}u)\n\
+         #define KU_TASK_DRIVER_COMPUTE_PHASE_OPERATIONS ((size_t){}u)\n",
+        super::task_range::COMPUTE_BANK_STATES,
+        super::task_range::COMPUTE_MAX_BANKS,
+        super::task_range::COMPUTE_PUBLIC_SELECTION_CREDITS,
+        super::task_range::COMPUTE_PRIVATE_SELECTION_CREDITS,
+        super::task_range::COMPUTE_MAX_OPERATIONS,
+        super::task_range::COMPUTE_RESERVATION_CREDITS,
+        super::task_range::COMPUTE_RESERVATION_STATES,
+        super::task_range::COMPUTE_PHASE_STATES,
+        super::task_range::COMPUTE_PHASE_OPERATIONS,
+    ));
     out.push_str(DRIVER_ABI);
     out.check()
 }
 
 const DRIVER_ABI: &str = r#"
-/* Internal driver ABI 10, not a public Task API, netpoll, or complete M:N scheduler.
+/* Internal driver ABI 11, not a public Task API, netpoll, or complete M:N scheduler.
  * Private V1 type spellings are retained, not their old binary layout/version.
  * Caller-owned zero-filled driver/slot/ring storage remains live until destroy
  * succeeds. Every API caller protects that storage. Init, join and destroy are
@@ -171,10 +194,11 @@ const DRIVER_ABI: &str = r#"
  * and keep healthy workers for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 10u
+#define KU_TASK_DRIVER_ABI_VERSION 12u
 #define KU_TASK_DRIVER_GLOBAL_BURST ((size_t)8u)
-#define KU_TASK_DRIVER_MAX_SLOTS ((size_t)1024u)
+#define KU_TASK_DRIVER_MAX_SLOTS ((size_t)16384u)
 #define KU_TASK_DRIVER_MAX_WORKERS ((size_t)32u)
+#define KU_TASK_DRIVER_SLICE_MAX_CREDITS ((size_t)4096u)
 enum {
   KU_TASK_DRIVER_OK = 0u, KU_TASK_DRIVER_PENDING = 1u,
   KU_TASK_DRIVER_INVALID_ARGUMENT = 7u, KU_TASK_DRIVER_ABI_MISMATCH = 8u,
@@ -278,6 +302,8 @@ typedef struct KuTaskDriverSlotV1 {
   size_t charged_bytes;
   /* Mutex-owned index+1 links/worker IDs; zero is empty, never a retained edge. */
   size_t ready_previous, ready_next, queue_worker, executor_worker;
+  size_t owner_worker; /* Stable index+1 for fixed-owner event-loop mode. */
+  uint64_t queued_at_ms;
   uint32_t state, notified, intent, owner_location;
   uint32_t deadline_fired, cancel_pending;
   uint64_t cancel_deadline;
@@ -311,17 +337,21 @@ typedef struct KuTaskDriverWorkerV1 {
   KuTaskDriverV1* driver;
   size_t index;
   size_t local_head, local_tail, local_queued, global_streak, steal_cursor;
-  uint32_t state, joined, closed;
+  uint64_t polls, progress_ms, last_queue_delay_ms, peak_queue_delay_ms;
+  uint32_t state, joined, closed, pumping, owner_bound;
 #if defined(_WIN32)
   HANDLE thread;
+  DWORD owner_thread;
 #else
   pthread_t thread;
+  pthread_t owner_thread;
 #endif
 } KuTaskDriverWorkerV1;
 typedef struct KuTaskDriverSnapshotV1 {
   size_t resident, building, queued, running, parked, retiring, terminal_held;
   size_t reserved_bytes, fixed_bytes, byte_limit;
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
+  uint64_t admission_slot_rejections,admission_byte_rejections;
   size_t timers, peak_timers, timer_limit;
   uint64_t polls, wakes, waits;
   size_t worker_target, workers_created, workers_waiting, workers_exited, workers_joined;
@@ -329,19 +359,40 @@ typedef struct KuTaskDriverSnapshotV1 {
 } KuTaskDriverSnapshotV1;
 struct KuTaskDriverV1 {
   uint32_t abi_version, initialized, closing, fault, clock_fault, sync_resources;
+  uint32_t fixed_owner, external_loops;
+  size_t next_owner;
+  /* Nonblocking notification only, called under the publication mutex.
+   * The owner loop later calls pump; this callback must never reenter driver. */
+  void* event_context;
+  void (*event_wake)(void*, size_t);
+  void* io_context;
+  int (*io_wait)(void*,size_t,uint64_t);
   size_t worker_target, workers_created, workers_waiting, workers_exited, workers_joined;
   size_t storage_size, capacity, head, global_queued, queued, running, resident, building;
   size_t reserved_bytes, fixed_bytes, byte_limit;
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
+  uint64_t admission_slot_rejections,admission_byte_rejections;
   size_t timers, peak_timers;
   uint64_t polls, wakes, waits, shutdown_deadline, next_deadline;
+  /* Private opt-in diagnostics, fixed storage; all counters are mutex-owned.
+   * Condition sleep/reacquire is separate from acquired-mutex wait and hold. */
+  uint32_t timing_enabled;
+  uint64_t timing_lock_count, timing_lock_wait_ns, timing_max_lock_wait_ns;
+  uint64_t timing_lock_hold_ns, timing_max_lock_hold_ns, timing_hold_started_ns;
+  uint64_t timing_condition_count, timing_condition_wait_ns, timing_max_condition_wait_ns;
+  uint64_t timing_clock_errors;
   /* Immutable while LIVE; close/ready callbacks are called without mutex. */
   void* blocking_pool;
   size_t blocking_pool_bytes;
+  void* blocking_storage; size_t blocking_storage_bytes;
   uint32_t (*blocking_close)(void*);
   uint32_t (*blocking_ready)(void*);
   KuTaskDriverSlotV1* slots;
   size_t* ring;
+  /* Driver-owned pointer identities, never leases. One compact allocation at
+   * init; only the publication mutex changes cells/count. No tombstones. */
+  KuTaskControlV1** binding_keys;
+  size_t binding_cells, binding_count;
   KuTaskDriverMutexV1 mutex;
   KuTaskDriverConditionV1 condition, work_condition;
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -349,6 +400,51 @@ struct KuTaskDriverV1 {
 #endif
   KuTaskDriverWorkerV1 workers[KU_TASK_DRIVER_MAX_WORKERS];
 };
+/* Includes every fixed index cell, independently from sparse resident Tasks.
+ * Callers use this same checked total for preflight and exact byte budgets. */
+static size_t ku_task_driver_fixed_storage_bytes(size_t capacity) {
+  const size_t per_slot=sizeof(KuTaskDriverSlotV1)+sizeof(size_t)+2u*sizeof(KuTaskControlV1*);
+  if (!capacity || capacity>KU_TASK_DRIVER_MAX_SLOTS
+      || capacity>(SIZE_MAX-sizeof(KuTaskDriverV1))/per_slot) return 0;
+  return sizeof(KuTaskDriverV1)+capacity*per_slot;
+}
+/* Only the trusted HTTP factory uses this scoped, thread-local entry hint.
+ * Existing hosted children inherit their parent's immutable owner instead. */
+static KU_THREAD_LOCAL size_t ku_task_driver_entry_owner;
+/* A generated resume may declare its ordinary ready continuation without
+ * another publication-lock round trip. This pointer never escapes its thread:
+ * run_one owns the stack record and its live execution lease, saving/restoring
+ * an outer record around nested execution. Shared slot intent stays mutex-owned.
+ * A real WAIT/YIELD publication during the callback takes precedence. */
+typedef struct KuTaskDriverComputeBudgetV1 {
+  size_t credit_limit, credits_used, states_used;
+  uint64_t started_ms;
+  uint32_t active, open, reported, invalid, clock_fault, time_exhausted;
+  size_t reservation_capacity, operations_used;
+  uint64_t last_observed_ms;
+  uint32_t reserved;
+  size_t reservation_credit_limit;
+} KuTaskDriverComputeBudgetV1;
+typedef struct KuTaskDriverExecutionV1 {
+  KuTaskDriverV1* driver;
+  size_t slot;
+  uint64_t generation;
+  KuTaskControlV1* control;
+  uint32_t default_yield, cooperative_yield, intent_touched, scalar_quantum, pure_ready;
+  KuTaskDriverComputeBudgetV1 compute;
+  uint64_t compute_stop_at_ms;
+  uint32_t reservation_allowed;
+} KuTaskDriverExecutionV1;
+static KU_THREAD_LOCAL KuTaskDriverExecutionV1* ku_task_driver_execution;
+/* Called immediately after an existing mutex-owned explicit intent write.
+ * Such a quantum cannot be combined with the next one, even if generated
+ * computation later exhausts its dispatch budget. No shared state is changed. */
+static void ku_task_driver_note_intent_locked(KuTaskDriverV1* driver,KuTaskDriverSlotV1* slot) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (execution && execution->driver==driver && execution->slot==(size_t)(slot-driver->slots)
+      && execution->generation==slot->generation && execution->control==slot->binding)
+    execution->intent_touched=1;
+}
 static uint64_t ku_task_driver_now_ms(void) {
   /* UINT64_MAX is a clock failure/range sentinel, never a valid sampled time.
    * Returning zero on failure would allow expired waits to retry forever. */
@@ -365,19 +461,83 @@ static uint64_t ku_task_driver_now_ms(void) {
 #endif
 }
 static uint64_t ku_task_driver_min(uint64_t a, uint64_t b) { return a < b ? a : b; }
-static int ku_task_driver_lock(KuTaskDriverV1* driver) {
+/* A zero/failing/backwards sample is diagnostic loss, never elapsed time.
+ * Saturation preserves bounded counters even during a very long-lived run. */
+static uint64_t ku_task_driver_timing_now_ns(void) {
 #if defined(_WIN32)
-  AcquireSRWLockExclusive(&driver->mutex); return 0;
+  LARGE_INTEGER counter, frequency;
+  if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0
+      || !QueryPerformanceCounter(&counter) || counter.QuadPart<=0) return 0;
+  uint64_t ticks=(uint64_t)counter.QuadPart, hz=(uint64_t)frequency.QuadPart;
+  uint64_t seconds=ticks/hz, remainder=ticks%hz;
+  if (seconds>UINT64_MAX/UINT64_C(1000000000)
+      || remainder>UINT64_MAX/UINT64_C(1000000000)) return 0;
+  uint64_t whole=seconds*UINT64_C(1000000000), fraction=remainder*UINT64_C(1000000000)/hz;
+  return fraction>UINT64_MAX-whole ? 0 : whole+fraction;
 #else
-  return pthread_mutex_lock(&driver->mutex);
+  struct timespec value;
+  if (clock_gettime(CLOCK_MONOTONIC,&value) || value.tv_sec<0
+      || value.tv_nsec<0 || value.tv_nsec>=1000000000L) return 0;
+  uint64_t seconds=(uint64_t)value.tv_sec;
+  if (seconds>UINT64_MAX/UINT64_C(1000000000)) return 0;
+  uint64_t whole=seconds*UINT64_C(1000000000), fraction=(uint64_t)value.tv_nsec;
+  return fraction>UINT64_MAX-whole ? 0 : whole+fraction;
 #endif
 }
+static void ku_task_driver_timing_add(uint64_t* counter,uint64_t amount) {
+  *counter=amount>UINT64_MAX-*counter ? UINT64_MAX : *counter+amount;
+}
+static void ku_task_driver_timing_interval(KuTaskDriverV1* driver,uint64_t from,uint64_t to,
+    uint64_t* total,uint64_t* maximum) {
+  if (!from || !to || to<from) { ku_task_driver_timing_add(&driver->timing_clock_errors,1u); return; }
+  uint64_t duration=to-from;
+  ku_task_driver_timing_add(total,duration);
+  if (duration>*maximum) *maximum=duration;
+}
+static void ku_task_driver_timing_hold_end(KuTaskDriverV1* driver,uint64_t now) {
+  ku_task_driver_timing_interval(driver,driver->timing_hold_started_ns,now,
+      &driver->timing_lock_hold_ns,&driver->timing_max_lock_hold_ns);
+  driver->timing_hold_started_ns=0;
+}
+static int ku_task_driver_lock(KuTaskDriverV1* driver) {
+  uint64_t started=driver->timing_enabled ? ku_task_driver_timing_now_ns() : 0;
+#if defined(_WIN32)
+  AcquireSRWLockExclusive(&driver->mutex);
+  int result=0;
+#else
+  int result=pthread_mutex_lock(&driver->mutex);
+#endif
+  if (!result && driver->timing_enabled) {
+    uint64_t now=ku_task_driver_timing_now_ns();
+    ku_task_driver_timing_add(&driver->timing_lock_count,1u);
+    ku_task_driver_timing_interval(driver,started,now,&driver->timing_lock_wait_ns,&driver->timing_max_lock_wait_ns);
+    driver->timing_hold_started_ns=now;
+  }
+  return result;
+}
 static int ku_task_driver_unlock(KuTaskDriverV1* driver) {
+  if (driver->timing_enabled) ku_task_driver_timing_hold_end(driver,ku_task_driver_timing_now_ns());
 #if defined(_WIN32)
   ReleaseSRWLockExclusive(&driver->mutex); return 0;
 #else
   return pthread_mutex_unlock(&driver->mutex);
 #endif
+}
+/* Condition APIs release/reacquire the OS mutex internally. Pause hold timing
+ * before sleeping; the separate duration includes sleep AND mutex reacquire,
+ * and must not be interpreted as ready-for-CPU or mutex contention alone. */
+static uint64_t ku_task_driver_timing_condition_begin(KuTaskDriverV1* driver) {
+  if (!driver->timing_enabled) return 0;
+  uint64_t now=ku_task_driver_timing_now_ns();
+  ku_task_driver_timing_hold_end(driver,now);
+  return now;
+}
+static void ku_task_driver_timing_condition_end(KuTaskDriverV1* driver,uint64_t started) {
+  if (!driver->timing_enabled) return;
+  uint64_t now=ku_task_driver_timing_now_ns();
+  ku_task_driver_timing_add(&driver->timing_condition_count,1u);
+  ku_task_driver_timing_interval(driver,started,now,&driver->timing_condition_wait_ns,&driver->timing_max_condition_wait_ns);
+  driver->timing_hold_started_ns=now;
 }
 static void ku_task_driver_signal(KuTaskDriverV1* driver) {
 #if defined(_WIN32)
@@ -389,10 +549,30 @@ static void ku_task_driver_signal(KuTaskDriverV1* driver) {
 /* Worker work and external state observers deliberately use separate channels.
  * A worker's parking announcement must not wake another idle worker. */
 static void ku_task_driver_signal_work(KuTaskDriverV1* driver) {
+  if (driver->event_wake)
+    for (size_t i=0;i<driver->workers_created;i++) driver->event_wake(driver->event_context,i);
 #if defined(_WIN32)
   WakeAllConditionVariable(&driver->work_condition);
 #else
   if (pthread_cond_broadcast(&driver->work_condition) != 0) driver->fault = KU_TASK_DRIVER_INTERNAL;
+#endif
+}
+/* Ordinary fixed-owner work has exactly one possible executor. External
+ * loops do not wait on the driver's internal work condition at all. Keep
+ * broadcast for startup/close/fault and legacy shared-condition workers. */
+static void ku_task_driver_signal_owner(KuTaskDriverV1* driver,size_t owner) {
+  if(driver->fixed_owner && driver->event_wake && owner && owner<=driver->workers_created) {
+    /* The active external pump rechecks ready work and reports deadline zero
+     * under this same mutex before returning. Later publication observes
+     * pumping==0 and keeps its directed wake; self-notification adds no work. */
+    if(driver->external_loops && driver->workers[owner-1u].pumping)return;
+    driver->event_wake(driver->event_context,owner-1u);
+    if(driver->external_loops || driver->io_wait)return;
+  } else {ku_task_driver_signal_work(driver);return;}
+#if defined(_WIN32)
+  WakeAllConditionVariable(&driver->work_condition);
+#else
+  if(pthread_cond_broadcast(&driver->work_condition))driver->fault=KU_TASK_DRIVER_INTERNAL;
 #endif
 }
 /* Requires mutex. 0: notification/spurious wake; 1: deadline; -1: OS error;
@@ -409,10 +589,18 @@ static int ku_task_driver_wait_on(
     uint64_t remaining = deadline - now;
     delay = remaining >= (uint64_t)INFINITE ? INFINITE - 1u : (DWORD)remaining;
   }
-  if (SleepConditionVariableSRW(condition, &driver->mutex, delay, 0)) return 0;
-  return GetLastError() == ERROR_TIMEOUT ? 1 : -1;
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
+  int slept=SleepConditionVariableSRW(condition, &driver->mutex, delay, 0);
+  DWORD error=slept ? 0 : GetLastError();
+  ku_task_driver_timing_condition_end(driver,timing_started);
+  return slept ? 0 : error == ERROR_TIMEOUT ? 1 : -1;
 #else
-  if (deadline == UINT64_MAX) return pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
+  if (deadline == UINT64_MAX) {
+    uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
+    int result=pthread_cond_wait(condition, &driver->mutex);
+    ku_task_driver_timing_condition_end(driver,timing_started);
+    return result == 0 ? 0 : -1;
+  }
   uint64_t remaining = deadline - now;
   /* Use at most a day for the OS conversion, then recheck the absolute budget.
    * This is a platform range bound, not a progress-poll interval. */
@@ -421,6 +609,7 @@ static int ku_task_driver_wait_on(
 #if defined(__APPLE__)
   timeout.tv_sec = (time_t)(remaining / 1000u);
   timeout.tv_nsec = (long)((remaining % 1000u) * 1000000u);
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
   int result = pthread_cond_timedwait_relative_np(condition, &driver->mutex, &timeout);
 #else
   /* The condition uses CLOCK_MONOTONIC too. Reconstructing from a SECOND clock
@@ -430,8 +619,10 @@ static int ku_task_driver_wait_on(
   timeout.tv_sec = (time_t)(wake_at / 1000u);
   if ((uint64_t)timeout.tv_sec != wake_at / 1000u) return -1;
   timeout.tv_nsec = (long)((wake_at % 1000u) * 1000000u);
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
   int result = pthread_cond_timedwait(condition, &driver->mutex, &timeout);
 #endif
+  ku_task_driver_timing_condition_end(driver,timing_started);
   return result == 0 ? 0 : result == ETIMEDOUT ? 1 : -1;
 #endif
 }
@@ -443,11 +634,14 @@ static int ku_task_driver_wait_work(KuTaskDriverV1* driver, uint64_t deadline) {
 }
 static int ku_task_driver_wait_without_clock(KuTaskDriverV1* driver) {
   KuTaskDriverConditionV1* condition = &driver->work_condition;
+  uint64_t timing_started=ku_task_driver_timing_condition_begin(driver);
 #if defined(_WIN32)
-  return SleepConditionVariableSRW(condition, &driver->mutex, INFINITE, 0) ? 0 : -1;
+  int result=SleepConditionVariableSRW(condition, &driver->mutex, INFINITE, 0) ? 0 : -1;
 #else
-  return pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
+  int result=pthread_cond_wait(condition, &driver->mutex) == 0 ? 0 : -1;
 #endif
+  ku_task_driver_timing_condition_end(driver,timing_started);
+  return result;
 }
 static uint32_t ku_task_driver_check_lifecycle(KuTaskDriverV1* driver) {
   if (!ku_task_frame_storage_valid(driver, sizeof(*driver), sizeof(*driver),
@@ -474,6 +668,55 @@ static uint32_t ku_task_driver_check_ticket(const KuTaskDriverTicketV1* ticket) 
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
   return ku_task_driver_check(ticket->driver);
 }
+/* Exact2*capacity cells keep load<=1/2. Expected short lookup is not a
+ * worst-case constant-time claim: every collision walk is bounded by cells.
+ * Hashing/comparing identities never dereferences a stored control. */
+static size_t ku_task_driver_binding_home(KuTaskControlV1* control,size_t cells) {
+  uintptr_t key=(uintptr_t)control;
+#if UINTPTR_MAX>UINT32_MAX
+  key^=key>>30; key*=UINT64_C(0xbf58476d1ce4e5b9);
+  key^=key>>27; key*=UINT64_C(0x94d049bb133111eb); key^=key>>31;
+#else
+  key^=key>>16; key*=UINT32_C(0x7feb352d);
+  key^=key>>15; key*=UINT32_C(0x846ca68b); key^=key>>16;
+#endif
+  return (size_t)(key%cells);
+}
+/* Requires mutex. Returns1 for duplicate,0 with an empty insertion cell,-1
+ * for malformed storage. A failed/retryable commit does not change the set. */
+static int ku_task_driver_binding_find(KuTaskDriverV1* driver,KuTaskControlV1* control,
+    size_t* position) {
+  if (!control || !driver->capacity || driver->capacity>KU_TASK_DRIVER_MAX_SLOTS
+      || !driver->binding_keys || driver->binding_cells!=2u*driver->capacity
+      || driver->binding_count>driver->capacity) return -1;
+  size_t cell=ku_task_driver_binding_home(control,driver->binding_cells);
+  for(size_t probes=0;probes<driver->binding_cells;probes++) {
+    KuTaskControlV1* key=driver->binding_keys[cell];
+    if (!key) { *position=cell; return 0; }
+    if (key==control) { *position=cell; return 1; }
+    cell=cell+1u==driver->binding_cells ? 0u:cell+1u;
+  }
+  return -1;
+}
+/* Requires mutex and the still-live registry lease. Backshift deletion keeps
+ * probe chains searchable without accumulating tombstones across slot reuse.
+ * Deletion must finish before binding retirement can release/free control. */
+static int ku_task_driver_binding_remove(KuTaskDriverV1* driver,KuTaskControlV1* control) {
+  size_t hole=0;
+  if (!driver->binding_count || ku_task_driver_binding_find(driver,control,&hole)!=1) return 0;
+  size_t cells=driver->binding_cells;
+  size_t scan=hole+1u==cells ? 0u:hole+1u;
+  for(size_t probes=0;probes<cells;probes++) {
+    KuTaskControlV1* key=driver->binding_keys[scan];
+    if (!key) { driver->binding_keys[hole]=NULL; driver->binding_count--; return 1; }
+    size_t home=ku_task_driver_binding_home(key,cells);
+    size_t to_hole=hole>=home ? hole-home:cells-home+hole;
+    size_t to_scan=scan>=home ? scan-home:cells-home+scan;
+    if (to_hole<to_scan) { driver->binding_keys[hole]=key; hole=scan; }
+    scan=scan+1u==cells ? 0u:scan+1u;
+  }
+  return 0; /* Corrupt/full set: caller quarantines, never releases a binding. */
+}
 static int ku_task_driver_external_storage(
     KuTaskDriverV1* driver, const void* pointer, size_t size, size_t alignment) {
   return ku_task_frame_storage_valid(pointer, size, size, alignment)
@@ -482,26 +725,37 @@ static int ku_task_driver_external_storage(
                                        driver->capacity * sizeof(*driver->slots))
       && !ku_task_frame_ranges_overlap(pointer, size, driver->ring,
                                        driver->capacity * sizeof(*driver->ring))
+      && (!driver->binding_keys || !ku_task_frame_ranges_overlap(pointer,size,
+          driver->binding_keys,driver->binding_cells*sizeof(*driver->binding_keys)))
       && (!driver->blocking_pool || !ku_task_frame_ranges_overlap(pointer,size,
-          driver->blocking_pool,driver->blocking_pool_bytes));
+          driver->blocking_pool,driver->blocking_pool_bytes))
+      && (!driver->blocking_storage || !ku_task_frame_ranges_overlap(pointer,size,
+          driver->blocking_storage,driver->blocking_storage_bytes));
 }
 /* Exclusive setup, before the first admission. Fixed pool storage remains
  * protected through the driver's final destroy, including a timed-out close. */
 static uint32_t ku_task_driver_attach_blocking(KuTaskDriverV1* driver,
-    void* pool, size_t bytes, uint32_t (*close)(void*), uint32_t (*ready)(void*)) {
+    void* pool, size_t bytes, uint32_t (*close)(void*), uint32_t (*ready)(void*),
+    void* storage,size_t storage_bytes) {
   uint32_t checked=ku_task_driver_check(driver);
   if (checked!=KU_TASK_DRIVER_OK) return checked;
   if (!pool || !bytes || !close || !ready
-      || !ku_task_driver_external_storage(driver,pool,bytes,1)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+      || !storage || !storage_bytes || storage_bytes>SIZE_MAX-bytes
+      || !ku_task_driver_external_storage(driver,pool,bytes,1)
+      || !ku_task_driver_external_storage(driver,storage,storage_bytes,1)
+      || ku_task_frame_ranges_overlap(pool,bytes,storage,storage_bytes)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t total=bytes+storage_bytes;
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
   uint32_t status=driver->blocking_pool || driver->resident || driver->building || driver->closing
       ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
   if (status==KU_TASK_DRIVER_OK && (driver->fixed_bytes>driver->byte_limit
-      || bytes>driver->byte_limit-driver->fixed_bytes)) status=KU_TASK_DRIVER_LIMIT;
+      || driver->reserved_bytes>driver->byte_limit-driver->fixed_bytes
+      || total>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes)) status=KU_TASK_DRIVER_LIMIT;
   if (status==KU_TASK_DRIVER_OK) {
     driver->blocking_pool=pool; driver->blocking_pool_bytes=bytes;
+    driver->blocking_storage=storage; driver->blocking_storage_bytes=storage_bytes;
     driver->blocking_close=close; driver->blocking_ready=ready;
-    driver->fixed_bytes+=bytes;
+    driver->fixed_bytes+=total;
   }
   ku_task_driver_unlock(driver);
   return status;
@@ -543,7 +797,7 @@ static void ku_task_driver_arm_deadline(KuTaskDriverV1* driver, KuTaskDriverSlot
     driver->next_deadline = ku_task_driver_min(driver->next_deadline, slot->scope_wait_deadline);
   if (slot->timer_state == KU_TASK_DRIVER_TIMER_ARMED)
     driver->next_deadline = ku_task_driver_min(driver->next_deadline, slot->timer_deadline);
-  if (driver->next_deadline < previous) ku_task_driver_signal_work(driver);
+  if (driver->next_deadline < previous) ku_task_driver_signal_owner(driver,slot->owner_worker);
 }
 static void ku_task_driver_enter_clock_fault(KuTaskDriverV1* driver);
 /* Requires mutex and a protected driver lifetime. */
@@ -583,6 +837,12 @@ static int ku_task_driver_unlink_local(KuTaskDriverV1* driver, size_t index) {
 }
 static void ku_task_driver_enqueue_ready(KuTaskDriverV1* driver, size_t index, size_t local_worker) {
   KuTaskDriverSlotV1* slot = &driver->slots[index];
+  if (driver->fixed_owner) {
+    if (!slot->owner_worker || slot->owner_worker>driver->workers_created) {
+      driver->fault=KU_TASK_DRIVER_INTERNAL; return;
+    }
+    local_worker=slot->owner_worker;
+  }
   if (slot->cleanup_fault) return; /* Quarantined, never a retryable Pending. */
   if (slot->state == KU_TASK_DRIVER_RUNNING) { slot->notified = 1; return; }
   if (slot->state == KU_TASK_DRIVER_BUILDING
@@ -625,10 +885,10 @@ static void ku_task_driver_enqueue_ready(KuTaskDriverV1* driver, size_t index, s
     driver->ring[(driver->head + driver->global_queued) % driver->capacity] = index;
     driver->global_queued++;
   }
-  if (!already_queued) driver->queued++;
+  if (!already_queued) { driver->queued++; slot->queued_at_ms=ku_task_driver_now_ms(); }
   if (driver->queued > driver->peak_queued) driver->peak_queued = driver->queued;
   slot->state = KU_TASK_DRIVER_QUEUED;
-  ku_task_driver_signal_work(driver);
+  ku_task_driver_signal_owner(driver,slot->owner_worker);
   ku_task_driver_signal(driver);
 }
 /* Bounded shape/accounting preflight before publication can move ownership.
@@ -665,6 +925,18 @@ static void ku_task_driver_enqueue_local(KuTaskDriverV1* driver, size_t index, s
  * one local selection per eight global selections prevents local starvation.
  * A local selection clears the streak, preserving external Marker progress. */
 static int ku_task_driver_take_ready(KuTaskDriverV1* driver, KuTaskDriverWorkerV1* worker, size_t* output) {
+  if (driver->fixed_owner) {
+    size_t selected=worker->local_head;
+    if (!selected || selected>driver->capacity
+        || driver->slots[selected-1].owner_worker!=worker->index+1
+        || !ku_task_driver_unlink_local(driver,selected-1)) {
+      driver->fault=KU_TASK_DRIVER_INTERNAL; return 0;
+    }
+    *output=selected-1;
+    if (!driver->queued) { driver->fault=KU_TASK_DRIVER_INTERNAL; return 0; }
+    driver->queued--;
+    return 1;
+  }
   if (driver->global_queued && worker->global_streak < KU_TASK_DRIVER_GLOBAL_BURST) {
     *output = driver->ring[driver->head];
     driver->head = (driver->head + 1) % driver->capacity;
@@ -1265,6 +1537,7 @@ static uint32_t ku_task_driver_wait_arm(
     if (result == KU_TASK_DRIVER_WAIT_READY) {
       /* A caller may retry take on its next quantum; no empty WAIT is parked. */
       parent->intent = KU_TASK_DRIVER_YIELD;
+      ku_task_driver_note_intent_locked(driver,parent);
     } else if (result == KU_TASK_DRIVER_PENDING) {
       parent->wait_epoch++;
       parent->wait_state = KU_TASK_DRIVER_WAIT_ARMED; parent->wait_outcome = KU_TASK_DRIVER_PENDING;
@@ -1274,6 +1547,7 @@ static uint32_t ku_task_driver_wait_arm(
       child->waiter_epoch = parent->wait_epoch;
       *output = (KuTaskDriverWaitTokenV1){ driver, parent_ticket->slot, parent_ticket->generation, parent->wait_epoch };
       parent->intent = KU_TASK_DRIVER_WAIT;
+      ku_task_driver_note_intent_locked(driver,parent);
       /* R2 atomics publish outside this mutex. Recheck both cancellation and
        * readiness; later publications must visit their post-store wrapper hook. */
       ku_task_driver_wait_cancel_check_locked(driver, parent_ticket->slot);
@@ -1362,6 +1636,7 @@ static uint32_t ku_task_driver_cleanup_wait_arm(
       child->waiter_epoch = parent->wait_epoch;
       *output = (KuTaskDriverWaitTokenV1){ driver, parent_ticket->slot, parent->generation, parent->wait_epoch };
       parent->intent = KU_TASK_DRIVER_WAIT;
+      ku_task_driver_note_intent_locked(driver,parent);
       ku_task_driver_scope_refresh_locked(driver, parent_ticket->slot);
       ku_task_driver_wait_publish_locked(driver, receipt->slot);
       result = KU_TASK_DRIVER_PENDING;
@@ -1432,7 +1707,10 @@ static uint32_t ku_task_driver_wait_detach(KuTaskDriverWaitTokenV1* token) {
      * INTERNAL visible and do not mutate somebody else's unmatched link or
      * pretend to consume this token, but still unblock the affected parent. */
     if (parent->state == KU_TASK_DRIVER_RUNNING) {
-      if (parent->intent == KU_TASK_DRIVER_WAIT) parent->intent = KU_TASK_DRIVER_YIELD;
+      if (parent->intent == KU_TASK_DRIVER_WAIT) {
+        parent->intent = KU_TASK_DRIVER_YIELD;
+        ku_task_driver_note_intent_locked(driver,parent);
+      }
     } else ku_task_driver_enqueue(driver, index);
   }
   ku_task_driver_unlock(driver);
@@ -1487,6 +1765,7 @@ static uint32_t ku_task_driver_timer_arm(
     if (driver->timers > driver->peak_timers) driver->peak_timers = driver->timers;
     *output = (KuTaskDriverTimerTokenV1){driver, ticket->slot, ticket->generation, slot->timer_epoch};
     slot->intent = slot->timer_state == KU_TASK_DRIVER_TIMER_ARMED ? KU_TASK_DRIVER_WAIT : KU_TASK_DRIVER_YIELD;
+    ku_task_driver_note_intent_locked(driver,slot);
     ku_task_driver_arm_deadline(driver, slot);
     ku_task_driver_timer_cancel_check_locked(driver, ticket->slot);
     result = slot->timer_state == KU_TASK_DRIVER_TIMER_ABORTED ? KU_TASK_DRIVER_WAIT_ABORTED
@@ -1556,6 +1835,7 @@ static uint32_t ku_task_driver_timer_detach(KuTaskDriverTimerTokenV1* token) {
          * detaching it must still supply its one continuation; restricting
          * this to the old WAIT intent strands a bounded rearm transition. */
         slot->intent = KU_TASK_DRIVER_YIELD;
+        ku_task_driver_note_intent_locked(driver,slot);
       } else ku_task_driver_enqueue(driver, (size_t)(slot - driver->slots));
     }
   }
@@ -1615,9 +1895,193 @@ static uint32_t ku_task_driver_set_intent(const KuTaskDriverTicketV1* ticket, ui
   KuTaskDriverSlotV1* slot = ku_task_driver_find(ticket);
   uint32_t result = !slot ? KU_TASK_DRIVER_STALE : slot->state != KU_TASK_DRIVER_RUNNING
       ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
-  if (result == KU_TASK_DRIVER_OK) slot->intent = intent;
+  if (result == KU_TASK_DRIVER_OK) {
+    slot->intent = intent;
+    ku_task_driver_note_intent_locked(driver,slot);
+  }
   ku_task_driver_unlock(driver);
   return result;
+}
+/* Only the generated callback's initial default can use this local path.
+ * Later explicit YIELD/WAIT calls must preserve their original ordered slot
+ * publications. A direct raw-adapter caller retains the old locked contract. */
+static uint32_t ku_task_driver_begin_quantum(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (execution && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control) {
+    execution->default_yield=1;
+    return KU_TASK_DRIVER_OK;
+  }
+  return ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_YIELD);
+}
+/* Only a generated bounded fuel/operation stop emits this witness. Pending
+ * from timers, I/O, child waits, cleanup or a raw callback is not cooperative
+ * ready work and must return through the original locked commit path. */
+static void ku_task_driver_note_quantum_yield(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,int scalar_quantum) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control) {
+    execution->cooperative_yield=1;
+    execution->scalar_quantum=scalar_quantum!=0;
+  }
+}
+/* This local witness never reads cached shared charges. The adapter separately
+ * excludes blocking functions, active children/receipts, waits and drain. */
+static int ku_task_driver_scalar_quantum(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  return execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control
+      && execution->cooperative_yield && execution->scalar_quantum && !execution->intent_touched
+      && ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE;
+}
+/* The charge-only frame witness is insufficient: only the generated adapter
+ * can exclude active waits/receipts/drain and blocking/finally behavior after
+ * its complete return path. This thread-local fact never publishes a shared
+ * queue/intent and cannot authorize a second poll through raw pump(1). */
+static void ku_task_driver_note_pure_ready(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (execution && ticket && execution->driver==ticket->driver && execution->slot==ticket->slot
+      && execution->generation==ticket->generation && execution->control==control)
+    execution->pure_ready=1;
+}
+/* One callback-scoped work allowance, not another lease or shared clock.
+ * Complete generated adapters opt in; raw frame/control callers have none.
+ * Each borrowed bank keeps the original 64-state fuel unit. Its successful
+ * grant spends one pump credit, independently from actual resume-call metrics.
+ * No pointer to this stack record may escape the registered resume callback. */
+static KuTaskDriverComputeBudgetV1* ku_task_driver_compute_budget(
+    const KuTaskDriverTicketV1* ticket,KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  if (!execution || !ticket || execution->driver!=ticket->driver || execution->slot!=ticket->slot
+      || execution->generation!=ticket->generation || execution->control!=control
+      || !execution->compute.credit_limit) return NULL;
+  return &execution->compute;
+}
+static void ku_task_driver_compute_begin(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,int allowed) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget) return;
+  budget->active=allowed && ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE;
+  budget->open=budget->active && budget->credit_limit>1u;
+}
+static uint32_t ku_task_driver_compute_borrow_bank(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->open || budget->invalid || budget->reserved
+      || budget->credits_used>=budget->credit_limit
+      || ku_task_driver_execution->intent_touched) return 0;
+  uint64_t now=ku_task_driver_now_ms();
+  if (now==UINT64_MAX || now<budget->started_ms) {
+    budget->clock_fault=1; budget->open=0; return 0;
+  }
+  if (now-budget->started_ms>=1u) {
+    budget->time_exhausted=1; budget->open=0; return 0;
+  }
+  /* A request may publish while the real clock is being read. Observe it
+   * before granting the next bank, never reuse the pre-clock phase value. */
+  if (ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE) {
+    budget->open=0; return 0;
+  }
+  budget->credits_used++;
+  return 1;
+}
+static void ku_task_driver_compute_close_banks(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (budget) budget->open=0; /* Retain report scope through this bank's tail. */
+}
+static void ku_task_driver_compute_report_states(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t used_in_current_bank) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active) return;
+  if (budget->reserved || used_in_current_bank>KU_TASK_DRIVER_COMPUTE_BANK_STATES
+      || !budget->credits_used || budget->credits_used>budget->credit_limit) {
+    budget->invalid=1; budget->reported=0; budget->open=0; return;
+  }
+  budget->states_used=KU_TASK_DRIVER_COMPUTE_BANK_STATES*(budget->credits_used-1u)
+      +used_in_current_bank;
+  budget->reported=1;
+}
+/* A private HTTP slice may reserve finite compute CAPACITY, never charge it.
+ * Fresh clock decisions retain the slice's immutable origin/real deadline.
+ * The post-clock acquire observes cancellation published during that read. */
+static int ku_task_driver_compute_observe(KuTaskDriverComputeBudgetV1* budget,
+    KuTaskControlV1* control) {
+  KuTaskDriverExecutionV1* execution=ku_task_driver_execution;
+  uint64_t now=ku_task_driver_now_ms();
+  size_t phase=ku_task_control_atomic_load(&control->phase);
+  if (now==UINT64_MAX || now<budget->started_ms
+      || (budget->last_observed_ms && now<budget->last_observed_ms)) {
+    budget->clock_fault=1; budget->open=0; return 0;
+  }
+  budget->last_observed_ms=now;
+  if (now>=execution->compute_stop_at_ms) {
+    budget->time_exhausted=1; budget->open=0; return 0;
+  }
+  if (phase!=KU_TASK_CONTROL_LIVE) { budget->open=0; return 0; }
+  return 1;
+}
+static size_t ku_task_driver_compute_reserve_begin(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !ku_task_driver_execution->reservation_allowed
+      || budget->invalid || budget->reserved || ku_task_driver_execution->intent_touched)
+    return 0;
+  if (budget->credit_limit>KU_TASK_DRIVER_COMPUTE_MAX_BANKS
+      || !budget->reservation_credit_limit
+      || budget->reservation_credit_limit>KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS) {
+    budget->invalid=1; budget->open=0; return SIZE_MAX;
+  }
+  budget->reserved=1;
+  budget->credit_limit=budget->reservation_credit_limit;
+  budget->reservation_capacity=budget->credit_limit*KU_TASK_DRIVER_COMPUTE_BANK_STATES;
+  if (budget->reservation_capacity>KU_TASK_DRIVER_COMPUTE_RESERVATION_STATES) {
+    budget->invalid=1; budget->open=0; return SIZE_MAX;
+  }
+  budget->open=1;
+  if (!ku_task_driver_compute_observe(budget,control)) return SIZE_MAX;
+  return budget->reservation_capacity;
+}
+static void ku_task_driver_compute_report_reservation(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t states,size_t operations) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->reserved) return;
+  size_t credits=states ? 1u+(states-1u)/KU_TASK_DRIVER_COMPUTE_BANK_STATES : 1u;
+  if (states>budget->reservation_capacity || operations>KU_TASK_DRIVER_COMPUTE_MAX_OPERATIONS
+      || credits>budget->credit_limit || states<budget->states_used
+      || operations<budget->operations_used) {
+    budget->invalid=1; budget->reported=0; budget->open=0; return;
+  }
+  budget->states_used=states; budget->operations_used=operations;
+  budget->credits_used=credits; budget->reported=1;
+}
+static int ku_task_driver_compute_reservation_boundary(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,size_t states,size_t operations) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget || !budget->active || !budget->reserved) return 0;
+  ku_task_driver_compute_report_reservation(ticket,control,states,operations);
+  budget->open=0;
+  if (budget->invalid) return 0;
+  return ku_task_driver_compute_observe(budget,control);
+}
+static int ku_task_driver_compute_end(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control) {
+  KuTaskDriverComputeBudgetV1* budget=ku_task_driver_compute_budget(ticket,control);
+  if (!budget) return 1;
+  if (budget->reserved) {
+    if (!budget->reported) budget->invalid=1;
+    if (!budget->invalid) (void)ku_task_driver_compute_observe(budget,control);
+  }
+  /* R2 may invoke cleanup after resume returns. Its drive must never replace
+   * the normal callback's fuel report, even when it uses the same host. */
+  budget->active=0; budget->open=0;
+  return !budget->invalid;
 }
 static uint32_t ku_task_driver_wrapper_begin(
     const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease) {
@@ -1912,6 +2376,27 @@ static uint32_t ku_task_driver_transfer_charge(
   ku_task_driver_unlock(driver);
   return result;
 }
+/* A terminal Result take can move bytes to an external runtime owner while
+ * preserving the aggregate reservation. The payload remains charged after its
+ * Task allocation is physically reclaimed; scratch_refund ends that receipt. */
+static uint32_t ku_task_driver_extract_charge(const KuTaskDriverTicketV1* from,
+    size_t bytes,size_t minimum_from_bytes) {
+  uint32_t checked=ku_task_driver_check_ticket(from);
+  if(checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=from->driver;
+  if(ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(from);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : !slot->wrapper_active || !slot->driver_lease.control
+        || slot->binding!=slot->driver_lease.control
+        || ku_task_control_atomic_load(&slot->binding->payload)!=KU_TASK_CONTROL_PAYLOAD_TAKING
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if(status==KU_TASK_DRIVER_OK && (!minimum_from_bytes || slot->charged_bytes<minimum_from_bytes
+      || bytes>slot->charged_bytes-minimum_from_bytes || slot->charged_bytes>driver->reserved_bytes))
+    status=KU_TASK_DRIVER_LIMIT;
+  if(status==KU_TASK_DRIVER_OK) slot->charged_bytes-=bytes;
+  ku_task_driver_unlock(driver); return status;
+}
 static uint32_t ku_task_driver_owner_drop_impl(
     const KuTaskDriverTicketV1* ticket, KuTaskControlOwnerV1* owner, uint64_t deadline,
     KuTaskDriverCleanupReceiptV1* receipt) {
@@ -2100,9 +2585,10 @@ static uint32_t ku_task_driver_reserve_impl(
   KuTaskDriverSlotV1* parent = NULL;
   uint32_t result = source ? ku_task_driver_start_parent_locked(driver, source, &parent)
       : KU_TASK_DRIVER_OK;
-  (void)parent;
-  if (result == KU_TASK_DRIVER_OK && source && source->owned_bytes > SIZE_MAX - task_bytes)
+  if (result == KU_TASK_DRIVER_OK && source && source->owned_bytes > SIZE_MAX - task_bytes) {
+    if(driver->admission_byte_rejections!=UINT64_MAX)driver->admission_byte_rejections++;
     result = KU_TASK_DRIVER_LIMIT;
+  }
   if (result == KU_TASK_DRIVER_OK) {
     if (driver->closing || driver->workers_created != driver->worker_target
         || !driver->workers_created || driver->workers_exited) result = KU_TASK_DRIVER_CLOSED;
@@ -2110,9 +2596,13 @@ static uint32_t ku_task_driver_reserve_impl(
     else if (driver->fixed_bytes > driver->byte_limit
         || driver->reserved_bytes > driver->byte_limit - driver->fixed_bytes) {
       driver->fault = KU_TASK_DRIVER_INTERNAL; result = KU_TASK_DRIVER_INTERNAL;
-    } else if (driver->resident >= driver->capacity
-        || task_bytes > driver->byte_limit - driver->fixed_bytes - driver->reserved_bytes)
+    } else if (driver->resident >= driver->capacity) {
+      if(driver->admission_slot_rejections!=UINT64_MAX)driver->admission_slot_rejections++;
       result = KU_TASK_DRIVER_LIMIT;
+    } else if (task_bytes > driver->byte_limit - driver->fixed_bytes - driver->reserved_bytes) {
+      if(driver->admission_byte_rejections!=UINT64_MAX)driver->admission_byte_rejections++;
+      result = KU_TASK_DRIVER_LIMIT;
+    }
   }
   if (result == KU_TASK_DRIVER_OK) {
     result = KU_TASK_DRIVER_LIMIT;
@@ -2131,12 +2621,20 @@ static uint32_t ku_task_driver_reserve_impl(
       slot->charged_bytes = task_bytes;
       slot->cancel_deadline = UINT64_MAX;
       slot->scope_wait_deadline = UINT64_MAX;
+      if (driver->fixed_owner) {
+        slot->owner_worker=parent ? parent->owner_worker
+            : driver->external_loops && ku_task_driver_entry_owner
+              ? ku_task_driver_entry_owner : (driver->next_owner++%driver->workers_created)+1;
+      }
       driver->resident++; driver->building++; driver->reserved_bytes += task_bytes;
       if (driver->resident > driver->peak_resident) driver->peak_resident = driver->resident;
       if (driver->reserved_bytes > driver->peak_reserved_bytes) driver->peak_reserved_bytes = driver->reserved_bytes;
       *output = (KuTaskDriverTicketV1){ driver, i, generation };
       result = KU_TASK_DRIVER_OK; break;
     }
+    /* Capacity may contain exhausted generations with no reusable FREE slot. */
+    if(result==KU_TASK_DRIVER_LIMIT && driver->admission_slot_rejections!=UINT64_MAX)
+      driver->admission_slot_rejections++;
   }
   ku_task_driver_unlock(driver);
   return result;
@@ -2285,10 +2783,12 @@ static uint32_t ku_task_driver_commit_impl(
           || !slot->charged_bytes || slot->charged_bytes > driver->reserved_bytes)) {
     driver->fault = KU_TASK_DRIVER_INTERNAL; result = KU_TASK_DRIVER_INTERNAL;
   }
+  size_t binding_cell=0;
   if (result == KU_TASK_DRIVER_OK) {
-    for (size_t i = 0; i < driver->capacity; i++) {
-      if (driver->slots[i].binding == registry.control) { result = KU_TASK_DRIVER_INVALID_STATE; break; }
-    }
+    int found=ku_task_driver_binding_find(driver,registry.control,&binding_cell);
+    if (found<0 || (!found && driver->binding_count>=driver->capacity)) {
+      driver->fault=KU_TASK_DRIVER_INTERNAL; result=KU_TASK_DRIVER_INTERNAL;
+    } else if (found) result=KU_TASK_DRIVER_INVALID_STATE;
   }
   if (result == KU_TASK_DRIVER_OK && source) {
     if (source->parent.driver != driver || source->parent.slot == ticket->slot)
@@ -2317,6 +2817,10 @@ static uint32_t ku_task_driver_commit_impl(
     slot->driver_lease = registry; registry.control = NULL;
     slot->execution_lease = execution; execution.control = NULL;
     slot->binding = slot->driver_lease.control;
+    /* No callbacks or other publication can change the located empty cell
+     * while this mutex is held. Every fallible validation/owner move preceded
+     * publication; duplicate/failure paths never insert or consume an owner. */
+    driver->binding_keys[binding_cell]=slot->binding; driver->binding_count++;
     if (mode == KU_TASK_DRIVER_ABORT) {
       slot->owner_location = KU_TASK_DRIVER_OWNER_DEFERRED;
       slot->cancel_pending = 1; slot->cancel_deadline = deadline;
@@ -2357,6 +2861,8 @@ static void ku_task_driver_snapshot_locked(KuTaskDriverV1* driver, KuTaskDriverS
   output->byte_limit = driver->byte_limit;
   output->peak_resident = driver->peak_resident; output->peak_queued = driver->peak_queued;
   output->peak_running = driver->peak_running; output->peak_reserved_bytes = driver->peak_reserved_bytes;
+  output->admission_slot_rejections=driver->admission_slot_rejections;
+  output->admission_byte_rejections=driver->admission_byte_rejections;
   output->timers = driver->timers; output->peak_timers = driver->peak_timers; output->timer_limit = driver->capacity;
   output->polls = driver->polls; output->wakes = driver->wakes; output->waits = driver->waits;
   output->worker_target = driver->worker_target; output->workers_created = driver->workers_created;
@@ -2444,41 +2950,123 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
   slot->cleanup_acked_generation = slot->generation;
   return KU_TASK_DRIVER_CLEANUP_ACK;
 }
-static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
-  KuTaskDriverV1* driver = worker->driver;
-  if (ku_task_driver_lock(driver)) return;
-  for (;;) {
-    uint64_t sampled_now = driver->clock_fault ? 0 : ku_task_driver_now_ms();
-    if (sampled_now == UINT64_MAX) ku_task_driver_enter_clock_fault(driver);
-    uint64_t next_deadline = driver->next_deadline;
-    if (!driver->clock_fault && next_deadline != UINT64_MAX && sampled_now >= next_deadline)
-      next_deadline = ku_task_driver_deadlines_locked(driver, sampled_now);
-    if (driver->closing && !driver->resident && !driver->running && !driver->queued) break;
-    if (!driver->queued) {
-      worker->state = KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
-      if (driver->waits != UINT64_MAX) driver->waits++;
-      ku_task_driver_signal(driver); /* Observers only: never a work wake. */
-      int waited = driver->clock_fault ? ku_task_driver_wait_without_clock(driver)
-          : ku_task_driver_wait_work(driver, next_deadline);
-      worker->state = KU_TASK_DRIVER_WORKER_ACTIVE; driver->workers_waiting--;
-      if (waited == -2) { ku_task_driver_enter_clock_fault(driver); continue; }
-      if (waited < 0) {
-        driver->fault = KU_TASK_DRIVER_INTERNAL;
-        driver->closing = 1; driver->shutdown_deadline = 0;
-        ku_task_driver_signal_work(driver); ku_task_driver_signal(driver);
-        break;
+/* This stack-only record is private to the sole RUNNING executor. Pure ready
+ * continuations need not release/reclaim R2 executor between dispatch budgets:
+ * no ownership or host observation can occur in the witnessed quantum. Every
+ * actual resume consumes at least one pump credit; B2 borrowed banks consume
+ * another. A private reserved callback settles only ceil(actual states/64).
+ * Public pump(1) cannot borrow or run a second resume and cannot reserve.
+ * No phase/time sample is cached across a boundary or used as a deadline
+ * decision. Ordinary/raw callbacks continue through the full control poll. */
+typedef struct KuTaskDriverSegmentV1 {
+  KuTaskDriverExecutionV1* execution;
+  size_t max_quanta, quanta, polls;
+  uint64_t started;
+  int clock_fault, time_exhausted;
+} KuTaskDriverSegmentV1;
+enum {
+  KU_TASK_SLICE_CONTINUE=0u, KU_TASK_SLICE_IDLE=1u, KU_TASK_SLICE_WORK_CAP=2u,
+  KU_TASK_SLICE_TIME=3u, KU_TASK_SLICE_HTTP_DEADLINE=4u, KU_TASK_SLICE_WAKE=5u,
+  KU_TASK_SLICE_WAIT=6u, KU_TASK_SLICE_YIELD=7u, KU_TASK_SLICE_BOUNDARY=8u,
+  KU_TASK_SLICE_COMPLETE=9u, KU_TASK_SLICE_CANCEL=10u, KU_TASK_SLICE_FAULT=11u
+};
+typedef struct KuTaskDriverSliceResultV1 {
+  uint64_t next_deadline;
+  size_t work_credits, resume_calls, segments;
+  uint32_t reason;
+} KuTaskDriverSliceResultV1;
+typedef struct KuTaskDriverSliceV1 {
+  uint64_t origin_ms, stop_at_ms, external_deadline;
+  int (*interrupted)(void*);
+  void* interrupt_context;
+  KuTaskDriverSliceResultV1* result;
+} KuTaskDriverSliceV1;
+static uint32_t ku_task_driver_slice_time_reason(const KuTaskDriverSliceV1* slice) {
+  return slice->external_deadline<=slice->stop_at_ms
+      ? KU_TASK_SLICE_HTTP_DEADLINE : KU_TASK_SLICE_TIME;
+}
+static uint32_t ku_task_driver_resume_segment(void* raw) {
+  KuTaskDriverSegmentV1* segment=(KuTaskDriverSegmentV1*)raw;
+  KuTaskDriverExecutionV1* execution=segment->execution;
+  uint32_t outcome;
+  do {
+    size_t remaining=segment->max_quanta-segment->quanta;
+    execution->compute=(KuTaskDriverComputeBudgetV1){
+      .credit_limit=remaining<KU_TASK_DRIVER_COMPUTE_MAX_BANKS ? remaining : KU_TASK_DRIVER_COMPUTE_MAX_BANKS,
+      .credits_used=1u,.started_ms=segment->started,
+      .reservation_credit_limit=execution->reservation_allowed
+        ? (remaining<KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS ? remaining : KU_TASK_DRIVER_COMPUTE_RESERVATION_CREDITS) : 0u};
+    outcome=execution->control->operations.resume(execution->control->context);
+    execution->compute.active=0; execution->compute.open=0;
+    segment->polls++;
+    size_t used=execution->compute.credits_used;
+    if (!used || used>execution->compute.credit_limit) {
+      outcome=KU_TASK_CONTROL_INVALID_STATE;
+      used=1u;
+    } else if (execution->compute.invalid) {
+      outcome=KU_TASK_CONTROL_INVALID_STATE;
+    }
+    segment->quanta+=used;
+    segment->clock_fault|=execution->compute.clock_fault;
+    segment->time_exhausted|=execution->compute.time_exhausted;
+    if (outcome!=KU_TASK_CONTROL_PENDING || !execution->cooperative_yield
+        || !execution->pure_ready || execution->intent_touched
+        || segment->quanta>=segment->max_quanta || segment->clock_fault || segment->time_exhausted
+        || ku_task_control_atomic_load(&execution->control->phase)!=KU_TASK_CONTROL_LIVE)
+      break;
+    if (!execution->compute.reserved) {
+      uint64_t now=ku_task_driver_now_ms();
+      if (now==UINT64_MAX || now<segment->started) { segment->clock_fault=1; break; }
+      if (now-segment->started>=1u) { segment->time_exhausted=1; break; }
+    }
+    /* Reserved callbacks have just made a fresh finish observation; their
+     * NEXT frame makes another fresh entry observation before computation.
+     * No old timestamp authorizes that next zone or renews the slice origin. */
+    execution->default_yield=0; execution->cooperative_yield=0;
+    execution->intent_touched=0; execution->scalar_quantum=0; execution->pure_ready=0;
+  } while (1);
+  return outcome;
+}
+/* One owner segment, consuming at most max_quanta 64-state work credits:
+ * public/B2 selections keep32; only a private HTTP slice may select128.
+ * Enter and return with the publication mutex held. User callbacks/drop run
+ * unlocked. Only pure generated bounded yields may share the live RUNNING
+ * execution lease. Public/B2 reads keep their old bank boundaries. The private
+ * reservation has fresh entry/finish/nonpure observations and a <=8192-state,
+ * <=65536-pure-operation zone. Generated private phase chunks are bounded by
+ * <=256 states AND <=1024 operations; neither bound promises sub-ms realtime.
+ * Actual poll
+ * metrics count registered-resume/control attempts, not borrowed banks:
+ * the 1ms segment budget can overrun by a finite reservation/expensive operation. */
+static int ku_task_driver_run_one_mode_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta,
+    KuTaskDriverSliceV1* slice) {
+  KuTaskDriverV1* driver=worker->driver;
+    uint64_t selected_now=0;
+    if (slice) {
+      selected_now=ku_task_driver_now_ms();
+      if (selected_now==UINT64_MAX || selected_now<slice->origin_ms) {
+        ku_task_driver_enter_clock_fault(driver);
+        slice->result->reason=KU_TASK_SLICE_FAULT; return 0;
       }
-      continue;
+      if (selected_now>=slice->stop_at_ms) {
+        slice->result->reason=ku_task_driver_slice_time_reason(slice); return 0;
+      }
     }
     size_t index;
     if (!ku_task_driver_take_ready(driver, worker, &index)) {
       driver->closing = 1; driver->shutdown_deadline = 0;
       ku_task_driver_signal_work(driver); ku_task_driver_signal(driver);
-      break;
+      return 0;
     }
     driver->running++;
     if (driver->running > driver->peak_running) driver->peak_running = driver->running;
     KuTaskDriverSlotV1* slot = &driver->slots[index];
+    uint64_t started=slice ? slice->origin_ms : ku_task_driver_now_ms();
+    if (!slice) selected_now=started;
+    worker->last_queue_delay_ms=selected_now!=UINT64_MAX && slot->queued_at_ms!=UINT64_MAX
+        && selected_now>=slot->queued_at_ms ? selected_now-slot->queued_at_ms : 0;
+    if(worker->last_queue_delay_ms>worker->peak_queue_delay_ms)
+      worker->peak_queue_delay_ms=worker->last_queue_delay_ms;
     slot->state = KU_TASK_DRIVER_RUNNING; slot->notified = 0; slot->intent = 0;
     slot->executor_worker = worker->index + 1;
     KuTaskControlLeaseV1 execution = slot->execution_lease;
@@ -2495,17 +3083,72 @@ static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
     slot->cancel_deadline = deadline;
     if (cancel) ku_task_driver_wait_abort_locked(driver, index);
     else ku_task_driver_wait_cancel_check_locked(driver, index);
+    KuTaskDriverExecutionV1 context={driver,index,slot->generation,execution.control,0,0,0,0,0,{0},0,0};
+    context.reservation_allowed=slice!=NULL;
+    context.compute_stop_at_ms=slice ? slice->stop_at_ms : 0;
+    KuTaskDriverExecutionV1* previous_execution=ku_task_driver_execution;
     ku_task_driver_unlock(driver);
 
     uint32_t request = KU_TASK_CONTROL_OK, dropped = KU_TASK_CONTROL_OK;
     if (cancel) request = ku_task_control_request_cancel(&execution, KU_TASK_CONTROL_CANCELLED, deadline);
     if (owner.lease.control) dropped = ku_task_control_owner_drop(&owner, deadline);
-    uint32_t outcome = ku_task_control_poll(&execution);
+    ku_task_driver_execution=&context;
+    size_t quanta=0, polls=0, resume_calls=0;
+    uint32_t outcome=KU_TASK_CONTROL_PENDING;
+    int segment_clock_fault=started==UINT64_MAX;
+    do {
+      context.default_yield=0; context.cooperative_yield=0; context.intent_touched=0; context.scalar_quantum=0; context.pure_ready=0;
+      context.compute=(KuTaskDriverComputeBudgetV1){0};
+      KuTaskDriverSegmentV1 segment={&context,max_quanta-quanta,0u,0u,started,segment_clock_fault,0};
+      outcome=ku_task_control_poll_impl(&execution,ku_task_driver_resume_segment,&segment);
+      /* A terminal/cancelled/contended control poll may not invoke resume. It
+       * still spends one exact pump credit, as before this private batching. */
+      quanta+=segment.quanta ? segment.quanta : 1u;
+      polls+=segment.polls ? segment.polls : 1u;
+      resume_calls+=segment.polls;
+      segment_clock_fault=segment.clock_fault;
+      if (slice) {
+        if (segment_clock_fault) slice->result->reason=KU_TASK_SLICE_FAULT;
+        else if (segment.time_exhausted) slice->result->reason=ku_task_driver_slice_time_reason(slice);
+        else if (outcome==KU_TASK_CONTROL_CANCELLED || outcome==KU_TASK_CONTROL_TIMED_OUT)
+          slice->result->reason=KU_TASK_SLICE_CANCEL;
+        else if (ku_task_control_is_terminal(outcome)) slice->result->reason=KU_TASK_SLICE_COMPLETE;
+        else if (outcome!=KU_TASK_CONTROL_PENDING) slice->result->reason=KU_TASK_SLICE_FAULT;
+        else if (!context.pure_ready || context.intent_touched)
+          slice->result->reason=KU_TASK_SLICE_BOUNDARY;
+      }
+      int stop=outcome!=KU_TASK_CONTROL_PENDING || !context.cooperative_yield || context.intent_touched
+          || quanta>=max_quanta || segment_clock_fault || segment.time_exhausted
+          || (slice && slice->result->reason!=KU_TASK_SLICE_CONTINUE);
+      if (!stop) {
+        size_t continued_phase=ku_task_control_atomic_load(&execution.control->phase);
+        if (continued_phase!=KU_TASK_CONTROL_LIVE) {
+          if (slice && slice->result->reason==KU_TASK_SLICE_CONTINUE)
+            slice->result->reason=KU_TASK_SLICE_CANCEL;
+          stop=1;
+        }
+      }
+      if (stop) break;
+      uint64_t now=ku_task_driver_now_ms();
+      if (now==UINT64_MAX || now<started) { segment_clock_fault=1; break; }
+      if (now-started>=1u) {
+        if (slice) slice->result->reason=ku_task_driver_slice_time_reason(slice);
+        break;
+      }
+    } while (1);
+    ku_task_driver_execution=previous_execution;
 
-    if (ku_task_driver_lock(driver)) return;
+    if (ku_task_driver_lock(driver)) return -1;
     slot = &driver->slots[index];
-    if (driver->polls != UINT64_MAX) driver->polls++;
+    if (segment_clock_fault) ku_task_driver_enter_clock_fault(driver);
+    if (!slot->intent && context.default_yield) slot->intent=KU_TASK_DRIVER_YIELD;
+    if (slice && slice->result->reason==KU_TASK_SLICE_BOUNDARY && context.intent_touched) {
+      if (slot->intent==KU_TASK_DRIVER_WAIT) slice->result->reason=KU_TASK_SLICE_WAIT;
+      else if (slot->intent==KU_TASK_DRIVER_YIELD) slice->result->reason=KU_TASK_SLICE_YIELD;
+    }
+    driver->polls=polls>UINT64_MAX-driver->polls ? UINT64_MAX : driver->polls+polls;
     driver->running--; slot->executor_worker = 0;
+    worker->polls=polls>UINT64_MAX-worker->polls ? UINT64_MAX : worker->polls+polls;
     if (slot->owner_location == KU_TASK_DRIVER_OWNER_WORKER) {
       if (owner.lease.control) {
         slot->deferred_owner = owner; owner.lease.control = NULL;
@@ -2531,6 +3174,11 @@ static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
        * A faulted child's enqueue is disabled; this wakes its parent instead. */
       ku_task_driver_wait_publish_locked(driver, index);
       if (ack != KU_TASK_DRIVER_CLEANUP_ACK) retire = 0;
+      else if (!ku_task_driver_binding_remove(driver,slot->binding)) {
+        slot->cleanup_fault=KU_TASK_DRIVER_INTERNAL; driver->fault=KU_TASK_DRIVER_INTERNAL;
+        ku_task_driver_wait_publish_locked(driver,index);
+        retire=0; /* Keep all registry/executor references and charged storage. */
+      }
     }
     if (retire) {
       registry = slot->driver_lease; slot->driver_lease.control = NULL;
@@ -2569,8 +3217,66 @@ static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
       ku_task_driver_unlock(driver);
       if (execution.control) ku_task_control_lease_release(&execution);
       if (registry.control) ku_task_control_lease_release(&registry);
-      if (ku_task_driver_lock(driver)) return;
+      if (ku_task_driver_lock(driver)) return -1;
     }
+  if (slice) {
+    slice->result->resume_calls+=resume_calls;
+    if (segment_clock_fault || driver->fault) slice->result->reason=KU_TASK_SLICE_FAULT;
+    else if (slice->result->reason==KU_TASK_SLICE_CONTINUE
+        && slot->generation==context.generation && slot->driver_lease.control
+        && ku_task_control_atomic_load(&slot->driver_lease.control->phase)!=KU_TASK_CONTROL_LIVE)
+      slice->result->reason=KU_TASK_SLICE_CANCEL;
+  }
+  return (int)quanta;
+}
+/* Exact/public modes keep their original per-selection time origin. */
+static int ku_task_driver_run_one_locked(KuTaskDriverWorkerV1* worker,size_t max_quanta) {
+  return ku_task_driver_run_one_mode_locked(worker,max_quanta,NULL);
+}
+static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
+  KuTaskDriverV1* driver = worker->driver;
+  if (ku_task_driver_lock(driver)) return;
+  for (;;) {
+    if(driver->io_wait) {
+      void* context=driver->io_context;
+      int (*wait_io)(void*,size_t,uint64_t)=driver->io_wait;
+      ku_task_driver_unlock(driver);
+      int progress=wait_io(context,worker->index,0u);
+      if(ku_task_driver_lock(driver)) return;
+      if(progress<0) { driver->fault=KU_TASK_DRIVER_INTERNAL; driver->closing=1; driver->shutdown_deadline=0; }
+    }
+    uint64_t sampled_now = driver->clock_fault ? 0 : ku_task_driver_now_ms();
+    if (sampled_now == UINT64_MAX) ku_task_driver_enter_clock_fault(driver);
+    uint64_t next_deadline = driver->next_deadline;
+    if (!driver->clock_fault && next_deadline != UINT64_MAX && sampled_now >= next_deadline)
+      next_deadline = ku_task_driver_deadlines_locked(driver, sampled_now);
+    if (driver->closing && !driver->resident && !driver->running && !driver->queued) break;
+    if (!(driver->fixed_owner ? worker->local_queued : driver->queued)) {
+      worker->state = KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
+      if (driver->waits != UINT64_MAX) driver->waits++;
+      ku_task_driver_signal(driver); /* Observers only: never a work wake. */
+      int waited;
+      if(driver->io_wait && !driver->clock_fault) {
+        void* context=driver->io_context;
+        int (*wait_io)(void*,size_t,uint64_t)=driver->io_wait;
+        ku_task_driver_unlock(driver);
+        waited=wait_io(context,worker->index,next_deadline);
+        if(ku_task_driver_lock(driver)) return;
+      } else waited = driver->clock_fault ? ku_task_driver_wait_without_clock(driver)
+          : ku_task_driver_wait_work(driver, next_deadline);
+      worker->state = KU_TASK_DRIVER_WORKER_ACTIVE; driver->workers_waiting--;
+      if (waited == -2) { ku_task_driver_enter_clock_fault(driver); continue; }
+      if (waited < 0) {
+        driver->fault = KU_TASK_DRIVER_INTERNAL;
+        driver->closing = 1; driver->shutdown_deadline = 0;
+        ku_task_driver_signal_work(driver); ku_task_driver_signal(driver);
+        break;
+      }
+      continue;
+    }
+    int advanced=ku_task_driver_run_one_locked(worker,32u);
+    if (advanced<0) return; /* Broken mutex: retain storage, never unlock it. */
+    if (!advanced) break;
   }
   worker->state = KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
   ku_task_driver_signal(driver);
@@ -2589,19 +3295,20 @@ static void* ku_task_driver_thread(void* raw) {
 /* On post-resource failure this object remains LIVE or REAPING. The exclusive
  * caller must use the original startup D for shutdown/join/destroy, and may
  * free or zero storage only after destroy succeeds. No Task is admitted early. */
-static uint32_t ku_task_driver_init(
+static uint32_t ku_task_driver_init_impl(
     KuTaskDriverV1* driver, size_t bytes, uint32_t abi,
     KuTaskDriverSlotV1* slots, size_t capacity, size_t* ring, size_t ring_capacity,
-    size_t byte_limit, size_t worker_count, uint64_t startup_deadline) {
+    size_t byte_limit, size_t worker_count, uint64_t startup_deadline,
+    int external, void* event_context, void (*event_wake)(void*,size_t)) {
   if (abi != KU_TASK_DRIVER_ABI_VERSION) return KU_TASK_DRIVER_ABI_MISMATCH;
   if (!capacity || capacity > KU_TASK_DRIVER_MAX_SLOTS || ring_capacity != capacity
       || !worker_count || worker_count > KU_TASK_DRIVER_MAX_WORKERS)
     return KU_TASK_DRIVER_LIMIT;
   if (startup_deadline == UINT64_MAX) return KU_TASK_DRIVER_INVALID_ARGUMENT;
-  if (capacity > (SIZE_MAX - sizeof(*driver)) / (sizeof(*slots) + sizeof(*ring)))
-    return KU_TASK_DRIVER_LIMIT;
+  if (external && !event_wake) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
+  if (!fixed) return KU_TASK_DRIVER_LIMIT;
   size_t slot_bytes = capacity * sizeof(*slots), ring_bytes = capacity * sizeof(*ring);
-  size_t fixed = sizeof(*driver) + slot_bytes + ring_bytes;
   if (byte_limit < fixed) return KU_TASK_DRIVER_LIMIT;
   if (!ku_task_frame_storage_valid(driver, bytes, sizeof(*driver), KU_TASK_FRAME_ALIGNOF(KuTaskDriverV1))
       || !ku_task_frame_storage_valid(slots, slot_bytes, slot_bytes, KU_TASK_FRAME_ALIGNOF(KuTaskDriverSlotV1))
@@ -2614,6 +3321,11 @@ static uint32_t ku_task_driver_init(
   uint64_t now = ku_task_driver_now_ms();
   if (now == UINT64_MAX) return KU_TASK_DRIVER_INTERNAL;
   if (now >= startup_deadline) return KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;
+  /* Allocation failure leaves the caller's all-zero storage retryable and
+   * acquires no OS resources. Once recorded below, REAPING/destroy owns it. */
+  size_t binding_cells=2u*capacity;
+  KuTaskControlV1** binding_keys=(KuTaskControlV1**)calloc(binding_cells,sizeof(*binding_keys));
+  if (!binding_keys) return KU_TASK_DRIVER_INTERNAL;
 
   /* Record each native resource before the next fallible acquisition. REAPING
    * blocks ordinary APIs if a later initializer fails. No worker exists yet. */
@@ -2621,8 +3333,13 @@ static uint32_t ku_task_driver_init(
   driver->initialized = KU_TASK_DRIVER_STORAGE_REAPING;
   driver->storage_size = sizeof(*driver); driver->capacity = capacity;
   driver->slots = slots; driver->ring = ring; driver->fixed_bytes = fixed;
+  driver->binding_keys=binding_keys; driver->binding_cells=binding_cells;
   driver->byte_limit = byte_limit; driver->worker_target = worker_count;
+  driver->external_loops=external!=0; driver->fixed_owner=external!=0;
+  driver->event_context=event_context; driver->event_wake=event_wake;
   driver->shutdown_deadline = startup_deadline; driver->next_deadline = UINT64_MAX;
+  const char* timing=getenv("KU_TASK_DRIVER_TIMING");
+  driver->timing_enabled=timing && !strcmp(timing,"1");
   driver->closing = 1; driver->fault = KU_TASK_DRIVER_INTERNAL;
 #if defined(_WIN32)
   InitializeSRWLock(&driver->mutex);
@@ -2665,13 +3382,34 @@ static uint32_t ku_task_driver_init(
     KuTaskDriverWorkerV1* worker = &driver->workers[index];
     worker->driver = driver; worker->index = index;
     worker->state = KU_TASK_DRIVER_WORKER_ACTIVE;
+    if (external) {
+      worker->state=KU_TASK_DRIVER_WORKER_WAITING;
+      driver->workers_waiting++; driver->workers_created++;
+      continue;
+    }
 #if defined(_WIN32)
-    worker->thread = (HANDLE)_beginthreadex(NULL, 0, ku_task_driver_thread, worker, 0, NULL);
+    worker->thread = (HANDLE)_beginthreadex(NULL,
+#if defined(KU_RUNTIME_RESOURCE_CONFIG)
+        (unsigned)ku_runtime_thread_stack_bytes(),
+#else
+        0,
+#endif
+        ku_task_driver_thread, worker, 0, NULL);
     if (!worker->thread) { result = KU_TASK_DRIVER_INTERNAL; break; }
 #else
-    if (pthread_create(&worker->thread, NULL, ku_task_driver_thread, worker)) {
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes)) { result=KU_TASK_DRIVER_INTERNAL; break; }
+#if defined(KU_RUNTIME_RESOURCE_CONFIG)
+    if (pthread_attr_setstacksize(&attributes,ku_runtime_thread_stack_bytes())) {
+      (void)pthread_attr_destroy(&attributes); result=KU_TASK_DRIVER_INTERNAL; break;
+    }
+#endif
+    int creation=pthread_create(&worker->thread, &attributes, ku_task_driver_thread, worker);
+    int destroyed=pthread_attr_destroy(&attributes);
+    if (creation) {
       result = KU_TASK_DRIVER_INTERNAL; break;
     }
+    if (destroyed) { driver->workers_created++; result=KU_TASK_DRIVER_INTERNAL; break; }
 #endif
     /* New entrypoints block on this mutex until every actual handle has been
      * registered. Never expose an unregistered live thread to teardown. */
@@ -2696,6 +3434,178 @@ static uint32_t ku_task_driver_init(
   }
   if (ku_task_driver_unlock(driver)) return KU_TASK_DRIVER_INTERNAL;
   return result;
+}
+static uint32_t ku_task_driver_init(
+    KuTaskDriverV1* driver, size_t bytes, uint32_t abi,
+    KuTaskDriverSlotV1* slots, size_t capacity, size_t* ring, size_t ring_capacity,
+    size_t byte_limit, size_t worker_count, uint64_t startup_deadline) {
+  return ku_task_driver_init_impl(driver,bytes,abi,slots,capacity,ring,ring_capacity,
+      byte_limit,worker_count,startup_deadline,0,NULL,NULL);
+}
+/* External loop storage and its nonblocking wake callback outlive this driver.
+ * No OS thread is created here. Each owner binds to its first pump's real
+ * thread; the embedding loop owns that thread's eventual join. */
+static uint32_t ku_task_driver_init_external(
+    KuTaskDriverV1* driver, size_t bytes, uint32_t abi,
+    KuTaskDriverSlotV1* slots, size_t capacity, size_t* ring, size_t ring_capacity,
+    size_t byte_limit, size_t worker_count, uint64_t startup_deadline,
+    void* event_context, void (*event_wake)(void*,size_t)) {
+  return ku_task_driver_init_impl(driver,bytes,abi,slots,capacity,ring,ring_capacity,
+      byte_limit,worker_count,startup_deadline,1,event_context,event_wake);
+}
+static uint32_t ku_task_driver_set_fixed_owner(KuTaskDriverV1* driver) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  checked=driver->resident || driver->queued || driver->running || driver->closing
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (checked==KU_TASK_DRIVER_OK) driver->fixed_owner=1;
+  ku_task_driver_unlock(driver); return checked;
+}
+/* Poll a finite work-credit batch on its fixed event-loop owner, without sleeping.
+ * One credit permits at most the original 64-state bank. Pure hosted frames
+ * may borrow up to four banks in one resume, spending each credit only at the
+ * exhausted-bank boundary. max_quanta==1 remains an exact single-poll entry.
+ * All
+ * accepted wakes are retained in the slot's one queue node, even at capacity.
+ * next_deadline is absolute monotonic ms. UINT64_MAX permits an indefinite
+ * event wait; a finite due value or remaining ready work requires another
+ * turn. The wake callback and mutex publication close the check/sleep race. */
+static uint32_t ku_task_driver_pump(KuTaskDriverV1* driver, size_t owner,
+    size_t max_quanta, uint64_t* next_deadline) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!driver->external_loops || owner>=driver->workers_created || !max_quanta
+      || max_quanta>64u || !ku_task_driver_external_storage(driver,next_deadline,
+          sizeof(*next_deadline),KU_TASK_FRAME_ALIGNOF(uint64_t)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverWorkerV1* worker=&driver->workers[owner];
+  if (worker->pumping || worker->state==KU_TASK_DRIVER_WORKER_EXITED) {
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+#if defined(_WIN32)
+  DWORD thread=GetCurrentThreadId();
+  if (worker->owner_bound && worker->owner_thread!=thread) {
+#else
+  pthread_t thread=pthread_self();
+  if (worker->owner_bound && !pthread_equal(worker->owner_thread,thread)) {
+#endif
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+  worker->owner_bound=1; worker->owner_thread=thread; worker->pumping=1;
+  if (worker->state==KU_TASK_DRIVER_WORKER_WAITING) driver->workers_waiting--;
+  worker->state=KU_TASK_DRIVER_WORKER_ACTIVE;
+  size_t count=0;
+  for (;count<max_quanta;) {
+    uint64_t now=driver->clock_fault ? 0 : ku_task_driver_now_ms();
+    if (now==UINT64_MAX) ku_task_driver_enter_clock_fault(driver);
+    if (!driver->clock_fault && driver->next_deadline!=UINT64_MAX
+        && now>=driver->next_deadline) ku_task_driver_deadlines_locked(driver,now);
+    if (!worker->local_queued) break;
+    size_t remaining=max_quanta-count;
+    int advanced=ku_task_driver_run_one_locked(worker,remaining<KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS
+        ? remaining : KU_TASK_DRIVER_PUBLIC_SELECTION_CREDITS);
+    if (advanced<0) return KU_TASK_DRIVER_INTERNAL; /* Quarantined storage. */
+    if (!advanced) break;
+    count+=(size_t)advanced;
+  }
+  *next_deadline=worker->local_queued ? 0 : driver->next_deadline;
+  worker->pumping=0;
+  if (driver->closing && !driver->resident && !driver->running && !driver->queued) {
+    worker->state=KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
+  } else {
+    worker->state=KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
+    /* Remaining ready work already requires the caller's immediate next turn.
+     * Do not call its socket notifier under this lock for our own continuation.
+     * A later publisher takes the same lock, sees pumping==0, and still wakes
+     * the owner if it arrives between this return and the caller's OS wait. */
+  }
+  checked=driver->fault ? driver->fault : count ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
+  ku_task_driver_signal(driver);
+  ku_task_driver_unlock(driver); return checked;
+}
+/* Private HTTP-only compute slice. The caller has just serviced current I/O
+ * and observed an empty nonblocking OS probe, with no partial/queued/network
+ * work and a finite real HTTP deadline minimum (not the ready-work zero hint).
+ * The hook is an atomic-only wake observation: it must not lock, allocate,
+ * wait or reenter driver. It does not clear the publisher's wake state.
+ * Private selections rotate the original fixed-owner FIFO after <=128
+ * credits; all selections and frame banks share the SAME origin and 1ms cap.
+ * A boundary/time stop ends this entire call, never a renewed inner slice.
+ * The HTTP caller must rebuild/serve I/O before another call or OS sleep. */
+static uint32_t ku_task_driver_compute_slice(KuTaskDriverV1* driver,size_t owner,
+    size_t max_work_credits,uint64_t origin_ms,uint64_t external_deadline,
+    int (*interrupted)(void*),void* interrupt_context,KuTaskDriverSliceResultV1* output) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!driver->external_loops || !driver->fixed_owner || owner>=driver->workers_created
+      || !max_work_credits || max_work_credits>KU_TASK_DRIVER_SLICE_MAX_CREDITS
+      || origin_ms>=UINT64_MAX-1u
+      || !ku_task_driver_external_storage(driver,output,sizeof(*output),
+          KU_TASK_FRAME_ALIGNOF(KuTaskDriverSliceResultV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverWorkerV1* worker=&driver->workers[owner];
+  if (worker->pumping || worker->state==KU_TASK_DRIVER_WORKER_EXITED) {
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+#if defined(_WIN32)
+  DWORD thread=GetCurrentThreadId();
+  if (worker->owner_bound && worker->owner_thread!=thread) {
+#else
+  pthread_t thread=pthread_self();
+  if (worker->owner_bound && !pthread_equal(worker->owner_thread,thread)) {
+#endif
+    ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INVALID_STATE;
+  }
+  *output=(KuTaskDriverSliceResultV1){UINT64_MAX,0,0,0,KU_TASK_SLICE_CONTINUE};
+  KuTaskDriverSliceV1 slice={origin_ms,ku_task_driver_min(origin_ms+1u,external_deadline),
+      external_deadline,interrupted,interrupt_context,output};
+  worker->owner_bound=1; worker->owner_thread=thread; worker->pumping=1;
+  if (worker->state==KU_TASK_DRIVER_WORKER_WAITING) driver->workers_waiting--;
+  worker->state=KU_TASK_DRIVER_WORKER_ACTIVE;
+  while (output->work_credits<max_work_credits && output->reason==KU_TASK_SLICE_CONTINUE) {
+    uint64_t now=ku_task_driver_now_ms();
+    if (now==UINT64_MAX || now<origin_ms) {
+      ku_task_driver_enter_clock_fault(driver); output->reason=KU_TASK_SLICE_FAULT; break;
+    }
+    if (driver->fault) { output->reason=KU_TASK_SLICE_FAULT; break; }
+    if (driver->closing) { output->reason=KU_TASK_SLICE_CANCEL; break; }
+    if (now>=slice.stop_at_ms) { output->reason=ku_task_driver_slice_time_reason(&slice); break; }
+    if (interrupted && interrupted(interrupt_context)) { output->reason=KU_TASK_SLICE_WAKE; break; }
+    if (driver->next_deadline!=UINT64_MAX && now>=driver->next_deadline)
+      ku_task_driver_deadlines_locked(driver,now);
+    if (driver->fault) { output->reason=KU_TASK_SLICE_FAULT; break; }
+    if (driver->closing) { output->reason=KU_TASK_SLICE_CANCEL; break; }
+    if (!worker->local_queued) { output->reason=KU_TASK_SLICE_IDLE; break; }
+    size_t remaining=max_work_credits-output->work_credits;
+    int advanced=ku_task_driver_run_one_mode_locked(worker,remaining<KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS
+        ? remaining : KU_TASK_DRIVER_PRIVATE_SELECTION_CREDITS,&slice);
+    if (advanced<0) {
+      output->reason=KU_TASK_SLICE_FAULT;
+      return KU_TASK_DRIVER_INTERNAL; /* Quarantined broken mutex/storage. */
+    }
+    if (!advanced) {
+      if (driver->fault) output->reason=KU_TASK_SLICE_FAULT;
+      else if (driver->closing) output->reason=KU_TASK_SLICE_CANCEL;
+      else if (output->reason==KU_TASK_SLICE_CONTINUE) output->reason=KU_TASK_SLICE_IDLE;
+      break;
+    }
+    output->segments++;
+    output->work_credits+=(size_t)advanced;
+  }
+  if (output->reason==KU_TASK_SLICE_CONTINUE) output->reason=KU_TASK_SLICE_WORK_CAP;
+  output->next_deadline=worker->local_queued ? 0 : driver->next_deadline;
+  worker->pumping=0;
+  if (driver->closing && !driver->resident && !driver->running && !driver->queued) {
+    worker->state=KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
+  } else {
+    worker->state=KU_TASK_DRIVER_WORKER_WAITING; driver->workers_waiting++;
+  }
+  checked=driver->fault ? driver->fault
+      : output->work_credits ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_PENDING;
+  ku_task_driver_signal(driver);
+  ku_task_driver_unlock(driver); return checked;
 }
 /* External root owns this live lease until after take. Readiness is checked
  * under the publication mutex, then condition-wait atomically releases it.
@@ -2759,7 +3669,7 @@ static uint32_t ku_task_driver_wait_idle(KuTaskDriverV1* driver, uint64_t deadli
   if (driver->fault) result = driver->fault;
   ku_task_driver_unlock(driver); return result;
 }
-static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadline) {
+static uint32_t ku_task_driver_shutdown_impl(KuTaskDriverV1* driver, uint64_t deadline, int wait) {
   uint32_t checked = ku_task_driver_check(driver);
   if (checked != KU_TASK_DRIVER_OK) return checked;
   /* Pool->driver is the notification lock order; never close it under ours. */
@@ -2803,6 +3713,10 @@ static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadlin
   ku_task_driver_signal_work(driver);
   ku_task_driver_signal(driver);
   uint32_t result = KU_TASK_DRIVER_OK;
+  if (!wait) {
+    result=driver->fault ? driver->fault : KU_TASK_DRIVER_OK;
+    ku_task_driver_unlock(driver); return result;
+  }
   while (driver->workers_exited != driver->workers_created || driver->resident
          || driver->building || driver->queued || driver->running) {
     /* Another caller may only tighten the shared D while this observer waits. */
@@ -2817,6 +3731,12 @@ static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadlin
   }
   if (driver->fault && result == KU_TASK_DRIVER_OK) result = driver->fault;
   ku_task_driver_unlock(driver); return result;
+}
+static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadline) {
+  return ku_task_driver_shutdown_impl(driver,deadline,1);
+}
+static uint32_t ku_task_driver_request_close(KuTaskDriverV1* driver, uint64_t deadline) {
+  return ku_task_driver_shutdown_impl(driver,deadline,0);
 }
 /* Exclusive lifecycle validation. No worker/observer accesses records after
  * all EXITED witnesses and all native joins; REAPING never reacquires a mutex
@@ -2875,6 +3795,12 @@ static uint32_t ku_task_driver_join(KuTaskDriverV1* driver, uint64_t deadline) {
 #endif
   for (size_t index = 0; index < driver->workers_created; index++) {
     KuTaskDriverWorkerV1* worker = &driver->workers[index];
+    if (driver->external_loops) {
+      /* EXITED is the last driver-storage access, not a native-thread join.
+       * The enclosing reactor still owns and joins its actual OS threads. */
+      if (!worker->joined) { worker->joined=1; driver->workers_joined++; }
+      worker->closed=1; continue;
+    }
 #if defined(_WIN32)
     if (!worker->closed && !worker->thread) return KU_TASK_DRIVER_INTERNAL;
     if (!worker->joined) {
@@ -2915,6 +3841,10 @@ static uint32_t ku_task_driver_destroy(KuTaskDriverV1* driver) {
   if (driver->workers_joined != driver->workers_created) return KU_TASK_DRIVER_PENDING;
   for (size_t index = 0; index < driver->workers_created; index++)
     if (!driver->workers[index].closed) return KU_TASK_DRIVER_PENDING;
+  if (!driver->binding_keys || driver->binding_cells!=2u*driver->capacity
+      || driver->binding_count) return KU_TASK_DRIVER_INTERNAL;
+  for(size_t cell=0;cell<driver->binding_cells;cell++)
+    if(driver->binding_keys[cell]) return KU_TASK_DRIVER_INTERNAL;
   /* All OS threads are reaped, and the caller excludes all other APIs. Keep
    * each successful destructor recorded so a retry never uses a dead primitive. */
   driver->initialized = KU_TASK_DRIVER_STORAGE_REAPING;
@@ -2947,6 +3877,8 @@ static uint32_t ku_task_driver_destroy(KuTaskDriverV1* driver) {
     driver->sync_resources &= ~KU_TASK_DRIVER_SYNC_MUTEX;
   }
 #endif
+  free(driver->binding_keys); driver->binding_keys=NULL;
+  driver->binding_cells=0; driver->binding_count=0;
   driver->initialized = KU_TASK_DRIVER_STORAGE_ZERO;
   return KU_TASK_DRIVER_OK;
 }

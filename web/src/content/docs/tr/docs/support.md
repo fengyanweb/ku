@@ -1,12 +1,12 @@
 ---
 title: 'Platform ve arka uç desteği'
 description: 'Ku sürüm platformlarını, yorumlayıcıyı, çalıştırıcıyı, yerel C, Task alt kümesi ve LLVM desteğini ayırt edin.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'docs/syntax.md',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/protocol-foundation.md',
     '.github/workflows/native-three-os.yml',
@@ -36,7 +36,7 @@ Varsayılan derlemeler eşleşen Rust araçlarını ve bağlayıcıyı gerektiri
 
 Güncel geliştirme dalında sınırlı bir `async fn main(): null!` kaynak yolu vardır. Açıkça listelenen ilkelleri, dizgileri, düz dizileri, tek katmanlı Results, Task başlatma/taşıma/await işlemlerini, bazı kontrol akışlarını ve sınırlı dosya/dizin arka plan işlemlerini kapsar. Yayımlanan v0.0.18 paketinde tam bir async arka uç değildir.
 
-Genel Task ağ beklemesi, tam M:N yürütmesi, rastgele dinamik yığın birleşimleri, tüm async yakalama/işlev birleşimleri ve tam uzun süreli dayanıklılık testleri tamamlanmamıştır. Kabul ve ret edilen kesin alt küme için [eşzamanlılık sözleşmesine](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) bakın.
+Genel Task ağ beklemesi, tam M:N yürütmesi, rastgele dinamik yığın birleşimleri, tüm async yakalama/işlev birleşimleri ve tam uzun süreli dayanıklılık testleri tamamlanmamıştır. Kabul ve ret edilen kesin alt küme için [eşzamanlılık sözleşmesine](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md) bakın.
 
 ## Veritabanı ve ağ sınırları
 
@@ -79,4 +79,4 @@ The coordinator itself has no OS memory hard limit. Its bounded admission/contro
 
 When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
 
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.

@@ -1,9 +1,9 @@
 ---
 title: 'Primii pași'
 description: 'Scrie Hello Ku, verifică sursa și deosebește interpretarea de compilare.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Această pagină folosește sintaxa de bază și comenzi CLI deja existente în v0.0.17. Mai întâi [instalează Ku](/ro/docs/install/) și confirmă că `ku --version` funcționează.

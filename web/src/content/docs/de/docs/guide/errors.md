@@ -1,7 +1,7 @@
 ---
 title: 'Fehler und Fehlerbehebung'
 description: 'Diagnostizieren Sie Fehler bei Installation, Imports, Ownership, JSON und Backend-Fähigkeiten von Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ Die Ausgabe besteht aus **JSON Lines**, mit einer Diagnose pro Zeile. Zu den Fel
 | `E0913`  | Ausgeliehener async-Parameter              | Einen eigenen Parameter verwenden; beim Aufrufer klonen, falls das Original benötigt wird |
 | `E0918`  | `&value` an der Aufrufstelle               | Ein gewöhnliches Argument übergeben; die Signatur deklariert das Ausleihen                |
 
-Dies fasst registrierte Diagnosen zusammen und führt nicht jeden Fehler auf. Das aktuell maßgebliche Register ist [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+Dies fasst registrierte Diagnosen zusammen und führt nicht jeden Fehler auf. Das aktuell maßgebliche Register ist [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs).
 
 ## Laufzeitfehler folgen einem separaten Vertrag
 
@@ -74,4 +74,4 @@ Ein erfolgreiches `ku check` belegt nur, dass die Frontend-Prüfung erfolgreich 
 
 Die Datenbankfehler `execution_unknown` und `execution_completed_without_result` dürfen keine automatische Wiederholung auslösen. Bewahren Sie Anfrage- und Geschäftsnachweise auf und klären Sie zuerst den tatsächlichen Ausführungszustand. Zur Prüfung der lokalen Website ist keine Verbindung zu einer Produktionsdatenbank erforderlich.
 
-Weitere Einzelheiten finden Sie im [Diagnoseleitfaden des Repositorys](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+Weitere Einzelheiten finden Sie im [Diagnoseleitfaden des Repositorys](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).

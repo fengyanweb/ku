@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — A language in the making",
-  "siteDescription": "Meet Ku, an experimental programming language. Explore real examples, installation, language guides and backend support.",
+  "siteTitle": "Ku — Native compilation and async programming",
+  "siteDescription": "Ku is a compiled language for native applications and concurrent services, with a focus on execution efficiency, async programming and resource control.",
   "skip": "Skip to content",
   "home": "Ku home",
   "documentation": "Documentation",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Source available to view",
   "development": "Experimental prerelease",
   "heroTitle": ["An idea.", "A little", "Ku."],
-  "heroDescription": "A small language with room to grow. Readable syntax, explicit ownership, and a toolchain you can explore from the first line.",
+  "heroDescription": "Ku is a compiled language for native applications and concurrent services, with a focus on execution efficiency, async programming and resource control.",
   "start": "Start writing Ku",
   "explore": "Explore the language",
   "heroNote": "Early by design. Explore, experiment, share feedback.",
@@ -38,24 +38,32 @@
   "approachDescription": "Get to know Ku through its actual behavior, with the current boundaries always in view.",
   "features": [
     [
-      "Read it. Understand it.",
-      "Declare a binding on first assignment. Use functions, structured values and explicit error handling to express your idea.",
+      "Compile native programs.",
+      "Use the Ku CLI to build a native executable. Check the supported language subset and dependencies for your target.",
+      "Installation & downloads",
+      "docs/install"
+    ],
+    [
+      "Write with async/await.",
+      "Express asynchronous tasks with async/await while the runtime handles execution and scheduling within the supported backend scope.",
       "Language guide",
       "docs/guide/language"
     ],
     [
-      "Make ownership explicit.",
-      "Move by default, clone intentionally, and borrow read-only in synchronous calls. The current rules are documented alongside their limits.",
-      "Ownership & boundaries",
-      "docs/support"
-    ],
-    [
-      "Choose your execution path.",
-      "Run with the interpreter, package an executable runner, or explore native C. Check the support matrix before choosing a backend.",
-      "Explore the toolchain",
+      "Set resource boundaries.",
+      "Bound service connections, active requests, waiting queues and buffers. OS limits depend on the platform and deployment.",
+      "Support matrix",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Fixed-load observations",
+  "performanceScope": "0.0.19: one sequential round across seven languages in a Linux ARM64 VM, with four CPU cores per service and 30 seconds per workload. Values compare service CPU time per correct request (Ku/Rust), not request latency.",
+  "performanceMetrics": [
+    ["CPU workload — CPU cost", "About 32% lower", "Ku/Rust ≈ 0.678"],
+    ["JSON workload — CPU cost", "About 26% higher", "Ku/Rust ≈ 1.260"],
+    ["PG workload — CPU cost", "About 35% higher", "Ku/Rust ≈ 1.350"]
+  ],
+  "performanceLimits": "A single round is not capacity or long-term acceptance. Host paging and long-tail latency remain. PG pool-reset semantics differ. This round measured cgroup memory, not RSS; no RSS comparison is made.",
   "practiceTitle": ["Familiar data.", "Explicit errors."],
   "practiceDescription": "Import a module, build a value, and encode it as JSON. The ? operator propagates errors instead of hiding them.",
   "jsonReference": "Read the JSON reference",
@@ -89,9 +97,9 @@
     ]
   ],
   "projectTitle": "A work in progress. A story to follow.",
-  "projectDescription": "This documentation describes the frozen scope of the v{releasedVersion} experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} remains in development. A Linux ARM64 deployment candidate has been rehearsed with an isolated sample; real-business production use has not been validated. Evaluate it with your own programs and share feedback. Published artifacts are listed in GitHub Releases.",
   "github": "Explore on GitHub",
-  "license": "Source is available to view. No open-source license has been granted.",
+  "license": "Licensed under Apache-2.0. See LICENSE and NOTICE.",
   "verified": "Verified",
   "limitations": "Support & limitations",
   "version": "Documentation version",

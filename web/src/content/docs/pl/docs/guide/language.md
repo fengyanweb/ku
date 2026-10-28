@@ -1,7 +1,7 @@
 ---
 title: 'Przewodnik po języku'
 description: 'Poznaj zmienne, funkcje, przepływ sterowania, własność, moduły i obsługiwalne błędy Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Przewodnik wprowadza podstawową składnię. Nadrzędne pozostają [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) i [kontrakt semantyki](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) repozytorium. To fragmenty dydaktyczne; różnice opisuje [obsługa zapleczy](/pl/docs/support/).
+Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Przewodnik wprowadza podstawową składnię. Nadrzędne pozostają [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) i [kontrakt semantyki](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) repozytorium. To fragmenty dydaktyczne; różnice opisuje [obsługa zapleczy](/pl/docs/support/).
 
 ## Zmienne i typy
 

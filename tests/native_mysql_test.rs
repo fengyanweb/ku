@@ -145,16 +145,18 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         );
     }
 
-    for (name, start, end) in [
+    for (name, start, end, implementation) in [
         (
             "query",
             "static KuResult_mysql_result ku_mysql_client_query(",
             "static KuResult_int ku_mysql_client_execute(",
+            "static KuResult_mysql_result ku_mysql_client_query_impl(",
         ),
         (
             "execute",
             "static KuResult_int ku_mysql_client_execute(",
             "static int64_t ku_mysql_result_rows(",
+            "static KuResult_int ku_mysql_client_execute_impl(",
         ),
     ] {
         let body = generated
@@ -166,14 +168,28 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         let validation = body
             .find("ku_mysql_validate_statement_input")
             .unwrap_or_else(|| panic!("MySQL {name} input validation"));
-        let thread_enter = body
+        let budget = body
+            .find("ku_database_operation_begin(")
+            .unwrap_or_else(|| panic!("MySQL {name} process byte admission"));
+        let dispatch = body
+            .find(&format!("ku_mysql_client_{name}_impl(client"))
+            .unwrap_or_else(|| panic!("MySQL {name} admitted execution"));
+        assert!(validation < budget && budget < dispatch);
+        assert!(body[dispatch..].contains("ku_database_operation_end(operation_charge)"));
+        let implementation = generated
+            .split_once(implementation)
+            .map(|(_, suffix)| suffix)
+            .and_then(|suffix| suffix.split_once(start))
+            .map(|(body, _)| body)
+            .expect("generated admitted MySQL implementation");
+        let thread_enter = implementation
             .find("ku_mysql_thread_enter()")
             .unwrap_or_else(|| panic!("MySQL {name} thread entry"));
-        let acquire = body
+        let acquire = implementation
             .find("ku_mysql_acquire(")
             .unwrap_or_else(|| panic!("MySQL {name} pool acquisition"));
         assert!(
-            validation < thread_enter && thread_enter < acquire,
+            thread_enter < acquire,
             "MySQL {name} must reject hostile input before thread or pool side effects"
         );
     }
@@ -181,7 +197,9 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
     let fetch_result = generated
         .split_once("static KuMysqlResult* ku_mysql_fetch_result(")
         .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split_once("static KuResult_mysql_result ku_mysql_client_query("))
+        .and_then(|suffix| {
+            suffix.split_once("static KuResult_mysql_result ku_mysql_client_query_impl(")
+        })
         .map(|(body, _)| body)
         .expect("generated MySQL result delivery implementation");
     let after_fetch = fetch_result
@@ -217,9 +235,9 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
     );
 
     let execute = generated
-        .split_once("static KuResult_int ku_mysql_client_execute(")
+        .split_once("static KuResult_int ku_mysql_client_execute_impl(")
         .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split_once("static int64_t ku_mysql_result_rows("))
+        .and_then(|suffix| suffix.split_once("static KuResult_int ku_mysql_client_execute("))
         .map(|(body, _)| body)
         .expect("generated MySQL execute implementation");
     assert!(

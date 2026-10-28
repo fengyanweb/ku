@@ -1,8 +1,8 @@
 ---
 title: Language guide
 description: Learn Ku variables, functions, control flow, ownership, modules, and recoverable errors.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19 / experimental prerelease'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/syntax.md',
@@ -10,12 +10,14 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'src/cli.rs',
+    'src/ir/task_lower.rs',
   ]
 sidebar:
   order: 0
 ---
 
-This guide introduces core syntax. The repository's [syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
+This guide introduces core syntax. The repository's [syntax contract](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/main/docs/semantics.md) remain authoritative. These are teaching fragments; see [backend support](/en/docs/support/) for differences.
 
 ## Variables and types
 
@@ -117,3 +119,11 @@ Error has `domain`, `code`, and `message` fields. Ordinary `catch` does not catc
 ## Concurrency boundaries
 
 Application code obtains a single use Task handle by calling an `async fn`, then uses `await`. There are no application APIs named `task.spawn`, `Task.new`, or `thread.spawn`. The interpreter and native Task subset have different coverage. An example working in one backend does not prove full support in another. See [platform and backend support](/en/docs/support/).
+
+## Select the execution contract
+
+The source language and backend coverage are related but separate. `ku check` checks a program; `ku run` executes the interpreter; default `ku build` packages that interpreter path; `ku build --backend c` lowers only its supported subset. A library call accepted by the checker can still be rejected by native lowering.
+
+Read `T!` as a Result value and `async fn` as a Task-producing function. `?` propagates a Result; `await` consumes a Task. They are not interchangeable. Operations such as native HTTP PG queries have explicitly supported suspension paths and must be used exactly as their module describes.
+
+Start from the [standard library index](/en/docs/stdlib/) for parameter/return/error tables, then check [backend and resource boundaries](/en/docs/support/) before selecting deployment commands. No general-purpose thread-spawn or automatic retry API is implied by async syntax.

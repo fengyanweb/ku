@@ -1,9 +1,9 @@
 ---
 title: Getting started
 description: Write Hello Ku, check your source, and distinguish interpretation from compilation.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+kuVersion: '0.0.19 / experimental prerelease'
+verifiedAt: '2026-10-28'
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 [Install Ku](/en/docs/install/) first and confirm that `ku --version` runs.
@@ -82,3 +82,16 @@ ku run
 The package entry is configured in `ku.mod`. `ku create --list` lists available templates. There are currently no `ku test` or `ku fmt` commands.
 
 Continue with the [language guide](/en/docs/guide/language/), [troubleshooting](/en/docs/guide/errors/), and [backend support](/en/docs/support/). The outputs here are expected examples and do not replace installation verification on your platform.
+
+## Where to go next
+
+| Goal                                    | Read next                                                           | Execution requirement                                                 |
+| --------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Understand values, ownership and errors | [Language guide](/en/docs/guide/language/)                          | Start with `check` and `run`                                          |
+| Encode data and inspect dynamic fields  | [JSON](/en/docs/stdlib/json/)                                       | General synchronous API or the explicitly limited native Task example |
+| Serve HTTP                              | [HTTP](/en/docs/stdlib/http/)                                       | Synchronous interpreter example or separately compiled native handler |
+| Wait or measure elapsed work            | [Time](/en/docs/stdlib/time/) / [Task](/en/docs/guide/concurrency/) | Choose clocks and waits supported by your backend                     |
+| Query a database                        | [Database clients](/en/docs/stdlib/database/)                       | Native C, native libraries, a real service and private credentials    |
+| Run a resident service with limits      | [CLI](/en/docs/tools/cli/) / [support](/en/docs/support/)           | Configure process supervision and OS prerequisites explicitly         |
+
+Examples identify their backend and external dependencies. Start with one complete program; running every example directory as a batch would also start servers and contact databases.

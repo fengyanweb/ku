@@ -1,7 +1,7 @@
 ---
 title: 'Dil kılavuzu'
 description: 'Ku değişkenlerini, işlevlerini, kontrol akışını, sahipliği, modülleri ve kurtarılabilir hataları öğrenin.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu kılavuz temel sözdizimini tanıtır. Deponun [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) ve [anlam sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) belirleyici olmaya devam eder. Bunlar öğretici parçalardır; farklar için [arka uç desteğine](/tr/docs/support/) bakın.
+Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu kılavuz temel sözdizimini tanıtır. Deponun [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) ve [anlam sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) belirleyici olmaya devam eder. Bunlar öğretici parçalardır; farklar için [arka uç desteğine](/tr/docs/support/) bakın.
 
 ## Değişkenler ve türler
 

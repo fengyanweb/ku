@@ -1,7 +1,7 @@
 ---
 title: 'Standardbibliothek'
 description: 'Finden Sie Ku-Standardbibliotheksmodule, grundlegende Signaturen und Backend-Grenzen.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Diese grundlegenden Einstiegspunkte wurden anhand des Quelltexts geprüft; dies ist keine vollständige API-Referenz. Der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) definiert das Verhalten. Backend-Grenzen stehen in der [Unterstützungsmatrix](/de/docs/support/).
+Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Diese grundlegenden Einstiegspunkte wurden anhand des Quelltexts geprüft; dies ist keine vollständige API-Referenz. Der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) definiert das Verhalten. Backend-Grenzen stehen in der [Unterstützungsmatrix](/de/docs/support/).
 
 ## Module importieren
 
@@ -77,7 +77,7 @@ Erstellen Sie zuerst eine UTF-8-Datei `message.txt` neben dem Quelltext. Eine fe
 
 ## Die Referenz pflegen
 
-Metadaten öffentlicher Schnittstellen liegen in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sie werden zusammen mit Implementierungen und Verträgen geprüft. Diese Website pflegt derzeit eine ausgewählte manuelle Referenz; ein vorhandener Befehl `ku doc` wurde nicht bestätigt.
+Metadaten öffentlicher Schnittstellen liegen in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Sie werden zusammen mit Implementierungen und Verträgen geprüft. Diese Website pflegt derzeit eine ausgewählte manuelle Referenz; ein vorhandener Befehl `ku doc` wurde nicht bestätigt.
 
 ## API reference (English)
 

@@ -1,7 +1,7 @@
 ---
 title: '言語ガイド'
 description: 'Ku の変数、関数、制御フロー、所有権、モジュール、回復可能なエラーを学びます。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。このガイドでは中心となる構文を紹介します。リポジトリの[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)が正式な定義です。以下は学習用の断片です。差異については[バックエンドの対応範囲](/ja/docs/support/)を参照してください。
+本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。このガイドでは中心となる構文を紹介します。リポジトリの[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)と[意味仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)が正式な定義です。以下は学習用の断片です。差異については[バックエンドの対応範囲](/ja/docs/support/)を参照してください。
 
 ## 変数と型
 

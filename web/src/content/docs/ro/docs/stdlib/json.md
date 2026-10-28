@@ -1,7 +1,7 @@
 ---
 title: 'Referință JSON'
 description: 'Codificare și decodificare JSON Ku, conversie KuValue, coduri de eroare și suportul backendurilor.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Codificarea și citirea valorilor
 
-Acesta este un exemplu complet de bază. Ramura de dezvoltare are un exemplu de regresie mai amplu în [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Acesta este un exemplu complet de bază. Ramura de dezvoltare are un exemplu de regresie mai amplu în [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ Erorile recuperabile folosesc domeniul `json`. Codurile comune sunt `parse_error
 
 Interpretorul, lansatorul împachetat implicit și backendul C nativ sincron au implementări JSON. **Submulțimea nativă Task restrânsă și LLVM nu suportă JSON.** Importurile lansatorului implicit încă depind de locațiile surselor; suportul JSON nu implică un pachet complet independent.
 
-Semnăturile și limitele paginii au fost verificate în surse și contracte. Verificarea execuției trebuie să numească versiunea, commitul și backendul. Vezi [contractul complet de sintaxă JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Semnăturile și limitele paginii au fost verificate în surse și contracte. Verificarea execuției trebuie să numească versiunea, commitul și backendul. Vezi [contractul complet de sintaxă JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

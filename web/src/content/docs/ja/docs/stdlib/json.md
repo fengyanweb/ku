@@ -1,7 +1,7 @@
 ---
 title: 'JSON リファレンス'
 description: 'Ku の JSON エンコード、デコード、KuValue 変換、エラーコード、バックエンド対応。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## 値をエンコードして読む
 
-次は完全な基本例です。開発ブランチの [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku) には、より広範な回帰検証例があります。
+次は完全な基本例です。開発ブランチの [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku) には、より広範な回帰検証例があります。
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 インタープリター、既定のパッケージ化ランナー、同期ネイティブ C バックエンドには JSON 実装があります。**制限付きネイティブ Task サブセットと LLVM は JSON に対応していません。** 既定のランナーでは、インポートしたソースの元の場所への依存が残ります。JSON 対応は、完全に独立したパッケージを意味しません。
 
-このページのシグネチャと制約は、ソースおよび仕様と照合しました。実行検証ではバージョン、コミット、バックエンドを明記する必要があります。完全な [JSON 構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json)をご覧ください。
+このページのシグネチャと制約は、ソースおよび仕様と照合しました。実行検証ではバージョン、コミット、バックエンドを明記する必要があります。完全な [JSON 構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json)をご覧ください。

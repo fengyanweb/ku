@@ -188,17 +188,21 @@ fn generated_helpers() -> String {
         );
     }
     for forbidden in [
-        "malloc(",
-        "calloc(",
-        "realloc(",
-        "free(",
-        "exit(",
-        "abort(",
-        "__int128",
-        "__builtin_",
+        "malloc(", "calloc(", "realloc(", "free(", "exit(", "abort(", "__int128",
     ] {
         assert!(!helpers.contains(forbidden), "helper used {forbidden}");
     }
+    for builtin in helpers
+        .match_indices("__builtin_")
+        .map(|(index, _)| &helpers[index..])
+    {
+        assert!(
+            builtin.starts_with("__builtin_add_overflow")
+                || builtin.starts_with("__builtin_sub_overflow")
+                || builtin.starts_with("__builtin_mul_overflow")
+        );
+    }
+    assert!(helpers.contains("#undef KU_INT_USE_OVERFLOW_BUILTINS"));
     for forbidden in ["run_source", "const SOURCE"] {
         assert!(!source.contains(forbidden));
     }
@@ -245,14 +249,21 @@ fn boundary_values() -> Vec<i64> {
         i64::MAX / 3 + 1,
         i64::MIN / 3,
         i64::MIN / 3 - 1,
+        // Constant-33 multiplication bounds used by the recurrence, both signs.
+        -33,
+        33,
+        i64::MAX / 33,
+        i64::MAX / 33 + 1,
+        i64::MIN / 33,
+        i64::MIN / 33 - 1,
     ];
-    assert_eq!(values.len(), 23);
+    assert_eq!(values.len(), 29);
     assert_eq!(
         values
             .iter()
             .collect::<std::collections::HashSet<_>>()
             .len(),
-        23
+        29
     );
     values
 }
@@ -346,44 +357,65 @@ fn append_matrix(source: &mut String) -> (usize, usize) {
 #[test]
 fn native_task_integer_helpers_match_checked_i64_without_output_corruption_in_c() {
     let generated = generated_helpers();
-    assert_eq!(generated.matches("int main(void) {").count(), 1);
-    let mut source = generated.replacen(
-        "int main(void) {",
-        "static int ku_generated_main(void) {",
-        1,
-    );
-    let (binary_count, unary_count) = append_matrix(&mut source);
-    assert_eq!(binary_count, 2_651);
-    assert_eq!(unary_count, 23);
-    source.push_str(C_MAIN);
-    let directory = TempDir::new("task-checked-integer");
-    let c_file = directory.path().join("checked-integer.c");
-    fs::write(&c_file, source).expect("write emitted integer helper fixture");
-    let Some(executable) = compile_harness(directory.path(), &c_file, "checked-integer") else {
-        assert!(
-            std::env::var_os("GITHUB_ACTIONS").is_none(),
-            "CI must execute the emitted integer arithmetic matrix"
+    let anchor = "static uint32_t ku_int_neg(";
+    assert_eq!(generated.matches(anchor).count(), 1);
+    for portable in [false, true] {
+        let branch = if portable { "portable" } else { "compiler" };
+        let probe = if portable {
+            "#undef KU_INT_USE_OVERFLOW_BUILTINS\n#define KU_INT_USE_OVERFLOW_BUILTINS 0\n"
+        } else {
+            ""
+        };
+        let generated = generated.replacen(
+            anchor,
+            &format!(
+                "{probe}enum {{ FIXTURE_INT_BUILTINS = KU_INT_USE_OVERFLOW_BUILTINS }};\n{anchor}"
+            ),
+            1,
         );
-        return;
-    };
-    fs::remove_file(&c_file).expect("remove C source before native execution");
-    let output = run_bounded(
-        Command::new(executable).current_dir(directory.path()),
-        RUN_TIMEOUT,
-        RUN_LIMITS,
-    )
-    .expect("integer arithmetic matrix must obey the native process watchdog");
-    assert!(
-        output.status.success(),
-        "integer arithmetic fixture failed: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        format!("task-checked-integer-ok {binary_count} {unary_count}\n"),
-    );
-    assert!(output.stderr.is_empty());
+        assert_eq!(generated.matches("int main(void) {").count(), 1);
+        let mut source = generated.replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        );
+        let (binary_count, unary_count) = append_matrix(&mut source);
+        assert_eq!(binary_count, 4_211);
+        assert_eq!(unary_count, 29);
+        source.push_str(C_MAIN);
+        let directory = TempDir::new("task-checked-integer");
+        let c_file = directory.path().join("checked-integer.c");
+        fs::write(&c_file, source).expect("write emitted integer helper fixture");
+        let Some(executable) = compile_harness(directory.path(), &c_file, "checked-integer") else {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI must execute the emitted integer arithmetic matrix"
+            );
+            return;
+        };
+        fs::remove_file(&c_file).expect("remove C source before native execution");
+        let output = run_bounded(
+            Command::new(executable).current_dir(directory.path()),
+            RUN_TIMEOUT,
+            RUN_LIMITS,
+        )
+        .expect("integer arithmetic matrix must obey the native process watchdog");
+        assert!(
+            output.status.success(),
+            "{branch} integer arithmetic fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap().replace('\r', "");
+        assert!(
+            stdout == format!("task-checked-integer-ok {binary_count} {unary_count} 0\n")
+                || !portable
+                    && stdout
+                        == format!("task-checked-integer-ok {binary_count} {unary_count} 1\n")
+        );
+        println!("{branch}: {}", stdout.trim());
+        assert!(output.stderr.is_empty());
+    }
 }
 
 const C_MAIN: &str = r#"
@@ -405,7 +437,7 @@ int main(void) {
   CHECK(KU_INT_OK==0u && KU_INT_OVERFLOW==1u && KU_INT_DIV_ZERO==2u);
   size_t binaries=sizeof(fixture_binary)/sizeof(fixture_binary[0]);
   size_t unaries=sizeof(fixture_unary)/sizeof(fixture_unary[0]);
-  CHECK(binaries==2651u && unaries==23u);
+  CHECK(binaries==4211u && unaries==29u);
   for (size_t i=0;i<binaries;i++) {
     fixture_case=i;
     const FixtureBinary* test=&fixture_binary[i];
@@ -421,6 +453,15 @@ int main(void) {
     CHECK(status==test->status);
     CHECK(guarded.before==before && guarded.after==after);
     CHECK(guarded.output==(status==KU_INT_OK ? test->value : sentinel));
+    if(test->operation<3u) {
+      FixtureGuarded left_alias={before,left,after},right_alias={before,right,after};
+      status=fixture_operations[test->operation](left_alias.output,right,&left_alias.output);
+      CHECK(status==test->status && left_alias.before==before && left_alias.after==after);
+      CHECK(left_alias.output==(status==KU_INT_OK ? test->value : left));
+      status=fixture_operations[test->operation](left,right_alias.output,&right_alias.output);
+      CHECK(status==test->status && right_alias.before==before && right_alias.after==after);
+      CHECK(right_alias.output==(status==KU_INT_OK ? test->value : right));
+    }
   }
   for (size_t i=0;i<unaries;i++) {
     fixture_case=binaries+i;
@@ -435,7 +476,8 @@ int main(void) {
     CHECK(guarded.before==before && guarded.after==after);
     CHECK(guarded.output==(status==KU_INT_OK ? test->value : sentinel));
   }
-  printf("task-checked-integer-ok %zu %zu\n",binaries,unaries);
+  CHECK(FIXTURE_INT_BUILTINS==0 || FIXTURE_INT_BUILTINS==1);
+  printf("task-checked-integer-ok %zu %zu %u\n",binaries,unaries,(unsigned)FIXTURE_INT_BUILTINS);
   return 0;
 }
 "#;

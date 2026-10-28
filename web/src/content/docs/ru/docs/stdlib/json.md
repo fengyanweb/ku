@@ -1,7 +1,7 @@
 ---
 title: 'Справочник JSON'
 description: 'Кодирование и декодирование JSON, преобразование KuValue, коды ошибок и поддержка бэкендов Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Кодирование и чтение значений
 
-Это полный базовый пример. Ветка разработки содержит более широкий регрессионный пример в [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Это полный базовый пример. Ветка разработки содержит более широкий регрессионный пример в [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 Реализации JSON есть в интерпретаторе, упакованном средстве запуска по умолчанию и синхронном нативном C-бэкенде. **Ограниченное нативное подмножество Task и LLVM не поддерживают JSON.** Импорты обычного средства запуска всё ещё зависят от расположения исходных файлов; поддержка JSON не означает полностью независимый пакет.
 
-Сигнатуры и ограничения этой страницы сверены с исходным кодом и контрактами. При проверке выполнения нужно указывать версию, коммит и бэкенд. См. полный [контракт синтаксиса JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Сигнатуры и ограничения этой страницы сверены с исходным кодом и контрактами. При проверке выполнения нужно указывать версию, коммит и бэкенд. См. полный [контракт синтаксиса JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

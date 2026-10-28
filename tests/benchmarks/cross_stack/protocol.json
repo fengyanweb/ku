@@ -1,0 +1,310 @@
+{
+  "schema": 1,
+  "status": "v5_new_protocol_requires_new_frozen_results_do_not_mix_v4",
+  "candidate_base": "cac47df6b1db6a3bbd4eebf470306221ca4ef13c",
+  "service": "HTTP/1.1 keep-alive, no compression/TLS/proxy",
+  "endpoints": {
+    "ok": {
+      "method": "GET",
+      "path": "/ok",
+      "expected": "ok:{rid}"
+    },
+    "json_object": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "object",
+      "expected": "new envelope {id:rid string,counter:input.counter+1,data:deep decoded input.data}"
+    },
+    "json_array": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "array"
+    },
+    "json_escape": {
+      "method": "POST",
+      "path": "/json",
+      "corpus": "escape"
+    },
+    "cpu": {
+      "method": "GET",
+      "path": "/work",
+      "work_units": [
+        480,
+        512,
+        544,
+        576
+      ],
+      "seed_lengths": [
+        1,
+        3,
+        7,
+        11
+      ],
+      "expected": "{rid}:{checksum:08d}"
+    },
+    "timer": {
+      "method": "GET",
+      "path": "/timer",
+      "milliseconds": 25,
+      "expected": "timer:{rid}"
+    },
+    "wait": {
+      "method": "GET",
+      "path": "/wait",
+      "milliseconds": 35000,
+      "expected": "wait:{rid}"
+    },
+    "tcp": {
+      "method": "GET",
+      "path": "/tcp",
+      "peer": "write K, read K after controlled release",
+      "expected": "tcp:{rid}"
+    },
+    "db": {
+      "method": "GET",
+      "path": "/db",
+      "query": "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
+      "keys": 1024,
+      "expected": "{id:int,label:str,score:int,rid:str}"
+    },
+    "mixed": {
+      "basis_points": {
+        "json_object": 7000,
+        "db": 2000,
+        "timer": 900,
+        "cpu": 100
+      },
+      "deterministic_schedule": "index mod100:0..69 JSON;70..89 DB;90..98 timer;99 CPU"
+    }
+  },
+  "cpu_algorithm": {
+    "integer": "signed64 in Ku/Go/Rust; Node exact Number intermediates <2^53",
+    "iterations": "work_units*1000",
+    "seed": "seed query string length",
+    "initial": "total=seed",
+    "step": "total=(total*33+i+seed)%100000000; i=0..iterations-1",
+    "overflow": "none by bounds; maximum intermediate <3.4e9",
+    "batch": {
+      "input": "batch.json",
+      "fields": {
+        "iterations": 512000,
+        "seed": 3,
+        "repeat": 32768
+      },
+      "output": "{checksums:[int],compute_ms:monotonic milliseconds}",
+      "expected_checksum_per_repeat": 22944003,
+      "formal_minimum_process_wall_seconds": 30,
+      "formal_minimum_compute_ms_per_process": 30000,
+      "process_group_absolute_deadline_seconds": 600,
+      "deadline_origin": "shared frozen-domain release through last natural child exit; no startup subtraction",
+      "maximum_bytes_per_stdout_or_stderr": 1048576,
+      "resource_sampling_interval_seconds": 0.1,
+      "maximum_resource_samples": 6016,
+      "resource_sampling_scope": "bounded100ms whole-domain snapshots cover the full600s execution window; subinterval peaks may be missed by sampled RSS/current; kernel memory.peak is retained",
+      "formal_eligibility": "all checksum outputs correct, all children exit naturally, original OOM/resource/cleanup gates pass, process wall>=30s and every process compute_ms>=30000; no sleeping, auto-increased work or selective retries to qualify",
+      "short_formal_window": "retain evidence, mark ineligible and stop later formal rounds for that stack; never silently increase repeat",
+      "previous_repeat64": "retained R&D only, excluded from the formal table",
+      "cold_start": "repeat=0 in a fresh process, reported separately with no30s minimum; never subtracted from repeat=32768"
+    }
+  },
+  "corpora": {
+    "object": {
+      "path": "corpora/object.json",
+      "bytes": 1048,
+      "sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "array": {
+      "path": "corpora/array.json",
+      "bytes": 937,
+      "sha256": "96e17f4ef99d04bede9f7208d0fa94f8b2f0dbeebc53c417e4b0624e7fda3ae1",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "escape": {
+      "path": "corpora/escape.json",
+      "bytes": 4116,
+      "sha256": "a5916fe82167409eb847eb0021da550a2c9bcaa224c80f1d62e91210dd72d8af",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    }
+  },
+  "database": {
+    "table": "cross_stack_items",
+    "columns": {
+      "id": "integer primary key",
+      "label": "text not null",
+      "score": "integer not null"
+    },
+    "rows": 1024,
+    "label": "item-<id>-中文🙂",
+    "score": "id*17",
+    "pool_total": 16,
+    "retry": false,
+    "cache_results": false,
+    "isolated_fixture_only": true
+  },
+  "resources": {
+    "service_cpu_counts": [
+      1,
+      2,
+      4
+    ],
+    "service_memory_bytes": 1073741824,
+    "small_memory_bytes": 268435456,
+    "service_domain": "whole cgroup including primary/workers/background/GC",
+    "service_cpuset": "0..cores-1",
+    "driver_cpuset": "4-6 if8vCPU available; actual written in environment manifest",
+    "database_cpuset": "7 if8vCPU available",
+    "cpu_max": "cores*100000 100000",
+    "memory_swap_max": 0,
+    "Ku_background_threads": 17,
+    "Ku_thread_budget": 64,
+    "Ku_HTTP_active": 1024,
+    "Ku_HTTP_pending": 128,
+    "Ku_HTTP_connections": 4096,
+    "Ku_task_bytes": 67108864,
+    "unmatched_admission_controls": "record actual native framework semantics; no artificial slow layer",
+    "waiting_admission": "Harness writes ordinary config max_active_requests=target+64, max_connections=target+128, max_pending_requests=128 for dedicated wait instances. Ku reads same config; actual protected limits must match, not inferred from Task driver capacity."
+  },
+  "SLO": {
+    "success_fraction_planned": 0.999,
+    "body_errors": 0,
+    "ok_p99_ms": 100,
+    "json_p99_ms": 100,
+    "cpu_p99_ms": 1000,
+    "db_p99_ms": 250,
+    "timer_p99_ms": 100,
+    "primary_latency": "scheduled-to-complete; sent-to-complete and schedule lag also shown",
+    "ordinary_absolute_timeout_seconds": 3,
+    "long_wait_timeout_seconds": 50,
+    "recovery_seconds": 5,
+    "ordinary_absolute_timeout_origin": "scheduled arrival, including client queue/dial/write/read and full response validation",
+    "waiting_server_absolute_timeout_ms": 45000,
+    "waiting_deadline_scope": "dedicated long-wait instances only; 35s timer / 30s TCP hold cannot fit ordinary server default30s; ordinary matrix unchanged"
+  },
+  "matrix": {
+    "warmup_seconds": 30,
+    "maximum_warmup_seconds": 120,
+    "formal_seconds": 30,
+    "formal_repeats": 7,
+    "capacity_explore_seconds": 5,
+    "maximum_boundary_refinements": 3,
+    "waiting_counts": [
+      32,
+      64,
+      128,
+      512,
+      2048,
+      8192
+    ],
+    "waiting_stop": "confirmed hard limit/SLO/resource failure; no higher fake capacity",
+    "wait_observation_seconds": 30,
+    "sustained_seconds": 600,
+    "sustained_rate": "60% of minimum nonzero seven-round verified mixed point; point is a lower bound, not exact capacity",
+    "overload_seconds": 30,
+    "warmup_policy": "30 seconds once for every stack and CPU/memory/workload case; native services retained between interleaved rounds only after all actual jobs are drained",
+    "resume_prime_seconds": 3,
+    "inactive_services": "whole idle service cgroup frozen between interleaved rounds, freeze/resume history retained; 3s prime excluded uniformly",
+    "vm_memory_fallback": "if whole guest available memory falls below 800MiB while retaining idle services, restart every stack for that case and repeat uniform 30s warmup; record fallback",
+    "waiting_warmup": "all stacks: 30s at32rps of ordinary25ms timer before the held cohort; complete all responses before baseline",
+    "formal_seconds_rule": "at least30s, extend uniformly to reach>=1000 pooled correct samples per required type without changing70/20/9/1 mix; actual failures may still leave insufficient tails",
+    "overload_multiples": [
+      1.5,
+      2,
+      5
+    ],
+    "maximum_additional_overload_multiples": [
+      10,
+      20,
+      40
+    ],
+    "overload_escalation_stop": "after5x, stop on valid observed service boundary, driver/measurement censoring, unexplained service fault, or frozen rate ceiling; below boundary cannot pass true-overload recovery",
+    "small_memory_workloads": [
+      "json_object",
+      "mixed"
+    ],
+    "seven_stack_scope": "Ku/Go/Rust/Node original matrix; Java/.NET/C++ four-core ok/json_object/mixed, including256MiB json_object and600s mixed. Select --case and --stacks explicitly; no extra JSON workload requirement for the added three.",
+    "sustained_case": "--case selects its own CPU/memory/workload formal basis, includingc4-m268435456-mixed; no reuse of1GiB capacity for256MiB"
+  },
+  "measurement": {
+    "all_outcomes": "mutually exclusive; failed results never excluded from denominators",
+    "times": [
+      "scheduled_at",
+      "sent_at",
+      "completed_at"
+    ],
+    "late": "associated event, not second terminal count",
+    "events": "bounded streaming compressed CSV allowed; output overflow invalidates run",
+    "no_retry": true,
+    "small_tail_samples": "p99 null below100 correct,p999 null below1000; below100 check observed maximum only; core pooled p99 claim requires>=1000 per type and>=7 seeded interleaved windows; merge same identity/config only",
+    "capacity_search_ceiling_rps": 100000,
+    "driver_headroom": "driver invalidity or CPU saturation censors server capacity; it is not a server capacity failure",
+    "planned_window_tail": "stop creating plans at the frozen window end; already planned requests may start and complete until their original scheduled+absolute deadline. Do not discard at window cutoff, renew deadlines, replay, or credit completion-tail throughput to the window",
+    "client_schema": "ku-cross-stack-client-v5",
+    "overload_recovery_origins": "primary: planned arrival cutoff+5s unchanged; secondary: separately report last actual business sent+5s and continued-offering tail; secondary never rescues failed primary",
+    "connection_reuse": "bounded shared LIFO; default500ms idle expiry unchanged; report dial attempts/idle expirations/cold and reused latency/scheduled-to-attempt/dial duration. Separate three-point diagnostic uses500vs0 expiry; no mixing of policies in formal distributions.",
+    "cross_process_clock": "Linux CLOCK_MONOTONIC anchor with recorded <=1ms uncertainty; resource and recovery correlation never uses realtime/Unix arithmetic. Combined anchors conservatively bound new-probe timing; missing or uncertain clocks censor measurement, not server capacity.",
+    "driver_average_cpu_saturation_fraction": 0.9,
+    "histogram_representation": "v5-fixed-log128:256 linear10us cells below2.56ms then128cells/doubling;5760cells/distribution covers int64 ns; all counts retained; upper-edge quantiles",
+    "histogram_maximum_relative_bucket_width": 0.0078125,
+    "paired_statistics": {
+      "seed": 20261023,
+      "bootstrap_resamples": 20000,
+      "minimum_windows": 7,
+      "unit": "paired interleaved window, not individual request",
+      "estimand": "geometric mean per-window ratio",
+      "interval": "percentile95% bootstrap; dependence/stationarity assumption disclosed; no target claim when service/measurement gates fail",
+      "comparison_views": {
+        "common": "same arrival rate: lifecycle CPU, steady/peak memory, p99 and delivered goodput; not maximum throughput capacity",
+        "own_capacity": "Ku/Go and Ku/Rust separate qualified own-point seven-window goodput ratios with paired CI; credible upper exploration evidence required for capacity target, otherwise censored"
+      }
+    },
+    "resource_cost_scopes": [
+      "arrival window CPU interpolation with uncertainty and current-memory middle60% median/observed peak",
+      "driver lifetime including client tail",
+      "full lifecycle through actual quiescence or forced termination; forced exit fails natural reclamation",
+      "post-driver CPU distinct from provable useless-work CPU; unavailable attribution is null"
+    ],
+    "physical_settle_observation": {
+      "fixture_gate_seconds": 5,
+      "maximum_observation_seconds_after_driver": 45,
+      "runtime_deadlines_changed": false,
+      "meaning": "keep5s fixture result; await real responsibility quiescence within frozen runtime contract then record physical end or forced termination"
+    },
+    "histogram_minimum_resolution_us": 10
+  },
+  "known_capability_differences": {
+    "json_response_mime": {
+      "ku_json_text_mode": "/json uses text/plain; charset=utf-8 via public http.text; historical/default text API column",
+      "ku_json_response_mode": "/json uses application/json; charset=utf-8 via public http.json; separately identified expanded source and ELF",
+      "ku_database": "/db uses text/plain; charset=utf-8 via public http.text in both async and sync PG execution modes; JSON body still validated",
+      "go_java_dotnet_cpp": "/json and /db use application/json; charset=utf-8",
+      "rust_node": "/json and /db use application/json without an explicit charset parameter",
+      "claim": "JSON business bodies are validated equivalently; response MIME differs by actual public API and stack; historical results keep their original protocol/source hashes"
+    },
+    "json_subtree_ownership": "Current Ku fixture reads counter through ordinary scalar indexing, then decoded.take(\"data\") consumes the root and transfers the selected subtree. Rust moves it; Go and Node retain decoded object references. Decode, scalar lookup, remaining-root cleanup, envelope construction and encoding still occur; ownership/allocation work is not asserted identical. Historical accessor-copy runs retain their original source and protocol hashes.",
+    "ku_pg_execution": {
+      "default": "async named local handler captures the original initialized PgClient; public query suspends through Task; integer getters plus old JSON writer",
+      "legacy_sync": "explicit --ku-pg-execution sync; --ku-pg-read value preserves string-to-JSON numeric decode, int isolates getter change",
+      "unchanged": "same SQL, shared pool size16, DISCARD ALL, absolute deadlines, no SQL retry, response status/body/MIME; modes have distinct source/C/ELF hashes"
+    }
+  },
+  "revision": 5
+}

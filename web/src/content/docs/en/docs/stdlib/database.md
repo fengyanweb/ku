@@ -1,14 +1,18 @@
 ---
 title: Database clients
 description: PostgreSQL, Redis, MySQL and MariaDB configuration, queries, results, errors, and lifecycle.
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/backend/c.rs',
     'src/cli.rs',
     'docs/protocol-foundation.md',
+    'src/backend/c_database_budget.c',
+    'src/backend/c_pg_async_runtime.c',
+    'src/backend/c_task_pg_runtime.c',
+    'src/ir/task_lower.rs',
   ]
 sidebar:
   order: 9
@@ -48,6 +52,8 @@ These variables configure native linking, not database credentials. MySQL automa
 
 Only use fields applicable to that client. Unknown fields and invalid types or ranges return `invalid_config`. Pool operations can report `pool_busy`, `acquire_timeout`, `connect_timeout`, `connect_error`, `client_closed`, or `out_of_memory`, with the appropriate module domain. Limits do not give a hard deadline for every synchronous DNS or external library call, and a result-size cap is not a process memory cap.
 
+The native process also shares database admission budgets across clients: `KU_DB_MAX_CONNECTIONS` (default 256), `KU_DB_MAX_WAITERS` (4096) and `KU_DB_MAX_PENDING_BYTES` (67,108,864 bytes). These are environment variables, not constructor fields. Pool slot reservations and pending-operation storage are budgeted separately; they are not all result bytes, all live objects or an OS process-memory ceiling.
+
 ## PostgreSQL
 
 Import `pg` from `std.pg`. In addition to pool fields, `pg.client(config)` requires `conninfo:str`, a libpq connection string or URI. No separate `pg.connect` or raw connection API is provided.
@@ -57,6 +63,7 @@ Import `pg` from `std.pg`. In addition to pool fields, `pg.client(config)` requi
 | `client.query(sql:str, parameters:[str])` | result Result | Parameterized SQL using `$1`, `$2`, …; pass `[]` when no parameters are needed. |
 | `result.rows()` / `result.cols()`         | `int`         | Detached result dimensions.                                                     |
 | `result.value(row:int, column:int)`       | `str!`        | Copy a non-NULL cell as text.                                                   |
+| `result.value_int(row:int, column:int)`   | `int!`        | Parse a canonical signed int64 cell without a float/string coercion.            |
 | `result.is_null(row:int, column:int)`     | `bool!`       | Distinguish SQL NULL from an empty string.                                      |
 | `client.close()`                          | `null`        | Consume and close the client.                                                   |
 
@@ -94,7 +101,47 @@ With a reachable PostgreSQL server, output is:
 true
 ```
 
-`query` returns owned results detached from the pool connection, so result reads do not hold a pool slot. `value` on SQL NULL returns `pg/null_value`; invalid coordinates return a recoverable error. Explicit transactions, session state, COPY and exclusive connections are not supported by this shared client.
+`query` returns owned results detached from the pool connection, so result reads do not hold a pool slot. `value` on SQL NULL returns `pg/null_value`; invalid coordinates return a recoverable error. `value_int` accepts canonical signed int64 text: no leading `+`, whitespace, decimal point or leading zeroes except `0`. Noncanonical/out-of-range values report `pg/integer_value_error`; SQL NULL still reports `pg/null_value`. Explicit transactions, session state, COPY and exclusive connections are not supported by this shared client.
+
+<a id="async-pg"></a>
+
+### PostgreSQL in an async HTTP handler
+
+Save as `async-pg.ku`, prepare the same private `db.conn` and libpq dependency as above, and compile with `ku build --backend c --profile release async-pg.ku -o async-pg`. Port 8080 must be free:
+
+```ku
+import http from "std.http"
+import pg from "std.pg"
+import fs from "std.fs"
+
+fn main(): null! {
+    client = pg.client({
+        conninfo: fs.read("db.conn")?,
+        max_connections: 4,
+        max_waiters: 8,
+        connect_timeout_ms: 2000,
+        acquire_timeout_ms: 100,
+        query_timeout_ms: 1000
+    })?
+    async fn read(): HttpResponse! {
+        result = client.query("SELECT $1::text", ["Ku"])?
+        return ok(http.text(result.value(0, 0)?))
+    }
+    app = http.service({
+        max_connections: 64,
+        max_active_requests: 16,
+        max_pending_requests: 32,
+        handler_timeout_ms: 2000
+    })
+    app.get("/read", read)
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+```
+
+Start the binary and call `curl http://127.0.0.1:8080/read`; a successful query returns `Ku`. This example only reads data. The handler borrows the supported captured PG client read-only through the native handler binding; it does not move or close that shared client. This is a dedicated capture binding, not an async `&` parameter. Arbitrary resource captures, constructing/closing a client in a Task, Redis/MySQL Task waiting and general async database methods are not implied.
+
+Here `client.query(...)?` is a suspension supported by native lowering, returning a Result; it is not a user-created Task handle to `await`. Acquisition, connection/query progress and reset retain a deadline clamped to the original HTTP request/handler deadline. They do not renew that deadline or retry SQL. A timeout after sending can still have an uncertain database outcome. Complete pool/OS cleanup and service shutdown remain separate from returning an HTTP response.
 
 ## Redis
 
@@ -198,4 +245,4 @@ Use `?` to propagate an error, or `try/catch` to inspect its `domain`, `code`, a
 
 The SQL clients do **not automatically retry statements**. `execution_unknown` means a statement was sent but its final outcome is not known. `execution_completed_without_result` means execution completed but a usable result could not be returned. `session_state_unsupported` can be detected before sending or after execution; its message distinguishes the stage. Do not infer rollback or retryability from a timeout, a worker exit, a reset, or these error codes. Confirm uncertain writes through business identifiers and database state before any manual retry.
 
-A pool reset clears supported per-connection state; it does not undo committed changes or external effects. Keep SQL application-controlled, bind values as parameters, and use a database account limited to the required operations. This page describes the v0.0.18 API; it does not claim a completed database platform matrix.
+A pool reset clears supported per-connection state; it does not undo committed changes or external effects. Keep SQL application-controlled, bind values as parameters, and use a database account limited to the required operations. The listed API does not establish a complete database/platform matrix.

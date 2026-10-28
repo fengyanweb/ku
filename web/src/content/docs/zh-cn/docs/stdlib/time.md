@@ -1,9 +1,17 @@
 ---
 title: 时间与计时
 description: 使用 std.time 读取时钟、处理日期格式、计算时长和等待。
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
-sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
+sources:
+  [
+    'src/stdlib/time.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'src/ir/task_lower.rs',
+    'src/backend/c.rs',
+    'src/runtime/interpreter.rs',
+  ]
 sidebar:
   order: 6
 ---
@@ -138,3 +146,23 @@ time.sleep(duration:Duration): null!
 ## 执行支持
 
 完整日历和时长 API 支持 `ku run` 与默认打包 runner。同步 native C 当前支持 `now()`、`instant()`、`elapsed(Time)`、`millis()` / `millis(Time)`（Time 来自 `instant()`）和 `steady_millis()`，不支持完整日历解析、格式化、自造 Time 对象与同步 sleep。native Task 有单独受限的整数 sleep 路径；LLVM 不提供完整时间库。
+
+<a id="native-task-wait"></a>
+
+## Native Task 等待
+
+保存为 `task-sleep.ku`。执行 `ku check task-sleep.ku` 与 `ku build --backend c --profile release task-sleep.ku -o task-sleep`，选择受支持的整数定时路径：
+
+```ku
+import time from "std.time"
+
+async fn main(): null! {
+    time.sleep(10)?
+    println("awake")
+    return ok(null)
+}
+```
+
+运行程序，等待可完成后输出 `awake`。10 毫秒是请求的等待，不保证精确调度时刻或延迟。此处 native Task 接受整数毫秒，不接受通用 `Duration` 对象重载，也不支持在 Task `finally` 中使用。返回 `null!`，用 `?` 处理，不写 `await`。取消和清理保留既有绝对截止期限。
+
+交换日期使用墙钟 epoch 值，本进程耗时使用单调差值。不能把 `steady_millis` 当日期、跨进程时间戳，或在没有明确降低支持时作为 native Task 操作。

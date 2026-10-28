@@ -1,7 +1,7 @@
 ---
 title: 'Biblioteca padrão'
 description: 'Encontre módulos da biblioteca padrão do Ku, assinaturas essenciais e limites dos backends.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Esta documentação descreve o escopo congelado da pré-versão experimental v0.0.18. A publicação efetiva e os downloads estão registrados no GitHub Releases. Estes pontos de entrada essenciais foram conferidos no código-fonte; não é uma referência exaustiva da API. O [contrato de sintaxe](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) define o comportamento. Consulte a [matriz de suporte](/pt/docs/support/) para os limites dos backends.
+Esta documentação descreve o escopo congelado da pré-versão experimental v0.0.18. A publicação efetiva e os downloads estão registrados no GitHub Releases. Estes pontos de entrada essenciais foram conferidos no código-fonte; não é uma referência exaustiva da API. O [contrato de sintaxe](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) define o comportamento. Consulte a [matriz de suporte](/pt/docs/support/) para os limites dos backends.
 
 ## Importe módulos
 
@@ -77,7 +77,7 @@ Primeiro crie um `message.txt` em UTF-8 ao lado do código-fonte. Um arquivo aus
 
 ## Manutenção da referência
 
-Os metadados das interfaces públicas ficam em [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Eles são verificados com as implementações e os contratos. Atualmente o site mantém uma referência manual selecionada; a existência de um comando `ku doc` não foi confirmada.
+Os metadados das interfaces públicas ficam em [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Eles são verificados com as implementações e os contratos. Atualmente o site mantém uma referência manual selecionada; a existência de um comando `ku doc` não foi confirmada.
 
 ## API reference (English)
 

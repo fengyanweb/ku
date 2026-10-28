@@ -17,6 +17,108 @@ use ku::{
 use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
 use std::{fs, process::Command};
 
+fn lowered_json(source: &str) -> task_lower::NativeTaskProgram {
+    let mut ast = parsed(source);
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:json".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new()
+        .check(&ast)
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
+    task_lower::lower_program(&ast).unwrap_or_else(|error| panic!("{error}\n{source}"))
+}
+
+#[test]
+fn native_task_json_literal_keeps_source_order_unique_keys_and_owned_inputs() {
+    let source = r#"
+import json from "std.json"
+async fn next(value:int):int! { println(value) return ok(value) }
+async fn main():null! {
+    value="中文😀\"\\\n\u0000"
+    body=json.encode({z:(await next(1))?,y:(await next(2))?,x:(await next(3))?,a:value.clone(),low:-9223372036854775807 - 1,high:9223372036854775807,b:true,n:null})?
+    println(body)
+    println(value.byte_len())
+    return ok(null)
+}
+"#;
+    let source = source.replace("\\u0000", "\0");
+    let native = lowered_json(&source);
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let directory = TempDir::new("task-json-literal");
+    let path = directory.path().join("literal.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "literal") else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8(result.stdout).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(&lines[..3], ["1", "2", "3"]);
+    assert_eq!(
+        lines[3],
+        r#"{"a":"中文😀\"\\\n\u0000","b":true,"high":9223372036854775807,"low":-9223372036854775808,"n":null,"x":3,"y":2,"z":1}"#
+    );
+    assert_eq!(lines[4], "中文😀\"\\\n\0".len().to_string());
+    assert_eq!(lines.len(), 5);
+    let moved = r#"import json from "std.json" async fn main():null! {value="x" body=json.encode({a:value})? println(value) return ok(null)}"#;
+    assert!(ku::cli::check_source("task-json-moved.ku", moved).is_err());
+    let duplicate = r#"import json from "std.json" async fn main():null! {body=json.encode({a:1,a:2})? return ok(null)}"#;
+    assert!(ku::cli::check_source("task-json-duplicate.ku", duplicate)
+        .unwrap_err()
+        .message
+        .contains("duplicate field"));
+    assert!(task_lower::lower_program(&parsed(duplicate))
+        .unwrap_err()
+        .message
+        .contains("duplicate field"));
+    for unsupported in [
+        r#"import json from "std.json" async fn main():null! {body=json.encode({a:1.5})? return ok(null)}"#,
+        r#"import json from "std.json" async fn main():null! {value={a:1} body=json.encode(value)? return ok(null)}"#,
+    ] {
+        assert!(task_lower::lower_program(&parsed(unsupported)).is_err());
+    }
+}
+
+#[test]
+fn native_task_json_literal_allocation_refusals_are_results_and_reclaim_charge() {
+    let native = lowered_json(
+        r#"import json from "std.json" async fn main():null! { try {text=json.encode({a:"hello",b:1})? println(text)} catch(error){println(error.code)} return ok(null)}"#,
+    );
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    for (name,needle,replacement,expected) in [
+        ("oom","buffer.data=(uint8_t*)malloc(capacity);buffer.cap=capacity;","buffer.data=NULL;buffer.cap=capacity;","out_of_memory"),
+        ("limit","if(status==KU_TASK_DRIVER_OK)status=ku_task_driver_grow_charge(host->ticket,capacity);","if(status==KU_TASK_DRIVER_OK)status=KU_TASK_DRIVER_LIMIT;","resource_limit"),
+        ("output-limit","#define KU_JSON_MAX_OUTPUT_BYTES ((size_t)1000000)","#define KU_JSON_MAX_OUTPUT_BYTES ((size_t)18)","stringify_error"),
+        // Integer capacity is conservatively 20 bytes. Saturating the prepaid
+        // capacity at the output limit must still permit a smaller actual
+        // representation that fits the exact bound.
+        ("output-exact","#define KU_JSON_MAX_OUTPUT_BYTES ((size_t)1000000)","#define KU_JSON_MAX_OUTPUT_BYTES ((size_t)19)",r#"{"a":"hello","b":1}"#),
+    ] {
+        assert_eq!(generated.matches(needle).count(),1);
+        let directory=TempDir::new(&format!("task-json-{name}"));
+        let path=directory.path().join("failure.c");fs::write(&path,generated.replacen(needle,replacement,1)).unwrap();
+        let Some(executable)=compile_harness(directory.path(),&path,"failure") else {return;};
+        let output=run_bounded(Command::new(executable).current_dir(directory.path()),RUN_TIMEOUT,RUN_LIMITS).unwrap();
+        assert!(output.status.success(),"{name}: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(),expected);
+    }
+}
+
 fn parsed(source: &str) -> ku::ast::Program {
     Parser::new(Lexer::new(source).lex().expect("source lexes"))
         .parse_program()
@@ -347,13 +449,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             .len(),
         64
     );
-    let error = task_lower::lower_program(&budget_ast(63, false)).unwrap_err();
+    let compacted = task_lower::lower_program(&budget_ast(63, false)).unwrap();
     assert!(
-        error
-            .message
-            .contains("more than 64 generated Task frame slots"),
-        "{error}"
+        compacted.tasks.functions[0].slots.len() < 64,
+        "dead Copy temporaries beyond logical64 must reuse physical slots"
     );
+    task::verify_and_plan(&compacted.tasks, task::TaskLimits::default()).unwrap();
     let error = task_lower::lower_program(&budget_ast(64, true)).unwrap_err();
     assert!(
         error

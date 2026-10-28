@@ -1524,9 +1524,48 @@ impl Interpreter {
                 return Ok(None);
             }
         }
-        let target_value = self.eval(target, env, depth)?;
+        // `take` is a new KuValue method, not a globally reserved field name.
+        // Preserve already-supported struct/object callable fields. Inspect a
+        // bound source without cloning or consuming it; the ordinary call path
+        // below still evaluates its receiver once before its arguments.
+        let callable_take = if name == "take" {
+            if let ExprKind::Variable(local) = &target.kind {
+                if env.contains(local) {
+                    env.with_value(local, target.span, |value| {
+                        value.with_read(target.span, |value| Ok(has_callable_take_field(value)))
+                    })?
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let target_value = if name == "take" && !callable_take {
+            if let ExprKind::Variable(local) = &target.kind {
+                self.tick(target.span)?;
+                env.take_owned_json_value(local, target.span)?
+            } else {
+                self.eval(target, env, depth)?
+            }
+        } else {
+            self.eval(target, env, depth)?
+        };
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
+        }
+        if name == "take"
+            && target_value.with_read(target.span, |value| Ok(has_callable_take_field(value)))?
+        {
+            self.tick(callee.span)?;
+            let callable = target_value
+                .with_read(callee.span, |value| field_value(value, name, callee.span))?;
+            drop(target_value);
+            return self
+                .eval_callable_arguments(callable, callee, args, env, depth, span)
+                .map(Some);
         }
         if name == "map" && matches!(target_value, Value::Array(_)) {
             return self
@@ -1584,7 +1623,7 @@ impl Interpreter {
             Ok(match target {
                 // A KuValue can carry any runtime tag, including objects with
                 // callable fields. Converters retain their existing priority.
-                _ if name == "as_int" || name == "as_str" => "kuvalue",
+                _ if matches!(name.as_str(), "as_int" | "as_str" | "take") => "kuvalue",
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
                 Value::Object(_) if name == "get_or" => "object",
@@ -1633,7 +1672,7 @@ impl Interpreter {
             "string" => stdlib::string::eval(name, &values, span),
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
-            "kuvalue" => Ok(eval_kuvalue_method(name, &values)),
+            "kuvalue" => eval_kuvalue_method(name, &mut values, span),
             _ => Ok(None),
         }?;
         value
@@ -4633,6 +4672,9 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("string", "ends_with") => "string.ends_with",
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
+        ("json", "parse") => "json.parse",
+        ("json", "decode") => "json.decode",
+        ("json", "try_parse") => "json.try_parse",
         ("json", "stringify") => "json.stringify",
         ("json", "encode") => "json.encode",
         _ => return None,
@@ -4687,8 +4729,10 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
         if let Some(method) = name.strip_prefix("array.") {
             return stdlib::array::eval(method, std::slice::from_ref(first), span);
         }
-        if matches!(name, "json.stringify" | "json.encode") {
-            return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
+        if let Some(method) = name.strip_prefix("json.") {
+            // The old parser and writer read synchronously and return their
+            // own storage. Hold the existing loan only through that call.
+            return stdlib::json::eval(method, std::slice::from_ref(first), span);
         }
         if name == "print" {
             print!("{first}");
@@ -4701,11 +4745,46 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
     })
 }
 
+fn has_callable_take_field(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) | Value::Struct { fields, .. } => {
+            matches!(fields.get("take"), Some(Value::Function { .. }))
+        }
+        _ => false,
+    }
+}
+
 /// `KuValue.as_int()` / `.as_str()`: convert a dynamic value read from an object
 /// to a concrete type, returning `T!` (Err on a tag mismatch).
-fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
-    let value = values.first()?;
-    match name {
+fn eval_kuvalue_method(name: &str, values: &mut [Value], span: Span) -> KuResult<Option<Value>> {
+    if name == "take" {
+        expect_runtime_arg_count("KuValue.take", values.len(), 2, span)?;
+        if !matches!(&values[1], Value::String(_)) {
+            return Err(KuError::runtime("KuValue.take requires a string key", span));
+        }
+        // The method owns its receiver. HashMap::remove moves the selected
+        // subtree; dropping the remaining fields cannot invalidate the result.
+        let (receiver, key_value) = values.split_at_mut(1);
+        let Value::String(key) = &key_value[0] else {
+            unreachable!()
+        };
+        let value = std::mem::replace(&mut receiver[0], Value::Null);
+        return Ok(Some(match value {
+            Value::Object(mut fields) => match fields.remove(key) {
+                Some(selected) => stdlib::errors::ok(selected),
+                None => stdlib::errors::err(
+                    "object",
+                    "missing_key",
+                    format!("missing object key: {key}"),
+                ),
+            },
+            _ => stdlib::errors::err("object", "type_unsupported", "expected object value"),
+        }));
+    }
+    let Some(value) = values.first() else {
+        return Ok(None);
+    };
+    Ok(match name {
         "as_int" => Some(match value {
             Value::Int(i) => stdlib::errors::ok(Value::Int(*i)),
             other => stdlib::errors::err(
@@ -4723,7 +4802,7 @@ fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
             ),
         }),
         _ => None,
-    }
+    })
 }
 
 fn eval_index_value(
@@ -7833,6 +7912,9 @@ mod collection_tests {
                 "contains",
                 "starts_with",
                 "ends_with",
+                "parse",
+                "decode",
+                "try_parse",
                 "stringify",
                 "encode",
                 "push",

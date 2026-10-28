@@ -1,7 +1,7 @@
 ---
 title: 数组
 description: 同类型数组、索引、映射及返回新数组的集合操作。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
@@ -67,4 +67,4 @@ index_out_of_bounds
 
 ## 后端支持
 
-此示例适用于解释器和同步 native C。v0.0.18 native C 对已支持的元素和回调类型实现了 `len`、`is_empty`、`try_get`、`push`、`map`，尚未实现 `first`、`last`、`concat`。对象或函数值数组、native Task 代码还有额外限制，解释器运行成功不代表 native 必然支持。
+此示例适用于解释器和同步 native C。v0.0.19 native C 对已支持的元素和回调类型实现了 `len`、`is_empty`、`try_get`、`push`、`map`，尚未实现 `first`、`last`、`concat`。对象或函数值数组、native Task 代码还有额外限制，解释器运行成功不代表 native 必然支持。

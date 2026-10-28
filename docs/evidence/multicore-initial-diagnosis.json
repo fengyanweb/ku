@@ -1,0 +1,3133 @@
+{
+  "scope": "Bounded B01/B06 diagnosis; not formal capacity acceptance and not historical 504 attribution",
+  "linux": {
+    "run": "https://github.com/fengyanweb/ku/actions/runs/39747963102",
+    "source_commit": "c1de5e3245bff62eb0b422d5c39a5212a1d1723b",
+    "source_dirty": false,
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "04220f76c2e8e2c4f0e016435266a82ef3574f0938e763e6a53703dcd2862a13",
+      "native_sha256": "85961e3359890b3955eda7ee7e6e6f12aaa47783d3f191a6a2b08583c3ba9afc",
+      "build_output": "native c ok: /tmp/ku-multicore-capacity-yj9pb1nx/.ku/build/release/c/5ZVfMm805xu_JdJQ1eI2UEs56PEP3ZjDhIJgDoqBXuI/capacity.c\nbuild ok: /tmp/ku-multicore-capacity-yj9pb1nx/capacity\n",
+      "generated_c_sha256": [
+        "2af7d1b1558a0b67e57ae13213efd95840edf0a4dc15744147156bbde35a03a7"
+      ]
+    },
+    "cli_sha256": "ea95440fc0f62526edc7f04f90f9dbed026d9ca1963171c7181cb7c72558c4e9",
+    "samples": [
+      {
+        "index": 0,
+        "submit_ns": 279151,
+        "headers_after_submit_ns": 12383269,
+        "body_after_headers_ns": 18238,
+        "total_ns": 12680658,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 1,
+        "submit_ns": 55333,
+        "headers_after_submit_ns": 41792375,
+        "body_after_headers_ns": 12048,
+        "total_ns": 41859756,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 2,
+        "submit_ns": 58999,
+        "headers_after_submit_ns": 41956256,
+        "body_after_headers_ns": 10987,
+        "total_ns": 42026242,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 3,
+        "submit_ns": 57216,
+        "headers_after_submit_ns": 41970605,
+        "body_after_headers_ns": 12569,
+        "total_ns": 42040390,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 4,
+        "submit_ns": 72129,
+        "headers_after_submit_ns": 41866962,
+        "body_after_headers_ns": 11297,
+        "total_ns": 41950388,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 5,
+        "submit_ns": 66019,
+        "headers_after_submit_ns": 41889673,
+        "body_after_headers_ns": 11186,
+        "total_ns": 41966878,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 6,
+        "submit_ns": 54682,
+        "headers_after_submit_ns": 41925129,
+        "body_after_headers_ns": 9685,
+        "total_ns": 41989496,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 7,
+        "submit_ns": 55414,
+        "headers_after_submit_ns": 41984285,
+        "body_after_headers_ns": 11638,
+        "total_ns": 42051337,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 8,
+        "submit_ns": 55363,
+        "headers_after_submit_ns": 41937016,
+        "body_after_headers_ns": 11567,
+        "total_ns": 42003946,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 9,
+        "submit_ns": 58608,
+        "headers_after_submit_ns": 41950445,
+        "body_after_headers_ns": 11547,
+        "total_ns": 42020600,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 10,
+        "submit_ns": 58428,
+        "headers_after_submit_ns": 41828323,
+        "body_after_headers_ns": 10226,
+        "total_ns": 41896977,
+        "status": 200,
+        "body": "cpu-ready"
+      },
+      {
+        "index": 11,
+        "submit_ns": 49825,
+        "headers_after_submit_ns": 42003103,
+        "body_after_headers_ns": 11598,
+        "total_ns": 42064526,
+        "status": 200,
+        "body": "cpu-ready"
+      }
+    ],
+    "packet_timeline": [
+      "1792657895.517874 IP 127.0.0.1.39150 > 127.0.0.1.59749: Flags [P.], seq 96:191, ack 113, win 64, options [nop,nop,TS val 4176342648 ecr 4176342648], length 95",
+      "1792657895.519067 IP 127.0.0.1.59749 > 127.0.0.1.39150: Flags [P.], seq 113:130, ack 191, win 64, options [nop,nop,TS val 4176342649 ecr 4176342648], length 17",
+      "1792657895.559501 IP 127.0.0.1.39150 > 127.0.0.1.59749: Flags [.], ack 130, win 64, options [nop,nop,TS val 4176342690 ecr 4176342649], length 0",
+      "1792657895.559509 IP 127.0.0.1.59749 > 127.0.0.1.39150: Flags [P.], seq 130:225, ack 191, win 64, options [nop,nop,TS val 4176342690 ecr 4176342690], length 95"
+    ],
+    "syscalls_second_response": [
+      "[pid  5762] 1792657895.519046 sendto(9, \"HTTP/1.1 200 OK\\r\\n\", 17, MSG_NOSIGNAL, NULL, 0) = 17",
+      "[pid  5762] 1792657895.519100 sendto(9, \"content-type: \", 14, MSG_NOSIGNAL, NULL, 0) = 14",
+      "[pid  5762] 1792657895.519145 sendto(9, \"text/plain; charset=utf-8\", 25, MSG_NOSIGNAL, NULL, 0) = 25",
+      "[pid  5762] 1792657895.519190 sendto(9, \"\\r\\n\", 2, MSG_NOSIGNAL, NULL, 0) = 2",
+      "[pid  5762] 1792657895.519233 sendto(9, \"content-length: 9\\r\\nconnection: k\"..., 45, MSG_NOSIGNAL, NULL, 0) = 45",
+      "[pid  5762] 1792657895.519276 sendto(9, \"cpu-ready\", 9, MSG_NOSIGNAL, NULL, 0) = 9"
+    ],
+    "trace_sha256": {
+      "packets.txt": "fc0aaa4e370511b6df6dc5ea8cb394692ec6d6a0cf6d2ea20211a88c6a931439",
+      "syscalls.txt": "909e69c18c69654b07faea56c53119e88ed5a9dabfe5e6d232e8e52abaa89714"
+    }
+  },
+  "mac_lock_sites": {
+    "kind": "bounded generated-C driver-lock call-site diagnosis",
+    "diagnostic": true,
+    "source_commit": "c1de5e3245bff62eb0b422d5c39a5212a1d1723b",
+    "source_dirty": true,
+    "instrumentation": "Fixed per-call-site successful-lock counters incremented while holding the one HTTP Task-driver mutex; no per-lock clocks, no hot-path output; atexit emits one bounded counter vector. N4 includes a 1-second native sample. Not performance acceptance.",
+    "environment": {
+      "platform": "macOS-26.5.2-arm64-arm-64bit",
+      "machine": "arm64",
+      "python_version": "3.9.6",
+      "logical_cpus": 8,
+      "same_host_generator": true,
+      "exclusive_cpu_reservation": false,
+      "errors": [],
+      "native_pid": null,
+      "affinity_scope": "The platform exposes no sched_getaffinity; owner thread placement is not established.",
+      "sysctl": {
+        "hw.physicalcpu": "8",
+        "hw.logicalcpu": "8",
+        "hw.memsize": "8589934592",
+        "hw.model": "MacBookAir10,1",
+        "machdep.cpu.brand_string": "Apple M1",
+        "hw.perflevel0.name": "Performance",
+        "hw.perflevel0.physicalcpu": "4",
+        "hw.perflevel0.logicalcpu": "4",
+        "hw.perflevel1.name": "Efficiency",
+        "hw.perflevel1.physicalcpu": "4",
+        "hw.perflevel1.logicalcpu": "4"
+      },
+      "sysctl_optional_missing": "",
+      "quota_scope": "Native macOS has no Linux cgroup quota. Logical contexts can include performance/efficiency clusters; placement, frequency and other host work are not controlled.",
+      "effective_visible_cpu_bound": 8,
+      "capacity_bound_scope": "Upper bound from visible logical CPUs, affinity and quotas; the Go client, Python observer and sampler subprocesses share it with the native service. It is not a count of equivalent dedicated performance cores."
+    },
+    "runs": [
+      {
+        "loops": 1,
+        "seconds": 3,
+        "host_cpu_before": [
+          {
+            "pid": 166,
+            "cpu_percent": 40.0,
+            "executable": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          },
+          {
+            "pid": 53539,
+            "cpu_percent": 8.2,
+            "executable": "/Users/mac/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+          },
+          {
+            "pid": 53558,
+            "cpu_percent": 7.2,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53444,
+            "cpu_percent": 5.5,
+            "executable": "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+          },
+          {
+            "pid": 53467,
+            "cpu_percent": 4.7,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          },
+          {
+            "pid": 53501,
+            "cpu_percent": 4.7,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 178,
+            "cpu_percent": 4.4,
+            "executable": "/usr/sbin/coreaudiod"
+          },
+          {
+            "pid": 34823,
+            "cpu_percent": 2.6,
+            "executable": "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/154.0.8037.98/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
+          }
+        ],
+        "host_cpu_after": [
+          {
+            "pid": 84211,
+            "cpu_percent": 72.0,
+            "executable": "/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-lock-site-diagnostic-ugtlidrs/diagnostic"
+          },
+          {
+            "pid": 166,
+            "cpu_percent": 38.6,
+            "executable": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          },
+          {
+            "pid": 53539,
+            "cpu_percent": 8.7,
+            "executable": "/Users/mac/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+          },
+          {
+            "pid": 53501,
+            "cpu_percent": 7.6,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53558,
+            "cpu_percent": 7.2,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53444,
+            "cpu_percent": 5.4,
+            "executable": "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+          },
+          {
+            "pid": 178,
+            "cpu_percent": 4.4,
+            "executable": "/usr/sbin/coreaudiod"
+          },
+          {
+            "pid": 537,
+            "cpu_percent": 2.7,
+            "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          }
+        ],
+        "exit": 0,
+        "driver_lock_total_including_startup_sampling_drain": 3225074,
+        "driver_lock_functions": [
+          {
+            "function": "ku_task_driver_reconcile_charge",
+            "count": 2054144,
+            "fraction": 0.6369292611580385
+          },
+          {
+            "function": "ku_http_task_poll",
+            "count": 1024349,
+            "fraction": 0.3176203088673314
+          },
+          {
+            "function": "ku_task_driver_run_one_locked",
+            "count": 67631,
+            "fraction": 0.02097037153256018
+          },
+          {
+            "function": "ku_task_driver_pump",
+            "count": 64074,
+            "fraction": 0.01986745110344755
+          },
+          {
+            "function": "ku_task_driver_grow_charge",
+            "count": 2560,
+            "fraction": 0.0007937802357403272
+          },
+          {
+            "function": "ku_task_value_check",
+            "count": 2304,
+            "fraction": 0.0007144022121662945
+          },
+          {
+            "function": "ku_task_driver_owner_drop_impl",
+            "count": 1536,
+            "fraction": 0.0004762681414441963
+          },
+          {
+            "function": "ku_task_driver_wrapper_begin",
+            "count": 1280,
+            "fraction": 0.0003968901178701636
+          },
+          {
+            "function": "ku_task_driver_wrapper_end",
+            "count": 1280,
+            "fraction": 0.0003968901178701636
+          },
+          {
+            "function": "ku_task_driver_reserve_impl",
+            "count": 768,
+            "fraction": 0.00023813407072209816
+          },
+          {
+            "function": "ku_task_driver_disposed",
+            "count": 768,
+            "fraction": 0.00023813407072209816
+          },
+          {
+            "function": "ku_task_driver_commit_impl",
+            "count": 768,
+            "fraction": 0.00023813407072209816
+          },
+          {
+            "function": "ku_task_driver_wait_arm",
+            "count": 512,
+            "fraction": 0.00015875604714806545
+          },
+          {
+            "function": "ku_task_driver_wait_read",
+            "count": 512,
+            "fraction": 0.00015875604714806545
+          },
+          {
+            "function": "ku_task_driver_wait_detach",
+            "count": 512,
+            "fraction": 0.00015875604714806545
+          },
+          {
+            "function": "ku_task_driver_transfer_charge",
+            "count": 512,
+            "fraction": 0.00015875604714806545
+          },
+          {
+            "function": "ku_task_host_deadline",
+            "count": 512,
+            "fraction": 0.00015875604714806545
+          },
+          {
+            "function": "ku_task_driver_scratch_refund",
+            "count": 257,
+            "fraction": 7.968809397861879e-05
+          },
+          {
+            "function": "ku_task_driver_extract_charge",
+            "count": 256,
+            "fraction": 7.937802357403272e-05
+          },
+          {
+            "function": "ku_http_task_handle_acquire",
+            "count": 256,
+            "fraction": 7.937802357403272e-05
+          },
+          {
+            "function": "ku_http_task_handle_release",
+            "count": 256,
+            "fraction": 7.937802357403272e-05
+          },
+          {
+            "function": "ku_http_task_metrics",
+            "count": 9,
+            "fraction": 2.7906336412745877e-06
+          },
+          {
+            "function": "ku_http_task_driver_timing",
+            "count": 9,
+            "fraction": 2.7906336412745877e-06
+          },
+          {
+            "function": "ku_task_driver_reap_ready",
+            "count": 2,
+            "fraction": 6.201408091721307e-07
+          },
+          {
+            "function": "ku_http_task_owner_exited",
+            "count": 2,
+            "fraction": 6.201408091721307e-07
+          },
+          {
+            "function": "ku_task_driver_attach_blocking",
+            "count": 1,
+            "fraction": 3.1007040458606533e-07
+          },
+          {
+            "function": "ku_task_driver_scratch_reserve",
+            "count": 1,
+            "fraction": 3.1007040458606533e-07
+          },
+          {
+            "function": "ku_task_driver_init_impl",
+            "count": 1,
+            "fraction": 3.1007040458606533e-07
+          },
+          {
+            "function": "ku_task_driver_shutdown_impl",
+            "count": 1,
+            "fraction": 3.1007040458606533e-07
+          },
+          {
+            "function": "ku_http_task_runtime_free",
+            "count": 1,
+            "fraction": 3.1007040458606533e-07
+          }
+        ],
+        "driver_lock_sites": [
+          {
+            "id": 1,
+            "function": "ku_task_driver_attach_blocking",
+            "generated_line": 10396,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 5,
+            "function": "ku_task_driver_wait_arm",
+            "generated_line": 11157,
+            "argument": "driver",
+            "count": 512
+          },
+          {
+            "id": 7,
+            "function": "ku_task_driver_wait_read",
+            "generated_line": 11316,
+            "argument": "driver",
+            "count": 512
+          },
+          {
+            "id": 8,
+            "function": "ku_task_driver_wait_detach",
+            "generated_line": 11338,
+            "argument": "driver",
+            "count": 512
+          },
+          {
+            "id": 14,
+            "function": "ku_task_driver_wrapper_begin",
+            "generated_line": 11584,
+            "argument": "driver",
+            "count": 1280
+          },
+          {
+            "id": 15,
+            "function": "ku_task_driver_wrapper_end",
+            "generated_line": 11599,
+            "argument": "driver",
+            "count": 1280
+          },
+          {
+            "id": 21,
+            "function": "ku_task_driver_scratch_reserve",
+            "generated_line": 11719,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 22,
+            "function": "ku_task_driver_scratch_refund",
+            "generated_line": 11731,
+            "argument": "driver",
+            "count": 257
+          },
+          {
+            "id": 23,
+            "function": "ku_task_driver_grow_charge",
+            "generated_line": 11745,
+            "argument": "driver",
+            "count": 2560
+          },
+          {
+            "id": 26,
+            "function": "ku_task_driver_reconcile_charge",
+            "generated_line": 11816,
+            "argument": "driver",
+            "count": 2054144
+          },
+          {
+            "id": 27,
+            "function": "ku_task_driver_transfer_charge",
+            "generated_line": 11845,
+            "argument": "driver",
+            "count": 512
+          },
+          {
+            "id": 28,
+            "function": "ku_task_driver_extract_charge",
+            "generated_line": 11878,
+            "argument": "driver",
+            "count": 256
+          },
+          {
+            "id": 29,
+            "function": "ku_task_driver_owner_drop_impl",
+            "generated_line": 11918,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 30,
+            "function": "ku_task_driver_owner_drop_impl",
+            "generated_line": 11934,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 33,
+            "function": "ku_task_driver_reserve_impl",
+            "generated_line": 12075,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 35,
+            "function": "ku_task_driver_disposed",
+            "generated_line": 12185,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 36,
+            "function": "ku_task_driver_commit_impl",
+            "generated_line": 12239,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 38,
+            "function": "ku_task_driver_run_one_locked",
+            "generated_line": 12488,
+            "argument": "driver",
+            "count": 66863
+          },
+          {
+            "id": 39,
+            "function": "ku_task_driver_run_one_locked",
+            "generated_line": 12559,
+            "argument": "driver",
+            "count": 768
+          },
+          {
+            "id": 43,
+            "function": "ku_task_driver_init_impl",
+            "generated_line": 12696,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 45,
+            "function": "ku_task_driver_pump",
+            "generated_line": 12800,
+            "argument": "driver",
+            "count": 64074
+          },
+          {
+            "id": 48,
+            "function": "ku_task_driver_shutdown_impl",
+            "generated_line": 12913,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 49,
+            "function": "ku_task_driver_reap_ready",
+            "generated_line": 12986,
+            "argument": "driver",
+            "count": 2
+          },
+          {
+            "id": 52,
+            "function": "ku_task_host_deadline",
+            "generated_line": 14834,
+            "argument": "driver",
+            "count": 512
+          },
+          {
+            "id": 54,
+            "function": "ku_task_value_check",
+            "generated_line": 26309,
+            "argument": "driver",
+            "count": 2304
+          },
+          {
+            "id": 55,
+            "function": "ku_http_task_handle_acquire",
+            "generated_line": 26361,
+            "argument": "&runtime->driver",
+            "count": 256
+          },
+          {
+            "id": 56,
+            "function": "ku_http_task_handle_release",
+            "generated_line": 26371,
+            "argument": "&runtime->driver",
+            "count": 256
+          },
+          {
+            "id": 58,
+            "function": "ku_http_task_metrics",
+            "generated_line": 26446,
+            "argument": "&runtime->driver",
+            "count": 9
+          },
+          {
+            "id": 59,
+            "function": "ku_http_task_driver_timing",
+            "generated_line": 26466,
+            "argument": "&runtime->driver",
+            "count": 9
+          },
+          {
+            "id": 60,
+            "function": "ku_http_task_owner_exited",
+            "generated_line": 26477,
+            "argument": "&runtime->driver",
+            "count": 2
+          },
+          {
+            "id": 61,
+            "function": "ku_http_task_poll",
+            "generated_line": 26505,
+            "argument": "&runtime->driver",
+            "count": 1021970
+          },
+          {
+            "id": 62,
+            "function": "ku_http_task_poll",
+            "generated_line": 26530,
+            "argument": "&runtime->driver",
+            "count": 2379
+          },
+          {
+            "id": 63,
+            "function": "ku_http_task_runtime_free",
+            "generated_line": 26553,
+            "argument": "&runtime->driver",
+            "count": 1
+          }
+        ],
+        "measurement": {
+          "measurement_valid": true,
+          "client_cpu": {
+            "seconds": 0.031491,
+            "user_seconds": 0.012326,
+            "system_seconds": 0.019164999999999998,
+            "source": "POSIX wait4 exact terminated process lifetime",
+            "scope": "Includes Go startup, measurement and finite cleanup; not restricted to the Go measurement window.",
+            "exit_tail_missing": false,
+            "max_rss_raw": 21102592,
+            "max_rss_raw_units": "bytes on macOS, KiB on Linux; platform raw value retained"
+          },
+          "server_delta": {
+            "observation_seconds": 3.5234235409999997,
+            "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+            "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+            "complete_requests_received": 256,
+            "connections_accepted": 16,
+            "admitted": 256,
+            "responses_prepared": {
+              "success_responses": 256,
+              "rejected_responses": 0,
+              "timeout_responses": 0,
+              "other_responses": 0
+            },
+            "event_threads": [
+              {
+                "id": 0,
+                "cpu_seconds": 2.309082709,
+                "cpu_sample_window_seconds": 3.555,
+                "cpu_sample_age_before_ms": 45,
+                "cpu_sample_age_after_ms": 13,
+                "cpu_clock_errors_delta": 0,
+                "complete_requests_received": 256
+              }
+            ],
+            "event_cpu_seconds": 2.309082709,
+            "average_event_cores_over_observation_window": 0.6553520126463843,
+            "native_process_cpu_seconds": 2.31,
+            "native_process_cpu_window_seconds": 3.521464709,
+            "task_driver_timing": {
+              "enabled_before": false,
+              "enabled_after": false,
+              "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+              "lock_count_delta": 0,
+              "lock_wait_ns_delta": 0,
+              "lock_hold_ns_delta": 0,
+              "condition_count_delta": 0,
+              "condition_sleep_reacquire_ns_delta": 0,
+              "clock_errors_delta": 0,
+              "max_lock_wait_ns_before": 0,
+              "max_lock_wait_ns_after": 0,
+              "max_lock_hold_ns_before": 0,
+              "max_lock_hold_ns_after": 0,
+              "max_condition_sleep_reacquire_ns_before": 0,
+              "max_condition_sleep_reacquire_ns_after": 0
+            },
+            "counter_errors": []
+          },
+          "metric_peaks": {
+            "http_connections": 16,
+            "http_pending": 0,
+            "http_queued": 0,
+            "http_running": 0,
+            "http_resident": 0,
+            "http_requests": 256,
+            "http_cpu_ns": 2309170875,
+            "task_ready": 16,
+            "task_waiting": 0,
+            "task_running": 1,
+            "task_resident": 16,
+            "task_timers": 0,
+            "task_polls": 2050048,
+            "http_queued_bytes": 0,
+            "http_buffer_bytes": 0,
+            "http_peak_buffer_bytes": 13730,
+            "http_buffer_rejections": 0,
+            "blocking_resident": 0,
+            "blocking_queued": 0,
+            "blocking_running": 0,
+            "blocking_output_charge_bytes": 0,
+            "blocking_net_wait": 0,
+            "blocking_net_step": 0,
+            "event_cpu_sample_age_ms_max": 69
+          },
+          "process_resource_peaks": {
+            "native": {
+              "rss_bytes": 3948544,
+              "threads": 8,
+              "fds": 25
+            },
+            "client": {
+              "rss_bytes": 16269312,
+              "threads": 7,
+              "fds": 20
+            }
+          },
+          "observer_cost": {
+            "before": {
+              "monotonic": 10.614266208,
+              "python_cpu_seconds": 0.305197,
+              "self": {
+                "ru_utime": 0.20192,
+                "ru_stime": 0.103291,
+                "ru_maxrss": 39190528,
+                "ru_minflt": 9330,
+                "ru_majflt": 413,
+                "ru_nvcsw": 391,
+                "ru_nivcsw": 1005,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              },
+              "waited_children": {
+                "ru_utime": 7.685221,
+                "ru_stime": 1.119609,
+                "ru_maxrss": 220758016,
+                "ru_minflt": 64535,
+                "ru_majflt": 13314,
+                "ru_nvcsw": 4963,
+                "ru_nivcsw": 37483,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              }
+            },
+            "after": {
+              "monotonic": 14.161595833,
+              "python_cpu_seconds": 0.408342,
+              "self": {
+                "ru_utime": 0.236334,
+                "ru_stime": 0.172013,
+                "ru_maxrss": 39190528,
+                "ru_minflt": 22224,
+                "ru_majflt": 414,
+                "ru_nvcsw": 728,
+                "ru_nivcsw": 1584,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              },
+              "waited_children": {
+                "ru_utime": 7.779098,
+                "ru_stime": 1.262986,
+                "ru_maxrss": 220758016,
+                "ru_minflt": 81016,
+                "ru_majflt": 13428,
+                "ru_nvcsw": 7370,
+                "ru_nivcsw": 40100,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              }
+            },
+            "wall_seconds": 3.5473296249999997,
+            "python_cpu_seconds": 0.10314499999999999,
+            "python_average_cores": 0.02907680168008069,
+            "sampler_thread": {
+              "thread_cpu_seconds": 0.07172125,
+              "scope": "Observer thread CPU only, excluding waited ps/lsof subprocesses; a subset of Python process CPU."
+            },
+            "max_rss_scope": "RUSAGE_SELF ru_maxrss is the Python process lifetime high-water mark, not this phase's incremental peak; bytes on macOS, KiB on Linux.",
+            "all_waited_child_cpu_seconds": 0.23725399999999985,
+            "generator_wait4_cpu_seconds": 0.031491,
+            "other_waited_child_cpu_seconds": 0.20576299999999986,
+            "observer_and_waited_tools_cpu_seconds": 0.30890799999999985,
+            "observer_and_waited_tools_average_cores": 0.0870818425846174,
+            "scope": "Python process CPU includes its main and observer threads. RUSAGE_CHILDREN delta includes reaped Go and ps/lsof tools; subtracting exact wait4 Go CPU leaves tools plus any other concurrently reaped children. Live/unreaped children and unrelated host processes are excluded. The sampler thread CPU is a subset of Python CPU, never added twice.",
+            "errors": []
+          },
+          "observation_windows": {
+            "event_cpu_wall_seconds": 3.5234235409999997,
+            "go_measurement_wall_seconds": 3,
+            "go_with_cleanup_wall_seconds": 3.030955416,
+            "python_wrapper_wall_seconds": 3.5473296249999997,
+            "meaning": "Use the event counter's own outer observation wall as its CPU denominator. The Go throughput window is separate; dividing outer-window event CPU by configured Go duration can overstate core use. Observer CPU includes metadata, startup, sampling and finite cleanup costs."
+          },
+          "reconciliation": {
+            "planned": 256,
+            "not_started": 0,
+            "started": 256,
+            "server_received": 256,
+            "server_received_minus_client_started": 0,
+            "complete_writes_minus_server_received": 0,
+            "scope": "Signed differences retain network/observation boundaries. A successful client write is not evidence of server reception; concurrent nonclient traffic is also in server deltas."
+          },
+          "client": {
+            "ledger": {
+              "active_after_cleanup": 0,
+              "completed": 256,
+              "completed_in_measurement_window": 240,
+              "correct_in_measurement_window": 240,
+              "failure_kinds": {},
+              "failure_stages": {},
+              "http_statuses": {
+                "200": 256
+              },
+              "no_request_bytes_written": 0,
+              "not_started": 0,
+              "not_started_reasons": {
+                "client_queue_full": 0,
+                "queued_or_closed_at_cutoff": 0,
+                "scheduler_at_cutoff": 0
+              },
+              "planned": 256,
+              "planned_reconciled": true,
+              "request_bytes_written": 84884,
+              "request_write_completed": 256,
+              "request_write_partial": 0,
+              "response_bytes_read": 2048,
+              "results": {
+                "correct_success": 256,
+                "http_rejected": 0,
+                "other_http_failure": 0,
+                "transport_or_timeout_failure": 0,
+                "unfinished_at_cutoff": 0
+              },
+              "server_received": null,
+              "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+              "started": 256,
+              "started_reconciled": true
+            },
+            "rates": {
+              "correct_per_measurement_second": 80,
+              "correct_per_second_including_cleanup": 84.46181644527364,
+              "started_per_measurement_second": 85.33333333333333
+            }
+          }
+        }
+      },
+      {
+        "loops": 4,
+        "seconds": 3,
+        "host_cpu_before": [
+          {
+            "pid": 166,
+            "cpu_percent": 38.6,
+            "executable": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          },
+          {
+            "pid": 53539,
+            "cpu_percent": 8.7,
+            "executable": "/Users/mac/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+          },
+          {
+            "pid": 53501,
+            "cpu_percent": 7.6,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53558,
+            "cpu_percent": 7.2,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53444,
+            "cpu_percent": 5.4,
+            "executable": "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+          },
+          {
+            "pid": 178,
+            "cpu_percent": 4.4,
+            "executable": "/usr/sbin/coreaudiod"
+          },
+          {
+            "pid": 537,
+            "cpu_percent": 2.7,
+            "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          },
+          {
+            "pid": 53467,
+            "cpu_percent": 2.7,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          }
+        ],
+        "host_cpu_after": [
+          {
+            "pid": 84288,
+            "cpu_percent": 264.9,
+            "executable": "/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-lock-site-diagnostic-ugtlidrs/diagnostic"
+          },
+          {
+            "pid": 166,
+            "cpu_percent": 38.1,
+            "executable": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+          },
+          {
+            "pid": 53539,
+            "cpu_percent": 8.6,
+            "executable": "/Users/mac/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService"
+          },
+          {
+            "pid": 53558,
+            "cpu_percent": 6.6,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 178,
+            "cpu_percent": 4.4,
+            "executable": "/usr/sbin/coreaudiod"
+          },
+          {
+            "pid": 53444,
+            "cpu_percent": 3.3,
+            "executable": "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+          },
+          {
+            "pid": 53501,
+            "cpu_percent": 2.9,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)"
+          },
+          {
+            "pid": 53467,
+            "cpu_percent": 2.8,
+            "executable": "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/155.0.8059.80/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+          }
+        ],
+        "exit": 0,
+        "driver_lock_total_including_startup_sampling_drain": 1996461,
+        "driver_lock_functions": [
+          {
+            "function": "ku_task_driver_reconcile_charge",
+            "count": 1668992,
+            "fraction": 0.8359752582194193
+          },
+          {
+            "function": "ku_http_task_poll",
+            "count": 207893,
+            "fraction": 0.10413075937872064
+          },
+          {
+            "function": "ku_task_driver_run_one_locked",
+            "count": 55363,
+            "fraction": 0.027730569242274204
+          },
+          {
+            "function": "ku_task_driver_pump",
+            "count": 52088,
+            "fraction": 0.02609016654970971
+          },
+          {
+            "function": "ku_task_driver_grow_charge",
+            "count": 2080,
+            "fraction": 0.0010418435421478305
+          },
+          {
+            "function": "ku_task_value_check",
+            "count": 1872,
+            "fraction": 0.0009376591879330476
+          },
+          {
+            "function": "ku_task_driver_owner_drop_impl",
+            "count": 1248,
+            "fraction": 0.0006251061252886983
+          },
+          {
+            "function": "ku_task_driver_wrapper_begin",
+            "count": 1040,
+            "fraction": 0.0005209217710739153
+          },
+          {
+            "function": "ku_task_driver_wrapper_end",
+            "count": 1040,
+            "fraction": 0.0005209217710739153
+          },
+          {
+            "function": "ku_task_driver_reserve_impl",
+            "count": 624,
+            "fraction": 0.00031255306264434915
+          },
+          {
+            "function": "ku_task_driver_disposed",
+            "count": 624,
+            "fraction": 0.00031255306264434915
+          },
+          {
+            "function": "ku_task_driver_commit_impl",
+            "count": 624,
+            "fraction": 0.00031255306264434915
+          },
+          {
+            "function": "ku_task_driver_wait_arm",
+            "count": 416,
+            "fraction": 0.00020836870842956613
+          },
+          {
+            "function": "ku_task_driver_wait_read",
+            "count": 416,
+            "fraction": 0.00020836870842956613
+          },
+          {
+            "function": "ku_task_driver_wait_detach",
+            "count": 416,
+            "fraction": 0.00020836870842956613
+          },
+          {
+            "function": "ku_task_driver_transfer_charge",
+            "count": 416,
+            "fraction": 0.00020836870842956613
+          },
+          {
+            "function": "ku_task_host_deadline",
+            "count": 416,
+            "fraction": 0.00020836870842956613
+          },
+          {
+            "function": "ku_task_driver_scratch_refund",
+            "count": 209,
+            "fraction": 0.00010468524053312336
+          },
+          {
+            "function": "ku_task_driver_extract_charge",
+            "count": 208,
+            "fraction": 0.00010418435421478306
+          },
+          {
+            "function": "ku_http_task_handle_acquire",
+            "count": 208,
+            "fraction": 0.00010418435421478306
+          },
+          {
+            "function": "ku_http_task_handle_release",
+            "count": 208,
+            "fraction": 0.00010418435421478306
+          },
+          {
+            "function": "ku_http_task_metrics",
+            "count": 36,
+            "fraction": 1.8031907460250915e-05
+          },
+          {
+            "function": "ku_http_task_driver_timing",
+            "count": 9,
+            "fraction": 4.507976865062729e-06
+          },
+          {
+            "function": "ku_http_task_owner_exited",
+            "count": 8,
+            "fraction": 4.0070905467224254e-06
+          },
+          {
+            "function": "ku_task_driver_reap_ready",
+            "count": 2,
+            "fraction": 1.0017726366806064e-06
+          },
+          {
+            "function": "ku_task_driver_attach_blocking",
+            "count": 1,
+            "fraction": 5.008863183403032e-07
+          },
+          {
+            "function": "ku_task_driver_scratch_reserve",
+            "count": 1,
+            "fraction": 5.008863183403032e-07
+          },
+          {
+            "function": "ku_task_driver_init_impl",
+            "count": 1,
+            "fraction": 5.008863183403032e-07
+          },
+          {
+            "function": "ku_task_driver_shutdown_impl",
+            "count": 1,
+            "fraction": 5.008863183403032e-07
+          },
+          {
+            "function": "ku_http_task_runtime_free",
+            "count": 1,
+            "fraction": 5.008863183403032e-07
+          }
+        ],
+        "driver_lock_sites": [
+          {
+            "id": 1,
+            "function": "ku_task_driver_attach_blocking",
+            "generated_line": 10396,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 5,
+            "function": "ku_task_driver_wait_arm",
+            "generated_line": 11157,
+            "argument": "driver",
+            "count": 416
+          },
+          {
+            "id": 7,
+            "function": "ku_task_driver_wait_read",
+            "generated_line": 11316,
+            "argument": "driver",
+            "count": 416
+          },
+          {
+            "id": 8,
+            "function": "ku_task_driver_wait_detach",
+            "generated_line": 11338,
+            "argument": "driver",
+            "count": 416
+          },
+          {
+            "id": 14,
+            "function": "ku_task_driver_wrapper_begin",
+            "generated_line": 11584,
+            "argument": "driver",
+            "count": 1040
+          },
+          {
+            "id": 15,
+            "function": "ku_task_driver_wrapper_end",
+            "generated_line": 11599,
+            "argument": "driver",
+            "count": 1040
+          },
+          {
+            "id": 21,
+            "function": "ku_task_driver_scratch_reserve",
+            "generated_line": 11719,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 22,
+            "function": "ku_task_driver_scratch_refund",
+            "generated_line": 11731,
+            "argument": "driver",
+            "count": 209
+          },
+          {
+            "id": 23,
+            "function": "ku_task_driver_grow_charge",
+            "generated_line": 11745,
+            "argument": "driver",
+            "count": 2080
+          },
+          {
+            "id": 26,
+            "function": "ku_task_driver_reconcile_charge",
+            "generated_line": 11816,
+            "argument": "driver",
+            "count": 1668992
+          },
+          {
+            "id": 27,
+            "function": "ku_task_driver_transfer_charge",
+            "generated_line": 11845,
+            "argument": "driver",
+            "count": 416
+          },
+          {
+            "id": 28,
+            "function": "ku_task_driver_extract_charge",
+            "generated_line": 11878,
+            "argument": "driver",
+            "count": 208
+          },
+          {
+            "id": 29,
+            "function": "ku_task_driver_owner_drop_impl",
+            "generated_line": 11918,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 30,
+            "function": "ku_task_driver_owner_drop_impl",
+            "generated_line": 11934,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 33,
+            "function": "ku_task_driver_reserve_impl",
+            "generated_line": 12075,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 35,
+            "function": "ku_task_driver_disposed",
+            "generated_line": 12185,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 36,
+            "function": "ku_task_driver_commit_impl",
+            "generated_line": 12239,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 38,
+            "function": "ku_task_driver_run_one_locked",
+            "generated_line": 12488,
+            "argument": "driver",
+            "count": 54739
+          },
+          {
+            "id": 39,
+            "function": "ku_task_driver_run_one_locked",
+            "generated_line": 12559,
+            "argument": "driver",
+            "count": 624
+          },
+          {
+            "id": 43,
+            "function": "ku_task_driver_init_impl",
+            "generated_line": 12696,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 45,
+            "function": "ku_task_driver_pump",
+            "generated_line": 12800,
+            "argument": "driver",
+            "count": 52088
+          },
+          {
+            "id": 48,
+            "function": "ku_task_driver_shutdown_impl",
+            "generated_line": 12913,
+            "argument": "driver",
+            "count": 1
+          },
+          {
+            "id": 49,
+            "function": "ku_task_driver_reap_ready",
+            "generated_line": 12986,
+            "argument": "driver",
+            "count": 2
+          },
+          {
+            "id": 52,
+            "function": "ku_task_host_deadline",
+            "generated_line": 14834,
+            "argument": "driver",
+            "count": 416
+          },
+          {
+            "id": 54,
+            "function": "ku_task_value_check",
+            "generated_line": 26309,
+            "argument": "driver",
+            "count": 1872
+          },
+          {
+            "id": 55,
+            "function": "ku_http_task_handle_acquire",
+            "generated_line": 26361,
+            "argument": "&runtime->driver",
+            "count": 208
+          },
+          {
+            "id": 56,
+            "function": "ku_http_task_handle_release",
+            "generated_line": 26371,
+            "argument": "&runtime->driver",
+            "count": 208
+          },
+          {
+            "id": 58,
+            "function": "ku_http_task_metrics",
+            "generated_line": 26446,
+            "argument": "&runtime->driver",
+            "count": 36
+          },
+          {
+            "id": 59,
+            "function": "ku_http_task_driver_timing",
+            "generated_line": 26466,
+            "argument": "&runtime->driver",
+            "count": 9
+          },
+          {
+            "id": 60,
+            "function": "ku_http_task_owner_exited",
+            "generated_line": 26477,
+            "argument": "&runtime->driver",
+            "count": 8
+          },
+          {
+            "id": 61,
+            "function": "ku_http_task_poll",
+            "generated_line": 26505,
+            "argument": "&runtime->driver",
+            "count": 207020
+          },
+          {
+            "id": 62,
+            "function": "ku_http_task_poll",
+            "generated_line": 26530,
+            "argument": "&runtime->driver",
+            "count": 873
+          },
+          {
+            "id": 63,
+            "function": "ku_http_task_runtime_free",
+            "generated_line": 26553,
+            "argument": "&runtime->driver",
+            "count": 1
+          }
+        ],
+        "native_sample": {
+          "exit": 0,
+          "bytes": 34356,
+          "selected_lines": [
+            "    92 Thread_23039653   DispatchQueue_1: com.apple.main-thread  (serial)",
+            "    92 Thread_23039654",
+            "    92 Thread_23039655",
+            "    +     92 ku_task_blocking_thread  (in diagnostic) + 300  [0x1004a12b4]  diagnostic.c:13540",
+            "    92 Thread_23039656",
+            "    +     92 ku_http_loop_thread  (in diagnostic) + 76  [0x10049d870]  diagnostic.c:8374",
+            "    +       27 ku_http_loop_run  (in diagnostic) + 5712  [0x1004a6bf8]  diagnostic.c:8219",
+            "    +       ! 22 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 22 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   22 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 5 pthread_mutex_lock  (in libsystem_pthread.dylib) + 52,72,...  [0x1812ec430,0x1812ec444,...]",
+            "    +       20 ku_http_loop_run  (in diagnostic) + 6040  [0x1004a6d40]  diagnostic.c:8219",
+            "    +       ! 16 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 16 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   16 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 4 pthread_mutex_lock  (in libsystem_pthread.dylib) + 124,32,...  [0x1812ec478,0x1812ec41c,...]",
+            "    +       20 ku_http_loop_run  (in diagnostic) + 6460  [0x1004a6ee4]  diagnostic.c:8239",
+            "    +       11 ku_http_loop_run  (in diagnostic) + 2472  [0x1004a5f50]  diagnostic.c:8112",
+            "    +       ! 8 ku_http_task_pump  (in diagnostic) + 1960  [0x10049f41c]  diagnostic.c:26439",
+            "    +       ! : 8 ku_task_control_poll  (in diagnostic) + 276  [0x1004830f0]  diagnostic.c:9692",
+            "    +       ! :   5 ku_task_1_resume  (in diagnostic) + 468  [0x1004758b4]  diagnostic.c:22603",
+            "    +       ! :   | 5 ku_task_frame_1_drive  (in diagnostic) + 3256  [0x100479ad8]  diagnostic.c:16593",
+            "    +       ! :   |   2 ku_task_frame_1_drive  (in diagnostic) + 476  [0x100478ffc]  diagnostic.c:16366",
+            "    +       ! :   |   1 ku_task_frame_1_check  (in diagnostic) + 16  [0x100478ce8]  diagnostic.c:16264",
+            "    +       ! :   |   1 ku_task_frame_1_drive  (in diagnostic) + 3160  [0x100479a78]  diagnostic.c:16575",
+            "    +       ! :   |   1 ku_task_frame_1_drive  (in diagnostic) + 3220  [0x100479ab4]  diagnostic.c:16588",
+            "    +       ! :   3 ku_task_1_resume  (in diagnostic) + 480  [0x1004758c0]  diagnostic.c:22606",
+            "    +       ! :     2 ku_task_1_reconcile_charge  (in diagnostic) + 2728  [0x10047728c]  diagnostic.c:22298",
+            "    +       ! :     + 2 ku_task_driver_reconcile_charge  (in diagnostic) + 176  [0x10047886c]  diagnostic.c:11816",
+            "    +       ! :     +   2 ku_task_driver_lock_site  (in diagnostic) + 136  [0x100472b24]  diagnostic.c:10210",
+            "    +       ! :     +     2 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! :     +       2 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :     +         2 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! :     1 ku_task_1_reconcile_charge  (in diagnostic) + 1492  [0x100476db8]  diagnostic.c:22172",
+            "    +       ! :       1 ku_task_adapter_http_map_charge  (in diagnostic) + 220  [0x100473b5c]  diagnostic.c:21456",
+            "    +       ! 3 ku_http_task_pump  (in diagnostic) + 2036  [0x10049f468]  diagnostic.c:26439",
+            "    +       !   2 ku_http_task_pump  (in diagnostic) + 1936,2068  [0x10049f404,0x10049f488]  diagnostic.c:26439",
+            "    +       7 ku_http_loop_run  (in diagnostic) + 5960  [0x1004a6cf0]  diagnostic.c:8219",
+            "    +       ! 7 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +       !   7 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +       !     7 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +       7 ku_http_loop_run  (in diagnostic) + 6176  [0x1004a6dc8]  diagnostic.c:8219",
+            "    +         6 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +         : 6 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +         :   6 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +         1 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 12  [0x1812ec950]",
+            "    92 Thread_23039657",
+            "    +     92 ku_http_loop_thread  (in diagnostic) + 76  [0x10049d870]  diagnostic.c:8374",
+            "    +       32 ku_http_loop_run  (in diagnostic) + 5712  [0x1004a6bf8]  diagnostic.c:8219",
+            "    +       ! 28 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 27 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! : | 27 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! : 1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 132  [0x1812eeecc]",
+            "    +       ! 4 pthread_mutex_lock  (in libsystem_pthread.dylib) + 72,32,...  [0x1812ec444,0x1812ec41c,...]",
+            "    +       17 ku_http_loop_run  (in diagnostic) + 2472  [0x1004a5f50]  diagnostic.c:8112",
+            "    +       ! 13 ku_http_task_pump  (in diagnostic) + 1960  [0x10049f41c]  diagnostic.c:26439",
+            "    +       ! : 13 ku_task_control_poll  (in diagnostic) + 276  [0x1004830f0]  diagnostic.c:9692",
+            "    +       ! :   8 ku_task_1_resume  (in diagnostic) + 468  [0x1004758b4]  diagnostic.c:22603",
+            "    +       ! :   | 8 ku_task_frame_1_drive  (in diagnostic) + 3256  [0x100479ad8]  diagnostic.c:16593",
+            "    +       ! :   |   5 ku_task_frame_1_drive  (in diagnostic) + 476,500  [0x100478ffc,0x100479014]  diagnostic.c:16366",
+            "    +       ! :   |   1 ku_task_frame_1_check  (in diagnostic) + 52  [0x100478d0c]  diagnostic.c:16267",
+            "    +       ! :   |   1 ku_task_frame_1_drive  (in diagnostic) + 404  [0x100478fb4]  diagnostic.c:0",
+            "    +       ! :   |   1 ku_task_frame_1_drive  (in diagnostic) + 3072  [0x100479a20]  diagnostic.c:16547",
+            "    +       ! :   5 ku_task_1_resume  (in diagnostic) + 480  [0x1004758c0]  diagnostic.c:22606",
+            "    +       ! :     4 ku_task_1_reconcile_charge  (in diagnostic) + 2728  [0x10047728c]  diagnostic.c:22298",
+            "    +       ! :     + 3 ku_task_driver_reconcile_charge  (in diagnostic) + 176  [0x10047886c]  diagnostic.c:11816",
+            "    +       ! :     + ! 3 ku_task_driver_lock_site  (in diagnostic) + 136  [0x100472b24]  diagnostic.c:10210",
+            "    +       ! :     + !   3 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! :     + !     3 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :     + !       3 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! :     + 1 ku_task_1_reconcile_charge  (in diagnostic) + 2728  [0x10047728c]  diagnostic.c:22298",
+            "    +       ! :     +   1 ku_task_driver_reconcile_charge  (in diagnostic) + 132  [0x100478840]  diagnostic.c:11810",
+            "    +       ! :     1 ku_task_1_reconcile_charge  (in diagnostic) + 1476  [0x100476da8]  diagnostic.c:22171",
+            "    +       ! :       1 ku_task_adapter_http_map_charge  (in diagnostic) + 284  [0x100473b9c]  diagnostic.c:21456",
+            "    +       ! 3 ku_http_task_pump  (in diagnostic) + 2036  [0x10049f468]  diagnostic.c:26439",
+            "    +       ! 1 ku_http_task_pump  (in diagnostic) + 84  [0x10049ecc8]  diagnostic.c:26439",
+            "    +       15 ku_http_loop_run  (in diagnostic) + 6460  [0x1004a6ee4]  diagnostic.c:8239",
+            "    +       13 ku_http_loop_run  (in diagnostic) + 6040  [0x1004a6d40]  diagnostic.c:8219",
+            "    +       ! 8 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 8 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   8 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 5 pthread_mutex_lock  (in libsystem_pthread.dylib) + 52,124,...  [0x1812ec430,0x1812ec478,...]",
+            "    +       11 ku_http_loop_run  (in diagnostic) + 6176  [0x1004a6dc8]  diagnostic.c:8219",
+            "    +       ! 9 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +       ! : 9 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +       ! :   9 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +       ! 2 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 104  [0x1812ec9ac]",
+            "    +       4 ku_http_loop_run  (in diagnostic) + 5960  [0x1004a6cf0]  diagnostic.c:8219",
+            "    +         2 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +         : 2 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +         :   2 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +         2 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 104  [0x1812ec9ac]",
+            "    92 Thread_23039658",
+            "    +     92 ku_http_loop_thread  (in diagnostic) + 76  [0x10049d870]  diagnostic.c:8374",
+            "    +       37 ku_http_loop_run  (in diagnostic) + 5712  [0x1004a6bf8]  diagnostic.c:8219",
+            "    +       ! 31 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 31 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   31 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 5 pthread_mutex_lock  (in libsystem_pthread.dylib) + 72,52,...  [0x1812ec444,0x1812ec430,...]",
+            "    +       ! 1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 120  [0x1812ec880]",
+            "    +       13 ku_http_loop_run  (in diagnostic) + 6460  [0x1004a6ee4]  diagnostic.c:8239",
+            "    +       12 ku_http_loop_run  (in diagnostic) + 2472  [0x1004a5f50]  diagnostic.c:8112",
+            "    +       ! 11 ku_http_task_pump  (in diagnostic) + 1960  [0x10049f41c]  diagnostic.c:26439",
+            "    +       ! : 11 ku_task_control_poll  (in diagnostic) + 276  [0x1004830f0]  diagnostic.c:9692",
+            "    +       ! :   6 ku_task_1_resume  (in diagnostic) + 480  [0x1004758c0]  diagnostic.c:22606",
+            "    +       ! :   | 5 ku_task_1_reconcile_charge  (in diagnostic) + 2728  [0x10047728c]  diagnostic.c:22298",
+            "    +       ! :   | + 4 ku_task_driver_reconcile_charge  (in diagnostic) + 176  [0x10047886c]  diagnostic.c:11816",
+            "    +       ! :   | + ! 4 ku_task_driver_lock_site  (in diagnostic) + 136  [0x100472b24]  diagnostic.c:10210",
+            "    +       ! :   | + !   4 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! :   | + !     4 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   | + !       4 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! :   | + 1 ku_task_driver_reconcile_charge  (in diagnostic) + 532  [0x1004789d0]  diagnostic.c:11827",
+            "    +       ! :   | +   1 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +       ! :   | +     1 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +       ! :   | +       1 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +       ! :   | 1 ku_task_1_reconcile_charge  (in diagnostic) + 1476  [0x100476da8]  diagnostic.c:22171",
+            "    +       ! :   |   1 ku_task_adapter_http_map_charge  (in diagnostic) + 356  [0x100473be4]  diagnostic.c:21457",
+            "    +       ! :   5 ku_task_1_resume  (in diagnostic) + 468  [0x1004758b4]  diagnostic.c:22603",
+            "    +       ! :     5 ku_task_frame_1_drive  (in diagnostic) + 3256  [0x100479ad8]  diagnostic.c:16593",
+            "    +       ! :       1 ku_task_frame_1_check  (in diagnostic) + 180  [0x100478d8c]  diagnostic.c:16273",
+            "    +       ! :       1 ku_task_frame_1_drive  (in diagnostic) + 452  [0x100478fe4]  diagnostic.c:16358",
+            "    +       ! :       1 ku_task_frame_1_drive  (in diagnostic) + 5732  [0x10047a484]  diagnostic.c:16362",
+            "    +       ! :       1 ku_task_frame_1_drive  (in diagnostic) + 476  [0x100478ffc]  diagnostic.c:16366",
+            "    +       ! :       1 ku_task_frame_1_drive  (in diagnostic) + 3276  [0x100479aec]  diagnostic.c:16593",
+            "    +       ! 1 ku_http_task_pump  (in diagnostic) + 344  [0x10049edcc]  diagnostic.c:26439",
+            "    +       !   1 ku_task_driver_lock_site  (in diagnostic) + 136  [0x100472b24]  diagnostic.c:10210",
+            "    +       !     1 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       !       1 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       !         1 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       11 ku_http_loop_run  (in diagnostic) + 6040  [0x1004a6d40]  diagnostic.c:8219",
+            "    +       ! 9 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 9 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   9 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 2 pthread_mutex_lock  (in libsystem_pthread.dylib) + 112,124  [0x1812ec46c,0x1812ec478]",
+            "    +       10 ku_http_loop_run  (in diagnostic) + 6176  [0x1004a6dc8]  diagnostic.c:8219",
+            "    +       ! 8 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +       ! : 8 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +       ! :   8 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +       ! 2 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 104,120  [0x1812ec9ac,0x1812ec9bc]",
+            "    +       8 ku_http_loop_run  (in diagnostic) + 5960  [0x1004a6cf0]  diagnostic.c:8219",
+            "    +       ! 4 _pthread_mutex_firstfit_unlock_slow  (in libsystem_pthread.dylib) + 220  [0x1812ecb94]",
+            "    +       ! : 4 _pthread_mutex_firstfit_wake  (in libsystem_pthread.dylib) + 28  [0x1812eef0c]",
+            "    +       ! :   4 __psynch_mutexdrop  (in libsystem_kernel.dylib) + 8  [0x1812b0ba8]",
+            "    +       ! 3 pthread_mutex_unlock  (in libsystem_pthread.dylib) + 12,32,...  [0x1812ec950,0x1812ec964,...]",
+            "    +       ! 1 DYLD-STUB$$pthread_mutex_unlock  (in diagnostic) + 4  [0x1004afc60]",
+            "    +       1 ku_http_loop_run  (in diagnostic) + 5676  [0x1004a6bd4]  diagnostic.c:8219",
+            "    92 Thread_23039659",
+            "    +     92 ku_http_loop_thread  (in diagnostic) + 76  [0x10049d870]  diagnostic.c:8374",
+            "    +       30 ku_http_loop_run  (in diagnostic) + 5712  [0x1004a6bf8]  diagnostic.c:8219",
+            "    +       ! 23 _pthread_mutex_firstfit_lock_slow  (in libsystem_pthread.dylib) + 216  [0x1812ec8e0]",
+            "    +       ! : 23 _pthread_mutex_firstfit_lock_wait  (in libsystem_pthread.dylib) + 84  [0x1812eee9c]",
+            "    +       ! :   23 __psynch_mutexwait  (in libsystem_kernel.dylib) + 8  [0x1812b09dc]",
+            "    +       ! 7 pthread_mutex_lock  (in libsystem_pthread.dylib) + 124,0,...  [0x1812ec478,0x1812ec3fc,...]",
+            "    +       16 ku_http_loop_run  (in diagnostic) + 2472  [0x1004a5f50]  diagnostic.c:8112",
+            "    +       ! 13 ku_http_task_pump  (in diagnostic) + 1960  [0x10049f41c]  diagnostic.c:26439",
+            "    +       ! : 13 ku_task_control_poll  (in diagnostic) + 276  [0x1004830f0]  diagnostic.c:9692",
+            "    +       ! :   9 ku_task_1_resume  (in diagnostic) + 468  [0x1004758b4]  diagnostic.c:22603",
+            "    +       ! :   | 9 ku_task_frame_1_drive  (in diagnostic) + 3256  [0x100479ad8]  diagnostic.c:16593",
+            "    +       ! :   |   4 ku_task_frame_1_drive  (in diagnostic) + 476,488  [0x100478ffc,0x100479008]  diagnostic.c:16366",
+            "    +       ! :   |   1 ku_task_frame_1_check  (in diagnostic) + 64  [0x100478d18]  diagnostic.c:16268"
+          ],
+          "selection_truncated": true,
+          "scope": "one-second sample while N4 diagnostic workload active; sample itself perturbs execution"
+        },
+        "measurement": {
+          "measurement_valid": true,
+          "client_cpu": {
+            "seconds": 0.031628,
+            "user_seconds": 0.013973,
+            "system_seconds": 0.017655,
+            "source": "POSIX wait4 exact terminated process lifetime",
+            "scope": "Includes Go startup, measurement and finite cleanup; not restricted to the Go measurement window.",
+            "exit_tail_missing": false,
+            "max_rss_raw": 20873216,
+            "max_rss_raw_units": "bytes on macOS, KiB on Linux; platform raw value retained"
+          },
+          "server_delta": {
+            "observation_seconds": 3.168823916999999,
+            "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+            "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+            "complete_requests_received": 208,
+            "connections_accepted": 16,
+            "admitted": 208,
+            "responses_prepared": {
+              "success_responses": 208,
+              "rejected_responses": 0,
+              "timeout_responses": 0,
+              "other_responses": 0
+            },
+            "event_threads": [
+              {
+                "id": 0,
+                "cpu_seconds": 2.060485625,
+                "cpu_sample_window_seconds": 3.2,
+                "cpu_sample_age_before_ms": 44,
+                "cpu_sample_age_after_ms": 13,
+                "cpu_clock_errors_delta": 0,
+                "complete_requests_received": 52
+              },
+              {
+                "id": 1,
+                "cpu_seconds": 2.053987458,
+                "cpu_sample_window_seconds": 3.2,
+                "cpu_sample_age_before_ms": 44,
+                "cpu_sample_age_after_ms": 13,
+                "cpu_clock_errors_delta": 0,
+                "complete_requests_received": 52
+              },
+              {
+                "id": 2,
+                "cpu_seconds": 2.048283583,
+                "cpu_sample_window_seconds": 3.19,
+                "cpu_sample_age_before_ms": 44,
+                "cpu_sample_age_after_ms": 23,
+                "cpu_clock_errors_delta": 0,
+                "complete_requests_received": 52
+              },
+              {
+                "id": 3,
+                "cpu_seconds": 2.054082416,
+                "cpu_sample_window_seconds": 3.2,
+                "cpu_sample_age_before_ms": 44,
+                "cpu_sample_age_after_ms": 13,
+                "cpu_clock_errors_delta": 0,
+                "complete_requests_received": 52
+              }
+            ],
+            "event_cpu_seconds": 8.216839082,
+            "average_event_cores_over_observation_window": 2.593024824736578,
+            "native_process_cpu_seconds": 8.23,
+            "native_process_cpu_window_seconds": 3.169944082999999,
+            "task_driver_timing": {
+              "enabled_before": false,
+              "enabled_after": false,
+              "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+              "lock_count_delta": 0,
+              "lock_wait_ns_delta": 0,
+              "lock_hold_ns_delta": 0,
+              "condition_count_delta": 0,
+              "condition_sleep_reacquire_ns_delta": 0,
+              "clock_errors_delta": 0,
+              "max_lock_wait_ns_before": 0,
+              "max_lock_wait_ns_after": 0,
+              "max_lock_hold_ns_before": 0,
+              "max_lock_hold_ns_after": 0,
+              "max_condition_sleep_reacquire_ns_before": 0,
+              "max_condition_sleep_reacquire_ns_after": 0
+            },
+            "counter_errors": []
+          },
+          "metric_peaks": {
+            "http_connections": 16,
+            "http_pending": 0,
+            "http_queued": 0,
+            "http_running": 0,
+            "http_resident": 0,
+            "http_requests": 208,
+            "http_cpu_ns": 8217120998,
+            "task_ready": 16,
+            "task_waiting": 0,
+            "task_running": 1,
+            "task_resident": 16,
+            "task_timers": 0,
+            "task_polls": 1665664,
+            "http_queued_bytes": 0,
+            "http_buffer_bytes": 0,
+            "http_peak_buffer_bytes": 6982,
+            "http_buffer_rejections": 0,
+            "blocking_resident": 0,
+            "blocking_queued": 0,
+            "blocking_running": 0,
+            "blocking_output_charge_bytes": 0,
+            "blocking_net_wait": 0,
+            "blocking_net_step": 0,
+            "event_cpu_sample_age_ms_max": 64
+          },
+          "process_resource_peaks": {
+            "native": {
+              "rss_bytes": 4145152,
+              "threads": 11,
+              "fds": 31
+            },
+            "client": {
+              "rss_bytes": 16498688,
+              "threads": 10,
+              "fds": 20
+            }
+          },
+          "observer_cost": {
+            "before": {
+              "monotonic": 14.283330875,
+              "python_cpu_seconds": 0.431689,
+              "self": {
+                "ru_utime": 0.253315,
+                "ru_stime": 0.17837899999999998,
+                "ru_maxrss": 39190528,
+                "ru_minflt": 23467,
+                "ru_majflt": 414,
+                "ru_nvcsw": 736,
+                "ru_nivcsw": 1668,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              },
+              "waited_children": {
+                "ru_utime": 9.929947,
+                "ru_stime": 1.494451,
+                "ru_maxrss": 220758016,
+                "ru_minflt": 83450,
+                "ru_majflt": 13441,
+                "ru_nvcsw": 7371,
+                "ru_nivcsw": 108125,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              }
+            },
+            "after": {
+              "monotonic": 17.474408708,
+              "python_cpu_seconds": 0.542369,
+              "self": {
+                "ru_utime": 0.290508,
+                "ru_stime": 0.251865,
+                "ru_maxrss": 39190528,
+                "ru_minflt": 36730,
+                "ru_majflt": 414,
+                "ru_nvcsw": 1054,
+                "ru_nivcsw": 2337,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              },
+              "waited_children": {
+                "ru_utime": 10.080521,
+                "ru_stime": 1.726183,
+                "ru_maxrss": 220758016,
+                "ru_minflt": 102423,
+                "ru_majflt": 13900,
+                "ru_nvcsw": 10125,
+                "ru_nivcsw": 114257,
+                "ru_inblock": 0,
+                "ru_oublock": 0
+              }
+            },
+            "wall_seconds": 3.191077832999998,
+            "python_cpu_seconds": 0.11068,
+            "python_average_cores": 0.03468420571113035,
+            "sampler_thread": {
+              "thread_cpu_seconds": 0.078719375,
+              "scope": "Observer thread CPU only, excluding waited ps/lsof subprocesses; a subset of Python process CPU."
+            },
+            "max_rss_scope": "RUSAGE_SELF ru_maxrss is the Python process lifetime high-water mark, not this phase's incremental peak; bytes on macOS, KiB on Linux.",
+            "all_waited_child_cpu_seconds": 0.3823059999999989,
+            "generator_wait4_cpu_seconds": 0.031628,
+            "other_waited_child_cpu_seconds": 0.35067799999999894,
+            "observer_and_waited_tools_cpu_seconds": 0.46135799999999894,
+            "observer_and_waited_tools_average_cores": 0.14457748263891979,
+            "scope": "Python process CPU includes its main and observer threads. RUSAGE_CHILDREN delta includes reaped Go and ps/lsof tools; subtracting exact wait4 Go CPU leaves tools plus any other concurrently reaped children. Live/unreaped children and unrelated host processes are excluded. The sampler thread CPU is a subset of Python CPU, never added twice.",
+            "errors": []
+          },
+          "observation_windows": {
+            "event_cpu_wall_seconds": 3.168823916999999,
+            "go_measurement_wall_seconds": 3,
+            "go_with_cleanup_wall_seconds": 3.13748725,
+            "python_wrapper_wall_seconds": 3.191077832999998,
+            "meaning": "Use the event counter's own outer observation wall as its CPU denominator. The Go throughput window is separate; dividing outer-window event CPU by configured Go duration can overstate core use. Observer CPU includes metadata, startup, sampling and finite cleanup costs."
+          },
+          "reconciliation": {
+            "planned": 208,
+            "not_started": 0,
+            "started": 208,
+            "server_received": 208,
+            "server_received_minus_client_started": 0,
+            "complete_writes_minus_server_received": 0,
+            "scope": "Signed differences retain network/observation boundaries. A successful client write is not evidence of server reception; concurrent nonclient traffic is also in server deltas."
+          },
+          "client": {
+            "ledger": {
+              "active_after_cleanup": 0,
+              "completed": 208,
+              "completed_in_measurement_window": 192,
+              "correct_in_measurement_window": 192,
+              "failure_kinds": {},
+              "failure_stages": {},
+              "http_statuses": {
+                "200": 208
+              },
+              "no_request_bytes_written": 0,
+              "not_started": 0,
+              "not_started_reasons": {
+                "client_queue_full": 0,
+                "queued_or_closed_at_cutoff": 0,
+                "scheduler_at_cutoff": 0
+              },
+              "planned": 208,
+              "planned_reconciled": true,
+              "request_bytes_written": 68948,
+              "request_write_completed": 208,
+              "request_write_partial": 0,
+              "response_bytes_read": 1664,
+              "results": {
+                "correct_success": 208,
+                "http_rejected": 0,
+                "other_http_failure": 0,
+                "transport_or_timeout_failure": 0,
+                "unfinished_at_cutoff": 0
+              },
+              "server_received": null,
+              "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+              "started": 208,
+              "started_reconciled": true
+            },
+            "rates": {
+              "correct_per_measurement_second": 64,
+              "correct_per_second_including_cleanup": 66.29509012347381,
+              "started_per_measurement_second": 69.33333333333333
+            }
+          }
+        }
+      }
+    ],
+    "temporary_directory_removed": true,
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "4156d00e2385c0b73404ddb29d52ea15c15d8ba540ccbc40685811432551778e",
+      "native_sha256": "f0a16e45e652a3f84a02f0553208eaa526af009b5dcf09a2ca2e6669fc4c0646",
+      "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-lock-site-diagnostic-ugtlidrs/.ku/build/release/c/Xb8o2IlFID62x5pLlGdwxisEr_yZYBxmy140wiF130I/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-lock-site-diagnostic-ugtlidrs/capacity\n",
+      "generated_c_sha256": [
+        "179b1e1f67250846dce9a1ab4c0cf95dd39521ff73f28c35c7ebfaa23d88d353"
+      ]
+    },
+    "cli_sha256": "f44e2ae9bafd05c11a37f367fa481c70d61aa3b5e0fd3ddfa27e0da0f074ccfc",
+    "fixed_site_limit": 512,
+    "sites": [
+      {
+        "id": 1,
+        "function": "ku_task_driver_attach_blocking",
+        "generated_line": 10396,
+        "argument": "driver"
+      },
+      {
+        "id": 2,
+        "function": "ku_task_driver_scope_begin",
+        "generated_line": 10877,
+        "argument": "driver"
+      },
+      {
+        "id": 3,
+        "function": "ku_task_driver_scope_promote_final",
+        "generated_line": 10954,
+        "argument": "driver"
+      },
+      {
+        "id": 4,
+        "function": "ku_task_driver_scope_end",
+        "generated_line": 11035,
+        "argument": "driver"
+      },
+      {
+        "id": 5,
+        "function": "ku_task_driver_wait_arm",
+        "generated_line": 11157,
+        "argument": "driver"
+      },
+      {
+        "id": 6,
+        "function": "ku_task_driver_cleanup_wait_arm",
+        "generated_line": 11221,
+        "argument": "driver"
+      },
+      {
+        "id": 7,
+        "function": "ku_task_driver_wait_read",
+        "generated_line": 11316,
+        "argument": "driver"
+      },
+      {
+        "id": 8,
+        "function": "ku_task_driver_wait_detach",
+        "generated_line": 11338,
+        "argument": "driver"
+      },
+      {
+        "id": 9,
+        "function": "ku_task_driver_timer_arm",
+        "generated_line": 11380,
+        "argument": "driver"
+      },
+      {
+        "id": 10,
+        "function": "ku_task_driver_timer_read",
+        "generated_line": 11445,
+        "argument": "driver"
+      },
+      {
+        "id": 11,
+        "function": "ku_task_driver_timer_detach",
+        "generated_line": 11470,
+        "argument": "driver"
+      },
+      {
+        "id": 12,
+        "function": "ku_task_driver_wake",
+        "generated_line": 11524,
+        "argument": "driver"
+      },
+      {
+        "id": 13,
+        "function": "ku_task_driver_set_intent",
+        "generated_line": 11541,
+        "argument": "driver"
+      },
+      {
+        "id": 14,
+        "function": "ku_task_driver_wrapper_begin",
+        "generated_line": 11584,
+        "argument": "driver"
+      },
+      {
+        "id": 15,
+        "function": "ku_task_driver_wrapper_end",
+        "generated_line": 11599,
+        "argument": "driver"
+      },
+      {
+        "id": 16,
+        "function": "ku_task_driver_request_cancel",
+        "generated_line": 11619,
+        "argument": "driver"
+      },
+      {
+        "id": 17,
+        "function": "ku_task_driver_cancel_bound",
+        "generated_line": 11651,
+        "argument": "driver"
+      },
+      {
+        "id": 18,
+        "function": "ku_task_driver_blocking_register",
+        "generated_line": 11676,
+        "argument": "driver"
+      },
+      {
+        "id": 19,
+        "function": "ku_task_driver_blocking_can_start",
+        "generated_line": 11691,
+        "argument": "driver"
+      },
+      {
+        "id": 20,
+        "function": "ku_task_driver_blocking_retired",
+        "generated_line": 11705,
+        "argument": "driver"
+      },
+      {
+        "id": 21,
+        "function": "ku_task_driver_scratch_reserve",
+        "generated_line": 11719,
+        "argument": "driver"
+      },
+      {
+        "id": 22,
+        "function": "ku_task_driver_scratch_refund",
+        "generated_line": 11731,
+        "argument": "driver"
+      },
+      {
+        "id": 23,
+        "function": "ku_task_driver_grow_charge",
+        "generated_line": 11745,
+        "argument": "driver"
+      },
+      {
+        "id": 24,
+        "function": "ku_task_driver_blocking_grow_charge",
+        "generated_line": 11773,
+        "argument": "driver"
+      },
+      {
+        "id": 25,
+        "function": "ku_task_driver_blocking_refund_charge",
+        "generated_line": 11798,
+        "argument": "driver"
+      },
+      {
+        "id": 26,
+        "function": "ku_task_driver_reconcile_charge",
+        "generated_line": 11816,
+        "argument": "driver"
+      },
+      {
+        "id": 27,
+        "function": "ku_task_driver_transfer_charge",
+        "generated_line": 11845,
+        "argument": "driver"
+      },
+      {
+        "id": 28,
+        "function": "ku_task_driver_extract_charge",
+        "generated_line": 11878,
+        "argument": "driver"
+      },
+      {
+        "id": 29,
+        "function": "ku_task_driver_owner_drop_impl",
+        "generated_line": 11918,
+        "argument": "driver"
+      },
+      {
+        "id": 30,
+        "function": "ku_task_driver_owner_drop_impl",
+        "generated_line": 11934,
+        "argument": "driver"
+      },
+      {
+        "id": 31,
+        "function": "ku_task_driver_cleanup_receipt_read",
+        "generated_line": 11976,
+        "argument": "driver"
+      },
+      {
+        "id": 32,
+        "function": "ku_task_driver_cancel_receipt",
+        "generated_line": 11996,
+        "argument": "driver"
+      },
+      {
+        "id": 33,
+        "function": "ku_task_driver_reserve_impl",
+        "generated_line": 12075,
+        "argument": "driver"
+      },
+      {
+        "id": 34,
+        "function": "ku_task_driver_rollback",
+        "generated_line": 12170,
+        "argument": "driver"
+      },
+      {
+        "id": 35,
+        "function": "ku_task_driver_disposed",
+        "generated_line": 12185,
+        "argument": "driver"
+      },
+      {
+        "id": 36,
+        "function": "ku_task_driver_commit_impl",
+        "generated_line": 12239,
+        "argument": "driver"
+      },
+      {
+        "id": 37,
+        "function": "ku_task_driver_snapshot",
+        "generated_line": 12362,
+        "argument": "driver"
+      },
+      {
+        "id": 38,
+        "function": "ku_task_driver_run_one_locked",
+        "generated_line": 12488,
+        "argument": "driver"
+      },
+      {
+        "id": 39,
+        "function": "ku_task_driver_run_one_locked",
+        "generated_line": 12559,
+        "argument": "driver"
+      },
+      {
+        "id": 40,
+        "function": "ku_task_driver_worker",
+        "generated_line": 12565,
+        "argument": "driver"
+      },
+      {
+        "id": 41,
+        "function": "ku_task_driver_worker",
+        "generated_line": 12572,
+        "argument": "driver"
+      },
+      {
+        "id": 42,
+        "function": "ku_task_driver_worker",
+        "generated_line": 12591,
+        "argument": "driver"
+      },
+      {
+        "id": 43,
+        "function": "ku_task_driver_init_impl",
+        "generated_line": 12696,
+        "argument": "driver"
+      },
+      {
+        "id": 44,
+        "function": "ku_task_driver_set_fixed_owner",
+        "generated_line": 12781,
+        "argument": "driver"
+      },
+      {
+        "id": 45,
+        "function": "ku_task_driver_pump",
+        "generated_line": 12800,
+        "argument": "driver"
+      },
+      {
+        "id": 46,
+        "function": "ku_task_driver_wait_result",
+        "generated_line": 12858,
+        "argument": "driver"
+      },
+      {
+        "id": 47,
+        "function": "ku_task_driver_wait_idle",
+        "generated_line": 12890,
+        "argument": "driver"
+      },
+      {
+        "id": 48,
+        "function": "ku_task_driver_shutdown_impl",
+        "generated_line": 12913,
+        "argument": "driver"
+      },
+      {
+        "id": 49,
+        "function": "ku_task_driver_reap_ready",
+        "generated_line": 12986,
+        "argument": "driver"
+      },
+      {
+        "id": 50,
+        "function": "ku_task_blocking_submit_net",
+        "generated_line": 14161,
+        "argument": "ticket->driver"
+      },
+      {
+        "id": 51,
+        "function": "ku_task_net_root_attach",
+        "generated_line": 14518,
+        "argument": "driver"
+      },
+      {
+        "id": 52,
+        "function": "ku_task_host_deadline",
+        "generated_line": 14834,
+        "argument": "driver"
+      },
+      {
+        "id": 53,
+        "function": "ku_task_adapter_fault",
+        "generated_line": 21411,
+        "argument": "driver"
+      },
+      {
+        "id": 54,
+        "function": "ku_task_value_check",
+        "generated_line": 26309,
+        "argument": "driver"
+      },
+      {
+        "id": 55,
+        "function": "ku_http_task_handle_acquire",
+        "generated_line": 26361,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 56,
+        "function": "ku_http_task_handle_release",
+        "generated_line": 26371,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 57,
+        "function": "ku_http_task_runtime_new",
+        "generated_line": 26420,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 58,
+        "function": "ku_http_task_metrics",
+        "generated_line": 26446,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 59,
+        "function": "ku_http_task_driver_timing",
+        "generated_line": 26466,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 60,
+        "function": "ku_http_task_owner_exited",
+        "generated_line": 26477,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 61,
+        "function": "ku_http_task_poll",
+        "generated_line": 26505,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 62,
+        "function": "ku_http_task_poll",
+        "generated_line": 26530,
+        "argument": "&runtime->driver"
+      },
+      {
+        "id": 63,
+        "function": "ku_http_task_runtime_free",
+        "generated_line": 26553,
+        "argument": "&runtime->driver"
+      }
+    ],
+    "diagnostic_build": {
+      "generated_c_sha256": "26c536d9725d671053409300facee269a740927fd36e6b7029567bcbaf9405ae",
+      "native_sha256": "39d98b608ab9814ca89ec08babe70a6e52793c46e12465192295e136f290cefe",
+      "flags": [
+        "-std=c11",
+        "-O2",
+        "-g",
+        "-pthread"
+      ]
+    },
+    "client_sha256": "ef4f157e6dc50bc95838c0b1adc89890432e6e9a54d1e14995bf85dda3c49400",
+    "original_report_sha256": "50c8595314f1d9b760001b2358f9a54c5f9cb5aec2fef5ef6deb73d59e9ed075"
+  },
+  "mac_reactor_scan": {
+    "kind": "Finite actual generated C blocking pool scan diagnosis; not capacity acceptance",
+    "scope": "N1 and N4 each one-second work128k window, fixed counters; two monotonic samples per interests scan, none per lock",
+    "failure": null,
+    "rows": [
+      {
+        "loops": 1,
+        "exit": 0,
+        "counts": {
+          "outside_locks": 13,
+          "owners": [
+            {
+              "owner": 0,
+              "locks": 41027584,
+              "scans": 20033,
+              "scan_wall_ns": 476968000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 1,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            },
+            {
+              "owner": 2,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            },
+            {
+              "owner": 3,
+              "locks": 0,
+              "scans": 0,
+              "scan_wall_ns": 0,
+              "active_jobs_seen": 0,
+              "capacity": 0,
+              "clock_errors": 0
+            }
+          ]
+        },
+        "client_ledger": {
+          "active_after_cleanup": 0,
+          "completed": 80,
+          "completed_in_measurement_window": 64,
+          "correct_in_measurement_window": 64,
+          "failure_kinds": {},
+          "failure_stages": {},
+          "http_statuses": {
+            "200": 80
+          },
+          "no_request_bytes_written": 0,
+          "not_started": 0,
+          "not_started_reasons": {
+            "client_queue_full": 0,
+            "queued_or_closed_at_cutoff": 0,
+            "scheduler_at_cutoff": 0
+          },
+          "planned": 80,
+          "planned_reconciled": true,
+          "request_bytes_written": 26391,
+          "request_write_completed": 80,
+          "request_write_partial": 0,
+          "response_bytes_read": 640,
+          "results": {
+            "correct_success": 80,
+            "http_rejected": 0,
+            "other_http_failure": 0,
+            "transport_or_timeout_failure": 0,
+            "unfinished_at_cutoff": 0
+          },
+          "server_received": null,
+          "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+          "started": 80,
+          "started_reconciled": true
+        },
+        "client_timing": {
+          "cutoff_snapshot": {
+            "completed": 64,
+            "inflight": 16,
+            "observed_seconds": 1.000273459,
+            "started": 80
+          },
+          "first_started_seconds": 8.2209e-05,
+          "last_completion_seconds": 1.190716917,
+          "last_started_seconds": 0.991518334,
+          "measurement_seconds": 1,
+          "with_cleanup_seconds": 1.1907231249999999
+        },
+        "server_delta": {
+          "observation_seconds": 1.698736541999999,
+          "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+          "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+          "complete_requests_received": 80,
+          "connections_accepted": 16,
+          "admitted": 80,
+          "responses_prepared": {
+            "success_responses": 80,
+            "rejected_responses": 0,
+            "timeout_responses": 0,
+            "other_responses": 0
+          },
+          "event_threads": [
+            {
+              "id": 0,
+              "cpu_seconds": 0.792256084,
+              "cpu_sample_window_seconds": 1.762,
+              "cpu_sample_age_before_ms": 73,
+              "cpu_sample_age_after_ms": 9,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 80
+            }
+          ],
+          "event_cpu_seconds": 0.792256084,
+          "average_event_cores_over_observation_window": 0.46637960885167123,
+          "native_process_cpu_seconds": 0.79,
+          "native_process_cpu_window_seconds": 1.6924778329999999,
+          "task_driver_timing": {
+            "enabled_before": false,
+            "enabled_after": false,
+            "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+            "lock_count_delta": 0,
+            "lock_wait_ns_delta": 0,
+            "lock_hold_ns_delta": 0,
+            "condition_count_delta": 0,
+            "condition_sleep_reacquire_ns_delta": 0,
+            "clock_errors_delta": 0,
+            "max_lock_wait_ns_before": 0,
+            "max_lock_wait_ns_after": 0,
+            "max_lock_hold_ns_before": 0,
+            "max_lock_hold_ns_after": 0,
+            "max_condition_sleep_reacquire_ns_before": 0,
+            "max_condition_sleep_reacquire_ns_after": 0
+          },
+          "counter_errors": []
+        },
+        "interpretation": {
+          "all_scans_have_no_active_net_wait": true,
+          "locks_per_nonempty_owner_scan": {
+            "0": 2048.0
+          },
+          "sum_scan_wall_seconds": 0.476968,
+          "scan_wall_scope": "Includes waiting for the shared pool mutex and scan time, so N4 owner durations overlap and are not CPU time."
+        }
+      },
+      {
+        "loops": 4,
+        "exit": 0,
+        "counts": {
+          "outside_locks": 12,
+          "owners": [
+            {
+              "owner": 0,
+              "locks": 8214528,
+              "scans": 4011,
+              "scan_wall_ns": 800253000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 1,
+              "locks": 8218624,
+              "scans": 4013,
+              "scan_wall_ns": 808889000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 2,
+              "locks": 8216576,
+              "scans": 4012,
+              "scan_wall_ns": 803112000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            },
+            {
+              "owner": 3,
+              "locks": 8218624,
+              "scans": 4013,
+              "scan_wall_ns": 805004000,
+              "active_jobs_seen": 0,
+              "capacity": 1024,
+              "clock_errors": 0
+            }
+          ]
+        },
+        "client_ledger": {
+          "active_after_cleanup": 0,
+          "completed": 64,
+          "completed_in_measurement_window": 48,
+          "correct_in_measurement_window": 48,
+          "failure_kinds": {},
+          "failure_stages": {},
+          "http_statuses": {
+            "200": 64
+          },
+          "no_request_bytes_written": 0,
+          "not_started": 0,
+          "not_started_reasons": {
+            "client_queue_full": 0,
+            "queued_or_closed_at_cutoff": 0,
+            "scheduler_at_cutoff": 0
+          },
+          "planned": 64,
+          "planned_reconciled": true,
+          "request_bytes_written": 21175,
+          "request_write_completed": 64,
+          "request_write_partial": 0,
+          "response_bytes_read": 512,
+          "results": {
+            "correct_success": 64,
+            "http_rejected": 0,
+            "other_http_failure": 0,
+            "transport_or_timeout_failure": 0,
+            "unfinished_at_cutoff": 0
+          },
+          "server_received": null,
+          "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+          "started": 64,
+          "started_reconciled": true
+        },
+        "client_timing": {
+          "cutoff_snapshot": {
+            "completed": 48,
+            "inflight": 16,
+            "observed_seconds": 1.000754291,
+            "started": 64
+          },
+          "first_started_seconds": 6.083e-06,
+          "last_completion_seconds": 1.028712166,
+          "last_started_seconds": 0.805327333,
+          "measurement_seconds": 1,
+          "with_cleanup_seconds": 1.028742458
+        },
+        "server_delta": {
+          "observation_seconds": 1.0744191250000004,
+          "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+          "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+          "complete_requests_received": 64,
+          "connections_accepted": 16,
+          "admitted": 64,
+          "responses_prepared": {
+            "success_responses": 64,
+            "rejected_responses": 0,
+            "timeout_responses": 0,
+            "other_responses": 0
+          },
+          "event_threads": [
+            {
+              "id": 0,
+              "cpu_seconds": 0.584697083,
+              "cpu_sample_window_seconds": 1.091,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 30,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 1,
+              "cpu_seconds": 0.587646375,
+              "cpu_sample_window_seconds": 1.102,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 19,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 2,
+              "cpu_seconds": 0.5893965,
+              "cpu_sample_window_seconds": 1.092,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 29,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            },
+            {
+              "id": 3,
+              "cpu_seconds": 0.593304833,
+              "cpu_sample_window_seconds": 1.102,
+              "cpu_sample_age_before_ms": 46,
+              "cpu_sample_age_after_ms": 19,
+              "cpu_clock_errors_delta": 0,
+              "complete_requests_received": 16
+            }
+          ],
+          "event_cpu_seconds": 2.355044791,
+          "average_event_cores_over_observation_window": 2.1919237439113894,
+          "native_process_cpu_seconds": 2.37,
+          "native_process_cpu_window_seconds": 1.0683880420000005,
+          "task_driver_timing": {
+            "enabled_before": false,
+            "enabled_after": false,
+            "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+            "lock_count_delta": 0,
+            "lock_wait_ns_delta": 0,
+            "lock_hold_ns_delta": 0,
+            "condition_count_delta": 0,
+            "condition_sleep_reacquire_ns_delta": 0,
+            "clock_errors_delta": 0,
+            "max_lock_wait_ns_before": 0,
+            "max_lock_wait_ns_after": 0,
+            "max_lock_hold_ns_before": 0,
+            "max_lock_hold_ns_after": 0,
+            "max_condition_sleep_reacquire_ns_before": 0,
+            "max_condition_sleep_reacquire_ns_after": 0
+          },
+          "counter_errors": []
+        },
+        "interpretation": {
+          "all_scans_have_no_active_net_wait": true,
+          "locks_per_nonempty_owner_scan": {
+            "0": 2048.0,
+            "1": 2048.0,
+            "2": 2048.0,
+            "3": 2048.0
+          },
+          "sum_scan_wall_seconds": 3.217258,
+          "scan_wall_scope": "Includes waiting for the shared pool mutex and scan time, so N4 owner durations overlap and are not CPU time."
+        }
+      }
+    ],
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "2d0aa719d2cbfa9f60d6ea178493f2710cd13ff0823887638d4f046139a02311",
+      "native_sha256": "2324b48ee13deb1c6e56ab4eba09e143eadad413d508988a201e1b05d24c1dbb",
+      "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-reactor-scan-0eeehnh7/.ku/build/release/c/ddcXpN6hJyfYx07xTgtoyEwm499zQ9mzqc_v04WV_3U/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-reactor-scan-0eeehnh7/capacity\n",
+      "generated_c_sha256": [
+        "dbc66bf54ce88ea5f2afc732c5dd75d03d7343faf1ff777ead84bfa46da5b4d3"
+      ]
+    },
+    "cli_sha256": "eb062a29b55cb361a07629f485bbfd6a8600a0bb9198ba1136f290ddd6bbcb7b",
+    "instrumented_c_sha256": "d029e863f35376897f478ed11c700731374a82d10783891b47435275b15a2a5f",
+    "instrumented_native_sha256": "7ec79a2915156ccc0f55d80edb1337da2b0747c23c741ae7fedf19ef1711bd1b",
+    "temporary_directory_removed": true,
+    "original_report_sha256": "53cda07918968c9380b6de1368f50ba1e7165878d5131a34f83069560c828faf"
+  },
+  "mac_scalar_actual_guards": {
+    "kind": "Finite actual multicore fixture scalar guard diagnosis; not performance acceptance",
+    "seconds": 1,
+    "loops": 1,
+    "production_changed": false,
+    "failure": null,
+    "build": {
+      "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+      "expanded_source_sha256": "d17a39bf9fe0296b2af392603447fa5c7ea6ae4064c90db8ec8dfaa108878fda",
+      "native_sha256": "e81fd016ee1778bbe81844bbe8c2fb78a4fbc8ea0a51d6faaaedc5f21cb44a02",
+      "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-scalar-guards-00tov3a5/.ku/build/release/c/xxuAdwOeBOyLOeDCuecovV5q3h81cK9N75u4q0LCwl4/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-scalar-guards-00tov3a5/capacity\n",
+      "generated_c_sha256": [
+        "e91acf1aefc69e1387ba670966b029d732b168fbf638d262c1eede885251aefb"
+      ]
+    },
+    "cli_sha256": "8ed73b1c936ffddd38d80b7e4eb80cfda984e0e49b9572999be3c9ca56fb85aa",
+    "instrumented_sha256": "ee182f3054e9eafe59725e1a7dcba4ac33d17546b01c242884b898b3c4ad9e89",
+    "native_sha256": "3b1cde70cf13f6aaabd848fc419727c88573597e63a7496bc8371541b2a82d52",
+    "exit": 0,
+    "counts": {
+      "marker": 768000,
+      "marker_pure": 767904,
+      "marker_dirty": 96,
+      "resume": 768288,
+      "skip": 767904
+    },
+    "guard_failure_counts": {
+      "frame_not_pending": 96,
+      "frame_uninitialized": 0,
+      "payload_initialized": 0,
+      "result_initialized": 96,
+      "child_slot_initialized": 192,
+      "receipt_mask_nonzero": 0,
+      "wait_driver_nonnull": 192,
+      "drain_started": 0,
+      "tls_absent": 0,
+      "tls_driver_mismatch": 0,
+      "tls_slot_mismatch": 0,
+      "tls_generation_mismatch": 0,
+      "tls_control_mismatch": 0,
+      "no_budget_marker": 288,
+      "not_scalar_quantum": 384,
+      "intent_touched": 192,
+      "phase_not_live": 0
+    },
+    "first_non_scalar_states": [
+      {
+        "state": 0,
+        "quantum_first_dirty_count": 96,
+        "generated_c_line": 16399,
+        "body": "  __ku_charge_unchanged=0;\n  frame->s_1 = ku_string_static((const uint8_t*)\"work\", 4);\n  frame->header.initialized |= (UINT64_C(1) << 1);\n  { KuValue* field_value=ku_object_get(frame->s_0.query,frame->s_1);\n  KuString field_string=field_value && field_value->tag==KU_STR ? field_value->as.s : (KuString){0};\n  uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,field_string,&frame->s_2);\n  if(cloned==KU_TASK_DRIVER_LIMIT || cloned==KU_TASK_HOST_ALLOCATION_FAILED) {\n    if (cleanup) goto ku_task_terminated;\n    frame->result=(KuResult_struct___ku_http_response){false,(KuStruct___ku_http_response){0}, ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"memory_limit\",12),ku_string_static((const uint8_t*)\"request map projection allocation rejected\",42))};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n  frame->header.cleanup_state = UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_EXIT_STAGED; frame->header.running=0; return KU_TASK_FRAME_EXIT_STAGED;\n  }\n  if(cloned!=KU_TASK_DRIVER_OK) {frame->header.running=0;return KU_TASK_FRAME_INVALID_STATE;}\n  }\n  frame->header.initialized |= (UINT64_C(1) << 2);\n  if (frame->header.initialized & (UINT64_C(1) << 1)) {\n  frame->header.initialized &= ~ (UINT64_C(1) << 1);\n  ku_string_drop(&frame->s_1);\n  }\n  frame->s_3=(int64_t)(ku_string_char_len(frame->s_2));\n  frame->header.initialized |= (UINT64_C(1) << 3);\n  if (frame->header.initialized & (UINT64_C(1) << 2)) {\n  frame->header.initialized &= ~ (UINT64_C(1) << 2);\n  ku_string_drop(&frame->s_2);\n  }\n  frame->s_4 = frame->s_3;\n  frame->header.initialized |= (UINT64_C(1) << 4);\n  frame->s_5 = INT64_C(1000);\n  frame->header.initialized |= (UINT64_C(1) << 5);\n  { uint32_t arithmetic_status = ku_int_mul(frame->s_4, frame->s_5, &frame->s_6);\n  if (arithmetic_status != KU_INT_OK) {\n    if (cleanup) goto ku_task_terminated;\n    frame->result=(KuResult_struct___ku_http_response){false,(KuStruct___ku_http_response){0}, ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n  frame->header.cleanup_state = UINT32_MAX;\n  frame->header.status=KU_TASK_FRAME_EXIT_STAGED; frame->header.running=0; return KU_TASK_FRAME_EXIT_STAGED;\n  } }\n  fra"
+      }
+    ],
+    "task_slot_mask": "13523993021644800",
+    "counter_scope": "Only generated work function id1; fixed counters, one stderr vector at normal exit, N1 serial owner; no lock clock instrumentation.",
+    "temporary_directory_removed": true,
+    "measurement_summary": {
+      "client_configuration": {
+        "address": "127.0.0.1:63523",
+        "automatic_retries": false,
+        "compression": false,
+        "duration_seconds": 1,
+        "expected_bytes": 8,
+        "keep_alive": true,
+        "keepalive_idle_retirement_ms": 500,
+        "max_response_bytes": 65536,
+        "max_response_header_bytes": 32768,
+        "maximum_live_connections": 16,
+        "mode": "closed",
+        "path": "/work?work=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&seed=sss",
+        "per_request_timeout_ms": 3000,
+        "pipelining": false,
+        "queue_descriptors_limit": 64,
+        "redirects": false,
+        "target_rps": 0,
+        "workers": 16
+      },
+      "client_ledger": {
+        "active_after_cleanup": 0,
+        "completed": 96,
+        "completed_in_measurement_window": 80,
+        "correct_in_measurement_window": 80,
+        "failure_kinds": {},
+        "failure_stages": {},
+        "http_statuses": {
+          "200": 96
+        },
+        "no_request_bytes_written": 0,
+        "not_started": 0,
+        "not_started_reasons": {
+          "client_queue_full": 0,
+          "queued_or_closed_at_cutoff": 0,
+          "scheduler_at_cutoff": 0
+        },
+        "planned": 96,
+        "planned_reconciled": true,
+        "request_bytes_written": 31671,
+        "request_write_completed": 96,
+        "request_write_partial": 0,
+        "response_bytes_read": 768,
+        "results": {
+          "correct_success": 96,
+          "http_rejected": 0,
+          "other_http_failure": 0,
+          "transport_or_timeout_failure": 0,
+          "unfinished_at_cutoff": 0
+        },
+        "server_received": null,
+        "server_received_note": "Collect before/after server complete-request counters separately; connect/write success does not prove server reception.",
+        "started": 96,
+        "started_reconciled": true
+      },
+      "client_timing": {
+        "cutoff_snapshot": {
+          "completed": 80,
+          "inflight": 16,
+          "observed_seconds": 1.0002805,
+          "started": 96
+        },
+        "first_started_seconds": 1.1625e-05,
+        "last_completion_seconds": 1.126889166,
+        "last_started_seconds": 0.944436375,
+        "measurement_seconds": 1,
+        "with_cleanup_seconds": 1.12689775
+      },
+      "server_delta": {
+        "observation_seconds": 1.6487145830000003,
+        "window_scope": "Before/after control observations include process launch, client measurement, bounded cleanup and observation gaps; they are not the exact Go measurement window.",
+        "counter_scope": "requests counts complete business bodies before UTF-8/admission; response counters count prepared responses, not confirmed client delivery. All concurrent traffic on this private service is included.",
+        "complete_requests_received": 96,
+        "connections_accepted": 16,
+        "admitted": 96,
+        "responses_prepared": {
+          "success_responses": 96,
+          "rejected_responses": 0,
+          "timeout_responses": 0,
+          "other_responses": 0
+        },
+        "event_threads": [
+          {
+            "id": 0,
+            "cpu_seconds": 0.847513167,
+            "cpu_sample_window_seconds": 1.695,
+            "cpu_sample_age_before_ms": 66,
+            "cpu_sample_age_after_ms": 20,
+            "cpu_clock_errors_delta": 0,
+            "complete_requests_received": 96
+          }
+        ],
+        "event_cpu_seconds": 0.847513167,
+        "average_event_cores_over_observation_window": 0.5140448054131149,
+        "native_process_cpu_seconds": 0.86,
+        "native_process_cpu_window_seconds": 1.6468359170000006,
+        "task_driver_timing": {
+          "enabled_before": false,
+          "enabled_after": false,
+          "scope": "Delta cumulative totals; max_* remain lifetime maxima and cannot be subtracted into phase maxima.",
+          "lock_count_delta": 0,
+          "lock_wait_ns_delta": 0,
+          "lock_hold_ns_delta": 0,
+          "condition_count_delta": 0,
+          "condition_sleep_reacquire_ns_delta": 0,
+          "clock_errors_delta": 0,
+          "max_lock_wait_ns_before": 0,
+          "max_lock_wait_ns_after": 0,
+          "max_lock_hold_ns_before": 0,
+          "max_lock_hold_ns_after": 0,
+          "max_condition_sleep_reacquire_ns_before": 0,
+          "max_condition_sleep_reacquire_ns_after": 0
+        },
+        "counter_errors": []
+      },
+      "client_first_errors": null,
+      "scope": "Counts were measured on this shared macOS desktop; 1 second diagnosis plus finite request cleanup, no capacity claim."
+    },
+    "interpretation": {
+      "actual_fast_path_confirmed": true,
+      "pure_marker_count_matches_actual_skip": true,
+      "typed_entry_counterexample": "Generated work frame state0 materializes an owned string projection from HttpRequest.query[\"work\"] via ku_task_host_clone_string; it drops the key and projected string after length evaluation. This quantum must remain non-scalar and reconcile. The computation loop itself is scalar and skips on all 767904 observed pure yields.",
+      "child_wait_guard_scope": "192 child-slot / wait-driver / explicit-intent observations occur during the two digits awaits for 96 completed requests. None blocks the preceding integer computation loop.",
+      "next_step_boundary": "This disproves a scalar guard miss in actual HTTP work. No classifier expansion or fixture modification is justified by this run; it does not establish end-to-end improvement."
+    },
+    "original_report_sha256": "80ecba4ab7fcb2d66186921e24730c2f24b651e6e4f1241a417012814972b057"
+  },
+  "mac_high_residency_readiness": {
+    "diagnosis": {
+      "kind": "single bounded local Mac pressure diagnosis",
+      "created_utc": "20261022T111538Z",
+      "source_commit": "420b44a92e6e435e9ff1a70c89acc31e265acde4",
+      "cli_sha256": "7813f6f634bfe1aca6d91c96ee28779dc6791333cf1ee966874f6adec2087bc2",
+      "environment": {
+        "platform": "macOS-26.5.2-arm64-arm-64bit",
+        "machine": "arm64",
+        "python_version": "3.9.6",
+        "logical_cpus": 8,
+        "same_host_generator": true,
+        "exclusive_cpu_reservation": false,
+        "errors": [],
+        "native_pid": null,
+        "affinity_scope": "The platform exposes no sched_getaffinity; owner thread placement is not established.",
+        "sysctl": {
+          "hw.physicalcpu": "8",
+          "hw.logicalcpu": "8",
+          "hw.memsize": "8589934592",
+          "hw.model": "MacBookAir10,1",
+          "machdep.cpu.brand_string": "Apple M1",
+          "hw.perflevel0.name": "Performance",
+          "hw.perflevel0.physicalcpu": "4",
+          "hw.perflevel0.logicalcpu": "4",
+          "hw.perflevel1.name": "Efficiency",
+          "hw.perflevel1.physicalcpu": "4",
+          "hw.perflevel1.logicalcpu": "4"
+        },
+        "sysctl_optional_missing": "",
+        "quota_scope": "Native macOS has no Linux cgroup quota. Logical contexts can include performance/efficiency clusters; placement, frequency and other host work are not controlled.",
+        "effective_visible_cpu_bound": 8,
+        "capacity_bound_scope": "Upper bound from visible logical CPUs, affinity and quotas; the Go client, Python observer and sampler subprocesses share it with the native service. It is not a count of equivalent dedicated performance cores."
+      },
+      "scope": "One uninstrumented 3s N4/32 calibration and one instrumented 5s open-arrival overload; no production edit. Temporary counter/timing overhead invalidates performance-benefit comparisons. Local host is not the CI virtual Mac.",
+      "plan": {
+        "work_units": 512,
+        "loops": 4,
+        "calibration_seconds": 3,
+        "calibration_clients": 32,
+        "overload_seconds": 5,
+        "capacity_multiplier": 5,
+        "active_limit": 128,
+        "pending_limit": 128,
+        "client_deadline_ms": 3000,
+        "stack_seconds": 1,
+        "stack_interval_ms": 10,
+        "maximum_monitor_rows": 120
+      },
+      "build": {
+        "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+        "expanded_source_sha256": "bb3f8350d8f54ba9684f383a72a751458fdd81761857c0a951bdb560600349c8",
+        "native_sha256": "2d4dc0d53a2189dbb114b7717441ea82bd64166a073dbd5bb73071f845ae258a",
+        "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-pressure-once-9i21g6y9/.ku/build/release/c/UlKZlxGsxXUVAeykbM9G2xU9VranfczX8_fPMeC7H_4/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-pressure-once-9i21g6y9/capacity\n",
+        "generated_c_sha256": [
+          "b5b02369e2786daf52d7d81d8b2273e78dcdd52e0903bc08762c199433274827"
+        ]
+      },
+      "diagnostic_build": {
+        "original_c_sha256": "b5b02369e2786daf52d7d81d8b2273e78dcdd52e0903bc08762c199433274827",
+        "diagnostic_c_sha256": "fcae912d96a211b1f8a5836827e909c87de0b0559d109639f3d57e5084ca7f80",
+        "binary_sha256": "291f0986b78baaf21b07bb1d919e0ae2a5a1d25791312ab3b8a76866d2cff29f",
+        "counter_scope": "HTTP readiness lock acquisition count and LIVE-phase hits only; no branch change, no extra lock, relaxed atomic increments. Counters emitted once at process exit. Driver timing enabled; this perturbs runtime."
+      },
+      "http_readiness_counts": {
+        "ready_calls": 15731690,
+        "ready_live": 15731104
+      },
+      "analysis": {
+        "event_owner_thread_samples": [
+          {
+            "thread": "Thread_23179408",
+            "observations": 97,
+            "http_readiness_stack_observations": 36,
+            "control_poll_stack_observations": 22,
+            "mutex_wait_leaf_observations": 32
+          },
+          {
+            "thread": "Thread_23179409",
+            "observations": 97,
+            "http_readiness_stack_observations": 27,
+            "control_poll_stack_observations": 17,
+            "mutex_wait_leaf_observations": 33
+          },
+          {
+            "thread": "Thread_23179410",
+            "observations": 97,
+            "http_readiness_stack_observations": 25,
+            "control_poll_stack_observations": 19,
+            "mutex_wait_leaf_observations": 24
+          },
+          {
+            "thread": "Thread_23179411",
+            "observations": 97,
+            "http_readiness_stack_observations": 24,
+            "control_poll_stack_observations": 26,
+            "mutex_wait_leaf_observations": 22
+          }
+        ],
+        "sample_meaning": "Wall-time stack observations, not CPU attribution. Mutex wait leaves include readiness and pump paths; do not add overlapping parent/child stack counts. Sampling and per-lock clocks perturb execution.",
+        "normal_precheck_counters": {
+          "driver_locks": 233702,
+          "task_polls": 2400600
+        },
+        "overload_counters": {
+          "driver_locks": 16366718,
+          "task_polls": 15841280
+        },
+        "normal_locks_per_actual_poll": 0.09735149545946846,
+        "overload_locks_per_actual_poll": 1.0331689105930835,
+        "confirmed": "During this instrumented high-residency sample, all event owners repeatedly enter HTTP readiness and shared mutex waits while others compute. Process-wide HTTP LIVE-readiness checks exceed 15.7 million. This establishes a local hotspot, not the performance gain of skipping it.",
+        "unproven": "It does not explain the independent CI N1 0.56-core result, uniquely map every timeout to a server stage, or isolate uninstrumented cost. A separate single fixed-rate uninstrumented A/B is pending."
+      },
+      "temporary_directory_removed": true
+    },
+    "unprobed_single_pair": {
+      "kind": "single bounded same-host original/candidate overload comparison",
+      "created_utc": "20261022T112133Z",
+      "source_commit": "b0bb40b90c9c85dcb303c8dee52bb3224543d4b8",
+      "cli_sha256": "7813f6f634bfe1aca6d91c96ee28779dc6791333cf1ee966874f6adec2087bc2",
+      "plan": {
+        "work_units": 512,
+        "event_loops": 4,
+        "active_requests": 128,
+        "pending_requests": 128,
+        "request_deadline_ms": 3000,
+        "overload_seconds": 5,
+        "fixed_open_arrival_rps": 374,
+        "load_workers": 512,
+        "client_queue": 256,
+        "driver_timing": false,
+        "diagnostic_counters": false,
+        "repeats_per_variant": 1,
+        "order": [
+          "original",
+          "candidate"
+        ]
+      },
+      "limits": "One ordered short pair establishes only a diagnostic signal, not a performance distribution or formal acceptance. No source repository changes; both use the same native frontend, fixture, generator and original budgets/deadlines. Baseline capacity reference is prior measured 74.6666667 rps; ceil(5x)=374.",
+      "build": {
+        "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+        "expanded_source_sha256": "dba6fba2b4d1e92c47be5e99997a494be7396ba680b2915eaca83ecfb2168a39",
+        "native_sha256": "e51bc0ce4f711df41612936cf5d3b788e87e251b1e9f3db99cc420f56c6a508a",
+        "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-live-ab-once-hhu9ilfx/.ku/build/release/c/VwW64VhH_ZX2P1vNWio4LqROLgQ7-i5Tx0vwd69Dnw0/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-mac-live-ab-once-hhu9ilfx/capacity\n",
+        "generated_c_sha256": [
+          "bfbe119210104f5d68ac2fc0c77c813e12259ecc2e11cc0730b3ba94de0601f2"
+        ]
+      },
+      "candidate": {
+        "original_c_sha256": "bfbe119210104f5d68ac2fc0c77c813e12259ecc2e11cc0730b3ba94de0601f2",
+        "candidate_c_sha256": "4d83bb1d3a2400e4ef0f2612bd7320dcf386a5f9162a0affe97ed809a0efac5a",
+        "candidate_binary_sha256": "beb1e19b4b67b7d89fdd6e5f440f8702b5aea454230bc6c0a98383e075842aae",
+        "only_replacement": "  if(cancel) handle->cancelled=1;\n  /* Experimental private-owner negative readiness only. No owner/lease move. */\n  if(!handle->cancelled && !handle->finishing && handle->value.tag==KU_TASK_VALUE_LIVE\n      && handle->value.ticket.driver==&runtime->driver\n      && handle->value.owner.lease.control\n      && ku_task_control_check_lease(&handle->value.owner.lease)==KU_TASK_CONTROL_OK\n      && ku_task_control_atomic_load(&handle->value.owner.lease.control->phase)==KU_TASK_CONTROL_LIVE)\n    return KU_TASK_DRIVER_PENDING;\n  if(!handle->finishing) {",
+        "proof_scope": "The used/private handle retains its unique owner lease until this owner thread takes/drops it. Cancel sets cancelled before this branch; finishing means owner can be consumed and excludes the branch. Non-LIVE atomic phases always retain the original locked path. ABI/storage/alignment checked through the existing lease checker; no registry/slot data read unlocked."
+      },
+      "analysis": {
+        "paired_results": [
+          {
+            "variant": "original",
+            "results": {
+              "correct_success": 523,
+              "http_rejected": 1181,
+              "other_http_failure": 0,
+              "transport_or_timeout_failure": 166,
+              "unfinished_at_cutoff": 0
+            },
+            "fully_sent": 1870,
+            "actual_starts": 1870,
+            "native_cpu_seconds": 13.76,
+            "native_cpu_wall_seconds": 8.568766416999999,
+            "event_cpu_seconds": 13.752439042,
+            "event_cpu_outer_wall_seconds": 8.48365025,
+            "event_cores": 1.6210520986529355,
+            "correct_in_measurement": 435,
+            "correct_measurement_rps": 87,
+            "go_with_cleanup_seconds": 7.999390375,
+            "go_cpu_seconds": 0.608132,
+            "remaining_checks": {
+              "ordinary_capacity_precheck_valid": true,
+              "overload_target_actual_starts": true,
+              "server_resource_edge_observed": true,
+              "unexplained_client_failure_absent": false,
+              "recovery_withdrawal_budget_confirmed": true
+            },
+            "recovery_upper_seconds": 4.529642958,
+            "final_resource_ledger": {
+              "buffer_bytes": 0,
+              "task_resident": 0,
+              "task_waiting": 0,
+              "http_queued": 0,
+              "pending": 0
+            },
+            "exit": 0
+          },
+          {
+            "variant": "candidate",
+            "results": {
+              "correct_success": 769,
+              "http_rejected": 1101,
+              "other_http_failure": 0,
+              "transport_or_timeout_failure": 0,
+              "unfinished_at_cutoff": 0
+            },
+            "fully_sent": 1870,
+            "actual_starts": 1870,
+            "native_cpu_seconds": 15.53,
+            "native_cpu_wall_seconds": 6.840821083000002,
+            "event_cpu_seconds": 15.522384501000001,
+            "event_cpu_outer_wall_seconds": 6.840913292,
+            "event_cores": 2.2690514904131898,
+            "correct_in_measurement": 514,
+            "correct_measurement_rps": 102.8,
+            "go_with_cleanup_seconds": 6.789862625,
+            "go_cpu_seconds": 0.625365,
+            "remaining_checks": {
+              "ordinary_capacity_precheck_valid": true,
+              "overload_target_actual_starts": true,
+              "server_resource_edge_observed": true,
+              "unexplained_client_failure_absent": true,
+              "recovery_withdrawal_budget_confirmed": true
+            },
+            "recovery_upper_seconds": 1.870852708000001,
+            "final_resource_ledger": {
+              "buffer_bytes": 0,
+              "task_resident": 0,
+              "task_waiting": 0,
+              "http_queued": 0,
+              "pending": 0
+            },
+            "exit": 0
+          }
+        ],
+        "confirmed": "Both variants start all 1870 requests at 374/s with identical fixed fixture budgets and 3s per-request client deadlines, no automatic retries, no timing/counter probes. In this single ordered short pair the candidate removes 166 observed response-header-stage deadlines and serves 246 more correct complete responses. Explicit 503 remains a refusal, never reclassified success. Both recover and exit cleanly.",
+        "boundary": "One original-then-candidate pair cannot establish repeatable platform-wide performance or eliminate shared-host/noise/order effects. Event CPU is normalized to its own observation window including different cleanup durations, not the fixed 5s arrival window. This experiment does not explain the distinct CI N1 0.56-core result or replace the formal acceptance matrix.",
+        "lifecycle": "The existing private/used HTTP handle range check runs first. Before take/drop transfer, its unique nonempty owner lease keeps control alive; cancelled/finishing/non-LIVE phases follow the original locked path. The candidate only observes immutable validated ABI/storage and atomic LIVE phase, and neither reads driver slots without a lock nor consumes ownership."
+      },
+      "temporary_directory_removed": true
+    },
+    "raw_evidence": [
+      {
+        "name": "mac-local-pressure-5s-20261022T111538Z.json",
+        "sha256": "e7c845a9af543be13babcde05fbb8ec04fb403c98e5e0fb727f02b28d32dffb8"
+      },
+      {
+        "name": "mac-local-live-readiness-ab-20261022T112133Z.json",
+        "sha256": "66d8a7735197848ff561970012dd93adb54ae896a25141482b8e417bebfff36e"
+      }
+    ]
+  },
+  "mac_empty_poll_diagnosis_and_candidate": {
+    "scope": "One bounded instrumented diagnosis locates the interval, followed by a separate uninstrumented A/B/B/A. Neither is formal acceptance; no claim that OS scheduling versus kernel-internal wait has been uniquely distinguished. Only socket interests, no new event backend.",
+    "entries": [
+      {
+        "kind": "Conditional finite poll0 diagnosis after actual N1 low CPU reproduced; not acceptance",
+        "plan": {
+          "loops": 1,
+          "work_units": 512,
+          "concurrency": 32,
+          "seconds": 5,
+          "sampling_stride": 64,
+          "sample_limit_per_thread": 8192,
+          "fixed_thread_slots": 8,
+          "native_sample_seconds": 1,
+          "production_changed": false
+        },
+        "failure": null,
+        "cli_sha256": "12ee85d818105d8f0d99ac49dffa5c37252c876860b41e3040b9b9ee8bc2db8e",
+        "cli_variant": {
+          "sha256_matches_parent_verified_readiness_candidate": true,
+          "http_live_readiness_branch": "present in parent-verified CLI hash; both diagnostics use the same supplied candidate, not the earlier unpatched production CLI",
+          "source_identity_scope": "Recorded CLI hash and emitted C/native hashes; current Git HEAD is not substituted for binary provenance."
+        },
+        "build": {
+          "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+          "expanded_source_sha256": "58aac80177acd3863b5a28b7613c9541a43265f0fcf25ad63362f5ad1cbac0e6",
+          "native_sha256": "3adfb04eb1e8d41cb8b3214538efdaa85386833cacb4900424229f9aaed8be68",
+          "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-n1-poll0-ywr97f3b/.ku/build/release/c/ojR2me0hVD7oV43wtq05Z6REtCmZTJi-WwinbeMaodw/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-n1-poll0-ywr97f3b/capacity\n",
+          "generated_c_sha256": [
+            "426149f12ffcd365fdb7ea7e624160c2c49b00752c2f38f3c7841381736284d9"
+          ]
+        },
+        "instrumented_c_sha256": "7ce9802aa5126c8ca1b357facca5fef085471d39c5dfb2e0a8129c19dba78378",
+        "instrumented_native_sha256": "2fb6481e32b159b7f892dfb82ee6800f921fd16d89cd26d0970142758d2b18b9",
+        "summary": {
+          "zero_poll_calls": 192047,
+          "sampled_zero_poll_calls": 3000,
+          "sample_wall_ns": 40282000,
+          "sample_thread_cpu_ns": 7788198,
+          "sample_non_cpu_ns": 32493802,
+          "sample_non_cpu_fraction": 0.8066581103222283,
+          "mean_sample_wall_us": 13.427333333333333,
+          "mean_sample_thread_cpu_us": 2.596066,
+          "stride_extrapolated_non_cpu_seconds": 2.079603328,
+          "estimate_scope": "Extrapolation only; deterministic sparse samples and the one intrusive sample can perturb this window. It is not an exact sum for all poll calls.",
+          "observed_ready_task_range": [
+            31,
+            32
+          ],
+          "observed_resident_task_range": [
+            32,
+            32
+          ],
+          "sample_event_thread_poll_stack_hits": 57,
+          "sample_event_thread_total_stack_hits": 93,
+          "conclusion": "Substantial wall time without matching thread CPU occurs inside the zero-timeout poll call interval while 31-32 Tasks remain ready. This refutes ready-queue starvation as the cause of this sample. It does not uniquely distinguish kernel-internal waiting from OS descheduling during that call interval."
+        },
+        "temporary_directory_removed": true,
+        "raw_file": "mac-n1-512k-poll0-diagnosis.json",
+        "raw_sha256": "b9d8f086f3324915a5044f22c7c48148e87c1c86ba58fbb85de64e205217c2dd"
+      },
+      {
+        "kind": "Temporary generated-C macOS select-negative candidate; two interleaved 5-second A/B pairs, not acceptance",
+        "plan": {
+          "order": [
+            "A",
+            "B",
+            "B",
+            "A"
+          ],
+          "A": "original poll",
+          "B": "negative select fast path; positive/error/unsupported falls back to original poll",
+          "seconds": 5,
+          "loops": 1,
+          "work_units": 512,
+          "concurrency": 32,
+          "production_changed": false,
+          "timing_probes": false,
+          "driver_quantum_unchanged": 64,
+          "http_pump_budget_unchanged": 32
+        },
+        "failure": null,
+        "cli_sha256": "12ee85d818105d8f0d99ac49dffa5c37252c876860b41e3040b9b9ee8bc2db8e",
+        "build": {
+          "fixture_sha256": "a2fb851c6aa78b6fca0c9ac0351631707a9c42f7bdd03c79cb8eff78bfbb4e1a",
+          "expanded_source_sha256": "3374e954409e42325da363ab8311b27cf458128ec68eb62085ad26ed3770edb5",
+          "native_sha256": "a3856d3c379a0c6e64945e1148e168a47a82f6761f6d56fb05becf9d7ec1d7ea",
+          "build_output": "native c ok: /private/var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-select-negative-ab-h9vvbkwi/.ku/build/release/c/KwbfcT04AshKwNeCX7wKq55ahwpia9xAM0o_mal-YhU/capacity.c\nbuild ok: /var/folders/cl/mj41g1gx3wz1tdl0c2zt2pmm0000gn/T/ku-select-negative-ab-h9vvbkwi/capacity\n",
+          "generated_c_sha256": [
+            "458dfe894310cb3d6ec8b9d1e9595e0136c36cdd75a9946dbad06e2674447193"
+          ]
+        },
+        "A": {
+          "generated_c_sha256": "458dfe894310cb3d6ec8b9d1e9595e0136c36cdd75a9946dbad06e2674447193",
+          "native_sha256": "5137a711d7c0df64df881f89a628d61f1e6a7d3aca91a7c73d5a5640ac293f80",
+          "flags": [
+            "-std=c11",
+            "-O2",
+            "-pthread"
+          ]
+        },
+        "B": {
+          "generated_c_sha256": "4834be9ee63c903aebbea6e3de9edb678e747c81ade063f5030746fb8bcdc82e",
+          "native_sha256": "8965ed8cbccd7be771ec7517296cd65319927fb2fe8f1151c43722658cf1966f",
+          "flags": [
+            "-std=c11",
+            "-O2",
+            "-pthread"
+          ]
+        },
+        "primary_sources": [
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/sys_socket.c",
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket2.c",
+          "https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/select.2.html",
+          "https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/sys_generic.c"
+        ],
+        "review": "Actual ku_http_poll call sites contain sockets only. XNU socket read readiness includes pending errors/receive shutdown and write readiness includes errors/send shutdown. Invalid descriptors make select fail, causing original poll fallback. events=0 and flags outside POLLIN/POLLOUT reject the fast path. Positive revents always come from poll; a negative select clears stale revents. This source-based argument and smoke cases do not establish all kernel versions/devices.",
+        "review_limitations": [
+          "The actual C socket smoke used AF_UNIX socketpair and invalid descriptors. It did not cover TCP connect refusal/RST or TCP full send buffers during half-close; those are required permanent regressions before production inclusion.",
+          "Read/write event and error semantics were checked against current Apple open source, not a source-identical build of every deployed macOS kernel.",
+          "Both candidate and baseline used recorded release CLI hash and identically rebuilt generated C with -O2 -pthread. No 30-minute or complete platform acceptance is claimed.",
+          "Task resident count was checked after Go cleanup. Client connections are zero in the client ledger; Service then exits normally. No assertion that persistent server sockets were continuously zero before normal shutdown is made."
+        ],
+        "socket_smoke": "negative-read-write-eof-hup-invalid-event-fallback-ok",
+        "summary": {
+          "A": {
+            "correct_rps": [
+              34,
+              32
+            ],
+            "event_cores": [
+              0.5663475225037166,
+              0.5971795309240653
+            ],
+            "native_cpu_seconds": [
+              3.26,
+              3.1
+            ],
+            "go_cpu_seconds": [
+              0.028606,
+              0.027718
+            ],
+            "all_correct_and_reclaimed": true
+          },
+          "B": {
+            "correct_rps": [
+              64,
+              64
+            ],
+            "event_cores": [
+              0.959595825292727,
+              0.9612267467225306
+            ],
+            "native_cpu_seconds": [
+              5.13,
+              5.05
+            ],
+            "go_cpu_seconds": [
+              0.038659,
+              0.038612999999999995
+            ],
+            "all_correct_and_reclaimed": true
+          },
+          "median_rps_gain": 0.9393939393939394
+        },
+        "temporary_directory_removed": true,
+        "raw_file": "mac-select-negative-ab.json",
+        "raw_sha256": "368cd0aaa3a00cf6717022f4a95126af8ae526ac98c1f89a0da8d22eb2f3b907"
+      }
+    ]
+  }
+}

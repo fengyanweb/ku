@@ -1,7 +1,7 @@
 ---
 title: 'Sprachleitfaden'
 description: 'Lernen Sie Ku-Variablen, Funktionen, Kontrollfluss, Ownership, Module und behebbare Fehler kennen.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Dieser Leitfaden führt die grundlegende Syntax ein. Maßgeblich bleiben der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) und der [Semantikvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) des Repositorys. Die Fragmente dienen dem Lernen; Unterschiede stehen unter [Backend-Unterstützung](/de/docs/support/).
+Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Dieser Leitfaden führt die grundlegende Syntax ein. Maßgeblich bleiben der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) und der [Semantikvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) des Repositorys. Die Fragmente dienen dem Lernen; Unterschiede stehen unter [Backend-Unterstützung](/de/docs/support/).
 
 ## Variablen und Typen
 

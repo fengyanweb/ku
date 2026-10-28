@@ -1,25 +1,27 @@
 ---
 title: 'Proyecto y contribuciones'
 description: 'Estado del proyecto Ku, código público, límites de licencia e informes de problemas reproducibles.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. El proyecto se llama **Ku programming language / Ku 编程语言**, y su CLI se llama `ku`. Ku es un pequeño lenguaje de programación e intérprete en desarrollo. Su versión pública actual es la preliminar experimental v0.0.18.
+La documentación actual corresponde a Ku 0.0.19, una versión preliminar experimental con la misma versión de CLI y extensión de VS Code. La disponibilidad, los archivos y las sumas de comprobación dependen del GitHub Release real.
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## Código fuente y licencia
 
-Consulta el [código en GitHub](https://github.com/fengyanweb/ku) y la [página de la versión](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). El código es visible públicamente, pero el código propio de Ku **no tiene una concesión de licencia de código abierto**. La extensión del editor está marcada como `UNLICENSED`. Publicar código o binarios no concede automáticamente una licencia de código abierto.
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-Los avisos de terceros incluidos en los archivos de versiones solo se aplican a sus respectivos componentes. No conceden permisos de uso, modificación ni redistribución de Ku. Cualquier autorización necesaria debe proceder expresamente del mantenedor; este sitio web no crea nuevos compromisos de licencia.
+Ku y la extensión de VS Code usan Apache License 2.0. Consulta [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) y [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Los componentes de terceros conservan sus propios derechos de autor y licencias.
 
 ## Informa de un problema
 
@@ -34,7 +36,7 @@ No envíes tokens, contraseñas, cadenas de conexión reales ni registros con da
 
 ## Antes de contribuir
 
-El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) definen el comportamiento del lenguaje. Revisa conjuntamente CI, implementación y contratos. Un objetivo del registro de trabajo no es una función implementada.
+El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) definen el comportamiento del lenguaje. Revisa conjuntamente CI, implementación y contratos. Un objetivo del registro de trabajo no es una función implementada.
 
 Limita los cambios y explica reproducción, causa, alcance y validación. Revisa el contenido del sitio junto al código correspondiente. Conserva las pruebas existentes, los cambios del árbol de trabajo y las evidencias únicas. El mantenedor decide la aceptación de contribuciones y los acuerdos de licencia; este sitio no inventa un acuerdo de contribución.
 

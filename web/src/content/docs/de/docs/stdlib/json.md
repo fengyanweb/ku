@@ -1,7 +1,7 @@
 ---
 title: 'JSON-Referenz'
 description: 'JSON-Kodierung und -Dekodierung in Ku, KuValue-Konvertierung, Fehlercodes und Backend-Unterstützung.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Werte kodieren und lesen
 
-Dies ist ein vollständiges Grundbeispiel. Im Entwicklungszweig steht ein umfangreicheres Regressionsbeispiel unter [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Dies ist ein vollständiges Grundbeispiel. Im Entwicklungszweig steht ein umfangreicheres Regressionsbeispiel unter [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ Behebbare Fehler verwenden die Domäne `json`. Häufige Codes sind `parse_error`
 
 Interpreter, standardmäßig verpackter Runner und synchrones natives C-Backend besitzen JSON-Implementierungen. **Die eingeschränkte native Task-Teilmenge und LLVM unterstützen JSON nicht.** Imports des Standard-Runners hängen weiterhin von ihren Quellorten ab; JSON-Unterstützung bedeutet kein vollständig unabhängiges Paket.
 
-Die Signaturen und Grenzen dieser Seite wurden anhand von Quelltext und Verträgen geprüft. Ausführungsprüfungen müssen Version, Commit und Backend nennen. Siehe den vollständigen [JSON-Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Die Signaturen und Grenzen dieser Seite wurden anhand von Quelltext und Verträgen geprüft. Ausführungsprüfungen müssen Version, Commit und Backend nennen. Siehe den vollständigen [JSON-Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

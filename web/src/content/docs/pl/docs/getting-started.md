@@ -1,9 +1,9 @@
 ---
 title: 'Pierwsze kroki'
 description: 'Napisz Hello Ku, sprawdź kod źródłowy i poznaj różnicę między interpretacją a kompilacją.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Ta strona używa podstawowej składni i poleceń CLI dostępnych już w v0.0.17. Najpierw [zainstaluj Ku](/pl/docs/install/) i sprawdź, czy działa `ku --version`.

@@ -1,7 +1,7 @@
 ---
 title: VS Code
 description: 安装 Ku 插件，配置运行、检查、格式化和代码补全。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources:
   [
@@ -17,12 +17,12 @@ Ku 插件为 VS Code 1.85 及以上版本提供语法高亮、代码片段、补
 
 ## 安装插件
 
-从 [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) 下载对应系统的压缩包并解压。每个平台包都包含 `ku-language-0.0.18.vsix` 和 CLI。VSIX 位于压缩包内，没有单独的 Release 下载文件。
+从 [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) 下载对应系统的压缩包并解压。每个平台包都包含 `ku-language-0.0.19.vsix` 和 CLI。VSIX 位于压缩包内，没有单独的 Release 下载文件；实际附件以对应发行页为准。
 
 在 VS Code 中打开**扩展 → … → 从 VSIX 安装…**，选择该文件，然后执行 **Developer: Reload Window**。也可以在解压目录执行：
 
 ```sh
-code --install-extension ./ku-language-0.0.18.vsix
+code --install-extension ./ku-language-0.0.19.vsix
 ```
 
 这种方式直接安装已发布的 VSIX，不依赖 Marketplace 上架。
@@ -71,4 +71,4 @@ fn main() {
 
 ## 更新
 
-安装与你使用的 Ku 版本对应的 VSIX，并重新加载 VS Code。公开的 v0.0.18 压缩包包含该版发布时的插件。仓库后续对补全、悬浮说明的修改，需要重新构建和安装插件才会生效，不会自动改变已经下载的 VSIX。
+安装与你使用的 Ku 版本对应的 VSIX，并重新加载 VS Code。公开的 v0.0.19 压缩包包含该版发布时的插件。仓库后续对补全、悬浮说明的修改，需要重新构建和安装插件才会生效，不会自动改变已经下载的 VSIX。

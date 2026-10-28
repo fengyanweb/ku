@@ -208,13 +208,13 @@ int main(void) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(2,sizeof(*slots));
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(startup_deadline!=UINT64_MAX);
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==12u);
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,2,ring,2,fixed+instances+31u,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   uint8_t* buffer=(uint8_t*)malloc(31u); CHECK(buffer); memcpy(buffer,"payload",7u);

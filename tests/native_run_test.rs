@@ -731,9 +731,10 @@ fn main(): null! {
     )
     .expect("write pending ready HTTP source");
     let generated = native_emit_c(dir, "main.ku");
-    let start = "/* Under pressure a genuinely idle persistent socket yields its slot.";
-    let end = "if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)";
+    let start = "      if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&";
+    let end = "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_REQUEST_WAIT) && now >= connection->deadline)";
     assert_eq!(generated.matches(start).count(), 1);
+    assert_eq!(generated.matches(end).count(), 1);
     // Execute the actual emitted promotion branch, rather than reimplementing
     // its idle predicate in the fixture. Only its surrounding loop is removed.
     let branch = generated
@@ -786,7 +787,7 @@ failed:
   *peer = *accepted = KU_HTTP_INVALID_SOCKET;
   return 0;
 }
-static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte) {
+static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte, int connection_pressure) {
   KuHttpSocket peer, accepted;
   if (!ku_http_fixture_tcp_pair(&peer, &accepted)) return 0;
   if (with_byte) {
@@ -804,37 +805,49 @@ static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte)
   server.buffer_budget = budget;
   server.idle_timeout_ms = 1000;
   KuHttpConnection connection = {0};
+  int active_index = -1;
+  KuHttpActiveSet active = {.connections=&connection,.indices=&active_index,
+      .capacity=1,.free_head=-1,.request_limit=1};
   ku_http_atomic_store(&ku_http_active_conns, 1);
-  ku_http_connection_start(&connection, accepted, &server);
+  ku_http_connection_start(&connection, &active, accepted, &server);
   connection.reused = 1;
   char* original_header = connection.header;
   const size_t original_capacity = connection.capacity;
   const unsigned long long original_deadline = connection.deadline;
-  int passed = connection.phase == KU_HTTP_IO_HEADER && original_header
-      && original_capacity == 1024 && budget->current == original_capacity;
-  if (passed) ku_http_fixture_promote(&connection);
+  /* A real empty C record owns its socket but has neither input backing nor
+     an A lease. Keep that lazy-allocation boundary while exercising pressure. */
+  int passed = connection.phase == KU_HTTP_IO_HEADER && !original_header
+      && !original_capacity && !budget->current && active.count == 1
+      && active.sockets == 1 && active.high_water == 1 && !active.request_active
+      && !connection.request_lease;
+  if (passed) ku_http_fixture_promote(&connection, connection_pressure);
   const int observed_phase = connection.phase;
   const int same_socket = connection.socket_value == accepted;
-  if (with_byte) {
-    char byte = 0;
+  if (with_byte || !connection_pressure) {
     passed = passed && same_socket && connection.phase == KU_HTTP_IO_HEADER
         && connection.header == original_header && connection.capacity == original_capacity
         && connection.deadline == original_deadline && !connection.buffered
-        && budget->current == original_capacity
-        && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+        && budget->current == original_capacity && active.count == 1
+        && active.sockets == 1 && !active.request_active && !connection.request_lease;
+    if (with_byte) {
+      char byte = 0;
+      passed = passed && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+    }
   } else {
     passed = passed && connection.socket_value == KU_HTTP_INVALID_SOCKET
-        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current;
+        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current
+        && !active.count && !active.sockets && !active.request_active;
   }
   /* Retire the actual connection owner before reporting an intentional red
      result; the failing old branch has already retired this owner itself. */
   ku_http_connection_close(&connection);
   ku_http_socket_close(peer);
-  const int retired = budget->current == 0 && ku_http_active_conns == 0;
+  const int retired = budget->current == 0 && ku_http_active_conns == 0
+      && !active.count && !active.sockets && !active.request_active;
   if (!passed || !retired) {
     fprintf(stderr,
-      "HTTP pending reuse failed after cleanup: with_byte=%d phase=%d same_socket=%d retired=%d\n",
-      with_byte, observed_phase, same_socket, retired);
+      "HTTP pending reuse failed after cleanup: with_byte=%d C_pressure=%d phase=%d same_socket=%d retired=%d\n",
+      with_byte, connection_pressure, observed_phase, same_socket, retired);
     return 0;
   }
   return 1;
@@ -844,12 +857,13 @@ int main(void) {
   KuHttpBufferBudget budget = {0};
   budget.limit = 65536;
   if (!ku_http_mutex_init(&budget.lock)) { ku_http_net_cleanup(); return 21; }
-  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1);
-  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0);
+  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1, 1);
+  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0, 1);
+  const int request_pressure_passed = ku_http_fixture_reuse_case(&budget, 0, 0);
   const int budget_zero = budget.current == 0;
   ku_http_mutex_destroy(&budget.lock);
   ku_http_net_cleanup();
-  if (!ready_passed || !idle_passed || !budget_zero) return 1;
+  if (!ready_passed || !idle_passed || !request_pressure_passed || !budget_zero) return 1;
   puts("http-pending-ready-reuse-ok");
   return 0;
 }
@@ -858,7 +872,7 @@ int main(void) {
     fs::write(
         &harness,
         format!(
-            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  {start}{branch}\n}}\n{checks}"
+            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection, int connection_pressure) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  pending.raw_count = connection_pressure;\n  const KuHttpActiveSet active = *connection->active_set;\n  {start}{branch}\n}}\n{checks}"
         ),
     )
     .expect("write pending ready HTTP C harness");
@@ -959,6 +973,18 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
 static int ku_http_fixture_zero(void) {
   return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
 }
+static int ku_http_fixture_partial_header(KuHttpConnection* connection, const char* prefix, size_t length) {
+  if (!ku_http_buffer_reserve(connection->budget, length)) return 0;
+  connection->header = (char*)malloc(length);
+  if (!connection->header) {
+    ku_http_buffer_refund(connection->budget, length);
+    return 0;
+  }
+  connection->capacity = length;
+  memcpy(connection->header, prefix, length);
+  connection->buffered = length;
+  return 1;
+}
 static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budget, int kind, unsigned long long now) {
   KuHttpQueue queue;
   if (!ku_http_queue_init(&queue, 1, wake)) return 0;
@@ -971,23 +997,24 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   server.read_body_timeout_ms = 222;
   server.write_timeout_ms = 77;
   server.handler_timeout_ms = 100;
+  server.request_timeout_ms = 1000;
   KuHttpConnection connection = {0};
   connection.socket_value = KU_HTTP_INVALID_SOCKET;
   ku_http_fixture_now = now;
   ku_http_fixture_recv_calls = 0;
   ku_http_fixture_would_block = now < 100;
   if (kind < 2) {
-    ku_http_connection_start(&connection, KU_HTTP_INVALID_SOCKET, &server);
-    if (!connection.header) {
-      ku_http_queue_close(&queue, 0);
-      ku_http_connection_close(&connection);
-      ku_http_queue_free(&queue);
-      return 0;
-    }
+    ku_http_connection_start(&connection, NULL, KU_HTTP_INVALID_SOCKET, &server);
+    /* HEADER starts without a backing allocation; only an already partial
+       request owns bytes, as after a real positive parser read. */
     if (kind == 1) {
       static const char prefix[] = "POST /ok HTTP/1.1\r\nHost: localhost\r\n";
-      memcpy(connection.header, prefix, sizeof(prefix) - 1);
-      connection.buffered = sizeof(prefix) - 1;
+      if (!ku_http_fixture_partial_header(&connection, prefix, sizeof(prefix) - 1)) {
+        ku_http_queue_close(&queue, 0);
+        ku_http_connection_close(&connection);
+        ku_http_queue_free(&queue);
+        return 0;
+      }
       ku_http_fixture_received = "Content-Length: 1\r\n\r\nx";
     } else {
       ku_http_fixture_received = "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
@@ -996,6 +1023,7 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     connection.budget = budget;
     connection.input.budget = budget;
+    connection.request_deadline = now + 1000;
     /* Match the real parser's retained body and target backing owners. */
     if (!ku_http_buffer_reserve(budget, 6)) {
       ku_http_queue_close(&queue, 0);
@@ -1047,8 +1075,9 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     passed = connection.phase == original_phase && connection.deadline == 100
       && ku_http_fixture_recv_calls == 1
-      && connection.header == original_header
-      && connection.capacity == original_capacity
+      && (kind == 0
+          ? connection.header != NULL && connection.capacity == 1024 && budget->current == 1024
+          : connection.header == original_header && connection.capacity == original_capacity)
       && connection.buffered == original_buffered
       && connection.input.body == original_body
       && connection.body_received == original_body_received
@@ -1242,6 +1271,9 @@ fn main(): null! {
         "int connect_expired = ku_pg_now_ms() >= deadline",
         "if (p->closing || connect_expired)",
         "static int ku_pg_client_take_dispose_locked",
+        "p->async_operations != 0 || p->capture_pins != 0",
+        "p->capture_pins--;int dispose=ku_pg_client_take_dispose_locked(p)",
+        "p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p)",
         "PostgreSQL client waiter limit reached",
         "p->waiters >= p->max_waiters",
         "timed out waiting for a PostgreSQL client connection",
@@ -1258,8 +1290,8 @@ fn main(): null! {
     }
     assert_eq!(
         c.matches("ku_pg_client_take_dispose_locked(p)").count(),
-        5,
-        "every PG close/release/acquire rollback path must use the one-finalizer arbiter"
+        7,
+        "PG close/release/acquire rollback, capture and async retirement must share the one-finalizer arbiter"
     );
     assert_eq!(
         c.matches("return ku_pg_finish_query(conn, result, deadline, broken)")
@@ -1496,6 +1528,11 @@ char* PQerrorMessage(const PGconn* value) {
 }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { if (value && value->id >= 1 && value->id <= 4) ku_test_finish_counts[value->id]++; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }
@@ -1657,6 +1694,11 @@ int PQstatus(const PGconn* value) { (void)value; ku_test_connection_touches++; r
 char* PQerrorMessage(const PGconn* value) { (void)value; return "stub error"; }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; ku_test_connection_touches++; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; ku_test_connection_touches++; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { (void)value; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }
@@ -4944,13 +4986,57 @@ fn native_kuvalue_function_equality_does_not_consume_closure() {
 #[test]
 fn native_json_array_roundtrip() {
     let dir = unique_temp_dir("json-arr");
+    let mut integers = vec![i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+    for exponent in 0..=18 {
+        let power = 10_i64.pow(exponent);
+        integers.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+    }
+    let mut state = 0x6b75_6a73_6f6e_696e_u64;
+    for _ in 0..128 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        integers.push(state as i64);
+    }
+    integers.sort_unstable();
+    integers.dedup();
+    let integer_text = format!(
+        "[{}]",
+        integers
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    fs::write(dir.join("integers.json"), integer_text).expect("write integer boundary cases");
     fs::write(
         dir.join("main.ku"),
-        "import json from \"std.json\"\n\nfn main(): null! {\n    println(json.stringify(json.parse(\"[1,2,3]\")?)?)\n    println(json.stringify(json.parse(\"[{\\\"a\\\":1},{\\\"a\\\":2}]\")?)?)\n    println(json.stringify(json.parse(\"[]\")?)?)\n    return ok(null)\n}\n",
+        r#"import {json, fs} from "std"
+
+fn main(): null! {
+    println(json.stringify(json.parse("[1,2,3]")?)?)
+    println(json.stringify(json.parse("[{\"a\":1},{\"a\":2}]")?)?)
+    println(json.stringify(json.parse("[]")?)?)
+    canonical = fs.read("integers.json")?
+    values = json.decode(canonical)?
+    if (json.encode(values)? != canonical || json.stringify(json.try_parse(json.stringify(values)?)?)? != canonical) {
+        panic("integer JSON token changed at a sign, digit or int64 boundary")
+    }
+    if (json.encode(json.decode("-0")?)? != "0") {
+        panic("integer negative zero must remain canonical zero")
+    }
+    typed = [0, -1, 9223372036854775807, -9223372036854775807 - 1]
+    if (json.encode(typed)? != "[0,-1,9223372036854775807,-9223372036854775808]") {
+        panic("typed integer array used a different JSON formatter")
+    }
+    return ok(null)
+}
+"#,
     )
     .expect("write main.ku");
 
     let Some(exe) = native_build(&dir, "main.ku", "jsonarr") else {
+        fs::remove_dir_all(&dir).ok();
         return;
     };
 
@@ -5268,6 +5354,14 @@ fn main(): null! {
     ExpectReject("\"\\uD83D\\u0041\"")?
     ExpectReject("\"\\uDE00\"")?
     ExpectReject("\"unterminated")?
+    prefix = ""
+    i = 0
+    while (i < 257) { prefix = prefix + "a"; i = i + 1 }
+    decoded = json.decode("\"" + prefix + "\\n你😀\\\"\\\\/tail\"")?
+    if (decoded.as_str()? != prefix + "\n你😀\"\\/tail") { panic("ascii run boundary") }
+    ExpectReject("\"" + prefix + "\\x\"")?
+    ExpectReject("\"" + prefix + "\n\"")?
+    ExpectReject("\"" + prefix + "")?
     return ok(null)
 }
 "#,
@@ -5409,6 +5503,11 @@ fn native_json_input_and_output_limits_are_hard_boundaries() {
     fs::write(dir.join("float-ok.txt"), vec![b'a'; 999_953]).expect("write float boundary payload");
     fs::write(dir.join("float-too-large.txt"), vec![b'a'; 999_954])
         .expect("write oversized float boundary payload");
+    // INT64_MIN occupies the complete 20-byte integer buffer; these objects
+    // have 44 bytes of syntax/number text, including its minus sign.
+    fs::write(dir.join("int-ok.txt"), vec![b'a'; 999_956]).expect("write integer boundary payload");
+    fs::write(dir.join("int-too-large.txt"), vec![b'a'; 999_957])
+        .expect("write oversized integer boundary payload");
     fs::write(
         dir.join("main.ku"),
         r#"import fs from "std.fs"
@@ -5424,6 +5523,12 @@ fn FloatOutputTooLarge(): null! {
     scale = 10000000000.0
     number = scale * scale
     json.encode({ number: number, padding: fs.read("float-too-large.txt")? })?
+    return ok(null)
+}
+
+fn IntegerOutputTooLarge(): null! {
+    number = -9223372036854775807 - 1
+    json.encode({ number: number, padding: fs.read("int-too-large.txt")? })?
     return ok(null)
 }
 
@@ -5455,6 +5560,21 @@ fn main(): null! {
     }
     if (!caught_float) {
         panic("float decimal marker exceeded the output limit")
+    }
+    minimum = -9223372036854775807 - 1
+    integer_text = json.encode({ number: minimum, padding: fs.read("int-ok.txt")? })?
+    if (integer_text.byte_len() != 1000000) {
+        panic("integer sign or digits were not included in output accounting")
+    }
+    json.decode(integer_text)?
+    caught_integer = false
+    try {
+        IntegerOutputTooLarge()?
+    } catch (err) {
+        caught_integer = err.domain == "json" && err.code == "stringify_error"
+    }
+    if (!caught_integer) {
+        panic("integer sign or digits exceeded the output limit")
     }
     return ok(null)
 }
@@ -5671,6 +5791,209 @@ fn native_json_stringify_typed_primitive_arrays() {
     assert_eq!(code, Some(0));
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_uses_existing_writer_in_bare_and_result_functions() {
+    let dir = unique_temp_dir("http-json-owned-result");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import { http, json } from "std"
+fn bare(): HttpResponse { return http.json({text:"owned"}) }
+fn created(): HttpResponse! {
+    decoded = json.decode("{\"text\":\"中文🙂\\u0000\",\"items\":[1,true,null]}")?
+    return ok(http.json(201, decoded))
+}
+fn main(): null! {
+    response = created()?
+    println(response.status)
+    println(response.body)
+    quoted = http.json("quote\"\\\n")
+    println(quoted.body)
+    response = bare()
+    println(response.body)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write native HTTP JSON Result source");
+    let generated = native_emit_c(&dir, "main.ku");
+    assert!(generated.contains("application/json; charset=utf-8"));
+    assert!(generated.contains("ku_http_json_response"));
+    let Some(exe) = native_build(&dir, "main.ku", "httpjsonresult") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(
+        stdout.replace('\r', ""),
+        concat!(
+            "201\n{\"items\":[1,true,null],\"text\":\"中文🙂\\u0000\"}\n",
+            "\"quote\\\"\\\\\\n\"\n{\"text\":\"owned\"}\n"
+        )
+    );
+    assert_eq!(code, Some(0));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_errors_match_interpreter_and_do_not_enter_catch() {
+    let dir = unique_temp_dir("http-json-fatal");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    for (name, expression, expected_prefix, message) in [
+        (
+            "status",
+            "http.json(status(), value())",
+            "status\nvalue\n",
+            "http status must be between 100 and 599",
+        ),
+        (
+            "writer",
+            "http.json(ok(\"owned\" + \" result\"))",
+            "",
+            "json.stringify does not support result",
+        ),
+    ] {
+        let source = format!(
+            r#"import http from "std.http"
+fn status(): int {{ println("status") return 99 }}
+fn value(): str {{ println("value") return "evaluated" }}
+fn response(): HttpResponse {{
+    try {{ return {expression} }}
+    catch (err) {{ println("unexpected-catch") return http.text("caught") }}
+    return http.text("unreachable")
+}}
+fn main(): null! {{
+    result = response()
+    println("unexpected-continuation")
+    return ok(null)
+}}
+"#
+        );
+        fs::write(dir.join("main.ku"), source).unwrap();
+        let mut interpreter = Command::new(ku_binary());
+        interpreter.current_dir(&dir).args(["run", "main.ku"]);
+        let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded interpreter HTTP JSON failure");
+        assert!(!interpreted.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert!(String::from_utf8_lossy(&interpreted.stderr).contains(message));
+        let Some(exe) = native_build(&dir, "main.ku", &format!("httpjson{name}")) else {
+            return;
+        };
+        let mut command = Command::new(exe);
+        command.current_dir(&dir);
+        let native = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded native HTTP JSON failure");
+        assert_eq!(native.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stderr).replace('\r', ""),
+            format!("{message}\n")
+        );
+    }
+}
+
+#[test]
+fn native_http_json_keeps_existing_consumed_input_rule() {
+    let dir = unique_temp_dir("http-json-contract");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    value={text:"owned"}
+    response=http.json(value)
+    println(value.text)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write consumed native HTTP JSON source");
+    let output = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(&dir)
+            .args(["check", "main.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .expect("bounded HTTP JSON ownership check");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use of moved value 'value'"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_mailbox_has_no_owner_and_releases_writer_inputs() {
+    let dir = unique_temp_dir("http-json-fatal-owners");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn Failure(): HttpResponse { return http.json(ok("owned" + " input")) }
+fn main(): null! { response=Failure() return ok(null) }
+"#,
+    )
+    .unwrap();
+    let generated = native_emit_c(&dir, "main.ku");
+    run_array_capacity_c_harness(
+        &dir,
+        &generated,
+        "httpjsonfatalowners",
+        r#"
+int main(void) {
+  for (unsigned round=0; round<16; ++round) {
+    __ku_sync_reset();
+    KuStruct___ku_http_response failed=Failure();
+    KuSyncExitSignal signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json.stringify does not support result"));
+    CHECK(__ku_sync_error_message_length(signal)==strlen("json.stringify does not support result"));
+    CHECK(!failed.body.ptr && !failed.content_type.ptr && !__ku_call_depth);
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(NO_LIVE_ALLOCATIONS());
+    // A future writer with an owning error must fall back before dropping it.
+    KuError owned=ku_error_make(
+      ku_string_concat(ku_string_static((const uint8_t*)"j",1),ku_string_static((const uint8_t*)"son",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"c",1),ku_string_static((const uint8_t*)"ode",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"owned",5),ku_string_static((const uint8_t*)" message",8)));
+    CHECK(ku_perf_live_allocations==3);
+    failed=ku_http_json_response(200,(KuResult_str){false,(KuString){0},owned});
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json stringify failed"));
+    CHECK(NO_LIVE_ALLOCATIONS());
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(ku_http_json_status(99)==0);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"http status must be between 100 and 599"));
+    KuString body=ku_string_concat(ku_string_static((const uint8_t*)"[",1),ku_string_static((const uint8_t*)"]",1));
+    uint8_t* original=body.ptr;
+    KuStruct___ku_http_response good=ku_http_json_response(201,(KuResult_str){true,ku_string_move(&body),{0}});
+    CHECK(good.status==201 && good.body.ptr==original && !body.ptr);
+    CHECK(ku_perf_live_allocations==1 && __ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+    ku_drop_struct___ku_http_response(&good);
+    CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  return 0;
+}
+"#,
+    );
+}
+
+struct HttpJsonFixture(PathBuf);
+impl Drop for HttpJsonFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -8464,8 +8787,9 @@ fn main(): null! {
 
     assert!(and_body.contains("bool __ku_logical_") && and_body.contains("= false;"));
     assert!(or_body.contains("bool __ku_logical_") && or_body.contains("= true;"));
-    assert!(!and_body.contains("&&"), "logical AND must be explicit CFG");
-    assert!(!or_body.contains("||"), "logical OR must be explicit CFG");
+    // Runtime guard predicates may themselves contain &&/||. Verify the source
+    // RHS's actual selected CFG edge below, rather than forbidding those tokens
+    // throughout unrelated guard/cleanup code. Execution also checks effects.
     assert_rhs_is_behind_branch(and_body, "left", "ExplodeAnd()", true);
     assert_rhs_is_behind_branch(or_body, "left", "ExplodeOr()", false);
     assert_rhs_is_behind_branch(bounds_and_body, "left", "ku_array_get_int", true);

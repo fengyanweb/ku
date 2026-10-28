@@ -1,8 +1,8 @@
 ---
 title: '标准库'
 description: '按用途查找 Ku 官方标准库与示例。'
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources: ['src/stdlib/metadata.rs', 'src/stdlib/mod.rs', 'docs/syntax.md']
 sidebar:
   order: 0
@@ -49,3 +49,9 @@ import { http, time } from "std"
 `T!` 表示可能返回 Error 的 Result；用 `?` 传播或 `try/catch` 处理。`&` 参数只读借用，不消费原值，也不隐式复制。返回新字符串或数组所需的分配与输入复制是不同的操作。
 
 [示例集](/zh-cn/docs/examples/)按可直接运行的任务组织；[包与模块](/zh-cn/docs/guide/packages/)介绍你自己的库。`std.task` 是内部观测接口，应用程序通过 `async fn` 与 `await` 使用 Task，见[并发指南](/zh-cn/docs/guide/concurrency/)。
+
+## 按合同阅读接口
+
+模块说明区分 import、参数类型/默认值、返回值、可恢复错误、完整程序以及后端/依赖边界。完整程序分别保存；标注为表达式或配置的片段不是独立程序。
+
+连接/请求预算见 [HTTP 限制](/zh-cn/docs/stdlib/http/#服务容量与期限)，数据库挂起见 [PG async 捕获](/zh-cn/docs/stdlib/database/#async-pg)，受限异步编码见 [Task JSON](/zh-cn/docs/stdlib/json/#native-task-中的标量-json-对象)，OS 控制见[进程限制](/zh-cn/docs/support/#应用预算与进程限制)。这些限制范围不同，不能互相替代。

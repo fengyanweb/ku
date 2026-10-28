@@ -13,6 +13,7 @@ pub(super) fn field(ty: &IrType) -> KuResult<&'static str> {
         IrType::Bool => Ok("boolean"),
         IrType::Null => Ok("null_value"),
         IrType::Str => Ok("string"),
+        ty if crate::ir::task::http_response_type(ty) => Ok("http_response"),
         IrType::Array(inner) => match inner.as_ref() {
             IrType::Int => Ok("integer_array"),
             IrType::Bool => Ok("boolean_array"),
@@ -29,6 +30,7 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
         IrType::Bool => Ok(2),
         IrType::Null => Ok(3),
         IrType::Str => Ok(4),
+        ty if crate::ir::task::http_response_type(ty) => Ok(8),
         IrType::Array(inner) => match inner.as_ref() {
             IrType::Int => Ok(5),
             IrType::Bool => Ok(6),
@@ -40,6 +42,13 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
 }
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     out.check()?;
+    if tasks.functions.iter().any(|function| function.slots.iter().any(|slot| matches!(&slot.ty,crate::ir::task::TaskSlotType::Value {ty,..} if crate::ir::task::pg_capture_type(ty)))) {
+        out.push_str(PG_CAPTURE);
+    }
+    if tasks.functions.iter().any(|function|crate::ir::task::http_type(&function.result)
+        || function.slots.iter().any(|slot|matches!(&slot.ty,crate::ir::task::TaskSlotType::Value{ty,..} if crate::ir::task::http_type(ty)))) {
+        out.push_str("#define KU_TASK_HTTP_TYPES 1\n");
+    }
     out.push_str(HOST_ABI);
     if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
@@ -49,6 +58,12 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     }
     if super::super::task::uses_blocking_net(tasks) {
         out.push_str(NET_HOST);
+    }
+    if super::super::task::uses_postgres(tasks) {
+        out.push_str(PG_HOST);
+    }
+    if super::super::task::uses_json(tasks) {
+        out.push_str(JSON_HOST);
     }
     for function in &tasks.functions {
         out.check()?;
@@ -90,7 +105,11 @@ typedef struct KuTaskAdapterOutcomeV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string;
           KuResult_array_int integer_array; KuResult_array_bool boolean_array;
-          KuResult_array_str string_array; } value;
+          KuResult_array_str string_array;
+#if defined(KU_TASK_HTTP_TYPES)
+          KuResult_struct___ku_http_response http_response;
+#endif
+          } value;
 } KuTaskAdapterOutcomeV1;
 /* Appended kind 5--7 members must preserve the original kind 1--4 layout.
  * These compile-time assertions apply to the C target's actual ABI. */
@@ -100,10 +119,12 @@ typedef struct KuTaskAdapterOutcomeLegacyV1 {
   union { KuResult_int integer; KuResult_bool boolean;
           KuResult_null null_value; KuResult_str string; } value;
 } KuTaskAdapterOutcomeLegacyV1;
+#if !defined(KU_TASK_HTTP_TYPES)
 typedef char KuTaskOutcomeSizeUnchangedV1[
   sizeof(KuTaskAdapterOutcomeV1)==sizeof(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
 typedef char KuTaskOutcomeAlignmentUnchangedV1[
   KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1)==KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeLegacyV1) ? 1 : -1];
+#endif
 typedef char KuTaskOutcomeOffsetsUnchangedV1[
   offsetof(KuTaskAdapterOutcomeV1,result_kind)==offsetof(KuTaskAdapterOutcomeLegacyV1,result_kind)
   && offsetof(KuTaskAdapterOutcomeV1,exit_class)==offsetof(KuTaskAdapterOutcomeLegacyV1,exit_class)
@@ -113,6 +134,10 @@ typedef char KuTaskOutcomeOffsetsUnchangedV1[
 typedef struct KuTaskAdapterTakeRequestV1 {
   KuTaskAdapterOutcomeV1* outcome;
   const KuTaskDriverTicketV1* parent;
+  /* Internal HTTP bridge retains payload bytes as a driver scratch receipt
+   * until response ownership returns to its HTTP buffer ledger. */
+  size_t retained_bytes;
+  uint32_t retain_payload_charge;
 } KuTaskAdapterTakeRequestV1;
 typedef struct KuTaskAdapterHostV1 {
   const KuTaskDriverTicketV1* ticket;
@@ -275,6 +300,13 @@ static int ku_task_outcome_empty(KuTaskAdapterOutcomeV1* output, uint32_t kind) 
     case 5: if (output->value.integer_array.ok || output->value.integer_array.value.data || output->value.integer_array.value.len || output->value.integer_array.value.capacity) return 0; error=&output->value.integer_array.error; break;
     case 6: if (output->value.boolean_array.ok || output->value.boolean_array.value.data || output->value.boolean_array.value.len || output->value.boolean_array.value.capacity) return 0; error=&output->value.boolean_array.error; break;
     case 7: if (output->value.string_array.ok || output->value.string_array.value.data || output->value.string_array.value.len || output->value.string_array.value.capacity) return 0; error=&output->value.string_array.error; break;
+#if defined(KU_TASK_HTTP_TYPES)
+    case 8: if (output->value.http_response.ok || output->value.http_response.value.status
+        || !ku_task_outcome_empty_string(output->value.http_response.value.content_type)
+        || !ku_task_outcome_empty_string(output->value.http_response.value.body)
+        || !ku_task_outcome_empty_string(output->value.http_response.value.location)) return 0;
+      error=&output->value.http_response.error; break;
+#endif
     default: return 0;
   }
   return ku_task_outcome_empty_string(error->domain) && ku_task_outcome_empty_string(error->code) && ku_task_outcome_empty_string(error->message);
@@ -288,6 +320,9 @@ static void ku_task_outcome_drop(KuTaskAdapterOutcomeV1* output) {
     case 5: ku_result_drop_array_int(&output->value.integer_array); break;
     case 6: ku_result_drop_array_bool(&output->value.boolean_array); break;
     case 7: ku_result_drop_array_str(&output->value.string_array); break;
+#if defined(KU_TASK_HTTP_TYPES)
+    case 8: ku_result_drop_struct___ku_http_response(&output->value.http_response); break;
+#endif
     default: break;
   }
   *output=(KuTaskAdapterOutcomeV1){0};
@@ -337,6 +372,9 @@ static uint32_t ku_task_value_take(KuTaskValueV1* value,
       case 5: output->value.integer_array.error=error; break;
       case 6: output->value.boolean_array.error=error; break;
       case 7: output->value.string_array.error=error; break;
+#if defined(KU_TASK_HTTP_TYPES)
+      case 8: output->value.http_response.error=error; break;
+#endif
       default: return KU_TASK_DRIVER_INVALID_ARGUMENT;
     }
     *value=(KuTaskValueV1){0}; return KU_TASK_DRIVER_OK;
@@ -539,5 +577,127 @@ static uint32_t ku_task_host_net_write_close(KuTaskAdapterHostV1* host,
       : ku_task_blocking_submit_net(host->ticket,host->control,host->blocking,kind,
           NULL,0,client,data,0,host->allocation_context,host->reconcile_charge,output);
   return ku_task_host_net_status(status);
+}
+"#;
+
+const PG_CAPTURE: &str = r#"
+/* Private, checked HTTP capture token. The source name still denotes the
+ * original move-only PgClient. This owner pins its existing environment, never
+ * clones the pool, and is unavailable as a public async parameter type. */
+typedef struct KuTaskPgCapture {
+  KuPgClient* client;
+  void* env;
+  uint64_t deadline;
+} KuTaskPgCapture;
+static KuTaskPgCapture ku_task_pg_capture_move(KuTaskPgCapture* source) {
+  KuTaskPgCapture value=*source; memset(source,0,sizeof(*source)); return value;
+}
+static void ku_task_pg_capture_drop(KuTaskPgCapture* value) {
+  void* env=value->env; KuPgClient* client=value->client; memset(value,0,sizeof(*value));
+  if(client) ku_pg_client_capture_release(client);
+  if(env) ((KuEnvHeader*)env)->release(env);
+}
+static int ku_task_pg_capture_acquire(KuPgClient* client,void* env,uint64_t deadline,KuTaskPgCapture* output) {
+  if(!client || !env || !deadline || !output || !ku_pg_client_capture_retain(client)) return 0;
+  ((KuEnvHeader*)env)->retain(env);
+  *output=(KuTaskPgCapture){client,env,deadline}; return 1;
+}
+"#;
+
+const JSON_HOST: &str = r#"
+/* Static keys and scalar slots only. The original JSON writers remain the
+ * encoding authority. Prepay one sufficiently large buffer before malloc, so
+ * their normal bounded append path never needs to grow an uncharged buffer. */
+static void ku_task_json_capacity_add(size_t* total,size_t bytes) {
+  if(*total>=KU_JSON_MAX_OUTPUT_BYTES || bytes>KU_JSON_MAX_OUTPUT_BYTES-*total)
+    *total=KU_JSON_MAX_OUTPUT_BYTES;
+  else *total+=bytes;
+}
+static int ku_task_json_string_capacity(KuString string,size_t* total) {
+  if(string.len && !string.ptr)return 0;
+  ku_task_json_capacity_add(total,2u);
+  for(size_t i=0;i<string.len && *total<KU_JSON_MAX_OUTPUT_BYTES;i++) {
+    uint8_t byte=string.ptr[i];
+    size_t width=(byte=='"' || byte=='\\' || byte=='\n' || byte=='\r' || byte=='\t')?2u:byte<0x20u?6u:1u;
+    ku_task_json_capacity_add(total,width);
+  }
+  return 1;
+}
+static KuResult_str ku_task_host_json_object(KuTaskAdapterHostV1* host,
+    const KuString* keys,const KuValue* values,size_t count) {
+  if(!host || !host->ticket || !host->control || count>64u || (count && (!keys || !values))
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge)
+    return (KuResult_str){false,{0},ku_json_error("resource_limit","Task JSON allocation host unavailable")};
+  size_t capacity=2u;
+  for(size_t i=0;i<count;i++) {
+    ku_task_json_capacity_add(&capacity,1u+(i!=0));
+    if(!ku_task_json_string_capacity(keys[i],&capacity))
+      return (KuResult_str){false,{0},ku_json_error("stringify_error","invalid utf-8 in json string")};
+    switch(values[i].tag) {
+      case KU_INT:ku_task_json_capacity_add(&capacity,20u);break;
+      case KU_BOOL:ku_task_json_capacity_add(&capacity,5u);break;
+      case KU_NULL:ku_task_json_capacity_add(&capacity,4u);break;
+      case KU_STR:if(!ku_task_json_string_capacity(values[i].as.s,&capacity))
+        return (KuResult_str){false,{0},ku_json_error("stringify_error","invalid utf-8 in json string")};break;
+      default:return (KuResult_str){false,{0},ku_json_error("stringify_error","Task JSON requires scalar fields")};
+    }
+  }
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  if(status==KU_TASK_DRIVER_OK)status=ku_task_driver_grow_charge(host->ticket,capacity);
+  if(status!=KU_TASK_DRIVER_OK)
+    return (KuResult_str){false,{0},ku_json_error("resource_limit","Task JSON byte budget exhausted")};
+  KuJsonBuffer buffer={0};buffer.data=(uint8_t*)malloc(capacity);buffer.cap=capacity;
+  if(!buffer.data) {
+    (void)host->reconcile_charge(host->allocation_context);
+    return (KuResult_str){false,{0},ku_json_error("out_of_memory","json allocation failed")};
+  }
+  KuError error={0};bool ok=ku_json_write_byte(&buffer,'{',&error);
+  for(size_t i=0;i<count && ok;i++) {
+    ok=(!i || ku_json_write_byte(&buffer,',',&error))
+        && ku_json_write_string(&buffer,keys[i],&error)
+        && ku_json_write_byte(&buffer,':',&error)
+        && ku_json_write_value(&buffer,values[i],1u,&error);
+  }
+  if(ok)ok=ku_json_write_byte(&buffer,'}',&error);
+  if(!ok) {
+    ku_json_buffer_drop(&buffer);
+    (void)host->reconcile_charge(host->allocation_context);
+    if(!error.code.ptr)error=ku_json_error("stringify_error","json stringify failed");
+    return (KuResult_str){false,{0},error};
+  }
+  ku_error_drop(&error);
+  return (KuResult_str){true,ku_json_buffer_take_string(&buffer),{0}};
+}
+"#;
+
+const PG_HOST: &str = r#"
+static uint32_t ku_task_host_pg_query(KuTaskAdapterHostV1* host,
+    KuTaskPgCapture client, KuString sql, KuArray_str params, KuResult_pg_result* output) {
+  if(!ku_task_host_net_valid(host) || !client.client || !client.env || !client.deadline || !output)
+    return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)
+    return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_take_pg(host->ticket,host->blocking,output)
+      : ku_task_blocking_submit_pg(host->ticket,host->control,host->blocking,
+          client.client,sql,params,client.deadline,host->allocation_context,host->reconcile_charge,output);
+  return ku_task_host_net_status(status);
+}
+static KuResult_str ku_task_host_pg_value(KuTaskAdapterHostV1* host,
+    KuPgResult* result, int64_t row, int64_t col) {
+  if(!ku_task_host_net_valid(host))
+    return (KuResult_str){false,{0},ku_pg_static_error("resource_limit",sizeof("resource_limit")-1,"PostgreSQL Task allocation host unavailable",sizeof("PostgreSQL Task allocation host unavailable")-1)};
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  size_t bytes=0;
+  if(ku_pg_cell_in_bounds(result,row,col)) {
+    KuPgCell cell=result->cells[(size_t)row*result->cols+(size_t)col];
+    if(cell.len!=KU_PG_NULL_CELL) bytes=(size_t)cell.len;
+  }
+  if(status==KU_TASK_DRIVER_OK && bytes) status=ku_task_driver_grow_charge(host->ticket,bytes);
+  if(status!=KU_TASK_DRIVER_OK)
+    return (KuResult_str){false,{0},ku_pg_static_error("resource_limit",sizeof("resource_limit")-1,"PostgreSQL Task value byte budget exhausted",sizeof("PostgreSQL Task value byte budget exhausted")-1)};
+  return ku_pg_value(result,row,col);
 }
 "#;

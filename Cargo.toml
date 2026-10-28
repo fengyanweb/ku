@@ -1,8 +1,9 @@
 ﻿[package]
 name = "ku"
-version = "0.0.18"
+version = "0.0.19"
 edition = "2021"
 rust-version = "1.89"
+license = "Apache-2.0"
 
 [workspace]
 members = ["crates/ku-native-tls"]
@@ -38,3 +39,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+
+# Test-only process-tree deadline; not installed or shipped as a Ku command.
+[[example]]
+name = "acceptance-runner"
+path = "tests/support/acceptance_runner.rs"
