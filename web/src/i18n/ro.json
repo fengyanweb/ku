@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Un limbaj în devenire",
-  "siteDescription": "Descoperă Ku, un limbaj de programare experimental. Exemple reale, instalare, ghiduri de limbaj și suportul backendurilor.",
+  "siteTitle": "Ku — Compilare nativă și programare asincronă",
+  "siteDescription": "Ku este un limbaj compilat pentru aplicații native și servicii concurente, axat pe eficiența execuției, programare asincronă și controlul resurselor.",
   "skip": "Sari la conținut",
   "home": "Acasă Ku",
   "documentation": "Documentație",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Sursa poate fi consultată",
   "development": "Experimental prerelease",
   "heroTitle": ["O idee.", "Puțin", "Ku."],
-  "heroDescription": "Un limbaj mic cu loc pentru creștere. Sintaxă lizibilă, proprietate explicită și instrumente pe care le poți explora de la prima linie.",
+  "heroDescription": "Ku este un limbaj compilat pentru aplicații native și servicii concurente, axat pe eficiența execuției, programare asincronă și controlul resurselor.",
   "start": "Începe să scrii Ku",
   "explore": "Explorează limbajul",
   "heroNote": "O etapă timpurie, în mod intenționat. Explorează, experimentează, oferă feedback.",
@@ -38,24 +38,39 @@
   "approachDescription": "Cunoaște Ku prin comportamentul real, având permanent în vedere limitele curente.",
   "features": [
     [
-      "Citește. Înțelege.",
-      "Declară o legare la prima atribuire. Folosește funcții, valori structurate și gestionarea explicită a erorilor pentru a-ți exprima ideea.",
+      "Compilează programe native.",
+      "Creează executabile native cu CLI-ul Ku. Verifică subsetul de limbaj și dependențele acceptate de platforma țintă.",
+      "Instalare și descărcări",
+      "docs/install"
+    ],
+    [
+      "Scrie cu async/await.",
+      "Exprimă sarcini asincrone cu async/await; mediul de execuție gestionează executarea și planificarea în limitele backendului ales.",
       "Ghidul limbajului",
       "docs/guide/language"
     ],
     [
-      "Fă proprietatea explicită.",
-      "Mută implicit, clonează intenționat și împrumută doar pentru citire în apeluri sincrone. Regulile curente sunt documentate alături de limitele lor.",
-      "Proprietate și limite",
-      "docs/support"
-    ],
-    [
-      "Alege calea de execuție.",
-      "Rulează cu interpretorul, împachetează un lansator executabil sau explorează C nativ. Verifică matricea de suport înainte de a alege un backend.",
-      "Explorează instrumentele",
+      "Stabilește limite de resurse.",
+      "Limitează conexiunile, cererile active, cozile de așteptare și bufferele. Limitele sistemului depind de platformă și de instalare.",
+      "Matrice de suport",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Observații de performanță",
+  "performanceScope": "Șapte perechi de ferestre de măsurare pentru o sarcină specifică HTTP și CPU pe Linux ARM64, comparate cu o configurație Rust de referință cu memorie redusă. Valorile sunt estimări punctuale ale mediilor geometrice ale rapoartelor.",
+  "performanceMetrics": [
+    [
+      "Cost CPU per cerere corectă",
+      "Cu aproximativ 33% mai mic",
+      "Ku/Rust ≈ 0.671"
+    ],
+    [
+      "RSS al procesului în regim stabil",
+      "Cu aproximativ 65% mai mic",
+      "Ku/Rust ≈ 0.351"
+    ]
+  ],
+  "performanceLimits": "Nu au fost îndeplinite toate criteriile de calificare a comparației și obiectivele de latență. Observațiile nu demonstrează creșterea debitului maxim, un clasament general al limbajelor sau pregătirea pentru producție.",
   "practiceTitle": ["Date familiare.", "Erori explicite."],
   "practiceDescription": "Importă un modul, construiește o valoare și codific-o în JSON. Operatorul ? propagă erorile în loc să le ascundă.",
   "jsonReference": "Citește referința JSON",
@@ -89,7 +104,7 @@
     ]
   ],
   "projectTitle": "O lucrare în curs. O poveste de urmărit.",
-  "projectDescription": "Documentația descrie domeniul fixat al prelansării experimentale v{releasedVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} este încă în dezvoltare. Un candidat de instalare Linux ARM64 a fost exersat cu un exemplu izolat; utilizarea în producție pentru o activitate reală nu a fost validată. Evaluează propriile programe și trimite feedback. Artefactele publicate se află în GitHub Releases.",
   "github": "Explorează pe GitHub",
   "license": "Sursa poate fi consultată. Nu a fost acordată o licență open source.",
   "verified": "Verificat",

@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Un lenguaje en desarrollo",
-  "siteDescription": "Conoce Ku, un lenguaje de programación experimental. Explora ejemplos reales, instalación, guías del lenguaje y compatibilidad de backends.",
+  "siteTitle": "Ku — Compilación nativa y programación asíncrona",
+  "siteDescription": "Ku es un lenguaje compilado para aplicaciones nativas y servicios concurrentes, centrado en la eficiencia de ejecución, la programación asíncrona y el control de recursos.",
   "skip": "Saltar al contenido",
   "home": "Inicio de Ku",
   "documentation": "Documentación",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Código fuente disponible para consultar",
   "development": "Experimental prerelease",
   "heroTitle": ["Una idea.", "Un poco de", "Ku."],
-  "heroDescription": "Un pequeño lenguaje con espacio para crecer. Sintaxis legible, propiedad explícita y una cadena de herramientas que puedes explorar desde la primera línea.",
+  "heroDescription": "Ku es un lenguaje compilado para aplicaciones nativas y servicios concurrentes, centrado en la eficiencia de ejecución, la programación asíncrona y el control de recursos.",
   "start": "Empieza a escribir Ku",
   "explore": "Explora el lenguaje",
   "heroNote": "En sus primeras etapas por diseño. Explora, experimenta y comparte tus comentarios.",
@@ -38,24 +38,39 @@
   "approachDescription": "Conoce Ku a través de su comportamiento real, sin perder de vista sus límites actuales.",
   "features": [
     [
-      "Léelo. Entiéndelo.",
-      "Declara un enlace en la primera asignación. Usa funciones, valores estructurados y gestión explícita de errores para expresar tu idea.",
+      "Compila programas nativos.",
+      "Genera ejecutables nativos con la CLI de Ku. Comprueba el subconjunto del lenguaje y las dependencias compatibles con tu plataforma.",
+      "Instalación y descargas",
+      "docs/install"
+    ],
+    [
+      "Programa con async/await.",
+      "Expresa tareas asíncronas con async/await; el entorno de ejecución se ocupa de ejecutarlas y planificarlas dentro del alcance de cada backend.",
       "Guía del lenguaje",
       "docs/guide/language"
     ],
     [
-      "Haz explícita la propiedad.",
-      "Mueve de forma predeterminada, clona con intención y toma prestado en modo de solo lectura en llamadas síncronas. Las reglas actuales están documentadas junto a sus límites.",
-      "Propiedad y límites",
-      "docs/support"
-    ],
-    [
-      "Elige tu ruta de ejecución.",
-      "Ejecuta con el intérprete, empaqueta un ejecutor o explora C nativo. Consulta la matriz de compatibilidad antes de elegir un backend.",
-      "Explora las herramientas",
+      "Establece límites de recursos.",
+      "Limita conexiones, solicitudes activas, colas de espera y búferes. Los límites del sistema operativo dependen de la plataforma y del despliegue.",
+      "Matriz de compatibilidad",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Observaciones de rendimiento",
+  "performanceScope": "Siete pares de ventanas de una carga específica de HTTP y CPU en Linux ARM64, frente a una configuración Rust de referencia de bajo consumo de memoria. Son estimaciones puntuales de razones medias geométricas.",
+  "performanceMetrics": [
+    [
+      "Coste de CPU por solicitud correcta",
+      "Aproximadamente un 33% menor",
+      "Ku/Rust ≈ 0.671"
+    ],
+    [
+      "RSS del proceso en estado estable",
+      "Aproximadamente un 65% menor",
+      "Ku/Rust ≈ 0.351"
+    ]
+  ],
+  "performanceLimits": "Aún no se han cumplido todos los requisitos de validez de la comparación ni los objetivos de latencia. Estas observaciones no demuestran mayor rendimiento máximo, una clasificación general de lenguajes ni preparación para producción.",
   "practiceTitle": ["Datos conocidos.", "Errores explícitos."],
   "practiceDescription": "Importa un módulo, crea un valor y codifícalo como JSON. El operador ? propaga los errores en lugar de ocultarlos.",
   "jsonReference": "Lee la referencia de JSON",
@@ -85,7 +100,7 @@
     ]
   ],
   "projectTitle": "Un trabajo en marcha. Una historia que seguir.",
-  "projectDescription": "Esta documentación describe el alcance fijado de la versión preliminar experimental v{releasedVersion}. La publicación real y las descargas constan en GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} sigue en desarrollo. Se ha ensayado un candidato de despliegue Linux ARM64 con un ejemplo aislado; no se ha validado su uso productivo en un negocio real. Evalúalo con tus programas y comparte comentarios. Los artefactos publicados figuran en GitHub Releases.",
   "github": "Explorar en GitHub",
   "license": "El código fuente se puede consultar. No se ha concedido una licencia de código abierto.",
   "verified": "Verificado",

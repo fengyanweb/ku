@@ -151,10 +151,36 @@ const resourceLabels = [
       ))}
     </div>
   </section>
+  <section class="approach shell" aria-labelledby="performance-title">
+    <div class="section-heading">
+      <p class="eyebrow" dir="ltr">
+        02 — PERFORMANCE
+      </p>
+      <h2 id="performance-title">{t.performanceTitle}</h2>
+      <p>{t.performanceScope}</p>
+    </div>
+    <div class="feature-list">
+      {t.performanceMetrics.map(([title, value, ratio], index) => (
+        <article>
+          <span class="feature-number" dir="ltr">
+            {String(index + 1).padStart(2, '0')}
+          </span>
+          <div>
+            <h3>{title}</h3>
+            <p>{value}</p>
+            <p>
+              <bdi>{ratio}</bdi>
+            </p>
+          </div>
+        </article>
+      ))}
+      <p class="example-note">{t.performanceLimits}</p>
+    </div>
+  </section>
   <section class="in-practice shell" aria-labelledby="practice-title">
     <div class="practice-copy">
       <p class="eyebrow" dir="ltr">
-        02 — IN PRACTICE
+        03 — IN PRACTICE
       </p>
       <h2 id="practice-title">
         {t.practiceTitle[0]}
@@ -189,7 +215,7 @@ const resourceLabels = [
     <div class="learn-heading">
       <div>
         <p class="eyebrow" dir="ltr">
-          03 — FIND YOUR WAY
+          04 — FIND YOUR WAY
         </p>
         <h2 id="learn-title">{t.learnTitle}</h2>
       </div>

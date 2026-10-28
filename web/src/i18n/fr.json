@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Un langage en devenir",
-  "siteDescription": "Découvrez Ku, un langage de programmation expérimental. Explorez des exemples réels, l'installation, les guides du langage et la prise en charge des backends.",
+  "siteTitle": "Ku — Compilation native et programmation asynchrone",
+  "siteDescription": "Ku est un langage compilé pour les applications natives et les services concurrents, axé sur l’efficacité d’exécution, la programmation asynchrone et le contrôle des ressources.",
   "skip": "Aller au contenu",
   "home": "Accueil Ku",
   "documentation": "Documentation",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Sources consultables",
   "development": "Experimental prerelease",
   "heroTitle": ["Une idée.", "Un peu de", "Ku."],
-  "heroDescription": "Un petit langage qui a de la place pour grandir. Une syntaxe lisible, une propriété explicite et une chaîne d'outils à explorer dès la première ligne.",
+  "heroDescription": "Ku est un langage compilé pour les applications natives et les services concurrents, axé sur l’efficacité d’exécution, la programmation asynchrone et le contrôle des ressources.",
   "start": "Commencer à écrire en Ku",
   "explore": "Explorer le langage",
   "heroNote": "Des débuts assumés. Explorez, expérimentez, partagez vos retours.",
@@ -38,24 +38,39 @@
   "approachDescription": "Découvrez Ku à travers son comportement réel, en gardant toujours ses limites actuelles à l'esprit.",
   "features": [
     [
-      "Lire. Comprendre.",
-      "Déclarez une liaison dès la première affectation. Utilisez fonctions, valeurs structurées et gestion explicite des erreurs pour exprimer votre idée.",
+      "Compiler des programmes natifs.",
+      "Créez un exécutable natif avec la CLI Ku. Vérifiez le sous-ensemble du langage et les dépendances pris en charge par votre cible.",
+      "Installation et téléchargements",
+      "docs/install"
+    ],
+    [
+      "Programmer avec async/await.",
+      "Exprimez des tâches asynchrones avec async/await ; le runtime gère leur exécution et leur ordonnancement dans les limites du backend choisi.",
       "Guide du langage",
       "docs/guide/language"
     ],
     [
-      "Rendre la propriété explicite.",
-      "Déplacez par défaut, clonez volontairement et empruntez en lecture seule dans les appels synchrones. Les règles actuelles sont documentées avec leurs limites.",
-      "Propriété et limites",
-      "docs/support"
-    ],
-    [
-      "Choisir votre chemin d'exécution.",
-      "Exécutez avec l'interpréteur, empaquetez un lanceur exécutable ou explorez C natif. Consultez la matrice de prise en charge avant de choisir un backend.",
-      "Explorer les outils",
+      "Définir les limites de ressources.",
+      "Bornez les connexions, requêtes actives, files d’attente et tampons. Les limites système dépendent de la plateforme et du déploiement.",
+      "Matrice de prise en charge",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Observations de performance",
+  "performanceScope": "Sept paires de fenêtres de mesure d’une charge HTTP et CPU définie sur Linux ARM64, comparées à une configuration Rust de référence à faible mémoire. Il s’agit d’estimations ponctuelles de moyennes géométriques des rapports.",
+  "performanceMetrics": [
+    [
+      "Coût CPU par requête correcte",
+      "Environ 33 % de moins",
+      "Ku/Rust ≈ 0.671"
+    ],
+    [
+      "RSS du processus en régime stable",
+      "Environ 65 % de moins",
+      "Ku/Rust ≈ 0.351"
+    ]
+  ],
+  "performanceLimits": "Tous les critères de qualification de la comparaison et objectifs de latence ne sont pas atteints. Ces observations ne prouvent ni un gain de débit maximal, ni un classement global des langages, ni une aptitude à la production.",
   "practiceTitle": ["Données familières.", "Erreurs explicites."],
   "practiceDescription": "Importez un module, construisez une valeur et encodez-la en JSON. L'opérateur ? propage les erreurs au lieu de les masquer.",
   "jsonReference": "Lire la référence JSON",
@@ -89,7 +104,7 @@
     ]
   ],
   "projectTitle": "Un projet en cours. Une histoire à suivre.",
-  "projectDescription": "Cette documentation décrit le périmètre figé de la préversion expérimentale v{releasedVersion}. La publication effective et les téléchargements sont consignés dans GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} est toujours en développement. Un candidat de déploiement Linux ARM64 a été testé avec un exemple isolé ; l’usage en production pour une activité réelle n’a pas été validé. Évaluez vos programmes et partagez vos retours. Les artefacts publiés figurent dans GitHub Releases.",
   "github": "Explorer sur GitHub",
   "license": "Les sources sont consultables. Aucune licence open source n'a été accordée.",
   "verified": "Vérifié",

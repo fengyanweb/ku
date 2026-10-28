@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku — Uma linguagem em construção",
-  "siteDescription": "Conheça Ku, uma linguagem de programação experimental. Explore exemplos reais, instalação, guias da linguagem e suporte dos backends.",
+  "siteTitle": "Ku — Compilação nativa e programação assíncrona",
+  "siteDescription": "Ku é uma linguagem compilada para aplicações nativas e serviços concorrentes, com foco na eficiência de execução, programação assíncrona e controle de recursos.",
   "skip": "Ir para o conteúdo",
   "home": "Início do Ku",
   "documentation": "Documentação",
@@ -27,7 +27,7 @@
   "sourceAvailable": "Código-fonte disponível para consulta",
   "development": "Experimental prerelease",
   "heroTitle": ["Uma ideia.", "Um pouco de", "Ku."],
-  "heroDescription": "Uma pequena linguagem com espaço para crescer. Sintaxe legível, propriedade explícita e uma cadeia de ferramentas para explorar desde a primeira linha.",
+  "heroDescription": "Ku é uma linguagem compilada para aplicações nativas e serviços concorrentes, com foco na eficiência de execução, programação assíncrona e controle de recursos.",
   "start": "Comece a escrever Ku",
   "explore": "Explore a linguagem",
   "heroNote": "No início, por escolha. Explore, experimente, compartilhe suas opiniões.",
@@ -38,24 +38,39 @@
   "approachDescription": "Conheça o Ku pelo seu comportamento real, mantendo sempre os limites atuais em vista.",
   "features": [
     [
-      "Leia. Entenda.",
-      "Declare uma ligação na primeira atribuição. Use funções, valores estruturados e tratamento explícito de erros para expressar sua ideia.",
+      "Compile programas nativos.",
+      "Crie executáveis nativos com a CLI do Ku. Verifique o subconjunto da linguagem e as dependências compatíveis com a plataforma de destino.",
+      "Instalação e downloads",
+      "docs/install"
+    ],
+    [
+      "Escreva com async/await.",
+      "Expresse tarefas assíncronas com async/await; o runtime cuida da execução e do escalonamento dentro do escopo suportado pelo backend.",
       "Guia da linguagem",
       "docs/guide/language"
     ],
     [
-      "Torne a propriedade explícita.",
-      "Mova por padrão, clone com intenção e tome emprestado somente para leitura em chamadas síncronas. As regras atuais estão documentadas junto aos seus limites.",
-      "Propriedade e limites",
-      "docs/support"
-    ],
-    [
-      "Escolha o caminho de execução.",
-      "Execute com o interpretador, empacote um executor ou explore C nativo. Consulte a matriz de suporte antes de escolher um backend.",
-      "Explore as ferramentas",
+      "Defina limites de recursos.",
+      "Limite conexões, requisições ativas, filas de espera e buffers. Os limites do sistema operacional dependem da plataforma e da implantação.",
+      "Matriz de suporte",
       "docs/support"
     ]
   ],
+  "performanceTitle": "Observações de desempenho",
+  "performanceScope": "Sete pares de janelas de medição de uma carga específica de HTTP e CPU no Linux ARM64, comparados a uma configuração Rust de referência de baixa memória. Os valores são estimativas pontuais das médias geométricas das razões.",
+  "performanceMetrics": [
+    [
+      "Custo de CPU por requisição correta",
+      "Cerca de 33% menor",
+      "Ku/Rust ≈ 0.671"
+    ],
+    [
+      "RSS do processo em regime estável",
+      "Cerca de 65% menor",
+      "Ku/Rust ≈ 0.351"
+    ]
+  ],
+  "performanceLimits": "Nem todos os critérios de qualificação da comparação e as metas de latência foram atendidos. As observações não comprovam maior vazão máxima, uma classificação geral de linguagens ou prontidão para produção.",
   "practiceTitle": ["Dados familiares.", "Erros explícitos."],
   "practiceDescription": "Importe um módulo, crie um valor e codifique-o como JSON. O operador ? propaga erros em vez de escondê-los.",
   "jsonReference": "Leia a referência de JSON",
@@ -85,7 +100,7 @@
     ]
   ],
   "projectTitle": "Um trabalho em andamento. Uma história para acompanhar.",
-  "projectDescription": "Esta documentação descreve o escopo congelado da pré-versão experimental v{releasedVersion}. A publicação efetiva e os downloads estão registrados no GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} continua em desenvolvimento. Um candidato de implantação Linux ARM64 foi ensaiado com um exemplo isolado; o uso em produção para um negócio real não foi validado. Avalie com seus programas e envie feedback. Os artefatos publicados estão no GitHub Releases.",
   "github": "Explore no GitHub",
   "license": "O código-fonte está disponível para consulta. Não foi concedida uma licença de código aberto.",
   "verified": "Verificado",

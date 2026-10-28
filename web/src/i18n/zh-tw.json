@@ -1,6 +1,6 @@
 {
-  "siteTitle": "Ku 程式語言 — 把想法，寫成 Ku",
-  "siteDescription": "認識 Ku，一門持續演進的實驗性程式語言。查看真實範例、安裝說明、語言指南和後端支援範圍。",
+  "siteTitle": "Ku 程式語言 — 原生編譯與非同步程式設計",
+  "siteDescription": "Ku 是面向原生應用與並行服務的編譯型語言，關注執行效率、非同步程式設計和資源控制。",
   "skip": "跳至正文",
   "home": "Ku 首頁",
   "documentation": "文件",
@@ -27,7 +27,7 @@
   "sourceAvailable": "原始碼可查看",
   "development": "Experimental prerelease",
   "heroTitle": ["把想法，", "寫成", "Ku。"],
-  "heroDescription": "一門持續生長的小型程式語言。用清晰的語法表達，用明確的規則構建，從第一行代碼開始探索。",
+  "heroDescription": "Ku 是面向原生應用與並行服務的編譯型語言，關注執行效率、非同步程式設計和資源控制。",
   "start": "開始使用 Ku",
   "explore": "認識這門語言",
   "heroNote": "尚在實驗階段。歡迎探索、嘗試，也歡迎反饋。",
@@ -38,24 +38,31 @@
   "approachDescription": "從真實的語言行為認識 Ku，也瞭解每項能力目前走到了哪裡。",
   "features": [
     [
-      "讓代碼，直接表達。",
-      "首次賦值即聲明。用函式、結構化資料和明確的錯誤處理，把想法寫成可讀的程序。",
-      "閱讀語言指南",
+      "編譯為原生程式。",
+      "透過 Ku 命令列工具建置本機執行檔；依目標平台核對支援的語言子集與相依項目。",
+      "安裝與下載",
+      "docs/install"
+    ],
+    [
+      "使用 async/await。",
+      "以 async/await 表達非同步任務，由執行階段處理執行與排程；支援範圍依後端而定。",
+      "語言指南",
       "docs/guide/language"
     ],
     [
-      "讓所有權，清晰可見。",
-      "預設移動，需要複製時顯式 clone，同步呼叫支援唯讀借用。規則與目前邊界都有據可查。",
-      "瞭解語義與邊界",
-      "docs/support"
-    ],
-    [
-      "按需求，選擇執行路徑。",
-      "從解釋器執行開始，打包可執行 runner，或探索原生 C 後端。選擇之前，先瞭解各路徑的支援範圍。",
-      "查看工具鏈支援",
+      "設定明確資源邊界。",
+      "限制服務連線、執行中請求、等待佇列與緩衝區；OS 限制取決於平台和部署設定。",
+      "支援範圍",
       "docs/support"
     ]
   ],
+  "performanceTitle": "指定負載下的效能觀察",
+  "performanceScope": "Linux ARM64 指定 HTTP 與 CPU 混合負載的七對視窗，與 Rust 低記憶體參考設定比較。以下為幾何平均比的點估計。",
+  "performanceMetrics": [
+    ["每個正確請求的 CPU 成本", "約少 33%", "Ku/Rust ≈ 0.671"],
+    ["穩態行程駐留記憶體 RSS", "約少 65%", "Ku/Rust ≈ 0.351"]
+  ],
+  "performanceLimits": "完整對照資格與延遲目標尚未全部通過。這些觀察不代表最大吞吐提升、跨語言整體排名或生產就緒。",
   "practiceTitle": ["熟悉的資料，", "明確的錯誤處理。"],
   "practiceDescription": "匯入模組，構造資料，再編碼為 JSON。用 ? 傳播錯誤，讓失敗路徑成為代碼的一部分。",
   "jsonReference": "閱讀 JSON 參考",
@@ -77,7 +84,7 @@
     ["瞭解目前邊界", "平台、執行路徑與已知限制。", "docs/support"]
   ],
   "projectTitle": "認真構建，也坦誠記錄。",
-  "projectDescription": "本文檔對應 v{releasedVersion} 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。",
+  "projectDescription": "Ku v{releasedVersion} 仍在開發中。Linux ARM64 候選部署已完成隔離範例預演，尚未驗證真實業務的生產使用。歡迎以實際程式參與評估並回饋問題；公開產物以 GitHub Release 為準。",
   "github": "在 GitHub 查看專案",
   "license": "原始碼公開可查看，目前尚未授予開放原始碼授權條款。",
   "verified": "內容覈實",
