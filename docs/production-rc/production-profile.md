@@ -1,36 +1,44 @@
-# Ku v0.0.18 RC 范围初稿
+# Ku v0.0.18-rc.1 交付范围
 
-当前为`in_progress`，本轮目标是`rc_prepared`。用户确认没有真实业务和目标机器；本文件不能据此宣布`ready_for_canary`或生产验收通过。RC安装、Linux监督与监控、部署/关闭预演仍须有实际收据后才能关闭准备项。
+当前达到`rc_prepared`，仅限已安装并预演的Linux ARM64隔离样例。实际[production-gate.json](/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1/production-gate.json)的七项`rc_checks`为true；真实业务门禁只有`identity_bound=true`，其余为null。不是`ready_for_canary`，没有实际生产或灰度流量。
 
-## 范围与缺口
+## 业务与外部条件
 
-| 字段 | 当前事实 | 放行前需要 |
-|---|---|---|
-| 真实应用、业务入口 | `null`；仅使用仓库HTTP/PG样例 | 确定程序、路由、依赖及写入语义 |
-| 主样例平台 | 拟选Linux ARM64；是本地隔离预演目标 | 固定实际内核、glibc、libpq/TLS依赖和服务用户 |
-| 真实部署目标、域名、入口 | `null` | 目标机器/访问方式、已有入口与授权 |
-| 业务负载与SLO | `null/tbd` | 峰值、并发、连接模式、请求大小、成功率、延迟、RTO |
-| 数据风险 | 真实业务未知；样例只用独有临时PG | 明确只读/幂等/非幂等及结果未知对账方式 |
-| 生产回退对象 | `null`；不存在已验证的旧生产后端 | 有旧服务则绑定产物/配置；新服务则约定关闭或降级 |
-| 授权 | 本地准备、隔离验证与预演 | 真实切流、DNS、公开发布、合并和购买不在本次自动授权内 |
+| 字段 | 当前事实 |
+|---|---|
+| 真实应用/业务入口 | `null`；交付的是独立PG参考样例 |
+| 真实部署目标/访问方式/域名 | `null`；本地Linux虚拟机仅用于隔离预演 |
+| 业务流量、SLO、风险 | `null/tbd`；真实只读/幂等/非幂等及外部副作用待确认 |
+| 生产回退对象 | `null`；没有已验证的旧生产后端，新服务应约定关闭或降级 |
+| 真实切流与观察授权 | 未落实；未部署canary、未开始真实观察 |
 
-内部样例拟采用100请求/秒、70%读/20%新ID写/10%健康、端到端p99≤250ms。这只是独立的内部演练契约，已通过Mac 30s combined链路，不是生产负载上限或业务SLO。任务书的普通API p99≤100ms同样只是待确认讨论草案。原20ms失败继续保留。
+Mac内部100请求/秒、250ms门槛是本轮独立30s样例契约；Linux320次请求是有间隔的小型功能预演。两者均不是生产负载上限或业务SLO。任务书普通API p99≤100ms只是讨论草案，原20ms失败仍保留。
 
-## 候选身份
+## 固定身份
 
-- 说明基点：`23229134d150cb5dcadab870f9ab2f5c6b81caac`；生产代码基点`cbb14afcff9b864bd0c41953f53684f0fa8a9456`。
-- 新Mac arm64 Release CLI：`31b6b9ce45bff064912aff2a1646d3fc73fccb86ce34c51db28a1707111a5e84`，来源为本轮`candidate-build-identity.json`。缓存目录名含1.89，实际编译器为rustc1.99.0，不能用目录名推断工具链。
-- 旧Linux ARM64正常CLI：`94283691e87f3d4133d970b67fc1e79460e9d9c3e824fb6b9a24507e023be2d6`；原C`cf59ceaa…`、ELF`455b47c7…`。它们是旧样例身份，不能冒称本轮新安装或新应用产物。
-- 本轮RC提交、应用二进制、配置及依赖SHA以协调者最终release manifest为准；本稿不把临时Mac CLI路径当永久安装位置。
+以[release-manifest.json](/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1/release-manifest.json)为准：
 
-Mac实际环境为Darwin25.5.0 arm64/8GiB/8逻辑CPU，HAProxy3.4.7与PostgreSQL17.11。独立Release代理、同步/异步PG及Mac 30s combined均已通过。combined为3000/3000正确、正确连接复用2968次，端到端p99上界6.8ms、发生器上界5.0ms；601笔成功写入逐ID/UTF8对账，PG会话退出归零。它不是持续运行或生产SLO通过。
+| 身份 | 值 |
+|---|---|
+| RC包提交 | `9cc43c06e7b61c64ade4f6c4a3260078a9c8ff96` |
+| CLI源码提交 | `44f973397c55cdef4dbce13c62c2ea02702df213` |
+| CLI SHA256 | `6006505dabac0a0d42208ea99169761c79424c1f4ae7f5e656787948bb1e7306` |
+| 应用ELF SHA256 | `a2cda9d1274858727bc00045aa0acd16db6a09b07b7220eae19ca23c6abea0be` |
+| 归档SHA256 | `1e6b164dfcd31d6d68bab2949dee5cb8ab01faa0feecf378193f69b198c0350f` |
+| 配置模板SHA256 | `61e23174f543f492f7447978e6b8149e0cd8318054a5b223a66e5a3b59a42f5d` |
 
-Linux已定向复现stock systemd的KillMode=control-group先终止native、丢失已接纳请求；同条件mixed返回完整200。当前stock与RC模板已改mixed，但最终候选单元/安装包仍须绑定修正后的SHA并复验。Linux新包、安装、OS预算、监控及新PG指标结果待补。Mac没有本轮逐服务OS CPU/内存硬限额，采样RSS不等同硬限制。
+包名`ku-v0.0.18-rc.1-aarch64-unknown-linux-gnu-native-deployment.tar.gz`，5,488,124B。它包含native部署所需CLI/样例及工具，不是完整Rust runner SDK、VSIX或native-TLS pack；未公开发布。CLI使用rustc/cargo1.89.0，正常Release C后端O2；包提交增加部署工具/文档，CLI源码另行冻结。
 
-## 运行与资源边界
+本机最终MD和新门禁是在实测后形成的说明。已封存归档中的MD是准备时初稿，归档及其SHA保持不变；两者不能相互冒充。
 
-参考链路为既有入口/HAProxy→native应用→实际依赖，Ku service负责进程监督，不是每请求代理。双活动实例和滚动备用位仍共享宿主，不能声称节点级高可用；本轮无公网TLS验证或第二主机。应用内部预算、supervisor、代理、PG和观察器分别核算，按PID去重，RSS含共享页不能冒充PSS。
+## 已预演环境与边界
 
-当前JSON旧默认、暂停的通用Value复制/释放与AST分析保持；不改生产schema/data，不加数据库盲重试。后续真实应用确定后，只补受影响的检查，不能把样例配置直接套到生产。
+Linux aarch64、内核6.8.0-147-generic、glibc2.39、PostgreSQL/libpq16.15、HAProxy2.8.30、Python3.12.3；依赖解析见安装收据。以非root账户`mac`运行，实际验证installed CLI版本/check/native hello、样例服务、systemd、监控及回退。
 
-参见[复用表](evidence-reuse.md)、[操作手册](production-runbook.md)、[验证汇总](verification-summary.md)及[交接](handoff.md)。
+参考链为HAProxy→native→私有PG，Ku service只负责监督。双活动实例与备用位共享宿主，不是节点级高可用；loopback验证不认证公网TLS或异地容灾。每个Ku整单元实测MemoryMax256MiB、CPUQuota200%、TasksMax64、FD8192、Stop16s；代理64MiB/100%/16任务、FD16384；PG256MiB/100%/48任务。均是本次样例预算，不可直接套到业务；supervisor/launcher/native、代理、PG、driver/观察器分别核算。
+
+正常320请求全正确、64笔写入ID/数量一致；摘流后旧keep-alive与fresh共20次未再流向A，已接纳hold请求在SIGTERM后完整200。退出替代、PG故障恢复和样例版本回退均有收据。监控仅12次/约55s，保留spare缺席及wrapper FD权限缺口，不认证长期无增长。
+
+历史Mac CLI31b6…/说明提交232…和旧性能CLI9428…/Ccf59…/ELF455…分别保留，不能充当新6006…的产物SHA。旧五项性能认证false、容量unknown；新RC代码的CI另见交付目录 `CI-RC-current.json`，历史CI仅按未受影响范围复用。
+
+JSON旧默认、暂停的Value复制/释放与AST分析保持；无生产schema/data改动、无盲重试、无网站部署/公开发版/合并/购买。参见[复用表](evidence-reuse.md)、[操作手册](production-runbook.md)、[验证汇总](verification-summary.md)、[交接](handoff.md)。

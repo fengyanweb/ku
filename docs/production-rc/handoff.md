@@ -1,27 +1,31 @@
-# Ku v0.0.18 RC交接初稿
+# Ku v0.0.18-rc.1 交接
 
-当前`in_progress`，本轮交付目标`rc_prepared`；尚未达到该状态。用户明确没有真实业务和目标机器，application/deployment target/business SLO为null/tbd。不能写ready_for_canary、生产运行或limited_production_accepted。
+已达到`rc_prepared`，可用于Linux ARM64隔离native部署样例的安装与受控预演。真实应用、目标机器、业务SLO、生产回退对象及切流授权均未提供；没有canary部署或持续生产观察，不是ready_for_canary或limited_production_accepted。
 
-## 已有可复用成果
+## 从哪里接续
 
-新Mac正常Release CLI31b6…已构建；Release代理生命周期和私有PG同步/异步均实际通过并清理。新CI-232-final.json已核三平台完整/安装PG成功，31 SUCCESS/9 SKIPPED，旧运行中快照不再作当前pending。Linux旧正常CLI9428…/Ccf59…/ELF455…身份可定位，源码等价证据和缓存保留，不能把它们伪装成本轮新安装。
+本机证据根：`/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28`。包内相对state为`RC-v0.0.18-rc.1/`；[门禁](/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1/production-gate.json)七项RC检查全true，[manifest](/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1/release-manifest.json)绑定CLI6006505d…（源44f9733…）、包提交9cc43c06…、应用a2cda9d…、归档1e6b164…。原机安装前缀`/opt/ku-production-rc-20261028/install`，预演配置为独有runtime/cluster.json，不是可直接投产的业务配置。
 
-旧正式7对、长测、物理取消与scoped M证据照常复用，旧五认证false、长测有效20ms失败和容量unknown不改。Rust比较尚未通过不阻止独立RC准备；新内部样例100rps/250ms又不构成真实生产承诺。
+在仓库根目录只读检查保存状态：
 
-## 当前独立可做项
+```sh
+python3 deploy/production_rc.py status --state '/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1'
+```
 
-由协调者串行安排Linux ARM64隔离安装、依赖和同用户启动、systemd/资源/监控验证、部署及关闭/回退预演；Mac combined 30s已实际通过：3000/3000正确、2968正确复用、601笔写入逐ID对账、PG会话归零及清理；formal未执行，不认证持续运行或生产SLO。systemd旧control-group已复现丢失admitted请求，mixed同条件200完成；当前模板已改mixed，最终包与安装单元绑定复验仍待收据。新Linux包、新PG指标/监控及安装预演仍pending。
+此命令不确认原机仍live、不访问生产，也不重新安装/压测。若证据根被移动，只改state实际路径并先核manifest SHA。操作语义、Linux安装和监督命令见[runbook](production-runbook.md)。
 
-现有RC工具为[production_rc.py](../../deploy/production_rc.py)，status/resume检查保存状态；preflight会实际安装并运行hello，verify/rehearse仅核验并附加实际收据，不自动重放动态操作。调用参数和边界见runbook，最终产物/配置SHA以manifest为准。
+## 实际完成与边界
 
-现有部署入口：[deploy/service/manage.py](../../deploy/service/manage.py)，操作说明：[production-runbook.md](production-runbook.md)。真实执行前先读最终门禁、manifest和当前进程，不因交接重复安装、创建数据库对象或重放写入。
+- Linux正常320次全正确，64笔写入逐ID一致；摘流后旧连接/fresh20次不再流向A，SIGTERM完成已接纳hold200。
+- native恢复0.302416s、样例回退0.608668s、恢复candidate0.438265s；PG重启新读0.638395s。故障中的unknown/拒绝保留，无盲重试。previous仅样例标记，不是旧生产后端。
+- 新包实际安装/依赖/normal CLI入口、sync/async PG及新指标、systemd整单元限制与清理通过；48个监控不可用项有确切范围。12次/约55s采集不等于长期观察。
+- 原control-group停止丢请求已复现并以mixed修正；两次proxy FD setup失败保留，仅proxy8192→16384，Ku仍8192。
+- Mac辅助链路和232历史CI可按范围复用；新RC CI另见交付目录 `CI-RC-current.json`。旧五性能认证false、容量unknown、20ms有效失败照常保留。
 
-## 外部条件与后续决策
+归档中MD为准备初稿；外部这五份最终MD及最终门禁说明实际结果，未更改原归档SHA。大原件留原机/已有索引，不为重新打包重测。
 
-真实部署前一次补齐：程序/业务、目标机器和访问方式、数据库及副作用、预计流量与SLO、回退或关闭方案、切流授权。没有稳定后端时使用新服务关闭/降级，现有sample previous/new仅版本标记演练。数据结果unknown必须对账，不当回滚、不盲重试。
+## 唯一外部决策清单
 
-完成其余RC准备后可交付`rc_prepared`并保留外部缺口；没有真实部署和持续观察就不进入canary。当前没有实际后台灰度观察器或自动后续任务，不能宣称会自行完成。
+后续一次补齐：实际程序与业务、目标机器/访问方式、数据库和副作用、流量与SLO、回退或关闭方案、真实切流授权。新服务没有稳定后端时采用关闭/降级，不虚构旧生产。target、SLO与预算冻结并通过目标验收后才评估ready_for_canary；没有实际流量和观察记录不能置生产通过。当前没有自动后台观察任务。
 
-不改JSON旧默认、暂停的Value/AST、生产schema/data；不公开发版、合并、部署网站或购买。临时探针与重复产物按归属清理，用户源码、原失败和独有证据保留。
-
-详情：[范围](production-profile.md)、[证据复用](evidence-reuse.md)、[验证汇总](verification-summary.md)。本机新证据在`/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28`，旧性能证据在`/Users/mac/Documents/Ku/实施/性能稳定性收口_2026-10-26`；大raw仍留原机，复用索引，不为打包重测。
+JSON旧默认、Value/AST暂停、用户源码与独有失败保留；不公开发布/合并/改DNS/部署网站/购买，不触生产schema/data。不要因换轮次重开旧Rust/容量/30分钟矩阵；输入变更影响哪项，只补对应检查。详情见[范围](production-profile.md)、[复用](evidence-reuse.md)、[验证汇总](verification-summary.md)。

@@ -48,19 +48,21 @@ class MonitorContracts(unittest.TestCase):
         def entries(_):
             return contextlib.nullcontext(iter(["0", "1", "2"]))
         with patch.object(N, "read_small", return_value=text), patch.object(N.os, "scandir", side_effect=entries), \
-                patch.object(N.os, "sysconf", return_value=4096):
+                patch.object(N.os, "sysconf", return_value=4096, create=True):
             record = N.proc_sample(55)
         self.assertEqual(record["starttime_ticks"], 1234)
         self.assertEqual(record["rss_bytes"], 6*4096)
         self.assertEqual(record["fd_count"], 3)
-        with patch.object(N, "read_small", return_value=text), patch.object(N.os, "scandir", side_effect=PermissionError):
+        with patch.object(N, "read_small", return_value=text), patch.object(N.os, "scandir", side_effect=PermissionError), \
+                patch.object(N.os, "sysconf", return_value=4096, create=True):
             partial = N.proc_sample(55)
         self.assertIsNone(partial["fd_count"])
         self.assertEqual(partial["fd_error_type"], "PermissionError")
         self.assertIn("rss_bytes", partial)
         fields[19] = "1235"
         changed = "55 (worker name) "+" ".join(fields)
-        with patch.object(N, "read_small", side_effect=[text, changed]), patch.object(N.os, "scandir", side_effect=entries):
+        with patch.object(N, "read_small", side_effect=[text, changed]), patch.object(N.os, "scandir", side_effect=entries), \
+                patch.object(N.os, "sysconf", return_value=4096, create=True):
             with self.assertRaisesRegex(ValueError, "identity changed"): N.proc_sample(55)
 
     def test_status_deadline_does_not_leave_an_alarm_installed(self):
@@ -85,6 +87,7 @@ class MonitorContracts(unittest.TestCase):
                 patch.object(N, "status_once", side_effect=lambda _, slot: {"phase": "ready", "pid": 200 if slot["name"] == "a" else 210, "generation": 1, "restarts": 0}), \
                 patch.object(N.M, "metrics", return_value=metric), patch.object(N, "cgroup_sample", return_value=group), \
                 patch.object(N, "proc_sample", side_effect=proc), patch.object(N.M, "proxy_command", return_value=proxy), \
+                patch.object(N.os, "sysconf", return_value=100, create=True), \
                 patch.object(N.time, "monotonic", side_effect=lambda: clock[0]):
             monitor = N.Monitor(config, Path(directory), 1048576, 3)
             for index in range(3): clock[0] = 10+5*index; monitor.sample(clock[0], 0)
@@ -96,6 +99,7 @@ class MonitorContracts(unittest.TestCase):
             self.assertTrue(queues)
             self.assertTrue(all(a["queue"] != "database_pg_client_waiters" for a in queues))
 
+    @unittest.skipUnless(hasattr(N.time, "clock_gettime_ns"), "Linux observer clock contract")
     def test_receipt_distinguishes_finite_continuous_gaps_and_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             receipt = N.Receipt.__new__(N.Receipt)

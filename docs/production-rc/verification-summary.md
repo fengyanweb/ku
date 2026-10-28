@@ -1,32 +1,34 @@
-# RC验证汇总初稿
+# RC验证结果
 
-当前状态`in_progress`，目标`rc_prepared`。本稿为已完成证据的只读汇总，未执行新负载、VM、构建或部署；缺项不默认通过。真实生产业务和目标机器缺失，未进入canary。
+[最终production-gate.json](/Users/mac/Documents/Ku/验收/生产前测试_2026-10-28/RC-v0.0.18-rc.1/production-gate.json)为`rc_prepared`，七项RC检查identity/install/business/lifecycle/resource_limits/observability/rollback全true。真实生产检查仅identity_bound=true，其余包括业务SLO、目标预检、灰度授权/部署/观察均null；两层门禁不可混同。
 
-| 项目 | 当前结果 | 证据与限制 |
+Linux实测以6006505d… CLI（源码44f9733…）、9cc43c06…包、a2cda9d…应用及1e6b164…归档绑定，完整SHA见[范围](production-profile.md)和release manifest。以下结果均为已完成样例，不是生产认证。
+
+| 检查 | 实际结果 | 原证据（相对新验收目录） |
 |---|---|---|
-| Mac arm64候选CLI | 已构建 | 新验收目录`candidate-build-identity.json`，SHA31b6…；正常Release用户入口，未替换已安装6288… CLI |
-| 独立Release代理生命周期 | 通过 | `release-service.json`，正常代理、单native退出替代、另实例10/10、样例滚动/回退通过，cleanup_errors=[]；complete_runtime_acceptance=false，不能提升为整链路/生产回退通过 |
-| 私有PG同步lane | 通过 | `pg-lifecycle.sync.json`、`PG-concise-results.json`；Unicode/null/参数/10000行、确认丢失、断连、压力及正常退出，退出后PG连接0 |
-| 私有PG异步lane | 通过 | `pg-lifecycle.async.json`；同类结果、unknown和预算归还分开，退出后连接0；未知不代表数据库回滚确认 |
-| 最新232源码/安装CI | 通过并复用 | CI-232-final.json，31 SUCCESS/9 SKIPPED；三平台完整workspace和实际安装CLI→PG均成功。旧运行中快照不作为当前状态，skipped仍不计通过 |
-| Linux ARM64候选身份 | 可复用旧绑定 | 9428… CLI→cf59… C→455… ELF；不是本轮安装收据 |
-| Linux实际安装、依赖和同用户启动 | 待验证 | 目标为隔离样例，协调者串行补齐本轮包与安装验证；定向停止对照不等于安装通过 |
-| systemd停止次序 | 旧配置失败；mixed定向对照通过 | systemd-stop-ordering.json：control-group在已接纳标记后停止，返回0B；mixed同条件返回HTTP200/109B并完成，cleanup_errors=[]。当前stock和RC模板已mixed；新包绑定、安装单元、有限重启及完整OS预算仍待验证 |
-| 监控、告警与关闭/回退预演 | 待验证 | 需实际采集、端点、有限日志与动作结果；无私有指标时unknown |
-| Mac combined 30s | 通过，production_ready=false | combined-short.json，3000正确/3000终态、零shed，2968正确复用；e2e p99上界6.8ms、max9.446083ms；gen上界5.0ms。601笔成功写入逐ID/UTF8对账、无重复，PG退出会话0、cleanup_errors=[]、临时目录已清理 |
-| combined故障与恢复 | 指定Mac样例通过 | native退出后435.756ms新代正确读；标记版本滚动/回退通过；PG停止后返回execution_unknown、重启后原绝对5s内新读恢复约0.647s，不重放失败请求 |
-| formal及Linux新包/PG指标 | 未执行/待验证 | 不把30s好窗或旧指标拼为持续运行、Linux实际安装或生产SLO通过 |
-| 真实应用正确性/业务SLO/目标预检 | 未定义/未执行 | application、target、business SLO均null/tbd；100rps/250ms只限内部样例 |
-| 真流量canary及观察 | 未执行 | 无机器、真实业务及切流条件；没有后台观察任务，不假称自动完成 |
+| 包安装与正常用户入口 | 通过：干净目录解包/依赖、installed version/check/native-build/run hello；非root业务启动 | `RC-v0.0.18-rc.1/installation-check.json`、`Linux-evidence/install-preflight.log` |
+| 正常业务与写入 | 320/320正确、0错误；64次新ID写入数量、唯一性及逐ID一致。8客户端各40次、每次间隔0.1s | `Linux-evidence/linux-installed-rehearsal.json`；小样本延迟仅原始记录，不认证性能/SLO/容量 |
+| 摘流与SIGTERM | A置MAINT后旧keep-alive/fresh共20次正确且A请求数不增；hold在SIGTERM后完整200/held-ready，整单元停止、空cgroup | 同上；Stop约0.533s，仍沿原16s停止预算 |
+| 原停止缺陷及修正 | stock control-group丢已接纳请求0B；mixed同条件完整200，最终RC预演再通过 | `systemd-stop-ordering.json`及上述rehearsal；旧失败不抹去 |
+| native退出恢复 | 新代恢复0.302416s，不重放写入，database_outcome仍unknown | `Linux-evidence/linux-installed-rehearsal.json` |
+| 样例回退与恢复 | rollback0.608668s响应rc-previous；恢复candidate0.438265s | 同上，previous仅样例，不是生产稳定后端；不证明数据回滚 |
+| PG故障与新读恢复 | 压力12次为8 execution_unknown+4 acquire_timeout；撤压后新读正确。PG重启新读0.638395s恢复，期间connect_error/unknown及解析失败记录保留，无写入重放 | 同上；HTTP200包着error不算业务成功 |
+| 安装CLI同步/异步PG | 两lane通过：字段/中文/null/10000行、确认丢失实际写入1行、断连/压力、新请求恢复、退出会话0，cleanup_errors=[] | `Linux-evidence/installed-pg-lifecycle.json`及各lane；sync确认取消5，async仍unknown7/确认取消0，不宣称回滚 |
+| 新PG与Task指标 | 两活动实例metrics有效；PG active/waiter、坏连接丢弃、Task/buffer及队列有固定字段；故障后活量归还，停止后PG会话0 | rehearsal和installed PG原JSON；瞬时值不推出长期无泄漏 |
+| OS资源域 | Ku每单元256MiB/200%/64tasks/FD8192；proxy64MiB/100%/16tasks/FD16384；PG256MiB/100%/48tasks，实际readback与最终inactive/空域 | rehearsal的render、units与unit_cleanup；整机和外部观察成本另计 |
+| 有界监控 | 12×5s、0gap/0dropped、219307B、约55s；48 unavailable=spare计划缺席24+root sudo wrapper FD拒读24，核心服务FD/metrics可见 | `Linux-evidence/monitor/run.json`、`metrics.0.jsonl`；有限前台采集，不是长期/灰度观察 |
+| setup失败 | 两次失败保留；实际原因proxy maxconn4096需8223FD而配置8192，仅proxy改16384 | `Linux-evidence/setup-failure-analysis.json`及两份失败JSON/log，无timeout放宽 |
+| Mac辅助链路 | Release代理、同步/异步PG、combined30s均通过；combined3000正确、2968复用、601写入对账及会话/清理归零 | 新验收目录Mac原JSON；31b6…是不同CLI，不能当Linux新身份 |
+| CI | 历史232三平台完整/实际安装PG成功可按输入复用；新增提交的 CI 状态单独保存为交付目录 `CI-RC-current.json`，历史成功不替代新检查 | `CI-232-final.json`为31 SUCCESS/9 SKIPPED，跳过不计通过 |
 
-## 旧性能结论保持
+## 保留的未验收项
 
-旧报告`final-gate.json`为`not_accepted`，五比较认证false、容量unknown。原phase4有效短p99=25.761695ms超过20ms；phase1生成无效且短p99=96.375543ms，恢复成功不能抵消。M只按已观察高水位解释scoped关闭，不宣称全项目无泄漏。最新控制无复现不证明宿主根因或所有本地路径穷尽。
+真实应用、目标机器、业务SLO、生产回退对象与切流授权未提供；canary未部署，观察未开始。100rps/250ms只是Mac内部样例，100ms只是任务书讨论草案。Linux小样本及有限监控不认证长期可靠性、生产容量、TLS公网入口或节点级高可用。
 
-本轮可采用独立、明确的新业务SLO，但任务书100ms草案尚未确认；不能把旧20ms失败改判。新样例成功也不认证Rust优势、多主机容灾、任意业务负载或任意平台。
+旧性能门禁仍not_accepted、五false、容量unknown。phase4有效短p99=25.761695ms超过20ms，phase1生成无效且96.375543ms；M只scoped关闭，不能声称全项目无泄漏。新好窗/功能预演不覆盖旧失败或证明宿主根因。
 
-## 收口条件
+## 交付与收尾
 
-RC产物/安装、配置、监督、监控、隔离预演与关闭/回退能力均有身份对应实际收据后，协调者才能将新门禁置`rc_prepared`。若只剩真实应用/机器缺口，集中交付；真实应用、目标、SLO、预算和授权落实并通过目标验收后才评估`ready_for_canary`。灰度实际部署、观察完成另行记录，不能从RC准备跳到limited生产通过。
+RC state中的安装及五类真实收据SHA已匹配，归档保持原1e6b…；其中MD是准备快照。本目录最终MD与外部门禁补充实测，不回写归档。预演归属单元全部inactive、PG会话0、cleanup_errors=[]；独有runtime目录的保留/清理由协调者单独留收据，不据文档推断删除。
 
-本轮无生产数据库migration、无公开部署/发版/合并、无购买；JSON旧默认和两个暂停项保持。最终链接、工具命令、manifest和门禁一致性随实际收据补核。
+无生产数据库migration、公开发版、合并、网站部署或购买；JSON旧默认及Value/AST暂停项保持。真正业务条件落实后，按固定目标SLO/预算与授权补目标验收，再评估ready_for_canary，不凭RC直接生产放行。

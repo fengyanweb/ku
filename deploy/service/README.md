@@ -98,7 +98,9 @@ python3 manage.py stop /etc/ku/cluster.json b
 
 ## 宿主与平台
 
-Linux 采用 `ku-service@.service`：只自动恢复异常崩溃的 supervisor，5 秒退避、5 分钟最多 3 次宿主启动，`KillMode=control-group`，停止预算 16 秒。Ku 因自身重启强度耗尽而正常退出码 1 不会被宿主无限再起。`manager_start`/`manager_stop` 示例由 systemd 管理，需按实际安装位置设置服务用户和文件权限。不要在 native 业务进程外再放另一个独立重启器。
+Linux 采用 `ku-service@.service`：只自动恢复异常崩溃的 supervisor，5 秒退避、5 分钟最多 3 次宿主启动，`KillMode=mixed`，停止预算 16 秒。TERM 先通知 supervisor 排空已接纳请求，超出停止预算后 systemd 才终止整个 cgroup；同时向全部子进程发送 TERM 会使已接纳请求丢失。Ku 因自身重启强度耗尽而正常退出码 1 不会被宿主无限再起。`manager_start`/`manager_stop` 示例由 systemd 管理，需按实际安装位置设置服务用户和文件权限。不要在 native 业务进程外再放另一个独立重启器。
+
+使用 `python3 manage.py metrics /etc/ku/cluster.json` 读取当前代的运行指标。它复用私有控制令牌，不向公共入口开放原生指标路由；未运行或采集失败返回 unavailable，不能作零用量处理。Linux RC 的有界采集、实际账户及 whole-unit 资源限制见 [RC 运行手册](../../docs/production-rc/production-runbook.md)。
 
 macOS 的 `com.ku.service-a.plist` 提供普通模式 launchd 模板；另两份分别改 Label/slot。仅异常崩溃重起、30 秒节流、保留默认进程组清理。需将 JSON 的 manager 命令改为本机实际 `launchctl bootstrap/bootout` 操作，或在隔离验证中移除 manager 字段直接 start/stop。未提供硬内存限制的替代品。
 
