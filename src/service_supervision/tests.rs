@@ -1,5 +1,25 @@
 use super::*;
 
+fn accept_fixture(listener: TcpListener) -> Option<TcpStream> {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Accepted sockets may inherit nonblocking mode on macOS.
+                stream.set_nonblocking(false).unwrap();
+                return Some(stream);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("fixture accept failed: {error}"),
+        }
+    }
+    None
+}
+
 #[test]
 fn control_token_rejects_duplicates_and_partial_matches() {
     let expected = "a".repeat(32);
@@ -22,7 +42,7 @@ fn probe_fixture(body: &str) -> (SocketAddr, thread::JoinHandle<()>) {
     let address = listener.local_addr().unwrap();
     let body = body.to_string();
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_fixture(listener).expect("probe fixture was not contacted");
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -68,7 +88,7 @@ fn slow_probe_has_one_absolute_response_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream = accept_fixture(listener).expect("slow probe fixture was not contacted");
         let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
         for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n" {
             if stream.write_all(&[*byte]).is_err() {
@@ -103,11 +123,13 @@ fn native_metrics_fixture(
     body: String,
     length: usize,
     slow: bool,
-) -> (SocketAddr, thread::JoinHandle<()>) {
+) -> (SocketAddr, thread::JoinHandle<(bool, bool)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let Some(mut stream) = accept_fixture(listener) else {
+            return (false, false);
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -117,19 +139,26 @@ fn native_metrics_fixture(
         let request = read_headers(&mut stream, MAX_CONTROL_REQUEST).unwrap();
         assert!(request.starts_with("GET /__ku/metrics HTTP/1.1\r\n"));
         assert!(request.contains(&format!("X-Ku-Control-Token: {}\r\n", "d".repeat(64))));
-        let _ = write!(
+        if write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: keep-alive\r\n\r\n"
-        );
+        )
+        .is_err()
+        {
+            return (true, false);
+        }
         if slow {
+            let mut body_started = false;
             for byte in body.bytes() {
                 if stream.write_all(&[byte]).is_err() {
                     break;
                 }
+                body_started = true;
                 thread::sleep(Duration::from_millis(20));
             }
+            (true, body_started)
         } else {
-            let _ = stream.write_all(body.as_bytes());
+            (true, stream.write_all(body.as_bytes()).is_ok())
         }
     });
     (address, worker)
@@ -175,13 +204,25 @@ fn native_metrics_rejects_oversize_and_token_echo() {
 #[test]
 fn native_metrics_body_consumes_the_original_remaining_deadline() {
     let body = "{\"value\":17}".to_string();
+    // A deadline may expire before connect when a parallel test is descheduled.
+    // The fixture must also retire when no client ever reaches accept.
+    let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
+    assert_eq!(
+        native_metrics_at(address, &"d".repeat(64), Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    let (accepted, _) = worker.join().unwrap();
+    assert!(!accepted, "expired request must not connect");
     let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
     let began = Instant::now();
     let deadline = began + Duration::from_millis(100);
     thread::sleep(Duration::from_millis(40));
     assert!(native_metrics_at(address, &"d".repeat(64), deadline).is_err());
     assert!(began.elapsed() < Duration::from_millis(400));
-    worker.join().unwrap();
+    let (_, body_started) = worker.join().unwrap();
+    assert!(body_started, "slow response body was not exercised");
 }
 
 #[test]
@@ -210,7 +251,8 @@ fn oversized_probe_length_cannot_overflow_or_exceed_the_response_bound() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let mut stream =
+            accept_fixture(listener).expect("oversize probe fixture was not contacted");
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
