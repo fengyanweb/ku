@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Observaciones de rendimiento",
-  "performanceScope": "Siete pares de ventanas de una carga específica de HTTP y CPU en Linux ARM64, frente a una configuración Rust de referencia de bajo consumo de memoria. Son estimaciones puntuales de razones medias geométricas.",
+  "performanceScope": "Mediciones de una compilación de desarrollo: Siete pares de ventanas de una carga específica de HTTP y CPU en Linux ARM64, frente a una configuración Rust de referencia de bajo consumo de memoria. Son estimaciones puntuales de razones medias geométricas.",
   "performanceMetrics": [
     [
       "Coste de CPU por solicitud correcta",

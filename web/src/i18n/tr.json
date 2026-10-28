@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Performans gözlemleri",
-  "performanceScope": "Linux ARM64 üzerinde belirli bir HTTP ve CPU karma yükünün yedi çift ölçüm penceresi, düşük bellekli Rust referans yapılandırmasıyla karşılaştırıldı. Değerler oranların geometrik ortalamalarının nokta tahminleridir.",
+  "performanceScope": "Geliştirme derlemesi ölçümleri: Linux ARM64 üzerinde belirli bir HTTP ve CPU karma yükünün yedi çift ölçüm penceresi, düşük bellekli Rust referans yapılandırmasıyla karşılaştırıldı. Değerler oranların geometrik ortalamalarının nokta tahminleridir.",
   "performanceMetrics": [
     [
       "Doğru istek başına CPU maliyeti",

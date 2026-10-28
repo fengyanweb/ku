@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "指定負載下的效能觀察",
-  "performanceScope": "Linux ARM64 指定 HTTP 與 CPU 混合負載的七對視窗，與 Rust 低記憶體參考設定比較。以下為幾何平均比的點估計。",
+  "performanceScope": "開發組建觀測：Linux ARM64 指定 HTTP 與 CPU 混合負載的七對視窗，與 Rust 低記憶體參考設定比較。以下為幾何平均比的點估計。",
   "performanceMetrics": [
     ["每個正確請求的 CPU 成本", "約少 33%", "Ku/Rust ≈ 0.671"],
     ["穩態行程駐留記憶體 RSS", "約少 65%", "Ku/Rust ≈ 0.351"]

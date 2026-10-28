@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Osservazioni sulle prestazioni",
-  "performanceScope": "Sette coppie di finestre di misura di un carico specifico HTTP e CPU su Linux ARM64, rispetto a una configurazione Rust di riferimento a bassa memoria. I valori sono stime puntuali delle medie geometriche dei rapporti.",
+  "performanceScope": "Misure di una build di sviluppo: Sette coppie di finestre di misura di un carico specifico HTTP e CPU su Linux ARM64, rispetto a una configurazione Rust di riferimento a bassa memoria. I valori sono stime puntuali delle medie geometriche dei rapporti.",
   "performanceMetrics": [
     [
       "Costo CPU per richiesta corretta",

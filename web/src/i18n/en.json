@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Performance observations",
-  "performanceScope": "Seven paired windows of a specified HTTP and CPU workload on Linux ARM64, compared with a Rust low-memory reference configuration. Figures are geometric-mean ratio point estimates.",
+  "performanceScope": "Development-build measurements: Seven paired windows of a specified HTTP and CPU workload on Linux ARM64, compared with a Rust low-memory reference configuration. Figures are geometric-mean ratio point estimates.",
   "performanceMetrics": [
     ["CPU cost per correct request", "About 33% lower", "Ku/Rust ≈ 0.671"],
     ["Steady process RSS", "About 65% lower", "Ku/Rust ≈ 0.351"]

@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Beobachtungen zur Leistung",
-  "performanceScope": "Sieben gepaarte Messfenster einer festgelegten HTTP- und CPU-Last unter Linux ARM64 im Vergleich zu einer speichersparenden Rust-Referenzkonfiguration. Die Werte sind Punktschätzungen geometrisch gemittelter Verhältnisse.",
+  "performanceScope": "Messungen eines Entwicklungsbuilds: Sieben gepaarte Messfenster einer festgelegten HTTP- und CPU-Last unter Linux ARM64 im Vergleich zu einer speichersparenden Rust-Referenzkonfiguration. Die Werte sind Punktschätzungen geometrisch gemittelter Verhältnisse.",
   "performanceMetrics": [
     [
       "CPU-Kosten je korrekter Anfrage",

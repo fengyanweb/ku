@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Observații de performanță",
-  "performanceScope": "Șapte perechi de ferestre de măsurare pentru o sarcină specifică HTTP și CPU pe Linux ARM64, comparate cu o configurație Rust de referință cu memorie redusă. Valorile sunt estimări punctuale ale mediilor geometrice ale rapoartelor.",
+  "performanceScope": "Măsurători ale unei versiuni de dezvoltare: Șapte perechi de ferestre de măsurare pentru o sarcină specifică HTTP și CPU pe Linux ARM64, comparate cu o configurație Rust de referință cu memorie redusă. Valorile sunt estimări punctuale ale mediilor geometrice ale rapoartelor.",
   "performanceMetrics": [
     [
       "Cost CPU per cerere corectă",

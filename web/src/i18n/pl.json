@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Obserwacje wydajności",
-  "performanceScope": "Siedem par okien pomiarowych określonego obciążenia HTTP i CPU na Linux ARM64, w porównaniu z referencyjną konfiguracją Rust o małym zużyciu pamięci. Wartości to estymaty punktowe średnich geometrycznych ilorazów.",
+  "performanceScope": "Pomiary kompilacji rozwojowej: Siedem par okien pomiarowych określonego obciążenia HTTP i CPU na Linux ARM64, w porównaniu z referencyjną konfiguracją Rust o małym zużyciu pamięci. Wartości to estymaty punktowe średnich geometrycznych ilorazów.",
   "performanceMetrics": [
     ["Koszt CPU na poprawne żądanie", "Około 33% mniej", "Ku/Rust ≈ 0.671"],
     ["RSS procesu w stanie ustalonym", "Około 65% mniej", "Ku/Rust ≈ 0.351"]

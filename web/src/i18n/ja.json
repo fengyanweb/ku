@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "性能の観測結果",
-  "performanceScope": "Linux ARM64で特定のHTTP・CPU混合負荷を測定した7組のウィンドウを、Rustの低メモリ参照構成と比較しました。値は比の幾何平均の点推定です。",
+  "performanceScope": "開発ビルドでの測定：Linux ARM64で特定のHTTP・CPU混合負荷を測定した7組のウィンドウを、Rustの低メモリ参照構成と比較しました。値は比の幾何平均の点推定です。",
   "performanceMetrics": [
     ["正しいリクエスト1件当たりのCPUコスト", "約33%減", "Ku/Rust ≈ 0.671"],
     ["定常状態のプロセスRSS", "約65%減", "Ku/Rust ≈ 0.351"]

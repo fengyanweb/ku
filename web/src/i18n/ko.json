@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "성능 관측 결과",
-  "performanceScope": "Linux ARM64의 지정된 HTTP·CPU 혼합 부하에서 일곱 쌍의 측정 구간을 Rust 저메모리 참조 구성과 비교했습니다. 수치는 비율의 기하평균에 대한 점추정입니다.",
+  "performanceScope": "개발 빌드 측정: Linux ARM64의 지정된 HTTP·CPU 혼합 부하에서 일곱 쌍의 측정 구간을 Rust 저메모리 참조 구성과 비교했습니다. 수치는 비율의 기하평균에 대한 점추정입니다.",
   "performanceMetrics": [
     ["올바른 요청당 CPU 비용", "약 33% 감소", "Ku/Rust ≈ 0.671"],
     ["정상 상태 프로세스 RSS", "약 65% 감소", "Ku/Rust ≈ 0.351"]

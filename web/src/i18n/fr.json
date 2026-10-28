@@ -57,7 +57,7 @@
     ]
   ],
   "performanceTitle": "Observations de performance",
-  "performanceScope": "Sept paires de fenêtres de mesure d’une charge HTTP et CPU définie sur Linux ARM64, comparées à une configuration Rust de référence à faible mémoire. Il s’agit d’estimations ponctuelles de moyennes géométriques des rapports.",
+  "performanceScope": "Mesures d’une version de développement : Sept paires de fenêtres de mesure d’une charge HTTP et CPU définie sur Linux ARM64, comparées à une configuration Rust de référence à faible mémoire. Il s’agit d’estimations ponctuelles de moyennes géométriques des rapports.",
   "performanceMetrics": [
     [
       "Coût CPU par requête correcte",
