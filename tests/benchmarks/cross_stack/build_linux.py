@@ -241,25 +241,15 @@ class Builder:
             destination = self.bin / ("ku-" + name)
             emission = self.command("ku-native-" + name, [ku, "build", "--backend", "c", "--profile", "release",
                                                        "--emit-c", "-o", destination, path], cwd=work,
-                                    environment={"KU_PG_LIB": str(private)}, accepted_exit_codes=(0, 1))
-            # The current CLI emits portable C but intentionally refuses to
-            # validate/link an ARM64 Linux release. Keep that official support
-            # boundary and compile the emitted file explicitly for this
-            # benchmark only. No compiler/runtime source is changed.
-            refusal = "native C linking is not validated for this host architecture"
-            if self.commands[-1]["exit_code"] != 1 or refusal not in emission:
-                raise RuntimeError("expected the exact unsupported Linux ARM64 linking diagnostic; inspect emission log")
+                                    environment={"KU_PG_LIB": str(private)})
+            # Measure the ordinary CLI's Release output. ARM64 Linux linking
+            # is now supported; a historical refusal is not a successful build.
             lines = emission.splitlines()
-            if len(lines) != 3 or not lines[0].startswith("native c ok: ") or lines[1] != refusal:
+            if len(lines) != 2 or not lines[0].startswith("native c ok: ") or lines[1] != "build ok: " + str(destination):
                 raise RuntimeError("unexpected Ku C emission output; refusing to reuse generated source")
             generated_source = Path(lines[0].removeprefix("native c ok: ")).resolve(strict=True)
             if work.resolve() not in generated_source.parents or generated_source.is_symlink():
                 raise RuntimeError("generated C escaped the private build directory")
-            compiler = ["clang-18", generated_source, "-std=c11", "-O2", "-pthread"]
-            if name == "server":
-                compiler.append(private / "libpq.so")
-            compiler.extend(["-lm", "-o", destination])
-            self.command("ku-manual-c-" + name, compiler, cwd=work, timeout=180)
             elf_header = self.command("ku-elf-header-" + name, ["readelf", "-h", destination], timeout=30)
             if "AArch64" not in elf_header or "ELF64" not in elf_header:
                 raise RuntimeError("native benchmark output is not actual ELF64 AArch64")
@@ -268,7 +258,7 @@ class Builder:
                                  generated_c=str(generated_source), generated_c_sha256=digest(generated_source),
                                  binary=str(destination), binary_sha256=digest(destination),
                                  elf_header=elf_header, dynamic_dependencies=dynamic,
-                                 linking="explicit benchmark-only ARM64 Linux C compilation; not an official Ku release target")
+                                 linking="ordinary Ku CLI native Release build on ARM64 Linux; no separate official archive in this release")
         generated = {str(p.relative_to(work)): digest(p) for p in work.rglob("*.c")}
         if not generated:
             raise RuntimeError("Ku native build did not retain generated C identity")
