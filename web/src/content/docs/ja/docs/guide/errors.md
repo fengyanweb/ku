@@ -1,7 +1,7 @@
 ---
 title: 'エラーとトラブルシューティング'
 description: 'Ku のインストール、インポート、所有権、JSON、バックエンド機能のエラーを診断します。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ ku check --json hello.ku
 | `E0913` | 非同期パラメーターを借用している      | 所有パラメーターを使い、元の値が必要なら呼び出し側でクローンする |
 | `E0918` | 呼び出し側で `&value` と書いている    | 通常の引数を渡す。借用はシグネチャで宣言する                     |
 
-これは登録済み診断の概要であり、すべてのエラーの一覧ではありません。現在の正式な登録情報は [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs) にあります。
+これは登録済み診断の概要であり、すべてのエラーの一覧ではありません。現在の正式な登録情報は [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs) にあります。
 
 ## 実行時エラーには別の仕様がある
 
@@ -74,4 +74,4 @@ fn main() {
 
 データベースエラー `execution_unknown` と `execution_completed_without_result` を理由に自動再実行してはいけません。リクエストと業務上の証拠を保管し、まず実際の実行状態を確認してください。ローカルのウェブサイトの検証に本番データベースへの接続は不要です。
 
-詳しくは[リポジトリの診断ガイド](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md)を参照してください。
+詳しくは[リポジトリの診断ガイド](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)を参照してください。

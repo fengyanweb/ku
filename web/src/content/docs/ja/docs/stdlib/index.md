@@ -1,7 +1,7 @@
 ---
 title: '標準ライブラリ'
 description: 'Ku の標準ライブラリモジュール、主要なシグネチャ、バックエンドの制約。'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。主要なエントリーポイントをソースと照合していますが、網羅的な API リファレンスではありません。動作は[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)で定義されます。バックエンドの制約は[対応表](/ja/docs/support/)をご覧ください。
+本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。主要なエントリーポイントをソースと照合していますが、網羅的な API リファレンスではありません。動作は[構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)で定義されます。バックエンドの制約は[対応表](/ja/docs/support/)をご覧ください。
 
 ## モジュールをインポートする
 
@@ -77,7 +77,7 @@ fn main(): null! {
 
 ## リファレンスの保守
 
-公開インターフェースのメタデータは [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs) にあります。実装と仕様と併せて確認します。このウェブサイトでは現在、内容を選定した手動リファレンスを管理しています。既存の `ku doc` コマンドは確認されていません。
+公開インターフェースのメタデータは [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs) にあります。実装と仕様と併せて確認します。このウェブサイトでは現在、内容を選定した手動リファレンスを管理しています。既存の `ku doc` コマンドは確認されていません。
 
 ## API reference (English)
 

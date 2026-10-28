@@ -1,9 +1,9 @@
 ---
 title: 'شروع کار'
 description: 'نوشتن Hello Ku، بررسی کد منبع و شناخت تفاوت تفسیر و کامپایل.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. این صفحه از نحو پایه و فرمان‌های CLI موجود در v0.0.17 استفاده می‌کند. ابتدا [Ku را نصب کنید](/fa/docs/install/) و مطمئن شوید `ku --version` اجرا می‌شود.

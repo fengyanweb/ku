@@ -1,25 +1,27 @@
 ---
 title: 專案與貢獻
 description: Ku 專案狀態、公開原始碼、授權邊界與提交問題的方式。
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。專案名稱為 **Ku 程式語言 / Ku programming language**，CLI 名稱為 `ku`。Ku 是仍在開發中的小型程式語言與解釋器，目前公開發行狀態為 v0.0.18 實驗預發行版。
+目前文件對應 Ku 0.0.19 實驗預發行版，CLI 與 VS Code 擴充功能版本一致。實際公開狀態、下載檔案與校驗值以對應 GitHub Release 為準。
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## 原始碼與授權
 
-[查看 GitHub 原始碼](https://github.com/fengyanweb/ku)與[發行頁面](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1)。原始碼公開可查看，但 Ku 自身代碼**未授予開放原始碼授權條款**，編輯器擴展標記為 `UNLICENSED`。公開原始碼和二進制發佈不自動授予開放原始碼授權。
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-發行歸檔中的第三方授權只適用於相應第三方組件，不能據此推斷 Ku 本身的使用、修改或再分發授權。需要相關授權時應由專案維護方明確說明；本站不添加新的授權承諾。
+Ku 與 VS Code 擴充功能採用 Apache License 2.0，詳見 [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) 與 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)。第三方元件保留各自的著作權與授權條款。
 
 ## 提交問題
 
@@ -34,7 +36,7 @@ sources:
 
 ## 貢獻前先讀
 
-[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)與[語義合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)規定語言行為。CI、實作和規範需一起核對，不能把工作日誌目標當成已實作功能。
+[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)與[語義合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)規定語言行為。CI、實作和規範需一起核對，不能把工作日誌目標當成已實作功能。
 
 修改應盡量小，說明復現、原因、影響和驗證範圍。網站內容與對應原始碼一起審查，已有測試原始碼、工作區改動和獨有證據需要保留。接受貢獻的具體流程與授權安排仍由維護方決定，本站不虛構貢獻協議。
 

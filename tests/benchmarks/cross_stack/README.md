@@ -1,18 +1,25 @@
 # 跨语言业务与资源对照
 
-本目录是 2026-10-22 任务书 T01—T08 的永久基准源码，不是性能结论。
-集中结果见 `docs/multicore-capacity-acceptance.md` 和原有 evidence JSON。
-候选运行时未公开发布，不能把这里的功能或成绩写成 v0.0.18-r1 已交付内容。
+本目录保留 Ku、Go、Rust、Node.js、Java、.NET、C++ 七栈基准源码及共享驱动，不是性能结论。
+集中结果见 `docs/multicore-capacity-acceptance.md` 和对应 evidence JSON；英文说明见
+[`README.en.md`](README.en.md)。每次运行须绑定候选提交、源码、CLI、实际服务二进制和协议哈希。
+更新版本或本文不改变历史结果身份，也不证明某项功能已进入公开安装包。
 
 ## 固定业务
 
 `protocol.json` 冻结语料哈希、算法、数据库表、SLO、资源档和测量窗口。
-四个服务分别使用 Ku native C、Go net/http、Rust Tokio/Axum、Node node:http；
-Node 多核使用 cluster，长计算在正常的有界后台执行。锁文件保留准确依赖。
+七个服务分别使用 Ku native C、Go net/http、Rust Tokio/Axum、Node node:http、
+Java Vert.x、.NET Kestrel 和 C++ Drogon；Node 多核使用 cluster，长计算在正常的
+有界后台执行。各栈锁文件及构建收据保留实际依赖与工具链身份。
+原 Ku/Go/Rust/Node 矩阵保留 1/2/4 核和既有业务组合；Java/.NET/C++ 的正式 HTTP
+范围为 4 核的 `ok`、`json_object`、`mixed`，其中 256 MiB 档含 `json_object`、`mixed`。
+新增三栈不自动扩展为原 TCP 等待矩阵；批处理另按共同内核验收。
 JSON 必须完整解码、构造新对象并重新编码。当前 Ku 用显式 `decoded.take("data")?`
 消费根对象并转移子树；旧索引接口仍返回 owned 副本。旧／新必须分别绑定源码身份，
 不能把历史索引路径成绩重新标为 take。
 数据库使用私有 PostgreSQL 16 的 1024 行夹具，总池 16，不重试业务查询。
+Ku 继续使用同一租约的 `DISCARD ALL`；Java/.NET/C++ 保留各自真实连接池的重置行为，
+不人为补上相同语句。SQL 和结果黄金检查相同，不代表连接重置成本完全等价。
 Ku 的 `/json` 在 `--ku-json text` 下使用 text/plain，`response` 模式通过公开
 `http.json` 使用 application/json；`/db` 两种执行路径都保持原 text/plain。
 Go/Java/.NET/C++ 的 JSON 响应带 UTF-8 charset；Rust/Node 使用无显式 charset 的
@@ -31,14 +38,19 @@ v4在到达起点捕获Linux CLOCK_MONOTONIC锚点及误差界；资源与恢复
 Unix字段仅供阅读。锚点不可用或误差超过1ms时将测量标为不可判定，不改服务SLO；
 撤压5秒边界保守包含两端锚点误差，不能借墙钟调整或实际发送尾部续期。
 原始终态保存在有界 gzip CSV，报告同时列计划、已发送、正确、拒绝、超时和未发送。
-不足的尾部样本标记不足；五轮合并原始分布，不平均各轮 p99。
+当前 v5 另记录 HTTP 状态、传输阶段、发送滞后、dial、冷连接与复用连接分布。
+不足的尾部样本标记不足；正式比较至少七轮，合并相同身份与配置的分布，不平均各轮 p99。
+完整驱动门禁与计费口径见 [`client/README.md`](client/README.md)；驱动无效或环境干扰
+未排除的窗口不能证明服务容量或语言优劣。
 
 ## 独立 Linux 环境
 
 参考环境为 8 vCPU、4 GiB 的 ARM64 Ubuntu 24.04 虚拟机。虚拟 CPU 不代表独占物理核。
-正式四栈比较只在同一 Linux 环境内进行，macOS 黄金响应检查不用于排名。
-当前 CLI 不能自动链接 Linux ARM64；这里保留其拒绝记录，并对未修改的生成 C 使用
-clang-18 C11/O2/pthread 显式编译。它是实验基准构建，不新增官方发布平台。
+正式比较只在同一 Linux 环境内进行，macOS 黄金响应检查不用于排名。
+当前 CLI 支持 Linux ARM64 本机 native 链接；`build_linux.py` 使用实际 CLI 的
+`--backend c --profile release --emit-c` 产物，并保存生成 C、ELF 和动态依赖身份，
+不再将历史拒绝退出当成功，也不手工重编生成 C。旧显式 clang 链接结果保留原构建身份。
+Linux ARM64 基准构建能力不等于新增该平台的官方完整 SDK 发布包。
 Ku 文件基址按程序路径和编译时 locator 定位，运行目录使用独立 bin/ 与 ku-native/
 布局放置程序和输入，避免误把 cwd 当文件基址，也不修改生成 C 来绕开语言语义。
 
@@ -61,20 +73,37 @@ sudo env BENCH_ROOT=/opt/ku-bench BENCH_USER=mac bash tests/benchmarks/cross_sta
 # 将确切候选源码复制到 /opt/ku-bench/src；不要复制构建缓存和 node_modules。
 python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/build_linux.py --root /opt/ku-bench \
   --candidate "$(git -C /opt/ku-bench/src rev-parse HEAD)" \
-  --ku-format direct --ku-json response --ku-pg-execution async --ku-pg-read int
+  --ku-format helpers --ku-json text --ku-pg-execution async --ku-pg-read int \
+  --only ku go rust node java dotnet cpp client
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/database.py --root /opt/ku-bench start
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/linux_harness.py \
-  --root /opt/ku-bench --output /opt/ku-bench/results/golden --phase smoke
+  --root /opt/ku-bench --output /opt/ku-bench/results/golden --phase smoke \
+  --stacks ku go rust node java dotnet cpp
+# 按已批准范围显式选择一个共同正式条目；本命令会执行协议规定的正式轮次。
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/linux_harness.py \
-  --root /opt/ku-bench --output /opt/ku-bench/results/formal --phase all
+  --root /opt/ku-bench --output /opt/ku-bench/results/formal-json --phase formal \
+  --case c4-m1073741824-json_object --stacks ku go rust node java dotnet cpp
 sudo python3 -B /opt/ku-bench/src/tests/benchmarks/cross_stack/database.py --root /opt/ku-bench stop
 ```
+
+`build_linux.py` 默认构建七栈和公共客户端；`linux_harness.py` 默认仍选原四栈，
+七栈运行必须显式传 `--stacks`。上面的正式条目是使用示例，不是每次文档或版本更新都要执行。
+单轮固定负载只验证该次窗口；不能写成七轮正式比较、完整矩阵或长期稳定性通过。
 
 构建使用夹具用户 uid 501/gid 1000；不同环境显式传入一致的 `--uid`/`--gid`。
 `build_linux.py` 要求非 root；数据库和 cgroup 编排要求 root。依赖和生成物留在 ROOT/build、
 ROOT/tools，源码目录保持可核对。安装脚本默认账号和路径由其开头的环境变量确定。
 实测前保存 environment、manifest、源码清单和程序哈希。改变冻结输入时使用新结果目录，
 不得把不同候选或配置的轮次拼在一起。
+
+## Ku 构建模式
+
+默认组合为 `--ku-format helpers --ku-json text --ku-pg-execution async --ku-pg-read int`。
+`helpers` 保留模板中的格式化调用路径；`direct` 使用公开 `str(int)` 与相同八位零填充，
+属于单独记录的比较变体。`text` 使用 `json.encode` 加 `http.text`；`response` 使用
+公开 `http.json`。变体的展开源码、生成 C、ELF、MIME 和完整调用成本分别记录，
+不能把 direct/response 的结果当作默认 helpers/text，也不能重新标注旧成绩。
+取消、期限、预算、正常值所有权和清理检查始终保留，不使用已撤回的实验实现。
 
 ## PostgreSQL 执行路径对照
 
@@ -92,7 +121,7 @@ PG 的 `http.text` 仍与历史 Ku 对照列保持相同文本 MIME；不能将�
 
 ## 分阶段执行与清理
 
-`--phase` 支持 smoke、explore、formal、overload、sustained、waiting、batch、all；
+`--phase` 支持 smoke、diagnose、explore、formal、overload、sustained、waiting、batch、all；
 `--case c4-m1073741824-json_object` 可选单个矩阵条目，其他参数默认对应冻结协议。
 等待组完整观察真实 timer/TCP 的挂起与结束，不拿 QPS 代替并发等待数量。
 批处理分别观察新进程启动和固定计算，不从计算结果中减去启动成本。
@@ -113,4 +142,5 @@ checksum；历史 `repeat=64` 结果保留为 R&D，不进入正式表。每轮�
 
 保留本目录、锁文件、精简原始结果和必要失败证据。一次性探针、重复包、临时构建和
 `node_modules`/`__pycache__` 用完删除。清理只作用于本次拥有的私有目录、进程和 cgroup。
-不改官网，不重跑旧 36 次内存验证，不恢复两个暂停分析模块。
+本基准入口不部署官网、不隐式重跑旧 36 次内存验证，也不恢复暂停的通用值复制／释放
+及 AST 分析。官网内容与打包按独立授权进行，不能用它替代运行证据。

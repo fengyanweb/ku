@@ -1,7 +1,7 @@
 ---
 title: 'Biblioteca estándar'
 description: 'Encuentra módulos de la biblioteca estándar de Ku, firmas esenciales y límites de los backends.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Estas interfaces esenciales se han contrastado con el código fuente; no es una referencia exhaustiva de API. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) define el comportamiento. Consulta los límites de los backends en la [matriz de compatibilidad](/es/docs/support/).
+Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Estas interfaces esenciales se han contrastado con el código fuente; no es una referencia exhaustiva de API. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) define el comportamiento. Consulta los límites de los backends en la [matriz de compatibilidad](/es/docs/support/).
 
 ## Importa módulos
 
@@ -77,7 +77,7 @@ Primero crea un archivo UTF-8 `message.txt` junto al código fuente. Si el archi
 
 ## Mantenimiento de la referencia
 
-Los metadatos de las interfaces públicas están en [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Se comprueban junto a implementaciones y contratos. El sitio mantiene actualmente una referencia manual seleccionada; no se ha confirmado la existencia de un comando `ku doc`.
+Los metadatos de las interfaces públicas están en [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Se comprueban junto a implementaciones y contratos. El sitio mantiene actualmente una referencia manual seleccionada; no se ha confirmado la existencia de un comando `ku doc`.
 
 ## API reference (English)
 

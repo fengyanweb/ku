@@ -1,9 +1,9 @@
 ---
 title: 'Başlangıç'
 description: 'Hello Ku yazın, kaynak kodunuzu denetleyin ve yorumlama ile derlemeyi ayırt edin.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu sayfa v0.0.17 içinde zaten bulunan temel sözdizimini ve CLI komutlarını kullanır. Önce [Ku kurulumunu](/tr/docs/install/) yapın ve `ku --version` komutunun çalıştığını doğrulayın.

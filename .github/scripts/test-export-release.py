@@ -51,10 +51,12 @@ class ReleaseExportTests(unittest.TestCase):
         self.put(self.package / "LICENSE-MIT", b"original license bytes\r\nCopyright sample\r\n")
         self.put(self.package / "NOTICE", b"original NOTICE bytes\n")
         self.put(self.repo / "Cargo.toml", b"workspace manifest\n")
+        self.put(self.repo / "LICENSE", b"original Ku Apache-2.0 license fixture\r\n")
+        self.put(self.repo / "NOTICE", b"original Ku copyright notice fixture\n")
         self.data = {
             "workspace_members": ["ku"],
             "packages": [
-                {"name": "ku", "version": "0.0.17", "id": "ku", "manifest_path": str(self.repo / "Cargo.toml"), "source": None, "license": None},
+                {"name": "ku", "version": "0.0.17", "id": "ku", "manifest_path": str(self.repo / "Cargo.toml"), "source": None, "license": "Apache-2.0"},
                 {"name": "sample", "version": "1.2.3", "id": "sample", "manifest_path": str(self.package / "Cargo.toml"), "source": "registry+https://github.com/rust-lang/crates.io-index", "license": "MIT", "license_file": None},
             ],
             "resolve": {"nodes": [
@@ -104,6 +106,7 @@ class ReleaseExportTests(unittest.TestCase):
         self.assertEqual(archive.name, f"ku-v0.0.17-{self.target}.tar.gz")
         self.assertEqual(manifest["asset"], archive.name)
         self.assertEqual(manifest["commit"], "a" * 40)
+        self.assertEqual(manifest["ku_license"], "Apache-2.0")
         self.assertEqual(manifest["size"], archive.stat().st_size)
         self.assertEqual(result["sha256"], hashlib.sha256(archive.read_bytes()).hexdigest())
         self.assertEqual(manifest["files"]["ku"]["mode"], 0o755)
@@ -114,13 +117,17 @@ class ReleaseExportTests(unittest.TestCase):
         self.assertEqual(license_path.read_bytes(), (self.package / "LICENSE-MIT").read_bytes())
         third_party = json.loads((extracted / "THIRD_PARTY.json").read_text(encoding="utf-8"))
         self.assertEqual([package["name"] for package in third_party["cargo"]], ["sample"])
+        self.assertEqual(third_party["ku_license"], "Apache-2.0")
+        self.assertEqual(third_party["ku_materials"], ["LICENSE", "NOTICE"])
+        for name in ("LICENSE", "NOTICE"):
+            self.assertEqual((extracted / name).read_bytes(), (self.repo / name).read_bytes())
         self.assertNotIn(str(self.root), json.dumps(third_party))
         sums = (extracted / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(sums), len(manifest["files"]) - 1)
         for line in sums:
             digest, name = line.split("  ", 1)
             self.assertEqual(digest, hashlib.sha256((extracted / name).read_bytes()).hexdigest())
-        self.assertIn("UNLICENSED", (extracted / "README-INSTALL.md").read_text(encoding="utf-8"))
+        self.assertIn("Apache-2.0", (extracted / "README-INSTALL.md").read_text(encoding="utf-8"))
 
     def test_release_cli_requires_actual_archive_installation_check(self):
         arguments = ["export-release.py", "--bundle", str(self.bundle), "--output", str(self.output),
@@ -447,6 +454,21 @@ class ReleaseExportTests(unittest.TestCase):
             self.run_export()
 
     def test_missing_license_and_copyright_do_not_silently_pass(self):
+        for name in ("LICENSE", "NOTICE"):
+            original = (self.repo / name).read_bytes()
+            (self.repo / name).unlink()
+            # Preserve read_bounded's existing I/O contract; main() reports
+            # OSError as a failed export with the missing material's path.
+            with self.assertRaises(FileNotFoundError) as missing:
+                self.run_export()
+            self.assertEqual(Path(missing.exception.filename), self.repo / name)
+            self.put(self.repo / name, original)
+        self.data["packages"][0]["license"] = None
+        self.write_metadata()
+        with self.assertRaisesRegex(EXPORT.ExportError, "must declare Apache-2.0"):
+            self.run_export()
+        self.data["packages"][0]["license"] = "Apache-2.0"
+        self.write_metadata()
         (self.package / "LICENSE-MIT").unlink()
         with self.assertRaisesRegex(EXPORT.ExportError, "missing original license"):
             self.run_export()

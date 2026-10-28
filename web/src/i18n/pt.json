@@ -56,21 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Observações de desempenho",
-  "performanceScope": "Medições de uma compilação de desenvolvimento: Sete pares de janelas de medição de uma carga específica de HTTP e CPU no Linux ARM64, comparados a uma configuração Rust de referência de baixa memória. Os valores são estimativas pontuais das médias geométricas das razões.",
+  "performanceTitle": "Observações com carga fixa",
+  "performanceScope": "0.0.19: uma única rodada sequencial de sete linguagens em uma VM Linux ARM64, com quatro núcleos de CPU por serviço e 30 segundos por carga. Os valores comparam o tempo de CPU do serviço por solicitação correta (Ku/Rust), não a latência das solicitações.",
   "performanceMetrics": [
-    [
-      "Custo de CPU por requisição correta",
-      "Cerca de 33% menor",
-      "Ku/Rust ≈ 0.671"
-    ],
-    [
-      "RSS do processo em regime estável",
-      "Cerca de 65% menor",
-      "Ku/Rust ≈ 0.351"
-    ]
+    ["Carga CPU — custo de CPU", "Cerca de 32% menor", "Ku/Rust ≈ 0.678"],
+    ["Carga JSON — custo de CPU", "Cerca de 26% maior", "Ku/Rust ≈ 1.260"],
+    ["Carga PG — custo de CPU", "Cerca de 35% maior", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Nem todos os critérios de qualificação da comparação e as metas de latência foram atendidos. As observações não comprovam maior vazão máxima, uma classificação geral de linguagens ou prontidão para produção.",
+  "performanceLimits": "Uma única rodada não constitui aceitação de capacidade nem de estabilidade a longo prazo. A paginação do host e as latências de cauda longa permanecem. A semântica de reset dos pools PG é diferente. Nesta rodada foi medida a memória cgroup, não RSS; não há comparação de RSS.",
   "practiceTitle": ["Dados familiares.", "Erros explícitos."],
   "practiceDescription": "Importe um módulo, crie um valor e codifique-o como JSON. O operador ? propaga erros em vez de escondê-los.",
   "jsonReference": "Leia a referência de JSON",
@@ -102,11 +95,11 @@
   "projectTitle": "Um trabalho em andamento. Uma história para acompanhar.",
   "projectDescription": "Ku v{releasedVersion} continua em desenvolvimento. Um candidato de implantação Linux ARM64 foi ensaiado com um exemplo isolado; o uso em produção para um negócio real não foi validado. Avalie com seus programas e envie feedback. Os artefatos publicados estão no GitHub Releases.",
   "github": "Explore no GitHub",
-  "license": "O código-fonte está disponível para consulta. Não foi concedida uma licença de código aberto.",
+  "license": "Licença Apache-2.0. Consulte LICENSE e NOTICE.",
   "verified": "Verificado",
   "limitations": "Suporte e limites",
   "version": "Versão da documentação",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Retrato da versão {version}",
   "snapshotNotice": "Retrato arquivado da documentação. É preservado independentemente da documentação de desenvolvimento atual; não anuncia uma publicação de binários.",
   "nextNotice": "Esta documentação descreve o escopo congelado da pré-versão experimental v{currentVersion}. A publicação efetiva e os downloads estão registrados no GitHub Releases.",

@@ -1,25 +1,27 @@
 ---
 title: 'Projekt und Beiträge'
 description: 'Projektstatus von Ku, öffentlicher Quelltext, Lizenzgrenzen und reproduzierbare Fehlermeldungen.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Das Projekt heißt **Ku programming language / Ku 编程语言**, die CLI `ku`. Ku ist eine kleine Programmiersprache mit Interpreter in Entwicklung. Die aktuelle öffentliche Version ist die experimentelle Vorabversion v0.0.18.
+Die aktuelle Dokumentation betrifft Ku 0.0.19, eine experimentelle Vorabversion mit gleicher Versionsnummer für CLI und VS-Code-Erweiterung. Verfügbarkeit, Dateien und Prüfsummen richten sich nach dem tatsächlichen GitHub Release.
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## Quelltext und Lizenzierung
 
-Sehen Sie sich den [Quelltext auf GitHub](https://github.com/fengyanweb/ku) und die [Veröffentlichungsseite](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) an. Der Quelltext ist öffentlich einsehbar, aber für Kus eigenen Code wurde **keine Open-Source-Lizenz erteilt**. Die Editor-Erweiterung ist als `UNLICENSED` gekennzeichnet. Die Veröffentlichung von Quelltext oder Binärdateien gewährt nicht automatisch eine Open-Source-Lizenz.
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-Drittanbieterhinweise in Veröffentlichungsarchiven gelten nur für die jeweiligen Komponenten. Sie gewähren keine Rechte zur Nutzung, Änderung oder Weitergabe von Ku selbst. Jede erforderliche Genehmigung muss ausdrücklich vom Maintainer kommen; diese Website begründet keine neue Lizenzzusage.
+Ku und die VS-Code-Erweiterung sind unter Apache License 2.0 lizenziert. Siehe [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) und [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Drittkomponenten behalten ihre eigenen Urheberrechts- und Lizenzhinweise.
 
 ## Ein Problem melden
 
@@ -34,7 +36,7 @@ Verwenden Sie für reproduzierbare Meldungen die [Issues](https://github.com/fen
 
 ## Vor einem Beitrag
 
-Der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) und der [Semantikvertrag](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) definieren das Sprachverhalten. Prüfen Sie CI, Implementierung und Verträge gemeinsam. Ein Ziel im Arbeitsprotokoll ist keine implementierte Funktion.
+Der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) und der [Semantikvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) definieren das Sprachverhalten. Prüfen Sie CI, Implementierung und Verträge gemeinsam. Ein Ziel im Arbeitsprotokoll ist keine implementierte Funktion.
 
 Halten Sie Änderungen eng begrenzt und erläutern Sie Reproduktion, Ursache, Umfang und Validierung. Prüfen Sie Website-Inhalte zusammen mit dem zugehörigen Quelltext. Bewahren Sie vorhandene Tests, Änderungen im Arbeitsverzeichnis und einzigartige Nachweise. Über Annahme von Beiträgen und Lizenzvereinbarungen entscheidet der Maintainer; diese Website erfindet keine Beitragsvereinbarung.
 

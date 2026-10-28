@@ -1,7 +1,7 @@
 ---
 title: 'Guía del lenguaje'
 description: 'Aprende las variables, funciones, flujo de control, propiedad, módulos y errores recuperables de Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Esta guía presenta la sintaxis esencial. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) del repositorio siguen siendo las referencias autorizadas. Son fragmentos didácticos; consulta las diferencias en la [compatibilidad de backends](/es/docs/support/).
+Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Esta guía presenta la sintaxis esencial. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) del repositorio siguen siendo las referencias autorizadas. Son fragmentos didácticos; consulta las diferencias en la [compatibilidad de backends](/es/docs/support/).
 
 ## Variables y tipos
 

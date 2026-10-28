@@ -1,7 +1,7 @@
 ---
 title: Errors and troubleshooting
 description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -46,7 +46,7 @@ The output is **JSON Lines**, with one diagnostic per line. Fields include `leve
 | `E0913`    | Borrowed async parameter            | Use an owned parameter; clone at the caller if the original is needed         |
 | `E0918`    | Writing `&value` at the call site   | Pass an ordinary argument; the signature declares borrowing                   |
 
-This summarizes registered diagnostics, rather than listing every error. The current authoritative registry is [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+This summarizes registered diagnostics, rather than listing every error. The current authoritative registry is [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs).
 
 ## Runtime errors use a separate contract
 
@@ -76,4 +76,4 @@ Passing `ku check` only establishes that frontend checking succeeded. Native C a
 
 Database errors `execution_unknown` and `execution_completed_without_result` must not trigger automatic replay. Retain request and business evidence and establish the actual execution state first.
 
-For more detail, see the [repository diagnostic guide](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+For more detail, see the [repository diagnostic guide](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).

@@ -1,7 +1,7 @@
 ---
 title: 'Biblioteka standardowa'
 description: 'Moduły biblioteki standardowej Ku, podstawowe sygnatury i ograniczenia zapleczy.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Te podstawowe punkty wejścia sprawdzono ze źródłami; nie jest to wyczerpujący opis API. Zachowanie definiuje [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md). Ograniczenia zapleczy opisuje [macierz obsługi](/pl/docs/support/).
+Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Te podstawowe punkty wejścia sprawdzono ze źródłami; nie jest to wyczerpujący opis API. Zachowanie definiuje [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md). Ograniczenia zapleczy opisuje [macierz obsługi](/pl/docs/support/).
 
 ## Importowanie modułów
 
@@ -77,7 +77,7 @@ Najpierw utwórz plik UTF-8 `message.txt` obok źródła. Brak pliku lub nieudan
 
 ## Utrzymywanie dokumentacji
 
-Metadane publicznego interfejsu znajdują się w [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Są sprawdzane razem z implementacjami i kontraktami. Witryna utrzymuje obecnie ręcznie redagowany opis; nie potwierdzono istniejącego polecenia `ku doc`.
+Metadane publicznego interfejsu znajdują się w [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Są sprawdzane razem z implementacjami i kontraktami. Witryna utrzymuje obecnie ręcznie redagowany opis; nie potwierdzono istniejącego polecenia `ku doc`.
 
 ## API reference (English)
 

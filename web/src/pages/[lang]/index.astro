@@ -10,6 +10,7 @@ export function getStaticPaths() {
 }
 const lang = Astro.params.lang as Locale;
 const t = translate(lang);
+const performanceReport = `${project.repository}/blob/v${project.version}/docs/performance-v0.0.19${lang === 'zh-cn' ? '' : '.en'}.md`;
 const json =
   'import json from "std.json"\n\nfn main(): null! {\n    message = { language: "Ku", hello: "world" }\n    text = json.stringify(message)?\n    println(text)\n    return ok(null)\n}';
 const resourceLabels = [
@@ -100,7 +101,9 @@ const resourceLabels = [
             <span class="status-dot"></span>
             {t.interpreter}
           </span>
-          <a href={`${project.repository}/blob/v0.0.18/examples/hello.ku`}>
+          <a
+            href={`${project.repository}/blob/v${project.version}/examples/hello.ku`}
+          >
             {t.viewSource} ↗
           </a>
         </div>
@@ -175,6 +178,10 @@ const resourceLabels = [
         </article>
       ))}
       <p class="example-note">{t.performanceLimits}</p>
+      <a class="text-link" href={performanceReport}>
+        {t.performanceTitle}
+        <span aria-hidden="true">↗</span>
+      </a>
     </div>
   </section>
   <section class="in-practice shell" aria-labelledby="practice-title">

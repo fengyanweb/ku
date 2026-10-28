@@ -56,17 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Osservazioni sulle prestazioni",
-  "performanceScope": "Misure di una build di sviluppo: Sette coppie di finestre di misura di un carico specifico HTTP e CPU su Linux ARM64, rispetto a una configurazione Rust di riferimento a bassa memoria. I valori sono stime puntuali delle medie geometriche dei rapporti.",
+  "performanceTitle": "Osservazioni a carico fisso",
+  "performanceScope": "0.0.19: un solo ciclo sequenziale di sette linguaggi in una VM Linux ARM64, con quattro core CPU per servizio e 30 secondi per carico. I valori confrontano il tempo CPU del servizio per richiesta corretta (Ku/Rust), non la latenza delle richieste.",
   "performanceMetrics": [
-    [
-      "Costo CPU per richiesta corretta",
-      "Circa il 33% in meno",
-      "Ku/Rust ≈ 0.671"
-    ],
-    ["RSS del processo a regime", "Circa il 65% in meno", "Ku/Rust ≈ 0.351"]
+    ["Carico CPU — costo CPU", "Circa il 32% in meno", "Ku/Rust ≈ 0.678"],
+    ["Carico JSON — costo CPU", "Circa il 26% in più", "Ku/Rust ≈ 1.260"],
+    ["Carico PG — costo CPU", "Circa il 35% in più", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Non tutti i criteri di qualificazione del confronto e gli obiettivi di latenza sono stati soddisfatti. Queste osservazioni non dimostrano guadagni di throughput massimo, una classifica generale dei linguaggi o idoneità alla produzione.",
+  "performanceLimits": "Un solo ciclo non costituisce una verifica di capacità o stabilità a lungo termine. Restano la paginazione dell’host e le latenze di coda lunga. La semantica di reset dei pool PG è diversa. In questo ciclo è stata misurata la memoria cgroup, non RSS; non viene fornito un confronto RSS.",
   "practiceTitle": ["Dati familiari.", "Errori espliciti."],
   "practiceDescription": "Importa un modulo, crea un valore e codificalo come JSON. L'operatore ? propaga gli errori invece di nasconderli.",
   "jsonReference": "Leggi il riferimento JSON",
@@ -98,11 +95,11 @@
   "projectTitle": "Un lavoro in corso. Una storia da seguire.",
   "projectDescription": "Ku v{releasedVersion} è ancora in sviluppo. Un candidato di deployment Linux ARM64 è stato provato con un esempio isolato; l’uso in produzione per un’attività reale non è stato validato. Valuta i tuoi programmi e invia feedback. Gli artefatti pubblicati sono in GitHub Releases.",
   "github": "Esplora su GitHub",
-  "license": "Il codice sorgente è consultabile. Non è stata concessa una licenza open source.",
+  "license": "Licenza Apache-2.0. Consulta LICENSE e NOTICE.",
   "verified": "Verificato",
   "limitations": "Supporto e limiti",
   "version": "Versione della documentazione",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Istantanea {version}",
   "snapshotNotice": "Istantanea archiviata della documentazione. È conservata indipendentemente dalla documentazione di sviluppo attuale; non annuncia un rilascio di binari.",
   "nextNotice": "Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v{currentVersion}. La pubblicazione effettiva e i download sono registrati in GitHub Releases.",

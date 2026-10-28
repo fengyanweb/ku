@@ -56,21 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Observations de performance",
-  "performanceScope": "Mesures d’une version de développement : Sept paires de fenêtres de mesure d’une charge HTTP et CPU définie sur Linux ARM64, comparées à une configuration Rust de référence à faible mémoire. Il s’agit d’estimations ponctuelles de moyennes géométriques des rapports.",
+  "performanceTitle": "Observations à charge fixe",
+  "performanceScope": "0.0.19 : un seul tour séquentiel de sept langages dans une VM Linux ARM64, avec quatre cœurs CPU par service et 30 secondes par charge. Les valeurs comparent le temps CPU du service par requête correcte (Ku/Rust), et non la latence des requêtes.",
   "performanceMetrics": [
-    [
-      "Coût CPU par requête correcte",
-      "Environ 33 % de moins",
-      "Ku/Rust ≈ 0.671"
-    ],
-    [
-      "RSS du processus en régime stable",
-      "Environ 65 % de moins",
-      "Ku/Rust ≈ 0.351"
-    ]
+    ["Charge CPU — coût CPU", "Environ 32 % de moins", "Ku/Rust ≈ 0.678"],
+    ["Charge JSON — coût CPU", "Environ 26 % de plus", "Ku/Rust ≈ 1.260"],
+    ["Charge PG — coût CPU", "Environ 35 % de plus", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Tous les critères de qualification de la comparaison et objectifs de latence ne sont pas atteints. Ces observations ne prouvent ni un gain de débit maximal, ni un classement global des langages, ni une aptitude à la production.",
+  "performanceLimits": "Un seul tour ne constitue pas une validation de capacité ni de stabilité à long terme. La pagination de l’hôte et les latences extrêmes persistent. La sémantique de réinitialisation des pools PG diffère. Cette fois, la mémoire mesurée est celle du cgroup, pas le RSS ; aucune comparaison de RSS n’est présentée.",
   "practiceTitle": ["Données familières.", "Erreurs explicites."],
   "practiceDescription": "Importez un module, construisez une valeur et encodez-la en JSON. L'opérateur ? propage les erreurs au lieu de les masquer.",
   "jsonReference": "Lire la référence JSON",
@@ -106,11 +99,11 @@
   "projectTitle": "Un projet en cours. Une histoire à suivre.",
   "projectDescription": "Ku v{releasedVersion} est toujours en développement. Un candidat de déploiement Linux ARM64 a été testé avec un exemple isolé ; l’usage en production pour une activité réelle n’a pas été validé. Évaluez vos programmes et partagez vos retours. Les artefacts publiés figurent dans GitHub Releases.",
   "github": "Explorer sur GitHub",
-  "license": "Les sources sont consultables. Aucune licence open source n'a été accordée.",
+  "license": "Sous licence Apache-2.0. Voir LICENSE et NOTICE.",
   "verified": "Vérifié",
   "limitations": "Prise en charge et limites",
   "version": "Version de la documentation",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Instantané {version}",
   "snapshotNotice": "Instantané archivé de la documentation. Il est conservé indépendamment de la documentation de développement actuelle ; il n'annonce pas de publication de binaires.",
   "nextNotice": "Cette documentation décrit le périmètre figé de la préversion expérimentale v{currentVersion}. La publication effective et les téléchargements sont consignés dans GitHub Releases.",

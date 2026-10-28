@@ -1,7 +1,7 @@
 ---
 title: '词法与语法调试'
 description: 'lexer.scan 与 parser.parse 调试接口。'
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/mod.rs', 'src/stdlib/metadata.rs']
 sidebar:

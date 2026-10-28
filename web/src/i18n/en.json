@@ -56,13 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Performance observations",
-  "performanceScope": "Development-build measurements: Seven paired windows of a specified HTTP and CPU workload on Linux ARM64, compared with a Rust low-memory reference configuration. Figures are geometric-mean ratio point estimates.",
+  "performanceTitle": "Fixed-load observations",
+  "performanceScope": "0.0.19: one sequential round across seven languages in a Linux ARM64 VM, with four CPU cores per service and 30 seconds per workload. Values compare service CPU time per correct request (Ku/Rust), not request latency.",
   "performanceMetrics": [
-    ["CPU cost per correct request", "About 33% lower", "Ku/Rust ≈ 0.671"],
-    ["Steady process RSS", "About 65% lower", "Ku/Rust ≈ 0.351"]
+    ["CPU workload — CPU cost", "About 32% lower", "Ku/Rust ≈ 0.678"],
+    ["JSON workload — CPU cost", "About 26% higher", "Ku/Rust ≈ 1.260"],
+    ["PG workload — CPU cost", "About 35% higher", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Comparison qualification and latency targets have not all passed. These observations do not establish peak throughput gains, an overall language ranking or production readiness.",
+  "performanceLimits": "A single round is not capacity or long-term acceptance. Host paging and long-tail latency remain. PG pool-reset semantics differ. This round measured cgroup memory, not RSS; no RSS comparison is made.",
   "practiceTitle": ["Familiar data.", "Explicit errors."],
   "practiceDescription": "Import a module, build a value, and encode it as JSON. The ? operator propagates errors instead of hiding them.",
   "jsonReference": "Read the JSON reference",
@@ -98,7 +99,7 @@
   "projectTitle": "A work in progress. A story to follow.",
   "projectDescription": "Ku v{releasedVersion} remains in development. A Linux ARM64 deployment candidate has been rehearsed with an isolated sample; real-business production use has not been validated. Evaluate it with your own programs and share feedback. Published artifacts are listed in GitHub Releases.",
   "github": "Explore on GitHub",
-  "license": "Source is available to view. No open-source license has been granted.",
+  "license": "Licensed under Apache-2.0. See LICENSE and NOTICE.",
   "verified": "Verified",
   "limitations": "Support & limitations",
   "version": "Documentation version",

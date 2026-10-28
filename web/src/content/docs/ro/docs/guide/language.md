@@ -1,7 +1,7 @@
 ---
 title: 'Ghidul limbajului'
 description: 'Învață variabilele, funcțiile, controlul execuției, proprietatea, modulele și erorile recuperabile Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Ghidul introduce sintaxa de bază. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) și [contractul semantic](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) ale depozitului rămân normative. Acestea sunt fragmente didactice; diferențele sunt descrise la [suportul backendurilor](/ro/docs/support/).
+Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Ghidul introduce sintaxa de bază. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) și [contractul semantic](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) ale depozitului rămân normative. Acestea sunt fragmente didactice; diferențele sunt descrise la [suportul backendurilor](/ro/docs/support/).
 
 ## Variabile și tipuri
 

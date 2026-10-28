@@ -1,9 +1,21 @@
 ---
 title: HTTP
 description: 创建 HTTP 服务、注册路由、调用接口，以及处理请求、响应、超时和容量限制。
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
-sources: ['src/stdlib/http.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
+sources:
+  [
+    'src/stdlib/http.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'src/backend/c_http_runtime.c',
+    'src/backend/c_task_http.rs',
+    'src/ir/task_lower.rs',
+    'src/service_supervision.rs',
+    'src/ir/mod.rs',
+    'src/backend/c.rs',
+    'tests/native_http_test.rs',
+  ]
 sidebar:
   order: 8
 ---
@@ -182,18 +194,18 @@ serviceUnavailable=503, gatewayTimeout=504
 | `handler_timeout_ms`     |     15,000 |       300,000 | handler 期限，起算点见下文   |
 | `max_body_bytes`         |  1,000,000 |    16,777,216 | 请求体                       |
 | `max_header_bytes`       |     16,384 |        65,536 | 请求 header                  |
-| `max_connections`        |      1,024 |         4,096 | 在线连接                     |
-| `max_active_requests`    |        256 |         1,024 | 活动请求槽位                 |
+| `max_connections`        |      1,024 |        32,768 | 在线连接                     |
+| `max_active_requests`    |        256 |        16,384 | 活动请求槽位                 |
 | `max_pending_requests`   |      1,024 |         8,192 | 等待中的请求                 |
 | `max_buffer_bytes`       | 67,108,864 | 1,073,741,824 | 每个 listener 的受控传输缓冲 |
 
-解释器从完整请求准备就绪时开始计算 `handler_timeout_ms`，等待执行也占用这段时间；native C 在调用匹配到的 handler 前开始计时，不包括此前的排队时间。它不是客户端观察到的端到端超时。
+解释器从完整请求准备就绪时计算 `handler_timeout_ms`，等待执行也占用预算。native C 在派发前开始 handler 阶段计时，同时从首次观察到请求字节起保留原始请求总期限。环境变量 `KU_HTTP_REQUEST_TIMEOUT_MS` 配置 native 总预算（默认 30,000 ms，最大 300,000 ms），它不是 `http.service` 对象字段。async handler/PG 的有效期限不超过原始请求期限，不因准入、排队或取连接刷新。首字节观察时刻不等于数据包到达时刻，也不是客户端端到端时钟。
 
 native runtime 的 handler worker 另外最多为 64 个。传输缓冲预算不是整个进程、用户堆、线程栈、内核 socket 缓冲或外部库内存的上限。
 
 运行时对坏请求返回 400、缺失路由 404、路径存在但方法不匹配 405、请求体过大 413、请求目标超过 8,192 字节 414、header 过大 431、准入或缓冲额度耗尽 503、handler 期限到达 504。native 的期限检查是协作式的，在循环和 Ku 调用返回点检查，不能强行中断任意阻塞的外部调用。增加期限不能修复停顿的 handler。
 
-HTTP/1.1 支持连接复用及按顺序返回流水线响应。请求包含 `Connection: close`、返回 4xx/5xx、协议出错或空闲期限到达时关闭连接。当前没有流式响应、SSE、WebSocket 或公开的优雅停止接口。部署前请阅读[执行路径与已知问题](/zh-cn/docs/support/)。
+HTTP/1.1 支持连接复用及按顺序返回流水线响应。请求包含 `Connection: close`、返回 4xx/5xx、协议出错或空闲期限到达时关闭连接。当前没有流式响应、SSE、WebSocket 或公开 `app.stop()` 方法。受监督 native 服务可通过 `ku service` 使用认证的健康/排空控制，与 listener 的 `close()` 不同。部署前请阅读[执行路径与已知问题](/zh-cn/docs/support/)。
 
 ## 只绑定，不启动
 
@@ -215,7 +227,7 @@ listener 持有绑定的 socket，直到开始运行、显式关闭或最后一�
 
 ## 执行支持
 
-`ku run` 和默认打包 runner 支持上面的完整服务端、客户端示例。同步 native C 支持 `app.listen(...)` 和 `text/html/empty/redirect` 响应，不支持 `http.json`、`http.statusText`、模块级 HTTP 客户端及 `bind/run/close`。native Task 和 LLVM 不提供本页完整接口。
+`ku run` 和默认打包 runner 支持上面的完整服务端、客户端示例。同步 native C 支持 `app.listen(...)` 和 `text/html/json/empty/redirect` 响应。`http.json(value)`、`http.json(status, value)` 使用同步 JSON writer，设置 `application/json; charset=utf-8`，返回响应而非 Result；状态非法或编码不支持时 handler 失败（500），不是普通可恢复 Result。native C 不支持 `http.statusText`、模块级 HTTP 客户端及 `bind/run/close`。具名 async native handler 使用下文受限路径，不提供上面的完整接口；LLVM 不提供本 HTTP 库。
 
 需要编译为 native C 时，保存下列服务为 `native-server.ku`。这个版本的 `/users/42` 返回纯文本 `42`：
 
@@ -243,3 +255,35 @@ ku build --native native-server.ku -o native-server
 ```
 
 Windows 使用 `-o native-server.exe` 并执行 `.\native-server.exe`。可沿用前面的 curl 命令调用，结束时按 Ctrl+C。不要同时让两个示例占用 8080 端口。
+
+## 具名 async native handler
+
+以下独立示例使用具名 async handler。保存为 `async-server.ku`，检查后用 native C 后端编译，不使用解释器运行：
+
+```ku
+import http from "std.http"
+
+fn main(): null! {
+    async fn health(): HttpResponse! {
+        return ok(http.text("ready"))
+    }
+    app = http.service({
+        max_connections: 64,
+        max_active_requests: 16,
+        max_pending_requests: 32
+    })
+    app.get("/health", health)
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+```
+
+```sh
+ku check async-server.ku
+ku build --backend c --profile release async-server.ku -o async-server
+./async-server
+```
+
+`curl http://127.0.0.1:8080/health` 预期返回 `ready`。运行其他同端口示例前先 Ctrl+C 停止当前程序；Windows 输出名使用 `.exe`。
+
+`HttpRequest` 与 `HttpResponse` 注解适用于这条 native HTTP 路径。`HttpResponse!` 通过 Result 传播错误，运行时管理准入、handler Task 与响应生命周期。这不代表任意资源句柄、动态闭包或所有标准库操作都可放进 Task。解释器拒绝 async HTTP handler。这些 async handler 的响应构造限于 `text/html/empty/redirect`；只读 PG client 捕获的受限路径见[数据库示例](/zh-cn/docs/stdlib/database/#async-pg)。

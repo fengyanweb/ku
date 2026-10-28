@@ -56,21 +56,18 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Observații de performanță",
-  "performanceScope": "Măsurători ale unei versiuni de dezvoltare: Șapte perechi de ferestre de măsurare pentru o sarcină specifică HTTP și CPU pe Linux ARM64, comparate cu o configurație Rust de referință cu memorie redusă. Valorile sunt estimări punctuale ale mediilor geometrice ale rapoartelor.",
+  "performanceTitle": "Observații la sarcină fixă",
+  "performanceScope": "0.0.19: o singură rundă secvențială pentru șapte limbaje într-o VM Linux ARM64, cu patru nuclee CPU pe serviciu și 30 de secunde pe sarcină. Valorile compară timpul CPU al serviciului pe cerere corectă (Ku/Rust), nu latența cererilor.",
   "performanceMetrics": [
+    ["Sarcină CPU — cost CPU", "Cu aproximativ 32% mai mic", "Ku/Rust ≈ 0.678"],
     [
-      "Cost CPU per cerere corectă",
-      "Cu aproximativ 33% mai mic",
-      "Ku/Rust ≈ 0.671"
+      "Sarcină JSON — cost CPU",
+      "Cu aproximativ 26% mai mare",
+      "Ku/Rust ≈ 1.260"
     ],
-    [
-      "RSS al procesului în regim stabil",
-      "Cu aproximativ 65% mai mic",
-      "Ku/Rust ≈ 0.351"
-    ]
+    ["Sarcină PG — cost CPU", "Cu aproximativ 35% mai mare", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Nu au fost îndeplinite toate criteriile de calificare a comparației și obiectivele de latență. Observațiile nu demonstrează creșterea debitului maxim, un clasament general al limbajelor sau pregătirea pentru producție.",
+  "performanceLimits": "O singură rundă nu reprezintă o validare a capacității sau a stabilității pe termen lung. Paginarea gazdei și latențele de coadă lungă persistă. Semantica resetării pool-urilor PG diferă. În această rundă s-a măsurat memoria cgroup, nu RSS; nu se prezintă o comparație RSS.",
   "practiceTitle": ["Date familiare.", "Erori explicite."],
   "practiceDescription": "Importă un modul, construiește o valoare și codific-o în JSON. Operatorul ? propagă erorile în loc să le ascundă.",
   "jsonReference": "Citește referința JSON",
@@ -106,11 +103,11 @@
   "projectTitle": "O lucrare în curs. O poveste de urmărit.",
   "projectDescription": "Ku v{releasedVersion} este încă în dezvoltare. Un candidat de instalare Linux ARM64 a fost exersat cu un exemplu izolat; utilizarea în producție pentru o activitate reală nu a fost validată. Evaluează propriile programe și trimite feedback. Artefactele publicate se află în GitHub Releases.",
   "github": "Explorează pe GitHub",
-  "license": "Sursa poate fi consultată. Nu a fost acordată o licență open source.",
+  "license": "Licență Apache-2.0. Consultați LICENSE și NOTICE.",
   "verified": "Verificat",
   "limitations": "Suport și limite",
   "version": "Versiunea documentației",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Instantaneu {version}",
   "snapshotNotice": "Instantaneu arhivat al documentației. Este păstrat independent de documentația curentă de dezvoltare; nu anunță o lansare binară.",
   "nextNotice": "Documentația descrie domeniul fixat al prelansării experimentale v{currentVersion}. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases.",

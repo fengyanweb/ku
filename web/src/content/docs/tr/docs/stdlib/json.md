@@ -1,7 +1,7 @@
 ---
 title: 'JSON başvurusu'
 description: 'Ku JSON kodlama, çözme, KuValue dönüşümü, hata kodları ve arka uç desteği.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Değerleri kodlama ve okuma
 
-Bu tam bir temel örnektir. Geliştirme dalında [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku) içinde daha kapsamlı bir regresyon örneği vardır.
+Bu tam bir temel örnektir. Geliştirme dalında [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku) içinde daha kapsamlı bir regresyon örneği vardır.
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ Kurtarılabilir hatalar `json` etki alanını kullanır. Yaygın kodlar `parse_e
 
 Yorumlayıcı, varsayılan paketlenmiş çalıştırıcı ve eşzamanlı yerel C arka ucu JSON uygulamalarına sahiptir. **Sınırlı yerel Task alt kümesi ve LLVM, JSON desteklemez.** Varsayılan çalıştırıcının içe aktarmaları kaynak konumlarına bağımlıdır; JSON desteği tamamen bağımsız paket anlamına gelmez.
 
-Bu sayfadaki imzalar ve sınırlar kaynak kod ve sözleşmelerle karşılaştırıldı. Yürütme doğrulaması sürüm, commit ve arka uç belirtmelidir. Tam [JSON sözdizimi sözleşmesine](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json) bakın.
+Bu sayfadaki imzalar ve sınırlar kaynak kod ve sözleşmelerle karşılaştırıldı. Yürütme doğrulaması sürüm, commit ve arka uç belirtmelidir. Tam [JSON sözdizimi sözleşmesine](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json) bakın.

@@ -1,0 +1,5648 @@
+{
+  "schema": "ku-v0.0.19-public-single-round-v1",
+  "date_utc": "2026-10-28",
+  "scope": "one strictly serial fixed-arrival-rate diagnostic; not maximum capacity, seven-round formal acceptance, 30-minute stability acceptance or production certification",
+  "candidate_commit": "d8c33bca3c629ce82d0d35709c6931f16c86d05b",
+  "later_release_source_equivalence": {
+    "runtime_compiler_inputs_unchanged": true,
+    "confirmation": "Coordinator verified no changes since candidate in src, crates, Cargo.toml, Cargo.lock and build.rs; later documentation/packaging/test-contract metadata is separate. Final release artifact identity is still reported by the release process."
+  },
+  "raw_evidence_archive_sha256": "5eafab92a5ae4addb2b84d3230e3d771682ba6d28eb5c99fe8c3d2bc90695709",
+  "raw_publication": "withheld: raw archive contains temporary database connection information; this file exports allowlisted aggregates only",
+  "summary_sha256": "df15f4190553df1cfd67a345de96062d9ad2de4f057343b436553a17c084bbb4",
+  "plan": {
+    "stacks": [
+      "ku",
+      "go",
+      "rust",
+      "node",
+      "java",
+      "dotnet",
+      "cpp"
+    ],
+    "cases_rps": {
+      "ok": 2000,
+      "json_object": 500,
+      "cpu": 80,
+      "db": 200
+    },
+    "warmup_seconds_per_case": 10,
+    "measurement_seconds_per_case": 30,
+    "driver_concurrency": 256,
+    "keepalive_idle_ms": 500,
+    "absolute_request_timeout_seconds": 3,
+    "service": {
+      "cores": 4,
+      "cpuset": "0-3",
+      "memory_bytes": 1073741824,
+      "swap_max_bytes": 0
+    },
+    "driver": {
+      "cores": 3,
+      "cpuset": "4-6",
+      "memory_bytes": 1073741824
+    },
+    "database": {
+      "cores": 1,
+      "cpuset": "7",
+      "memory_bytes": 536870912
+    },
+    "stack_order": "ku,go,rust,node,java,dotnet,cpp; each exits before next starts; no frozen previous service"
+  },
+  "windows": [
+    {
+      "stack": "ku",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 44.455600000000004,
+      "service_cpu_seconds": 2.667336,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.42,
+      "client_max_ms": 10.550527,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 4288512.0,
+      "cgroup_memory_observed_peak_bytes": 4546560,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 23,
+      "threads_max": 23,
+      "fd_sample_max": 34,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.23,
+      "schedule_to_attempt_max_ms": 5.09566,
+      "schedule_to_written_p99_bucket_upper_ms": 1.24,
+      "cold_count": 52,
+      "reused_count": 59948,
+      "largest_correct_request": {
+        "request_index": 28878,
+        "scheduled_offset_ms": 14439.0,
+        "latency_ns": 10550527,
+        "scheduled_to_attempt_ms": 1.137584,
+        "attempt_to_request_written_ms": 5.059757,
+        "request_written_to_complete_ms": 4.353186,
+        "connection_reused": "false",
+        "dial_ms": 0.268729,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4210688,
+        "memory_current_max_bytes": 4276224,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 109124,
+        "cpu_psi_full_us_delta": 108959
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4231168,
+        "memory_current_max_bytes": 4546560,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 102455,
+        "cpu_psi_full_us_delta": 102291
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 36839424,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 408167,
+        "cpu_psi_full_us_delta": 353574
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 86315008,
+        "memory_current_max_bytes": 86876160,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 755,
+        "io_psi_full_us_delta": 754,
+        "cpu_psi_some_us_delta": 7783,
+        "cpu_psi_full_us_delta": 4118
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2667336
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5535218
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 26,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 50304
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.06090668251214485,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3490430976,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:13:22.253628+00:00",
+        "sampled_end_utc": "2026-10-28T18:13:47.504395+00:00",
+        "covered_seconds": 25.250767,
+        "swapin_pages_delta": 4328,
+        "swapout_pages_delta": 5600,
+        "swapin_bytes_delta": 70909952,
+        "swapout_bytes_delta": 91750400,
+        "pageins_delta_separate": 10315,
+        "pageouts_delta_separate": 284
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/ku/measure/ok/client.json",
+        "resources": "results/current-serial/ku/measure/ok/resources.json",
+        "events": "results/current-serial/ku/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "ku",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 180.15413333333333,
+      "service_cpu_seconds": 2.702312,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 8.72,
+      "client_max_ms": 219.77301,
+      "over100ms": 57,
+      "over20ms": 109,
+      "over_workload_slo": 57,
+      "cgroup_memory_middle60_median_bytes": 4726784.0,
+      "cgroup_memory_observed_peak_bytes": 4984832,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 23,
+      "threads_max": 23,
+      "fd_sample_max": 123,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.6,
+      "schedule_to_attempt_max_ms": 141.75597,
+      "schedule_to_written_p99_bucket_upper_ms": 2.62,
+      "cold_count": 133,
+      "reused_count": 14867,
+      "largest_correct_request": {
+        "request_index": 2737,
+        "scheduled_offset_ms": 5474.0,
+        "latency_ns": 219773010,
+        "scheduled_to_attempt_ms": 42.874986,
+        "attempt_to_request_written_ms": 0.025886,
+        "request_written_to_complete_ms": 176.872138,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4653056,
+        "memory_current_max_bytes": 4718592,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 251655,
+        "cpu_psi_full_us_delta": 146316
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4435968,
+        "memory_current_max_bytes": 4984832,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 246977,
+        "cpu_psi_full_us_delta": 141638
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 28311552,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 442673,
+        "cpu_psi_full_us_delta": 356100
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 87695360,
+        "memory_current_max_bytes": 89468928,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 11091,
+        "io_psi_full_us_delta": 11092,
+        "cpu_psi_some_us_delta": 16191,
+        "cpu_psi_full_us_delta": 10432
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2702312
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 1,
+            "throttled_usec": 44,
+            "usage_usec": 5857881
+          },
+          "max_interval_throttled_us": 44
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 127,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 179806
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.06454707513630177,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3494850560,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:14:02.661610+00:00",
+        "sampled_end_utc": "2026-10-28T18:14:27.953323+00:00",
+        "covered_seconds": 25.291713,
+        "swapin_pages_delta": 4671,
+        "swapout_pages_delta": 3076,
+        "swapin_bytes_delta": 76529664,
+        "swapout_bytes_delta": 50397184,
+        "pageins_delta_separate": 6683,
+        "pageouts_delta_separate": 340
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/ku/measure/json_object/client.json",
+        "resources": "results/current-serial/ku/measure/json_object/resources.json",
+        "events": "results/current-serial/ku/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "ku",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 2608.1066666666666,
+      "service_cpu_seconds": 6.259456,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 6.28,
+      "client_max_ms": 10.259511,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 4702208.0,
+      "cgroup_memory_observed_peak_bytes": 4960256,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 23,
+      "threads_max": 23,
+      "fd_sample_max": 21,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.38,
+      "schedule_to_attempt_max_ms": 2.986568,
+      "schedule_to_written_p99_bucket_upper_ms": 2.54,
+      "cold_count": 1,
+      "reused_count": 2399,
+      "largest_correct_request": {
+        "request_index": 293,
+        "scheduled_offset_ms": 3662.5,
+        "latency_ns": 10259511,
+        "scheduled_to_attempt_ms": 2.40343,
+        "attempt_to_request_written_ms": 1.293972,
+        "request_written_to_complete_ms": 6.562109,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4694016,
+        "memory_current_max_bytes": 4698112,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 22565,
+        "cpu_psi_full_us_delta": 22565
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4702208,
+        "memory_current_max_bytes": 4960256,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 21480,
+        "cpu_psi_full_us_delta": 21480
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 17080320,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 67225,
+        "cpu_psi_full_us_delta": 57269
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 90341376,
+        "memory_current_max_bytes": 92557312,
+        "threads_min": 7,
+        "threads_max": 8,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 8067,
+        "io_psi_full_us_delta": 8067,
+        "cpu_psi_some_us_delta": 11284,
+        "cpu_psi_full_us_delta": 4646
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 6259456
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1148961
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 133,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 147617
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.012669486615267527,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3514916864,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:14:43.165437+00:00",
+        "sampled_end_utc": "2026-10-28T18:15:08.518492+00:00",
+        "covered_seconds": 25.353055,
+        "swapin_pages_delta": 3484,
+        "swapout_pages_delta": 516,
+        "swapin_bytes_delta": 57081856,
+        "swapout_bytes_delta": 8454144,
+        "pageins_delta_separate": 8216,
+        "pageouts_delta_separate": 264
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/ku/measure/cpu/client.json",
+        "resources": "results/current-serial/ku/measure/cpu/resources.json",
+        "events": "results/current-serial/ku/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "ku",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 358.0821666666667,
+      "service_cpu_seconds": 2.148493,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 4.06,
+      "client_max_ms": 230.508978,
+      "over100ms": 24,
+      "over20ms": 41,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 5163008.0,
+      "cgroup_memory_observed_peak_bytes": 5656576,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 23,
+      "threads_max": 23,
+      "fd_sample_max": 64,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.31,
+      "schedule_to_attempt_max_ms": 36.882425,
+      "schedule_to_written_p99_bucket_upper_ms": 1.61,
+      "cold_count": 39,
+      "reused_count": 5961,
+      "largest_correct_request": {
+        "request_index": 0,
+        "scheduled_offset_ms": 0.0,
+        "latency_ns": 230508978,
+        "scheduled_to_attempt_ms": 0.070545,
+        "attempt_to_request_written_ms": 14.148013,
+        "request_written_to_complete_ms": 216.29042,
+        "connection_reused": "false",
+        "dial_ms": 13.779997,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4702208,
+        "memory_current_max_bytes": 5132288,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 127547,
+        "cpu_psi_full_us_delta": 124912
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 5136384,
+        "memory_current_max_bytes": 5656576,
+        "threads_min": 23,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 121339,
+        "cpu_psi_full_us_delta": 121340
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 23056384,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 180632,
+        "cpu_psi_full_us_delta": 164335
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92356608,
+        "memory_current_max_bytes": 100265984,
+        "threads_min": 7,
+        "threads_max": 12,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 42029,
+        "io_psi_full_us_delta": 10584,
+        "cpu_psi_some_us_delta": 271467,
+        "cpu_psi_full_us_delta": 107980
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2148452
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2584780
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 1,
+            "throttled_usec": 1106,
+            "usage_usec": 1935996
+          },
+          "max_interval_throttled_us": 1106
+        }
+      ],
+      "driver_average_quota_fraction": 0.028491215968603854,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3487092736,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:15:23.730167+00:00",
+        "sampled_end_utc": "2026-10-28T18:15:49.103887+00:00",
+        "covered_seconds": 25.37372,
+        "swapin_pages_delta": 1718,
+        "swapout_pages_delta": 1208,
+        "swapin_bytes_delta": 28147712,
+        "swapout_bytes_delta": 19791872,
+        "pageins_delta_separate": 5037,
+        "pageouts_delta_separate": 152
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/ku/measure/db/client.json",
+        "resources": "results/current-serial/ku/measure/db/resources.json",
+        "events": "results/current-serial/ku/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "go",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 82.7431,
+      "service_cpu_seconds": 4.964586,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 3.12,
+      "client_max_ms": 170.687563,
+      "over100ms": 170,
+      "over20ms": 365,
+      "over_workload_slo": 170,
+      "cgroup_memory_middle60_median_bytes": 9535488.0,
+      "cgroup_memory_observed_peak_bytes": 14778368,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 10,
+      "threads_max": 10,
+      "fd_sample_max": 264,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.3,
+      "schedule_to_attempt_max_ms": 95.82111,
+      "schedule_to_written_p99_bucket_upper_ms": 1.39,
+      "cold_count": 351,
+      "reused_count": 59649,
+      "largest_correct_request": {
+        "request_index": 39208,
+        "scheduled_offset_ms": 19604.0,
+        "latency_ns": 170687563,
+        "scheduled_to_attempt_ms": 10.913095,
+        "attempt_to_request_written_ms": 18.801569,
+        "request_written_to_complete_ms": 140.972899,
+        "connection_reused": "false",
+        "dial_ms": 18.779022,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 8458240,
+        "memory_current_max_bytes": 9011200,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 308543,
+        "cpu_psi_full_us_delta": 226327
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 8523776,
+        "memory_current_max_bytes": 14778368,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 289577,
+        "cpu_psi_full_us_delta": 210770
+      },
+      "driver_sample_pressure": {
+        "samples": 32,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 43446272,
+        "threads_min": 0,
+        "threads_max": 9,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 545325,
+        "cpu_psi_full_us_delta": 422007
+      },
+      "database_sample_pressure": {
+        "samples": 32,
+        "memory_current_min_bytes": 92221440,
+        "memory_current_max_bytes": 92454912,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 4622,
+        "cpu_psi_full_us_delta": 53
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 304,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 4964586
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 6224216
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 8,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 33727
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.06833855871681246,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3474751488,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:16:19.476910+00:00",
+        "sampled_end_utc": "2026-10-28T18:16:44.708421+00:00",
+        "covered_seconds": 25.231511,
+        "swapin_pages_delta": 1286,
+        "swapout_pages_delta": 4248,
+        "swapin_bytes_delta": 21069824,
+        "swapout_bytes_delta": 69599232,
+        "pageins_delta_separate": 5514,
+        "pageouts_delta_separate": 119
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/go/measure/ok/client.json",
+        "resources": "results/current-serial/go/measure/ok/resources.json",
+        "events": "results/current-serial/go/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "go",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 272.3994,
+      "service_cpu_seconds": 4.085991,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.73,
+      "client_max_ms": 10.07639,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 8751104.0,
+      "cgroup_memory_observed_peak_bytes": 9203712,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 10,
+      "threads_max": 10,
+      "fd_sample_max": 13,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.13,
+      "schedule_to_attempt_max_ms": 6.958193,
+      "schedule_to_written_p99_bucket_upper_ms": 1.16,
+      "cold_count": 16,
+      "reused_count": 14984,
+      "largest_correct_request": {
+        "request_index": 14227,
+        "scheduled_offset_ms": 28454.0,
+        "latency_ns": 10076390,
+        "scheduled_to_attempt_ms": 4.41435,
+        "attempt_to_request_written_ms": 4.842115,
+        "request_written_to_complete_ms": 0.819925,
+        "connection_reused": "false",
+        "dial_ms": 0.463599,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 8646656,
+        "memory_current_max_bytes": 8966144,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 197824,
+        "cpu_psi_full_us_delta": 193630
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 8658944,
+        "memory_current_max_bytes": 9203712,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 189655,
+        "cpu_psi_full_us_delta": 185680
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 27545600,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 413973,
+        "cpu_psi_full_us_delta": 393019
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92221440,
+        "memory_current_max_bytes": 92221440,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 6050,
+        "cpu_psi_full_us_delta": 1490
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 4085991
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5416047
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 7,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 50188
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.059692986956636884,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3495272448,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:16:59.874835+00:00",
+        "sampled_end_utc": "2026-10-28T18:17:25.182926+00:00",
+        "covered_seconds": 25.308091,
+        "swapin_pages_delta": 1483,
+        "swapout_pages_delta": 2316,
+        "swapin_bytes_delta": 24297472,
+        "swapout_bytes_delta": 37945344,
+        "pageins_delta_separate": 3469,
+        "pageouts_delta_separate": 133
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/go/measure/json_object/client.json",
+        "resources": "results/current-serial/go/measure/json_object/resources.json",
+        "events": "results/current-serial/go/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "go",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 4329.286666666667,
+      "service_cpu_seconds": 10.390288,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 6.72,
+      "client_max_ms": 12.720124,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 9209856.0,
+      "cgroup_memory_observed_peak_bytes": 9641984,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 10,
+      "threads_max": 10,
+      "fd_sample_max": 9,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.08,
+      "schedule_to_attempt_max_ms": 2.421277,
+      "schedule_to_written_p99_bucket_upper_ms": 2.17,
+      "cold_count": 1,
+      "reused_count": 2399,
+      "largest_correct_request": {
+        "request_index": 338,
+        "scheduled_offset_ms": 4224.999999,
+        "latency_ns": 12720124,
+        "scheduled_to_attempt_ms": 2.098883,
+        "attempt_to_request_written_ms": 0.282227,
+        "request_written_to_complete_ms": 10.339014,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 8904704,
+        "memory_current_max_bytes": 8916992,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 100621,
+        "cpu_psi_full_us_delta": 100263
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 8663040,
+        "memory_current_max_bytes": 9641984,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 94212,
+        "cpu_psi_full_us_delta": 93855
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 20279296,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 39197,
+        "cpu_psi_full_us_delta": 34781
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92221440,
+        "memory_current_max_bytes": 92454912,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 4947,
+        "cpu_psi_full_us_delta": 193
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 10390288
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 689385
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 7,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 38020
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.007606748940342739,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3492917248,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:17:40.356539+00:00",
+        "sampled_end_utc": "2026-10-28T18:18:05.622233+00:00",
+        "covered_seconds": 25.265694,
+        "swapin_pages_delta": 832,
+        "swapout_pages_delta": 2084,
+        "swapin_bytes_delta": 13631488,
+        "swapout_bytes_delta": 34144256,
+        "pageins_delta_separate": 2785,
+        "pageouts_delta_separate": 100
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/go/measure/cpu/client.json",
+        "resources": "results/current-serial/go/measure/cpu/resources.json",
+        "events": "results/current-serial/go/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "go",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 571.6788333333334,
+      "service_cpu_seconds": 3.430073,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 15.36,
+      "client_max_ms": 327.338839,
+      "over100ms": 26,
+      "over20ms": 58,
+      "over_workload_slo": 15,
+      "cgroup_memory_middle60_median_bytes": 9164800.0,
+      "cgroup_memory_observed_peak_bytes": 10235904,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 10,
+      "threads_max": 10,
+      "fd_sample_max": 62,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.5,
+      "schedule_to_attempt_max_ms": 94.381679,
+      "schedule_to_written_p99_bucket_upper_ms": 2.78,
+      "cold_count": 45,
+      "reused_count": 5955,
+      "largest_correct_request": {
+        "request_index": 4201,
+        "scheduled_offset_ms": 21005.0,
+        "latency_ns": 327338839,
+        "scheduled_to_attempt_ms": 3.579839,
+        "attempt_to_request_written_ms": 26.763737,
+        "request_written_to_complete_ms": 296.995263,
+        "connection_reused": "false",
+        "dial_ms": 26.220008,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 8937472,
+        "memory_current_max_bytes": 9494528,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 172255,
+        "cpu_psi_full_us_delta": 161132
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 8876032,
+        "memory_current_max_bytes": 10235904,
+        "threads_min": 10,
+        "threads_max": 10,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 167571,
+        "cpu_psi_full_us_delta": 156456
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 23355392,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 207906,
+        "cpu_psi_full_us_delta": 180841
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92221440,
+        "memory_current_max_bytes": 115720192,
+        "threads_min": 7,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 409443,
+        "cpu_psi_full_us_delta": 98494
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 3430073
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2970627
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1796522
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.032706093825885345,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3460657152,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:18:20.794124+00:00",
+        "sampled_end_utc": "2026-10-28T18:18:46.108707+00:00",
+        "covered_seconds": 25.314583,
+        "swapin_pages_delta": 1856,
+        "swapout_pages_delta": 356,
+        "swapin_bytes_delta": 30408704,
+        "swapout_bytes_delta": 5832704,
+        "pageins_delta_separate": 3741,
+        "pageouts_delta_separate": 163
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/go/measure/db/client.json",
+        "resources": "results/current-serial/go/measure/db/resources.json",
+        "events": "results/current-serial/go/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "rust",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 42.88883333333333,
+      "service_cpu_seconds": 2.57333,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.68,
+      "client_max_ms": 16.589964,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 1792000.0,
+      "cgroup_memory_observed_peak_bytes": 2318336,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 5,
+      "threads_max": 5,
+      "fd_sample_max": 44,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.5,
+      "schedule_to_attempt_max_ms": 14.45981,
+      "schedule_to_written_p99_bucket_upper_ms": 1.52,
+      "cold_count": 84,
+      "reused_count": 59916,
+      "largest_correct_request": {
+        "request_index": 36963,
+        "scheduled_offset_ms": 18481.5,
+        "latency_ns": 16589964,
+        "scheduled_to_attempt_ms": 8.1855,
+        "attempt_to_request_written_ms": 0.043561,
+        "request_written_to_complete_ms": 8.360903,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 1187840,
+        "memory_current_max_bytes": 1970176,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 97684,
+        "cpu_psi_full_us_delta": 96813
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 1368064,
+        "memory_current_max_bytes": 2318336,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 92083,
+        "cpu_psi_full_us_delta": 91225
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 37474304,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 467983,
+        "cpu_psi_full_us_delta": 393783
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92459008,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 5089,
+        "cpu_psi_full_us_delta": 33
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2573330
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 6057414
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 10,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 40697
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.0665310301402294,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3489095680,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:19:16.470125+00:00",
+        "sampled_end_utc": "2026-10-28T18:19:41.746481+00:00",
+        "covered_seconds": 25.276356,
+        "swapin_pages_delta": 2281,
+        "swapout_pages_delta": 1804,
+        "swapin_bytes_delta": 37371904,
+        "swapout_bytes_delta": 29556736,
+        "pageins_delta_separate": 3465,
+        "pageouts_delta_separate": 183
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/rust/measure/ok/client.json",
+        "resources": "results/current-serial/rust/measure/ok/resources.json",
+        "events": "results/current-serial/rust/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "rust",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 143.02086666666665,
+      "service_cpu_seconds": 2.145313,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 3.76,
+      "client_max_ms": 126.374987,
+      "over100ms": 6,
+      "over20ms": 100,
+      "over_workload_slo": 6,
+      "cgroup_memory_middle60_median_bytes": 2592768.0,
+      "cgroup_memory_observed_peak_bytes": 2875392,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 5,
+      "threads_max": 5,
+      "fd_sample_max": 56,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.37,
+      "schedule_to_attempt_max_ms": 54.973089,
+      "schedule_to_written_p99_bucket_upper_ms": 1.68,
+      "cold_count": 56,
+      "reused_count": 14944,
+      "largest_correct_request": {
+        "request_index": 4701,
+        "scheduled_offset_ms": 9402.0,
+        "latency_ns": 126374987,
+        "scheduled_to_attempt_ms": 13.516364,
+        "attempt_to_request_written_ms": 66.070383,
+        "request_written_to_complete_ms": 46.78824,
+        "connection_reused": "false",
+        "dial_ms": 63.567189,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 1961984,
+        "memory_current_max_bytes": 2584576,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 123977,
+        "cpu_psi_full_us_delta": 123531
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 1961984,
+        "memory_current_max_bytes": 2875392,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 118560,
+        "cpu_psi_full_us_delta": 118112
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 27893760,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 433643,
+        "cpu_psi_full_us_delta": 364938
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92225536,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 3836,
+        "cpu_psi_full_us_delta": 79
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2145313
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5902461
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 52693
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.06496569886107534,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3496898560,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:19:56.950428+00:00",
+        "sampled_end_utc": "2026-10-28T18:20:22.309123+00:00",
+        "covered_seconds": 25.358695,
+        "swapin_pages_delta": 1132,
+        "swapout_pages_delta": 1784,
+        "swapin_bytes_delta": 18546688,
+        "swapout_bytes_delta": 29229056,
+        "pageins_delta_separate": 6654,
+        "pageouts_delta_separate": 177
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/rust/measure/json_object/client.json",
+        "resources": "results/current-serial/rust/measure/json_object/resources.json",
+        "events": "results/current-serial/rust/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "rust",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 3848.6383333333333,
+      "service_cpu_seconds": 9.236732,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 8,
+      "client_max_ms": 15.014134,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 3190784.0,
+      "cgroup_memory_observed_peak_bytes": 3416064,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 6,
+      "threads_max": 7,
+      "fd_sample_max": 13,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 3.68,
+      "schedule_to_attempt_max_ms": 4.318323,
+      "schedule_to_written_p99_bucket_upper_ms": 3.82,
+      "cold_count": 3,
+      "reused_count": 2397,
+      "largest_correct_request": {
+        "request_index": 657,
+        "scheduled_offset_ms": 8212.5,
+        "latency_ns": 15014134,
+        "scheduled_to_attempt_ms": 0.877693,
+        "attempt_to_request_written_ms": 0.038924,
+        "request_written_to_complete_ms": 14.097517,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 2682880,
+        "memory_current_max_bytes": 2879488,
+        "threads_min": 6,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 19092,
+        "cpu_psi_full_us_delta": 19091
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 2633728,
+        "memory_current_max_bytes": 3416064,
+        "threads_min": 6,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 18201,
+        "cpu_psi_full_us_delta": 18200
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 17481728,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 53028,
+        "cpu_psi_full_us_delta": 45054
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92438528,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 4623,
+        "cpu_psi_full_us_delta": 149
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 9236732
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 889125
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 10,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 56796
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.009809455477035451,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3510046720,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:20:37.508978+00:00",
+        "sampled_end_utc": "2026-10-28T18:21:02.823831+00:00",
+        "covered_seconds": 25.314853,
+        "swapin_pages_delta": 2530,
+        "swapout_pages_delta": 5692,
+        "swapin_bytes_delta": 41451520,
+        "swapout_bytes_delta": 93257728,
+        "pageins_delta_separate": 14542,
+        "pageouts_delta_separate": 272
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/rust/measure/cpu/client.json",
+        "resources": "results/current-serial/rust/measure/cpu/resources.json",
+        "events": "results/current-serial/rust/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "rust",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 265.2821666666667,
+      "service_cpu_seconds": 1.591693,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 26.4,
+      "client_max_ms": 375.318823,
+      "over100ms": 37,
+      "over20ms": 64,
+      "over_workload_slo": 14,
+      "cgroup_memory_middle60_median_bytes": 3432448.0,
+      "cgroup_memory_observed_peak_bytes": 3813376,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 5,
+      "threads_max": 5,
+      "fd_sample_max": 74,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.01,
+      "schedule_to_attempt_max_ms": 54.553991,
+      "schedule_to_written_p99_bucket_upper_ms": 2.7,
+      "cold_count": 52,
+      "reused_count": 5948,
+      "largest_correct_request": {
+        "request_index": 2664,
+        "scheduled_offset_ms": 13320.0,
+        "latency_ns": 375318823,
+        "scheduled_to_attempt_ms": 0.663224,
+        "attempt_to_request_written_ms": 71.104501,
+        "request_written_to_complete_ms": 303.551098,
+        "connection_reused": "false",
+        "dial_ms": 66.194519,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 2637824,
+        "memory_current_max_bytes": 3612672,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 125025,
+        "cpu_psi_full_us_delta": 117923
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 2895872,
+        "memory_current_max_bytes": 3813376,
+        "threads_min": 5,
+        "threads_max": 5,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 119272,
+        "cpu_psi_full_us_delta": 112171
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 22507520,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 230825,
+        "cpu_psi_full_us_delta": 175291
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 116355072,
+        "threads_min": 7,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 326528,
+        "cpu_psi_full_us_delta": 79371
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1591693
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 3035737
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1891410
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.033465359821297794,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3485016064,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:21:18.035128+00:00",
+        "sampled_end_utc": "2026-10-28T18:21:43.437577+00:00",
+        "covered_seconds": 25.402449,
+        "swapin_pages_delta": 672,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 11010048,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 4088,
+        "pageouts_delta_separate": 103
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/rust/measure/db/client.json",
+        "resources": "results/current-serial/rust/measure/db/resources.json",
+        "events": "results/current-serial/rust/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "node",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 105.12483333333331,
+      "service_cpu_seconds": 6.30749,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 11.68,
+      "client_max_ms": 229.721528,
+      "over100ms": 292,
+      "over20ms": 523,
+      "over_workload_slo": 292,
+      "cgroup_memory_middle60_median_bytes": 143845376.0,
+      "cgroup_memory_observed_peak_bytes": 147582976,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 39,
+      "threads_max": 39,
+      "fd_sample_max": 481,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 3.08,
+      "schedule_to_attempt_max_ms": 148.98985,
+      "schedule_to_written_p99_bucket_upper_ms": 4.44,
+      "cold_count": 357,
+      "reused_count": 59643,
+      "largest_correct_request": {
+        "request_index": 39871,
+        "scheduled_offset_ms": 19935.5,
+        "latency_ns": 229721528,
+        "scheduled_to_attempt_ms": 55.976816,
+        "attempt_to_request_written_ms": 101.91572,
+        "request_written_to_complete_ms": 71.828992,
+        "connection_reused": "false",
+        "dial_ms": 101.897885,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 140468224,
+        "memory_current_max_bytes": 146956288,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 162983,
+        "cpu_psi_full_us_delta": 82892
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 140591104,
+        "memory_current_max_bytes": 147582976,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 157909,
+        "cpu_psi_full_us_delta": 78613
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 41267200,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 620704,
+        "cpu_psi_full_us_delta": 402051
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92442624,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 5320,
+        "cpu_psi_full_us_delta": 2500
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 1,
+            "throttled_usec": 2485,
+            "usage_usec": 6307490
+          },
+          "max_interval_throttled_us": 2485
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 1,
+            "throttled_usec": 3219,
+            "usage_usec": 6408099
+          },
+          "max_interval_throttled_us": 3219
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 17987
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.07043019261398513,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3341746176,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:22:13.811047+00:00",
+        "sampled_end_utc": "2026-10-28T18:22:39.071743+00:00",
+        "covered_seconds": 25.260696,
+        "swapin_pages_delta": 12403,
+        "swapout_pages_delta": 23112,
+        "swapin_bytes_delta": 203210752,
+        "swapout_bytes_delta": 378667008,
+        "pageins_delta_separate": 16244,
+        "pageouts_delta_separate": 253
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/node/measure/ok/client.json",
+        "resources": "results/current-serial/node/measure/ok/resources.json",
+        "events": "results/current-serial/node/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "node",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 232.57786666666667,
+      "service_cpu_seconds": 3.488668,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 2.1,
+      "client_max_ms": 38.330628,
+      "over100ms": 0,
+      "over20ms": 7,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 156080128.0,
+      "cgroup_memory_observed_peak_bytes": 158633984,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 39,
+      "threads_max": 39,
+      "fd_sample_max": 145,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.54,
+      "schedule_to_attempt_max_ms": 11.467186,
+      "schedule_to_written_p99_bucket_upper_ms": 1.56,
+      "cold_count": 32,
+      "reused_count": 14968,
+      "largest_correct_request": {
+        "request_index": 9559,
+        "scheduled_offset_ms": 19118.0,
+        "latency_ns": 38330628,
+        "scheduled_to_attempt_ms": 1.151625,
+        "attempt_to_request_written_ms": 18.604716,
+        "request_written_to_complete_ms": 18.574287,
+        "connection_reused": "false",
+        "dial_ms": 5.70999,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 151187456,
+        "memory_current_max_bytes": 158756864,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 94602,
+        "cpu_psi_full_us_delta": 80785
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 153804800,
+        "memory_current_max_bytes": 158633984,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 89085,
+        "cpu_psi_full_us_delta": 77426
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 28069888,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 343413,
+        "cpu_psi_full_us_delta": 319242
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92225536,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 5292,
+        "cpu_psi_full_us_delta": 23
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 3488668
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 4853211
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 8,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 51106
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.05339240953614689,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3345367040,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:22:54.270964+00:00",
+        "sampled_end_utc": "2026-10-28T18:23:19.555151+00:00",
+        "covered_seconds": 25.284187,
+        "swapin_pages_delta": 1131,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 18530304,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 5433,
+        "pageouts_delta_separate": 125
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/node/measure/json_object/client.json",
+        "resources": "results/current-serial/node/measure/json_object/resources.json",
+        "events": "results/current-serial/node/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "node",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 9393.20375,
+      "service_cpu_seconds": 22.543689,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 12.48,
+      "client_max_ms": 69.437604,
+      "over100ms": 0,
+      "over20ms": 10,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 162404352.0,
+      "cgroup_memory_observed_peak_bytes": 162668544,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 39,
+      "threads_max": 39,
+      "fd_sample_max": 139,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.64,
+      "schedule_to_attempt_max_ms": 3.901353,
+      "schedule_to_written_p99_bucket_upper_ms": 1.75,
+      "cold_count": 6,
+      "reused_count": 2394,
+      "largest_correct_request": {
+        "request_index": 712,
+        "scheduled_offset_ms": 8900.0,
+        "latency_ns": 69437604,
+        "scheduled_to_attempt_ms": 0.338648,
+        "attempt_to_request_written_ms": 2.874987,
+        "request_written_to_complete_ms": 66.223969,
+        "connection_reused": "false",
+        "dial_ms": 2.753576,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 159248384,
+        "memory_current_max_bytes": 162590720,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 25374,
+        "cpu_psi_full_us_delta": 9836
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 160354304,
+        "memory_current_max_bytes": 162668544,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 23262,
+        "cpu_psi_full_us_delta": 9296
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 17227776,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 29476,
+        "cpu_psi_full_us_delta": 25950
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92225536,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 9805,
+        "cpu_psi_full_us_delta": 4004
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 22543689
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 297,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 538059
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 30108
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.005932656490730587,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3350151168,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 5,
+        "sampled_start_utc": "2026-10-28T18:23:39.773707+00:00",
+        "sampled_end_utc": "2026-10-28T18:23:59.963633+00:00",
+        "covered_seconds": 20.189926,
+        "swapin_pages_delta": 8185,
+        "swapout_pages_delta": 2144,
+        "swapin_bytes_delta": 134103040,
+        "swapout_bytes_delta": 35127296,
+        "pageins_delta_separate": 3572,
+        "pageouts_delta_separate": 77
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/node/measure/cpu/client.json",
+        "resources": "results/current-serial/node/measure/cpu/resources.json",
+        "events": "results/current-serial/node/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "node",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 992.5436666666668,
+      "service_cpu_seconds": 5.955262,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 236.8,
+      "client_max_ms": 445.887553,
+      "over100ms": 120,
+      "over20ms": 160,
+      "over_workload_slo": 54,
+      "cgroup_memory_middle60_median_bytes": 186597376,
+      "cgroup_memory_observed_peak_bytes": 191127552,
+      "memory_samples_in_arrival": 28,
+      "threads_min": 39,
+      "threads_max": 39,
+      "fd_sample_max": 257,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 110.72,
+      "schedule_to_attempt_max_ms": 258.17938,
+      "schedule_to_written_p99_bucket_upper_ms": 142.72,
+      "cold_count": 138,
+      "reused_count": 5862,
+      "largest_correct_request": {
+        "request_index": 3897,
+        "scheduled_offset_ms": 19485.0,
+        "latency_ns": 445887553,
+        "scheduled_to_attempt_ms": 199.219681,
+        "attempt_to_request_written_ms": 5.277754,
+        "request_written_to_complete_ms": 241.390118,
+        "connection_reused": "false",
+        "dial_ms": 5.194403,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 172990464,
+        "memory_current_max_bytes": 190869504,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 388169,
+        "cpu_psi_full_us_delta": 134712
+      },
+      "service_sample_pressure": {
+        "samples": 28,
+        "memory_current_min_bytes": 173318144,
+        "memory_current_max_bytes": 191127552,
+        "threads_min": 39,
+        "threads_max": 39,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 359094,
+        "cpu_psi_full_us_delta": 131167
+      },
+      "driver_sample_pressure": {
+        "samples": 30,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 22814720,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 409190,
+        "cpu_psi_full_us_delta": 181255
+      },
+      "database_sample_pressure": {
+        "samples": 30,
+        "memory_current_min_bytes": 104681472,
+        "memory_current_max_bytes": 115838976,
+        "threads_min": 15,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 576239,
+        "cpu_psi_full_us_delta": 67812
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5955135
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 1,
+            "throttled_usec": 2116,
+            "usage_usec": 4091460
+          },
+          "max_interval_throttled_us": 2116
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 1,
+            "throttled_usec": 26323,
+            "usage_usec": 1939956
+          },
+          "max_interval_throttled_us": 26323
+        }
+      ],
+      "driver_average_quota_fraction": 0.04499379833884997,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3300360192,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 5,
+        "sampled_start_utc": "2026-10-28T18:24:20.175997+00:00",
+        "sampled_end_utc": "2026-10-28T18:24:40.461886+00:00",
+        "covered_seconds": 20.285889,
+        "swapin_pages_delta": 6034,
+        "swapout_pages_delta": 1704,
+        "swapin_bytes_delta": 98861056,
+        "swapout_bytes_delta": 27918336,
+        "pageins_delta_separate": 10331,
+        "pageouts_delta_separate": 109
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/node/measure/db/client.json",
+        "resources": "results/current-serial/node/measure/db/resources.json",
+        "events": "results/current-serial/node/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "java",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 48.87376666666667,
+      "service_cpu_seconds": 2.932426,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.41,
+      "client_max_ms": 21.644118,
+      "over100ms": 0,
+      "over20ms": 1,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 109160448.0,
+      "cgroup_memory_observed_peak_bytes": 109699072,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 24,
+      "threads_max": 24,
+      "fd_sample_max": 70,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.24,
+      "schedule_to_attempt_max_ms": 3.802972,
+      "schedule_to_written_p99_bucket_upper_ms": 1.25,
+      "cold_count": 67,
+      "reused_count": 59933,
+      "largest_correct_request": {
+        "request_index": 21617,
+        "scheduled_offset_ms": 10808.5,
+        "latency_ns": 21644118,
+        "scheduled_to_attempt_ms": 2.682828,
+        "attempt_to_request_written_ms": 3.179149,
+        "request_written_to_complete_ms": 15.782141,
+        "connection_reused": "false",
+        "dial_ms": 1.38383,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 108523520,
+        "memory_current_max_bytes": 109158400,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 116220,
+        "cpu_psi_full_us_delta": 103542
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 108843008,
+        "memory_current_max_bytes": 109699072,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 108498,
+        "cpu_psi_full_us_delta": 97763
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 36966400,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 408337,
+        "cpu_psi_full_us_delta": 358588
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92442624,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 1983,
+        "cpu_psi_full_us_delta": 72
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2932426
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5835556
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 5,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 32082
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.0641957241226979,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3392303104,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:25:15.845512+00:00",
+        "sampled_end_utc": "2026-10-28T18:25:41.106867+00:00",
+        "covered_seconds": 25.261355,
+        "swapin_pages_delta": 652,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 10682368,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 2726,
+        "pageouts_delta_separate": 150
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/java/measure/ok/client.json",
+        "resources": "results/current-serial/java/measure/ok/resources.json",
+        "events": "results/current-serial/java/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "java",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 203.93793333333335,
+      "service_cpu_seconds": 3.059069,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 14.8,
+      "client_max_ms": 337.435589,
+      "over100ms": 89,
+      "over20ms": 141,
+      "over_workload_slo": 89,
+      "cgroup_memory_middle60_median_bytes": 114663424.0,
+      "cgroup_memory_observed_peak_bytes": 114933760,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 24,
+      "threads_max": 24,
+      "fd_sample_max": 149,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 3.24,
+      "schedule_to_attempt_max_ms": 201.099746,
+      "schedule_to_written_p99_bucket_upper_ms": 4.4,
+      "cold_count": 134,
+      "reused_count": 14866,
+      "largest_correct_request": {
+        "request_index": 2725,
+        "scheduled_offset_ms": 5450.0,
+        "latency_ns": 337435589,
+        "scheduled_to_attempt_ms": 0.142421,
+        "attempt_to_request_written_ms": 104.43898,
+        "request_written_to_complete_ms": 232.854188,
+        "connection_reused": "false",
+        "dial_ms": 53.158061,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 113979392,
+        "memory_current_max_bytes": 114491392,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 146763,
+        "cpu_psi_full_us_delta": 79381
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 114290688,
+        "memory_current_max_bytes": 114933760,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 143826,
+        "cpu_psi_full_us_delta": 77822
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 28131328,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 520297,
+        "cpu_psi_full_us_delta": 434331
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92225536,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 1789,
+        "cpu_psi_full_us_delta": 146
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 3059069
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 1,
+            "throttled_usec": 213151,
+            "usage_usec": 5964562
+          },
+          "max_interval_throttled_us": 213151
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 8,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 24132
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.0656330961884422,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3406528512,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:25:56.262705+00:00",
+        "sampled_end_utc": "2026-10-28T18:26:21.576237+00:00",
+        "covered_seconds": 25.313532,
+        "swapin_pages_delta": 1905,
+        "swapout_pages_delta": 576,
+        "swapin_bytes_delta": 31211520,
+        "swapout_bytes_delta": 9437184,
+        "pageins_delta_separate": 7980,
+        "pageouts_delta_separate": 202
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/java/measure/json_object/client.json",
+        "resources": "results/current-serial/java/measure/json_object/resources.json",
+        "events": "results/current-serial/java/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "java",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 3745.8450000000003,
+      "service_cpu_seconds": 8.990028,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 6.6,
+      "client_max_ms": 14.304346,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 115693568.0,
+      "cgroup_memory_observed_peak_bytes": 115986432,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 24,
+      "threads_max": 24,
+      "fd_sample_max": 52,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.12,
+      "schedule_to_attempt_max_ms": 4.682335,
+      "schedule_to_written_p99_bucket_upper_ms": 2.25,
+      "cold_count": 1,
+      "reused_count": 2399,
+      "largest_correct_request": {
+        "request_index": 885,
+        "scheduled_offset_ms": 11062.5,
+        "latency_ns": 14304346,
+        "scheduled_to_attempt_ms": 4.442656,
+        "attempt_to_request_written_ms": 4.300082,
+        "request_written_to_complete_ms": 5.561608,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 115216384,
+        "memory_current_max_bytes": 115302400,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 10666,
+        "cpu_psi_full_us_delta": 10667
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 115200000,
+        "memory_current_max_bytes": 115986432,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 10080,
+        "cpu_psi_full_us_delta": 10080
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 20283392,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 40334,
+        "cpu_psi_full_us_delta": 37621
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 92225536,
+        "memory_current_max_bytes": 92225536,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 4494,
+        "cpu_psi_full_us_delta": 103
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 8990028
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 847836
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 9,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 48405
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.009331057492421422,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3414347776,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:26:36.749019+00:00",
+        "sampled_end_utc": "2026-10-28T18:27:02.018319+00:00",
+        "covered_seconds": 25.2693,
+        "swapin_pages_delta": 444,
+        "swapout_pages_delta": 2396,
+        "swapin_bytes_delta": 7274496,
+        "swapout_bytes_delta": 39256064,
+        "pageins_delta_separate": 5499,
+        "pageouts_delta_separate": 137
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/java/measure/cpu/client.json",
+        "resources": "results/current-serial/java/measure/cpu/resources.json",
+        "events": "results/current-serial/java/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "java",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 525.4781666666667,
+      "service_cpu_seconds": 3.152869,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 3.1,
+      "client_max_ms": 20.578431,
+      "over100ms": 0,
+      "over20ms": 1,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 127367168.0,
+      "cgroup_memory_observed_peak_bytes": 131117056,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 24,
+      "threads_max": 24,
+      "fd_sample_max": 63,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.24,
+      "schedule_to_attempt_max_ms": 7.781879,
+      "schedule_to_written_p99_bucket_upper_ms": 1.3,
+      "cold_count": 9,
+      "reused_count": 5991,
+      "largest_correct_request": {
+        "request_index": 5996,
+        "scheduled_offset_ms": 29980.0,
+        "latency_ns": 20578431,
+        "scheduled_to_attempt_ms": 1.384497,
+        "attempt_to_request_written_ms": 2.4008,
+        "request_written_to_complete_ms": 16.793134,
+        "connection_reused": "false",
+        "dial_ms": 0.859182,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 127561728,
+        "memory_current_max_bytes": 130584576,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 98832,
+        "cpu_psi_full_us_delta": 96223
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 126857216,
+        "memory_current_max_bytes": 131117056,
+        "threads_min": 24,
+        "threads_max": 24,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 95481,
+        "cpu_psi_full_us_delta": 92873
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 21590016,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 150557,
+        "cpu_psi_full_us_delta": 142623
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 100012032,
+        "memory_current_max_bytes": 102109184,
+        "threads_min": 12,
+        "threads_max": 12,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 117502,
+        "cpu_psi_full_us_delta": 98530
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 3152869
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2243409
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1684051
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.024726212854497547,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3401809920,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:27:17.184974+00:00",
+        "sampled_end_utc": "2026-10-28T18:27:42.555520+00:00",
+        "covered_seconds": 25.370546,
+        "swapin_pages_delta": 776,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 12713984,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 3148,
+        "pageouts_delta_separate": 137
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/java/measure/db/client.json",
+        "resources": "results/current-serial/java/measure/db/resources.json",
+        "events": "results/current-serial/java/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "dotnet",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 86.74448333333333,
+      "service_cpu_seconds": 5.204669,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.39,
+      "client_max_ms": 9.945585,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 47398912.0,
+      "cgroup_memory_observed_peak_bytes": 47661056,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 22,
+      "threads_max": 23,
+      "fd_sample_max": 221,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.22,
+      "schedule_to_attempt_max_ms": 6.06213,
+      "schedule_to_written_p99_bucket_upper_ms": 1.23,
+      "cold_count": 40,
+      "reused_count": 59960,
+      "largest_correct_request": {
+        "request_index": 43874,
+        "scheduled_offset_ms": 21937.0,
+        "latency_ns": 9945585,
+        "scheduled_to_attempt_ms": 0.351322,
+        "attempt_to_request_written_ms": 8.286791,
+        "request_written_to_complete_ms": 1.307472,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 46551040,
+        "memory_current_max_bytes": 47079424,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 110909,
+        "cpu_psi_full_us_delta": 103340
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 47005696,
+        "memory_current_max_bytes": 47661056,
+        "threads_min": 22,
+        "threads_max": 23,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 103464,
+        "cpu_psi_full_us_delta": 96745
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 36827136,
+        "threads_min": 0,
+        "threads_max": 8,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 552669,
+        "cpu_psi_full_us_delta": 445052
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 93401088,
+        "memory_current_max_bytes": 93401088,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 3863,
+        "cpu_psi_full_us_delta": 88
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5204669
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5298524
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 8,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 17531
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.058280129604959964,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3480547328,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:28:12.912264+00:00",
+        "sampled_end_utc": "2026-10-28T18:28:38.135783+00:00",
+        "covered_seconds": 25.223519,
+        "swapin_pages_delta": 1479,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 24231936,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 11945,
+        "pageouts_delta_separate": 225
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/dotnet/measure/ok/client.json",
+        "resources": "results/current-serial/dotnet/measure/ok/resources.json",
+        "events": "results/current-serial/dotnet/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "dotnet",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 375.78746666666666,
+      "service_cpu_seconds": 5.636812,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.88,
+      "client_max_ms": 41.594951,
+      "over100ms": 0,
+      "over20ms": 13,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 48746496.0,
+      "cgroup_memory_observed_peak_bytes": 49844224,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 21,
+      "threads_max": 22,
+      "fd_sample_max": 220,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.23,
+      "schedule_to_attempt_max_ms": 18.484907,
+      "schedule_to_written_p99_bucket_upper_ms": 1.26,
+      "cold_count": 47,
+      "reused_count": 14953,
+      "largest_correct_request": {
+        "request_index": 8688,
+        "scheduled_offset_ms": 17376.0,
+        "latency_ns": 41594951,
+        "scheduled_to_attempt_ms": 15.107033,
+        "attempt_to_request_written_ms": 0.068922,
+        "request_written_to_complete_ms": 26.418996,
+        "connection_reused": "false",
+        "dial_ms": 0.045754,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 47579136,
+        "memory_current_max_bytes": 49803264,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 131209,
+        "cpu_psi_full_us_delta": 113419
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 48689152,
+        "memory_current_max_bytes": 49844224,
+        "threads_min": 21,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 122713,
+        "cpu_psi_full_us_delta": 107712
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 28106752,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 388649,
+        "cpu_psi_full_us_delta": 350353
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 93401088,
+        "memory_current_max_bytes": 93614080,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 2307,
+        "cpu_psi_full_us_delta": 64
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5636812
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5286378
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 8,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 24739
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.05827917845414508,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3491450880,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:28:53.300134+00:00",
+        "sampled_end_utc": "2026-10-28T18:29:18.629184+00:00",
+        "covered_seconds": 25.32905,
+        "swapin_pages_delta": 6407,
+        "swapout_pages_delta": 6236,
+        "swapin_bytes_delta": 104972288,
+        "swapout_bytes_delta": 102170624,
+        "pageins_delta_separate": 5386,
+        "pageouts_delta_separate": 121
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/dotnet/measure/json_object/client.json",
+        "resources": "results/current-serial/dotnet/measure/json_object/resources.json",
+        "events": "results/current-serial/dotnet/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "dotnet",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 3886.9608333333335,
+      "service_cpu_seconds": 9.328706,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 6.64,
+      "client_max_ms": 31.698409,
+      "over100ms": 0,
+      "over20ms": 2,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 48396288.0,
+      "cgroup_memory_observed_peak_bytes": 48590848,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 21,
+      "threads_max": 22,
+      "fd_sample_max": 206,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.08,
+      "schedule_to_attempt_max_ms": 6.644108,
+      "schedule_to_written_p99_bucket_upper_ms": 2.27,
+      "cold_count": 3,
+      "reused_count": 2397,
+      "largest_correct_request": {
+        "request_index": 345,
+        "scheduled_offset_ms": 4312.5,
+        "latency_ns": 31698409,
+        "scheduled_to_attempt_ms": 1.351595,
+        "attempt_to_request_written_ms": 12.308909,
+        "request_written_to_complete_ms": 18.037905,
+        "connection_reused": "false",
+        "dial_ms": 10.360187,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 48087040,
+        "memory_current_max_bytes": 48340992,
+        "threads_min": 20,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 25603,
+        "cpu_psi_full_us_delta": 23500
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 47820800,
+        "memory_current_max_bytes": 48590848,
+        "threads_min": 21,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 24304,
+        "cpu_psi_full_us_delta": 22209
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 17383424,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 48467,
+        "cpu_psi_full_us_delta": 42019
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 93401088,
+        "memory_current_max_bytes": 93401088,
+        "threads_min": 7,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 1237,
+        "cpu_psi_full_us_delta": 130
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 9328630
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 959241
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 27000
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.010583913930779757,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3513806848,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:29:33.799739+00:00",
+        "sampled_end_utc": "2026-10-28T18:29:59.093354+00:00",
+        "covered_seconds": 25.293615,
+        "swapin_pages_delta": 6794,
+        "swapout_pages_delta": 6824,
+        "swapin_bytes_delta": 111312896,
+        "swapout_bytes_delta": 111804416,
+        "pageins_delta_separate": 19308,
+        "pageouts_delta_separate": 222
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/dotnet/measure/cpu/client.json",
+        "resources": "results/current-serial/dotnet/measure/cpu/resources.json",
+        "events": "results/current-serial/dotnet/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "dotnet",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 933.5276666666667,
+      "service_cpu_seconds": 5.601166,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 3.6,
+      "client_max_ms": 10.421323,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 56705024.0,
+      "cgroup_memory_observed_peak_bytes": 57032704,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 20,
+      "threads_max": 22,
+      "fd_sample_max": 210,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 2.04,
+      "schedule_to_attempt_max_ms": 4.937159,
+      "schedule_to_written_p99_bucket_upper_ms": 2.08,
+      "cold_count": 9,
+      "reused_count": 5991,
+      "largest_correct_request": {
+        "request_index": 2552,
+        "scheduled_offset_ms": 12760.0,
+        "latency_ns": 10421323,
+        "scheduled_to_attempt_ms": 1.340508,
+        "attempt_to_request_written_ms": 0.097515,
+        "request_written_to_complete_ms": 8.9833,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 56217600,
+        "memory_current_max_bytes": 56528896,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 115696,
+        "cpu_psi_full_us_delta": 115106
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 56246272,
+        "memory_current_max_bytes": 57032704,
+        "threads_min": 20,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 111389,
+        "cpu_psi_full_us_delta": 110799
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 21766144,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 159442,
+        "cpu_psi_full_us_delta": 149033
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 99627008,
+        "memory_current_max_bytes": 99897344,
+        "threads_min": 11,
+        "threads_max": 11,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 127699,
+        "cpu_psi_full_us_delta": 113647
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5601107
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2412388
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 1743729
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.02654882021675564,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3492073472,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:30:14.284383+00:00",
+        "sampled_end_utc": "2026-10-28T18:30:39.622424+00:00",
+        "covered_seconds": 25.338041,
+        "swapin_pages_delta": 6663,
+        "swapout_pages_delta": 5596,
+        "swapin_bytes_delta": 109166592,
+        "swapout_bytes_delta": 91684864,
+        "pageins_delta_separate": 15568,
+        "pageouts_delta_separate": 173
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/dotnet/measure/db/client.json",
+        "resources": "results/current-serial/dotnet/measure/db/resources.json",
+        "events": "results/current-serial/dotnet/measure/db/events.csv.gz"
+      }
+    },
+    {
+      "stack": "cpp",
+      "workload": "ok",
+      "rps": 2000,
+      "planned": 60000,
+      "correct": 60000,
+      "terminal_counts": {
+        "correct": 60000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 40.667049999999996,
+      "service_cpu_seconds": 2.440023,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.65,
+      "client_max_ms": 11.389684,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 4849664.0,
+      "cgroup_memory_observed_peak_bytes": 5083136,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 17,
+      "threads_max": 17,
+      "fd_sample_max": 84,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.48,
+      "schedule_to_attempt_max_ms": 7.467492,
+      "schedule_to_written_p99_bucket_upper_ms": 1.5,
+      "cold_count": 21,
+      "reused_count": 59979,
+      "largest_correct_request": {
+        "request_index": 40473,
+        "scheduled_offset_ms": 20236.5,
+        "latency_ns": 11389684,
+        "scheduled_to_attempt_ms": 0.047331,
+        "attempt_to_request_written_ms": 7.849106,
+        "request_written_to_complete_ms": 3.493247,
+        "connection_reused": "false",
+        "dial_ms": 5.672301,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4689920,
+        "memory_current_max_bytes": 4808704,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 117322,
+        "cpu_psi_full_us_delta": 116835
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4730880,
+        "memory_current_max_bytes": 5083136,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 111458,
+        "cpu_psi_full_us_delta": 110971
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 37384192,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 458395,
+        "cpu_psi_full_us_delta": 396431
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 113065984,
+        "memory_current_max_bytes": 113328128,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 2206,
+        "cpu_psi_full_us_delta": 61
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2440023
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 6549853
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 22561
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.07204552485950509,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3532562432,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:31:09.972010+00:00",
+        "sampled_end_utc": "2026-10-28T18:31:35.234653+00:00",
+        "covered_seconds": 25.262643,
+        "swapin_pages_delta": 403,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 6602752,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 6371,
+        "pageouts_delta_separate": 114
+      },
+      "event_rows_verified": 60000,
+      "evidence_members": {
+        "client": "results/current-serial/cpp/measure/ok/client.json",
+        "resources": "results/current-serial/cpp/measure/ok/resources.json",
+        "events": "results/current-serial/cpp/measure/ok/events.csv.gz"
+      }
+    },
+    {
+      "stack": "cpp",
+      "workload": "json_object",
+      "rps": 500,
+      "planned": 15000,
+      "correct": 15000,
+      "terminal_counts": {
+        "correct": 15000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 136.9942,
+      "service_cpu_seconds": 2.054913,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 1.79,
+      "client_max_ms": 8.861645,
+      "over100ms": 0,
+      "over20ms": 0,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 4792320.0,
+      "cgroup_memory_observed_peak_bytes": 5038080,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 17,
+      "threads_max": 17,
+      "fd_sample_max": 69,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.31,
+      "schedule_to_attempt_max_ms": 5.314198,
+      "schedule_to_written_p99_bucket_upper_ms": 1.34,
+      "cold_count": 16,
+      "reused_count": 14984,
+      "largest_correct_request": {
+        "request_index": 8193,
+        "scheduled_offset_ms": 16386.0,
+        "latency_ns": 8861645,
+        "scheduled_to_attempt_ms": 4.819753,
+        "attempt_to_request_written_ms": 3.74329,
+        "request_written_to_complete_ms": 0.298602,
+        "connection_reused": "false",
+        "dial_ms": 1.977211,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4759552,
+        "memory_current_max_bytes": 4784128,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 94469,
+        "cpu_psi_full_us_delta": 94469
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4767744,
+        "memory_current_max_bytes": 5038080,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 90594,
+        "cpu_psi_full_us_delta": 90594
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 28680192,
+        "threads_min": 0,
+        "threads_max": 7,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 383883,
+        "cpu_psi_full_us_delta": 358247
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 113065984,
+        "memory_current_max_bytes": 113278976,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 1469,
+        "cpu_psi_full_us_delta": 12
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2054913
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 5524400
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 5,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 26783
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.060840602218909585,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3531669504,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:31:50.426949+00:00",
+        "sampled_end_utc": "2026-10-28T18:32:15.735666+00:00",
+        "covered_seconds": 25.308717,
+        "swapin_pages_delta": 781,
+        "swapout_pages_delta": 24,
+        "swapin_bytes_delta": 12795904,
+        "swapout_bytes_delta": 393216,
+        "pageins_delta_separate": 7678,
+        "pageouts_delta_separate": 220
+      },
+      "event_rows_verified": 15000,
+      "evidence_members": {
+        "client": "results/current-serial/cpp/measure/json_object/client.json",
+        "resources": "results/current-serial/cpp/measure/json_object/resources.json",
+        "events": "results/current-serial/cpp/measure/json_object/events.csv.gz"
+      }
+    },
+    {
+      "stack": "cpp",
+      "workload": "cpu",
+      "rps": 80,
+      "planned": 2400,
+      "correct": 2400,
+      "terminal_counts": {
+        "correct": 2400
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 3806.0604166666662,
+      "service_cpu_seconds": 9.134545,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 9.4,
+      "client_max_ms": 74.216019,
+      "over100ms": 0,
+      "over20ms": 8,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 4790272.0,
+      "cgroup_memory_observed_peak_bytes": 5066752,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 17,
+      "threads_max": 17,
+      "fd_sample_max": 72,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 3.86,
+      "schedule_to_attempt_max_ms": 21.714313,
+      "schedule_to_written_p99_bucket_upper_ms": 4.34,
+      "cold_count": 8,
+      "reused_count": 2392,
+      "largest_correct_request": {
+        "request_index": 534,
+        "scheduled_offset_ms": 6675.0,
+        "latency_ns": 74216019,
+        "scheduled_to_attempt_ms": 8.538939,
+        "attempt_to_request_written_ms": 0.07557,
+        "request_written_to_complete_ms": 65.60151,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 4771840,
+        "memory_current_max_bytes": 4780032,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 10563,
+        "cpu_psi_full_us_delta": 9864
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 4780032,
+        "memory_current_max_bytes": 5066752,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 10146,
+        "cpu_psi_full_us_delta": 9447
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 20516864,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 55845,
+        "cpu_psi_full_us_delta": 47008
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 113065984,
+        "memory_current_max_bytes": 113299456,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 2135,
+        "cpu_psi_full_us_delta": 8
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 9134545
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 303,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 997517
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 6,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 24423
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.010974925445782947,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3543019520,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:32:30.888416+00:00",
+        "sampled_end_utc": "2026-10-28T18:32:56.151082+00:00",
+        "covered_seconds": 25.262666,
+        "swapin_pages_delta": 388,
+        "swapout_pages_delta": 0,
+        "swapin_bytes_delta": 6356992,
+        "swapout_bytes_delta": 0,
+        "pageins_delta_separate": 1888,
+        "pageouts_delta_separate": 87
+      },
+      "event_rows_verified": 2400,
+      "evidence_members": {
+        "client": "results/current-serial/cpp/measure/cpu/client.json",
+        "resources": "results/current-serial/cpp/measure/cpu/resources.json",
+        "events": "results/current-serial/cpp/measure/cpu/events.csv.gz"
+      }
+    },
+    {
+      "stack": "cpp",
+      "workload": "db",
+      "rps": 200,
+      "planned": 6000,
+      "correct": 6000,
+      "terminal_counts": {
+        "correct": 6000
+      },
+      "valid_driver": true,
+      "qualified": true,
+      "qualification_reasons": [],
+      "warmup_qualified": true,
+      "cpu_us_per_correct": 333.59066666666666,
+      "service_cpu_seconds": 2.001544,
+      "cpu_full_lifecycle_accounted": false,
+      "client_p99_bucket_upper_ms": 3.16,
+      "client_max_ms": 66.22948,
+      "over100ms": 0,
+      "over20ms": 6,
+      "over_workload_slo": 0,
+      "cgroup_memory_middle60_median_bytes": 6658048.0,
+      "cgroup_memory_observed_peak_bytes": 7266304,
+      "memory_samples_in_arrival": 29,
+      "threads_min": 17,
+      "threads_max": 17,
+      "fd_sample_max": 73,
+      "generator_samples": 0,
+      "schedule_to_attempt_p99_bucket_upper_ms": 1.83,
+      "schedule_to_attempt_max_ms": 9.554705,
+      "schedule_to_written_p99_bucket_upper_ms": 1.91,
+      "cold_count": 12,
+      "reused_count": 5988,
+      "largest_correct_request": {
+        "request_index": 3620,
+        "scheduled_offset_ms": 18100.0,
+        "latency_ns": 66229480,
+        "scheduled_to_attempt_ms": 0.975114,
+        "attempt_to_request_written_ms": 0.060873,
+        "request_written_to_complete_ms": 65.193493,
+        "connection_reused": "true",
+        "dial_ms": 0.0,
+        "attribution": "client time segments, not runtime causes"
+      },
+      "service_domain": {
+        "samples": 2,
+        "memory_current_min_bytes": 5500928,
+        "memory_current_max_bytes": 7266304,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 93193,
+        "cpu_psi_full_us_delta": 93107
+      },
+      "service_sample_pressure": {
+        "samples": 29,
+        "memory_current_min_bytes": 6000640,
+        "memory_current_max_bytes": 7266304,
+        "threads_min": 17,
+        "threads_max": 17,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 89343,
+        "cpu_psi_full_us_delta": 89257
+      },
+      "driver_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 0,
+        "memory_current_max_bytes": 21852160,
+        "threads_min": 0,
+        "threads_max": 6,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 155031,
+        "cpu_psi_full_us_delta": 144860
+      },
+      "database_sample_pressure": {
+        "samples": 31,
+        "memory_current_min_bytes": 113065984,
+        "memory_current_max_bytes": 114229248,
+        "threads_min": 22,
+        "threads_max": 22,
+        "memory_events_delta": {
+          "low": 0,
+          "high": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0
+        },
+        "pgmajfault_delta": 0,
+        "memory_psi_some_us_delta": 0,
+        "memory_psi_full_us_delta": 0,
+        "io_psi_some_us_delta": 0,
+        "io_psi_full_us_delta": 0,
+        "cpu_psi_some_us_delta": 118861,
+        "cpu_psi_full_us_delta": 57941
+      },
+      "all_domain_throttling": [
+        {
+          "role": "service",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2001544
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "driver",
+          "total": {
+            "nr_periods": 302,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 2508545
+          },
+          "max_interval_throttled_us": 0
+        },
+        {
+          "role": "database",
+          "total": {
+            "nr_periods": 301,
+            "nr_throttled": 0,
+            "throttled_usec": 0,
+            "usage_usec": 878097
+          },
+          "max_interval_throttled_us": 0
+        }
+      ],
+      "driver_average_quota_fraction": 0.027667603914184415,
+      "driver_average_saturated": false,
+      "guest_min_available_bytes": 3540713472,
+      "guest_swap_total_bytes": 0,
+      "host_interior_samples": {
+        "available": true,
+        "samples": 6,
+        "sampled_start_utc": "2026-10-28T18:33:11.329128+00:00",
+        "sampled_end_utc": "2026-10-28T18:33:36.621145+00:00",
+        "covered_seconds": 25.292017,
+        "swapin_pages_delta": 2890,
+        "swapout_pages_delta": 1024,
+        "swapin_bytes_delta": 47349760,
+        "swapout_bytes_delta": 16777216,
+        "pageins_delta_separate": 7527,
+        "pageouts_delta_separate": 144
+      },
+      "event_rows_verified": 6000,
+      "evidence_members": {
+        "client": "results/current-serial/cpp/measure/db/client.json",
+        "resources": "results/current-serial/cpp/measure/db/resources.json",
+        "events": "results/current-serial/cpp/measure/db/events.csv.gz"
+      }
+    }
+  ],
+  "stack_exit": [
+    {
+      "stack": "ku",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "go",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "rust",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "node",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "java",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 143,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "dotnet",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    },
+    {
+      "stack": "cpp",
+      "golden": "passed",
+      "termination_succeeded": true,
+      "exit_code": 0,
+      "forced": false,
+      "remaining_tasks": 0,
+      "domain_after_empty": true
+    }
+  ],
+  "environment": {
+    "host_page_bytes": 16384,
+    "host_counter_samples": 257,
+    "host_sample_max_gap_seconds": 5.121114,
+    "host_window_alignment": "interior host samples selected by contemporaneous Unix timestamps; host/guest offset uncertainty is not measured, so alignment is approximate and not per-request causality",
+    "host_run": {
+      "available": true,
+      "samples": 246,
+      "sampled_start_utc": "2026-10-28T18:12:56.919294+00:00",
+      "sampled_end_utc": "2026-10-28T18:33:36.621145+00:00",
+      "covered_seconds": 1239.701851,
+      "swapin_pages_delta": 208489,
+      "swapout_pages_delta": 208724,
+      "swapin_bytes_delta": 3415883776,
+      "swapout_bytes_delta": 3419734016,
+      "pageins_delta_separate": 415579,
+      "pageouts_delta_separate": 9330
+    },
+    "host_by_stack": [
+      {
+        "stack": "ku",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:12:56.919294+00:00",
+        "sampled_end_utc": "2026-10-28T18:15:49.103887+00:00",
+        "covered_seconds": 172.184593,
+        "swapin_pages_delta": 26813,
+        "swapout_pages_delta": 23340,
+        "swapin_bytes_delta": 439304192,
+        "swapout_bytes_delta": 382402560,
+        "pageins_delta_separate": 63692,
+        "pageouts_delta_separate": 1912
+      },
+      {
+        "stack": "go",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:15:54.169652+00:00",
+        "sampled_end_utc": "2026-10-28T18:18:46.108707+00:00",
+        "covered_seconds": 171.939055,
+        "swapin_pages_delta": 28849,
+        "swapout_pages_delta": 27248,
+        "swapin_bytes_delta": 472662016,
+        "swapout_bytes_delta": 446431232,
+        "pageins_delta_separate": 37904,
+        "pageouts_delta_separate": 1083
+      },
+      {
+        "stack": "rust",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:18:51.187591+00:00",
+        "sampled_end_utc": "2026-10-28T18:21:43.437577+00:00",
+        "covered_seconds": 172.249986,
+        "swapin_pages_delta": 12500,
+        "swapout_pages_delta": 16896,
+        "swapin_bytes_delta": 204800000,
+        "swapout_bytes_delta": 276824064,
+        "pageins_delta_separate": 49315,
+        "pageouts_delta_separate": 1288
+      },
+      {
+        "stack": "node",
+        "available": true,
+        "samples": 36,
+        "sampled_start_utc": "2026-10-28T18:21:48.512938+00:00",
+        "sampled_end_utc": "2026-10-28T18:24:45.517121+00:00",
+        "covered_seconds": 177.004183,
+        "swapin_pages_delta": 50116,
+        "swapout_pages_delta": 60896,
+        "swapin_bytes_delta": 821100544,
+        "swapout_bytes_delta": 997720064,
+        "pageins_delta_separate": 56816,
+        "pageouts_delta_separate": 1031
+      },
+      {
+        "stack": "java",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:24:50.577579+00:00",
+        "sampled_end_utc": "2026-10-28T18:27:42.555520+00:00",
+        "covered_seconds": 171.977941,
+        "swapin_pages_delta": 10132,
+        "swapout_pages_delta": 10220,
+        "swapin_bytes_delta": 166002688,
+        "swapout_bytes_delta": 167444480,
+        "pageins_delta_separate": 45459,
+        "pageouts_delta_separate": 1373
+      },
+      {
+        "stack": "dotnet",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:27:47.633609+00:00",
+        "sampled_end_utc": "2026-10-28T18:30:39.622424+00:00",
+        "covered_seconds": 171.988815,
+        "swapin_pages_delta": 40218,
+        "swapout_pages_delta": 32548,
+        "swapin_bytes_delta": 658931712,
+        "swapout_bytes_delta": 533266432,
+        "pageins_delta_separate": 88785,
+        "pageouts_delta_separate": 1252
+      },
+      {
+        "stack": "cpp",
+        "available": true,
+        "samples": 35,
+        "sampled_start_utc": "2026-10-28T18:30:44.670481+00:00",
+        "sampled_end_utc": "2026-10-28T18:33:36.621145+00:00",
+        "covered_seconds": 171.950664,
+        "swapin_pages_delta": 10069,
+        "swapout_pages_delta": 11352,
+        "swapin_bytes_delta": 164970496,
+        "swapout_bytes_delta": 185991168,
+        "pageins_delta_separate": 50117,
+        "pageouts_delta_separate": 1103
+      }
+    ],
+    "conclusion": "Host swap-in and swap-out actually occurred during this serial round. Guest swap is zero; observed service/driver/database cgroup memory events, PSI and major faults are reported separately. These observations cannot identify host paging of a specific guest process or assign individual tail spikes."
+  },
+  "metric_definitions": {
+    "cpu_us_per_correct": "service cgroup usage_usec delta between pre-driver launch and post-driver completion, divided by all correct requests including terminal tail; excludes startup and later full-service teardown, driver/observer/PG CPU; complete_lifecycle_accounted=false",
+    "memory_median": "cgroup memory.current sampled in arrival window at 1Hz, median of middle60% samples; not RSS, not exact allocation high-water or per-Task memory",
+    "threads": "sampled min/max whole-service-cgroup thread count in arrival window; includes workers/runtime support threads",
+    "p99": "client-recorded conservative histogram upper edge for scheduled arrival to correct completion, including client queue/dial/write/read/validation; linear10us bins below2.56ms, higher relative bin width<=0.78125%; not an exact sorted percentile",
+    "max_ms": "observed maximum scheduled-to-correct-completion from ledger/events",
+    "generator_p99": "not recorded: scheduled_to_generated has zero samples in these client reports",
+    "cpu_comparison": "single sequential windows; no confidence intervals or stable ranking; different language/runtime semantics remain part of measured implementations"
+  },
+  "limitations": [
+    "Not an interleaved seven-window comparison; fixed order, JIT warmup and environmental drift can matter.",
+    "No dynamic CPU profiling in this round, so aggregate differences do not identify a runtime hotspot.",
+    "Public HTTP bodies validated; Ku uses text/plain while other stacks use application/json variants.",
+    "Ku JSON subtree access copies; Rust moves and Go/Node retain references; these are normal API semantics, not identical ownership work.",
+    "PG uses same SQL/keys/pool16 without retries or result caching; Ku DISCARD ALL is extra reset work versus other default pools.",
+    "Host swap activity does not establish that Ku guest pages were swapped; guest has no swap and cgroup memory/major-fault evidence has a different boundary.",
+    "Minor faults can arise from allocation or file mappings and are not swap evidence.",
+    "1Hz guest and approximately5s host observations miss subinterval behavior; no claim of zero environment impact.",
+    "No process commands, tokens, credentials, user absolute paths or raw process inventories are exported."
+  ],
+  "identity": {
+    "manifest_sha256": "5828edd60e570c46c4258042fac05f08bc5a65f75d230b8aed081dceaee46e3c",
+    "protocol_sha256": "2057816794f2907f1aee6e0139a734fedbe5be20475c32c86a59df1f63c24fd1",
+    "harness_sha256": "12fd7312236556f5ff4910ed6c0812f6741267559fce78c3a56b60d3837918b0",
+    "driver_binary_sha256": "8715eed7f79b4746694b28ebaf12ce8a0285dd8eee2fa56f79c167725b1859d2",
+    "ku_cli_sha256": "d9ab7422f3cd037f097f61de83f0493784b60b04187e663840b75d41fe7982b3",
+    "ku_server_sha256": "d1e0b719e542172a6806c0398f87e28bc533b4ca743dd342581b2151910eed56",
+    "ku_generated_c_sha256": "d2456e0c438a221d950f3f01744193f0af74cd4c6bf144404a996695719a5073",
+    "ku_source_variant": "helpers/text/async/int",
+    "ku_native_flags": "C11 -O2 -pthread -lm; installed libpq",
+    "platform": "Linux aarch64, kernel6.8.0-147-generic, Ubuntu24.04 VM; not an official release package target",
+    "versions": {
+      "Ku": "0.0.19",
+      "Rust": "1.89.0",
+      "Clang": "18.1.3",
+      "Go": "1.27.2",
+      "Node": "24.18.0",
+      "Java": "25.0.4.1",
+      "dotnet_sdk": "10.0.402",
+      "dotnet_runtime": "10.0.13",
+      "Drogon": "1.9.14",
+      "JsonCpp": "1.9.5"
+    },
+    "normal_build_modes": {
+      "ku": "normal Release O2; helpers/text/async/int",
+      "go": "normal optimizing Go build; normal GC",
+      "rust": "cargo release, Rust1.89.0",
+      "node": "normal node:http/cluster, normal GC",
+      "java": "normal tiered JIT/G1; heap maximum65% of cgroup, not whole-process limit",
+      "dotnet": "Release, normal tiered JIT/server GC; heap maximum65% of cgroup, not whole-process limit",
+      "cpp": "Clang18 C++17 O3 NDEBUG, Drogon async HTTP/PG, JsonCpp tree"
+    },
+    "build_receipt_source_files_compared": 218,
+    "build_receipt_current_source_mismatches": [
+      "tests/benchmarks/cross_stack/README.md"
+    ],
+    "mismatch_scope": "Only the benchmark README differs in the recorded source inventory; runtime/compiler inputs unchanged as confirmed by coordinator."
+  },
+  "business_work": {
+    "http": "HTTP/1.1 keep-alive, no compression/TLS/proxy",
+    "cpu": {
+      "integer": "signed64 in Ku/Go/Rust; Node exact Number intermediates <2^53",
+      "iterations": "work_units*1000",
+      "seed": "seed query string length",
+      "initial": "total=seed",
+      "step": "total=(total*33+i+seed)%100000000; i=0..iterations-1",
+      "overflow": "none by bounds; maximum intermediate <3.4e9"
+    },
+    "cpu_work_units": [
+      480,
+      512,
+      544,
+      576
+    ],
+    "cpu_seed_lengths": [
+      1,
+      3,
+      7,
+      11
+    ],
+    "json": {
+      "corpus_bytes": 1048,
+      "corpus_sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "work": "decode dynamic object, increment7 to8, construct envelope with request ID and decoded data subtree, encode and validate semantic body"
+    },
+    "pg": {
+      "query": "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
+      "keys": 1024,
+      "pool_total": 16,
+      "retry": false,
+      "result_cache": false,
+      "reset_difference": "Ku DISCARD ALL; counterpart default reset policies differ"
+    }
+  },
+  "totals": {
+    "windows": 28,
+    "correct": 583800,
+    "planned": 583800,
+    "all_golden_passed": true,
+    "all_natural_or_signal_stop_no_force": true,
+    "errors": []
+  },
+  "descriptive_ku_rust_ratios": [
+    {
+      "workload": "ok",
+      "ku_over_rust_service_cpu_ratio": 1.0365308763353323,
+      "ku_over_rust_cgroup_memory_median_ratio": 2.3931428571428572,
+      "interpretation": "descriptive single-window ratio, not paired formal evidence"
+    },
+    {
+      "workload": "json_object",
+      "ku_over_rust_service_cpu_ratio": 1.2596353072954858,
+      "ku_over_rust_cgroup_memory_median_ratio": 1.8230647709320695,
+      "interpretation": "descriptive single-window ratio, not paired formal evidence"
+    },
+    {
+      "workload": "cpu",
+      "ku_over_rust_service_cpu_ratio": 0.6776699811145327,
+      "ku_over_rust_cgroup_memory_median_ratio": 1.4736842105263157,
+      "interpretation": "descriptive single-window ratio, not paired formal evidence"
+    },
+    {
+      "workload": "db",
+      "ku_over_rust_service_cpu_ratio": 1.349816201993726,
+      "ku_over_rust_cgroup_memory_median_ratio": 1.5041766109785202,
+      "interpretation": "descriptive single-window ratio, not paired formal evidence"
+    }
+  ],
+  "findings": {
+    "confirmed": [
+      "All28 measurement windows reconcile583800 planned to583800 correct; all golden checks passed; no force-kill and empty service domains after controlled stop.",
+      "For this integer CPU HTTP implementation, Ku service CPU/correct was2608.107us versus Rust3848.638us in their respective sequential windows.",
+      "Ku service CPU/correct was higher than Rust for ok, JSON and PG; Rust cgroup-memory median was lower in all four workloads.",
+      "All stack phases included measured host swap-in and swap-out; guest swap total0, sampled guest available memory remained above3GiB, all observed domain pgmajfault deltas0 and memory-event deltas0.",
+      "Client generation-lag distribution contains zero samples; scheduling-to-attempt is available instead."
+    ],
+    "supported_but_not_confirmed": [
+      "Environmental drift and client connection/scheduling delays can affect reported tails; largest requests contain substantial non-server-exclusive segments."
+    ],
+    "unknown": [
+      "Unique root cause of each tail spike and precise host/guest contribution.",
+      "Stable latency ordering, maximum capacity, seven-round confidence intervals and30-minute stability.",
+      "Full-lifecycle CPU and universal leak freedom."
+    ]
+  }
+}

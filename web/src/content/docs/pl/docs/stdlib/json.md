@@ -1,7 +1,7 @@
 ---
 title: 'Dokumentacja JSON'
 description: 'Kodowanie i dekodowanie JSON w Ku, konwersja KuValue, kody błędów i obsługa zapleczy.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Kodowanie i odczyt wartości
 
-To kompletny podstawowy przykład. Gałąź rozwojowa zawiera szerszy przykład regresyjny w [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+To kompletny podstawowy przykład. Gałąź rozwojowa zawiera szerszy przykład regresyjny w [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ Obsługiwalne błędy używają domeny `json`. Typowe kody to `parse_error`, `st
 
 Interpreter, domyślny pakowany program uruchamiający i synchroniczne natywne zaplecze C mają implementacje JSON. **Ograniczony natywny podzbiór Task i LLVM nie obsługują JSON.** Importy domyślnego programu uruchamiającego nadal zależą od położenia źródeł; obsługa JSON nie oznacza w pełni niezależnego pakietu.
 
-Sygnatury i ograniczenia tej strony sprawdzono z kodem i kontraktami. Weryfikacja wykonania musi podawać wersję, commit i zaplecze. Zobacz pełny [kontrakt składni JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Sygnatury i ograniczenia tej strony sprawdzono z kodem i kontraktami. Weryfikacja wykonania musi podawać wersję, commit i zaplecze. Zobacz pełny [kontrakt składni JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

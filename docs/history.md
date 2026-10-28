@@ -41,7 +41,8 @@ history/
 | 0.0.15 | 已归档 | 对象解构、HTTP service 调用严格化、示例重写、clone/IR/native 路线同步 |
 | 0.0.16 | 历史版本 | native 标准库、统一数据库 client、package/registry 与 target-scoped 发布合同 |
 | 0.0.17 | 历史实验版本 | 同步 `&` 只读借用、Stage3 braced `while` 与跨平台测试工具修复；验收状态见 [版本记录](v0.0.17.md) |
-| 0.0.18 | 当前实验版本 | 有限 Task/阻塞调用与关闭修复、HTTP 复用、有界缓冲、JSON 大浮点往返及显式进程限制；冻结范围与已知问题见 [版本记录](v0.0.18.md) |
+| 0.0.18 | 历史实验版本 | 有限 Task/阻塞调用与关闭修复、HTTP 复用、有界缓冲、JSON 大浮点往返及显式进程限制；冻结范围与已知问题见 [版本记录](v0.0.18.md) |
+| 0.0.19 | 当前实验版本 / Current experimental version | 多事件循环、Task 主路径、异步 PG、服务管理及文档更新 / Multi-loop HTTP, Task paths, async PG, service management and documentation; [中文](v0.0.19.md) / [English](v0.0.19.en.md) |
 
 ## 自动化
 

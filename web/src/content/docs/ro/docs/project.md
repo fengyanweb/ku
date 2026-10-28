@@ -1,25 +1,27 @@
 ---
 title: 'Proiect și contribuții'
 description: 'Starea proiectului Ku, sursa publică, limitele licențierii și raportarea reproductibilă a problemelor.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Proiectul este **Ku programming language / Ku 编程语言**, cu CLI numit `ku`. Ku este un limbaj de programare mic și un interpretor în dezvoltare. Versiunea publică actuală este versiunea preliminară experimentală v0.0.18.
+Documentația curentă vizează Ku 0.0.19, o prelansare experimentală cu aceeași versiune pentru CLI și extensia VS Code. Disponibilitatea, fișierele și sumele de control sunt stabilite de GitHub Release efectiv.
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## Sursă și licențiere
 
-Vezi [sursa GitHub](https://github.com/fengyanweb/ku) și [pagina versiunii](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). Sursa poate fi văzută public, dar codul propriu Ku **nu are acordată o licență open source**. Extensia editorului este marcată `UNLICENSED`. Publicarea surselor sau binarelor nu acordă automat o licență open source.
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-Notificările terților din arhive se aplică doar componentelor respective. Nu stabilesc permisiuni de utilizare, modificare sau redistribuire pentru Ku în sine. Orice autorizare necesară trebuie să vină explicit de la responsabilul proiectului; site-ul nu creează noi angajamente de licențiere.
+Ku și extensia VS Code sunt oferite sub Apache License 2.0. Consultați [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) și [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Componentele terțe își păstrează drepturile de autor și licențele proprii.
 
 ## Raportează o problemă
 
@@ -34,7 +36,7 @@ Nu trimite tokenuri, parole, șiruri reale de conexiune sau jurnale cu date de a
 
 ## Înainte de a contribui
 
-[Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) și [contractul semantic](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) definesc comportamentul limbajului. Verifică împreună CI, implementarea și contractele. O țintă din jurnalul de lucru nu este o funcție implementată.
+[Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) și [contractul semantic](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) definesc comportamentul limbajului. Verifică împreună CI, implementarea și contractele. O țintă din jurnalul de lucru nu este o funcție implementată.
 
 Păstrează schimbările concentrate și explică reproducerea, cauza, aria și verificarea. Revizuiește conținutul site-ului alături de sursa relevantă. Păstrează testele existente, modificările arborelui de lucru și dovezile unice. Responsabilul proiectului decide acceptarea contribuțiilor și condițiile de licențiere; site-ul nu inventează un acord de contribuție.
 

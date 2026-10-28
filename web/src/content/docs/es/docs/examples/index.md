@@ -1,7 +1,7 @@
 ---
 title: 'Ejemplos (English)'
 description: 'Runnable examples documented in English.'
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['examples/README.md']
 ---

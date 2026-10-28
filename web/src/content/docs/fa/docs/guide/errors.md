@@ -1,7 +1,7 @@
 ---
 title: 'خطاها و عیب‌یابی'
 description: 'تشخیص خطاهای نصب، واردسازی، مالکیت، JSON و قابلیت‌های مسیرهای اجرای Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ ku check --json hello.ku
 | `E0913` | پارامتر امانت‌گرفتهٔ ناهمگام        | پارامتر مالک‌شده به کار ببرید؛ اگر اصل مقدار لازم است در فراخوان تکثیر کنید       |
 | `E0918` | نوشتن `&value` در محل فراخوانی      | آرگومان عادی بدهید؛ امانت‌گیری در امضا تعریف می‌شود                               |
 
-این جدول خلاصهٔ تشخیص‌های ثبت‌شده است و همهٔ خطاها را فهرست نمی‌کند. مرجع معتبر فعلی [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs) است.
+این جدول خلاصهٔ تشخیص‌های ثبت‌شده است و همهٔ خطاها را فهرست نمی‌کند. مرجع معتبر فعلی [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs) است.
 
 ## قرارداد خطاهای زمان اجرا جداست
 
@@ -74,4 +74,4 @@ fn main() {
 
 خطاهای پایگاه دادهٔ `execution_unknown` و `execution_completed_without_result` نباید باعث اجرای مجدد خودکار شوند. شواهد درخواست و عملیات تجاری را حفظ کنید و ابتدا وضعیت واقعی اجرا را مشخص کنید. بررسی وب‌سایت محلی به اتصال پایگاه دادهٔ محیط عملیاتی نیاز ندارد.
 
-برای جزئیات بیشتر [راهنمای تشخیص مخزن](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md) را ببینید.
+برای جزئیات بیشتر [راهنمای تشخیص مخزن](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md) را ببینید.

@@ -1,22 +1,28 @@
 ---
 title: 'Σημειώσεις εκδόσεων'
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku v0.0.19 experimental prerelease scope, downloads and known limitations.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/history.md',
     'Cargo.toml',
   ]
 ---
 
+## 0.0.19
+
+Η τρέχουσα τεκμηρίωση αφορά το Ku 0.0.19, μια πειραματική προέκδοση με ίδια έκδοση CLI και επέκτασης VS Code. Η διαθεσιμότητα, τα αρχεία και τα αθροίσματα ελέγχου καθορίζονται από το πραγματικό GitHub Release.
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/el/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18 · Ιστορικό
+
 Η τεκμηρίωση περιγράφει το οριστικοποιημένο εύρος της πειραματικής προέκδοσης v0.0.18. Η πραγματική δημοσίευση και οι λήψεις καταγράφονται στα GitHub Releases.
 
 > Οι νέες πληροφορίες για τη v0.0.18 ακολουθούν προς το παρόν στα αγγλικά· η υπόλοιπη μετάφραση διατηρείται. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-## v0.0.18 release scope and known limits
 
 This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
 

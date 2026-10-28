@@ -1,7 +1,7 @@
 ---
 title: 'Αναφορά JSON'
 description: 'Κωδικοποίηση και αποκωδικοποίηση JSON στο Ku, μετατροπή KuValue, κωδικοί σφαλμάτων και υποστήριξη backend.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## Κωδικοποίηση και ανάγνωση τιμών
 
-Αυτό είναι πλήρες βασικό παράδειγμα. Ο κλάδος ανάπτυξης έχει ευρύτερο παράδειγμα ελέγχου παλινδρόμησης στο [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+Αυτό είναι πλήρες βασικό παράδειγμα. Ο κλάδος ανάπτυξης έχει ευρύτερο παράδειγμα ελέγχου παλινδρόμησης στο [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 Ο διερμηνευτής, ο προεπιλεγμένος συσκευασμένος εκκινητής και ο σύγχρονος εγγενής backend C διαθέτουν υλοποιήσεις JSON. **Το περιορισμένο εγγενές υποσύνολο Task και το LLVM δεν υποστηρίζουν JSON.** Οι εισαγωγές του προεπιλεγμένου εκκινητή εξακολουθούν να εξαρτώνται από τις θέσεις πηγής· η υποστήριξη JSON δεν συνεπάγεται πλήρως ανεξάρτητο πακέτο.
 
-Οι υπογραφές και τα όρια αυτής της σελίδας ελέγχθηκαν με πηγές και συμβάσεις. Η επαλήθευση εκτέλεσης πρέπει να ονομάζει έκδοση, commit και backend. Δείτε την πλήρη [σύμβαση σύνταξης JSON](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+Οι υπογραφές και τα όρια αυτής της σελίδας ελέγχθηκαν με πηγές και συμβάσεις. Η επαλήθευση εκτέλεσης πρέπει να ονομάζει έκδοση, commit και backend. Δείτε την πλήρη [σύμβαση σύνταξης JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

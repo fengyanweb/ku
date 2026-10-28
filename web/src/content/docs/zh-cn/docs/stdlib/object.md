@@ -1,7 +1,7 @@
 ---
 title: 对象
 description: 字符串键对象、严格读取、显式默认值与 JSON 动态值。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/object.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:

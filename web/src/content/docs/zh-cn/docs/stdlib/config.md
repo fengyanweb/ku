@@ -1,7 +1,7 @@
 ---
 title: 配置文件
 description: 通过 std.config 从源码相对路径读取 .env 和平面 YAML 配置。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/config.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:

@@ -1,7 +1,7 @@
 ---
 title: 'Libreria standard'
 description: 'Trova moduli della libreria standard Ku, firme essenziali e limiti dei backend.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v0.0.18. La pubblicazione effettiva e i download sono registrati in GitHub Releases. Questi punti di ingresso essenziali sono stati confrontati con il sorgente; non è una documentazione API esaustiva. Il [contratto sintattico](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) definisce il comportamento. Consulta la [matrice di supporto](/it/docs/support/) per i limiti dei backend.
+Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v0.0.18. La pubblicazione effettiva e i download sono registrati in GitHub Releases. Questi punti di ingresso essenziali sono stati confrontati con il sorgente; non è una documentazione API esaustiva. Il [contratto sintattico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) definisce il comportamento. Consulta la [matrice di supporto](/it/docs/support/) per i limiti dei backend.
 
 ## Importa moduli
 
@@ -77,7 +77,7 @@ Crea prima un file UTF-8 `message.txt` accanto al sorgente. Un file assente o un
 
 ## Manutenzione della documentazione
 
-I metadati delle interfacce pubbliche si trovano in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sono verificati insieme a implementazioni e contratti. Il sito mantiene attualmente una documentazione manuale selezionata; l'esistenza di un comando `ku doc` non è stata confermata.
+I metadati delle interfacce pubbliche si trovano in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Sono verificati insieme a implementazioni e contratti. Il sito mantiene attualmente una documentazione manuale selezionata; l'esistenza di un comando `ku doc` non è stata confermata.
 
 ## API reference (English)
 

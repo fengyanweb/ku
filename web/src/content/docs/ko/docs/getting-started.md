@@ -1,9 +1,9 @@
 ---
 title: '시작하기'
 description: 'Hello Ku를 작성하고 소스를 검사하며 인터프리터 실행과 컴파일의 차이를 알아봅니다.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 이 페이지는 v0.0.17에 이미 있는 기본 문법과 CLI 명령을 사용합니다. 먼저 [Ku를 설치](/ko/docs/install/)하고 `ku --version`이 실행되는지 확인하세요.

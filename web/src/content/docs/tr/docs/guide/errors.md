@@ -1,7 +1,7 @@
 ---
 title: 'Hatalar ve sorun giderme'
 description: 'Ku kurulumu, içe aktarma, sahiplik, JSON ve arka uç yetenek hatalarını tanılayın.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ ku check --json hello.ku
 | `E0913` | Ödünç async parametre                 | Sahip olunan parametre kullanın; asıl değer gerekiyorsa çağıran tarafta klonlayın     |
 | `E0918` | Çağrı yerinde `&value` yazılması      | Normal argüman geçirin; ödünç almayı imza bildirir                                    |
 
-Bu, kayıtlı tanıların özetidir; her hatanın listesi değildir. Güncel belirleyici kayıt [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs) içindedir.
+Bu, kayıtlı tanıların özetidir; her hatanın listesi değildir. Güncel belirleyici kayıt [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs) içindedir.
 
 ## Çalışma zamanı hatalarının ayrı bir sözleşmesi vardır
 
@@ -74,4 +74,4 @@ Bu öğretici program bilerek kurtarılabilir ayrıştırma hatası üretir. Bil
 
 Veritabanı hataları `execution_unknown` ve `execution_completed_without_result` otomatik yeniden yürütmeyi tetiklememelidir. İstek ve iş işlemine ait kanıtları koruyun ve önce gerçek yürütme durumunu belirleyin. Yerel web sitesini doğrulamak üretim veritabanı bağlantısı gerektirmez.
 
-Ayrıntılar için [depodaki tanı kılavuzuna](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md) bakın.
+Ayrıntılar için [depodaki tanı kılavuzuna](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md) bakın.

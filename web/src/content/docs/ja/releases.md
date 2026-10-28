@@ -1,22 +1,28 @@
 ---
 title: 'リリースノート'
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku v0.0.19 experimental prerelease scope, downloads and known limitations.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/history.md',
     'Cargo.toml',
   ]
 ---
 
+## 0.0.19
+
+現在のドキュメントは実験的プレリリース Ku 0.0.19 を対象とし、CLI と VS Code 拡張機能のバージョンも 0.0.19 です。公開状況、ファイル、チェックサムは実際の GitHub Release を確認してください。
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/ja/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18 · 履歴
+
 本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。
 
 > v0.0.18 の追加情報は現在英語で掲載しています。既存の翻訳は保持しています。 [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-## v0.0.18 release scope and known limits
 
 This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
 

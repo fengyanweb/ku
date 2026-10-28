@@ -56,13 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "指定负载下的性能观察",
-  "performanceScope": "开发构建观测：Linux ARM64 指定 HTTP 与 CPU 混合负载的七对窗口，与 Rust 低内存参考配置比较。以下为几何平均比的点估计。",
+  "performanceTitle": "固定负载下的观察",
+  "performanceScope": "0.0.19 本轮单次短对照：Linux ARM64 VM，服务各限 4 核，每项业务 30 秒，7 种语言逐个执行。以下比较服务 CPU 时间/正确请求（Ku/Rust），不是请求延迟。",
   "performanceMetrics": [
-    ["每个正确请求的 CPU 成本", "约少 33%", "Ku/Rust ≈ 0.671"],
-    ["稳态进程驻留内存 RSS", "约少 65%", "Ku/Rust ≈ 0.351"]
+    ["CPU 业务的 CPU 成本", "约低 32%", "Ku/Rust ≈ 0.678"],
+    ["JSON 业务的 CPU 成本", "约高 26%", "Ku/Rust ≈ 1.260"],
+    ["PG 业务的 CPU 成本", "约高 35%", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "完整对照资格与延迟目标尚未全部通过。这些观察不表示最大吞吐提升、跨语言整体排名或生产就绪。",
+  "performanceLimits": "单轮观察不等于容量或长期验收。宿主实际换页与长尾延迟仍在，PG 连接池 reset 语义存在差异。本轮测量的是 cgroup 内存，不是 RSS，不提供 RSS 比较。",
   "practiceTitle": ["熟悉的数据，", "明确的错误处理。"],
   "practiceDescription": "导入模块，构造数据，再编码为 JSON。用 ? 传播错误，让失败路径成为代码的一部分。",
   "jsonReference": "阅读 JSON 参考",
@@ -90,7 +91,7 @@
   "projectTitle": "认真构建，也坦诚记录。",
   "projectDescription": "Ku v{releasedVersion} 仍处于开发阶段。Linux ARM64 候选部署已完成隔离样例预演，尚未验证真实业务生产使用。欢迎用实际程序参与评估并反馈问题；公开产物以 GitHub Release 为准。",
   "github": "在 GitHub 查看项目",
-  "license": "源码公开可查看，目前尚未授予开源许可证。",
+  "license": "采用 Apache-2.0 许可证，详见 LICENSE 和 NOTICE。",
   "verified": "内容核实",
   "limitations": "支持范围与限制",
   "version": "文档版本",

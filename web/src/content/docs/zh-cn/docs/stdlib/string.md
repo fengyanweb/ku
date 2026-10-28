@@ -1,7 +1,7 @@
 ---
 title: 字符串
 description: Unicode 文本长度、查找、切片、转换及后端支持。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
@@ -75,4 +75,4 @@ slice_error
 
 ## 后端支持
 
-此示例适用于解释器和同步 native C。v0.0.18 的 Unicode `trim`、`lower`、`upper` 仅由解释器实现，native C 会拒绝编译；表中其他接口已有 native C 实现。同步示例不表示通用 native Task 或 LLVM 支持。
+此示例适用于解释器和同步 native C。v0.0.19 的 Unicode `trim`、`lower`、`upper` 仅由解释器实现，native C 会拒绝编译；表中其他接口已有 native C 实现。同步示例不表示通用 native Task 或 LLVM 支持。

@@ -1,22 +1,28 @@
 ---
 title: 發佈記錄
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku v0.0.19 experimental prerelease scope, downloads and known limitations.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/history.md',
     'Cargo.toml',
   ]
 ---
 
+## 0.0.19
+
+目前文件對應 Ku 0.0.19 實驗預發行版，CLI 與 VS Code 擴充功能版本一致。實際公開狀態、下載檔案與校驗值以對應 GitHub Release 為準。
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/zh-tw/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18 · 歷史
+
 本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。
 
 > 以下 v0.0.18 新增發布資訊暫以英文提供；既有譯文保留。 [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-## v0.0.18 release scope and known limits
 
 This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
 

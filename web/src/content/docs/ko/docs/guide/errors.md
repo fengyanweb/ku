@@ -1,7 +1,7 @@
 ---
 title: '오류 및 문제 해결'
 description: 'Ku 설치, 가져오기, 소유권, JSON, 백엔드 기능 오류를 진단합니다.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ ku check --json hello.ku
 | `E0913` | 비동기 매개변수 대여            | 소유 매개변수를 사용하고 원본이 필요하면 호출자에서 복제 |
 | `E0918` | 호출 지점에 `&value` 작성       | 일반 인자를 전달. 대여는 시그니처에서 선언               |
 
-이는 등록된 진단의 요약이며 모든 오류 목록이 아닙니다. 현재의 기준 레지스트리는 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs)입니다.
+이는 등록된 진단의 요약이며 모든 오류 목록이 아닙니다. 현재의 기준 레지스트리는 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs)입니다.
 
 ## 런타임 오류에는 별도의 계약이 있음
 
@@ -74,4 +74,4 @@ fn main() {
 
 데이터베이스 오류 `execution_unknown`과 `execution_completed_without_result`는 자동 재실행의 근거가 되어서는 안 됩니다. 요청과 업무 증거를 보존하고 실제 실행 상태부터 확인하세요. 로컬 웹사이트 검증에는 프로덕션 데이터베이스 연결이 필요하지 않습니다.
 
-자세한 내용은 [저장소 진단 안내](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md)를 참고하세요.
+자세한 내용은 [저장소 진단 안내](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)를 참고하세요.

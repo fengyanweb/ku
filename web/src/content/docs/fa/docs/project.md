@@ -1,25 +1,27 @@
 ---
 title: 'پروژه و مشارکت'
 description: 'وضعیت پروژهٔ Ku، کد منبع عمومی، مرزهای مجوز و گزارش مشکل قابل بازتولید.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
     'README.md',
     'Cargo.toml',
     'editors/vscode-ku/package.json',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. نام پروژه **Ku programming language / Ku 编程语言** و نام CLI برابر `ku` است. Ku یک زبان برنامه‌نویسی کوچک و مفسر در حال توسعه است. انتشار عمومی فعلی آن پیش‌انتشار آزمایشی v0.0.18 است.
+مستندات فعلی مربوط به Ku 0.0.19، یک پیش‌انتشار آزمایشی با نسخهٔ یکسان CLI و افزونهٔ VS Code است. وضعیت انتشار، فایل‌ها و جمع‌های بررسی را در GitHub Release واقعی ببینید.
+
+**Ku programming language / Ku 编程语言** · CLI: `ku`.
 
 ## کد منبع و مجوز
 
-[کد منبع GitHub](https://github.com/fengyanweb/ku) و [صفحهٔ انتشار](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) را ببینید. کد منبع برای عموم قابل مشاهده است، اما کد خود Ku **مجوز متن‌باز دریافت نکرده است**. افزونهٔ ویرایشگر با `UNLICENSED` مشخص شده است. انتشار کد یا فایل اجرایی، خودکار مجوز متن‌باز اعطا نمی‌کند.
+[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
 
-اعلان‌های اشخاص ثالث در بایگانی انتشار فقط مربوط به اجزای خودشان‌اند. آن‌ها اجازهٔ استفاده، تغییر یا بازتوزیع خود Ku را مشخص نمی‌کنند. هر مجوز لازم باید صریحاً از نگهدارنده دریافت شود؛ این وب‌سایت تعهد مجوز جدیدی ایجاد نمی‌کند.
+Ku و افزونهٔ VS Code با Apache License 2.0 عرضه می‌شوند. [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) و [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) را بخوانید. اجزای شخص ثالث حق نشر و مجوزهای خود را حفظ می‌کنند.
 
 ## گزارش مشکل
 
@@ -34,7 +36,7 @@ sources:
 
 ## پیش از مشارکت
 
-[قرارداد نحو](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) و [قرارداد معناشناسی](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) رفتار زبان را تعریف می‌کنند. CI، پیاده‌سازی و قراردادها را با هم بررسی کنید. هدف گزارش کار، ویژگی پیاده‌سازی‌شده نیست.
+[قرارداد نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) و [قرارداد معناشناسی](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) رفتار زبان را تعریف می‌کنند. CI، پیاده‌سازی و قراردادها را با هم بررسی کنید. هدف گزارش کار، ویژگی پیاده‌سازی‌شده نیست.
 
 تغییرها را محدود نگه دارید و بازتولید، علت، محدوده و بررسی را توضیح دهید. محتوای وب‌سایت را همراه کد مرتبط مرور کنید. آزمون‌های موجود، تغییرات درخت کاری و شواهد منحصربه‌فرد را حفظ کنید. پذیرش مشارکت و ترتیبات مجوز را نگهدارنده تعیین می‌کند؛ این وب‌سایت قرارداد مشارکت ابداع نمی‌کند.
 

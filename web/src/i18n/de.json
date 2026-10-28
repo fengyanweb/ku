@@ -56,17 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Beobachtungen zur Leistung",
-  "performanceScope": "Messungen eines Entwicklungsbuilds: Sieben gepaarte Messfenster einer festgelegten HTTP- und CPU-Last unter Linux ARM64 im Vergleich zu einer speichersparenden Rust-Referenzkonfiguration. Die Werte sind Punktschätzungen geometrisch gemittelter Verhältnisse.",
+  "performanceTitle": "Beobachtungen bei fester Last",
+  "performanceScope": "0.0.19: ein sequenzieller Durchlauf mit sieben Sprachen in einer Linux-ARM64-VM, vier CPU-Kernen je Dienst und 30 Sekunden je Arbeitslast. Verglichen wird die CPU-Zeit des Dienstes pro korrekter Anfrage (Ku/Rust), nicht die Anfragelatenz.",
   "performanceMetrics": [
-    [
-      "CPU-Kosten je korrekter Anfrage",
-      "Etwa 33 % geringer",
-      "Ku/Rust ≈ 0.671"
-    ],
-    ["Stationärer Prozess-RSS", "Etwa 65 % geringer", "Ku/Rust ≈ 0.351"]
+    ["CPU-Arbeitslast — CPU-Kosten", "Etwa 32 % niedriger", "Ku/Rust ≈ 0.678"],
+    ["JSON-Arbeitslast — CPU-Kosten", "Etwa 26 % höher", "Ku/Rust ≈ 1.260"],
+    ["PG-Arbeitslast — CPU-Kosten", "Etwa 35 % höher", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Die Vergleichsqualifikation und Latenzziele sind noch nicht vollständig erfüllt. Die Beobachtungen belegen weder einen höheren maximalen Durchsatz noch eine allgemeine Sprachrangfolge oder Produktionsreife.",
+  "performanceLimits": "Ein einzelner Durchlauf ist keine Kapazitäts- oder Langzeitabnahme. Host-Paging und lange Latenzausreißer bleiben bestehen. Die Reset-Semantik der PG-Verbindungspools unterscheidet sich. Diese Runde misst cgroup-Speicher, nicht RSS; ein RSS-Vergleich wird nicht angegeben.",
   "practiceTitle": ["Vertraute Daten.", "Explizite Fehler."],
   "practiceDescription": "Importieren Sie ein Modul, erstellen Sie einen Wert und kodieren Sie ihn als JSON. Der Operator ? reicht Fehler weiter, statt sie zu verbergen.",
   "jsonReference": "JSON-Referenz lesen",
@@ -98,11 +95,11 @@
   "projectTitle": "Ein laufendes Projekt. Eine Geschichte zum Verfolgen.",
   "projectDescription": "Ku v{releasedVersion} befindet sich weiter in Entwicklung. Ein Linux-ARM64-Deployment-Kandidat wurde mit einem isolierten Beispiel erprobt; ein realer Produktionseinsatz wurde nicht validiert. Eigene Programme evaluieren und Rückmeldungen geben. Veröffentlichte Artefakte stehen in GitHub Releases.",
   "github": "Auf GitHub erkunden",
-  "license": "Der Quelltext ist einsehbar. Es wurde keine Open-Source-Lizenz erteilt.",
+  "license": "Lizenziert unter Apache-2.0. Siehe LICENSE und NOTICE.",
   "verified": "Geprüft",
   "limitations": "Unterstützung & Grenzen",
   "version": "Dokumentationsversion",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Snapshot {version}",
   "snapshotNotice": "Archivierter Dokumentationsstand. Er wird unabhängig von der aktuellen Entwicklungsdokumentation aufbewahrt und kündigt keine Binärveröffentlichung an.",
   "nextNotice": "Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v{currentVersion}. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases.",

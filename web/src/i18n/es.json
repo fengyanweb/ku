@@ -56,21 +56,26 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Observaciones de rendimiento",
-  "performanceScope": "Mediciones de una compilación de desarrollo: Siete pares de ventanas de una carga específica de HTTP y CPU en Linux ARM64, frente a una configuración Rust de referencia de bajo consumo de memoria. Son estimaciones puntuales de razones medias geométricas.",
+  "performanceTitle": "Observaciones con carga fija",
+  "performanceScope": "0.0.19: una sola ronda secuencial de siete lenguajes en una VM Linux ARM64, con cuatro núcleos de CPU por servicio y 30 segundos por carga. Se compara el tiempo de CPU del servicio por solicitud correcta (Ku/Rust), no la latencia de las solicitudes.",
   "performanceMetrics": [
     [
-      "Coste de CPU por solicitud correcta",
-      "Aproximadamente un 33% menor",
-      "Ku/Rust ≈ 0.671"
+      "Carga CPU — coste de CPU",
+      "Aproximadamente un 32 % menor",
+      "Ku/Rust ≈ 0.678"
     ],
     [
-      "RSS del proceso en estado estable",
-      "Aproximadamente un 65% menor",
-      "Ku/Rust ≈ 0.351"
+      "Carga JSON — coste de CPU",
+      "Aproximadamente un 26 % mayor",
+      "Ku/Rust ≈ 1.260"
+    ],
+    [
+      "Carga PG — coste de CPU",
+      "Aproximadamente un 35 % mayor",
+      "Ku/Rust ≈ 1.350"
     ]
   ],
-  "performanceLimits": "Aún no se han cumplido todos los requisitos de validez de la comparación ni los objetivos de latencia. Estas observaciones no demuestran mayor rendimiento máximo, una clasificación general de lenguajes ni preparación para producción.",
+  "performanceLimits": "Una sola ronda no constituye una aceptación de capacidad ni de estabilidad a largo plazo. Persisten la paginación del host y las latencias de cola larga. La semántica de reinicio de los pools de conexiones PG difiere. En esta ronda se midió memoria cgroup, no RSS; no se presenta una comparación de RSS.",
   "practiceTitle": ["Datos conocidos.", "Errores explícitos."],
   "practiceDescription": "Importa un módulo, crea un valor y codifícalo como JSON. El operador ? propaga los errores en lugar de ocultarlos.",
   "jsonReference": "Lee la referencia de JSON",
@@ -102,11 +107,11 @@
   "projectTitle": "Un trabajo en marcha. Una historia que seguir.",
   "projectDescription": "Ku v{releasedVersion} sigue en desarrollo. Se ha ensayado un candidato de despliegue Linux ARM64 con un ejemplo aislado; no se ha validado su uso productivo en un negocio real. Evalúalo con tus programas y comparte comentarios. Los artefactos publicados figuran en GitHub Releases.",
   "github": "Explorar en GitHub",
-  "license": "El código fuente se puede consultar. No se ha concedido una licencia de código abierto.",
+  "license": "Licencia Apache-2.0. Consulta LICENSE y NOTICE.",
   "verified": "Verificado",
   "limitations": "Compatibilidad y límites",
   "version": "Versión de la documentación",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "Instantánea {version}",
   "snapshotNotice": "Instantánea archivada de la documentación. Se conserva independientemente de la documentación de desarrollo actual; no anuncia una publicación de binarios.",
   "nextNotice": "Esta documentación describe el alcance fijado de la versión preliminar experimental v{currentVersion}. La publicación real y las descargas constan en GitHub Releases.",

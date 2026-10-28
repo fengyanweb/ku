@@ -41,6 +41,7 @@ COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,119}\Z")
 LICENSE_NAME = re.compile(r"(?:LICEN[CS]E|COPYING|NOTICE|COPYRIGHT)(?:[._-].*)?\Z", re.I)
 RLIB_NAME = re.compile(r"deps/lib[A-Za-z_][A-Za-z0-9_]*-[0-9a-f]{16}\.rlib\Z")
+KU_LICENSE = "Apache-2.0"
 
 
 class ExportError(ValueError):
@@ -478,6 +479,14 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
             raise ExportError("license material total exceeds limit")
         stage.add(name, data=value)
 
+    ku = [package for package in packages if package["id"] in workspace
+          and package["name"] == "ku"
+          and Path(package["manifest_path"]).parent.resolve() == repo]
+    if len(ku) != 1 or ku[0].get("license") != KU_LICENSE:
+        raise ExportError("Ku Cargo metadata must declare Apache-2.0")
+    for name in ("LICENSE", "NOTICE"):
+        add_license(repo / name, name)
+
     for package in sorted(packages, key=lambda p: (p["name"], p["version"], p["id"])):
         name, version = package["name"], package["version"]
         if not PACKAGE.fullmatch(name) or not PACKAGE.fullmatch(version):
@@ -486,7 +495,7 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
         plain(manifest)
         root = manifest.parent
         if package["id"] in workspace:
-            # No source-license grant is inferred for Ku's workspace packages.
+            # Ku's own original license and notice are included at archive root.
             continue
         identity = f"{name}-{version}"
         if identity.casefold() in seen:
@@ -546,7 +555,8 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
     return {
         "format": "ku-third-party-v1",
         "scope": "Non-dev dependency closure of workspace roots from caller-supplied cargo metadata --filter-platform TARGET. Includes build dependencies as a conservative superset, not a minimal linked-dependency list.",
-        "ku_license": "No open-source license grant for Ku's own code is included in this release.",
+        "ku_license": KU_LICENSE,
+        "ku_materials": ["LICENSE", "NOTICE"],
         "cargo": records,
         "rust": {"required_toolchain": "1.89.0", "materials": rust_paths},
     }
@@ -632,7 +642,7 @@ def export_release(bundle: Path, output: Path, repo: Path, version: str,
         raise ExportError("release output already exists; refusing overwrite")
     release = {"format": "ku-release-v1", "version": version, "target": target, "commit": commit,
                "rust_toolchain": "1.89.0", "status": "experimental",
-               "ku_license": "UNLICENSED; no open-source license grant is included for Ku's own code."}
+               "ku_license": KU_LICENSE}
     with tempfile.TemporaryDirectory(prefix="ku-export-") as temporary:
         temporary = Path(temporary).resolve()
         staging = temporary / "staging"
@@ -681,9 +691,9 @@ asset manifest also covers SHA256SUMS and the complete compressed archive.
 THIRD_PARTY.json records original Cargo/Rust license and copyright materials.
 The VSIX uses Node/VS Code APIs; its npm build tools are not distributed.
 
-Ku's own code remains UNLICENSED. Publishing source or binaries here does not
-grant an open-source license. Third-party licenses apply only to their respective
-components. No additional license grant for Ku is implied by this archive.
+Ku's own code is licensed under Apache-2.0. The original LICENSE and NOTICE are
+included at the archive root. Third-party components retain their respective
+licenses and copyright notices in THIRD_PARTY/ and THIRD_PARTY.json.
 """
         stage.add("README-INSTALL.md", data=instructions.encode("utf-8"))
         sums = "".join(f"{spec['sha256']}  {name}\n" for name, spec in sorted(stage.files.items()))

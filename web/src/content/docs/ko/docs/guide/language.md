@@ -1,7 +1,7 @@
 ---
 title: '언어 안내'
 description: 'Ku의 변수, 함수, 제어 흐름, 소유권, 모듈, 복구 가능한 오류를 배웁니다.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 이 안내는 핵심 문법을 소개합니다. 저장소의 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)과 [의미 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)이 기준입니다. 아래는 학습용 코드 조각입니다. 차이점은 [백엔드 지원](/ko/docs/support/)을 참고하세요.
+이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 이 안내는 핵심 문법을 소개합니다. 저장소의 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)과 [의미 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)이 기준입니다. 아래는 학습용 코드 조각입니다. 차이점은 [백엔드 지원](/ko/docs/support/)을 참고하세요.
 
 ## 변수와 타입
 

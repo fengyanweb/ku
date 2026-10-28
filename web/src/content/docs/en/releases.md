@@ -1,16 +1,24 @@
 ---
 title: 'Versions and release notes'
 description: 'Versions and release notes'
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
-sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
+sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.19.md']
 ---
 
-## 0.0.18 revision 1
+## 0.0.19
+
+Ku 0.0.19 is an experimental prerelease for controlled evaluation, with matching CLI and VS Code extension versions. It collects the implemented native Task, HTTP, PostgreSQL and service-management work, keeps the previous JSON default, and uses Apache-2.0. Complete M:N, general I/O coverage and the full database platform matrix remain incomplete. Historical HTTP 504s and cancellation-related latency tails remain documented; this release does not claim completed long-term or production acceptance.
+
+[Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/en/docs/install/) · [Full notes](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+The Release page determines actual publication, assets and checksums. Native programs should be rebuilt after upgrading; package targets remain macOS ARM64, Linux x64 and Windows x64.
+
+## 0.0.18 revision 1 (historical)
 
 Release tag `v0.0.18-r1` retains CLI and extension version `0.0.18`. It fixes chained calls, large float literals, `time.date(Time)` and extension metadata. The [original release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) remains available.
 
-The current experimental prerelease includes bounded Task/waiting and shutdown fixes, HTTP connection reuse and buffers, large-float JSON round trips and explicit `ku supervise` workers.
+That experimental prerelease included bounded Task/waiting and shutdown fixes, HTTP connection reuse and buffers, large-float JSON round trips and explicit `ku supervise` workers.
 
 [Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [Fixed docs](/en/v0.0.18/) · [Known limits](/en/docs/support/)
 

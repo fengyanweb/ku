@@ -1,7 +1,7 @@
 ---
 title: 'Bibliothèque standard'
 description: 'Trouvez les modules de la bibliothèque standard Ku, leurs signatures essentielles et les limites des backends.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Ces points d'entrée essentiels ont été vérifiés dans les sources ; il ne s'agit pas d'une référence API exhaustive. Le [contrat syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) définit le comportement. Consultez la [matrice de prise en charge](/fr/docs/support/) pour les limites des backends.
+Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Ces points d'entrée essentiels ont été vérifiés dans les sources ; il ne s'agit pas d'une référence API exhaustive. Le [contrat syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) définit le comportement. Consultez la [matrice de prise en charge](/fr/docs/support/) pour les limites des backends.
 
 ## Importer des modules
 
@@ -77,7 +77,7 @@ Créez d'abord un fichier UTF-8 `message.txt` à côté du source. Un fichier ab
 
 ## Entretenir la référence
 
-Les métadonnées d'interfaces publiques se trouvent dans [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Elles sont vérifiées avec les implémentations et les contrats. Ce site maintient actuellement une référence manuelle sélectionnée ; l'existence d'une commande `ku doc` n'a pas été confirmée.
+Les métadonnées d'interfaces publiques se trouvent dans [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Elles sont vérifiées avec les implémentations et les contrats. Ce site maintient actuellement une référence manuelle sélectionnée ; l'existence d'une commande `ku doc` n'a pas été confirmée.
 
 ## API reference (English)
 

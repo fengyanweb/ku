@@ -1,7 +1,7 @@
 ---
 title: Arrays
 description: Typed arrays, lookup, mapping, and non-mutating collection operations.
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
@@ -67,4 +67,4 @@ index_out_of_bounds
 
 ## Backend support
 
-The example works in the interpreter and synchronous native C. v0.0.18 native C supports `len`, `is_empty`, `try_get`, `push`, and `map` for supported element and callback types. It does not implement `first`, `last`, or `concat`. General object/function-valued arrays and native Task code have additional backend limits; a successful interpreter run alone does not prove native support.
+The example works in the interpreter and synchronous native C. v0.0.19 native C supports `len`, `is_empty`, `try_get`, `push`, and `map` for supported element and callback types. It does not implement `first`, `last`, or `concat`. General object/function-valued arrays and native Task code have additional backend limits; a successful interpreter run alone does not prove native support.

@@ -1,9 +1,16 @@
 ---
 title: '示例集'
 description: '按任务查找可以运行的 Ku 示例。'
-kuVersion: '0.0.18'
-verifiedAt: '2026-10-21'
-sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
+sources:
+  [
+    'examples/README.md',
+    'examples/http_server.ku',
+    'examples/json.ku',
+    'tests/fixtures/http_pg_lifecycle_async.ku',
+    'src/ir/task_lower.rs',
+  ]
 ---
 
 这些示例按任务组织。每个链接包含完整程序、运行方式以及后端要求。需要输入文件、服务器或数据库时，页面会明确列出准备步骤。
@@ -21,4 +28,15 @@ sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
 | 数据库查询      | [PG / Redis / MySQL](/zh-cn/docs/stdlib/database/)；native C 与真实服务       |
 | 二进制与 TCP    | [bytes](/zh-cn/docs/stdlib/bytes/) / [net](/zh-cn/docs/stdlib/net/)；native C |
 
-仓库 [examples 目录](https://github.com/fengyanweb/ku/tree/v0.0.18/examples)还有更完整的应用示例。诸如持续运行服务、压力负载或数据库示例有各自依赖，不适合把整个目录作为无条件批量执行命令。
+仓库 [examples 目录](https://github.com/fengyanweb/ku/tree/main/examples)还有更完整的应用示例。诸如持续运行服务、压力负载或数据库示例有各自依赖，不适合把整个目录作为无条件批量执行命令。
+
+## Native Task 示例
+
+| 完整程序                                                                          | 要求与预期结果                                            |
+| --------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| [HTTP](/zh-cn/docs/stdlib/http/#具名-async-native-handler) 的 `async-server.ku`   | Native C，8080 端口空闲；`GET /health` 返回 `ready`       |
+| [JSON](/zh-cn/docs/stdlib/json/#native-task-中的标量-json-对象) 的 `task-json.ku` | Native Task 标量对象编码，输出确定顺序的 JSON             |
+| [时间](/zh-cn/docs/stdlib/time/#native-task-wait) 的 `task-sleep.ku`              | 整数定时等待，输出 `awake`，不需要外部服务                |
+| [数据库](/zh-cn/docs/stdlib/database/#async-pg) 的 `async-pg.ku`                  | Native C、libpq 与真实私有 PG 配置；`GET /read` 返回 `Ku` |
+
+它们分别演示不同的支持路径，不是性能上限、完整异步库或生产就绪证明。

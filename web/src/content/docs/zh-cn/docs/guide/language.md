@@ -1,8 +1,8 @@
 ---
 title: 语言指南
 description: 学习 Ku 的变量、函数、控制流、所有权、模块与可恢复错误。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19 / experimental prerelease'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/syntax.md',
@@ -10,12 +10,14 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'src/cli.rs',
+    'src/ir/task_lower.rs',
   ]
 sidebar:
   order: 0
 ---
 
-本页介绍核心写法，详细规则见仓库[语法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)和[语义合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)为准。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
+本页介绍核心写法，详细规则见仓库[语法合同](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md)和[语义合同](https://github.com/fengyanweb/ku/blob/main/docs/semantics.md)为准。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
 
 ## 变量与类型
 
@@ -117,3 +119,11 @@ Error 包含 `domain`、`code`、`message`。`panic`、Task 取消和超时不�
 ## 并发的当前边界
 
 普通开发者通过 `async fn` 获得一次性 Task 句柄，再 `await`；没有 `task.spawn`、`Task.new` 或 `thread.spawn` 业务入口。解释器和 native Task 子集的覆盖不同，不应从一种后端的示例推导另一种后端完整支持。参见[平台与后端支持](/zh-cn/docs/support/)。
+
+## 选择执行合同
+
+源码语言与后端覆盖相关，但不是同一件事。`ku check` 检查程序，`ku run` 执行解释器，默认 `ku build` 打包解释器路径，`ku build --backend c` 只降低其支持的子集。检查器接受的库调用仍可能被 native 降低拒绝。
+
+`T!` 表示 Result 值，`async fn` 产生 Task。`?` 传播 Result，`await` 消费 Task，二者不能互换。native HTTP 中的 PG 查询等操作有明确限定的挂起路径，必须按模块说明使用。
+
+从[标准库索引](/zh-cn/docs/stdlib/)查参数、返回值与错误，再核对[后端和资源边界](/zh-cn/docs/support/)选择部署命令。async 语法不代表通用线程启动或自动重试 API。

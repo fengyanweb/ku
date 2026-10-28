@@ -1,7 +1,7 @@
 ---
 title: 'Biblioteca standard'
 description: 'Găsește modulele bibliotecii standard Ku, semnăturile de bază și limitele backendurilor.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -12,7 +12,7 @@ sources:
   ]
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Aceste puncte de intrare principale au fost verificate în sursă; aceasta nu este o referință API exhaustivă. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) definește comportamentul. Vezi [matricea de suport](/ro/docs/support/) pentru limitele backendurilor.
+Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Aceste puncte de intrare principale au fost verificate în sursă; aceasta nu este o referință API exhaustivă. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) definește comportamentul. Vezi [matricea de suport](/ro/docs/support/) pentru limitele backendurilor.
 
 ## Importarea modulelor
 
@@ -77,7 +77,7 @@ Creează mai întâi un `message.txt` UTF-8 lângă sursă. Un fișier absent sa
 
 ## Întreținerea referinței
 
-Metadatele interfeței publice sunt în [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Sunt verificate împreună cu implementările și contractele. Site-ul întreține momentan o referință selectată manual; nu a fost confirmată o comandă `ku doc` existentă.
+Metadatele interfeței publice sunt în [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Sunt verificate împreună cu implementările și contractele. Site-ul întreține momentan o referință selectată manual; nu a fost confirmată o comandă `ku doc` existentă.
 
 ## API reference (English)
 

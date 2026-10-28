@@ -1,7 +1,7 @@
 ---
 title: 'راهنمای زبان'
 description: 'آشنایی با متغیرها، توابع، جریان کنترل، مالکیت، ماژول‌ها و خطاهای قابل بازیابی در Ku.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -13,7 +13,7 @@ sources:
   ]
 ---
 
-این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. این راهنما نحو اصلی را معرفی می‌کند. [قرارداد نحو](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) و [قرارداد معناشناسی](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) مخزن مرجع معتبرند. این‌ها قطعه‌کدهای آموزشی‌اند؛ تفاوت‌ها را در [پشتیبانی از مسیرهای اجرا](/fa/docs/support/) ببینید.
+این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. این راهنما نحو اصلی را معرفی می‌کند. [قرارداد نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) و [قرارداد معناشناسی](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) مخزن مرجع معتبرند. این‌ها قطعه‌کدهای آموزشی‌اند؛ تفاوت‌ها را در [پشتیبانی از مسیرهای اجرا](/fa/docs/support/) ببینید.
 
 ## متغیرها و انواع
 

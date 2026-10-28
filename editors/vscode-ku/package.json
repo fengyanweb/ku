@@ -2,9 +2,9 @@
   "name": "ku-language",
   "displayName": "Ku Language",
   "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "publisher": "ku-lang",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/fengyanweb/ku.git",

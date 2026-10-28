@@ -1,9 +1,9 @@
 ---
 title: 'Πρώτα βήματα'
 description: 'Γράψτε το Hello Ku, ελέγξτε τον πηγαίο κώδικα και διακρίνετε τη διερμηνεία από τη μεταγλώττιση.'
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
 Η τεκμηρίωση περιγράφει το οριστικοποιημένο εύρος της πειραματικής προέκδοσης v0.0.18. Η πραγματική δημοσίευση και οι λήψεις καταγράφονται στα GitHub Releases. Αυτή η σελίδα χρησιμοποιεί βασική σύνταξη και εντολές CLI που υπάρχουν ήδη στη v0.0.17. Πρώτα [εγκαταστήστε το Ku](/el/docs/install/) και επιβεβαιώστε ότι εκτελείται το `ku --version`.

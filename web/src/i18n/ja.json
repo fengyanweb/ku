@@ -56,13 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "性能の観測結果",
-  "performanceScope": "開発ビルドでの測定：Linux ARM64で特定のHTTP・CPU混合負荷を測定した7組のウィンドウを、Rustの低メモリ参照構成と比較しました。値は比の幾何平均の点推定です。",
+  "performanceTitle": "固定負荷での観測結果",
+  "performanceScope": "0.0.19の単回短時間比較です。Linux ARM64 VM上でサービスごとに4 CPUコアを割り当て、各ワークロードを30秒間、7言語を順番に実行しました。値は正常なリクエスト1件あたりのサービスCPU時間の比（Ku/Rust）であり、リクエスト遅延ではありません。",
   "performanceMetrics": [
-    ["正しいリクエスト1件当たりのCPUコスト", "約33%減", "Ku/Rust ≈ 0.671"],
-    ["定常状態のプロセスRSS", "約65%減", "Ku/Rust ≈ 0.351"]
+    ["CPUワークロードのCPUコスト", "約32%低い", "Ku/Rust ≈ 0.678"],
+    ["JSONワークロードのCPUコスト", "約26%高い", "Ku/Rust ≈ 1.260"],
+    ["PGワークロードのCPUコスト", "約35%高い", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "比較の適格条件と遅延目標はすべて達成されたわけではありません。最大スループットの向上、言語全体の順位、本番利用への適合を示すものではありません。",
+  "performanceLimits": "単回の観測は容量や長期安定性の受け入れ検証ではありません。ホストのページングと長いテール遅延は残っています。PG接続プールのリセットの意味論には違いがあります。今回のメモリ測定はcgroup使用量でありRSSではないため、RSSの比較は示しません。",
   "practiceTitle": ["身近なデータ。", "明示的なエラー。"],
   "practiceDescription": "モジュールをインポートし、値を作り、JSON にエンコードします。? 演算子はエラーを隠さず伝播します。",
   "jsonReference": "JSON リファレンスを読む",
@@ -90,11 +91,11 @@
   "projectTitle": "開発は続く。歩みを見届けよう。",
   "projectDescription": "Ku v{releasedVersion}は開発段階です。Linux ARM64の配備候補は隔離したサンプルでリハーサル済みですが、実業務での本番利用は検証されていません。実際のプログラムで評価し、フィードバックをお寄せください。公開成果物はGitHub Releasesに掲載しています。",
   "github": "GitHub で見る",
-  "license": "ソースは公開閲覧可能です。オープンソースライセンスは許諾されていません。",
+  "license": "Apache-2.0 ライセンス。LICENSE と NOTICE を参照してください。",
   "verified": "内容確認",
   "limitations": "対応範囲と制約",
   "version": "文書のバージョン",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "{version} スナップショット",
   "snapshotNotice": "保存された文書のスナップショットです。現在の開発文書から独立して保持されます。バイナリーのリリースを告知するものではありません。",
   "nextNotice": "本書は実験的プレリリース v{currentVersion} の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。",

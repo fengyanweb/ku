@@ -56,17 +56,22 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "Performans gözlemleri",
-  "performanceScope": "Geliştirme derlemesi ölçümleri: Linux ARM64 üzerinde belirli bir HTTP ve CPU karma yükünün yedi çift ölçüm penceresi, düşük bellekli Rust referans yapılandırmasıyla karşılaştırıldı. Değerler oranların geometrik ortalamalarının nokta tahminleridir.",
+  "performanceTitle": "Sabit yük gözlemleri",
+  "performanceScope": "0.0.19: Linux ARM64 VM üzerinde, her hizmete dört CPU çekirdeği ayrılarak ve iş yükü başına 30 saniye uygulanarak yedi dil sırayla tek turda çalıştırıldı. Değerler, doğru istek başına hizmet CPU süresini karşılaştırır (Ku/Rust); istek gecikmesini değil.",
   "performanceMetrics": [
     [
-      "Doğru istek başına CPU maliyeti",
-      "Yaklaşık %33 daha düşük",
-      "Ku/Rust ≈ 0.671"
+      "CPU iş yükü — CPU maliyeti",
+      "Yaklaşık %32 daha düşük",
+      "Ku/Rust ≈ 0.678"
     ],
-    ["Kararlı durum süreç RSS’i", "Yaklaşık %65 daha düşük", "Ku/Rust ≈ 0.351"]
+    [
+      "JSON iş yükü — CPU maliyeti",
+      "Yaklaşık %26 daha yüksek",
+      "Ku/Rust ≈ 1.260"
+    ],
+    ["PG iş yükü — CPU maliyeti", "Yaklaşık %35 daha yüksek", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "Karşılaştırmanın geçerlilik koşulları ve gecikme hedeflerinin tümü karşılanmış değildir. Bu gözlemler en yüksek iş hacmi artışını, genel bir dil sıralamasını veya üretime hazır olmayı kanıtlamaz.",
+  "performanceLimits": "Tek tur, kapasite veya uzun süreli kararlılık kabulü değildir. Ana makinede sayfalama ve uzun kuyruk gecikmeleri sürmektedir. PG bağlantı havuzlarının sıfırlama semantiği farklıdır. Bu turda RSS değil cgroup belleği ölçüldü; RSS karşılaştırması yapılmıyor.",
   "practiceTitle": ["Tanıdık veriler.", "Açık hatalar."],
   "practiceDescription": "Bir modül içe aktarın, değer oluşturun ve JSON olarak kodlayın. ? işleci hataları gizlemek yerine iletir.",
   "jsonReference": "JSON başvurusunu okuyun",
@@ -98,11 +103,11 @@
   "projectTitle": "Süren bir çalışma. İzlenecek bir hikâye.",
   "projectDescription": "Ku v{releasedVersion} geliştirme aşamasındadır. Linux ARM64 dağıtım adayı yalıtılmış bir örnekle prova edildi; gerçek bir işin üretim kullanımı doğrulanmadı. Kendi programlarınızla değerlendirin ve geri bildirim gönderin. Yayımlanan dosyalar GitHub Releases’tedir.",
   "github": "GitHub üzerinde keşfedin",
-  "license": "Kaynak görüntülenebilir. Açık kaynak lisansı verilmemiştir.",
+  "license": "Apache-2.0 lisansı. LICENSE ve NOTICE dosyalarına bakın.",
   "verified": "Doğrulandı",
   "limitations": "Destek ve sınırlamalar",
   "version": "Belge sürümü",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "{version} anlık görüntüsü",
   "snapshotNotice": "Arşivlenmiş belge anlık görüntüsü. Güncel geliştirme belgelerinden bağımsız korunur; ikili sürüm duyurusu değildir.",
   "nextNotice": "Bu belgeler v{currentVersion} deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.",

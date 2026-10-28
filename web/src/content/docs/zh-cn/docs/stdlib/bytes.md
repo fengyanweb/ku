@@ -1,7 +1,7 @@
 ---
 title: 二进制数据
 description: 拥有内容的 bytes、严格 UTF-8 转换、下标及网络二进制载荷。
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
 sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'tests/native_net_test.rs']

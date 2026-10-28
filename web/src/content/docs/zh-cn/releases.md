@@ -1,16 +1,24 @@
 ---
 title: '版本与发布记录'
 description: '版本与发布记录'
-kuVersion: '0.0.18'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
-sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
+sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.19.md']
 ---
 
-## 0.0.18 修订版 1
+## 0.0.19
 
-当前修订版保留 0.0.18 版本号，发布标识为 `v0.0.18-r1`。新增调用链、大浮点源码字面量、`time.date(Time)` 和插件修复；[初版 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 保留供追溯。
+Ku 0.0.19 是供受控环境试用的实验预发行版，CLI 与 VS Code 插件版本一致。它汇集已实现的 native Task、HTTP、PostgreSQL 和服务管理工作，保留旧 JSON 默认实现，采用 Apache-2.0。完整 M:N、通用 I/O 覆盖和数据库完整平台矩阵尚未完成；历史 HTTP 504 与取消场景长尾仍按已知问题记录，不宣称长期或生产验收已通过。
 
-当前实验预发行版。包含有限 Task/等待与关闭修复、HTTP 连接复用与缓冲限制、JSON 大浮点往返修复，以及显式 `ku supervise` 受控 worker。
+[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [安装](/zh-cn/docs/install/) · [完整说明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.md) · [已知问题](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.md)
+
+实际公开状态、附件与校验信息以 Release 页面为准。升级后应重新构建 native 程序；本版安装包目标仍为 macOS ARM64、Linux x64 和 Windows x64。
+
+## 0.0.18 修订版 1（历史）
+
+历史修订版保留 0.0.18 版本号，发布标识为 `v0.0.18-r1`。新增调用链、大浮点源码字面量、`time.date(Time)` 和插件修复；[初版 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 保留供追溯。
+
+该版为实验预发行版，包含有限 Task/等待与关闭修复、HTTP 连接复用与缓冲限制、JSON 大浮点往返修复，以及显式 `ku supervise` 受控 worker。
 
 [下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [固定文档](/zh-cn/v0.0.18/) · [已知限制](/zh-cn/docs/support/)
 

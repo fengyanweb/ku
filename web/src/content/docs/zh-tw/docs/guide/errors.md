@@ -1,7 +1,7 @@
 ---
 title: 錯誤與排查
 description: 定位 Ku 安裝、匯入、所有權、JSON 與後端能力錯誤。
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -44,7 +44,7 @@ ku check --json hello.ku
 | `E0913` | async 函式聲明 borrowed 參數 | 改為 owned 參數；需要保留原值時由呼叫者 clone            |
 | `E0918` | 在呼叫處寫 `&value`          | 呼叫寫普通實參，借用模式由函式簽名聲明                   |
 
-這些是已登記診斷的摘要，不是完整錯誤碼清單。目前唯一登記來源是 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs)。
+這些是已登記診斷的摘要，不是完整錯誤碼清單。目前唯一登記來源是 [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/error.rs)。
 
 ## 可恢復錯誤與編譯器診斷不同
 
@@ -74,4 +74,4 @@ fn main() {
 
 資料庫的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自動重放；保留請求和業務證據，先核對真實執行狀態。官網本地驗證不需要連接生產資料庫。
 
-更多規則見[倉庫診斷說明](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md)。
+更多規則見[倉庫診斷說明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)。

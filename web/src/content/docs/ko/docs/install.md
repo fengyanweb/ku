@@ -1,32 +1,32 @@
 ---
 title: '설치 및 다운로드'
-description: 'Ku 0.0.18 실험적 사전 릴리스 다운로드와 플랫폼 및 빌드 요구 사항.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku 0.0.19 실험적 사전 릴리스 다운로드와 플랫폼 및 빌드 요구 사항.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-21'
 sources:
   [
     'Cargo.toml',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/history.md',
     '.github/scripts/export-release.py',
   ]
 ---
 
-> v0.0.18 추가 정보는 현재 영어로 제공하며 기존 번역은 유지합니다. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+> v0.0.19 추가 정보는 현재 영어로 제공하며 기존 번역은 유지합니다. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
 
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) and its assets; documentation alone does not establish completed publication or production readiness.
+This page targets the **v0.0.19 experimental prerelease**. Use the actual [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and its assets; documentation alone does not establish completed publication or production readiness.
 
 ## 플랫폼 선택
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1). `native_ci-*` artifacts are CI examples, not CLI installers.
+Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19). `native_ci-*` artifacts are CI examples, not CLI installers.
 
-| 시스템  | 아키텍처              | 압축 파일                                                                                                                                                |
-| ------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.18-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz) |
+| 시스템  | 아키텍처              | 압축 파일                                                                                                                                             |
+| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS   | Apple Silicon / arm64 | [`ku-v0.0.19-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)         |
+| Windows | x64 / MSVC            | [`ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz)     |
+| Linux   | x64 / GNU             | [`ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) |
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1/SHA256SUMS)
+[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)
 
 다른 플랫폼용 압축 파일은 검증하지 않았습니다. 크로스 컴파일 지원은 모든 운영체제나 아키텍처용 패키지가 공개되었다는 뜻이 아닙니다.
 
@@ -46,16 +46,16 @@ Windows PowerShell에서는:
 .\ku.exe --version
 ```
 
-표시되는 버전은 `0.0.18`이어야 합니다. 필요하면 이 디렉터리를 `PATH`에 추가한 뒤 `ku --version`을 실행하세요. VS Code 연동에는 포함된 `ku-language-0.0.18.vsix`를 설치합니다.
+표시되는 버전은 `0.0.19`이어야 합니다. 필요하면 이 디렉터리를 `PATH`에 추가한 뒤 `ku --version`을 실행하세요. VS Code 연동에는 포함된 `ku-language-0.0.19.vsix`를 설치합니다.
 
 ## Interpreter and VS Code extension
 
-Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.18.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
+Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.19.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
 
-After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.18.vsix`, and reload the window. Alternatively, run this from the extracted directory:
+After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.19.vsix`, and reload the window. Alternatively, run this from the extracted directory:
 
 ```sh
-code --install-extension ./ku-language-0.0.18.vsix
+code --install-extension ./ku-language-0.0.19.vsix
 ```
 
 The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
@@ -80,12 +80,12 @@ cargo +1.89.0 run --locked --release -- --version
 cargo +1.89.0 run --locked --release -- run examples/hello.ku
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+The CLI and Cargo version for this release is `0.0.19`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
 
 ## 제거
 
 압축 파일로 설치한 경우 압축을 푼 디렉터리를 제거하고 추가한 `PATH` 항목을 되돌린 뒤 VS Code 확장을 제거하세요. 그곳에 만든 소스 파일과 설정은 먼저 보존해야 합니다. 별도의 원클릭 설치 프로그램, 패키지 관리자를 통한 설치, `ku uninstall` 명령은 검증하지 않았습니다.
 
-다음 단계: [첫 프로그램 실행](/ko/docs/getting-started/). 설치 계약의 출처: [릴리스 압축 파일](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+다음 단계: [첫 프로그램 실행](/ko/docs/getting-started/). 설치 계약의 출처: [릴리스 압축 파일](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/history.md).
 
 `ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/ko/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.

@@ -56,13 +56,14 @@
       "docs/support"
     ]
   ],
-  "performanceTitle": "성능 관측 결과",
-  "performanceScope": "개발 빌드 측정: Linux ARM64의 지정된 HTTP·CPU 혼합 부하에서 일곱 쌍의 측정 구간을 Rust 저메모리 참조 구성과 비교했습니다. 수치는 비율의 기하평균에 대한 점추정입니다.",
+  "performanceTitle": "고정 부하 관측 결과",
+  "performanceScope": "0.0.19 단일 단기 비교입니다. Linux ARM64 VM에서 서비스마다 CPU 코어 4개를 할당하고, 각 워크로드를 30초씩 7개 언어로 순차 실행했습니다. 수치는 올바른 요청 1건당 서비스 CPU 시간의 비율(Ku/Rust)이며 요청 지연 시간이 아닙니다.",
   "performanceMetrics": [
-    ["올바른 요청당 CPU 비용", "약 33% 감소", "Ku/Rust ≈ 0.671"],
-    ["정상 상태 프로세스 RSS", "약 65% 감소", "Ku/Rust ≈ 0.351"]
+    ["CPU 워크로드의 CPU 비용", "약 32% 낮음", "Ku/Rust ≈ 0.678"],
+    ["JSON 워크로드의 CPU 비용", "약 26% 높음", "Ku/Rust ≈ 1.260"],
+    ["PG 워크로드의 CPU 비용", "약 35% 높음", "Ku/Rust ≈ 1.350"]
   ],
-  "performanceLimits": "비교 적격 조건과 지연 시간 목표를 모두 통과하지는 못했습니다. 최대 처리량 향상, 언어 전체 순위 또는 프로덕션 준비 완료를 입증하는 관측은 아닙니다.",
+  "performanceLimits": "한 번의 관측은 용량이나 장기 안정성 검증이 아닙니다. 호스트 페이징과 긴 꼬리 지연은 여전히 관측됩니다. PG 연결 풀의 리셋 의미가 다릅니다. 이번 메모리 측정은 RSS가 아닌 cgroup 사용량이므로 RSS 비교는 제시하지 않습니다.",
   "practiceTitle": ["익숙한 데이터.", "명시적 오류."],
   "practiceDescription": "모듈을 가져오고 값을 만든 뒤 JSON으로 인코딩합니다. ? 연산자는 오류를 숨기지 않고 전파합니다.",
   "jsonReference": "JSON 참조 읽기",
@@ -86,11 +87,11 @@
   "projectTitle": "진행 중인 작업. 지켜볼 이야기.",
   "projectDescription": "Ku v{releasedVersion}은 개발 중입니다. Linux ARM64 배포 후보는 격리된 예제로 리허설했으며, 실제 업무의 프로덕션 사용은 검증하지 않았습니다. 실제 프로그램으로 평가하고 피드백을 보내 주세요. 공개 산출물은 GitHub Releases에서 확인할 수 있습니다.",
   "github": "GitHub에서 보기",
-  "license": "소스는 열람할 수 있습니다. 오픈 소스 라이선스는 부여되지 않았습니다.",
+  "license": "Apache-2.0 라이선스. LICENSE와 NOTICE를 참조하세요.",
   "verified": "내용 확인",
   "limitations": "지원 및 제한",
   "version": "문서 버전",
-  "next": "v0.0.18",
+  "next": "v0.0.19",
   "snapshot": "{version} 스냅샷",
   "snapshotNotice": "보관된 문서 스냅샷입니다. 현재 개발 문서와 독립적으로 보존되며 바이너리 릴리스 발표를 뜻하지 않습니다.",
   "nextNotice": "이 문서는 실험적 사전 릴리스 v{currentVersion}의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요.",

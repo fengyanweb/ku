@@ -1,86 +1,66 @@
 ---
 title: Platform and backend support
 description: Distinguish Ku release platforms, interpreter, runner, native C, Task subset, and LLVM support.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19 / experimental prerelease'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/syntax.md',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/protocol-foundation.md',
     '.github/workflows/native-three-os.yml',
+    'src/service_supervision.rs',
+    'src/ir/task_lower.rs',
+    'src/backend/c_http_runtime.c',
+    'src/backend/c_task_pg_runtime.c',
   ]
 ---
 
-## Published CLI platforms
+## Choose a platform and execution path
 
-The v0.0.18 experimental prerelease covers Windows x64 (MSVC), Linux x64 (GNU), and macOS arm64 (Apple Silicon). Each platform has its own archive. There is no single executable for all three systems. No other platform assets were verified; see [installation](/en/docs/install/).
+Use [installation](/en/docs/install/) and the actual [release assets](https://github.com/fengyanweb/ku/releases) to select a CLI for your system and architecture. A source build, CI job or isolated deployment rehearsal does not by itself publish a downloadable platform package. The Linux ARM64 release-candidate rehearsal covers its sample service and dependencies; a real application, its production SLO and canary acceptance are separate.
 
-## Execution paths
+| Capability                 | Interpreter `ku run` / default runner                                     | Native C                                                  | Native Task path                                                                  |
+| -------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Language and local imports | Interpreter; runner embeds the entry but still needs local import sources | Supported source graph is expanded during generation      | Restricted typed subset                                                           |
+| JSON                       | General encode/decode                                                     | General synchronous encode/decode                         | Encode a scalar object literal only; no general decode                            |
+| HTTP                       | Client and synchronous handlers                                           | Synchronous server subset, including `http.json`          | Named async handlers with supported request/response types                        |
+| PostgreSQL / Redis / MySQL | No database client implementation                                         | Pooled native clients with target-compatible dependencies | PG query suspension in a supported async HTTP handler; not generic database async |
+| Time                       | Calendar, durations and waits                                             | Selected clocks                                           | Integer-millisecond sleep                                                         |
+| TCP, TLS and file I/O      | See the individual module                                                 | Selected native interfaces                                | Only explicitly lowered operations; not arbitrary network suspension              |
 
-| Capability                                     | Interpreter `ku run`             | Default `ku build` runner           | Synchronous native C                                | Development native Task                | LLVM text prototype   |
-| ---------------------------------------------- | -------------------------------- | ----------------------------------- | --------------------------------------------------- | -------------------------------------- | --------------------- |
-| Basic language, functions, control flow        | Implemented                      | Interpreter path                    | Implemented subset                                  | Restricted typed subset                | Limited prototype     |
-| JSON                                           | Supported                        | Supported                           | Supported                                           | Unsupported                            | Unsupported           |
-| Source independent complete local import graph | Loads source                     | Unsupported; only entry is embedded | Expanded during generation                          | Expanded within supported subset       | No deployment promise |
-| async / await                                  | Implemented with resource limits | Interpreter path                    | Dedicated subset or rejection                       | Partial, not full async                | No full support       |
-| HTTP                                           | Client and server                | Interpreter path                    | Server subset; see [HTTP](../stdlib/http/)          | No general HTTP support                | Unsupported           |
-| PostgreSQL / Redis / MySQL clients             | No database access               | No interpreted database access      | Native only                                         | Not general Task waiting               | Unsupported           |
-| TCP / TLS client                               | No corresponding native path     | No corresponding native path        | Generated C implementation; TLS needs matching pack | No complete generic network wait claim | Unsupported           |
+See [HTTP](/en/docs/stdlib/http/), [JSON](/en/docs/stdlib/json/), [time](/en/docs/stdlib/time/) and [database clients](/en/docs/stdlib/database/) for parameters, errors and complete examples. Type checking is separate from backend compilation. Default runner builds need a matching Rust toolchain and archive layout; native builds need a target C compiler and relevant native libraries. The LLVM text backend remains a limited prototype.
 
-Default builds require the matching Rust toolchain and linker. Native C requires a target C toolchain. Passing `ku check` does not prove either build works. An LLVM command does not imply a complete release backend.
+## Task boundaries
 
-## The native Task subset
+An async call submits work and returns a one-use Task handle. `await` obtains its result; it does not define when execution first starts. The native Task path supports its listed primitive/string/flat-array operations, Results, Task start/move/await, timers and selected bounded I/O. It also supports named async HTTP handlers and the narrowly documented PG capture path. This is not full M:N execution, every async closure/capture combination, general JSON manipulation or a universal network scheduler.
 
-v0.0.18 includes a restricted `async fn main(): null!` source path. It covers explicitly listed primitives, strings, flat arrays, single layer Results, Task start/move/await, some control flow, and bounded file/directory background operations. This remains a subset, not a complete async backend.
+Owned inputs, cancellation, shared cleanup deadlines and supported operations still apply. A successful arithmetic Task does not establish support for a whole library. Follow the [Task guide](/en/docs/guide/concurrency/) and the [concurrency contract](https://github.com/fengyanweb/ku/blob/main/docs/concurrency.md).
 
-Generic Task network waiting, complete M:N execution, arbitrary dynamic heap combinations, all async capture/function combinations, and complete long duration soak remain unfinished. See the precise accepted and rejected subset in the [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md).
+## Application budgets and process limits
 
-## Database and network limits
+These controls cover different resources:
 
-Database APIs use `module.client(config)?` followed by receiver methods, with a bounded pool inside the client. Real server validation is separate for each driver, system, and commit. A fake ABI or successful link does not substitute for a real query.
+| Control                          | Scope and limit                                                                                                                                |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP service options             | Connections, active/pending requests and controlled transport buffers for that service; not its entire heap                                    |
+| Task and shared database budgets | Runtime-managed slots, pending operations and tracked allocations; shared pools and foreign allocations are not exact per-Task heap accounting |
+| `ku service`, ordinary mode      | Supervises one resident native HTTP instance, authenticated health/drain/metrics and bounded restart policy; no OS memory hard limit           |
+| `ku supervise`                   | Runs bounded whole-program jobs; it is not an HTTP request scheduler                                                                           |
+| Explicit OS memory mode          | Linux cgroup v2 charged memory or Windows Job committed memory, subject to the prerequisites below                                             |
 
-Redis uses plaintext TCP. MySQL lacks consistent fail-closed certificate verification across Oracle/MariaDB. Direct connections should therefore use loopback, controlled private networks, or a verified TLS tunnel. Remote PostgreSQL requires explicit `sslmode=verify-full` and trusted root certificates. Native TLS in `std.net` does not mean HTTP, Redis, or the interpreter reuse that path.
+`ku service` ordinary mode is available on Linux, macOS and Windows. Read `ku service --help` and the [CLI guide](/en/docs/tools/cli/) before configuring it. It does not attach limits to an unrelated `ku run`. There is no public `app.stop()` method: supervised native health/drain control and interpreter listener `close()` have different lifecycles. A fail-stop process exit, including native exit code 80 on relevant cleanup failures, is a service failure and needs a finite supervisory policy.
 
-## Self hosting and compatibility
+| Host    | Explicit OS memory mode                                                                                                                                                                                                                |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux   | Delegated cgroup v2 domain with writable memory/pids controls, including `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing permissions or controls cause refusal before the application runs. |
+| Windows | Job Object limits use committed virtual memory, not RSS. Initial commit and Job assignment are checked before application execution; host policy can reject nesting.                                                                   |
+| macOS   | Native hard memory mode is rejected. Ordinary service supervision is a separate supported mode; no automatic Linux VM bridge is provided.                                                                                              |
 
-Ku's self hosted lexer and parser have bounded subsets and differential checks. A complete self hosted parser, checker, IR, and backend remain unfinished; Rust still supplies the bootstrap toolchain. Version 0.0.x does not promise source or generated C/FFI ABI compatibility.
+Linux charged memory, Windows commit and RSS are different measures. Linux limits can permit transient overshoot; none is a promise about all host physical memory at every instant. The coordinator, external PostgreSQL/Redis/MySQL servers, proxy, host/VM and build compilers are outside the managed worker's memory domain. Fixed control metadata also consumes real process memory.
 
-Work logs and previous CI results establish only their stated scope and commit. Use [release notes](/en/releases/) to separate published changes from development work. This website does not report all current branch CI, production workloads, or database acceptance as passed.
-
-## v0.0.18 release scope and known limits
-
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums.
-
-- JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
-- Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
-- HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
-- `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
-
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. The earliest three historical 504s lack enough evidence for a unique reconstruction.
-
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions.
-
-### Process memory boundary
-
-| Host    | `ku supervise` guarantee and prerequisite                                                                                                                                                                                                                                                                   |
-| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux   | cgroup v2 kernel charged memory; a writable, delegated domain root with `memory` and `pids` enabled is required. Required interfaces include `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing controls or permissions cause refusal before application execution. |
-| Windows | Nested Job Object limits for individual workers and the worker group, measured as committed virtual memory, not RSS. Initial process commit is checked before its suspended application thread is released. Host policy can reject Job assignment.                                                          |
-| macOS   | This isolation mode is not supported natively and is explicitly rejected before starting the application. Use a suitably configured Linux host/VM when required; there is no automatic VM bridge.                                                                                                           |
-
-Worker accounting covers applicable Ku and third-party library allocations in that worker's resource domain. Linux cgroup accounting and Windows commit are different metrics. Linux `memory.max` may permit transient overshoot; these mechanisms do not promise an absolute ceiling on all physical memory at every instant.
-
-The coordinator itself has no OS memory hard limit. Its bounded admission/control reserve is an accounting policy, not a coordinator RSS limit. A single Task's entire heap is not precisely metered; shared connection pools, caches and library allocations cannot be exactly attributed to each Task. External databases, the host/VM and build compilers lie outside the worker domain.
-
-When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
-
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
-
-## Run a controlled program
-
-After preparing dependencies and an ordinary `hello.ku`, Linux requires a real delegated root supplied by the administrator or service manager:
+After preparing a real delegated Linux root and a basic `hello.ku`, a bounded whole-program example is:
 
 ```sh
 ku supervise --worker-memory-bytes 134217728 --total-memory-bytes 536870912 \
@@ -89,4 +69,18 @@ ku supervise --worker-memory-bytes 134217728 --total-memory-bytes 536870912 \
   --cgroup-root "$KU_CGROUP_ROOT" -- ./hello.ku
 ```
 
-On Windows, use the same numeric limits and omit `--cgroup-root`. Decimal byte and millisecond values are required. `--` separates complete-program inputs; this is not a request-routing or general network scheduler API. The command emits configuration, per-execution and summary JSONL records and returns nonzero if a program fails. Native programs are built first and submitted with `--native`; compiler memory is outside the worker limit.
+On Windows omit `--cgroup-root`. All numeric values above are decimal bytes or milliseconds. `--` separates complete program inputs; native executables are built first and submitted with `--native`. Compilers are outside these limits. Failed workers release reservations only after confirmed cleanup. Allocation failure or a killed foreign library is not guaranteed to become an ordinary Result.
+
+## Database, transport and failure boundaries
+
+Database clients are native-only. A real-server check applies to its driver, platform, dependency and source identity; successful linking is not a query test. PostgreSQL remote connections need explicit `sslmode=verify-full` and trusted certificates. Redis is plaintext TCP. MySQL does not provide a uniform fail-closed certificate/hostname verification contract across Oracle/MariaDB. Use a controlled local/private connection or independently verified tunnel where required. `std.net` TLS does not imply TLS for every library.
+
+**Statements are never automatically retried.** Timeout, cancellation, worker exit and connection reset do not prove rollback. Preserve uncertain outcomes and reconcile writes using business identifiers before considering a manual retry.
+
+## Compatibility and current limits
+
+Ku remains under development. Complete self-hosted checking/IR/backend, generic Task network scheduling and a complete database/platform matrix are not promised. Rust supplies the bootstrap toolchain. Version 0.0.x does not guarantee source or generated C/FFI ABI compatibility.
+
+JSON keeps its existing default implementation; the yyjson replacement is not the default. A targeted runtime fix, a healthy short test or an isolated RC rehearsal does not establish that latency, overload, capacity or long-running stability acceptance has passed. Slow-request and historical timeout evidence remains workload-specific; an unconfirmed cause must not be assigned to the host or application by assumption.
+
+Use [release notes](/en/releases/) for published changes, and distinguish the tested scope from real-business production readiness. This site makes no throughput ranking, complete Rust advantage or whole-project leak-free claim.

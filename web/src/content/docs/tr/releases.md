@@ -1,22 +1,28 @@
 ---
 title: 'Sürüm notları'
-description: 'Ku v0.0.18 experimental prerelease scope, downloads and known limitations.'
-kuVersion: '0.0.18 / experimental prerelease'
+description: 'Ku v0.0.19 experimental prerelease scope, downloads and known limitations.'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
     'docs/v0.0.18-worklog.md',
     'docs/history.md',
     'Cargo.toml',
   ]
 ---
 
+## 0.0.19
+
+Güncel belgeler, CLI ve VS Code uzantısıyla aynı sürüm numarasını kullanan deneysel Ku 0.0.19 ön sürümünü kapsar. Kullanılabilirlik, dosyalar ve sağlama toplamları için gerçek GitHub Release esas alınır.
+
+[Release · SHA256SUMS](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [Installation](/tr/docs/install/) · [Release notes (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.en.md) · [Known issues (English)](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md)
+
+## v0.0.18 · Geçmiş
+
 Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır.
 
 > Aşağıdaki v0.0.18 güncellemeleri şimdilik İngilizcedir; çevirinin geri kalanı korunmuştur. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-## v0.0.18 release scope and known limits
 
 This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
 

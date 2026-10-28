@@ -1,7 +1,7 @@
 ---
 title: JSON 參考
 description: Ku JSON 編碼、解碼、KuValue 轉換、錯誤標識和後端支援範圍。
-kuVersion: '0.0.18 / experimental prerelease'
+kuVersion: '0.0.19 / experimental prerelease'
 verifiedAt: '2026-10-20'
 sources:
   [
@@ -9,7 +9,7 @@ sources:
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.18.md',
+    'docs/v0.0.19.md',
   ]
 ---
 
@@ -35,7 +35,7 @@ import json from "std.json"
 
 ## 編碼與讀取
 
-以下是完整基礎範例；更廣泛的開發分支回歸範例見[examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku)。
+以下是完整基礎範例；更廣泛的開發分支回歸範例見[examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku)。
 
 ```ku
 import json from "std.json"
@@ -87,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 解釋器、預設打包 runner 和同步 native C 已有 JSON 實作。**受限 native Task 子集與 LLVM 不支援 JSON。** 預設 runner 的 import 原始碼依賴仍存在，不能因 JSON 支援就宣稱完整獨立打包。
 
-本頁簽名與邊界來自原始碼和規範核對；執行驗證需綁定具體版本、commit 與後端。完整行為見[JSON 語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json)。
+本頁簽名與邊界來自原始碼和規範核對；執行驗證需綁定具體版本、commit 與後端。完整行為見[JSON 語法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json)。
