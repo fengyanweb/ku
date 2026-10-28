@@ -426,7 +426,7 @@ class Builder:
                      self.benchmark / "dotnet/packages.lock.json", self.benchmark / "cpp/dependencies.lock.json"):
             lockfiles[str(path.relative_to(self.source))] = digest(path)
         receipt = dict(schema="ku-cross-stack-build-v1", candidate_base=self.candidate,
-                       package_version="0.0.18", source_files=self.initial_hashes, lockfiles=lockfiles,
+                       package_version=self.package_version, source_files=self.initial_hashes, lockfiles=lockfiles,
                        source_inventory_sha256=hashlib.sha256(json.dumps(self.initial_hashes, sort_keys=True).encode()).hexdigest(),
                        exact_versions=self.versions, commands=self.commands, failure=failed,
                        compiled_jobs=2, uname=list(os.uname()), published=False)
