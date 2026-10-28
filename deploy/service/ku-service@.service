@@ -15,7 +15,9 @@ ExecStart=/usr/bin/python3 /opt/ku/service/manage.py run /etc/ku/cluster.json %i
 # An exhausted Ku restart intensity exits 1 and requires an operator action.
 Restart=on-abnormal
 RestartSec=5s
-KillMode=control-group
+# Let the supervisor drain admitted requests before terminating descendants.
+# systemd still kills the entire cgroup when TimeoutStopSec is exhausted.
+KillMode=mixed
 TimeoutStopSec=16s
 LimitNOFILE=8192
 TasksMax=512

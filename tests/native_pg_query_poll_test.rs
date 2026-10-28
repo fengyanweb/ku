@@ -413,7 +413,7 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         .map(|offset| detach + offset)
         .expect("unlock after detach");
     let finish = release
-        .find("if (discard) PQfinish(discard)")
+        .find("PQfinish(discard)")
         .expect("finish detached connection");
     assert!(
         unlock < finish,
@@ -2354,6 +2354,21 @@ int main(void) {
   ku_pg_client_release(closing_pool, closing_slot, 0, clock_ms + 50);
   CHECK(reset_sends == before_resets && finishes == before_close_finishes + 1);
   CHECK(!pool && live_connections == 0 && live_results == 0);
+
+  /* Closing an idle healthy pool retires its physical connection once, without
+     classifying normal retirement as an unusable/broken connection. */
+  KuResult_pg_client idle_retire = ku_pg_client_open(
+      text("hostaddr=127.0.0.1"), 1, 0, 5000, 5000, 30000);
+  CHECK(idle_retire.ok && idle_retire.value->active == 0);
+  KuDatabaseBudgetSnapshot before_idle_retire = ku_database_budget_snapshot();
+  int idle_retire_finishes = finishes;
+  ku_drop_pg_client(&idle_retire.value);
+  KuDatabaseBudgetSnapshot after_idle_retire = ku_database_budget_snapshot();
+  CHECK(!idle_retire.value && finishes == idle_retire_finishes + 1);
+  CHECK(after_idle_retire.pg_client_discarded_connections
+      == before_idle_retire.pg_client_discarded_connections + 1);
+  CHECK(after_idle_retire.pg_client_broken_discards
+      == before_idle_retire.pg_client_broken_discards);
 
   /* Failed connects publish a bounded retry window. Requests whose entire
      budget lies inside that window must not redial. Once fake time advances

@@ -42,6 +42,20 @@ typedef struct KuDatabaseBudgetSnapshot {
   size_t rejections;
   size_t unknown_results;
   size_t confirmed_cancellations;
+  /* Native pg.client slots include an in-flight connection establishment.
+   * These gauges are actual pool transitions, not capacity reservations or
+   * PostgreSQL backend-session counts. No pool pointer is retained here. */
+  size_t pg_client_active_slots;
+  size_t pg_client_waiters;
+  size_t pg_client_peak_active_slots;
+  size_t pg_client_peak_waiters;
+  size_t pg_client_acquire_timeouts;
+  size_t pg_client_pool_rejections;
+  /* Completed pool connection handles retired by close/expiry/broken reuse.
+   * Failed attempts destroyed inside the connect helper are not counted. */
+  size_t pg_client_discarded_connections;
+  size_t pg_client_broken_discards;
+  int pg_client_metrics_valid;
   int config_valid;
 } KuDatabaseBudgetSnapshot;
 
@@ -69,6 +83,7 @@ static void ku_database_budget_initialize_locked(void) {
   if (ku_database_budget_initialized) return;
   ku_database_budget_initialized = 1;
   KuDatabaseBudgetSnapshot* state = &ku_database_budget_state;
+  state->pg_client_metrics_valid = 1;
   state->config_valid = ku_database_budget_env("KU_DB_MAX_CONNECTIONS", 256,
       65536, &state->max_connections)
       && ku_database_budget_env("KU_DB_MAX_WAITERS", 4096,
@@ -162,4 +177,45 @@ static KuDatabaseBudgetSnapshot ku_database_budget_snapshot(void) {
   KuDatabaseBudgetSnapshot snapshot = ku_database_budget_state;
   KU_DATABASE_UNLOCK();
   return snapshot;
+}
+
+/* Pool locks may precede this ledger lock. Ledger helpers never acquire a
+ * pool lock or perform I/O. Instrumentation failure marks the gauges unknown;
+ * it must not change a query result, ownership, deadline or cleanup decision. */
+static void ku_database_pg_pool_delta(int active, int waiting) {
+  KU_DATABASE_LOCK();
+  ku_database_budget_initialize_locked();
+  KuDatabaseBudgetSnapshot* state = &ku_database_budget_state;
+  if ((active < 0 && !state->pg_client_active_slots)
+      || (waiting < 0 && !state->pg_client_waiters)
+      || (active > 0 && state->pg_client_active_slots == SIZE_MAX)
+      || (waiting > 0 && state->pg_client_waiters == SIZE_MAX)) {
+    state->pg_client_metrics_valid = 0;
+  } else {
+    if (active > 0) state->pg_client_active_slots++;
+    else if (active < 0) state->pg_client_active_slots--;
+    if (waiting > 0) state->pg_client_waiters++;
+    else if (waiting < 0) state->pg_client_waiters--;
+    if (state->pg_client_active_slots > state->pg_client_peak_active_slots)
+      state->pg_client_peak_active_slots = state->pg_client_active_slots;
+    if (state->pg_client_waiters > state->pg_client_peak_waiters)
+      state->pg_client_peak_waiters = state->pg_client_waiters;
+  }
+  KU_DATABASE_UNLOCK();
+}
+
+enum { KU_PG_METRIC_ACQUIRE_TIMEOUT, KU_PG_METRIC_POOL_REJECTED,
+       KU_PG_METRIC_CONNECTION_DISCARDED, KU_PG_METRIC_BROKEN_DISCARDED };
+static void ku_database_pg_pool_event(int event) {
+  KU_DATABASE_LOCK();
+  ku_database_budget_initialize_locked();
+  size_t* count = event == KU_PG_METRIC_ACQUIRE_TIMEOUT
+      ? &ku_database_budget_state.pg_client_acquire_timeouts
+      : event == KU_PG_METRIC_POOL_REJECTED
+      ? &ku_database_budget_state.pg_client_pool_rejections
+      : event == KU_PG_METRIC_BROKEN_DISCARDED
+      ? &ku_database_budget_state.pg_client_broken_discards
+      : &ku_database_budget_state.pg_client_discarded_connections;
+  if (*count != SIZE_MAX) (*count)++;
+  KU_DATABASE_UNLOCK();
 }

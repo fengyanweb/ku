@@ -99,6 +99,112 @@ fn tokens_are_bounded_and_per_generation() {
     assert_ne!(first, second);
 }
 
+fn native_metrics_fixture(
+    body: String,
+    length: usize,
+    slow: bool,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let request = read_headers(&mut stream, MAX_CONTROL_REQUEST).unwrap();
+        assert!(request.starts_with("GET /__ku/metrics HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("X-Ku-Control-Token: {}\r\n", "d".repeat(64))));
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: keep-alive\r\n\r\n"
+        );
+        if slow {
+            for byte in body.bytes() {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        } else {
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    (address, worker)
+}
+
+#[test]
+fn native_metrics_has_a_separate_large_bound_without_changing_health() {
+    assert_eq!(MAX_PROBE_RESPONSE, 8192);
+    let body = format!("{{\"counter\":17,\"padding\":\"{}\"}}", "x".repeat(10000));
+    let (address, worker) = native_metrics_fixture(body.clone(), body.len(), false);
+    let actual = native_metrics_at(
+        address,
+        &"d".repeat(64),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(actual, body);
+    worker.join().unwrap();
+}
+
+#[test]
+fn native_metrics_rejects_oversize_and_token_echo() {
+    for (body, length) in [
+        ("{}".to_string(), MAX_NATIVE_METRICS_BODY + 1),
+        (format!("{{\"secret\":\"{}\"}}", "d".repeat(64)), 77),
+    ] {
+        let length = if body.len() > 2 { body.len() } else { length };
+        let (address, worker) = native_metrics_fixture(body, length, false);
+        assert_eq!(
+            native_metrics_at(
+                address,
+                &"d".repeat(64),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn native_metrics_body_consumes_the_original_remaining_deadline() {
+    let body = "{\"value\":17}".to_string();
+    let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
+    let began = Instant::now();
+    let deadline = began + Duration::from_millis(100);
+    thread::sleep(Duration::from_millis(40));
+    assert!(native_metrics_at(address, &"d".repeat(64), deadline).is_err());
+    assert!(began.elapsed() < Duration::from_millis(400));
+    worker.join().unwrap();
+}
+
+#[test]
+fn unavailable_metrics_is_not_a_cached_zero_or_native_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut state = exited_status();
+    state.generation = 9;
+    let (code, body) = metrics_response(
+        listener.local_addr().unwrap(),
+        None,
+        &state,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(code, 503);
+    assert!(body.contains("\"available\":false") && body.contains("\"generation\":9"));
+    assert!(body.contains("\"native\":null") && body.contains("no_native_instance"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
 #[test]
 fn oversized_probe_length_cannot_overflow_or_exceed_the_response_bound() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

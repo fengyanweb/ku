@@ -15,7 +15,7 @@ use std::{
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::error::KuError;
@@ -33,12 +33,14 @@ pub const SERVICE_USAGE: &str = "ku service --probe-addr IP:PORT --control-addr 
 [--watch-stdin] \
 -- <native-program> [args...]\n\
 Native HTTP health/drain routes must validate KU_SERVICE_CONTROL_TOKEN and echo it as the body.\n\
-Control: GET /status or POST /stop with X-Ku-Control-Token from the token file.\n\
+Control: GET /status, GET /metrics or POST /stop with X-Ku-Control-Token from the token file.\n\
 Logs from the managed program go to the null device; HTTP metrics remain available.\n\
 Memory limits are optional; when requested the existing strict OS provider is mandatory.\n";
 
 const MAX_CONTROL_REQUEST: usize = 4096;
 const MAX_PROBE_RESPONSE: usize = 8192;
+const MAX_NATIVE_METRICS_BODY: usize = 57344;
+const MAX_METRICS_CONTROL_RESPONSE: usize = 65536;
 const MAX_OPTIONS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const CONTROL_POLL: Duration = Duration::from_millis(20);
@@ -197,7 +199,7 @@ pub fn run_service_command(args: &[String]) -> Result<(), KuError> {
     let mut restart_times = VecDeque::with_capacity(policy.restart_limit);
     let mut backoff = policy.backoff;
     loop {
-        if service_stop(&listener, &policy, &state)? {
+        if service_stop(&listener, &policy, &state, None)? {
             return Ok(());
         }
         state.generation = state
@@ -318,7 +320,7 @@ fn run_instance(
     let mut next_probe = Instant::now();
     let mut startup_ok = false;
     loop {
-        if service_stop(listener, policy, state)? {
+        if service_stop(listener, policy, state, Some(token))? {
             state.last_reason = "requested_stop";
             drain_and_retire(listener, policy, state, process, token)?;
             return Ok(InstanceEnd::Stop);
@@ -395,7 +397,7 @@ fn drain_and_retire(
     let _ = probe(policy, token, "POST", "/__ku/drain");
     let mut observed_exit = None;
     while Instant::now() < deadline {
-        let _ = service_stop(listener, policy, state)?;
+        let _ = service_stop(listener, policy, state, Some(token))?;
         if let Some(exit) = process.try_wait().map_err(command_error)? {
             observed_exit = Some(exit);
             break;
@@ -499,7 +501,7 @@ fn wait_control(
     deadline: Instant,
 ) -> Result<bool, KuError> {
     while Instant::now() < deadline {
-        if service_stop(listener, policy, state)? {
+        if service_stop(listener, policy, state, None)? {
             return Ok(true);
         }
         thread::sleep(CONTROL_POLL.min(deadline.saturating_duration_since(Instant::now())));
@@ -507,7 +509,12 @@ fn wait_control(
     Ok(false)
 }
 
-fn service_stop(listener: &TcpListener, policy: &Policy, state: &Status) -> Result<bool, KuError> {
+fn service_stop(
+    listener: &TcpListener,
+    policy: &Policy,
+    state: &Status,
+    native_token: Option<&str>,
+) -> Result<bool, KuError> {
     if STOP_REQUESTED.load(Ordering::Acquire) {
         return Ok(true);
     }
@@ -519,6 +526,9 @@ fn service_stop(listener: &TcpListener, policy: &Policy, state: &Status) -> Resu
                 return Ok(false);
             }
             let response_timeout = policy.probe_timeout.min(Duration::from_millis(200));
+            // A control request owns one deadline, including any native metrics
+            // collection and the final response. Partial I/O never renews it.
+            let deadline = Instant::now() + response_timeout;
             // Accepted sockets can inherit the listener's nonblocking mode.
             // A peer reset can also make timeout setup fail (Darwin EINVAL).
             // Both setup and failure belong to this one bounded connection,
@@ -531,11 +541,16 @@ fn service_stop(listener: &TcpListener, policy: &Policy, state: &Status) -> Resu
             {
                 return Ok(false);
             }
-            let request = read_headers(&mut stream, MAX_CONTROL_REQUEST);
+            let request = read_headers_until(&mut stream, MAX_CONTROL_REQUEST, deadline);
             let (code, body, stop) = match request {
                 Ok(request) if valid_control_token(&request, &policy.control_token) => {
                     match request.lines().next() {
                         Some("GET /status HTTP/1.1") => (200, state.json(), false),
+                        Some("GET /metrics HTTP/1.1") => {
+                            let (code, body) =
+                                metrics_response(policy.probe_addr, native_token, state, deadline);
+                            (code, body, false)
+                        }
                         Some("POST /stop HTTP/1.1") => (202, "stopping\n".into(), true),
                         _ => (404, "unknown control route\n".into(), false),
                     }
@@ -548,7 +563,9 @@ fn service_stop(listener: &TcpListener, policy: &Policy, state: &Status) -> Resu
                 ),
             };
             let response = format!("HTTP/1.1 {code} Control\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            let _ = stream.write_all(response.as_bytes());
+            if response.len() <= MAX_METRICS_CONTROL_RESPONSE {
+                let _ = write_until(&mut stream, response.as_bytes(), deadline);
+            }
             Ok(stop)
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
@@ -571,8 +588,17 @@ fn valid_control_token(request: &str, expected: &str) -> bool {
     found
 }
 
+#[cfg(test)]
 fn read_headers(stream: &mut TcpStream, limit: usize) -> io::Result<String> {
     let deadline = Instant::now() + stream.read_timeout()?.unwrap_or(Duration::from_millis(200));
+    read_headers_until(stream, limit, deadline)
+}
+
+fn read_headers_until(
+    stream: &mut TcpStream,
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<String> {
     let mut bytes = Vec::with_capacity(limit.min(1024));
     let mut chunk = [0_u8; 512];
     while bytes.len() < limit {
@@ -598,6 +624,190 @@ fn read_headers(stream: &mut TcpStream, limit: usize) -> io::Result<String> {
         io::ErrorKind::InvalidData,
         "HTTP header limit or early EOF",
     ))
+}
+
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "control request deadline"))
+}
+
+fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining_until(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "control peer closed",
+                ))
+            }
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn native_metrics_at(address: SocketAddr, token: &str, deadline: Instant) -> io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(&address, remaining_until(deadline)?)?;
+    let request = format!(
+        "GET /__ku/metrics HTTP/1.1\r\nHost: {address}\r\nX-Ku-Control-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    write_until(&mut stream, request.as_bytes(), deadline)?;
+    // The native management channel already has this separate body bound.
+    // Health probes continue to use their original 8192-byte response limit.
+    let capacity = MAX_CONTROL_REQUEST + MAX_NATIVE_METRICS_BODY;
+    let mut response = Vec::with_capacity(1024);
+    let mut expected_end: Option<usize> = None;
+    let mut body_offset = None;
+    let mut chunk = [0_u8; 1024];
+    loop {
+        stream.set_read_timeout(Some(remaining_until(deadline)?))?;
+        let allowed = expected_end
+            .unwrap_or(capacity)
+            .saturating_sub(response.len());
+        if allowed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "native metrics response bound",
+            ));
+        }
+        let count = stream.read(&mut chunk[..allowed.min(1024)])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete native metrics",
+            ));
+        }
+        response.extend_from_slice(&chunk[..count]);
+        if body_offset.is_none() {
+            if let Some(offset) = response.windows(4).position(|part| part == b"\r\n\r\n") {
+                if offset + 4 > MAX_CONTROL_REQUEST {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native metrics header bound",
+                    ));
+                }
+                let headers = std::str::from_utf8(&response[..offset]).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid native metrics headers")
+                })?;
+                let mut lines = headers.split("\r\n");
+                if !lines.next().is_some_and(|line| {
+                    line.starts_with("HTTP/1.1 200 ") || line.starts_with("HTTP/1.0 200 ")
+                }) {
+                    return Err(io::Error::other("native metrics unavailable"));
+                }
+                let mut length = None;
+                for line in lines {
+                    let (name, value) = line.split_once(':').ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid native metrics header")
+                    })?;
+                    if name.eq_ignore_ascii_case("transfer-encoding") {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "native metrics transfer encoding",
+                        ));
+                    }
+                    if name.eq_ignore_ascii_case("content-length") {
+                        if length.is_some()
+                            || !value.trim().bytes().all(|byte| byte.is_ascii_digit())
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate or invalid native metrics length",
+                            ));
+                        }
+                        length = Some(value.trim().parse::<usize>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "native metrics length overflow",
+                            )
+                        })?);
+                    }
+                }
+                let length = length
+                    .filter(|length| *length <= MAX_NATIVE_METRICS_BODY)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "native metrics body bound")
+                    })?;
+                body_offset = Some(offset + 4);
+                expected_end = Some(offset + 4 + length);
+            } else if response.len() >= MAX_CONTROL_REQUEST {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native metrics header bound",
+                ));
+            }
+        }
+        if let Some(end) = expected_end {
+            if response.len() > end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "extra native metrics response bytes",
+                ));
+            }
+            if response.len() == end {
+                remaining_until(deadline)?;
+                let body =
+                    std::str::from_utf8(&response[body_offset.unwrap()..end]).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid native metrics body")
+                    })?;
+                // This is the fixed native JSON producer, not a general proxy.
+                // Its JSON schema is validated by the collector. Never forward
+                // an echoed private token or turn health text into metrics.
+                if !body.trim().starts_with('{')
+                    || !body.trim().ends_with('}')
+                    || body.contains(token)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid native metrics object",
+                    ));
+                }
+                return Ok(body.to_string());
+            }
+        }
+    }
+}
+
+fn metrics_response(
+    address: SocketAddr,
+    native_token: Option<&str>,
+    state: &Status,
+    deadline: Instant,
+) -> (u16, String) {
+    let began = Instant::now();
+    let result = native_token
+        .filter(|_| state.pid != 0)
+        .map(|token| native_metrics_at(address, token, deadline));
+    let observed_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "null".to_string(),
+        |duration| duration.as_millis().to_string(),
+    );
+    let (code, available, native, reason) = match result {
+        Some(Ok(body)) => (200, true, body, "collected"),
+        Some(Err(error)) => (
+            503,
+            false,
+            "null".to_string(),
+            match error.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "native_deadline",
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                    "invalid_native_response"
+                }
+                _ => "native_unavailable",
+            },
+        ),
+        None => (503, false, "null".to_string(), "no_native_instance"),
+    };
+    let body = format!(
+        "{{\"available\":{available},\"generation\":{},\"phase\":\"{}\",\"observed_unix_ms\":{observed_unix_ms},\"supervisor_elapsed_ms\":{},\"collection_elapsed_ms\":{},\"reason\":\"{reason}\",\"native\":{native}}}\n",
+        state.generation, state.phase.name(), state.started.elapsed().as_millis(), began.elapsed().as_millis()
+    );
+    (code, body)
 }
 
 fn probe(policy: &Policy, token: &str, method: &str, path: &str) -> bool {

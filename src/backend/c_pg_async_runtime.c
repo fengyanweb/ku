@@ -153,7 +153,7 @@ static void ku_pg_async_unlink_locked(KuPgAsyncOp* op) {
   else p->async_tail=op->waiter.previous;
   op->waiter.next=op->waiter.previous=NULL;op->waiter.linked=0;
   if (op->waiting) {
-    p->waiters--;op->waiting=0;
+    p->waiters--;ku_database_pg_pool_delta(0,-1);op->waiting=0;
     /* A later arrival cannot barge past an already notified waiter. After
      * withdrawal or a successful claim, hand off any resource still available.
      * The claimed slot is already in_use, so the shared helper cannot offer it
@@ -181,10 +181,10 @@ static void ku_pg_async_release(KuPgAsyncOp* op,int broken) {
   if ((broken || p->closing) && p->conns[op->slot]) {
     discard=p->conns[op->slot];p->conns[op->slot]=NULL;
   }
-  p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;op->slot=-1;op->conn=NULL;
+  p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;ku_database_pg_pool_delta(-1,0);op->slot=-1;op->conn=NULL;
   ku_pg_client_signal_locked(p,p->closing);
   ku_pg_mutex_unlock(&p->lock);
-  if (discard) PQfinish(discard);
+  if (discard) {ku_database_pg_pool_event(KU_PG_METRIC_CONNECTION_DISCARDED);if(broken)ku_database_pg_pool_event(KU_PG_METRIC_BROKEN_DISCARDED);PQfinish(discard);}
 }
 static void ku_pg_async_shutdown(KuPgAsyncOp* op) {
   if (!op->conn) return;
@@ -275,17 +275,17 @@ static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
   now=ku_pg_now_ms();op->observed_ms=now;
   if(op->waiting && op->waiter.notified && op->waiter.diagnostic.consumed!=UINT64_MAX)op->waiter.diagnostic.consumed++;
   if(p->closing) error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);
-  else if(now>=op->acquire_deadline) {ku_pg_async_capture_acquire_locked(op,now);error=ku_pg_client_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);}
+  else if(now>=op->acquire_deadline) {ku_pg_async_capture_acquire_locked(op,now);error=ku_pg_client_acquire_timeout_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);}
   if(error.code.len) {ku_pg_async_unlink_locked(op);ku_pg_mutex_unlock(&p->lock);ku_pg_async_finish(op,error,0);return -1;}
   int can_claim=op->waiting || p->waiters==0;
   if(can_claim) for(size_t i=0;i<p->size;i++) if(p->conns[i] && !p->in_use[i]) {
-    p->in_use[i]=1;p->active++;op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_claim_locked(op,now);ku_pg_async_unlink_locked(op);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);break;
+    p->in_use[i]=1;p->active++;ku_database_pg_pool_delta(1,0);op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_claim_locked(op,now);ku_pg_async_unlink_locked(op);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);break;
   }
   if(op->slot<0 && can_claim && !p->connect_in_flight && now>=p->reconnect_not_before_ms)
-    for(size_t i=0;i<p->size;i++) if(!p->conns[i] && !p->in_use[i]) {make=(int)i;p->in_use[i]=1;p->active++;p->connect_in_flight=1;op->slot=make;op->connecting=1;ku_pg_async_claim_locked(op,now);ku_pg_async_set_phase(op,KU_PG_ASYNC_CONNECT);ku_pg_async_unlink_locked(op);break;}
+    for(size_t i=0;i<p->size;i++) if(!p->conns[i] && !p->in_use[i]) {make=(int)i;p->in_use[i]=1;p->active++;ku_database_pg_pool_delta(1,0);p->connect_in_flight=1;op->slot=make;op->connecting=1;ku_pg_async_claim_locked(op,now);ku_pg_async_set_phase(op,KU_PG_ASYNC_CONNECT);ku_pg_async_unlink_locked(op);break;}
   if(op->slot<0 && !op->waiting) {
-    if(p->waiters>=p->max_waiters) error=ku_pg_client_error("pool_busy",sizeof("pool_busy")-1,"PostgreSQL client waiter limit reached",sizeof("PostgreSQL client waiter limit reached")-1);
-    else {op->waiting=1;p->waiters++;op->waiter.linked=1;op->waiter.notified=0;
+    if(p->waiters>=p->max_waiters) error=ku_pg_client_pool_busy_error("pool_busy",sizeof("pool_busy")-1,"PostgreSQL client waiter limit reached",sizeof("PostgreSQL client waiter limit reached")-1);
+    else {op->waiting=1;p->waiters++;ku_database_pg_pool_delta(0,1);op->waiter.linked=1;op->waiter.notified=0;
       op->waiter.previous=p->async_tail;if(p->async_tail)p->async_tail->next=&op->waiter;else p->async_head=&op->waiter;p->async_tail=&op->waiter;}
   } else if(op->waiting) op->waiter.notified=0;
   if(make>=0) {op->connect_deadline=ku_pg_client_saturating_add_ms(now,p->connect_timeout_ms);if(op->acquire_deadline<op->connect_deadline)op->connect_deadline=op->acquire_deadline;}
@@ -315,14 +315,14 @@ static void ku_pg_async_connected(KuPgAsyncOp* op,unsigned long long now,int can
   op->connected.conn=NULL;p->connect_in_flight=0;op->connecting=0;
   if(connection && !closed && !cancelled && now<op->acquire_deadline) {
     p->conns[op->slot]=connection;op->conn=connection;ku_pg_client_record_connect_success_locked(p);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);
-  } else {if(!connection)ku_pg_client_record_connect_failure_locked(p,now);p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;op->slot=-1;}
+  } else {if(!connection)ku_pg_client_record_connect_failure_locked(p,now);p->async_owners[op->slot]=NULL;p->in_use[op->slot]=0;p->active--;ku_database_pg_pool_delta(-1,0);op->slot=-1;}
   ku_pg_client_signal_locked(p,closed);ku_pg_mutex_unlock(&p->lock);
   if(op->slot>=0)return;
-  if(connection)PQfinish(connection);
+  if(connection) {ku_database_pg_pool_event(KU_PG_METRIC_CONNECTION_DISCARDED);PQfinish(connection);}
   KuError error=closed ? ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1)
       : cancelled ? ku_pg_client_error("cancelled",sizeof("cancelled")-1,"PostgreSQL query was cancelled before it was sent",sizeof("PostgreSQL query was cancelled before it was sent")-1)
       : op->connected.outcome==KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error()
-      : now>=op->acquire_deadline ? ku_pg_client_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1)
+      : now>=op->acquire_deadline ? ku_pg_client_acquire_timeout_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1)
       : op->connected.outcome==KU_PG_CONNECT_TIMED_OUT ? ku_pg_client_error("connect_timeout",sizeof("connect_timeout")-1,"timed out connecting a PostgreSQL client connection",sizeof("timed out connecting a PostgreSQL client connection")-1)
       : ku_pg_connect_failure_error();
   ku_pg_async_finish(op,error,0);

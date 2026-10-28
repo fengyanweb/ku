@@ -133,6 +133,16 @@ fn request(
     path: &str,
     token: Option<&str>,
 ) -> std::io::Result<String> {
+    request_bounded(address, method, path, token, 8192)
+}
+
+fn request_bounded(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    response_limit: u64,
+) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(100))?;
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     stream.set_write_timeout(Some(Duration::from_millis(200)))?;
@@ -141,8 +151,58 @@ fn request(
     });
     write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n")?;
     let mut response = String::new();
-    stream.take(8192).read_to_string(&mut response)?;
+    stream.take(response_limit).read_to_string(&mut response)?;
     Ok(response)
+}
+
+#[test]
+fn resident_metrics_is_authorized_fresh_and_generation_bound() {
+    let mut fixture = start("metrics", &[]);
+    wait_status(&mut fixture, |status| {
+        status.contains("\"phase\":\"ready\"")
+    });
+    let first = request_bounded(fixture.control, "GET", "/metrics", Some(TOKEN), 65536).unwrap();
+    assert!(
+        first.starts_with("HTTP/1.1 200 ") && first.len() > 8192,
+        "metrics bridge did not preserve bounded large native data"
+    );
+    assert!(first.contains("\"available\":true") && first.contains("\"generation\":1"));
+    assert!(first.contains("\"launch\":1") && first.contains("\"calls\":1"));
+    assert!(!first.contains(TOKEN));
+    assert!(request(fixture.control, "GET", "/metrics", Some("invalid"))
+        .unwrap()
+        .starts_with("HTTP/1.1 403"));
+    let next = request_bounded(fixture.control, "GET", "/metrics", Some(TOKEN), 65536).unwrap();
+    assert!(
+        next.contains("\"calls\":2"),
+        "a rejected operator request reached native metrics or data was cached"
+    );
+    let _ = request(fixture.service, "GET", "/crash", None);
+    wait_status(&mut fixture, |status| {
+        status.contains("\"phase\":\"ready\"") && status.contains("\"generation\":2")
+    });
+    let restarted =
+        request_bounded(fixture.control, "GET", "/metrics", Some(TOKEN), 65536).unwrap();
+    assert!(
+        restarted.contains("\"generation\":2")
+            && restarted.contains("\"launch\":2")
+            && restarted.contains("\"calls\":1")
+    );
+    assert!(request(fixture.control, "POST", "/stop", Some(TOKEN))
+        .unwrap()
+        .starts_with("HTTP/1.1 202"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(exit) = fixture.supervisor.try_wait().unwrap() {
+            assert!(exit.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metrics bridge prevented normal stop"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_status(fixture: &mut Fixture, predicate: impl Fn(&str) -> bool) -> String {
@@ -564,6 +624,19 @@ fn resident_process_fixture() {
         std::process::exit(75);
     }
     let token = std::env::var("KU_SERVICE_CONTROL_TOKEN").unwrap();
+    let metrics_launch = if mode == "metrics" {
+        let path = PathBuf::from(std::env::var("KU_SERVICE_TEST_STATE").unwrap());
+        let number = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .unwrap_or(0)
+            + 1;
+        fs::write(path, number.to_string()).unwrap();
+        number
+    } else {
+        0
+    };
+    let mut metrics_calls = 0_u64;
     let first_liveness_failure = if mode.starts_with("first_liveness_failure") {
         let path = PathBuf::from(std::env::var("KU_SERVICE_TEST_STATE").unwrap());
         let first = !path.exists();
@@ -604,7 +677,18 @@ fn resident_process_fixture() {
         } else {
             200
         };
-        let body = if internal && authenticated {
+        let metrics_body = if mode == "metrics" && path == "/__ku/metrics" && authenticated {
+            metrics_calls += 1;
+            Some(format!(
+                "{{\"launch\":{metrics_launch},\"calls\":{metrics_calls},\"padding\":\"{}\"}}",
+                "x".repeat(9000)
+            ))
+        } else {
+            None
+        };
+        let body = if let Some(body) = metrics_body.as_deref() {
+            body
+        } else if internal && authenticated {
             token.as_str()
         } else if internal {
             "forbidden"

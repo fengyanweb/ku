@@ -3081,10 +3081,14 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
 
 #if defined(KU_FEATURE_DATABASE_BUDGET)
     KuDatabaseBudgetSnapshot db = ku_database_budget_snapshot();
-    n=snprintf(text+used,management_capacity-used,",\"database\":{\"reserved_connections\":%llu,\"reserved_waiters\":%llu,\"pending_operations\":%llu,\"pending_bytes\":%llu,\"peak_pending_bytes\":%llu,\"rejections\":%llu,\"unknown_results\":%llu,\"confirmed_cancellations\":%llu}",
+    n=snprintf(text+used,management_capacity-used,",\"database\":{\"reserved_connections\":%llu,\"reserved_waiters\":%llu,\"pending_operations\":%llu,\"pending_bytes\":%llu,\"peak_pending_bytes\":%llu,\"rejections\":%llu,\"unknown_results\":%llu,\"confirmed_cancellations\":%llu,\"pg_client_active_slots\":%llu,\"pg_client_waiters\":%llu,\"pg_client_peak_active_slots\":%llu,\"pg_client_peak_waiters\":%llu,\"pg_client_acquire_timeouts\":%llu,\"pg_client_pool_rejections\":%llu,\"pg_client_discarded_connections\":%llu,\"pg_client_broken_discards\":%llu,\"pg_client_metrics_valid\":%s}",
       (unsigned long long)db.reserved_connections,(unsigned long long)db.reserved_waiters,
       (unsigned long long)db.pending_operations,(unsigned long long)db.pending_bytes,(unsigned long long)db.peak_pending_bytes,
-      (unsigned long long)db.rejections,(unsigned long long)db.unknown_results,(unsigned long long)db.confirmed_cancellations);
+      (unsigned long long)db.rejections,(unsigned long long)db.unknown_results,(unsigned long long)db.confirmed_cancellations,
+      (unsigned long long)db.pg_client_active_slots,(unsigned long long)db.pg_client_waiters,
+      (unsigned long long)db.pg_client_peak_active_slots,(unsigned long long)db.pg_client_peak_waiters,
+      (unsigned long long)db.pg_client_acquire_timeouts,(unsigned long long)db.pg_client_pool_rejections,
+      (unsigned long long)db.pg_client_discarded_connections,(unsigned long long)db.pg_client_broken_discards,db.pg_client_metrics_valid ? "true" : "false");
     if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
 #endif
 #if defined(KU_FEATURE_SERVICE_OUTPUT)

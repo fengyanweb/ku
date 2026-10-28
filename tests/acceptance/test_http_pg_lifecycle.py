@@ -684,7 +684,12 @@ class LaneOrchestrationContracts(unittest.TestCase):
     def test_async_unknown_does_not_claim_synchronous_cancel_confirmation(self):
         metrics = {"reserved_connections": 4, "reserved_waiters": 8,
                    "pending_operations": 0, "pending_bytes": 0,
-                   "confirmed_cancellations": 0, "unknown_results": 1}
+                   "confirmed_cancellations": 0, "unknown_results": 1,
+                   "pg_client_metrics_valid": True,
+                   "pg_client_active_slots": 0, "pg_client_waiters": 0,
+                   "pg_client_peak_active_slots": 4, "pg_client_peak_waiters": 8,
+                   "pg_client_acquire_timeouts": 1,
+                   "pg_client_discarded_connections": 1, "pg_client_broken_discards": 1}
         fixture.validate_database_metrics(metrics, "async", True)
         with self.assertRaises(AssertionError):
             fixture.validate_database_metrics(metrics, "sync", True)
@@ -692,9 +697,11 @@ class LaneOrchestrationContracts(unittest.TestCase):
         with self.assertRaises(AssertionError):
             fixture.validate_database_metrics(metrics, "async", True)
         fixture.validate_database_metrics(metrics, "async", False)
-        for key in ("pending_operations", "pending_bytes"):
+        for key in ("pending_operations", "pending_bytes", "pg_client_active_slots", "pg_client_waiters"):
             with self.subTest(key=key), self.assertRaises(AssertionError):
                 fixture.validate_database_metrics(metrics | {key: 1}, "async", False)
+        with self.assertRaises(AssertionError):
+            fixture.validate_database_metrics(metrics | {"pg_client_metrics_valid": False}, "async", False)
 
 
 class RecoveryHTTPDeadlineContracts(unittest.TestCase):

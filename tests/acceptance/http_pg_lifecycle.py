@@ -1128,7 +1128,15 @@ def validate_database_metrics(metrics, lane, with_faults):
     assert metrics["reserved_waiters"] == 8, metrics
     assert metrics["pending_operations"] == 0, metrics
     assert metrics["pending_bytes"] == 0, metrics
+    assert metrics["pg_client_metrics_valid"] is True, metrics
+    assert metrics["pg_client_active_slots"] == 0, metrics
+    assert metrics["pg_client_waiters"] == 0, metrics
+    assert 1 <= metrics["pg_client_peak_active_slots"] <= 4, metrics
+    assert 0 <= metrics["pg_client_peak_waiters"] <= 8, metrics
     if with_faults:
+        assert metrics["pg_client_acquire_timeouts"] > 0, metrics
+        assert metrics["pg_client_discarded_connections"] > 0, metrics
+        assert 0 < metrics["pg_client_broken_discards"] <= metrics["pg_client_discarded_connections"], metrics
         if lane == "sync":
             assert metrics["confirmed_cancellations"] > 0, metrics
         else:
