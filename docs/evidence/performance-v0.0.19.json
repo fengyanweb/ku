@@ -5513,7 +5513,7 @@
     "Not an interleaved seven-window comparison; fixed order, JIT warmup and environmental drift can matter.",
     "No dynamic CPU profiling in this round, so aggregate differences do not identify a runtime hotspot.",
     "Public HTTP bodies validated; Ku uses text/plain while other stacks use application/json variants.",
-    "Ku JSON subtree access copies; Rust moves and Go/Node retain references; these are normal API semantics, not identical ownership work.",
+    "The frozen Ku JSON handler first performs an ordinary scalar counter lookup, then consumes decoded with take(\"data\") to transfer the selected subtree; Rust moves and Go/Node retain references. Decode, scalar lookup, remaining-root cleanup, envelope construction and encode remain; equivalent ownership/allocation work across stacks is not established.",
     "PG uses same SQL/keys/pool16 without retries or result caching; Ku DISCARD ALL is extra reset work versus other default pools.",
     "Host swap activity does not establish that Ku guest pages were swapped; guest has no swap and cgroup memory/major-fault evidence has a different boundary.",
     "Minor faults can arise from allocation or file mappings and are not swap evidence.",
@@ -5556,7 +5556,34 @@
     "build_receipt_current_source_mismatches": [
       "tests/benchmarks/cross_stack/README.md"
     ],
-    "mismatch_scope": "Only the benchmark README differs in the recorded source inventory; runtime/compiler inputs unchanged as confirmed by coordinator."
+    "mismatch_scope": "Only the benchmark README differs in the recorded source inventory; runtime/compiler inputs unchanged as confirmed by coordinator.",
+    "json_handler_source_evidence": {
+      "original_source": "tests/benchmarks/cross_stack/ku/server.ku",
+      "original_source_sha256": "f186a3069a768514e5a1ff5d20dc98b8358dbb51a7c38f738ee4b7f1fb148b18",
+      "retained_expanded_source_member": "build/ku-native/server.ku",
+      "expanded_source_sha256": "1d51da01eb79c91feb48d0896e10bc15b053c797392627543fe005578cbe6f69",
+      "expanded_counter_lookup_line": 27,
+      "expanded_take_line": 30,
+      "retained_generated_c_member": "build/ku-native/.ku/build/release/c/ltH2o_-IOstZ3rNp-j19KnijZzOFqDNt8yVRSc5HQTY/ku-server.c",
+      "generated_c_sha256": "d2456e0c438a221d950f3f01744193f0af74cd4c6bf144404a996695719a5073",
+      "generated_counter_lookup": {
+        "line": 12735,
+        "function": "ku_value_get_result",
+        "key": "counter"
+      },
+      "generated_selected_subtree_transfer": {
+        "line": 12803,
+        "function": "ku_value_take_result",
+        "receiver": "ku_value_move(&t6)",
+        "key": "data"
+      },
+      "generated_take_helper": {
+        "lines": "4241-4259",
+        "success_path": "ku_value_move(found), then cleanup of consumed root; returns moved selected value"
+      },
+      "current_native_emitter": "src/backend/c.rs:16335-16343 emits ku_value_take_result for kuvalue.take; helper at4796-4814",
+      "stale_descriptive_metadata": "protocol.json known_capability_differences.json_subtree_ownership retains the earlier accessor-copy description; actual frozen source and generated C establish this round used explicit take."
+    }
   },
   "business_work": {
     "http": "HTTP/1.1 keep-alive, no compression/TLS/proxy",
@@ -5583,7 +5610,13 @@
     "json": {
       "corpus_bytes": 1048,
       "corpus_sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
-      "work": "decode dynamic object, increment7 to8, construct envelope with request ID and decoded data subtree, encode and validate semantic body"
+      "work": "decode dynamic object, increment7 to8, construct envelope with request ID and decoded data subtree, encode and validate semantic body",
+      "ownership_path": {
+        "actual": "counter = decoded[\"counter\"]?.as_int()?; data = decoded.take(\"data\")?",
+        "selected_data_subtree": "explicit consuming take transfers the selected subtree on success; this handler does not use the old indexed subtree-copy path",
+        "remaining_work": "ordinary scalar counter lookup before take; complete JSON decode, selected-key lookup, cleanup of the consumed remainder, response-object construction and encode",
+        "comparison_boundary": "Do not infer identical ownership, allocation or cleanup work across languages from the presence of transfer alone."
+      }
     },
     "pg": {
       "query": "SELECT id,label,score FROM cross_stack_items WHERE id=$1",
@@ -5644,5 +5677,12 @@
       "Stable latency ordering, maximum capacity, seven-round confidence intervals and30-minute stability.",
       "Full-lifecycle CPU and universal leak freedom."
     ]
-  }
+  },
+  "report_corrections": [
+    {
+      "scope": "JSON ownership description only",
+      "reason": "Replaced stale protocol accessor-copy wording with verified frozen fixture and generated-C consuming-take path; ordinary counter scalar lookup remains.",
+      "measurements_changed": false
+    }
+  ]
 }

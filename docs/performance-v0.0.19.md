@@ -22,8 +22,10 @@ Linux ARM64 虚拟机、Ubuntu 24.04、内核 6.8.0-147-generic；Rust 1.89.0、
 HTTP/1.1 keep-alive，无 TLS、压缩或代理；客户端并发上限 256，连接空闲 500 ms 失效，原计划时点起算的绝对期限 3 秒，无请求重试。
 
 - **CPU**：480/512/544/576 × 1000 次迭代，种子为字符串长度 1/3/7/11；`total=(total*33+i+seed)%100000000`，初值为 seed，核对八位校验输出。边界内整数不溢出。
-- **JSON**：固定 1,048 字节对象，解码、counter 由 7 加到 8、构建包含请求 ID 与 data 子树的新 envelope，再编码并校验正文。Ku 的子树读取复制、Rust move、Go/Node 保留引用，所有权工作并非完全相同；Ku text API 与其他栈的 JSON MIME 也不同。
+- **JSON**：固定 1,048 字节对象，解码、counter 由 7 加到 8、构建包含请求 ID 与 data 子树的新 envelope，再编码并校验正文。本轮 Ku 先普通索引读取 `counter` 标量，再以 `decoded.take("data")?` 消费根对象并移交子树；不是旧索引读取整个 data 子树并复制的路径。完整解码、标量读取、剩余根字段清理、新对象构造和编码仍存在。Rust move、Go/Node 保留引用，但不能据此推断各栈所有权、分配与清理工作完全等价；Ku text API 与其他栈的 JSON MIME 也不同。
 - **PG**：同一 1,024 键数据集、同一参数 SQL、池上限 16，无结果缓存及 SQL 重试。Ku 归还连接执行 `DISCARD ALL`，其他栈采用各自默认 reset；因此数据库列不是等量 reset 工作的对比。
+
+冻结的 [Ku 夹具](https://github.com/fengyanweb/ku/blob/d8c33bca3c629ce82d0d35709c6931f16c86d05b/tests/benchmarks/cross_stack/ku/server.ku#L25-L32)和保留生成 C 确认 handler 调用 `ku_value_take_result`。协议中一条旧的所有权说明未同步，不能代替实际路径；公开 JSON 保留了源码 SHA、标量读取和移交位置。本次仅更正所有权说明，测量数字不变。
 
 完整算法、语料 SHA 与合同见候选的[测试协议](https://github.com/fengyanweb/ku/tree/d8c33bca3c629ce82d0d35709c6931f16c86d05b/tests/benchmarks/cross_stack/protocol.json)；协议中的七轮/30 秒预热是完整正式矩阵要求，**本次明确采用独立的 10 秒预热单轮计划**。
 

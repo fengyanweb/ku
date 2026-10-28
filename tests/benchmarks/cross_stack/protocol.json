@@ -299,7 +299,7 @@
       "rust_node": "/json and /db use application/json without an explicit charset parameter",
       "claim": "JSON business bodies are validated equivalently; response MIME differs by actual public API and stack; historical results keep their original protocol/source hashes"
     },
-    "json_subtree_ownership": "Ku accessor copies decoded subtree; Rust moves it; Go and Node retain decoded object references. Normal API costs included, no artificial copies added to counterparts.",
+    "json_subtree_ownership": "Current Ku fixture reads counter through ordinary scalar indexing, then decoded.take(\"data\") consumes the root and transfers the selected subtree. Rust moves it; Go and Node retain decoded object references. Decode, scalar lookup, remaining-root cleanup, envelope construction and encoding still occur; ownership/allocation work is not asserted identical. Historical accessor-copy runs retain their original source and protocol hashes.",
     "ku_pg_execution": {
       "default": "async named local handler captures the original initialized PgClient; public query suspends through Task; integer getters plus old JSON writer",
       "legacy_sync": "explicit --ku-pg-execution sync; --ku-pg-read value preserves string-to-JSON numeric decode, int isolates getter change",
