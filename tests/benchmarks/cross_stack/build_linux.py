@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import tomllib
 
 CANDIDATE = "8210e5200c466d9041807d04a68c1844ba9cbd6f"
 
@@ -150,6 +151,7 @@ class Builder:
         self.commands, self.versions = [], {}
         self.built = set()
         self.initial_hashes = identities(self.source)
+        self.package_version = tomllib.loads((self.source / "Cargo.toml").read_text(encoding="utf-8-sig"))["package"]["version"]
         self.candidate, self.uid, self.gid = candidate, uid, gid
         self.ku_format, self.ku_json, self.ku_pg_read = ku_format, ku_json, ku_pg_read
         self.ku_pg_execution = ku_pg_execution
@@ -163,7 +165,7 @@ class Builder:
                              protocol=str(self.benchmark / "protocol.json"), peer_port=peer_port,
                              driver_cpuset="4-6", service_cpu_set="0..cores-1", database_cpu_set="7",
                              cgroup_root="/sys/fs/cgroup/ku-cross-stack",
-                             package_version="0.0.18", release_status="unpublished runtime candidate; no tag or release created",
+                             package_version=self.package_version, release_status="benchmark build; release publication is verified separately",
                              service_env=dict(KU_EVENT_LOOPS="{cores}", KU_BLOCKING_THREADS="17",
                                               KU_THREAD_BUDGET="64", KU_TASK_MAX_BYTES="67108864"))
         self.manifest.setdefault("stacks", {})
@@ -217,7 +219,7 @@ class Builder:
         self.command("ku-cli", [self.cargo, "+1.89.0", "build", "--locked", "--release", "--bin", "ku",
                                 "--jobs", "2", "--target-dir", target])
         ku = target / "release/ku"
-        self.version("ku", [ku, "--version"], "ku 0.0.18")
+        self.version("ku", [ku, "--version"], "ku " + self.package_version)
         libpq = Path("/usr/lib/aarch64-linux-gnu/libpq.so").resolve(strict=True)
         with libpq.open("rb") as stream:
             magic = stream.read(4)
