@@ -75,7 +75,8 @@ class HostedCycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)
             for name in ['B/build/ku-cargo/release/ku','R/build/rust-cargo/release/ku-cross-stack-rust','B/build/ku-native/normal.c',
-                         'B/src/tests/benchmarks/cross_stack/rust/src/main.rs','cli-cache/release/ku','B/src/src/runtime.rs']:
+                         'B/src/tests/benchmarks/cross_stack/rust/src/main.rs','cli-cache/release/ku','B/src/src/runtime.rs',
+                         'compiler/http-train-ku/http-profiles/train.profraw','compiler/KGenerate/build-time-profiles/build.profraw']:
                 path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'normal bytes')
             h.save(root/'state.json',{'db_url':'postgresql://private:pw@host/db','owner_token':'secret',
                 'command':['postgresql://private/db'],'cancel_token_count':3,'root':str(root)})
@@ -85,6 +86,10 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertIn('R/build/rust-cargo/release/ku-cross-stack-rust',names)
                 self.assertIn('B/src/tests/benchmarks/cross_stack/rust/src/main.rs',names)
                 self.assertNotIn('cli-cache/release/ku',names);self.assertNotIn('B/src/src/runtime.rs',names)
+                profile='compiler/http-train-ku/http-profiles/train.profraw'
+                self.assertIn(profile,names);self.assertNotIn('compiler/KGenerate/build-time-profiles/build.profraw',names)
+                mapping={x['path']:x for x in json.load(tar.extractfile('portable-file-map.json'))['files']}
+                self.assertEqual(mapping[profile]['original_sha256'],h.sha(root/profile))
                 redacted=json.load(tar.extractfile('state.json'));self.assertNotIn('db_url',redacted);self.assertNotIn('owner_token',redacted)
                 self.assertEqual(redacted['cancel_token_count'],3);self.assertNotIn('postgresql://',str(redacted))
                 self.assertEqual(tar.extractfile('B/build/ku-native/normal.c').read(),b'normal bytes')
