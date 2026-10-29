@@ -140,13 +140,20 @@ static size_t ku_runtime_loop_count(void) {
   if (count>=budget) { fputs("KU_EVENT_LOOPS leaves no blocking thread budget\n",stderr); exit(1); }
   return count;
 }
-static size_t ku_runtime_blocking_count(void) {
+static size_t ku_runtime_blocking_count_reserved(size_t reserved) {
   size_t budget=ku_runtime_thread_budget()-2u,loops=ku_runtime_loop_count();
-  size_t fallback=loops<2u ? 2u : loops;
+  /* HTTP's background Task worker shares this total with its handler workers.
+     Only the implicit default includes that reservation; an explicit count is
+     still the caller's exact total and cannot expand the thread budget. */
+  size_t fallback=loops+reserved;
+  if (fallback<2u) fallback=2u;
   if (fallback>budget-loops) fallback=budget-loops;
   size_t count=ku_runtime_env_count("KU_BLOCKING_THREADS",fallback,64u);
   if (count>budget-loops) { fputs("event and blocking threads exceed KU_THREAD_BUDGET\n",stderr); exit(1); }
   return count;
+}
+static size_t ku_runtime_blocking_count(void) {
+  return ku_runtime_blocking_count_reserved(0u);
 }
 static size_t ku_runtime_thread_stack_bytes(void) {
   size_t bytes=ku_runtime_env_count("KU_THREAD_STACK_BYTES",2097152u,67108864u);

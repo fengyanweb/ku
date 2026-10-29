@@ -4535,10 +4535,11 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
   if (group.max_requests == (unsigned long long)LONG_MAX) group.max_requests = 0;
   /* Conservative default until the quota-aware target probe is applied. */
   group.count = (int)ku_runtime_loop_count();
-  int blocking = (int)ku_runtime_blocking_count();
+  size_t blocking_reserved=0u;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
-  blocking -= (int)ku_http_task_blocking_threads((size_t)blocking);
+  blocking_reserved=ku_http_task_blocking_threads(1u);
 #endif
+  int blocking = (int)(ku_runtime_blocking_count_reserved(blocking_reserved)-blocking_reserved);
   if (!getenv("KU_EVENT_LOOPS")) {
     if (group.count > server->max_connections) group.count = (int)server->max_connections;
     if (group.count > server->max_active_requests) group.count = (int)server->max_active_requests;

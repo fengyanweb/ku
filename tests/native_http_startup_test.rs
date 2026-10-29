@@ -7,7 +7,13 @@ mod native_harness;
 
 use ku::{backend::c, checker::Checker, ir, lexer::Lexer, parser::Parser};
 use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
-use std::{fs, process::Command};
+use std::{
+    fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    process::Command,
+    time::{Duration, Instant},
+};
 
 #[test]
 fn native_http_pg_capture_cannot_be_closed_or_moved_while_an_async_handler_is_registered() {
@@ -109,6 +115,145 @@ fn main(): null! {
     let setup = parsed(&setup_source);
     let lowered = ir::lower_program(&setup).unwrap();
     c::generate_mixed_http_c_source(&lowered, &tasks, &Default::default()).unwrap()
+}
+
+#[test]
+fn native_http_blocking_default_reserves_background_worker_within_thread_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    // Merely registering this handler enables the real blocking Task runtime.
+    // It is never requested, so this regression requires no peer or database.
+    let asynchronous = r#"async fn network(): HttpResponse! {
+    client=net.client({host:"127.0.0.1",port:9,tls:false,connect_timeout_ms:100})?
+    client.close()
+    return ok(http.text("unused"))
+}"#;
+    let source = format!(
+        r#"
+import {{http, net}} from "std"
+fn ready(): HttpResponse {{return http.text("ready")}}
+{asynchronous}
+fn main(): null! {{
+    app=http.server({{max_connections:16,max_active_requests:8,max_pending_requests:8}})
+    app.get("/ok",ready)
+    app.get("/net",network)
+    app.listen("{address}")?
+    return ok(null)
+}}
+"#
+    );
+    let with_net = |source: &str| {
+        let mut ast = parsed(source);
+        ast.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: "std:net".into(),
+                span: Default::default(),
+            }),
+        );
+        ast
+    };
+    let ast = with_net(&source);
+    Checker::new().check(&ast).unwrap();
+    let tasks = ir::task_lower::lower_service_handlers(&ast).unwrap();
+    let setup = with_net(&source.replace(
+        asynchronous,
+        "fn network(): HttpResponse! { fail \"signature only\" }",
+    ));
+    let lowered = ir::lower_program(&setup).unwrap();
+    let generated = c::generate_mixed_http_c_source(&lowered, &tasks, &Default::default()).unwrap();
+    let generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+        1,
+    );
+    // The ordinary Task-root/default-count interface remains unchanged, even
+    // though this HTTP group needs a separate background-worker reservation.
+    let wrapper = r#"
+int main(void) {
+  if(ku_runtime_blocking_count()!=(size_t)strtoul(getenv("KU_FIXTURE_BASE_BLOCKING"),NULL,10))return 94;
+  return fixture_original_main();
+}
+"#;
+    let directory = TempDir::new("http-blocking-default");
+    let file = directory.path().join("startup.c");
+    fs::write(&file, generated + wrapper).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &file, "startup") else {
+        return;
+    };
+    for (blocking, budget, success) in [
+        (None, "16", true),
+        (Some("3"), "16", true),
+        (Some("2"), "16", false),
+        (None, "6", false),
+        (None, "7", true),
+        (Some("17"), "64", true),
+    ] {
+        let mut command = Command::new(&executable);
+        command
+            .current_dir(directory.path())
+            .env("KU_EVENT_LOOPS", "2")
+            .env_remove("KU_BLOCKING_THREADS")
+            .env("KU_THREAD_BUDGET", budget)
+            .env("KU_FIXTURE_BASE_BLOCKING", blocking.unwrap_or("2"))
+            .env("KU_HTTP_MAX_REQUESTS", "1")
+            .env("KU_HTTP_DRAIN_TIMEOUT_MS", "1000")
+            .env("KU_TASK_MAX_BYTES", "16777216")
+            .env("KU_SERVICE_OUTPUT", "bounded");
+        if let Some(blocking) = blocking {
+            command.env("KU_BLOCKING_THREADS", blocking);
+        }
+        let (result, response) = std::thread::scope(|scope| {
+            let request = success.then(|| {
+                scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let mut stream = loop {
+                        match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+                            Ok(stream) => break stream,
+                            Err(_) if Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("HTTP startup did not accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .write_all(
+                            b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    let mut response = Vec::new();
+                    stream.take(4096).read_to_end(&mut response).unwrap();
+                    response
+                })
+            });
+            let result = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap();
+            let response = request.map(|request| request.join().unwrap());
+            (result, response)
+        });
+        assert_eq!(
+            result.status.code(),
+            Some(if success { 0 } else { 1 }),
+            "B={blocking:?}, budget={budget}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if success {
+            let response = response.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            assert!(response.ends_with(b"\r\n\r\nready"));
+            assert!(result.stdout.is_empty() && result.stderr.is_empty());
+        } else {
+            assert!(String::from_utf8_lossy(&result.stderr)
+                .contains("blocking_threads must cover every loop"));
+        }
+    }
 }
 
 #[test]
