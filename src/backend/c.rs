@@ -5720,6 +5720,30 @@ static inline size_t ku_json_utf8_width(
   return 0;
 }
 
+/* A whole word is ordinary only when every byte is ASCII >= 0x20 and neither
+   quote nor backslash. memcpy avoids alignment/aliasing assumptions; callers
+   bound end to real readable input (and, for output, the remaining budget).
+   These tests only ask whether a hazard exists, so byte order does not matter.
+   Subtraction can conservatively flag another lane after a borrow. */
+static inline const uint8_t* ku_json_scan_ascii(
+    const uint8_t* current, const uint8_t* end) {
+  const uint64_t ones = UINT64_C(0x0101010101010101);
+  const uint64_t high = UINT64_C(0x8080808080808080);
+  while ((size_t)(end - current) >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, current, sizeof(word));
+    uint64_t quote = word ^ UINT64_C(0x2222222222222222);
+    uint64_t slash = word ^ UINT64_C(0x5c5c5c5c5c5c5c5c);
+    uint64_t hazard = word & high;
+    hazard |= (word - UINT64_C(0x2020202020202020)) & ~word & high;
+    hazard |= (quote - ones) & ~quote & high;
+    hazard |= (slash - ones) & ~slash & high;
+    if (hazard) break;
+    current += sizeof(word);
+  }
+  return current;
+}
+
 static size_t ku_json_encode_utf8(uint32_t scalar, uint8_t bytes[4]) {
   if (scalar <= 0x7F) {
     bytes[0] = (uint8_t)scalar;
@@ -5870,6 +5894,11 @@ static bool ku_json_parse_string(
     const uint8_t* start = parser->current;
     const uint8_t* end = parser->end;
     while (parser->current < end) {
+      const uint8_t* ascii = ku_json_scan_ascii(parser->current, end);
+      if (ascii != parser->current) {
+        parser->current = ascii;
+        continue;
+      }
       uint8_t next = *parser->current;
       if (next < 0x20 || next == '"' || next == '\\') break;
       if (next < 0x80) {
@@ -6236,6 +6265,21 @@ static bool ku_json_write_string(
   const uint8_t* end = current + string.len;
   const uint8_t* span = current;
   while (current < end) {
+    /* Do not inspect a whole word beyond the output allowance. A later invalid
+       UTF-8 byte must not replace an earlier output-limit error. Near the bound
+       retain the original scalar ordering, including validation before width. */
+    size_t room = KU_JSON_MAX_OUTPUT_BYTES - output->len;
+    size_t pending = (size_t)(current - span);
+    if (pending <= room && room - pending >= sizeof(uint64_t)) {
+      size_t scan_len = room - pending;
+      const uint8_t* scan_end = (size_t)(end - current) < scan_len
+          ? end : current + scan_len;
+      const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
+      if (ascii != current) {
+        current = ascii;
+        continue;
+      }
+    }
     uint8_t byte = *current;
     if (byte >= 0x20 && byte != '"' && byte != '\\') {
       if (byte < 0x80) current++;
