@@ -42,6 +42,20 @@
 - UTF8宽度候选：两个调用者不使用scalar，O2仍计算并写出；候选保留C2/DF、E0/ED/F0/F4、截断、错误优先级和清理规则。便宜HTTP A/U各15000正确、无错误，CPU点值约低5.04%，但内存点值高264192B，不能当稳定改善。五组后撤回，实际默认仍为旧逻辑。
 - 容量提示候选：根容器字段数≥2时首次64→128。76输入字节/语义一致、349个OOM点清理恢复通过；冻结对象4→3次分配，但小对象峰值64→128B，大单段申请反而增加。已否决，未进入默认或HTTP计分。无完整二次遍历、永久大缓存或借用短命输入。
 
+### 比较合同的具体差异
+
+此次保留原夹具，没有为同工诊断改写路由。`/json` 的decode→counter+1→移交data→encode业务与结果语义一致，HTTP均为1.1 keep-alive；这不表示HTTP头、封装和API成本完全相同：
+
+| 项目 | Ku默认 | Rust默认 |
+| --- | --- | --- |
+| JSON响应Content-Type | `http.text`：`text/plain; charset=utf-8` | `encoded`：`application/json` |
+| JSON执行封装 | 有界同步HTTP handler，16个同步worker；不是Task计算路由 | Axum异步route中调用serde_json |
+| JSON拥有值 | owned body/RID、KuValue及take子树 | owned body/RID、serde_json::Value及remove子树 |
+| PG客户端/结果API | libpq文本参数及结果，checked owned-result `value_int`、UTF8验证 | tokio-postgres typed INT4/String API，类型化参数/结果 |
+| PG默认归还 | 原期限内完整`DISCARD ALL`并验证，失败驱逐 | deadpool Fast，不执行同样reset；同reset模式另列且本轮未计分 |
+
+没有保留两边每个动态响应头的完整逐项抓包，不宣称头部字节完全一致。上述差异不能从服务CPU中凭空扣除；本轮既未达成稳定比较，也未将默认Rust PG当严格同合同成绩。
+
 ## 正常构建后的五组结果
 
 A为复用的正常c9ce1dc CLI Release产物；B为已撤回的UTF8宽度＋first64组合；R为Rust默认。helpers/text/async/int、C11 O2、clang18.1.3、相同协议/输入/数据库/资源限制，500/s、预热10秒、计分30秒，每窗新实例，前一实例自然退出并移除域后才启动后一实例。顺序A-B-R、B-R-A、R-A-B、A-R-B、B-A-R；不是并行语言测试。无探针、采样、诊断计数或O3。

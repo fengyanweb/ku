@@ -42,6 +42,20 @@ The existing allocation ledger remains:decode28/35 allocation calls and7800reque
 
 The capacity-hint experiment started root containers of at least2 fields at128 rather than64B. All76 cases matched bytes/semantics and349 OOM positions cleaned up/recovered. The fixed object used4→3 allocation calls,but small objects doubled peak64→128B and a large single span requested more bytes. It was rejected before product/HTTP scoring. There was no second full tree traversal,permanent large cache or borrowed short-lived input.
 
+### Concrete contract differences
+
+The original fixtures were retained. Both `/json` handlers decode,increment counter,move the data subtree and encode semantically checked output over HTTP/1.1 keep-alive. This does not mean identical headers,wrappers or API cost:
+
+| Item | Ku default | Rust default |
+| --- | --- | --- |
+| JSON response Content-Type | `http.text`: `text/plain; charset=utf-8` | `encoded`: `application/json` |
+| JSON execution wrapper | Bounded synchronous HTTP handler,16 sync workers;not the Task compute route | serde_json inside an Axum async route |
+| JSON ownership | Owned body/RID,KuValue and take subtree | Owned body/RID,serde_json::Value and remove subtree |
+| PG client/result API | libpq text parameters/results,checked owned-result value_int and UTF8 validation | tokio-postgres typed INT4/String parameters/results |
+| PG normal return | Complete DISCARD ALL under original deadline,session validation/eviction | deadpool Fast without equivalent reset;strict-reset mode is separate and not scored this round |
+
+A complete per-header dynamic packet capture was not retained;header bytes are not claimed identical. These differences cannot be numerically subtracted from service CPU. No stable comparison was accepted and normal Rust PG was not substituted for strict-reset scoring.
+
 ## Five groups after ordinary native builds
 
 A is a reused verified normalc9ce1dc CLI Release artifact;B is the subsequently withdrawn UTF8-width+first64 combination;R is Rust normal. Modes are helpers/text/async/int,C11O2,clang18.1.3,same protocol/data/DB/resource limits. Each window warms10s and scores30s at500/s. A fresh instance starts only after its predecessor exits and removes its domain; no frozen other-language services or overlapping builds. Order:A-B-R,B-R-A,R-A-B,A-R-B,B-A-R. No probes,sampling,diagnostic counters orO3 in scores.

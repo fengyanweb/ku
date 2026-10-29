@@ -946,5 +946,25 @@
     "4path memory vsRust goals",
     "stable tail/full acceptance"
   ],
-  "scope": "development branch only,no main runtime merge,no deployment,no production DB or schema migration; pausedValue/AST unchanged; raw evidence delivered as private local portable archive"
+  "scope": "development branch only,no main runtime merge,no deployment,no production DB or schema migration; pausedValue/AST unchanged; raw evidence delivered as private local portable archive",
+  "comparison_contract_differences": {
+    "JSON_ContentType": {
+      "Ku": "text/plain; charset=utf-8",
+      "Rust": "application/json"
+    },
+    "JSON_wrapper": {
+      "Ku": "bounded synchronous16handlerworkers,notTaskcompute",
+      "Rust": "Axum async route+serde_json"
+    },
+    "PG_API": {
+      "Ku": "libpq text parameters/results,checked owned span integer getters",
+      "Rust": "tokio-postgres typedINT4/String"
+    },
+    "PG_return": {
+      "Ku": "strict original-deadline DISCARD ALL",
+      "Rust_default": "deadpoolFast,noequivalentreset",
+      "strict_mode": "separate,final score not run"
+    },
+    "dynamic_header_capture": "not retained in full; do not claim byte-identicalHTTPheaders"
+  }
 }
