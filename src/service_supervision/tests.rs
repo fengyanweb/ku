@@ -297,21 +297,79 @@ fn native_metrics_body_consumes_the_original_remaining_deadline() {
         "expired request must not connect: {}",
         evidence.describe()
     );
-    let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
+    // Establish the slow-body precondition before starting the response budget.
+    // A wall-clock sleep cannot guarantee that connect/headers happen before D
+    // when a parallel CI thread is descheduled.
+    let fixture_began = Instant::now();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+    let mut peer = accept_fixture(listener).expect("slow body fixture was not contacted");
+    let setup_deadline = Instant::now() + Duration::from_secs(1);
+    let token = "d".repeat(64);
+    let request = format!(
+        "GET /__ku/metrics HTTP/1.1\r\nHost: {address}\r\nX-Ku-Control-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    write_until(&mut stream, request.as_bytes(), setup_deadline).unwrap();
+    let actual_request =
+        read_headers_until(&mut peer, MAX_CONTROL_REQUEST, setup_deadline).unwrap();
+    assert_eq!(actual_request, request);
+    let prefix = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+        body.len(),
+        &body[..1]
+    );
+    write_until(&mut peer, prefix.as_bytes(), setup_deadline).unwrap();
+    peer.set_write_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut evidence = NativeMetricsFixtureEvidence {
+        accepted: true,
+        request_headers_read: true,
+        response_headers_written: true,
+        body_bytes_written: 1,
+        stages: vec![("headers_and_first_body_byte", fixture_began.elapsed())],
+        failure: None,
+    };
+    let (body_tx, body_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        if body_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            evidence.failure = Some(("body_start", io::ErrorKind::TimedOut));
+            return evidence;
+        }
+        for byte in body.bytes().skip(1) {
+            thread::sleep(Duration::from_millis(20));
+            if let Err(error) = peer.write_all(&[byte]) {
+                evidence.failure = Some(("response_body", error.kind()));
+                return evidence;
+            }
+            evidence.body_bytes_written += 1;
+        }
+        evidence
+            .stages
+            .push(("body_finished", fixture_began.elapsed()));
+        evidence
+    });
     let began = Instant::now();
     let deadline = began + Duration::from_millis(100);
-    thread::sleep(Duration::from_millis(40));
+    body_tx.send(()).unwrap();
     let client_began = Instant::now();
     let remaining = deadline.checked_duration_since(client_began);
-    let result = native_metrics_at(address, &"d".repeat(64), deadline);
+    let result = read_native_metrics_until(&mut stream, &token, deadline);
     let elapsed = began.elapsed();
+    drop(stream);
     let evidence = worker.join().unwrap();
     let diagnostic = format!(
         "client={result:?}, before_client={:?}, remaining={remaining:?}, elapsed={elapsed:?}; {}",
         client_began.duration_since(began),
         evidence.describe()
     );
-    assert!(result.is_err(), "{diagnostic}");
+    assert!(
+        result.as_ref().err().is_some_and(|error| matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        )),
+        "{diagnostic}"
+    );
     assert!(elapsed < Duration::from_millis(400), "{diagnostic}");
     assert!(
         evidence.body_bytes_written > 0,

@@ -657,6 +657,14 @@ fn native_metrics_at(address: SocketAddr, token: &str, deadline: Instant) -> io:
         "GET /__ku/metrics HTTP/1.1\r\nHost: {address}\r\nX-Ku-Control-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     write_until(&mut stream, request.as_bytes(), deadline)?;
+    read_native_metrics_until(&mut stream, token, deadline)
+}
+
+fn read_native_metrics_until(
+    stream: &mut TcpStream,
+    token: &str,
+    deadline: Instant,
+) -> io::Result<String> {
     // The native management channel already has this separate body bound.
     // Health probes continue to use their original 8192-byte response limit.
     let capacity = MAX_CONTROL_REQUEST + MAX_NATIVE_METRICS_BODY;
