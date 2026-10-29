@@ -7248,9 +7248,116 @@ typedef struct KuHttpConnection {
   void* job;void* async_task;
   uint64_t request_deadline,deadline,connection_generation,request_wait_probe_deadline;
 } KuHttpConnection;
+#define KU_HTTP_REACTOR_FD_ORACLE 1
+static size_t fixture_alloc_calls,fixture_fail_alloc,fixture_live_allocs,fixture_live_bytes;
+static struct {void* pointer;size_t bytes;} fixture_allocations[8];
+static void* fixture_calloc(size_t count,size_t size) {
+  fixture_alloc_calls++;
+  if(fixture_fail_alloc==fixture_alloc_calls)return NULL;
+  if(count && size>SIZE_MAX/count)abort();
+  void* value=calloc(count,size);if(!value)return NULL;
+  for(size_t i=0;i<8u;i++)if(!fixture_allocations[i].pointer) {
+    fixture_allocations[i].pointer=value;fixture_allocations[i].bytes=count*size;
+    fixture_live_allocs++;fixture_live_bytes+=count*size;return value;
+  }
+  abort();
+}
+static void fixture_free(void* value) {
+  if(!value)return;
+  for(size_t i=0;i<8u;i++)if(fixture_allocations[i].pointer==value) {
+    fixture_live_allocs--;fixture_live_bytes-=fixture_allocations[i].bytes;
+    fixture_allocations[i].pointer=NULL;fixture_allocations[i].bytes=0;free(value);return;
+  }
+  abort();
+}
+#define calloc fixture_calloc
+#define free fixture_free
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static int fixture_fd_index_clusters(void) {
+  KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init(&r,&active,0u));
+  KuHttpSocket keys[4];size_t count=0;
+  /* Deliberately wrap a collision cluster across the last bucket. */
+  for(int fd=0;fd<65536 && count<4u;fd++)
+    if(ku_http_reactor_fd_start(&r,fd)==r.hash_capacity-1u)keys[count++]=fd;
+  CHECK(count==4u);
+  for(size_t round=0;round<128u;round++) {
+    for(size_t i=0;i<4u;i++) {
+      r.registrations[i]=(KuHttpRegistration){keys[i],1u+i,round,0,1,-1,0};
+      size_t at=ku_http_reactor_fd_bucket(&r,keys[i]);
+      CHECK(at!=SIZE_MAX && !r.fd_entries[at]);r.fd_entries[at]=(uint32_t)(i+1u);
+      CHECK(ku_http_reactor_fd_oracle(&r,keys[i],i));
+    }
+    const size_t deletion[4]={1u,0u,3u,2u};
+    for(size_t step=0;step<4u;step++) {
+      size_t i=deletion[step];ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};
+      CHECK(!r.fault && ku_http_reactor_fd_oracle(&r,keys[i],SIZE_MAX));
+      for(size_t other=0;other<4u;other++)if(r.registrations[other].registered) {
+        size_t at=ku_http_reactor_fd_bucket(&r,keys[other]);
+        CHECK(at!=SIZE_MAX && r.fd_entries[at]==other+1u);
+      }
+    }
+    for(size_t i=0;i<r.hash_capacity;i++)CHECK(!r.fd_entries[i]);
+  }
+  /* A full/corrupt index must fail closed after a bounded probe, not spin. */
+  r.registrations[0]=(KuHttpRegistration){keys[0],1u,0,0,1,-1,0};
+  for(size_t i=0;i<r.hash_capacity;i++)r.fd_entries[i]=1u;
+  CHECK(ku_http_reactor_fd_bucket(&r,keys[1])==SIZE_MAX && r.fault);
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-persistent-fd-index-collision-backshift-ok");return 0;
+}
+static int fixture_fd_index_init_failures(void) {
+  for(size_t fail=1u;fail<=5u;fail++) {
+    KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+    fixture_alloc_calls=0;fixture_fail_alloc=fail;
+    CHECK(!ku_http_reactor_init(&r,&active,1u));
+    CHECK(r.descriptor==-1 && !r.registrations && !r.hash && !r.fd_entries && !r.work && !r.idle_heap);
+    CHECK(!active.reactor && !fixture_live_allocs && !fixture_live_bytes);
+  }
+  fixture_fail_alloc=0;fixture_alloc_calls=0;
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init_pending(&r,&active,1u,2u));
+  CHECK(fixture_alloc_calls==5u);
+  CHECK(fixture_live_bytes==ku_http_reactor_pending_storage_bytes(1u,1u,2u)-sizeof(r));
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  CHECK(!ku_http_reactor_init(&r,&active,(size_t)UINT32_MAX));
+  CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-persistent-fd-index-init-budget-cleanup-ok");return 0;
+}
+static int fixture_failed_new_preserves_alias(void) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
+  CHECK(ku_http_reactor_init(&r,&active,1u));
+  int pair[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+  size_t old=4u;KuHttpSocket fd=pair[0];
+  ku_http_reactor_interest(&r,old,fd,KU_HTTP_POLL_READ,UINT64_MAX-99u,0);
+  uint64_t token=r.registrations[old].token;CHECK(!r.fault);
+#if defined(__linux__)
+  /* ADD on the still-live old fd fails with EEXIST. Keep both the logical
+   * index and old kernel interest; unlike kqueue this does not replace it. */
+  ku_http_reactor_interest(&r,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-98u,-1);
+  CHECK(r.fault && !r.registrations[0].registered && r.registrations[old].registered);
+  CHECK(ku_http_reactor_lookup(&r,token)==old);r.fault=0;
+  KuHttpPollFd poll_items[8]={{0}};
+  CHECK(write(pair[1],"f",1)==1 && ku_http_reactor_wait(&r,poll_items,1000)>0);
+  CHECK(poll_items[0].revents&KU_HTTP_POLL_READ);
+  char byte;CHECK(read(fd,&byte,1)==1 && byte=='f');
+#endif
+  CHECK(!close(fd));
+  /* The externally-owned socket closed but its logical snapshot has not yet
+   * retired. A failed new ADD must not retire that old identity/index. */
+  ku_http_reactor_interest(&r,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-98u,-1);
+  CHECK(r.fault && !r.registrations[0].registered && r.registrations[old].registered);
+  CHECK(ku_http_reactor_lookup(&r,token)==old);
+  size_t bucket=ku_http_reactor_fd_bucket(&r,fd);CHECK(bucket!=SIZE_MAX && r.fd_entries[bucket]==old+1u);
+  r.fault=0;ku_http_reactor_delete(&r,old);
+  CHECK(!r.fault && !r.registrations[old].registered);
+  bucket=ku_http_reactor_fd_bucket(&r,fd);CHECK(bucket!=SIZE_MAX && !r.fd_entries[bucket]);
+  CHECK(!close(pair[1]));ku_http_reactor_destroy(&r);
+  CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-persistent-failed-new-keeps-old-alias-ok");return 0;
+}
 static int fixture_external_net_close(int reuse,int both_filters) {
   KuHttpConnection connections[1]={{0}};
   KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
@@ -7275,6 +7382,9 @@ static int fixture_external_net_close(int reuse,int both_filters) {
     /* A new HTTP slot (or new net resource) can register the reused numeric
      * fd before the retired net entry is reconciled. DEL is by numeric fd:
      * the old token must never delete this new kernel registration. */
+    CHECK(!reactor.registrations[old_net].registered);
+    size_t fd_bucket=ku_http_reactor_fd_bucket(&reactor,fd);
+    CHECK(fd_bucket!=SIZE_MAX && reactor.fd_entries[fd_bucket]==1u);
     ku_http_reactor_delete(&reactor,old_net);
     CHECK(!reactor.fault);
     CHECK(write(replacement[1],"r",1)==1);
@@ -7341,6 +7451,9 @@ static int fixture_closed_event_source(void) {
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
 int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
+  if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
+  if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
   if(argc>1 && !strcmp(argv[1],"external-net-close")) return fixture_external_net_close(0,0);
   if(argc>1 && !strcmp(argv[1],"external-net-reuse")) return fixture_external_net_close(1,0);
   if(argc>1 && !strcmp(argv[1],"external-net-reuse-both")) return fixture_external_net_close(1,1);
@@ -7463,6 +7576,9 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
+        "fd-index-clusters",
+        "fd-index-init-failures",
+        "failed-new-alias",
         "external-net-close",
         "external-net-reuse",
         "external-net-reuse-both",

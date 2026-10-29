@@ -3304,6 +3304,8 @@ typedef struct KuHttpReactor {
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
   KuHttpRegistrationHash* hash;
+  /* Slot+1, not a truncated fd/token. Zero is empty; keys live in registrations. */
+  uint32_t* fd_entries;
   int* work;
   int* idle_heap;
   KuHttpReadyEvent ready[KU_HTTP_READY_BATCH];
@@ -3324,14 +3326,14 @@ static size_t ku_http_reactor_hash_capacity(size_t capacity) {
 static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
   size_t capacity=slots+3u+net;
   return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
-      +ku_http_reactor_hash_capacity(capacity)*sizeof(KuHttpRegistrationHash)
+      +ku_http_reactor_hash_capacity(capacity)*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t))
       +slots*2u*sizeof(int);
 }
 static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size_t pending) {
   size_t before=slots+3u+net,after=before+pending;
   return ku_http_reactor_storage_bytes(slots,net)
       +pending*sizeof(KuHttpRegistration)
-      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*sizeof(KuHttpRegistrationHash);
+      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t));
 }
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
   token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
@@ -3374,6 +3376,51 @@ static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
   }
   r->fault=1;
 }
+/* Owner-local fd index. At most one logical registration owns a numeric fd:
+ * a successful NEW replaces a retired external resource before old events are
+ * dispatched. Capacity is bounded by the same registration table, not fd value.
+ * Open addressing has <=1/2 load; deletion back-shifts instead of accumulating
+ * tombstones. No index allocation or growth occurs in a request turn. */
+static size_t ku_http_reactor_fd_start(const KuHttpReactor* r,KuHttpSocket fd) {
+  return ku_http_reactor_hash_start(r,(uint64_t)(uintptr_t)fd);
+}
+static size_t ku_http_reactor_fd_bucket(KuHttpReactor* r,KuHttpSocket fd) {
+  size_t start=ku_http_reactor_fd_start(r,fd);
+  for(size_t i=0;i<r->hash_capacity;i++) {
+    size_t at=(start+i)&(r->hash_capacity-1u);
+    uint32_t stored=r->fd_entries[at];
+    if(!stored)return at;
+    size_t index=(size_t)stored-1u;
+    if(index>=r->capacity || !r->registrations[index].registered) {r->fault=1;return SIZE_MAX;}
+    if(r->registrations[index].fd==fd)return at;
+  }
+  r->fault=1;return SIZE_MAX;
+}
+static void ku_http_reactor_fd_remove(KuHttpReactor* r,size_t index) {
+  size_t hole=ku_http_reactor_fd_bucket(r,r->registrations[index].fd);
+  if(hole==SIZE_MAX || r->fd_entries[hole]!=(uint32_t)(index+1u)) {r->fault=1;return;}
+  size_t mask=r->hash_capacity-1u,at=(hole+1u)&mask;
+  for(size_t moved=0;moved<r->hash_capacity && r->fd_entries[at];moved++,at=(at+1u)&mask) {
+    size_t other=(size_t)r->fd_entries[at]-1u;
+    if(other>=r->capacity || !r->registrations[other].registered) {r->fault=1;return;}
+    size_t home=ku_http_reactor_fd_start(r,r->registrations[other].fd);
+    if(((at-home)&mask)>=((hole-home)&mask)) {r->fd_entries[hole]=r->fd_entries[at];hole=at;}
+  }
+  r->fd_entries[hole]=0;
+}
+#if defined(KU_HTTP_REACTOR_FD_ORACLE)
+/* Diagnostic-only oracle: compare exact target identity against the previous
+ * full scan on every NEW/delete. Ordinary scoring contains no scan/counters. */
+static int ku_http_reactor_fd_oracle(KuHttpReactor* r,KuHttpSocket fd,size_t expected) {
+  size_t found=SIZE_MAX;
+  for(size_t i=0;i<r->capacity;i++) {
+    if(!r->registrations[i].registered || r->registrations[i].fd!=fd)continue;
+    if(found!=SIZE_MAX)return 0;
+    found=i;
+  }
+  return found==expected;
+}
+#endif
 static int ku_http_reactor_kernel(KuHttpReactor* r,KuHttpRegistration* entry,
     KuHttpSocket fd,short events,uint64_t token,int remove) {
   /* Task-net owns its sockets and can close one during pump/interests, before
@@ -3427,20 +3474,27 @@ static void ku_http_reactor_delete(KuHttpReactor* r,size_t index) {
   if(!entry->registered) return;
   if(!ku_http_reactor_kernel(r,entry,entry->fd,0,entry->token,1)) r->fault=1;
   ku_http_reactor_hash_remove(r,entry->token);
+  ku_http_reactor_fd_remove(r,index);
+#if defined(KU_HTTP_REACTOR_FD_ORACLE)
+  KuHttpSocket removed_fd=entry->fd;
+#endif
   *entry=(KuHttpRegistration){0};
+#if defined(KU_HTTP_REACTOR_FD_ORACLE)
+  if(!ku_http_reactor_fd_oracle(r,removed_fd,SIZE_MAX))r->fault=1;
+#endif
 }
-static void ku_http_reactor_retire_fd_aliases(KuHttpReactor* r,size_t current,KuHttpSocket fd) {
-  /* This scan runs only after a NEW kernel registration succeeded, never on
-   * stable turns or ordinary MOD. The OS accepted the current identity; an
-   * older snapshot with the same number is logically retired WITHOUT DEL,
-   * which would otherwise delete the new fd owner. Tokens/generations remain
-   * full-width, so already-returned events for the old identity are rejected. */
-  for(size_t i=0;i<r->capacity;i++) {
-    KuHttpRegistration* old=&r->registrations[i];
-    if(i==current || !old->registered || old->fd!=fd) continue;
-    ku_http_reactor_hash_remove(r,old->token);
-    *old=(KuHttpRegistration){0};
-  }
+static void ku_http_reactor_retire_fd_aliases(KuHttpReactor* r,size_t current,KuHttpSocket fd,size_t bucket) {
+  /* Only after the NEW kernel registration succeeded. Never DEL this old
+   * numeric fd: it now denotes the new resource and its kernel registration. */
+  uint32_t stored=r->fd_entries[bucket];
+  if(!stored)return;
+  size_t i=(size_t)stored-1u;
+  if(i==current || i>=r->capacity || !r->registrations[i].registered
+      || r->registrations[i].fd!=fd) {r->fault=1;return;}
+  KuHttpRegistration* old=&r->registrations[i];
+  ku_http_reactor_hash_remove(r,old->token);
+  *old=(KuHttpRegistration){0};
+
 }
 static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
     KuHttpSocket fd,short events,uint64_t generation,int poll_index) {
@@ -3455,11 +3509,23 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   if(r->next_token>=UINT64_MAX-1u) {r->fault=1;return;}
   uint64_t token=++r->next_token;
   if(!ku_http_reactor_hash_add(r,token,index)) {r->fault=1;return;}
+  /* Preflight before changing the kernel. This owner cannot concurrently
+   * mutate the index, so a successful NEW can publish without a fallible insert. */
+  size_t bucket=ku_http_reactor_fd_bucket(r,fd);
+  if(bucket==SIZE_MAX) {ku_http_reactor_hash_remove(r,token);r->fault=1;return;}
+#if defined(KU_HTTP_REACTOR_FD_ORACLE)
+  size_t expected=r->fd_entries[bucket]?(size_t)r->fd_entries[bucket]-1u:SIZE_MAX;
+  if(!ku_http_reactor_fd_oracle(r,fd,expected)) {ku_http_reactor_hash_remove(r,token);r->fault=1;return;}
+#endif
   if(!ku_http_reactor_kernel(r,entry,fd,events,token,0)) {
     ku_http_reactor_hash_remove(r,token);r->fault=1;return;
   }
-  ku_http_reactor_retire_fd_aliases(r,index,fd);
+  ku_http_reactor_retire_fd_aliases(r,index,fd,bucket);
   *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
+  r->fd_entries[bucket]=(uint32_t)(index+1u);
+#if defined(KU_HTTP_REACTOR_FD_ORACLE)
+  if(!ku_http_reactor_fd_oracle(r,fd,index))r->fault=1;
+#endif
 }
 static int ku_http_reactor_idle(const KuHttpConnection* c) {
   return c->phase==KU_HTTP_IO_HEADER && !c->request_lease && !c->request_queued && !c->buffered && !c->carry_length
@@ -3602,15 +3668,21 @@ static int ku_http_reactor_wait(KuHttpReactor* r,KuHttpPollFd* items,int timeout
 }
 static void ku_http_reactor_destroy(KuHttpReactor* r) {
   if(r->descriptor>=0) close(r->descriptor);
-  free(r->registrations);free(r->hash);free(r->work);free(r->idle_heap);
-  r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->work=NULL;r->idle_heap=NULL;
+  free(r->registrations);free(r->hash);free(r->fd_entries);free(r->work);free(r->idle_heap);
+  r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->fd_entries=NULL;r->work=NULL;r->idle_heap=NULL;
 }
 static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active,size_t net,size_t pending) {
   memset(r,0,sizeof(*r));r->descriptor=-1;r->slots=active->capacity;r->active=active;
+  /* Public limits are much smaller (C<=32768,N<=16384,R<=8192). Keep the
+   * slot+1 representation explicit even for direct internal callers. */
+  if(r->slots<0 || (size_t)r->slots>UINT32_MAX-3u
+      || net>UINT32_MAX-3u-(size_t)r->slots
+      || pending>UINT32_MAX-3u-(size_t)r->slots-net)return 0;
   r->pending_base=(size_t)r->slots+3u+net;
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
   r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
+  r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
 #if defined(__linux__)
   r->descriptor=epoll_create1(EPOLL_CLOEXEC);
@@ -3618,7 +3690,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->descriptor=kqueue();
   if(r->descriptor>=0 && fcntl(r->descriptor,F_SETFD,FD_CLOEXEC)<0) {close(r->descriptor);r->descriptor=-1;}
 #endif
-  if(r->descriptor<0 || !r->registrations || !r->hash || (r->slots && (!r->work || !r->idle_heap))) {
+  if(r->descriptor<0 || !r->registrations || !r->hash || !r->fd_entries || (r->slots && (!r->work || !r->idle_heap))) {
     ku_http_reactor_destroy(r);return 0;
   }
   active->reactor=r;return 1;
