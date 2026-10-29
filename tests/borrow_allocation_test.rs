@@ -700,7 +700,8 @@ int main(void) {
   KuResult_kuvalue span=ku_json_parse(ku_string_static((const uint8_t*)ordinary,prefix_len+2));
   CHECK(span.ok && span.value.tag==KU_STR && span.value.as.s.len==prefix_len);
   printf("JSON ordinary UTF8 append_calls=%zu allocation_calls=%zu bytes=%zu\n",ku_fixture_json_append_calls,ku_borrow_json_allocation_calls,prefix_len);fflush(stdout);
-  CHECK(ku_fixture_json_append_calls==1 && ku_borrow_json_allocation_calls==1);
+  CHECK(ku_fixture_json_append_calls==0 && ku_borrow_json_allocation_calls==1);
+  CHECK(span.value.as.s.capacity==prefix_len && span.value.as.s.storage==KU_STRING_OWNED);
   CHECK(span.value.as.s.ptr!=(const uint8_t*)ordinary+1);
   free(ordinary);ordinary=NULL;
   for(size_t i=0;i<repeats;i++)CHECK(!memcmp(span.value.as.s.ptr+i*unit_len,unit,unit_len));

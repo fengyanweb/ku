@@ -1269,10 +1269,7 @@ fn run_pg_live_loopback(name: &str, suite: &str, pipeline: bool) -> Option<Strin
     harness.push_str(suite);
     let source = directory.path().join(format!("{name}.c"));
     fs::write(&source, harness).expect("write live PG harness without embedded credentials");
-    let Some(executable) = compile_harness_with_libpq(directory.path(), &source, name, &libdir)
-    else {
-        return None;
-    };
+    let executable = compile_harness_with_libpq(directory.path(), &source, name, &libdir)?;
     let mut command = Command::new(executable);
     command
         .current_dir(directory.path())
