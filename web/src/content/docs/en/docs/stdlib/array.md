@@ -42,18 +42,17 @@ Save as `arrays.ku`, then run `ku run arrays.ku`. This example also compiles usi
 ```ku
 import array from "std.array"
 
-fn main(): null! {
+fn main() {
     values = [1, 2, 3]
     extended = values.push(4)
     doubled = extended.map(x => x * 2)
     println(array.len(values))
-    println(doubled.try_get(3)?)
+    println(doubled[3])
     try {
         values.try_get(9)?
     } catch (error) {
         println(error.code)
     }
-    return ok(null)
 }
 ```
 
@@ -64,6 +63,8 @@ index_out_of_bounds
 ```
 
 `values` still contains three elements after `push`; `extended` contains four. `mapper` must match the element type, and normal ownership and Result rules apply inside it.
+
+Here `doubled` is known to have four elements, so `doubled[3]` reads directly. Use `try_get(index)?` when an index may be invalid and you want to handle that error. The example handles its `?` inside `try/catch`, so `main` does not need a `null!` return type.
 
 ## Backend support
 

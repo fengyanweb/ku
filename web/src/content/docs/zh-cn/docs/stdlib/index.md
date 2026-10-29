@@ -46,7 +46,7 @@ import { http, time } from "std"
 
 每页示例都显式导入依赖。数据库、`bytes` 和 `net` 目前使用 native C 后端，其他模块的具体范围见各页及[支持矩阵](/zh-cn/docs/support/)。
 
-`T!` 表示可能返回 Error 的 Result；用 `?` 传播或 `try/catch` 处理。`&` 参数只读借用，不消费原值，也不隐式复制。返回新字符串或数组所需的分配与输入复制是不同的操作。
+返回类型 `T!` 表示 Result，调用后用 `?` 取出成功值并传递错误；也可在 `try` 内使用 `?`，由 `catch` 处理错误。直接返回 `int`、`str` 等普通值的调用不加 `?`。具体写法见[错误处理](/zh-cn/docs/guide/errors/#result-operators)。`&` 参数只读借用，不消费原值，也不隐式复制。返回新字符串或数组所需的分配与输入复制是不同的操作。
 
 [示例集](/zh-cn/docs/examples/)按可直接运行的任务组织；[包与模块](/zh-cn/docs/guide/packages/)介绍你自己的库。`std.task` 是内部观测接口，应用程序通过 `async fn` 与 `await` 使用 Task，见[并发指南](/zh-cn/docs/guide/concurrency/)。
 

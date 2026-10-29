@@ -2,7 +2,7 @@
 title: 'Kurulum ve indirme'
 description: 'Ku 0.0.19 deneysel ön sürümünü indirin; platform ve derleme gereksinimlerini öğrenin.'
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'Cargo.toml',
@@ -12,80 +12,74 @@ sources:
   ]
 ---
 
-> Aşağıdaki v0.0.19 güncellemeleri şimdilik İngilizcedir; çevirinin geri kalanı korunmuştur. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+Bilgisayarınız için **Ku 0.0.19** paketini indirin. Bu deneysel ön sürümün her paketi komut satırı aracını, yorumlayıcıyı ve VS Code eklentisini içerir.
 
-This page targets the **v0.0.19 experimental prerelease**. Use the actual [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and its assets; documentation alone does not establish completed publication or production readiness.
+## 1. Ku’yu indirin
 
-## Platformunuzu seçin
+| Sistem  | Mimari                | İndir                                                                                                                          | Boyut   |
+| ------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| macOS   | Apple Silicon / ARM64 | [İndir macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)     | 39.8 MB |
+| Windows | x64                   | [İndir Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz) | 44.1 MB |
+| Linux   | x64 / GNU             | [İndir Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) | 48.3 MB |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19). `native_ci-*` artifacts are CI examples, not CLI installers.
+## 2. Çıkarın ve çalıştırın
 
-| Sistem  | Mimari                | Arşiv                                                                                                                                                 |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.19-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) |
+**Paketin tamamını** boş bir klasöre, örneğin kullanıcı klasörünüzdeki `ku` klasörüne çıkarın. Tüm dosyaları bir arada tutun; yalnızca çalıştırılabilir dosyayı taşımayın. Bu klasörde bir terminal açın.
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)
-
-Diğer platform arşivleri doğrulanmadı. Çapraz derleme desteği her işletim sistemi veya mimari için yayımlanmış paket olduğu anlamına gelmez.
-
-## Çıkarın ve doğrulayın
-
-1. Arşivi sürümdeki `SHA256SUMS` ile doğrulayın. Ayrı bir `.manifest.json`, arşiv ve dosya bütünlüğünü açıklar. Sağlama toplamları bütünlük denetimidir; yayıncı imzası değildir.
-2. **Arşivin tamamını** boş bir dizine çıkarın ve `README-INSTALL.md` dosyasını okuyun. `ku`, `libku.rlib`, `deps/` ve `native-tls/` arasındaki göreli dizilimi koruyun.
-3. O dizinden sürümü denetleyin. macOS / Linux üzerinde:
+macOS / Linux:
 
 ```sh
 ./ku --version
 ```
 
-Windows PowerShell içinde:
+Windows PowerShell:
 
 ```powershell
 .\ku.exe --version
 ```
 
-Bildirilen sürüm `0.0.19` olmalıdır. İsterseniz bu dizini `PATH` içine ekleyip `ku --version` çalıştırın. VS Code bütünleşmesi için paketteki `ku-language-0.0.19.vsix` dosyasını kurun.
+Çıktıda `ku 0.0.19` görünmelidir. Artık `.ku` dosyalarını çalıştırıp denetleyebilirsiniz; bu işlemler için Rust kurulumu gerekmez.
 
-## Interpreter and VS Code extension
+<details>
+<summary>İsteğe bağlı: ku’yu her klasörden kullanın</summary>
 
-Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.19.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
-
-After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.19.vsix`, and reload the window. Alternatively, run this from the extracted directory:
-
-```sh
-code --install-extension ./ku-language-0.0.19.vsix
-```
-
-The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
-
-## Çalıştırma ve derleme gereksinimleri
-
-| İşlem                                   | Ek gereksinimler                                                                            |
-| --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | Eşleşen platform için Ku CLI                                                                |
-| Varsayılan `ku build hello.ku`          | Hedef için Rust **1.89.0** ve sistem bağlayıcısı; paketlenmiş Rust bağımlılıklarını koruyun |
-| `ku build --backend c hello.ku`         | Çalışan bir hedef C derleyicisi ve bağlayıcısı                                              |
-| Yerel veritabanı programı               | Eşleşen harici veritabanı istemcisi dinamik kütüphaneleri; pakete dahil değildir            |
-
-Varsayılan çalıştırıcı yalnızca giriş kaynağını gömer. İçe aktarılan modüller özgün konumlarından yüklenmeye devam eder. Tam bir yerel içe aktarma grafiğinin kaynaklardan bağımsız dağıtımı, C üzerinden yerel derleme gerektirir ve [arka uç sınırlarına](/tr/docs/support/) tabidir.
-
-## Geliştirme kaynak kodunu deneyin
-
-Deponun yerel bir kopyasında:
+Paketi `~/ku` dizinine çıkardıysanız kabuğunuzun başlangıç dosyasına, örneğin `~/.zshrc` veya `~/.bashrc` dosyasına şu satırı ekleyin:
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.19`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+Windows’ta «Hesabınız için ortam değişkenlerini düzenleyin» seçeneğini açın, kullanıcı `Path` değişkenini düzenleyin ve çıkardığınız klasörün tam yolunu, örneğin `%USERPROFILE%\ku`, ekleyin. Mevcut girdileri koruyun.
 
-## Kaldırma
+Yeni bir terminal açıp `ku --version` komutunu çalıştırın.
 
-Arşiv kurulumu için çıkardığınız dizini silin, eklediğiniz `PATH` girdisini geri alın ve VS Code uzantısını kaldırın. Önce orada oluşturduğunuz kaynak dosyalarını ve yapılandırmayı koruyun. Ayrı bir tek tık kurucusu, paket yöneticisi kurulumu veya `ku uninstall` komutu doğrulanmadı.
+</details>
 
-Sıradaki adım: [ilk programınızı çalıştırın](/tr/docs/getting-started/). Kurulum sözleşmesinin kaynağı: [sürüm arşivleri](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/history.md).
+## 3. VS Code eklentisini kurun
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/tr/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+VS Code’un Eklentiler görünümünde **… → VSIX’ten Yükle…** seçeneğini kullanın, çıkardığınız klasördeki `ku-language-0.0.19.vsix` dosyasını seçin ve pencereyi yeniden yükleyin.
+
+Ku `PATH` içinde değilse `ku.executablePath` ayarını `ku` dosyasının (Windows’ta `ku.exe`) tam yoluna ayarlayın.
+
+<details>
+<summary>İndirmeyi doğrulayın</summary>
+
+Paketin SHA-256 değerini [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS) ile karşılaştırın. [Sürüm sayfasında](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) her paket için dosya sağlama toplamlarını içeren bir `.manifest.json` da bulunur. Ek talimatlar paketteki `README-INSTALL.md` dosyasındadır.
+
+</details>
+
+<details>
+<summary>Kendi Ku programlarınızı derleyin</summary>
+
+`ku run` ve `ku check` için yalnızca platformun CLI aracı gerekir. Varsayılan `ku build` ayrıca Rust **1.89.0** ve sistem bağlayıcısı gerektirir. `ku build --backend c` hedef platform için C derleyicisi ve bağlayıcı gerektirir. Yerel veritabanı programları ayrıca uygun veritabanı istemci kitaplıklarına ihtiyaç duyar; bunlar pakete dahil değildir.
+
+</details>
+
+<details>
+<summary>Kaldırma</summary>
+
+Oluşturduğunuz kaynak dosyaları ve yapılandırmaları koruyun; ardından çıkardığınız klasörü, eklediğiniz `PATH` girdisini ve VS Code eklentisini kaldırın.
+
+</details>
+
+[Sonraki adım: ilk programınızı çalıştırın](/tr/docs/getting-started/)

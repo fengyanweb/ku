@@ -17,6 +17,8 @@ sources:
   ]
 ---
 
+<span id="execution"></span>
+
 ## 选择平台与执行路径
 
 按[安装说明](/zh-cn/docs/install/)和实际[发行资产](https://github.com/fengyanweb/ku/releases)选择系统与架构对应的 CLI。源码构建、CI 作业或隔离安装预演不等于已发布相应平台的下载包。Linux ARM64 RC 预演只覆盖样例服务及其依赖；真实应用、生产 SLO 与灰度验收需要单独完成。
@@ -32,7 +34,7 @@ sources:
 
 参数、返回值、错误和完整示例见 [HTTP](/zh-cn/docs/stdlib/http/)、[JSON](/zh-cn/docs/stdlib/json/)、[时间](/zh-cn/docs/stdlib/time/)与[数据库](/zh-cn/docs/stdlib/database/)。类型检查与后端编译是两个步骤。默认 runner 构建需要匹配的 Rust 工具链及发行归档布局；native 构建需要目标 C 编译器和相应原生库。LLVM 文本后端仍为有限原型。
 
-## Task 边界
+## Task 支持
 
 调用 async 函数会提交任务并返回一次性 Task 句柄；`await` 取回结果，不规定任务何时首次执行。native Task 路径支持已列明的基础类型、字符串、平面数组、Result、Task 启动/移动/等待、定时器和部分有界 I/O，也支持具名 async HTTP handler 及文档限定的 PG 捕获路径。这不代表完整 M:N、任意 async 闭包/捕获组合、通用 JSON 操作或通用网络调度器。
 
@@ -71,16 +73,21 @@ ku supervise --worker-memory-bytes 134217728 --total-memory-bytes 536870912 \
 
 Windows 省略 `--cgroup-root`。数值使用十进制字节或毫秒。`--` 后是完整程序输入；native 程序先构建，再以 `--native` 提交，编译器不计入 worker 限制。失败 worker 只有确认清理后才退还预留；分配失败或外部库被终止不保证成为普通 Result。
 
-## 数据库、传输与失败边界
+## 数据库连接与失败处理
 
 数据库客户端仅支持 native。真实服务器验证只适用于相应驱动、平台、依赖和源码身份，链接成功不等于查询成功。远程 PostgreSQL 需要显式 `sslmode=verify-full` 及可信证书。Redis 为明文 TCP；MySQL 在 Oracle/MariaDB 间没有统一的失败即关闭证书/主机名校验合同。需要加密时使用受控本地/私网或独立验证的隧道。`std.net` TLS 不代表所有库都复用 TLS。
 
 **数据库语句不自动重试。** 超时、取消、worker 退出和连接重置都不证明回滚。先保留不确定结果，通过业务标识对账，再决定是否人工重试。
 
-## 兼容性与当前限制
+## 版本兼容性
 
 Ku 仍在开发中，不承诺完整自举检查器/IR/后端、通用 Task 网络调度或完整数据库平台矩阵。Rust 仍提供 bootstrap 工具链。0.0.x 不保证源码或生成 C/FFI ABI 兼容。
 
-JSON 保留原默认实现，yyjson 替换未作为默认。局部运行时修正、健康短测或隔离 RC 预演，不代表延迟、过载、容量及长期稳定性验收全部通过。慢请求与历史超时证据仅适用于对应负载，根因未确认时不能推断由宿主或应用造成。
+## 已知问题
 
-[发布记录](/zh-cn/releases/)列出已发布变化，请区分实测范围与真实业务生产就绪状态。本站不宣称吞吐排名、对 Rust 的全面优势或全项目无泄漏。
+截至 2026-10-28，0.0.19 的三平台发布检查与安装包验证已通过。以下延迟问题仍保留：
+
+- **间歇性 HTTP 504**：历史出现过，最近的短时复核未复现，根因尚未确认。
+- **取消场景的偶发长尾**：最近一次 30 秒复核中，60,000 个短请求全部正确，p99 为 1.557 ms；最大值为 98.809 ms，仍有少量请求超过 20 ms。
+
+这些短测不代替正式 30 分钟稳定性验收，后者尚未通过。完整记录见 [0.0.19 已知问题](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.md)。遇到问题可提交 [Issue](https://github.com/fengyanweb/ku/issues)，或发送邮件至 [kagura.gc@qq.com](mailto:kagura.gc@qq.com)。

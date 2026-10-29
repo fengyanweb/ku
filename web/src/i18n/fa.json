@@ -107,5 +107,10 @@
   "toolsGroup": "زبان و ابزارها",
   "projectGroup": "پروژه",
   "libraryGroup": "کتابخانهٔ استاندارد",
-  "examplesGroup": "مثال‌ها"
+  "examplesGroup": "مثال‌ها",
+  "supportKu": "حمایت از Ku",
+  "donateDescription": "اگر Ku برای شما مفید است، می‌توانید با کمک مالی داوطلبانه از ادامهٔ توسعهٔ آن حمایت کنید. سپاسگزاریم.",
+  "wechatInstruction": "با WeChat اسکن کنید، یا تصویر را ذخیره و در WeChat باز کنید.",
+  "wechatAlt": "کد حمایت مالی WeChat برای Ku",
+  "emailFeedback": "بازخورد از طریق ایمیل"
 }

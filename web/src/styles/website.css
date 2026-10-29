@@ -37,7 +37,7 @@ svg {
   color: #242720;
 }
 :focus-visible {
-  outline: 3px solid #75a745;
+  outline: 3px solid var(--ku-accent-ink);
   outline-offset: 5px;
 }
 .shell {
@@ -335,6 +335,15 @@ p {
   margin-left: auto;
   font-size: 8px;
 }
+.code-copy {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 5px;
+}
 .hero-source {
   display: flex;
   gap: 20px;
@@ -412,6 +421,7 @@ p {
   position: absolute;
   right: -14px;
   bottom: 3px;
+  pointer-events: none;
   display: flex;
   gap: 10px;
   align-items: center;

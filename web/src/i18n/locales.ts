@@ -16,15 +16,21 @@ const dictionaries = import.meta.glob<Translation>('./*.json', {
 export function translate(locale: Locale): Translation {
   const dictionary = dictionaries[`./${locale}.json`];
   if (!dictionary) throw new Error(`Missing locale dictionary: ${locale}`);
-  const interpolate = (value: string) =>
-    value
-      .replaceAll('{currentVersion}', versions.current)
-      .replaceAll('{releasedVersion}', versions.released);
-  return {
-    ...dictionary,
-    nextNotice: interpolate(dictionary.nextNotice),
-    projectDescription: interpolate(dictionary.projectDescription),
+  const interpolate = (value: unknown): unknown => {
+    if (typeof value === 'string')
+      return value
+        .replaceAll('{currentVersion}', versions.current)
+        .replaceAll('{releasedVersion}', versions.released)
+        .replaceAll('{languageVersion}', versions.current)
+        .replaceAll('{releaseTag}', versions.releaseTag);
+    if (Array.isArray(value)) return value.map(interpolate);
+    if (value && typeof value === 'object')
+      return Object.fromEntries(
+        Object.entries(value).map(([key, item]) => [key, interpolate(item)]),
+      );
+    return value;
   };
+  return interpolate(dictionary) as Translation;
 }
 export function localeFromPath(path: string): Locale {
   const segment = path.split('/')[1] as Locale;

@@ -18,7 +18,9 @@ fn main() {
 }
 ```
 
-`fn main()` 是入口，`println` 输出一行文本。Ku 源码不使用 `let` 或 `let mut`。
+`fn main()` 是程序入口，`println` 输出一行文本。这个程序不需要返回类型注解，也不需要 `!`、`?` 或 `return ok(null)`。入口函数本身仍需保留。Ku 源码不使用 `let` 或 `let mut`。
+
+读取文件、解析 JSON 等操作可能返回 Result；需要处理这些结果时，再使用[错误处理中的 `T!` 与 `?`](/zh-cn/docs/guide/errors/#result-operators)。
 
 ## 检查并运行
 

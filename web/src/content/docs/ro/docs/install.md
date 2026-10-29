@@ -2,7 +2,7 @@
 title: 'Instalare și descărcare'
 description: 'Descarcă versiunea preliminară experimentală Ku 0.0.19 și înțelege cerințele de platformă și compilare.'
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'Cargo.toml',
@@ -12,80 +12,74 @@ sources:
   ]
 ---
 
-> Actualizările v0.0.19 de mai jos sunt momentan în engleză; restul traducerii este păstrat. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+Descarcă **Ku 0.0.19** pentru calculatorul tău. Fiecare pachet al acestei versiuni preliminare experimentale include instrumentul de linie de comandă, interpretorul și extensia VS Code.
 
-This page targets the **v0.0.19 experimental prerelease**. Use the actual [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and its assets; documentation alone does not establish completed publication or production readiness.
+## 1. Descarcă Ku
 
-## Alege platforma
+| Sistem  | Arhitectură           | Descarcă                                                                                                                          | Dimensiune |
+| ------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| macOS   | Apple Silicon / ARM64 | [Descarcă macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)     | 39.8 MB    |
+| Windows | x64                   | [Descarcă Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz) | 44.1 MB    |
+| Linux   | x64 / GNU             | [Descarcă Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) | 48.3 MB    |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19). `native_ci-*` artifacts are CI examples, not CLI installers.
+## 2. Extrage și rulează
 
-| Sistem  | Arhitectură           | Arhivă                                                                                                                                                |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.19-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) |
+Extrage **întregul pachet** într-un dosar gol, de exemplu `ku` în dosarul tău de utilizator. Păstrează toate fișierele împreună; nu muta doar executabilul. Deschide un terminal în acel dosar.
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)
-
-Nu au fost verificate arhive pentru alte platforme. Suportul pentru compilare încrucișată nu înseamnă că fiecare sistem sau arhitectură are un pachet publicat.
-
-## Extragere și verificare
-
-1. Verifică arhiva folosind `SHA256SUMS` al versiunii. Un `.manifest.json` separat descrie integritatea arhivei și fișierelor. Sumele de control verifică integritatea, nu sunt semnături ale editorului.
-2. Extrage **întreaga arhivă** într-un director gol și citește `README-INSTALL.md`. Păstrează dispunerea relativă a `ku`, `libku.rlib`, `deps/` și `native-tls/`.
-3. Verifică versiunea din acel director. Pe macOS / Linux:
+macOS / Linux:
 
 ```sh
 ./ku --version
 ```
 
-În Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 .\ku.exe --version
 ```
 
-Versiunea raportată trebuie să fie `0.0.19`. Opțional, adaugă directorul în `PATH`, apoi rulează `ku --version`. Instalează `ku-language-0.0.19.vsix` inclus pentru integrarea VS Code.
+Ar trebui să apară `ku 0.0.19`. Acum poți rula și verifica fișiere `.ku`; aceste operații nu necesită instalarea Rust.
 
-## Interpreter and VS Code extension
+<details>
+<summary>Opțional: folosește ku din orice dosar</summary>
 
-Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.19.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
-
-After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.19.vsix`, and reload the window. Alternatively, run this from the extracted directory:
-
-```sh
-code --install-extension ./ku-language-0.0.19.vsix
-```
-
-The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
-
-## Cerințe de rulare și compilare
-
-| Operație                                | Cerințe suplimentare                                                                     |
-| --------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | Ku CLI pentru platforma corespunzătoare                                                  |
-| `ku build hello.ku` implicit            | Rust **1.89.0** pentru țintă și linkerul sistemului; păstrează dependențele Rust incluse |
-| `ku build --backend c hello.ku`         | Un compilator C și un linker funcționale pentru țintă                                    |
-| Program nativ cu bază de date           | Biblioteci dinamice externe potrivite ale clientului bazei de date; nu sunt incluse      |
-
-Lansatorul implicit încorporează doar sursa punctului de intrare. Modulele importate se încarcă în continuare din locațiile originale. Distribuirea întregului graf de importuri locale independent de surse necesită compilare nativă prin C și rămâne supusă [limitelor backendurilor](/ro/docs/support/).
-
-## Încearcă sursa de dezvoltare
-
-Dintr-o copie locală a depozitului:
+Dacă ai extras în `~/ku`, adaugă această linie în fișierul de inițializare al shell-ului, precum `~/.zshrc` sau `~/.bashrc`:
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.19`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+În Windows, deschide «Editați variabilele de mediu pentru cont», editează `Path` al utilizatorului și adaugă calea completă a dosarului extras, de exemplu `%USERPROFILE%\ku`. Păstrează intrările existente.
 
-## Dezinstalare
+Deschide un terminal nou și rulează `ku --version`.
 
-Pentru instalarea din arhivă, șterge directorul extras, anulează intrarea adăugată în `PATH` și dezinstalează extensia VS Code. Păstrează mai întâi sursele și configurația create acolo. Nu a fost verificat un instalator separat cu un clic, instalarea prin manager de pachete sau comanda `ku uninstall`.
+</details>
 
-Urmează: [rulează primul program](/ro/docs/getting-started/). Sursa contractului de instalare: [arhivele versiunilor](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/history.md).
+## 3. Instalează extensia VS Code
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/ro/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+În vizualizarea Extensii din VS Code, alege **… → Install from VSIX…**, selectează `ku-language-0.0.19.vsix` din dosarul extras și reîncarcă fereastra.
+
+Dacă Ku nu este în `PATH`, setează `ku.executablePath` la calea completă către `ku` (`ku.exe` în Windows).
+
+<details>
+<summary>Verifică descărcarea</summary>
+
+Compară SHA-256 al pachetului cu [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS). [Pagina versiunii](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) oferă și un `.manifest.json` pentru fiecare pachet, cu sumele de verificare ale fișierelor. Alte instrucțiuni se află în `README-INSTALL.md` din pachet.
+
+</details>
+
+<details>
+<summary>Compilarea propriilor programe Ku</summary>
+
+`ku run` și `ku check` au nevoie doar de CLI-ul platformei. Comanda implicită `ku build` necesită suplimentar Rust **1.89.0** și un linker de sistem. `ku build --backend c` necesită un compilator C și un linker pentru țintă. Programele native de baze de date necesită și bibliotecile client corespunzătoare, care nu sunt incluse.
+
+</details>
+
+<details>
+<summary>Dezinstalare</summary>
+
+Păstrează sursele și configurațiile create de tine, apoi șterge dosarul extras, intrarea adăugată în `PATH` și extensia VS Code.
+
+</details>
+
+[În continuare: rulează primul program](/ro/docs/getting-started/)

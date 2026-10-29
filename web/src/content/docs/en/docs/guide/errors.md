@@ -2,7 +2,7 @@
 title: Errors and troubleshooting
 description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/diagnostics.md',
@@ -15,6 +15,52 @@ sidebar:
 ---
 
 Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.
+
+<a id="result-operators"></a>
+
+## When to write `!` and `?`
+
+The meaning depends on where the symbol appears:
+
+| Form                            | Meaning                                                                                                                       | Example                |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `!` after a type                | `T!` denotes Result: success contains a `T`, and failure contains an Error.                                                   | `fn read_name(): str!` |
+| `?` after an expression         | Extract success; on failure, transfer control to an enclosing `try/catch` or return the error from the current `T!` function. | `name = read_name()?`  |
+| `!` before a boolean expression | Negate a `bool`; this is unrelated to Result.                                                                                 | `!ready`               |
+
+Not every function needs a `!` return type, and not every call needs `?`. Calls such as `println(...)`, `text.len()`, and direct array indexing return ordinary values and do not use `?`. The `?` operator does not denote an optional value or turn an error into `null`.
+
+### A plain entry point
+
+For ordinary calculations, or when errors are handled inside the function with `try/catch`, write `fn main()` without a return type annotation. The `main` function itself is still the required entry point.
+
+```ku
+fn main() {
+    ready = false
+    println(!ready)
+}
+```
+
+This program prints `true`. It needs neither `: null!` nor `return ok(null)`.
+
+### Returning an error
+
+Declare `T!` when a function should return recoverable errors to its caller. Return a successful value with `ok(value)`:
+
+```ku
+fn read_name(): str! {
+    return ok("Ku")
+}
+
+fn main(): null! {
+    println(read_name()?)
+    return ok(null)
+}
+```
+
+Here `read_name()` returns Result, and `?` extracts its string. If it returns an error, later statements do not run: the error leaves `main`, and the CLI reports it and exits with a nonzero status. `null!` means that success carries no application value, while failure can still carry an Error.
+
+Removing only `: null!` while keeping the outer `?` in this example is invalid. To handle the error within a plain `main`, put the call in `try/catch`, as in the JSON example below. A `try` block still needs `?` to check a Result; placing a Result-returning call inside it does not automatically unwrap that Result or trigger `catch`.
 
 ## Identify the Ku executable
 

@@ -103,5 +103,10 @@
   "toolsGroup": "言語とツール",
   "projectGroup": "プロジェクト",
   "libraryGroup": "標準ライブラリ",
-  "examplesGroup": "サンプル"
+  "examplesGroup": "サンプル",
+  "supportKu": "Ku を支援する",
+  "donateDescription": "Ku が役立っている方は、任意の寄付で開発の継続をご支援いただけます。ありがとうございます。",
+  "wechatInstruction": "WeChat でスキャンするか、画像を保存して WeChat で開いてください。",
+  "wechatAlt": "Ku の WeChat 寄付コード",
+  "emailFeedback": "メールで報告"
 }

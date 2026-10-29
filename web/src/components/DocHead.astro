@@ -12,6 +12,8 @@ const head = Astro.locals.starlightRoute.head.filter(
     ) && !(tag === 'meta' && attrs?.name === 'robots'),
 );
 const path = Astro.url.pathname;
+const translations = translationsForPath(path);
+const defaultPage = translations.find(({ locale }) => locale === 'en');
 const indexable =
   import.meta.env.INDEXABLE === 'true' &&
   !!Astro.site &&
@@ -31,8 +33,15 @@ const indexable =
 />
 {Astro.site && (
   <>
+    {defaultPage && (
+      <link
+        rel="alternate"
+        hreflang="x-default"
+        href={new URL(defaultPage.path, Astro.site)}
+      />
+    )}
     <link rel="canonical" href={new URL(path, Astro.site)} />
-    {translationsForPath(path).map(({ locale: key, path: translatedPath }) => (
+    {translations.map(({ locale: key, path: translatedPath }) => (
       <link
         rel="alternate"
         hreflang={localeDefinitions[key].lang}

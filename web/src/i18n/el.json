@@ -111,5 +111,10 @@
   "toolsGroup": "Γλώσσα και εργαλεία",
   "projectGroup": "Έργο",
   "libraryGroup": "Τυπική βιβλιοθήκη",
-  "examplesGroup": "Παραδείγματα"
+  "examplesGroup": "Παραδείγματα",
+  "supportKu": "Υποστηρίξτε το Ku",
+  "donateDescription": "Αν το Ku σας βοηθά, μπορείτε να στηρίξετε τη συνεχή ανάπτυξή του με μια προαιρετική δωρεά. Ευχαριστούμε.",
+  "wechatInstruction": "Σαρώστε με το WeChat ή αποθηκεύστε την εικόνα και ανοίξτε την στο WeChat.",
+  "wechatAlt": "Κωδικός δωρεάς WeChat για το Ku",
+  "emailFeedback": "Σχόλια μέσω email"
 }

@@ -46,7 +46,7 @@ import { http, time } from "std"
 
 Examples import their dependencies explicitly. Databases, `bytes` and `net` currently require native C. See each module and the [support matrix](/en/docs/support/) for backend availability.
 
-`T!` is a Result that may contain an Error. Propagate it with `?` or handle it with `try/catch`. An `&` parameter borrows read-only without consuming or implicitly copying its input. Allocating a new output string or array is separate from copying an input.
+A return type `T!` denotes Result. After a call, `?` extracts success or propagates the error; inside `try`, that error can be handled by `catch`. Calls returning ordinary values such as `int` or `str` do not use `?`. See [error handling](/en/docs/guide/errors/#result-operators). An `&` parameter borrows read-only without consuming or implicitly copying its input. Allocating a new output string or array is separate from copying an input.
 
 Browse the task-oriented [examples](/en/docs/examples/) or learn to write your own library in [packages and modules](/en/docs/guide/packages/). `std.task` is an internal observation interface; applications use `async fn` and `await`, described in the [concurrency guide](/en/docs/guide/concurrency/).
 

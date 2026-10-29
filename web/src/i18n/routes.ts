@@ -12,6 +12,7 @@ const homeAnchors = [
   'main',
   'hero-title',
   'approach-title',
+  'performance-title',
   'practice-title',
   'learn-title',
 ];
@@ -29,7 +30,14 @@ const documentPages = await Promise.all(
       path: `/${id}/`,
       locale: locale as Locale,
       topic: topic.join('/'),
-      anchors: ['_top', ...headings.map(({ slug }) => slug)],
+      anchors: [
+        '_top',
+        ...headings.map(({ slug }) => slug),
+        ...Array.from(
+          (entry.body ?? '').matchAll(/\bid=["']([A-Za-z][\w:-]*)["']/g),
+          (match) => match[1],
+        ),
+      ],
     };
   }),
 );
@@ -43,6 +51,12 @@ export const languagePages: LanguagePage[] = [
     topic: '',
     anchors: homeAnchors,
   })),
+  ...locales.map((locale) => ({
+    path: `/${locale}/support/`,
+    locale,
+    topic: 'support',
+    anchors: ['main'],
+  })),
   ...documentPages.filter((page): page is LanguagePage => !!page),
 ];
 
@@ -53,7 +67,15 @@ export function translationsForPath(path: string) {
 }
 
 export function languageDestination(path: string, locale: Locale) {
-  const page = translationsForPath(path).find((page) => page.locale === locale);
+  const sourceLocale = path.split('/')[1] as Locale;
+  const topic = path.split('/').slice(2).join('/').replace(/\/$/, '');
+  // Recover real target content even when the source URL is a framework fallback.
+  // SEO still advertises only actual translated source entries.
+  const page = locales.includes(sourceLocale)
+    ? languagePages.find(
+        (page) => page.locale === locale && page.topic === topic,
+      )
+    : undefined;
   return page
     ? { ...page, fallback: false }
     : {

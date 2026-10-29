@@ -2,7 +2,7 @@
 title: 错误与排查
 description: 定位 Ku 安装、导入、所有权、JSON 与后端能力错误。
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+verifiedAt: '2026-10-28'
 sources:
   [
     'docs/diagnostics.md',
@@ -15,6 +15,52 @@ sidebar:
 ---
 
 编译器诊断可能随实验版本收敛。报告问题时同时提供 CLI 版本、Git commit、后端、完整命令和最小源码，避免把不同版本的行为混在一起。
+
+<a id="result-operators"></a>
+
+## 什么时候写 `!` 和 `?`
+
+先看符号出现的位置：
+
+| 写法               | 含义                                                                       | 例子                   |
+| ------------------ | -------------------------------------------------------------------------- | ---------------------- |
+| 类型后的 `!`       | `T!` 表示 Result：成功值是 `T`，失败值是 Error。                           | `fn read_name(): str!` |
+| 表达式后的 `?`     | 成功时取出值；失败时交给所在的 `try/catch`，或从当前返回 `T!` 的函数传出。 | `name = read_name()?`  |
+| 布尔表达式前的 `!` | 对 `bool` 取反，与 Result 无关。                                           | `!ready`               |
+
+`!` 不是每个函数都需要的后缀，`?` 也不是每次调用都要写。`println(...)`、`text.len()` 和普通数组索引返回普通值，不加 `?`。`?` 不表示可选值，也不会把错误转成 `null`。
+
+### 普通入口
+
+只做普通计算，或者在函数内通过 `try/catch` 处理错误时，可以写 `fn main()`，省略返回类型。`main` 函数本身仍是必需的入口。
+
+```ku
+fn main() {
+    ready = false
+    println(!ready)
+}
+```
+
+这个程序输出 `true`，不需要 `: null!` 或 `return ok(null)`。
+
+### 将错误传出
+
+函数要把可恢复错误交给调用者时，声明返回 `T!`；成功时用 `ok(value)` 返回：
+
+```ku
+fn read_name(): str! {
+    return ok("Ku")
+}
+
+fn main(): null! {
+    println(read_name()?)
+    return ok(null)
+}
+```
+
+这里 `read_name()` 返回 Result，`?` 取出其中的字符串。若它返回错误，后续语句不再执行，错误从 `main` 传出，CLI 报错并以非零状态退出。`null!` 表示成功时不返回业务值，失败时仍能传出 Error。
+
+不能只删除这个例子中的 `: null!` 而保留函数外层的 `?`；若要在普通 `main` 内自行处理错误，应把相应调用放入 `try/catch`，如下面的 JSON 示例。`try` 中仍使用 `?` 检查 Result；仅把一次返回 Result 的调用放进 `try`，不会自动解包或触发 `catch`。
 
 ## 先确认运行的是哪一个 Ku
 

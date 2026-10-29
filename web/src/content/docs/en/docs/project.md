@@ -27,6 +27,8 @@ Third-party components retain their own copyrights and license terms. Their noti
 
 Use the repository's [Issues](https://github.com/fengyanweb/ku/issues) for reproducible reports. Include:
 
+Email feedback: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku version, Git commit for development sources, and target system / architecture.
 - Full command, backend, and minimal `.ku` source.
 - Complete diagnostic or structured Error, expected output, and actual output.

@@ -2,7 +2,7 @@
 title: '설치 및 다운로드'
 description: 'Ku 0.0.19 실험적 사전 릴리스 다운로드와 플랫폼 및 빌드 요구 사항.'
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'Cargo.toml',
@@ -12,80 +12,74 @@ sources:
   ]
 ---
 
-> v0.0.19 추가 정보는 현재 영어로 제공하며 기존 번역은 유지합니다. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+컴퓨터에 맞는 **Ku 0.0.19**를 다운로드하세요. 이 실험적 사전 릴리스의 각 패키지에는 명령줄 도구, 인터프리터, VS Code 확장이 포함되어 있습니다.
 
-This page targets the **v0.0.19 experimental prerelease**. Use the actual [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and its assets; documentation alone does not establish completed publication or production readiness.
+## 1. Ku 다운로드
 
-## 플랫폼 선택
+| 시스템  | 아키텍처              | 다운로드                                                                                                                          | 크기    |
+| ------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| macOS   | Apple Silicon / ARM64 | [다운로드 macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)     | 39.8 MB |
+| Windows | x64                   | [다운로드 Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz) | 44.1 MB |
+| Linux   | x64 / GNU             | [다운로드 Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) | 48.3 MB |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19). `native_ci-*` artifacts are CI examples, not CLI installers.
+## 2. 압축 해제 후 실행
 
-| 시스템  | 아키텍처              | 압축 파일                                                                                                                                             |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.19-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) |
+**전체 패키지**를 사용자 폴더의 `ku` 같은 빈 폴더에 압축 해제하세요. 모든 파일을 함께 보관하고 실행 파일만 옮기지 마세요. 해당 폴더에서 터미널을 엽니다.
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)
-
-다른 플랫폼용 압축 파일은 검증하지 않았습니다. 크로스 컴파일 지원은 모든 운영체제나 아키텍처용 패키지가 공개되었다는 뜻이 아닙니다.
-
-## 압축 해제 및 검증
-
-1. 릴리스의 `SHA256SUMS`와 대조하여 압축 파일을 검증합니다. 별도의 `.manifest.json`에는 압축 파일과 개별 파일의 무결성 정보가 있습니다. 체크섬은 무결성 확인 수단이며 배포자 서명이 아닙니다.
-2. 빈 디렉터리에 **압축 파일 전체**를 풀고 `README-INSTALL.md`를 읽으세요. `ku`, `libku.rlib`, `deps/`, `native-tls/`의 상대적 배치를 유지해야 합니다.
-3. 해당 디렉터리에서 버전을 확인합니다. macOS / Linux에서는:
+macOS / Linux:
 
 ```sh
 ./ku --version
 ```
 
-Windows PowerShell에서는:
+Windows PowerShell:
 
 ```powershell
 .\ku.exe --version
 ```
 
-표시되는 버전은 `0.0.19`이어야 합니다. 필요하면 이 디렉터리를 `PATH`에 추가한 뒤 `ku --version`을 실행하세요. VS Code 연동에는 포함된 `ku-language-0.0.19.vsix`를 설치합니다.
+`ku 0.0.19`가 표시되면 준비가 끝납니다. `.ku` 파일 실행과 검사에는 Rust를 설치할 필요가 없습니다.
 
-## Interpreter and VS Code extension
+<details>
+<summary>선택 사항: 모든 폴더에서 ku 사용</summary>
 
-Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.19.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
-
-After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.19.vsix`, and reload the window. Alternatively, run this from the extracted directory:
-
-```sh
-code --install-extension ./ku-language-0.0.19.vsix
-```
-
-The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
-
-## 실행 및 빌드 요구 사항
-
-| 작업                                    | 추가 요구 사항                                                                |
-| --------------------------------------- | ----------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | 해당 플랫폼의 Ku CLI                                                          |
-| 기본 `ku build hello.ku`                | 대상 플랫폼용 Rust **1.89.0**과 시스템 링커. 포함된 Rust 의존성을 보존해야 함 |
-| `ku build --backend c hello.ku`         | 동작하는 대상 플랫폼용 C 컴파일러와 링커                                      |
-| 네이티브 데이터베이스 프로그램          | 대응하는 외부 데이터베이스 클라이언트 동적 라이브러리. 패키지에 포함되지 않음 |
-
-기본 러너에는 진입 소스만 포함됩니다. 가져온 모듈은 여전히 원래 위치에서 읽습니다. 전체 로컬 가져오기 그래프를 소스에 의존하지 않고 배포하려면 네이티브 C 컴파일이 필요하며 [백엔드 지원 범위](/ko/docs/support/)의 제한도 적용됩니다.
-
-## 개발 소스 사용해 보기
-
-로컬에 체크아웃한 저장소에서 실행합니다:
+`~/ku`에 압축을 풀었다면 셸 시작 파일(예: `~/.zshrc` 또는 `~/.bashrc`)에 다음 줄을 추가하세요:
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.19`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+Windows에서 «계정의 환경 변수 편집»을 열고 사용자 `Path`에 압축 해제한 폴더의 전체 경로(예: `%USERPROFILE%\ku`)를 추가하세요. 기존 항목은 유지하세요.
 
-## 제거
+새 터미널을 열고 `ku --version`을 실행하세요.
 
-압축 파일로 설치한 경우 압축을 푼 디렉터리를 제거하고 추가한 `PATH` 항목을 되돌린 뒤 VS Code 확장을 제거하세요. 그곳에 만든 소스 파일과 설정은 먼저 보존해야 합니다. 별도의 원클릭 설치 프로그램, 패키지 관리자를 통한 설치, `ku uninstall` 명령은 검증하지 않았습니다.
+</details>
 
-다음 단계: [첫 프로그램 실행](/ko/docs/getting-started/). 설치 계약의 출처: [릴리스 압축 파일](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/history.md).
+## 3. VS Code 확장 설치
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/ko/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+VS Code 확장 보기에서 **… → VSIX에서 설치…**를 선택하고 압축 해제한 폴더의 `ku-language-0.0.19.vsix`를 연 다음 창을 다시 로드하세요.
+
+Ku를 `PATH`에 추가하지 않았다면 `ku.executablePath`를 `ku`(Windows에서는 `ku.exe`)의 전체 경로로 설정하세요.
+
+<details>
+<summary>다운로드 검증</summary>
+
+패키지의 SHA-256을 [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)와 비교할 수 있습니다. [릴리스 페이지](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)에는 각 패키지의 파일 체크섬이 담긴 `.manifest.json`도 있습니다. 자세한 내용은 패키지의 `README-INSTALL.md`를 참고하세요.
+
+</details>
+
+<details>
+<summary>자신의 Ku 프로그램 컴파일</summary>
+
+`ku run`과 `ku check`는 해당 플랫폼의 CLI만 필요합니다. 기본 `ku build`에는 Rust **1.89.0**과 시스템 링커가 추가로 필요합니다. `ku build --backend c`에는 대상 C 컴파일러와 링커가 필요합니다. 네이티브 데이터베이스 프로그램에는 패키지에 포함되지 않은 해당 데이터베이스 클라이언트 라이브러리도 필요합니다.
+
+</details>
+
+<details>
+<summary>제거</summary>
+
+직접 만든 소스와 설정을 보관한 다음 압축 해제한 폴더, 추가한 `PATH` 항목, VS Code 확장을 삭제하세요.
+
+</details>
+
+[다음 단계: 첫 프로그램 실행](/ko/docs/getting-started/)

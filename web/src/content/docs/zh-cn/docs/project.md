@@ -27,6 +27,8 @@ sources:
 
 通过[仓库 Issues](https://github.com/fengyanweb/ku/issues)提交可复现问题。报告尽量包含：
 
+邮件反馈：[kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku 版本、Git commit（使用开发源码时）和目标系统 / 架构。
 - 完整命令、后端、最小 `.ku` 源码。
 - 完整诊断或结构化 Error、预期与实际输出。

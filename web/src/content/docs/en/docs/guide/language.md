@@ -98,7 +98,7 @@ Standard library imports use dotted paths, such as `import json from "std.json"`
 
 ## Recoverable errors
 
-The return type `T!` can return either T or Error. `?` propagates a recoverable error; `fail` creates one:
+The return type `T!` is a Result: success contains a `T`, and failure contains an Error. After a call, `?` extracts the successful value; on failure it transfers control to an enclosing `try/catch`, or returns the error from the current `T!` function. Do not append `?` to an ordinary value. `fail` creates a recoverable error:
 
 ```ku
 fn read_name(): str! {
@@ -113,6 +113,8 @@ fn main() {
     }
 }
 ```
+
+Here `main` uses a plain declaration because the error is caught inside it. Declare `T!` when errors should reach the caller; for an entry point this is `fn main(): null!`. The type suffix `!` is different from boolean negation such as `!ready`. See [error handling](/en/docs/guide/errors/#result-operators).
 
 Error has `domain`, `code`, and `message` fields. Ordinary `catch` does not catch `panic`, Task cancellation, or timeout. Cancellation cleanup in finally shares an absolute deadline budget; it does not guarantee completion of arbitrary user cleanup.
 

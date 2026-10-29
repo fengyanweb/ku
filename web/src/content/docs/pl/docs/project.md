@@ -27,6 +27,8 @@ Ku i rozszerzenie VS Code są dostępne na licencji Apache License 2.0. Zobacz [
 
 Odtwarzalne zgłoszenia umieszczaj w [Issues](https://github.com/fengyanweb/ku/issues) repozytorium. Dołącz:
 
+Uwagi e-mailem: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Wersję Ku, commit Git dla źródeł rozwojowych oraz docelowy system / architekturę.
 - Pełne polecenie, zaplecze i minimalne źródło `.ku`.
 - Pełną diagnostykę lub ustrukturyzowany Error, oczekiwany i rzeczywisty wynik.

@@ -27,6 +27,8 @@ Ku と VS Code 拡張機能は Apache License 2.0 で提供されます。[LICEN
 
 再現可能な報告には、リポジトリの [Issues](https://github.com/fengyanweb/ku/issues) を使用してください。次を含めます：
 
+メールで報告：[kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku のバージョン、開発ソースの Git コミット、ターゲットシステム／アーキテクチャ。
 - 完全なコマンド、バックエンド、最小の `.ku` ソース。
 - 完全な診断または構造化 Error、期待した出力、実際の出力。

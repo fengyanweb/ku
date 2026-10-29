@@ -31,7 +31,7 @@ import object from "std.object"
 保存为 `objects.ku`，执行 `ku run objects.ku`；或用 `ku build --backend c -o objects objects.ku` 编译后运行。
 
 ```ku
-fn main(): null! {
+fn main() {
     user = { name: "Ku" }
     println(user.get_or("name", "unknown"))
     println(user.get_or("age", 99))
@@ -41,7 +41,6 @@ fn main(): null! {
     } catch (error) {
         println(error.code)
     }
-    return ok(null)
 }
 ```
 

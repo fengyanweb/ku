@@ -98,7 +98,7 @@ println(user.name)
 
 ## 可恢复错误
 
-返回类型 `T!` 表示可能成功返回 T，也可能返回 Error。`?` 传播可恢复错误，`fail` 产生错误：
+返回类型 `T!` 是 Result：成功时保存 `T`，失败时保存 Error。调用后的 `?` 取出成功值；遇到错误则交给所在的 `try/catch`，或从返回 `T!` 的当前函数传出。普通值不加 `?`。`fail` 产生可恢复错误：
 
 ```ku
 fn read_name(): str! {
@@ -113,6 +113,8 @@ fn main() {
     }
 }
 ```
+
+此处 `main` 使用普通声明，因为错误已在函数内捕获。若要把错误传给调用方，才声明 `T!`；`main` 传出错误的写法为 `fn main(): null!`。类型后的 `!` 与布尔取反 `!ready` 是两种不同用法，详见[错误处理](/zh-cn/docs/guide/errors/#result-operators)。
 
 Error 包含 `domain`、`code`、`message`。`panic`、Task 取消和超时不由普通 `catch` 捕获。取消时的 finally 清理有共享的绝对截止预算，不保证执行完任意用户清理逻辑。
 

@@ -17,6 +17,8 @@ sources:
   ]
 ---
 
+<span id="execution"></span>
+
 ## Choose a platform and execution path
 
 Use [installation](/en/docs/install/) and the actual [release assets](https://github.com/fengyanweb/ku/releases) to select a CLI for your system and architecture. A source build, CI job or isolated deployment rehearsal does not by itself publish a downloadable platform package. The Linux ARM64 release-candidate rehearsal covers its sample service and dependencies; a real application, its production SLO and canary acceptance are separate.
@@ -32,7 +34,7 @@ Use [installation](/en/docs/install/) and the actual [release assets](https://gi
 
 See [HTTP](/en/docs/stdlib/http/), [JSON](/en/docs/stdlib/json/), [time](/en/docs/stdlib/time/) and [database clients](/en/docs/stdlib/database/) for parameters, errors and complete examples. Type checking is separate from backend compilation. Default runner builds need a matching Rust toolchain and archive layout; native builds need a target C compiler and relevant native libraries. The LLVM text backend remains a limited prototype.
 
-## Task boundaries
+## Task support
 
 An async call submits work and returns a one-use Task handle. `await` obtains its result; it does not define when execution first starts. The native Task path supports its listed primitive/string/flat-array operations, Results, Task start/move/await, timers and selected bounded I/O. It also supports named async HTTP handlers and the narrowly documented PG capture path. This is not full M:N execution, every async closure/capture combination, general JSON manipulation or a universal network scheduler.
 
@@ -71,16 +73,21 @@ ku supervise --worker-memory-bytes 134217728 --total-memory-bytes 536870912 \
 
 On Windows omit `--cgroup-root`. All numeric values above are decimal bytes or milliseconds. `--` separates complete program inputs; native executables are built first and submitted with `--native`. Compilers are outside these limits. Failed workers release reservations only after confirmed cleanup. Allocation failure or a killed foreign library is not guaranteed to become an ordinary Result.
 
-## Database, transport and failure boundaries
+## Database connections and failure handling
 
 Database clients are native-only. A real-server check applies to its driver, platform, dependency and source identity; successful linking is not a query test. PostgreSQL remote connections need explicit `sslmode=verify-full` and trusted certificates. Redis is plaintext TCP. MySQL does not provide a uniform fail-closed certificate/hostname verification contract across Oracle/MariaDB. Use a controlled local/private connection or independently verified tunnel where required. `std.net` TLS does not imply TLS for every library.
 
 **Statements are never automatically retried.** Timeout, cancellation, worker exit and connection reset do not prove rollback. Preserve uncertain outcomes and reconcile writes using business identifiers before considering a manual retry.
 
-## Compatibility and current limits
+## Version compatibility
 
 Ku remains under development. Complete self-hosted checking/IR/backend, generic Task network scheduling and a complete database/platform matrix are not promised. Rust supplies the bootstrap toolchain. Version 0.0.x does not guarantee source or generated C/FFI ABI compatibility.
 
-JSON keeps its existing default implementation; the yyjson replacement is not the default. A targeted runtime fix, a healthy short test or an isolated RC rehearsal does not establish that latency, overload, capacity or long-running stability acceptance has passed. Slow-request and historical timeout evidence remains workload-specific; an unconfirmed cause must not be assigned to the host or application by assumption.
+## Known issues
 
-Use [release notes](/en/releases/) for published changes, and distinguish the tested scope from real-business production readiness. This site makes no throughput ranking, complete Rust advantage or whole-project leak-free claim.
+As of 2026-10-28, the three-platform release gates and package verification for 0.0.19 have passed. These latency issues remain:
+
+- **Intermittent HTTP 504s** occurred historically but were not reproduced in the latest short recheck. Their root cause is unconfirmed.
+- **Occasional latency tails during cancellation** remain. In the latest 30-second recheck, all 60,000 short requests were correct and p99 was 1.557 ms; the maximum was 98.809 ms, with a small number above 20 ms.
+
+These short measurements do not replace formal 30-minute stability acceptance, which has not passed. See the [0.0.19 known-issue record](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.en.md). Report a problem through [Issues](https://github.com/fengyanweb/ku/issues) or email [kagura.gc@qq.com](mailto:kagura.gc@qq.com).

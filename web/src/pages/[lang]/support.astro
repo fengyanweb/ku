@@ -1,0 +1,56 @@
+---
+import Website from '../../layouts/Website.astro';
+import { locales, translate, type Locale } from '../../i18n/locales';
+
+export function getStaticPaths() {
+  return locales.map((lang) => ({ params: { lang } }));
+}
+const lang = Astro.params.lang as Locale;
+const t = translate(lang);
+---
+
+<Website locale={lang} title={t.supportKu} description={t.donateDescription}>
+  <section class="donation shell">
+    <h1>{t.supportKu}</h1>
+    <p>{t.donateDescription}</p>
+    <figure>
+      <a href="/images/wechat-donation.png" aria-label={t.wechatAlt}>
+        <img
+          src="/images/wechat-donation.png"
+          alt={t.wechatAlt}
+          width="1152"
+          height="1152"
+        />
+      </a>
+      <figcaption>{t.wechatInstruction}</figcaption>
+    </figure>
+  </section>
+</Website>
+
+<style>
+  .donation {
+    padding-block: 4rem;
+    text-align: center;
+  }
+  .donation h1 {
+    font-size: clamp(2rem, 5vw, 3rem);
+    margin-bottom: 1rem;
+  }
+  .donation p {
+    max-width: 40rem;
+    margin-inline: auto;
+  }
+  figure {
+    margin: 2rem auto 0;
+    max-width: 30rem;
+  }
+  img {
+    width: 100%;
+    height: auto;
+    border-radius: 0.75rem;
+  }
+  figcaption {
+    margin-top: 1rem;
+    font-size: 0.9rem;
+  }
+</style>

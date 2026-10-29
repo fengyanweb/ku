@@ -2,7 +2,7 @@
 import Website from '../../layouts/Website.astro';
 import { Code } from 'astro:components';
 import kuGrammar from '../../data/grammar';
-import hello from '../../../../examples/hello.ku?raw';
+import hello from '../../data/hello.ku?raw';
 import { project } from '../../data/site';
 import { locales, translate, type Locale } from '../../i18n/locales';
 export function getStaticPaths() {
@@ -13,6 +13,10 @@ const t = translate(lang);
 const performanceReport = `${project.repository}/blob/v${project.version}/docs/performance-v0.0.19${lang === 'zh-cn' ? '' : '.en'}.md`;
 const json =
   'import json from "std.json"\n\nfn main(): null! {\n    message = { language: "Ku", hello: "world" }\n    text = json.stringify(message)?\n    println(text)\n    return ok(null)\n}';
+const topicPath = (topic: string) => {
+  const [path, hash] = topic.split('#');
+  return `/${lang}/${path}/${hash ? `#${hash}` : ''}`;
+};
 const resourceLabels = [
   '01 / START',
   '02 / LEARN',
@@ -53,6 +57,10 @@ const resourceLabels = [
           {t.explore}
           <span aria-hidden="true">→</span>
         </a>
+        <a class="text-link" href={`/${lang}/docs/install/`}>
+          {t.install}
+          <span aria-hidden="true">↓</span>
+        </a>
       </div>
       <p class="hero-note">
         <span class="tiny-cross">+</span>
@@ -72,7 +80,15 @@ const resourceLabels = [
             <i></i>
           </div>
           <span>hello.ku</span>
-          <span class="file-type">KU</span>
+          <button
+            type="button"
+            class="file-type code-copy"
+            data-copy-code="hello"
+            aria-label={t.copyExample}
+            aria-live="polite"
+          >
+            {t.copy} ⧉
+          </button>
         </div>
         <div class="hero-source">
           <span class="line-numbers" aria-hidden="true">
@@ -145,7 +161,7 @@ const resourceLabels = [
           <div>
             <h3>{title}</h3>
             <p>{description}</p>
-            <a class="text-link" href={`/${lang}/${href}/`}>
+            <a class="text-link" href={topicPath(href)}>
               {label}
               <span aria-hidden="true">→</span>
             </a>
@@ -203,7 +219,13 @@ const resourceLabels = [
     <div class="example-panel" dir="ltr">
       <div class="example-caption">
         <span>json.ku</span>
-        <button data-copy-json aria-label={t.copyExample}>
+        <button
+          type="button"
+          data-copy-json
+          data-copy-code="json"
+          aria-label={t.copyExample}
+          aria-live="polite"
+        >
           {t.copy} ⧉
         </button>
       </div>
@@ -233,7 +255,7 @@ const resourceLabels = [
     </div>
     <div class="resource-grid">
       {t.resources.map(([title, description, href], index) => (
-        <a class="resource-link" href={`/${lang}/${href}/`}>
+        <a class="resource-link" href={topicPath(href)}>
           <span class="resource-eyebrow" dir="ltr">
             {resourceLabels[index]}
           </span>
@@ -265,17 +287,34 @@ const resourceLabels = [
       </div>
     </div>
   </section>
-  <script define:vars={{ json, copied: t.copied, fallback: t.copyFallback }}>
-    document
-      .querySelector('[data-copy-json]')
-      ?.addEventListener('click', async (event) => {
-        const button = event.currentTarget;
+  <script
+    define:vars={{
+      examples: { hello: hello.trim(), json },
+      copied: t.copied,
+      fallback: t.copyFallback,
+    }}
+  >
+    document.querySelectorAll('[data-copy-code]').forEach((button) => {
+      if (!(button instanceof HTMLButtonElement)) return;
+      const label = button.textContent;
+      let reset;
+      button.addEventListener('click', async () => {
+        clearTimeout(reset);
+        button.disabled = true;
         try {
-          await navigator.clipboard.writeText(json);
+          const code = examples[button.dataset.copyCode];
+          if (typeof code !== 'string') throw new Error('Unknown example');
+          await navigator.clipboard.writeText(code);
           button.textContent = copied;
         } catch {
           button.textContent = fallback;
+        } finally {
+          button.disabled = false;
+          reset = setTimeout(() => {
+            button.textContent = label;
+          }, 2000);
         }
       });
+    });
   </script>
 </Website>

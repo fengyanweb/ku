@@ -27,6 +27,8 @@ Ku와 VS Code 확장은 Apache License 2.0으로 제공됩니다. [LICENSE](http
 
 재현 가능한 보고는 저장소의 [Issues](https://github.com/fengyanweb/ku/issues)를 이용하세요. 다음을 포함합니다:
 
+이메일로 의견 보내기: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku 버전, 개발 소스의 Git 커밋, 대상 시스템 / 아키텍처.
 - 전체 명령, 백엔드, 최소 `.ku` 소스.
 - 완전한 진단 또는 구조화된 Error, 예상 출력과 실제 출력.

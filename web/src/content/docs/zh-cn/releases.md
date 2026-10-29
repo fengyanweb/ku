@@ -10,7 +10,7 @@ sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.19.md']
 
 Ku 0.0.19 是供受控环境试用的实验预发行版，CLI 与 VS Code 插件版本一致。它汇集已实现的 native Task、HTTP、PostgreSQL 和服务管理工作，保留旧 JSON 默认实现，采用 Apache-2.0。完整 M:N、通用 I/O 覆盖和数据库完整平台矩阵尚未完成；历史 HTTP 504 与取消场景长尾仍按已知问题记录，不宣称长期或生产验收已通过。
 
-[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [安装](/zh-cn/docs/install/) · [完整说明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.md) · [已知问题](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19-known-issues.md)
+[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) · [安装](/zh-cn/docs/install/) · [完整说明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/v0.0.19.md) · [已知问题](/zh-cn/docs/support/#已知问题)
 
 实际公开状态、附件与校验信息以 Release 页面为准。升级后应重新构建 native 程序；本版安装包目标仍为 macOS ARM64、Linux x64 和 Windows x64。
 
