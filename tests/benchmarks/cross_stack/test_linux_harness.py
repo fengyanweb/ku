@@ -7,6 +7,7 @@ import csv
 import gzip
 import tempfile
 import types
+import os
 from pathlib import Path
 from unittest import mock
 from task_cpu_window import generation_gate, driver_lifecycle_cpu
@@ -19,6 +20,8 @@ from linux_harness import (arrival_cpu, business_send_end, measurement_clock, qu
                            benchmark_limits, cases, GIB, MIB, java_shutdown_receipt,
                            service_termination_succeeded, JAVA_SHUTDOWN_PREFIX, JAVA_SHUTDOWN_STAGES)
 from linux_harness import result_assessment
+import linux_harness
+import focus_cycle
 
 
 def clock(origin=100_000_000_000, uncertainty=1000):
@@ -637,6 +640,240 @@ class DriverLifecycleCPUTest(unittest.TestCase):
                 result = driver_lifecycle_cpu(first, last, duration)
                 self.assertFalse(result['available'])
                 self.assertFalse(result['passed'])
+
+
+class FocusCycleTests(unittest.TestCase):
+    """All executions below use synthetic windows; no server/cgroup is started."""
+
+    def plan(self):
+        return {'versions': {n:{'root':'unused','binary_sha256':'a'*64} for n in ('A','B','R')},
+                'resources': {'driver_cores':1,'driver_cpuset':'2','service_cores':2,'service_memory_bytes':1<<30},
+                'quality_policy':{},'rates':{'ok':100},'control_cpu_max_min':1.10,
+                'control':{'warmup_seconds':0,'score_seconds':1},
+                'screen':{'warmup_seconds':0,'score_seconds':1},
+                'final_orders':['ABR','BRA','RAB','ARB','BAR'],
+                'bootstrap_resamples':100,'resume':{'maximum_replacements':1}}
+
+    @staticmethod
+    def binding(plan, name):
+        return {'source_commit':'a'*40,'build_mode':{'native_flags':'O2'},
+                'files':{'ELF':{'sha256':name*64}}}
+
+    def fake_window(self, costs=None, invalid=False, failed=False, calls=None):
+        values = iter(costs) if costs else None
+        def run(plan,name,workload,rate,warmup,duration,output,**kwargs):
+            if calls is not None:
+                calls.append((name,kwargs['job']['phase']))
+            return {'name':name,'workload':workload,'rate':rate,'status':'functional_failure' if failed else 'observed',
+                    'functional_valid':not failed,'accounting_valid':True,'arrival_schedule_quality':'pass',
+                    'environment_quality':'unknown' if invalid else 'pass','measurement_invalid':invalid,
+                    'independent_collector_fault':invalid,'goal_status':'not_met' if failed else 'unknown',
+                    'candidate_accepted':False,'cpu_us':next(values) if values else 1,
+                    'qualification':{'qualified':not invalid and not failed},'natural_reclamation':True,
+                    'formal_duration':kwargs['job']['phase']=='final','comparison_contract':{'same':'contract'}}
+        return run
+
+    def test_old_flags_and_final_duration_remain_explicit(self):
+        p=self.plan()
+        self.assertEqual(len(focus_cycle.jobs_for(p,'control','ok')),3)
+        self.assertEqual(len(focus_cycle.jobs_for(p,'screen','ok')),3)
+        final=focus_cycle.jobs_for(p,'final','ok')
+        self.assertEqual(len(final),15)
+        self.assertTrue(all(r['warmup']==10 and r['duration']==30 for r in final))
+        p['final_orders']=['BR','RB','BR','RB','BR']
+        self.assertEqual(len(focus_cycle.jobs_for(p,'final','ok',('B','R'))),10)
+        p['schedule']=[{'phase':'final','workload':'ok','names':['A'],'warmup_seconds':0,'score_seconds':3}]
+        with self.assertRaisesRegex(ValueError,'final requires'):
+            focus_cycle.jobs_for(p,'final')
+
+    def test_old_control_spread_does_not_block_planned_explore(self):
+        p=self.plan();p['schedule']=[{'phase':'control','workload':'ok','orders':[['A']]*3,
+            'warmup_seconds':0,'score_seconds':1},{'phase':'explore','workload':'ok','orders':[['B','R']],
+            'warmup_seconds':0,'score_seconds':3}]
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'plan.json';path.write_text(json.dumps(p));calls=[]
+            with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                 mock.patch.object(focus_cycle,'window',side_effect=self.fake_window([1,1.05,1.105,1,1],calls=calls)):
+                result=focus_cycle.execute(path,Path(d)/'out','all','ok')
+            self.assertFalse(result['control_qualified'])
+            self.assertTrue(result['exploration_allowed'])
+            self.assertEqual(calls[-2:],[('B','explore'),('R','explore')])
+            self.assertFalse(result['formal_qualified'])
+
+    def test_resume_keeps_bad_scores_and_allows_only_retained_independent_fault(self):
+        p=self.plan();p['schedule']=[{'phase':'explore','workload':'ok','names':['B'],'warmup_seconds':0,'score_seconds':3}]
+        for invalid,failed,expected in ((False,False,1),(False,True,1),(True,True,1),(True,False,2)):
+            with self.subTest(invalid=invalid,failed=failed), tempfile.TemporaryDirectory() as d:
+                path=Path(d)/'plan.json';path.write_text(json.dumps(p));out=Path(d)/'out';calls=[]
+                with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                     mock.patch.object(focus_cycle,'window',side_effect=self.fake_window(invalid=invalid,failed=failed,calls=calls)):
+                    first=focus_cycle.execute(path,out,'explore','ok')
+                    state=json.loads((out/'state.json').read_text());key=first['rows'][0]['id']
+                    old=Path(state['windows'][key][0]['result_path']);before=old.read_bytes()
+                    focus_cycle.execute(path,out,'explore','ok',resume=True)
+                state=json.loads((out/'state.json').read_text())
+                self.assertEqual(len(calls),expected)
+                self.assertEqual(len(state['windows'][key]),expected)
+                self.assertEqual(old.read_bytes(),before)
+                self.assertFalse(first['candidate_accepted'])
+
+    def test_unknown_running_window_is_blocked_and_changed_plan_is_preserved(self):
+        p=self.plan();p['schedule']=[{'phase':'explore','workload':'ok','names':['B'],'warmup_seconds':0,'score_seconds':3}]
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'plan.json';path.write_text(json.dumps(p));out=Path(d)/'out';calls=[]
+            with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                 mock.patch.object(focus_cycle,'window',side_effect=self.fake_window(calls=calls)):
+                focus_cycle.execute(path,out,'explore','ok')
+                state=json.loads((out/'state.json').read_text());key=next(iter(state['windows']))
+                state['windows'][key][-1]['state']='running';write_json(out/'state.json',state)
+                result=focus_cycle.execute(path,out,'explore','ok',resume=True)
+                self.assertEqual(result['rows'][0]['status'],'blocked_resume')
+                self.assertEqual(len(calls),1)
+                p['rates']['ok']=101;path.write_text(json.dumps(p))
+                with self.assertRaisesRegex(ValueError,'changed identity'):
+                    focus_cycle.execute(path,out,'explore','ok',resume=True)
+            self.assertEqual(len(list(out.glob('invalidation-*.json'))),1)
+            self.assertTrue((out/key/'attempt-00/result.json').is_file())
+
+    def test_identity_checks_cli_c_source_elf_driver_and_dependencies(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);files={}
+            for name in ('cli','server.ku','server.c','server','libpq','driver'):
+                files[name]=root/name;files[name].write_bytes(name.encode())
+            manifest={'candidate_base':'a'*40,'client':{'command':[str(files['driver'])],'sha256':focus_cycle.digest(files['driver'])},
+                'stacks':{'ku':{'command':[str(files['server'])],'build':{
+                    'cli':str(files['cli']),'cli_sha256':focus_cycle.digest(files['cli']),
+                    'libpq_source':str(files['libpq']),'libpq_sha256':focus_cycle.digest(files['libpq']),
+                    'native':{'server':{'source':str(files['server.ku']),'source_sha256':focus_cycle.digest(files['server.ku']),
+                        'generated_c':str(files['server.c']),'generated_c_sha256':focus_cycle.digest(files['server.c'])}}}}}}
+            write_json(root/'manifest.json',manifest)
+            p={'versions':{'A':{'root':str(root),'binary_sha256':focus_cycle.digest(files['server'])}}}
+            self.assertEqual(len(focus_cycle.version_identity(p,'A')['files']),6)
+            for name,path in files.items():
+                original=path.read_bytes();path.write_bytes(original+b'changed')
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError,'identity changed'):
+                    focus_cycle.version_identity(p,'A')
+                path.write_bytes(original)
+
+    def test_replacement_needs_independent_receipt_and_never_erases500_or_bad_shutdown(self):
+        with tempfile.TemporaryDirectory() as d:
+            evidence=Path(d)/'collector-error.log';evidence.write_text('independent collector exception')
+            attempt={'row':{'functional_valid':True},'result_sha256':'a'*64}
+            receipt={'measurement_fault_confirmed':True,'result_sha256':'a'*64,'cause':'collector_failure',
+                     'evidence_files':[{'path':str(evidence),'sha256':focus_cycle.digest(evidence)}]}
+            self.assertTrue(focus_cycle.replacement_allowed(attempt,receipt,2,0))
+            receipt['cause']='arrival_lateness'
+            self.assertFalse(focus_cycle.replacement_allowed(attempt,receipt,2,0))
+            receipt['cause']='collector_failure';attempt['row']['functional_valid']=False
+            self.assertFalse(focus_cycle.replacement_allowed(attempt,receipt,2,0))
+            attempt['row'].update(functional_valid=True,termination={'forced':True})
+            self.assertFalse(focus_cycle.replacement_allowed(attempt,receipt,2,0))
+            attempt['row']={'functional_valid':True}
+            self.assertFalse(focus_cycle.replacement_allowed(attempt,receipt,2,2))
+
+    def test_capacity_stops_at_finite_bracket_and_never_calls503_success(self):
+        p=self.plan();p['capacity']={'final_frozen':True,'workloads':['ok'],'names':['B'],
+            'maximum_points':4,'refinements':1,'maximum_rate':1000,'factor':2}
+        for fault in (False,True):
+            calls=[]
+            def point(plan,job,*args,**kwargs):
+                rate=job['rate'];calls.append(rate);good=rate<=200
+                return dict(job,status='observed',functional_valid=not fault or good,accounting_valid=True,
+                    qualification={'qualified':good},recovery={'passed':True},
+                    results={'correct':100 if good else 90,'rejected_503':0 if good else 10},
+                    upper_point={'rate':rate,'censored':False},overload_boundary={'boundary_observed':not good and not fault})
+            with tempfile.TemporaryDirectory() as d, mock.patch.object(focus_cycle,'run_one',side_effect=point):
+                rows=focus_cycle.capacity_jobs(p,Path(d),{'windows':{}},{})
+            self.assertEqual(rows[0]['qualified_lower_rate'],200)
+            self.assertLessEqual(len(calls),4)
+            self.assertEqual(calls,[100,200,400] if fault else [100,200,400,300])
+            self.assertEqual(rows[0]['boundary_observed'],not fault)
+            if fault:
+                self.assertNotEqual(rows[0]['claim'],'observed bracket')
+
+    def test_goals_resample_whole_matching_groups_and_keep_adoption_separate(self):
+        p=self.plan();p['targets']=[dict(phase='final',workload='ok',contract='dom',numerator='B',denominator='R',minimum_pairs=5)]
+        rows=[]
+        for group in range(5):
+            for name,cpu in (('B',.8),('R',1)):
+                rows.append(dict(name=name,entry=0,group=group,rate=100,phase='final',workload='ok',contract='dom',
+                    cpu_us=cpu,qualification={'qualified':True},formal_duration=True,natural_reclamation=True,
+                    functional_valid=True,accounting_valid=True,comparison_contract={'same':'input'}))
+        value=focus_cycle.compare_goals(p,rows)[0]
+        self.assertEqual(value['paired_windows'],5)
+        self.assertEqual(value['interval']['unit'],'paired interleaved window')
+        self.assertEqual(value['goal_status'],'met');self.assertFalse(value['candidate_accepted'])
+        rows[0]['comparison_contract']={'different':'input'}
+        self.assertEqual(focus_cycle.compare_goals(p,rows)[0]['goal_status'],'unknown')
+        with self.assertRaisesRegex(ValueError,'duplicate window'):
+            focus_cycle.compare_goals(p,rows+[rows[0]])
+
+
+class DriverOwnedCleanupTests(unittest.TestCase):
+    def test_finalizer_recovers_owned_domain_after_interrupted_stop_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace=[]
+            domain=types.SimpleNamespace(path=Path(d),kill=lambda:trace.append('kill'),
+                snapshot=lambda:{'process_count':0},remove=lambda:True)
+            process=types.SimpleNamespace(wait=lambda timeout:trace.append('reap'))
+            service=types.SimpleNamespace(stopped=True,domain=domain,process=process,stack='ku')
+            h=Harness.__new__(Harness);h.services=[service]
+            result=h.close()
+            self.assertEqual(trace,['kill','reap'])
+            self.assertTrue(result[0]['forced_owned_cleanup'])
+            self.assertTrue(result[0]['cgroup_removed'])
+
+    def test_launch_failure_and_coordinator_interrupt_reap_only_owned_driver(self):
+        for interrupt in (False,True):
+            with self.subTest(interrupt=interrupt), tempfile.TemporaryDirectory() as d:
+                trace=[]
+                class DomainFake:
+                    label='driver'
+                    def __init__(self,*args):pass
+                    def snapshot(self):return {'monotonic_ns':1,'cpu_stat':{'usage_usec':0},'process_count':0}
+                    def kill(self):trace.append('kill')
+                    def remove(self):trace.append('remove');return True
+                class SamplerFake:
+                    def __init__(self,*args,**kwargs):pass
+                    def start(self):return self
+                    def stop(self):trace.append('sampler_stop');return []
+                class ProcessFake:
+                    returncode=None
+                    calls=0
+                    def wait(self,timeout):
+                        self.calls+=1
+                        if self.calls==1:raise KeyboardInterrupt('coordinator')
+                        trace.append('reap');self.returncode=-9;return -9
+                    def poll(self):return self.returncode
+                h=Harness.__new__(Harness);h.root=Path(d);h.protocol=Path(d)/'protocol.json'
+                h.uid=os.getuid();h.gid=os.getgid();h.db_domain=None
+                h.identity={'protocol_sha256':'a'*64,'manifest_sha256':'b'*64}
+                h.manifest={'client':{'command':['not-executed']},'driver_cores':1,'driver_cpuset':'2'}
+                h.launch=mock.Mock(return_value=ProcessFake()) if interrupt else mock.Mock(side_effect=OSError('launch failed'))
+                s=types.SimpleNamespace(startup={'identity':{}},address='unused:1',metrics=lambda:{},domain=DomainFake())
+                expected=KeyboardInterrupt if interrupt else OSError
+                with mock.patch.object(linux_harness,'Domain',DomainFake),mock.patch.object(linux_harness,'Sampler',SamplerFake), \
+                     mock.patch.object(linux_harness.os,'chown'), self.assertRaises(expected):
+                    h.client(s,'ok',1,1,Path(d)/'driver',events=False)
+                self.assertIn('sampler_stop',trace);self.assertIn('kill',trace);self.assertIn('remove',trace)
+                receipt=read_json(Path(d)/'driver/driver-cleanup.json')
+                self.assertTrue(receipt['cgroup_removed'])
+                self.assertEqual(receipt['process_reaped'],interrupt)
+                if interrupt:self.assertIn('reap',trace)
+
+    def test_known_shutdown_cpu_is_included_and_separately_reported(self):
+        report={'ledger':{'correct_total':10},'service_cost':{
+            'before':{'cpu_stat':{'usage_usec':100,'user_usec':60,'system_usec':40}},
+            'after':{'cpu_stat':{'usage_usec':200,'user_usec':100,'system_usec':100}}}}
+        physical={'cpu_stat':{'usage_usec':1000,'user_usec':600,'system_usec':400},'process_count':1}
+        termination={'forced':False,'cgroup_removed':True,'after':{
+            'cpu_stat':{'usage_usec':1600,'user_usec':1000,'system_usec':600},'process_count':0}}
+        result=full_lifecycle_cost(report,physical,True,termination,{})
+        self.assertTrue(result['termination_cpu_accounted'])
+        self.assertAlmostEqual(result['cpu_seconds'],.0015)
+        self.assertAlmostEqual(result['post_driver_cpu_seconds'],.0014)
+        self.assertAlmostEqual(result['post_quiet_shutdown_cpu_seconds'],.0006)
+        self.assertAlmostEqual(sum(result['cpu_seconds_by_mode'].values()),.0015)
 
 
 if __name__ == '__main__':

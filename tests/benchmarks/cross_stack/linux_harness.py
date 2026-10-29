@@ -317,15 +317,27 @@ def full_lifecycle_cost(report, physical_end, quiet, termination, final_metrics)
     cost=report['service_cost']
     before,driver_end=cost['before'],cost['after']
     begin_cpu=before['cpu_stat'].get('usage_usec',0)
-    end_cpu=physical_end['cpu_stat'].get('usage_usec',0)
+    # Fresh-window runners stop before returning their receipt. Include the
+    # observed drain/worker-exit CPU when that last cgroup snapshot exists;
+    # older reused/frozen instances still expose the original quiet endpoint.
+    stopped_end=termination.get('after',{}) if termination else {}
+    termination_cpu_accounted=(type(stopped_end.get('cpu_stat',{}).get('usage_usec')) is int
+        and stopped_end['cpu_stat']['usage_usec']>=physical_end['cpu_stat'].get('usage_usec',0))
+    accounting_end=stopped_end if termination_cpu_accounted else physical_end
+    end_cpu=accounting_end['cpu_stat'].get('usage_usec',0)
     total=max(0,end_cpu-begin_cpu)/1e6
     tail=max(0,end_cpu-driver_end['cpu_stat'].get('usage_usec',0))/1e6
     correct=report['ledger']['correct_total']
     return {'available':quiet or bool(termination and physical_end.get('process_count')==0 and termination.get('cgroup_removed')),'cpu_seconds':total,'cpu_seconds_per_correct':total/correct if correct else None,
         'post_driver_cpu_seconds':tail,'physical_end':physical_end,'final_metrics':final_metrics,
+        'accounting_end':accounting_end,'termination_cpu_accounted':termination_cpu_accounted,
+        'post_quiet_shutdown_cpu_seconds':max(0,end_cpu-physical_end['cpu_stat'].get('usage_usec',0))/1e6,
+        'cpu_seconds_by_mode':{key:(accounting_end['cpu_stat'][key]-before['cpu_stat'][key])/1e6
+            if type(accounting_end['cpu_stat'].get(key)) is int and type(before['cpu_stat'].get(key)) is int
+                and accounting_end['cpu_stat'][key]>=before['cpu_stat'][key] else None for key in ('user_usec','system_usec')},
         'physically_quiet_before_freeze':quiet,'forced_termination':bool(termination and termination.get('forced')),
         'termination':termination,'natural_reclamation_passed':quiet and not bool(termination and termination.get('forced')),
-        'scope':'whole service domain from driver launch until observable physical quiescence or completed forced termination; includes expensive failed generations',
+        'scope':'whole service domain from driver launch through physical quiescence and observed termination when available; shutdown CPU is never silently discarded; includes expensive failed generations',
         'internal_error_reason_delta':error_reason_delta(cost.get('runtime_before',{}),final_metrics),
         'useless_work_cpu_seconds':None,'useless_work_note':'not inferable from cgroup total: needs per-request undeliverable/cancellable responsibility; post-driver CPU is not automatically useless work'}
 
@@ -876,22 +888,40 @@ class Harness:
             runtime_before=service.metrics()
         except Exception as error:
             runtime_before={'observation_error':repr(error)}
-        process = self.launch(command, Path(spec.get('cwd', self.root)), env, domain, output / 'client.log')
+        process = None
         try:
+            process = self.launch(command, Path(spec.get('cwd', self.root)), env, domain, output / 'client.log')
             code = process.wait(timeout=duration + timeout + 15)
         except subprocess.TimeoutExpired:
             domain.kill()
-            process.wait(timeout=3)
+            if process is not None:
+                process.wait(timeout=3)
             raise RuntimeError('bounded driver execution deadline; see retained log')
         finally:
-            runtime_stop.set()
-            if runtime_thread:
-                runtime_thread.join(timeout=3)
-            samples = sampler.stop()
-            after = service.domain.snapshot()
-            driver_after = domain.snapshot()
-            domain.kill()
-            removed = domain.remove()
+            try:
+                runtime_stop.set()
+                if runtime_thread:
+                    runtime_thread.join(timeout=3)
+                samples = sampler.stop()
+                after = service.domain.snapshot()
+                driver_after = domain.snapshot()
+            finally:
+                cleanup_error=None
+                try:
+                    domain.kill()
+                    if process is not None:
+                        process.wait(timeout=3)  # Reap on interruption as well as ordinary wait.
+                except BaseException as error:
+                    cleanup_error=repr(error)
+                    raise
+                finally:
+                    cleanup_after = domain.snapshot()
+                    removed = domain.remove()
+                    write_json(output/'driver-cleanup.json',{'launched':process is not None,
+                        'exit_code':process.returncode if process is not None else None,
+                        'process_reaped':process is not None and process.poll() is not None,
+                        'after':cleanup_after,'cgroup_removed':removed,'cleanup_error':cleanup_error,
+                        'scope':'owned driver cleanup; coordinator cancellation is not a product crash'})
         if code != 0 or not report.exists():
             raise RuntimeError(f'driver exit={code}, report exists={report.exists()}; see {output}/client.log')
         result = read_json(report)
@@ -959,6 +989,20 @@ class Harness:
                     results.append(service.stop())
                 except Exception as error:
                     results.append({'error': repr(error), 'stack': service.stack})
+            # Service.stop marks its ownership closed before bounded wait/join.
+            # An interrupted stop must not make a still-owned domain invisible
+            # to this finalizer. Never enumerate or terminate unrelated groups.
+            if service.domain.path.exists():
+                try:
+                    service.domain.kill()
+                    service.process.wait(timeout=3)
+                    after=service.domain.snapshot()
+                    removed=service.domain.remove()
+                    results.append({'stack':service.stack,'forced_owned_cleanup':True,
+                                    'after':after,'cgroup_removed':removed,
+                                    'scope':'prior stop incomplete; this is not natural reclamation'})
+                except Exception as error:
+                    results.append({'stack':service.stack,'forced_owned_cleanup':True,'error':repr(error)})
         return results
 
 def result_assessment(result, policy=None, environment=None):
