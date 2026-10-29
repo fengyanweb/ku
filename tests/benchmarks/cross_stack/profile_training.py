@@ -199,14 +199,16 @@ def http_recipe(mode):
     payload = ({'data': [{'note': '留出🚀\t雪', 'values': [None, False, 1234567]}]*5, 'counter': 17}
                if held else {'counter': 7, 'data': {'message': '中文🙂"\\\n\0', 'items': [1, True, None]}})
     return {'transport': 'http', 'workloads': ['ok', 'cpu', 'json_object', 'db'],
-        'seconds_per_workload': 2, 'rate': 10, 'concurrency': 8,
+        'seconds_per_workload': 2, 'rates': {'ok': 2000, 'json_object': 500, 'cpu': 80, 'db': 200}, 'concurrency': 8,
         'input': {'payload': payload, 'ascii_json': held, 'cpu_units': 47 if held else 32,
                   'seed': 9 if held else 5, 'db_key': 997 if held else 37,
                   'rid_prefix': 200 if held else 100},
         'negative_paths': ['invalid_json', 'malformed_content_length', 'one_sent_tcp_rst'],
         'negative_expected_status': {'invalid_json': {'ku': 500, 'rust': 400}, 'malformed_content_length': 400},
         'limits': {'manual_requests': 8, 'timeout_seconds': 2, 'response_bytes': 65536},
-        'scope': 'common public routes; independent JSON/CPU/RID/query-key supplements; no retry; no performance score'}
+        'normal_driver_scope': 'shared frozen protocol/corpora/CPU arrays and DB keys1..400; regression, not held-out business evidence',
+        'heldout_scope': 'supplements only: new JSON shape/order/size, seed, work, RID and DB997 outside train normal1..400/manual37',
+        'scope': 'shared normal-route regression plus independent supplemental business inputs; no retry; no performance score'}
 
 
 def http_probes(address, recipe, stack, rows):
@@ -301,6 +303,8 @@ def run_http(manifest_path, output, stack, mode, tools):
         'target_elf_header': elf_header.hex(),
         'target_elf_machine': int.from_bytes(elf_header[18:20], 'little' if elf_header[5]==1 else 'big'),
         'plan': recipe, 'plan_sha256': identity(recipe), 'manual_samples': [], 'driver_windows': [],
+        'heldout_new_inputs': recipe['input'] if mode=='validate' else None,
+        'normal_driver_inputs_shared': recipe['normal_driver_scope'],
         'training_plan_sha256': identity(http_recipe('train')), 'validation_plan_sha256': identity(http_recipe('validate')),
         'training_input_sha256': identity(http_recipe('train')['input']),
         'validation_input_sha256': identity(http_recipe('validate')['input']),
@@ -316,17 +320,16 @@ def run_http(manifest_path, output, stack, mode, tools):
             raise ValueError('held-out HTTP protocol differs from training frozen base')
         profiles = output/'http-profiles'; profiles.mkdir(); os.chown(profiles, h.uid, h.gid)
         env = {'LLVM_PROFILE_FILE': str(profiles/'%m-%p.profraw') if mode=='train' else '/dev/null'}
-        protocol = load(h.protocol); corpus_dir = output/'corpora'; corpus_dir.mkdir()
+        protocol_path = h.protocol; protocol = load(protocol_path); corpus_dir = output/'corpora'; corpus_dir.mkdir()
         for name,item in protocol['corpora'].items():
             source = h.protocol.parent/item['path']; destination = corpus_dir/(name+'.json')
-            body = (json.dumps(recipe['input']['payload'], ensure_ascii=recipe['input']['ascii_json'], separators=(',', ':')).encode()
-                    if name=='object' else source.read_bytes())
-            if name!='object' and hashlib.sha256(body).hexdigest()!=item['sha256']:
+            body = source.read_bytes()
+            if hashlib.sha256(body).hexdigest()!=item['sha256']:
                 raise ValueError('frozen HTTP corpus changed: '+name)
-            destination.write_bytes(body); item.update(path='corpora/'+name+'.json', sha256=digest(destination), bytes=len(body))
-            if name=='object': item.update(counter=recipe['input']['payload']['counter'], response_counter=recipe['input']['payload']['counter']+1)
-        protocol['endpoints']['cpu'].update(work_units=[recipe['input']['cpu_units']], seed_lengths=[recipe['input']['seed']])
-        h.protocol = output/'protocol.http.json'; save(h.protocol, protocol)
+            if json.loads(body)==http_recipe('validate')['input']['payload']:
+                raise ValueError('reserved held-out payload overlaps a normal training corpus')
+            destination.write_bytes(body)
+        h.protocol = output/'protocol.http.json'; h.protocol.write_bytes(protocol_path.read_bytes())
         h.identity['protocol_sha256'] = digest(h.protocol)
         result.update(protocol_sha256=digest(h.protocol), corpora_sha256={name:item['sha256'] for name,item in protocol['corpora'].items()},
                       profile_environment=env, database_domain=str(h.db_domain.path), driver_commands=[])
@@ -336,9 +339,10 @@ def run_http(manifest_path, output, stack, mode, tools):
         for index,kind in enumerate(recipe['workloads']):
             h.manifest['client']['command'] = original+['--rid-prefix', str(recipe['input']['rid_prefix']+index)]
             result['driver_commands'].append(h.manifest['client']['command'])
-            report = h.client(service, kind, recipe['rate'], 2, output/('driver-'+kind), concurrency=8, timeout=3)
+            report = h.client(service, kind, recipe['rates'][kind], 2, output/('driver-'+kind), concurrency=8, timeout=3)
             result['driver_windows'].append({'kind': kind, 'ledger': report['ledger'], 'configuration': report['configuration']})
             if (report.get('valid_driver') is not True or report['ledger'].get('planned_reconciled') is not True
+                    or report['ledger'].get('planned') != recipe['rates'][kind]*2
                     or report['ledger'].get('correct_total') != report['ledger'].get('planned')
                     or report['ledger'].get('results') != {'correct': report['ledger'].get('planned')}):
                 raise ValueError('HTTP training main driver results not entirely correct: '+kind)

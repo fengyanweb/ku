@@ -476,6 +476,10 @@ class HttpProfileTrainingTests(unittest.TestCase):
         self.assertEqual(list(held['input']['payload']), ['data','counter'])
         self.assertNotEqual(identity(train['input']), identity(held['input']))
         self.assertEqual(train['seconds_per_workload'], 2)
+        self.assertEqual(train['rates'], {'ok':2000,'json_object':500,'cpu':80,'db':200})
+        self.assertEqual(sum(train['rates'].values())*2,5560)
+        self.assertGreater(held['input']['db_key'],train['rates']['db']*2)
+        self.assertIn('shared frozen',train['normal_driver_scope'])
         self.assertEqual(plan('train')['kind'], 'serial_batch_compiler_train')
 
     def test_explicit_error_contracts_rst_and_following_health_are_separate(self):
@@ -544,8 +548,9 @@ class HttpProfileTrainingTests(unittest.TestCase):
                     return self.service
                 def client(self,service,kind,rate,duration,output,**kwargs):
                     trace.append('driver-'+kind)
-                    return {'valid_driver':True,'ledger':{'planned_reconciled':True,'correct_total':20,
-                        'planned':20,'results':{'correct':20}},'configuration':{'workload':kind}}
+                    planned=rate*duration
+                    return {'valid_driver':True,'ledger':{'planned_reconciled':True,'correct_total':planned,
+                        'planned':planned,'results':{'correct':planned}},'configuration':{'workload':kind}}
                 def close(self):
                     trace.append('close')
                     if self.service and self.service.domain.path.exists(): self.service.stop()
@@ -560,12 +565,17 @@ class HttpProfileTrainingTests(unittest.TestCase):
                  patch.object(profile_training,'merge_profile',side_effect=merge) as merger:
                 training=profile_training.run_http(manifest_path,root/'train','ku','train',root/'tools')
                 self.assertTrue(training['passed']);self.assertEqual(merger.call_count,1)
+                self.assertEqual(training['protocol_sha256'],training['base_protocol_sha256'])
+                self.assertIsNone(training['heldout_new_inputs'])
+                self.assertNotEqual(json.loads((root/'train/corpora/object.json').read_text()),
+                                    profile_training.http_recipe('validate')['input']['payload'])
                 self.assertEqual(profile_input(root/'train/receipt.json','ku','f'*64)[0],(root/'train/merged.profdata').resolve())
                 manifest['stacks']['ku']['compiler_variant']['variant']='use'
                 manifest_path.write_text(json.dumps(manifest));build.update(variant='use',training_receipt=training)
                 build_path.write_text(json.dumps(build))
                 held=profile_training.run_http(manifest_path,root/'held','ku','validate',root/'tools')
                 self.assertTrue(held['passed']);self.assertFalse(held['profile_complete'])
+                self.assertEqual(held['heldout_new_inputs']['db_key'],997)
                 self.assertEqual(merger.call_count,1)
                 broken={'valid_driver':True,'ledger':{'planned_reconciled':True,'correct_total':19,
                     'planned':20,'results':{'correct':19,'server_error':1}},'configuration':{}}
