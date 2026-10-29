@@ -6437,6 +6437,93 @@ fn main(): null! {
 }
 
 #[test]
+fn native_json_typed_envelope_keeps_dynamic_subtree_without_output_dom() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-typed-envelope"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        include_str!("../examples/json_typed.ku"),
+    )
+    .expect("write typed JSON envelope source");
+    let generated = native_emit_c(dir, "main.ku");
+    let writer = generated
+        .split("static bool ku_json_write_typed_struct_Envelope(")
+        .nth(2)
+        .expect("typed envelope writer body")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(writer.contains("ku_json_write_value(output, value.data, depth + 1, error)"));
+    assert!(
+        !writer.contains("ku_object_") && !writer.contains("ku_json_write_string(output,"),
+        "static fields must not build a DOM or rescan static keys: {writer}"
+    );
+    let reserve = "static bool ku_json_buffer_reserve(";
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static size_t ku_json_typed_allocations = 0, ku_json_typed_fail = 0;
+static void* ku_json_typed_realloc(void* value, size_t len) {{
+  ku_json_typed_allocations++;
+  if(ku_json_typed_fail && ku_json_typed_allocations==ku_json_typed_fail) return NULL;
+  return realloc(value,len);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(allocation).count(), 1);
+    let generated = generated.replacen(
+        allocation,
+        "uint8_t* data = (uint8_t*)ku_json_typed_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-typed-envelope",
+        r#"
+int main(void) {
+  /* Execute the actual Ku example before the directed allocator failures. */
+  CHECK(ku_fixture_main()==0 && NO_LIVE_ALLOCATIONS());
+  uint8_t body[129];memset(body,'x',sizeof(body));
+  KuStruct_Envelope input={0};
+  input.id=ku_string_concat(ku_string_static((const uint8_t*)"owned",5),
+      ku_string_static((const uint8_t*)"-rid",4));
+  input.counter=8;
+  input.data=ku_v_str(ku_string_concat(ku_string_static(body,sizeof(body)),
+      ku_string_static((const uint8_t*)"",0)));
+  uint8_t* id=input.id.ptr;uint8_t* data=input.data.as.s.ptr;
+  size_t live=ku_perf_live_bytes;
+  ku_json_typed_allocations=0;
+  KuResult_str encoded=ku_json_stringify_typed_struct_Envelope(input);
+  CHECK(encoded.ok);size_t allocations=ku_json_typed_allocations;CHECK(allocations>0);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  CHECK(ku_perf_live_bytes==live);
+  for(size_t ordinal=1;ordinal<=allocations;ordinal++) {
+    ku_json_typed_allocations=0;ku_json_typed_fail=ordinal;
+    encoded=ku_json_stringify_typed_struct_Envelope(input);
+    CHECK(!encoded.ok && ku_string_equal(encoded.error.code,
+        ku_string_static((const uint8_t*)"out_of_memory",13)));
+    CHECK(input.id.ptr==id && input.data.as.s.ptr==data && input.counter==8);
+    ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+    CHECK(ku_perf_live_bytes==live);
+  }
+  ku_json_typed_fail=0;
+  encoded=ku_json_stringify_typed_struct_Envelope(input);CHECK(encoded.ok);
+  ku_drop_struct_Envelope(&input);
+  KuResult_kuvalue decoded=ku_json_parse(encoded.value);
+  CHECK(decoded.ok && decoded.value.tag==KU_OBJECT);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn native_json_stringify_unsupported_owned_values_are_catchable_and_dropped() {
     let dir = unique_temp_dir("json-unsupported-owned");
     fs::write(

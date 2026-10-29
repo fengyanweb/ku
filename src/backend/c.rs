@@ -5037,6 +5037,49 @@ fn json_typed_write_call(
     }
 }
 
+/// Field names are valid UTF8 at compile time. Emit the same bounded write
+/// stages as the dynamic string writer, including each escape, so an earlier
+/// allocation failure still precedes a later output-limit failure. No runtime
+/// UTF8/key scan, heap key, hash insertion, or output-object sort is needed.
+fn json_static_key_write_calls(name: &str, output: &str, error: &str) -> Vec<String> {
+    fn append_span(calls: &mut Vec<String>, span: &str, output: &str, error: &str) {
+        if !span.is_empty() {
+            calls.push(format!(
+                "ku_json_write_bytes({output}, (const char*)({}).ptr, {}, {error})",
+                c_static_utf8_string(span),
+                span.len()
+            ));
+        }
+    }
+    let mut calls = vec![format!("ku_json_write_byte({output}, '\"', {error})")];
+    let mut start = 0;
+    for (index, byte) in name.bytes().enumerate() {
+        let escaped = match byte {
+            b'"' => Some("\\\"".to_string()),
+            b'\\' => Some("\\\\".to_string()),
+            b'\n' => Some("\\n".to_string()),
+            b'\r' => Some("\\r".to_string()),
+            b'\t' => Some("\\t".to_string()),
+            0..=0x1f => Some(format!("\\u00{byte:02x}")),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            // Every separator is ASCII, therefore these are UTF8 boundaries.
+            append_span(&mut calls, &name[start..index], output, error);
+            calls.push(format!(
+                "ku_json_buffer_escape({output}, ({}).ptr, {}, {error})",
+                c_static_utf8_string(&escaped),
+                escaped.len()
+            ));
+            start = index + 1;
+        }
+    }
+    append_span(&mut calls, &name[start..], output, error);
+    calls.push(format!("ku_json_write_byte({output}, '\"', {error})"));
+    calls.push(format!("ku_json_write_byte({output}, ':', {error})"));
+    calls
+}
+
 fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -> KuResult<()> {
     out.check()?;
     let suffix = c_type_suffix(ty)?;
@@ -5109,7 +5152,6 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                 if index != 0 {
                     out.push_str("  if (!ku_json_write_byte(output, ',', error)) return false;\n");
                 }
-                let key = c_static_utf8_string(&field.name);
                 let field_expression = format!("value.{}", c_ident(&field.name));
                 let field_call = json_typed_write_call(
                     &field.ty,
@@ -5119,10 +5161,11 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                     "error",
                     program,
                 )?;
+                let mut writes = json_static_key_write_calls(&field.name, "output", "error");
+                writes.push(field_call);
                 out.push_str(&format!(
-                    "  if (!ku_json_write_string(output, {key}, error)\n\
-                     \x20     || !ku_json_write_byte(output, ':', error)\n\
-                     \x20     || !{field_call}) return false;\n"
+                    "  if (!({})) return false;\n",
+                    writes.join(" && ")
                 ));
             }
             out.push_str("  return ku_json_write_byte(output, '}', error);\n}\n");

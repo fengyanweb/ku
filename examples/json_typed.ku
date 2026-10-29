@@ -1,0 +1,23 @@
+// A native static envelope uses the existing json.encode API. Its dynamic
+// subtree is still decoded and encoded in full by the ordinary JSON engine.
+import json from "std.json"
+
+struct Envelope {
+    id: str
+    counter: int
+    data: KuValue
+}
+
+fn main(): null! {
+    decoded = json.decode("{\"counter\":7,\"data\":{\"text\":\"中文🙂\",\"items\":[1,true,null]}}")?
+    counter = decoded["counter"]?.as_int()?
+    data = decoded.take("data")?
+    envelope = Envelope { id: "example", counter: counter + 1, data: data }
+    text = json.encode(envelope)?
+    println(text)
+    // Encoding borrows the envelope; it can be encoded again.
+    if (json.encode(envelope)? != text) { panic("typed JSON changed its input") }
+    roundtrip = json.decode(text)?
+    if (roundtrip["counter"]?.as_int()? != 8) { panic("JSON counter mismatch") }
+    return ok(null)
+}
