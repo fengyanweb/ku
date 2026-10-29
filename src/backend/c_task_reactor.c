@@ -28,7 +28,7 @@ static void ku_task_net_resolve(KuTaskBlockingJobV1* job,KuObject* config,
       || !ku_net_config_int(config,"read_timeout_ms",KU_NET_DEFAULT_TIMEOUT_MS,1,KU_NET_MAX_TIMEOUT_MS,&read_ms,&error)
       || !ku_net_config_int(config,"write_timeout_ms",KU_NET_DEFAULT_TIMEOUT_MS,1,KU_NET_MAX_TIMEOUT_MS,&write_ms,&error)
       || !ku_net_config_int(config,"max_read_bytes",KU_NET_DEFAULT_MAX_READ_BYTES,1,KU_NET_MAX_READ_BYTES,&max_read,&error)) goto failed;
-  if(job->net_present & (uint16_t)((1u<<7)|(1u<<8))) {
+  if(job->inputs->net_present & (uint16_t)((1u<<7)|(1u<<8))) {
     error=ku_net_error("invalid_config","net TLS fields require tls to be true"); goto failed;
   }
   if(ku_net_socket_startup()) { error=ku_net_error("transport_error","network runtime initialization failed"); goto failed; }

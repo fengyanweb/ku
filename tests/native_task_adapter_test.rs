@@ -1830,6 +1830,9 @@ static void blocking_setup(size_t capacity,size_t dynamic_budget) {
   CHECK(!ku_task_driver_external_storage(&blocking_driver,&blocking_pool.jobs[0],sizeof(blocking_pool.jobs[0]),1));
   KuString alias=ku_string_static((const uint8_t*)&blocking_pool.jobs[0],1);
   CHECK(ku_task_adapter_string_overlaps_runtime(alias,&blocking_driver));
+  CHECK(!ku_task_driver_external_storage(&blocking_driver,&blocking_pool.inputs[0],sizeof(blocking_pool.inputs[0]),1));
+  alias=ku_string_static((const uint8_t*)&blocking_pool.inputs[0],1);
+  CHECK(ku_task_adapter_string_overlaps_runtime(alias,&blocking_driver));
 }
 static void blocking_finish(uint64_t deadline) {
   CHECK(ku_task_driver_shutdown(&blocking_driver,deadline)==KU_TASK_DRIVER_OK);
@@ -2378,21 +2381,25 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
   for(size_t cap=1;cap<=16384u;cap=cap==1u?16384u:16385u) {
     memset(&pool,0,sizeof(pool));
     CHECK(ku_task_blocking_init(&pool,cap,1u,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
-    size_t bytes=cap*(sizeof(KuTaskBlockingJobV1)+sizeof(size_t)+sizeof(uint32_t));
+    size_t bytes=cap*(sizeof(KuTaskBlockingJobV1)+sizeof(KuTaskBlockingInputsV1)+sizeof(size_t)+sizeof(uint32_t));
     CHECK(pool.storage_bytes==bytes && pool.capacity==cap);
-    CHECK((void*)pool.jobs==pool.storage && pool.ring==(size_t*)((uint8_t*)pool.storage+cap*sizeof(*pool.jobs)));
+    CHECK((void*)pool.jobs==pool.storage && pool.inputs==(KuTaskBlockingInputsV1*)((uint8_t*)pool.storage+cap*sizeof(*pool.jobs)) && pool.ring==(size_t*)(pool.inputs+cap));
     CHECK(pool.free_indices==(uint32_t*)(pool.ring+cap)&&pool.free_count==cap&&!pool.retired_slots);
     CHECK(pool.workers_created==1u && fixture_ledger().allocations==1u && fixture_ledger().bytes==bytes);
     CHECK(!ku_task_blocking_lock(&pool));
     CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
     for(size_t i=0;i<cap;i++) {
       size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK&&index==i);
+      CHECK(pool.jobs[index].inputs==&pool.inputs[index]);
+      CHECK(ku_task_frame_zero_bytes(pool.jobs[index].inputs,sizeof(*pool.jobs[index].inputs)));
+      pool.jobs[index].inputs->content=ku_string_static((const uint8_t*)"cold",4u);
     }
     size_t unavailable=SIZE_MAX;
     CHECK(ku_task_blocking_claim_locked(&pool,&unavailable)==KU_TASK_DRIVER_LIMIT&&unavailable==SIZE_MAX);
     CHECK(!pool.free_count&&pool.resident==cap&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
     /* BUILDING rejection has no worker/callback pin; return exactly once. */
     for(size_t i=0;i<cap;i++)CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[i],i)==KU_TASK_DRIVER_OK);
+    for(size_t i=0;i<cap;i++)CHECK(!pool.jobs[i].inputs&&ku_task_frame_zero_bytes(&pool.inputs[i],sizeof(pool.inputs[i])));
     CHECK(pool.free_count==cap&&!pool.resident&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
     CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[0],0u)==KU_TASK_DRIVER_INTERNAL);
     CHECK(pool.fault==KU_TASK_DRIVER_INTERNAL&&pool.free_count==cap&&!pool.resident);
@@ -2406,7 +2413,7 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
     if(cap==1u)CHECK(ku_task_blocking_claim_locked(&pool,&unavailable)==KU_TASK_DRIVER_LIMIT);
     ku_task_blocking_unlock(&pool);
     CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
-    CHECK(!pool.initialized && !pool.storage && !pool.jobs && !pool.ring&&!pool.free_indices);
+    CHECK(!pool.initialized && !pool.storage && !pool.jobs && !pool.inputs && !pool.ring&&!pool.free_indices);
     CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   }
 }
@@ -4156,10 +4163,10 @@ static KuTaskDriverSnapshotV1 net_snapshot(void) {
  * every optional-field mask, all scalar slots and empty/owned-form string
  * descriptors survive compact storage without a new allocation or a clone. */
 static void net_config_storage_roundtrip(void) {
-  KuTaskBlockingJobV1 job={0};
-  CHECK(sizeof(job.net_config)<9u*sizeof(KuValue));
-  fprintf(stderr,"network-config-layout compact=%zu old_values=%zu job=%zu fixed_2048=%zu\n",
-      sizeof(job.net_config),9u*sizeof(KuValue),sizeof(job),ku_task_blocking_fixed_bytes(2048u));
+  KuTaskBlockingInputsV1 inputs={0};KuTaskBlockingJobV1 job={0};job.inputs=&inputs;
+  CHECK(sizeof(job.inputs->net_config)<9u*sizeof(KuValue));
+  fprintf(stderr,"network-config-layout compact=%zu old_values=%zu hot_job=%zu cold_inputs=%zu fixed_2048=%zu\n",
+      sizeof(job.inputs->net_config),9u*sizeof(KuValue),sizeof(job),sizeof(inputs),ku_task_blocking_fixed_bytes(2048u));
   const int64_t integers[5]={INT64_MIN,INT64_MAX,-1,0,UINT32_MAX};
   FixtureLedger initial=fixture_ledger();
   for(size_t round=0;round<3u;round++) {
@@ -4178,12 +4185,12 @@ static void net_config_storage_roundtrip(void) {
       else {values[i].tag=KU_INT;values[i].as.i=integers[i-1u];}
     }
     for(uint16_t present=0;present<512u;present++) {
-      uint64_t generation=job.generation+1u;memset(&job,0,sizeof(job));job.generation=generation;
-      CHECK(!job.net_present && !job.net_tls && !job.net_config.strings[0].ptr
-          && !job.net_config.strings[1].ptr && !job.net_config.strings[2].ptr);
+      uint64_t generation=job.generation+1u;memset(&job,0,sizeof(job));job.generation=generation;job.inputs=&inputs;memset(&inputs,0,sizeof(inputs));
+      CHECK(!job.inputs->net_present && !job.inputs->net_tls && !job.inputs->net_config.strings[0].ptr
+          && !job.inputs->net_config.strings[1].ptr && !job.inputs->net_config.strings[2].ptr);
       for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i))
         ku_task_blocking_net_config_store(&job,i,values[i]);
-      job.net_present=present;
+      job.inputs->net_present=present;
       FixtureLedger before=fixture_ledger();
       for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i)) {
         KuValue value=ku_task_blocking_net_config_value(&job,i);CHECK(value.tag==values[i].tag);
@@ -4194,7 +4201,7 @@ static void net_config_storage_roundtrip(void) {
       }
       FixtureLedger after=fixture_ledger();
       CHECK(before.allocations==after.allocations && before.bytes==after.bytes && !after.overflow);
-      CHECK(job.generation==generation && job.net_present==present);
+      CHECK(job.generation==generation && job.inputs->net_present==present);
     }
     /* These descriptor-only checks never transfer ownership into a real job.
      * The original test strings remain owned here until every mask is checked. */

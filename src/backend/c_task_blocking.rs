@@ -82,6 +82,22 @@ typedef struct KuTaskBlockingNetConfigV1 {
   int64_t integers[5]; /* port, connect/read/write timeout, max_read_bytes */
 } KuTaskBlockingNetConfigV1;
 #endif
+/* Fixed cold input plane. It is allocated at startup with every hot header,
+ * never grown/moved and never allocated on an admitted request. Only FS and
+ * connect touch it; PG/read/write/close keep their hot access paths direct. */
+typedef struct KuTaskBlockingInputsV1 {
+#if KU_TASK_BLOCKING_FILES
+  KuFsNativeChar* path;
+#else
+  void* path;
+#endif
+  KuString content;
+#if KU_TASK_BLOCKING_NETWORK
+  KuTaskBlockingNetConfigV1 net_config;
+  uint16_t net_present;
+  bool net_tls;
+#endif
+} KuTaskBlockingInputsV1;
 typedef struct KuTaskBlockingJobV1 {
   uint64_t generation;
   uint32_t state, cancelled, kind;
@@ -90,12 +106,7 @@ typedef struct KuTaskBlockingJobV1 {
 #endif
   size_t output_charge;
   KuTaskDriverTicketV1 ticket;
-#if KU_TASK_BLOCKING_FILES
-  KuFsNativeChar* path;
-#else
-  void* path;
-#endif
-  KuString content;
+  KuTaskBlockingInputsV1* inputs;
   /* kind is fixed from BUILDING through DONE retirement. Only its matching
    * Result is ever published; inputs, physical operation state and exists_value
    * remain independent because they may outlive/ accompany that Result. */
@@ -120,9 +131,6 @@ typedef struct KuTaskBlockingJobV1 {
   uint32_t pg_ready;
 #endif
 #if KU_TASK_BLOCKING_NETWORK
-  KuTaskBlockingNetConfigV1 net_config;
-  uint16_t net_present;
-  bool net_tls;
   uint64_t net_deadline;
   int64_t net_requested;
   KuNetClient* net_client;
@@ -140,16 +148,16 @@ typedef struct KuTaskBlockingJobV1 {
 static KuValue ku_task_blocking_net_config_value(const KuTaskBlockingJobV1* job,size_t index) {
   KuValue value={0};
   if(index==0u || index==7u || index==8u) {
-    value.tag=KU_STR;value.as.s=job->net_config.strings[index==0u ? 0u:index-6u];
-  } else if(index==6u) {value.tag=KU_BOOL;value.as.b=job->net_tls;}
-  else if(index>=1u && index<=5u) {value.tag=KU_INT;value.as.i=job->net_config.integers[index-1u];}
+    value.tag=KU_STR;value.as.s=job->inputs->net_config.strings[index==0u ? 0u:index-6u];
+  } else if(index==6u) {value.tag=KU_BOOL;value.as.b=job->inputs->net_tls;}
+  else if(index>=1u && index<=5u) {value.tag=KU_INT;value.as.i=job->inputs->net_config.integers[index-1u];}
   return value;
 }
 static void ku_task_blocking_net_config_store(KuTaskBlockingJobV1* job,size_t index,KuValue value) {
   if(index==0u || index==7u || index==8u)
-    job->net_config.strings[index==0u ? 0u:index-6u]=value.as.s;
-  else if(index==6u)job->net_tls=value.as.b;
-  else if(index>=1u && index<=5u)job->net_config.integers[index-1u]=value.as.i;
+    job->inputs->net_config.strings[index==0u ? 0u:index-6u]=value.as.s;
+  else if(index==6u)job->inputs->net_tls=value.as.b;
+  else if(index>=1u && index<=5u)job->inputs->net_config.integers[index-1u]=value.as.i;
 }
 #endif
 typedef struct KuTaskBlockingWorkerV1 {
@@ -186,6 +194,7 @@ struct KuTaskBlockingPoolV1 {
 #endif
   void* storage; size_t storage_bytes;
   KuTaskBlockingJobV1* jobs;
+  KuTaskBlockingInputsV1* inputs;
   size_t* ring;
   uint32_t* free_indices;
 #if KU_TASK_BLOCKING_NETWORK
@@ -195,7 +204,7 @@ struct KuTaskBlockingPoolV1 {
   KuTaskBlockingWorkerV1 workers[64u];
 };
 static size_t ku_task_blocking_fixed_bytes(size_t capacity) {
-  const size_t stride=sizeof(KuTaskBlockingJobV1)+sizeof(size_t)+sizeof(uint32_t);
+  const size_t stride=sizeof(KuTaskBlockingJobV1)+sizeof(KuTaskBlockingInputsV1)+sizeof(size_t)+sizeof(uint32_t);
   if(capacity>(SIZE_MAX-sizeof(KuTaskBlockingPoolV1))/stride)return SIZE_MAX;
   return sizeof(KuTaskBlockingPoolV1)+capacity*stride;
 }
@@ -255,7 +264,7 @@ static uint32_t ku_task_blocking_claim_locked(KuTaskBlockingPoolV1* pool,size_t*
   if(slot>=pool->capacity)goto invalid;
   KuTaskBlockingJobV1* job=&pool->jobs[slot];
   if(job->state!=KU_TASK_BLOCKING_FREE || job->generation==UINT64_MAX)goto invalid;
-  pool->free_count--;job->generation++;
+  pool->free_count--;job->generation++;job->inputs=&pool->inputs[slot];
 #if KU_TASK_BLOCKING_PG
   ku_task_control_atomic_init(&job->pg_cancelled_view,0u);
 #endif
@@ -270,10 +279,14 @@ invalid:
 static uint32_t ku_task_blocking_return_locked(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job,size_t index) {
   if(index>=pool->capacity || job!=&pool->jobs[index] || !pool->resident
       || job->state==KU_TASK_BLOCKING_FREE || job->output_charge>pool->output_charge_total
+      || job->inputs!=&pool->inputs[index]
       || pool->free_count>=pool->capacity || pool->retired_slots>=pool->capacity)goto invalid;
   uint64_t generation=job->generation;
   if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_FREE)!=KU_TASK_DRIVER_OK)goto invalid;
   pool->output_charge_total-=job->output_charge;
+  /* Unused cold inputs stay untouched. A prior FS/connect return cleared the
+   * entire input block; payload ownership was already moved/freed above. */
+  if(job->kind<=5u)memset(job->inputs,0,sizeof(*job->inputs));
   memset(job,0,sizeof(*job));job->generation=generation;pool->resident--;
   if(generation==UINT64_MAX)pool->retired_slots++;
   else pool->free_indices[pool->free_count++]=(uint32_t)index;
@@ -512,9 +525,9 @@ static void ku_task_blocking_net_drop_result(KuTaskBlockingJobV1* job) {
 }
 static void ku_task_blocking_net_drop_config(KuTaskBlockingJobV1* job) {
   static const unsigned fields[3]={0u,7u,8u};
-  for(size_t i=0;i<3u;i++)if(job->net_present & (uint16_t)(1u<<fields[i])) {
-    ku_task_blocking_free(job->net_config.strings[i].ptr);
-    job->net_config.strings[i]=(KuString){0};
+  for(size_t i=0;i<3u;i++)if(job->inputs->net_present & (uint16_t)(1u<<fields[i])) {
+    ku_task_blocking_free(job->inputs->net_config.strings[i].ptr);
+    job->inputs->net_config.strings[i]=(KuString){0};
   }
 }
 static void ku_task_net_resolve(KuTaskBlockingJobV1*,KuObject*,KuTaskBlockingOutputV1*);
@@ -534,7 +547,7 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
       static const char* names[9]={"host","port","connect_timeout_ms","read_timeout_ms","write_timeout_ms","max_read_bytes","tls","tls_server_name","tls_ca_pem"};
       KuEntry entries[16]; memset(entries,0,sizeof(entries));
       KuObject config={0,16,entries};
-      for (size_t i=0;i<9u;i++) if (job->net_present & (uint16_t)(1u<<i)) {
+      for (size_t i=0;i<9u;i++) if (job->inputs->net_present & (uint16_t)(1u<<i)) {
         KuString key=ku_string_static((const uint8_t*)names[i],strlen(names[i]));
         size_t at=(size_t)ku_obj_hash(key)&15u;
         while (entries[at].used) at=(at+1u)&15u;
@@ -557,7 +570,7 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
   __ku_handler_deadline=previous_deadline; __ku_handler_cleanup_deadline=previous_cleanup;
   __ku_handler_timed_out=previous_timeout; __ku_handler_unwind_depth=previous_unwind;
   /* Config and write snapshots use the private prepaid prefix allocator. */
-  ku_task_blocking_net_drop_config(job);
+  if(job->kind==5u)ku_task_blocking_net_drop_config(job);
   ku_task_blocking_free(job->net_write.ptr); job->net_write=(KuBytes){0};
   if (allocation->status!=KU_TASK_DRIVER_OK) {
     ku_task_blocking_net_drop_result(job);
@@ -596,8 +609,10 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     }
     pool->running++;
     if (pool->running>pool->peak_running) pool->peak_running=pool->running;
-    void* path=job->path;
-    KuString content=job->content;
+    void* path=NULL;KuString content={0};
+#if KU_TASK_BLOCKING_FILES
+    if(job->kind<5u) {path=job->inputs->path;content=job->inputs->content;}
+#endif
     uint32_t start=ku_task_driver_blocking_can_start(&job->ticket);
     int cancelled=job->cancelled || pool->closing || start!=KU_TASK_DRIVER_OK;
     int closing=pool->closing;
@@ -664,7 +679,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     ku_task_blocking_free(content.ptr);
     if (ku_task_blocking_lock(pool)) return;
     job=&pool->jobs[index];
-    job->path=NULL; job->content=(KuString){0};
+    if(kind<5u) {job->inputs->path=NULL;job->inputs->content=(KuString){0};}
 #if KU_TASK_BLOCKING_DIRECTORY
     if (kind==4u) job->directory_result=directory_result;
     else
@@ -744,7 +759,8 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   pool->storage=calloc(1,pool->storage_bytes);
   if(!pool->storage)return KU_TASK_BLOCKING_OUT_OF_MEMORY;
   pool->jobs=(KuTaskBlockingJobV1*)pool->storage;
-  pool->ring=(size_t*)((uint8_t*)pool->storage+capacity*sizeof(*pool->jobs));
+  pool->inputs=(KuTaskBlockingInputsV1*)((uint8_t*)pool->storage+capacity*sizeof(*pool->jobs));
+  pool->ring=(size_t*)(pool->inputs+capacity);
   pool->free_indices=(uint32_t*)(pool->ring+capacity);pool->free_count=capacity;
   for(size_t i=0;i<capacity;i++)pool->free_indices[i]=(uint32_t)(capacity-1u-i);
 #if defined(_WIN32)
@@ -889,7 +905,7 @@ static uint32_t ku_task_blocking_finish(KuTaskBlockingPoolV1* pool, uint64_t dea
 #else
   pool->resources=0;
 #endif
-  free(pool->storage);pool->storage=NULL;pool->storage_bytes=0;pool->jobs=NULL;pool->ring=NULL;pool->free_indices=NULL;pool->free_count=0;
+  free(pool->storage);pool->storage=NULL;pool->storage_bytes=0;pool->jobs=NULL;pool->inputs=NULL;pool->ring=NULL;pool->free_indices=NULL;pool->free_count=0;
   pool->initialized=KU_TASK_DRIVER_STORAGE_ZERO;
   return failure ? failure : KU_TASK_DRIVER_OK;
 }
@@ -908,11 +924,12 @@ static uint32_t ku_task_blocking_oracle_locked(KuTaskBlockingPoolV1* pool) {
   for(size_t i=0;i<pool->capacity;i++) {
     KuTaskBlockingJobV1* job=&pool->jobs[i];
     if(job->state==KU_TASK_BLOCKING_FREE) {
+      if(job->inputs)goto invalid;
       if(job->generation==UINT64_MAX) {if(seen[i])goto invalid;retired++;}
       else if(!seen[i])goto invalid;
       continue;
     }
-    if(seen[i] || job->state>KU_TASK_BLOCKING_NET_STEP || !job->generation
+    if(seen[i] || job->state>KU_TASK_BLOCKING_NET_STEP || !job->generation || job->inputs!=&pool->inputs[i]
         || job->output_charge>SIZE_MAX-output)goto invalid;
     resident++;output+=job->output_charge;
     cancelled+=job->cancelled && job->state==KU_TASK_BLOCKING_RUNNING;
@@ -1023,12 +1040,12 @@ static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTask
     ku_task_blocking_signal(pool);return status;
   }
 #endif
-  ku_task_blocking_free(job->path);job->path=NULL;
-  ku_task_blocking_free(job->content.ptr);job->content=(KuString){0};
+  ku_task_blocking_free(job->inputs->path);job->inputs->path=NULL;
+  ku_task_blocking_free(job->inputs->content.ptr);job->inputs->content=(KuString){0};
   KuError error=ku_task_blocking_error("cancelled","queued operation was cancelled before execution");
 #if KU_TASK_BLOCKING_NETWORK
   if(job->kind>=5u) {
-    ku_task_blocking_net_drop_config(job);
+    if(job->kind==5u)ku_task_blocking_net_drop_config(job);
     ku_task_blocking_free(job->net_write.ptr);job->net_write=(KuBytes){0};
     ku_drop_net_client(&job->net_client);
     if(job->kind==5u)job->net_connect_result=(KuResult_net_client){false,NULL,error};
@@ -1216,7 +1233,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     status=KU_TASK_DRIVER_CLOSED; ku_task_blocking_unlock(pool); goto ku_blocking_rejected;
   }
   job=&pool->jobs[index];
-  job->path=native; job->content=(KuString){copy,content.len,content.len,KU_STRING_OWNED};
+  job->inputs->path=native; job->inputs->content=(KuString){copy,content.len,content.len,KU_STRING_OWNED};
   if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_QUEUED)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
   pool->ring[(pool->head+pool->queued)%pool->capacity]=index; pool->queued++;
   if (pool->queued>pool->peak_queued) pool->peak_queued=pool->queued;
@@ -1401,7 +1418,7 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
   if (kind==5u) {
     for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i))
       ku_task_blocking_net_config_store(job,i,copied[i]);
-    job->net_present=present;
+    job->inputs->net_present=present;
   }
   else {
     /* No allocation or fallible operation after this physical owner move. The
