@@ -148,6 +148,56 @@ Do not present direct/response results as default helpers/text or relabel old
 results. Keep cancellation, deadlines, budgets, ordinary value ownership and
 cleanup checks enabled; do not restore withdrawn experiments.
 
+## JSON dense diagnostic entry
+
+`json_dense.py` and `json_dense.c.inc` are the minimal retained reproducible entry
+required by this task. Input is the default text-path `server.c` emitted by the
+normal CLI from `ku/server.ku`. Only rename its original main and append a wrapper;
+do not rewrite Transform or alter the runtime. Each call creates owned body,
+query and RID, invokes actual `encode(HttpRequest)`, compares every response byte,
+and releases the output. Python independently derives `{id, counter+1, data}` from
+the input and validates every preflight body, rather than trusting candidate goldens.
+
+`http-object` preserves the frozen 1048-byte object, including its final LF, and
+16-byte RID. `http-object32` separates the 32-byte RID case. `ascii`, `chinese`,
+`emoji` and `escape` are separate families; `variants` recreates the earlier twenty
+inputs exactly. Prepare fixtures outside timing; owned copies and output release
+remain inside each timed iteration.
+
+```sh
+# Emit identities/fixtures only; no compilation or measurement. Use actual receipt hashes.
+python3 -B tests/benchmarks/cross_stack/json_dense.py \
+  --generated-c /opt/ku-bench/build/ku-native/server.c --output /opt/ku-bench/dense-A \
+  --source-commit "$KU_BENCH_SOURCE_COMMIT" --cli-sha256 "$KU_BENCH_CLI_SHA256" \
+  --link /opt/ku-bench/tools/lib/libpq.so --debug-symbols --emit-only
+# Compile with emission.json's command and retain actual compiler/command/ELF identities.
+# Reuse these arguments without --emit-only, adding --binary /opt/ku-bench/dense-A/json-dense.
+# Default: validation only. Explicit --cpu-seconds 5 or --iterations 10000 enables timing.
+```
+
+Default `--context http` preserves active worker deadline TLS. Request duration is
+30000 ms (runtime default, not overridden by the ordinary fixture); the fixture's
+handler duration is 45000 ms. Before owned projection the wrapper creates a
+synthetic admission deadline, preserves the worker expiry gate, then clamps the
+handler duration to remaining request time and passes a **relative duration** to
+`__ku_handler_timeout_begin`. Finish through original `__ku_sync_finish_request`.
+There is no real network/queue age here. If the HTTP comparison changes durations,
+explicitly set matching `--request-timeout-ms` and `--handler-timeout-ms`.
+`--context none` is separate inactive-HTTP-TLS mechanism diagnosis, never the
+default or an HTTP score. Guard/clock conditions differ; do not combine these rows.
+
+CPU includes owned request preparation, actual handler, full-byte comparison and
+per-call output cleanup. It excludes sockets, routing, queues, job locks/wakes and
+service buffer accounting; it cannot replace HTTP/Rust acceptance. Preflight setup
+and golden retirement are separate. Read diagnostic thread-CPU/wall clocks once per 2048-call batch;
+original product checks keep their frequency. CPU target is capped at 20 seconds,
+fixed repeat at 50 million, with an external process-group wall bound. Results
+retain input/generated-C/template/CLI/binary hashes, declared flags, correct count
+and raw logs. External `--binary` builds require the caller's actual build receipt;
+declared flags are not proof. Remove generated C/ELF after use, preserving compact
+results, inputs and required samples. Keep this entry and the contract regressions
+in existing `test_compile_variants.py`.
+
 ## PostgreSQL execution comparison
 
 The default source uses a named local `async fn database` capturing the original

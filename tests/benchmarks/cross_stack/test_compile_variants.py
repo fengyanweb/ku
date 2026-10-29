@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 import batch
 import compile_variants
+import json_dense
 from compile_variants import profile_input, native_flags
 from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
@@ -98,6 +99,101 @@ class BatchWindowTests(unittest.TestCase):
             self.assertEqual(report['summaries'][0]['valid_formal_rounds'], 0)
             self.assertEqual(report['summaries'][0]['failed_formal_rounds'], 1)
             self.assertTrue((Path(directory) / 'summary.json').exists())
+
+
+class JsonDenseEntryTests(unittest.TestCase):
+    """Check the retained entry's input/accounting contract without running C."""
+
+    def test_http_fixture_and_earlier_twenty_inputs_keep_their_exact_identity(self):
+        rows = json_dense.make_cases()
+        frozen = Path(__file__).with_name('corpora').joinpath('object.json').read_bytes()
+        http = [row for row in rows if row['family'] == 'http-object']
+        self.assertEqual(len(http), 16)
+        self.assertEqual(len(frozen), 1048)
+        self.assertTrue(all(row['input'].encode() == frozen and len(row['rid']) == 16 for row in http))
+        self.assertEqual(len({row['rid'] for row in http}), 16)
+        # SHA of retained raw/dense/cases.json, with only its original family
+        # labels restored. No old raw bundle is needed to reproduce those inputs.
+        legacy = copy.deepcopy([row for row in rows if row['family'] == 'variants'])
+        for index, row in enumerate(legacy):
+            row['family'] = 'object' if index < 16 else 'array' if index < 18 else 'escape'
+        self.assertEqual(json_dense.case_identity(legacy),
+                         '467262874ec13458f56b2ef238bdebfe255d52a5f73c186dac92b3f2d13562ed')
+        self.assertEqual(set(row['family'] for row in rows), set(json_dense.FAMILIES))
+        self.assertEqual(json_dense.REQUEST_TIMEOUT_MS, 30000)
+        self.assertEqual(json_dense.HANDLER_TIMEOUT_MS, 45000)
+
+    @staticmethod
+    def result(rows, family='ascii'):
+        value = {'schema': json_dense.SCHEMA, 'family': family, 'batch_size': 2048,
+                 'context': 'http', 'request_timeout_ms': 30000, 'handler_timeout_ms': 45000,
+                 'iterations': 0, 'correct': 0, 'thread_cpu_ns': 0, 'wall_ns': 0,
+                 'setup_thread_cpu_ns': 100, 'setup_wall_ns': 200, 'stop_reason': 'validation_only',
+                 'golden_cleanup_thread_cpu_ns': 10, 'golden_cleanup_wall_ns': 20,
+                 'validation': [{'case': index, 'body_hex': json.dumps(row['expected'],
+                                 ensure_ascii=False).encode().hex()}
+                                for index, row in enumerate(rows) if row['family'] == family]}
+        return value
+
+    def test_semantics_are_independent_of_candidate_golden_bytes(self):
+        rows = json_dense.make_cases()
+        value = self.result(rows)
+        parse = lambda x, **kw: json_dense.validate_output(
+            json.dumps(x, separators=(',', ':')), rows, 'ascii', **kw)
+        checked = parse(value)
+        self.assertFalse(checked['performance_measured'])
+        self.assertIsNone(checked['ns_per_correct'])
+        self.assertEqual(checked['semantic_preflight_correct'], 8)
+        for kind in ('counter', 'bool', 'missing', 'duplicate', 'context', 'clock', 'repeat'):
+            with self.subTest(kind=kind):
+                changed = copy.deepcopy(value)
+                if kind in ('counter', 'bool'):
+                    body = json.loads(bytes.fromhex(changed['validation'][0]['body_hex']))
+                    if kind == 'counter':
+                        body['counter'] -= 1
+                    else:
+                        body['data']['items'][0] = 1  # True must not accept an integer.
+                    changed['validation'][0]['body_hex'] = json.dumps(body).encode().hex()
+                elif kind == 'missing':
+                    changed['validation'].pop()
+                elif kind == 'duplicate':
+                    changed['validation'].append(changed['validation'][0])
+                elif kind == 'context':
+                    changed['context'] = 'none'
+                elif kind == 'clock':
+                    changed['thread_cpu_ns'] = True
+                else:
+                    changed.update(correct=1, iterations=1, stop_reason='iterations')
+                with self.assertRaises(ValueError):
+                    parse(changed)
+        value.update(correct=17, iterations=17, thread_cpu_ns=1700, stop_reason='iterations')
+        self.assertEqual(parse(value, repeat=17)['ns_per_correct'], 100)
+        with self.assertRaisesRegex(ValueError, 'fixed repeat incomplete'):
+            parse(value, repeat=18)
+        value.update(context='none', stop_reason='thread_cpu_budget', thread_cpu_ns=1_000_000_000)
+        self.assertIn('mechanism-only', parse(value, cpu_seconds=1, context='none')['deadline_context'])
+
+    def test_emission_changes_only_main_name_and_appends_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'server.c'
+            runtime = ('/* ku_object_try_set_owned ku_drop_struct___ku_http_request '
+                       'ku_result_drop_struct___ku_http_response __ku_handler_timeout_begin '
+                       'ku_http_deadline_ms ku_http_now_ms __ku_sync_reset __ku_sync_finish_request */\n'
+                       'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {\n'
+                       '  /* unchanged ordinary generated handler */\n}\n'
+                       'int main(void) {\n  /* unchanged ordinary startup */\n}\n')
+            source.write_text(runtime)
+            emitted = json_dense.emit(source, json_dense.make_cases(),
+                                      Path(__file__).with_name('json_dense.c.inc'))
+            expected = runtime.replace('int main(void) {', 'static int ku_json_dense_original_main(void) {')
+            self.assertTrue(emitted.startswith(expected))
+            self.assertEqual(source.read_text(), runtime)
+            self.assertIn('KuResult_struct___ku_http_response result=encode(request);', emitted)
+            self.assertIn('int expired=__ku_sync_finish_request(&signal);', emitted)
+            self.assertIn('handler_ms>remaining ? remaining:handler_ms', emitted)
+            source.write_text(runtime.replace('encode(KuStruct___ku_http_request req)', 'different(req)'))
+            with self.assertRaisesRegex(ValueError, 'ordinary generated'):
+                json_dense.emit(source, [], Path(__file__).with_name('json_dense.c.inc'))
 
 
 class ProfileReceiptTests(unittest.TestCase):

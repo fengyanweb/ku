@@ -105,6 +105,46 @@ ROOT/tools，源码目录保持可核对。安装脚本默认账号和路径由�
 不能把 direct/response 的结果当作默认 helpers/text，也不能重新标注旧成绩。
 取消、期限、预算、正常值所有权和清理检查始终保留，不使用已撤回的实验实现。
 
+## JSON 密集诊断入口
+
+`json_dense.py` 和 `json_dense.c.inc` 是任务要求保留的最小可复现基准入口。
+输入必须是正常 CLI 从本目录 `ku/server.ku` 生成的默认 text 路径 `server.c`；只改原
+`main` 名称并追加 wrapper，不重写 Transform 或修改运行时。每轮新建 owned body、query、
+RID，调用实际 `encode(HttpRequest)`，检查状态和完整响应字节后释放。Python 另按输入独立
+计算 `{id, counter+1, data}` 并核对所有预检正文；候选自己的输出不能自证正确。
+
+`http-object` 保留冻结 1048 B object 正文（包括末尾 LF）及 16 B RID；`http-object32`
+单列 32 B RID。`ascii`、`chinese`、`emoji`、`escape` 分族，`variants` 精确重建此前的
+20 个变化输入。输入在计时外准备，owned 拷贝和输出释放仍在每轮计时内。
+
+```sh
+# 只生成入口、输入及身份，不编译或测量。完整提交/CLI SHA 从实际构建收据取值。
+python3 -B tests/benchmarks/cross_stack/json_dense.py \
+  --generated-c /opt/ku-bench/build/ku-native/server.c --output /opt/ku-bench/dense-A \
+  --source-commit "$KU_BENCH_SOURCE_COMMIT" --cli-sha256 "$KU_BENCH_CLI_SHA256" \
+  --link /opt/ku-bench/tools/lib/libpq.so --debug-symbols --emit-only
+# 按 emission.json 的命令编译，保留实际命令/编译器/ELF 身份；可另加明确的分核或采样前缀。
+# 沿用相同参数去掉 --emit-only，加 --binary /opt/ku-bench/dense-A/json-dense
+# 默认只验证；显式 --cpu-seconds 5 或 --iterations 10000 才产生计时结果。
+```
+
+默认 `--context http` 保留真实 worker 的期限 TLS：request duration 默认 30000 ms
+（runtime 默认，普通夹具无覆盖），handler duration 为夹具配置的 45000 ms。wrapper 在
+owned 投影前建立模拟准入期限，执行 worker 的到期检查，调用前取剩余期限与 handler duration
+的较小值，再把**相对时长**交给 `__ku_handler_timeout_begin`，结束用原
+`__ku_sync_finish_request`。真实网络／队列年龄不在此密集入口内；如果实际 HTTP 比较改了
+期限，必须显式传相同 `--request-timeout-ms`、`--handler-timeout-ms`。
+`--context none` 仅供无 HTTP 期限上下文的机制诊断，单独列示，不能作为默认或 HTTP 成绩。
+两列的 guards 和时钟调用条件不同，不能合并。
+
+计量含 owned 请求准备、实际 handler、全字节比较和每轮输出释放；不含 socket、路由、
+队列、job 锁与唤醒或服务缓冲计费，不能用来代替 HTTP/Rust 验收。预检准备和 golden 回收单列；诊断
+thread CPU／wall clock 每批 2048 次才读取，产品原有检查不降频。CPU 目标上限 20 秒、
+固定次数上限 5000 万，另有外部进程组 wall 上限。结果保存输入／生成 C／模板／CLI／
+二进制 SHA、声明编译参数、正确次数和原始日志。外部 `--binary` 的实际构建须由调用方
+收据核对，声明参数不冒充编译证明。用完删除本次生成 C 和 ELF，保留精简结果、输入和
+必要采样；入口本身及既有 `test_compile_variants.py` 合同回归保留。
+
 ## PostgreSQL 执行路径对照
 
 当前 Ku 默认源码使用具名局部 `async fn database` 捕获原初始化 pool：`query()` 挂起、
