@@ -1,5 +1,7 @@
 // Permanent full-stack benchmark. The runner writes an isolated config.json;
 // no production database, cached JSON, or replacement JSON library is used.
+// Explicit typed JSON/PG comparisons are expanded by build_linux.py; the
+// checked-in generic JSON and text-protocol PG remain its default.
 import { http, json, fs, time, net, bytes } from "std"
 import pg from "std.pg"
 

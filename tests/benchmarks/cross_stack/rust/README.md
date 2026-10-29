@@ -201,3 +201,25 @@ The new unit cases exercise HTTP-versus-CPU receipts, visible queue refusal and
 dropping a genuinely queued future without returning an unrelated holder's
 permit. They do not establish wire-level stop latency or fix the historical
 queued-runtime delay by themselves.
+
+## Explicit typed API comparisons
+
+The unset `BENCH_JSON_MODE=generic` path retains the full DOM decode and dynamic
+Map envelope. `BENCH_JSON_MODE=typed` keeps the same decode, counter check, and
+`remove("data")` ownership transfer, then serializes a `Serialize` envelope
+with the complete `Value` subtree. Its response wrapper and bytes are unchanged;
+it is recorded separately from generic JSON.
+
+`BENCH_PG_API=typed-text-key` uses the same `WHERE id=$1::int4` SQL as the explicit
+Ku binary typed mode, supplies the original key as PostgreSQL TEXT, and reads
+binary INT4/TEXT/INT4 results with `query_typed_raw`. It holds at most one owned
+row, drains extra rows to `ReadyForQuery`, and reports a later SQL error before
+an earlier row-count/conversion error. Query failure, deadline, or cancellation
+evicts the lease; no SQL is retried. `BENCH_PG_API=normal` (unset) retains the
+original INT4 parameter and `query_typed` behavior.
+
+The API choice is independent of `BENCH_PG_MODE`: `normal` keeps its 1s pool/query
+contract without DISCARD; `reset-equivalent` retains the 250ms acquire and one
+2s absolute budget through query and same-lease DISCARD. The new explicit path
+uses `futures-core` 0.3.34, already present in the locked graph, solely for its
+`Stream` trait. These variants do not replace the generic main table.

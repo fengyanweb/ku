@@ -1,5 +1,7 @@
 //! Explicit session-isolation comparison; normal driver behavior is unchanged.
 use deadpool_postgres::{Object, Pool};
+use futures_core::Stream;
+use std::future::poll_fn;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 use tokio_postgres::types::Type;
@@ -15,6 +17,28 @@ pub fn parse(value: Option<&str>) -> Result<Mode, &'static str> {
         None | Some("") | Some("normal") => Ok(Mode::Normal),
         Some("reset-equivalent") => Ok(Mode::ResetEquivalent),
         _ => Err("invalid BENCH_PG_MODE: expected normal or reset-equivalent"),
+    }
+}
+
+/// An explicit API/parameter contract, independent of session reset mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    Int4,
+    TypedTextKey,
+}
+impl Api {
+    pub fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value {
+            None | Some("") | Some("normal") => Ok(Self::Int4),
+            Some("typed-text-key") => Ok(Self::TypedTextKey),
+            _ => Err("invalid BENCH_PG_API: expected normal or typed-text-key"),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int4 => "normal",
+            Self::TypedTextKey => "typed-text-key",
+        }
     }
 }
 
@@ -74,6 +98,88 @@ async fn query_reset_lease(
     Ok(finish_reset(lease, deadline, (id, label, score)).await)
 }
 
+const TYPED_TEXT_SQL: &str = "SELECT id,label,score FROM cross_stack_items WHERE id=$1::int4";
+type OwnedRow = (i32, String, i32);
+
+// An empty/extra row or client conversion error is reported only after drain;
+// a later PostgreSQL error therefore retains precedence. No Vec<Row> is built.
+fn finish_exact_one(
+    first: Option<Result<OwnedRow, String>>,
+    extra: bool,
+) -> Result<OwnedRow, String> {
+    if extra {
+        return Err("incorrect database row count".into());
+    }
+    first.ok_or_else(|| "incorrect database row count".to_owned())?
+}
+fn typed_query_error(error: tokio_postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(database) => format!("{error}: {}", database.message()),
+        None => error.to_string(),
+    }
+}
+async fn typed_text_row(
+    lease: &ResetLease,
+    key: &str,
+    deadline: Instant,
+    sql: &str,
+) -> Result<OwnedRow, String> {
+    timeout_at(deadline, async {
+        let stream = lease
+            .client()
+            .query_typed_raw(sql, [(&key, Type::TEXT)])
+            .await
+            .map_err(typed_query_error)?;
+        let mut stream = std::pin::pin!(stream);
+        let mut first = None;
+        let mut extra = false;
+        while let Some(row) = poll_fn(|context| stream.as_mut().poll_next(context)).await {
+            // A wire/SQL error ends this operation and evicts the lease. In
+            // particular, never spin on a disconnected stream's repeated error.
+            let row = row.map_err(typed_query_error)?;
+            if first.is_none() {
+                first = Some((|| {
+                    Ok((
+                        row.try_get("id").map_err(typed_query_error)?,
+                        row.try_get("label").map_err(typed_query_error)?,
+                        row.try_get("score").map_err(typed_query_error)?,
+                    ))
+                })());
+            } else {
+                extra = true;
+            }
+            // Row drops here; only the first row's independently owned scalars
+            // and String remain while later messages are drained.
+        }
+        finish_exact_one(first, extra)
+    })
+    .await
+    .map_err(|_| "query deadline".to_owned())?
+}
+
+pub async fn query_typed_text_key(pool: &Pool, key: &str, mode: Mode) -> Result<OwnedRow, String> {
+    let started = Instant::now();
+    let (client, deadline) = if mode == Mode::ResetEquivalent {
+        let client = timeout_at(started + Duration::from_millis(250), pool.get())
+            .await
+            .map_err(|_| "pool acquire deadline".to_owned())?
+            .map_err(|error| error.to_string())?;
+        (client, started + Duration::from_secs(2))
+    } else {
+        // The pool's existing 1s acquire/create configuration is unchanged.
+        let client = pool.get().await.map_err(|error| error.to_string())?;
+        (client, Instant::now() + Duration::from_secs(1))
+    };
+    let lease = ResetLease(Some(client));
+    let owned = typed_text_row(&lease, key, deadline, TYPED_TEXT_SQL).await?;
+    if mode == Mode::ResetEquivalent {
+        Ok(finish_reset(lease, deadline, owned).await)
+    } else {
+        lease.release_clean();
+        Ok(owned)
+    }
+}
+
 async fn finish_reset(
     lease: ResetLease,
     deadline: Instant,
@@ -106,6 +212,24 @@ mod tests {
         for value in ["reset", "RESET-EQUIVALENT", " normal "] {
             assert!(parse(Some(value)).is_err());
         }
+    }
+
+    #[test]
+    fn typed_text_api_is_explicit_and_exact_one_finishes_after_drain() {
+        assert_eq!(Api::parse(None), Ok(Api::Int4));
+        assert_eq!(Api::parse(Some("normal")), Ok(Api::Int4));
+        assert_eq!(Api::parse(Some("typed-text-key")), Ok(Api::TypedTextKey));
+        assert!(Api::parse(Some("typed")).is_err());
+        assert!(finish_exact_one(None, false).is_err());
+        assert!(finish_exact_one(Some(Ok((1, "owned".into(), 2))), true).is_err());
+        assert_eq!(
+            finish_exact_one(Some(Err("field error".into())), false),
+            Err("field error".into())
+        );
+        assert_eq!(
+            finish_exact_one(Some(Ok((1, "owned".into(), 2))), false).unwrap(),
+            (1, "owned".into(), 2)
+        );
     }
 
     fn private_pool() -> Pool {
@@ -207,6 +331,39 @@ mod tests {
             operation.abort();
             assert!(operation.await.unwrap_err().is_cancelled());
             assert_eq!(pool.status().size, 0);
+            pool.close();
+        });
+    }
+    #[test]
+    #[ignore = "requires BENCH_PG_TEST_URL pointing at the private fixture"]
+    fn live_typed_text_key_preserves_business_and_evicts_late_sql_error() {
+        run_live(async {
+            let pool = private_pool();
+            let expected = query_reset_equivalent(&pool, 17).await.unwrap();
+            for mode in [Mode::Normal, Mode::ResetEquivalent] {
+                assert_eq!(
+                    query_typed_text_key(&pool, "17", mode).await.unwrap(),
+                    expected
+                );
+            }
+            let client = pool.get().await.unwrap();
+            let lease = ResetLease(Some(client));
+            let error=typed_text_row(&lease,"17",Instant::now()+Duration::from_secs(2),
+                "SELECT (1/(2-n))::int4 AS id,'owned'::text AS label,1::int4 AS score FROM generate_series(1,2) n WHERE $1::text IS NOT NULL")
+                .await.unwrap_err();
+            assert!(error.contains("division by zero"), "{error}");
+            drop(lease);
+            assert_eq!(
+                pool.status().size,
+                0,
+                "SQL error cannot recycle the old lease"
+            );
+            assert_eq!(
+                query_typed_text_key(&pool, "17", Mode::ResetEquivalent)
+                    .await
+                    .unwrap(),
+                expected
+            );
             pool.close();
         });
     }

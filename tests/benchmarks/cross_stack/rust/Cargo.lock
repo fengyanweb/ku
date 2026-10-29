@@ -409,6 +409,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "deadpool-postgres",
+ "futures-core",
  "libc",
  "serde",
  "serde_json",

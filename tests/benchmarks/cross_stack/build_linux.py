@@ -64,14 +64,16 @@ def benchmark_stack_sources(directory):
 def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="int", pg_execution="async"):
     if mode not in ("helpers", "direct"):
         raise ValueError("unknown Ku formatting mode")
-    if json_mode not in ("text", "response"):
+    if json_mode not in ("text", "response", "typed"):
         raise ValueError("unknown Ku JSON response mode")
-    if pg_read not in ("value", "int"):
+    if pg_read not in ("value", "int", "typed"):
         raise ValueError("unknown Ku PG result read mode")
     if pg_execution not in ("async", "sync"):
         raise ValueError("unknown Ku PG execution mode")
-    if pg_execution == "async" and pg_read != "int":
+    if pg_execution == "async" and pg_read == "value":
         raise ValueError("async PG requires typed integer reads; legacy dynamic JSON reads are sync-only")
+    if pg_read == "typed" and pg_execution != "async":
+        raise ValueError("binary typed PG comparison requires the public async capture path")
     if text.count("__PEER_PORT__") != 1:
         raise RuntimeError("expected exactly one fixed peer substitution in Ku source")
     original = "    return (await work_response(req, total))"
@@ -88,6 +90,16 @@ def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read=
         if text.count(original_json) != 1:
             raise RuntimeError("expected exactly one original JSON handler encode/response")
         text = text.replace(original_json, "    return ok(http.json({id: req.query.rid, counter: counter + 1, data: data}))")
+    if json_mode == "typed":
+        original_json = "    body = json.encode({id: req.query.rid, counter: counter + 1, data: data})?"
+        original_handler = "fn encode(req: HttpRequest): HttpResponse! {"
+        if text.count(original_json) != 1 or text.count(original_handler) != 1:
+            raise RuntimeError("expected exactly one generic JSON envelope writer")
+        text = text.replace(original_handler,
+            "struct Envelope { id: str counter: int data: KuValue }\n\n" + original_handler)
+        text = text.replace(original_json,
+            "    envelope = Envelope {id: req.query.rid, counter: counter + 1, data: data}\n"
+            "    body = json.encode(envelope)?")
     original_pg = "    async fn database(req: HttpRequest): HttpResponse! {"
     if text.count(original_pg) != 1:
         raise RuntimeError("expected exactly one public async PG handler")
@@ -97,6 +109,14 @@ def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read=
     if pg_execution == "sync":
         text = text.replace(original_pg, '    app.get("/db", fn(req) {')
         text = text.replace(original_pg_end, '        return http.text(status, body)\n    })')
+    if pg_read == "typed":
+        original_query = ('            result = client.query("SELECT id,label,score FROM cross_stack_items WHERE id=$1",\n'
+                          '                [req.query.key])?')
+        if text.count(original_query) != 1:
+            raise RuntimeError("expected exactly one original parameterized PG query")
+        text = text.replace(original_query,
+            '            result = client.query_one_typed("SELECT id,label,score FROM cross_stack_items WHERE id=$1::int4",\n'
+            '                [req.query.key.clone()], ["text"], ["int4", "text", "int4"])?')
     for original_read, replacement in (
         ("            key = result.value_int(0, 0)?",
          "            key_value = json.decode(result.value(0, 0)?)?\n            key = key_value.as_int()?"),
@@ -271,8 +291,8 @@ class Builder:
                                                                   pg_execution_mode=self.ku_pg_execution,
                                                                   pg_execution_semantics="async uses public local named handler capturing the original shared pool; query/reset suspend on the existing Task reactor; sync is the separately identified bounded HTTP worker baseline; no SQL retries",
                                                                   pg_read_mode=self.ku_pg_read,
-                                                                  pg_read_semantics="value preserves original string plus JSON numeric decode; int uses checked owned-result span getter for id/score only; SQL, label, DISCARD and JSON/text response unchanged",
-                                                                  json_response_semantics="text preserves original encode plus text response; response uses public http.json, decoded input and Result propagation unchanged; database route uses public http.text in both PG execution modes",
+                                                                  pg_read_semantics="value keeps text plus JSON numeric decode; int keeps text-protocol result.value_int; typed uses exact-one binary int4/text/int4, TEXT key and explicit $1::int4 SQL through public Task path; label, same-lease DISCARD, no retry and JSON/text response retained",
+                                                                  json_response_semantics="text keeps generic encode+http.text; response uses public http.json; typed keeps full DOM decode/counter/take, then static Envelope writer+http.text without output DOM; database route uses http.text",
                                                                   original_server_source_sha256=digest(source),
                                                                   expanded_server_source_sha256=digest(expanded),
                                                                   formatting_semantics="helpers preserves original three formatting tasks; direct uses public str(int), same explicit eight-digit zero padding; user Task semantics unchanged",
@@ -304,7 +324,9 @@ class Builder:
                                                    cwd="{workdir}", env=dict(GOMAXPROCS="{cores}"),
                                                    build=dict(binary_sha256=digest(binary), flags="-trimpath -mod=readonly; normal GC",
                                                               source_files_sha256=benchmark_stack_sources(directory),
-                                                              pg_modes=["normal", "reset-equivalent"]))
+                                                              pg_modes=["normal", "reset-equivalent"],
+                                                                                  pg_apis=["normal", "typed-text-key"],
+                                                                                  json_modes=["generic", "typed"]))
             self.built.add("go")
 
     def rust(self):
@@ -467,12 +489,12 @@ def main():
     parser.add_argument("--candidate", default=CANDIDATE)
     parser.add_argument("--ku-format", choices=("helpers", "direct"), default="helpers",
                         help="helpers preserves legacy benchmark; direct requires a candidate CLI with public str(int), records separate source identity")
-    parser.add_argument("--ku-json", choices=("text", "response"), default="text",
-                        help="text preserves original JSON handler bytes; response uses public http.json, separately identified; database route remains text")
+    parser.add_argument("--ku-json", choices=("text", "response", "typed"), default="text",
+                        help="text keeps generic encode+http.text; response uses http.json; typed uses public static Envelope writer+http.text; separately identified")
     parser.add_argument("--ku-pg-execution", choices=("async", "sync"), default="async",
                         help="async uses the public captured-pool Task path; sync preserves the bounded-worker baseline, separately identified")
-    parser.add_argument("--ku-pg-read", choices=("value", "int"), default="int",
-                        help="int uses checked result.value_int for id/score; value preserves legacy numeric JSON conversion and requires --ku-pg-execution sync")
+    parser.add_argument("--ku-pg-read", choices=("value", "int", "typed"), default="int",
+                        help="int keeps text result.value_int; value keeps legacy JSON numeric reads (sync only); typed uses binary exact-one with TEXT key (async only)")
     parser.add_argument("--only", nargs="+", choices=("ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"),
                         default=["ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"])
     args = parser.parse_args()

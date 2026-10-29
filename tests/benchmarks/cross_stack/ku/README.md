@@ -76,3 +76,23 @@ or functional-smoke timings.
 
 `repeat=0` is supported only for the separate fresh-process startup observation.
 It returns an empty checksum array and is never subtracted from `repeat=32768`.
+
+## Explicit typed API comparisons
+
+`build_linux.py --ku-json typed` keeps full `json.decode`, the counter read,
+`take("data")`, and the original `http.text` response. It encodes a public
+`struct Envelope { id: str counter: int data: KuValue }` through the existing
+`json.encode` entry, eliminating only the temporary output DOM. The default
+`--ku-json text` remains the generic envelope; `response` is still a separate
+HTTP response API comparison. Record all expanded source and binary hashes.
+
+`--ku-pg-read typed --ku-pg-execution async` selects the public
+`query_one_typed(sql, [req.query.key.clone()], ["text"],
+["int4", "text", "int4"])` API with `WHERE id=$1::int4`. It retains the real
+key, shared pool, exact-one business row, getters, same-lease DISCARD, error
+response, and no-retry behavior. Its binary typed result and TEXT parameter
+contract is compared to Rust `BENCH_PG_API=typed-text-key`, with normal and
+reset-equivalent Rust session modes shown separately. Generic text PG remains
+the default. Typed PG currently requires the native C async capture path;
+Task parameter literals support flat int/bool/str/null leaves for this API,
+not arbitrary KuValue Task inputs/outputs or nested DOM values.

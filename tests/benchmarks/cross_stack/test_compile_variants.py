@@ -412,6 +412,34 @@ class ProfileReceiptTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             expand_ku_server(source.replace('    return ok(http.text(body))','    return ok(http.text("changed"))'),19191,json_mode='response')
 
+    def test_typed_expansion_is_explicit_and_keeps_full_subtree_and_pg_work(self):
+        source=Path(__file__).with_name('ku').joinpath('server.ku').read_text()
+        baseline=expand_ku_server(source,19191)
+        typed_json=expand_ku_server(source,19191,json_mode='typed')
+        self.assertEqual(baseline,source.replace('__PEER_PORT__','19191'))
+        self.assertNotIn('struct Envelope',baseline)
+        self.assertIn('struct Envelope { id: str counter: int data: KuValue }',typed_json)
+        handler=typed_json.split('fn encode(',1)[1].split('async fn work(',1)[0]
+        for step in ('decoded = json.decode(req.body)?','counter = decoded["counter"]?.as_int()?','data = decoded.take("data")?','body = json.encode(envelope)?','return ok(http.text(body))'):
+            self.assertEqual(handler.count(step),1)
+        self.assertNotIn('http.json(',handler)
+        self.assertNotIn('json.encode({',handler)
+        self.assertEqual(typed_json.split('fn main():',1)[1],baseline.split('fn main():',1)[1])
+        typed_pg=expand_ku_server(source,19191,pg_read='typed')
+        self.assertIn('client.query_one_typed("SELECT id,label,score FROM cross_stack_items WHERE id=$1::int4"',typed_pg)
+        self.assertIn('[req.query.key.clone()], ["text"], ["int4", "text", "int4"]',typed_pg)
+        self.assertEqual(typed_pg.count('result.value_int('),2)
+        self.assertIn('if (result.rows() != 1)',typed_pg)
+        self.assertIn('return ok(http.text(status, body))',typed_pg)
+        self.assertEqual(typed_pg.split('    async fn database(',1)[0],baseline.split('    async fn database(',1)[0])
+        with self.assertRaises(ValueError):
+            expand_ku_server(source,19191,pg_read='typed',pg_execution='sync')
+        with self.assertRaises(RuntimeError):
+            expand_ku_server(source.replace('WHERE id=$1','WHERE id=$2'),19191,pg_read='typed')
+        combined=expand_ku_server(source,19191,json_mode='typed',pg_read='typed')
+        self.assertIn('struct Envelope',combined)
+        self.assertIn('query_one_typed',combined)
+
     def test_normal_and_tuned_flags_do_not_weaken_arithmetic(self):
         self.assertEqual(native_flags('ku','normal',None,Path('/profiles')),['-O2'])
         self.assertEqual(native_flags('cpp','normal',None,Path('/profiles')),['-O3','-DNDEBUG'])

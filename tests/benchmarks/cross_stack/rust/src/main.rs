@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -94,6 +94,8 @@ struct App {
     counters: Counters,
     db: Option<Pool>,
     pg_mode: pg_mode::Mode,
+    pg_api: pg_mode::Api,
+    json_mode: JsonMode,
     peer: u16,
 }
 fn bounded(name: &str, default: usize, low: usize, high: usize) -> usize {
@@ -111,7 +113,30 @@ fn text(status: StatusCode, body: impl Into<String>) -> Response {
     )
         .into_response()
 }
-fn encoded(value: Value) -> Response {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonMode {
+    Generic,
+    Typed,
+}
+impl JsonMode {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value {
+            None | Some("") | Some("generic") => Ok(Self::Generic),
+            Some("typed") => Ok(Self::Typed),
+            _ => Err("invalid BENCH_JSON_MODE: expected generic or typed"),
+        }
+    }
+}
+// Declaration order preserves the generic Map's sorted key bytes. The full
+// decoded Value subtree is moved here, without an output Map/Value wrapper.
+#[derive(Serialize)]
+struct JsonEnvelope {
+    counter: i64,
+    data: Value,
+    id: String,
+}
+
+fn encoded(value: impl Serialize) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&value).expect("finite protocol values"),
@@ -203,6 +228,8 @@ async fn serve(
 ) -> Result<Option<cpu_work::FinalReceipt>, Box<dyn std::error::Error>> {
     let cpu_workers = runtime_plan.cpu_workers;
     let pg_mode = pg_mode::parse(std::env::var("BENCH_PG_MODE").ok().as_deref())?;
+    let pg_api = pg_mode::Api::parse(std::env::var("BENCH_PG_API").ok().as_deref())?;
+    let json_mode = JsonMode::parse(std::env::var("BENCH_JSON_MODE").ok().as_deref())?;
     let active = bounded("BENCH_MAX_ACTIVE", 1024, 1, 65536);
     let pending = bounded("BENCH_MAX_PENDING", 128, 1, 65536);
     let db_slots = bounded("BENCH_DB_POOL", 16, 1, 1024);
@@ -235,6 +262,8 @@ async fn serve(
         runtime_plan,
         counters: Counters::new(),
         pg_mode,
+        pg_api,
+        json_mode,
         db,
         peer: bounded("BENCH_PEER_PORT", 1, 1, 65535) as u16,
     });
@@ -358,6 +387,15 @@ async fn admission(State(app): State<Arc<App>>, mut request: Request, next: Next
 }
 async fn metrics(State(app): State<Arc<App>>) -> Response {
     let mut snapshot = app.counters.snapshot();
+    snapshot["json_mode"] = json!(match app.json_mode {
+        JsonMode::Generic => "generic",
+        JsonMode::Typed => "typed",
+    });
+    snapshot["pg_api"] = json!(app.pg_api.name());
+    snapshot["pg_mode"] = json!(match app.pg_mode {
+        pg_mode::Mode::Normal => "normal",
+        pg_mode::Mode::ResetEquivalent => "reset-equivalent",
+    });
     snapshot["cpu_mode"] = json!(app.cpu_config.mode.name());
     snapshot["cpu_chunk"] = json!(app.cpu_config.chunk);
     snapshot["event_interval"] = json!(app.cpu_config.event_interval);
@@ -414,11 +452,19 @@ async fn execute(app: Arc<App>, request: Request) -> Result<Response, Failure> {
                 .ok_or_else(|| invalid("invalid envelope"))?
                 .remove("data")
                 .ok_or_else(|| invalid("missing data"))?;
-            let mut envelope = serde_json::Map::with_capacity(3);
-            envelope.insert("id".into(), Value::String(rid));
-            envelope.insert("counter".into(), Value::from(counter + 1));
-            envelope.insert("data".into(), data);
-            encoded(Value::Object(envelope))
+            if app.json_mode == JsonMode::Typed {
+                encoded(JsonEnvelope {
+                    counter: counter + 1,
+                    data,
+                    id: rid,
+                })
+            } else {
+                let mut envelope = serde_json::Map::with_capacity(3);
+                envelope.insert("id".into(), Value::String(rid));
+                envelope.insert("counter".into(), Value::from(counter + 1));
+                envelope.insert("data".into(), data);
+                encoded(Value::Object(envelope))
+            }
         }
         "/work" => {
             let work = query
@@ -544,7 +590,13 @@ async fn execute(app: Arc<App>, request: Request) -> Result<Response, Failure> {
                 .as_ref()
                 .ok_or_else(|| failure("BENCH_DB_URL is required"))?;
             let _count = Count::new(&app.counters.waiting_db);
-            if app.pg_mode == pg_mode::Mode::ResetEquivalent {
+            if app.pg_api == pg_mode::Api::TypedTextKey {
+                let key_text = query.get("key").expect("validated key");
+                let (id, label, score) = pg_mode::query_typed_text_key(db, key_text, app.pg_mode)
+                    .await
+                    .map_err(failure)?;
+                encoded(json!({"id":id,"label":label,"score":score,"rid":rid}))
+            } else if app.pg_mode == pg_mode::Mode::ResetEquivalent {
                 let (id, label, score) = pg_mode::query_reset_equivalent(db, key)
                     .await
                     .map_err(failure)?;
@@ -576,4 +628,29 @@ async fn execute(app: Arc<App>, request: Request) -> Result<Response, Failure> {
         }
         _ => text(StatusCode::NOT_FOUND, "not found"),
     })
+}
+
+#[cfg(test)]
+mod typed_json_tests {
+    use super::*;
+    #[test]
+    fn explicit_typed_json_preserves_the_full_subtree_and_bytes() {
+        assert_eq!(JsonMode::parse(None), Ok(JsonMode::Generic));
+        assert_eq!(JsonMode::parse(Some("typed")), Ok(JsonMode::Typed));
+        assert!(JsonMode::parse(Some("TYPED")).is_err());
+        let mut decoded:Value=serde_json::from_str(r#"{"counter":7,"data":{"unicode":"中文🙂","items":[true,null,{"nested":[1,2,"\u0000"]}]}}"#).unwrap();
+        let counter = decoded["counter"].as_i64().unwrap();
+        let data = decoded.as_object_mut().unwrap().remove("data").unwrap();
+        let expected = json!({"counter":counter+1,"data":data.clone(),"id":"123"});
+        let actual = JsonEnvelope {
+            counter: counter + 1,
+            data,
+            id: "123".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&actual).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+        assert!(decoded.get("data").is_none());
+    }
 }
