@@ -14986,7 +14986,7 @@ invalid_integer:
  * close with more than 64 waiters; no subsequent release is required. */
 static void ku_pg_client_signal_locked(KuPgClient* p, int all) {
   if (all) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv);
-  size_t remaining=all ? p->waiters : (p->waiters != 0);
+  size_t remaining=p->waiters;
   while (remaining) {
     KuPgAsyncWaiter* batch[64]; size_t count=0;
     for (KuPgAsyncWaiter* node=p->async_head;node && count<64u && count<remaining;node=node->next) {
