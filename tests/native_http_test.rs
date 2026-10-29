@@ -3696,6 +3696,22 @@ int main(void) {
   input=(KuHttpInput){0};input.budget=&budget;budget.limit=1;
   CHECK(ku_http_parse_complete_header(server,plain,strlen(plain),&input)==503);
   ku_http_input_drop(&input);CHECK(!budget.current);
+  /* Owner retirement schedules one nonblocking I/O turn without sending a
+     self wake. An external producer still leaves an observable wake even if
+     owner-local work is already pending. */
+  CHECK(ku_http_net_init()==0);KuHttpWake wake={0};CHECK(ku_http_wake_init(&wake));
+  KuHttpQueue queue={0};queue.wake=&wake;KuHttpLoopOwner owner={0};owner.wake=&wake;
+  ku_http_current_loop=&owner;
+  for(int i=0;i<16;i++)ku_http_queue_notify(&queue);
+  KuHttpPollFd item={0};item.fd=wake.read_socket;item.events=KU_HTTP_POLL_READ;
+  CHECK(ku_http_poll(&item,1,0)==0 && queue.owner_work_pending);
+  CHECK(ku_http_queue_take_owner_work(&queue)==1 && !ku_http_queue_take_owner_work(&queue));
+  ku_http_queue_notify(&queue);ku_http_current_loop=NULL;
+  ku_http_queue_notify(&queue);item.revents=0;
+  CHECK(ku_http_poll(&item,1,0)==1 && (item.revents&KU_HTTP_POLL_READ));
+  CHECK(ku_http_queue_take_owner_work(&queue)==1);
+  ku_http_wake_drain(&wake);item.revents=0;CHECK(ku_http_poll(&item,1,0)==0);
+  ku_http_wake_close(&wake);ku_http_net_cleanup();
   ku_http_mutex_destroy(&budget.lock);ku_http_server_free(server);
   CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   puts("http-route-snapshot-owned-validation-budget-ok");return 0;

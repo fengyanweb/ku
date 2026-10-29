@@ -1572,7 +1572,16 @@ typedef struct KuHttpQueue {
   KuHttpMutex lock;
   KuHttpCondition not_empty;
   KuHttpWake* wake;
+  int owner_work_pending; /* Only the matching event owner reads/writes this. */
 } KuHttpQueue;
+static int ku_http_queue_is_current_owner(const KuHttpQueue* queue);
+static void ku_http_queue_notify(KuHttpQueue* queue) {
+  if(ku_http_queue_is_current_owner(queue)) queue->owner_work_pending=1;
+  else ku_http_wake_notify(queue->wake);
+}
+static int ku_http_queue_take_owner_work(KuHttpQueue* queue) {
+  int pending=queue->owner_work_pending;queue->owner_work_pending=0;return pending;
+}
 struct KuHttpJob {
   KuAtomicRefcount owners;
   KuHttpMutex lock;
@@ -1628,7 +1637,7 @@ static void ku_http_job_release(KuHttpJob* job) {
   }
   /* Release publication precedes wake, including the non-final worker owner.
      ClosedWaitingJob can now see the actual remaining owner count. */
-  ku_http_wake_notify(queue->wake);
+  ku_http_queue_notify(queue);
 }
 static int ku_http_job_only_owner(KuHttpJob* job) {
   /* The calling connection already owns a reference. The only additional
@@ -1654,14 +1663,14 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
   job->handler_deadline = __ku_handler_deadline;
   job->started = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_wake_notify(job->queue->wake);
+  ku_http_queue_notify(job->queue);
 }
 static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   ku_http_mutex_lock(&job->lock);
   int cancelled = job->cancelled || ku_http_now_ms() >= job->request_deadline;
   if (cancelled) { job->cancelled = 1; job->completed = 1; }
   ku_http_mutex_unlock(&job->lock);
-  if (cancelled) { ku_http_input_drop(&job->input); ku_http_wake_notify(job->queue->wake); return; }
+  if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_notify(job->queue); return; }
   ku_http_failure_current=(KuHttpFailure){0};
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
   KuHttpFailure failure=ku_http_failure_current;
@@ -1676,7 +1685,7 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   job->response = response;
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_wake_notify(job->queue->wake);
+  ku_http_queue_notify(job->queue);
 }
 static int ku_http_queue_push(KuHttpQueue* queue, KuHttpJob* job) {
   int accepted = 0;
@@ -1712,7 +1721,7 @@ static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
     ku_http_mutex_unlock(&job->lock);
   }
   ku_http_mutex_unlock(&queue->lock);
-  if (job) ku_http_wake_notify(queue->wake);
+  if (job) ku_http_queue_notify(queue);
   return job;
 }
 
@@ -2772,6 +2781,9 @@ static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint
 }
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
+static int ku_http_queue_is_current_owner(const KuHttpQueue* queue) {
+  return ku_http_current_loop && ku_http_current_loop->wake==queue->wake;
+}
 static void ku_http_connection_identity(KuHttpConnection* connection) {
   KuHttpLoopOwner* owner=ku_http_current_loop;
   connection->connection_slot=UINT64_MAX;
@@ -4208,12 +4220,17 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       ku_http_poll_add(poll_items,&poll_count,(KuHttpSocket)net_interests[i].socket_value,events);
     }
 #endif
+    /* Self-publication is owner-local. Consume it only at an actual I/O turn,
+     * after maintenance and FIFO admission, so no pending work is put to sleep.
+     * Cross-thread publications still use the original wake protocol. */
+    int owner_work=ku_http_queue_take_owner_work(&queue);
     int wait_ms = -1;
     if (nearest != ~0ULL) {
       now = ku_http_now_ms();
       unsigned long long remaining = nearest > now ? nearest - now : 0;
       wait_ms = remaining > (unsigned long long)INT_MAX ? INT_MAX : (int)remaining;
     }
+    if(owner_work)wait_ms=0;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     /* Only already-ready computation can defer an empty nonblocking probe.
      * Every subturn above still observes group close, Task deadlines, response
@@ -4224,7 +4241,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      * Fresh listener/peer readiness can wait only for this bounded batch;
      * its bytes and every wake publication remain registered and unconsumed. */
     int task_io_ready=task_deadline==0u && wait_ms==0 && active.count;
-    int task_io_structural_urgent=!task_io_ready || !started || !listening || listen_failure
+    int task_io_structural_urgent=owner_work || !task_io_ready || !started || !listening || listen_failure
         || pending.count
         || rejection.phase!=KU_HTTP_IO_FREE || now>=health_deadline;
 #if defined(KU_HTTP_HAS_TASK_NET)
