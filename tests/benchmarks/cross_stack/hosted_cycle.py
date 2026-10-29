@@ -5,7 +5,7 @@ No product patch, remote dispatch, SDK matrix, installation or release operation
 from __future__ import annotations
 import argparse, copy, gzip, hashlib, io, json, os
 from pathlib import Path
-import platform, re, shutil, signal, subprocess, tarfile, time
+import platform, pwd, re, shutil, signal, subprocess, sys, tarfile, time
 import build_linux as bl
 import focus_cycle as fc
 import database as db
@@ -236,6 +236,101 @@ def run(a,state):
         state['database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
 
 
+def compiler_plan(versions):
+    names=['B','KO3','KThin','KPGO','R','RThin','RPGO']
+    orders=[names,names[2:]+names[:2],names[4:]+names[:4]]
+    schedule=[dict(phase='explore',workload=w,rate=r,contract='compiler',orders=orders,warmup_seconds=5,score_seconds=15)
+        for w,r in [('cpu',80),('json_object',500)]]
+    schedule.append(dict(phase='explore',workload='cpu',rate=80,contract='direct-diagnostic',
+        orders=[['BD','B'],['B','BD'],['BD','B']],warmup_seconds=5,score_seconds=15))
+    return dict(versions=versions,resources=RESOURCES,quality_policy=POLICY,rates={'cpu':80,'json_object':500},
+        schedule=schedule,targets=[],resume={'maximum_replacements':0},stop_after_consecutive_unusable_windows=2,
+        scope='48 diagnostic comparison windows plus3 independent controls; no formal/capacity/stability; default remainsO2/helpers')
+
+
+def compiler(a,state):
+    """Existing compiler CLI under workload uid; HTTP train/heldout, then one short plan."""
+    import compile_variants as cv
+    import profile_training as pt
+    from linux_harness import Domain
+    if os.geteuid()!=0:raise ValueError('compiler requires root coordinator; compilation drops to build uid/gid')
+    boot=hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()
+    if state.setdefault('compiler_boot_sha256',boot)!=boot:raise ValueError('compiler resume across boots forbidden')
+    directory=a.root/'compiler';directory.mkdir(exist_ok=True);os.chown(directory,state['uid'],state['gid'])
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);old_fc,old_pt=fc.Harness,pt.Harness
+    private=None;environment=None
+    class HostedHarness(old_fc):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+            if environment:self.manifest['environment_qualification']=environment
+    def execute(label,plan):
+        path=directory/(label+'-plan.json');output=directory/label
+        if path.exists() and load(path)!=plan:raise ValueError('compiler plan changed; fresh root required')
+        if not path.exists():save(path,plan)
+        return step(state,a.root,'compiler-'+label,lambda:fc.execute(path,output,'all',resume=(output/'identity.json').exists()),resume=True)
+    def tuned(name,stack,variant,training=None):
+        output=directory/name;argv=[sys.executable,str(Path(cv.__file__).resolve()),'--manifest',str(a.root/('B' if stack=='ku' else 'R')/'manifest.json'),
+            '--output',str(output),'--tools',str(a.tools),'--stack',stack,'--variant',variant]
+        if training:argv+=['--training-receipt',str(training)]
+        def call():
+            h=old_fc(a.root/'B',directory/('build-coordinator-'+name));domain=Domain(h,'compiler-build',2,6*GIB,'0-1');process=None
+            env=cv.clean_environment(a.tools);env['HOME']=pwd.getpwuid(state['uid']).pw_dir
+            try:
+                process=h.launch(argv,a.source,env,domain,directory/(name+'-command.log'))
+                if process.wait(timeout=1500)!=0:raise ValueError('compiler CLI failed; retained log: '+name)
+                receipt=load(output/'build.json')
+                if receipt.get('passed') is not True:raise ValueError('compiler receipt not passed: '+name)
+                return {'passed':True,'goal_status':'unknown','build':str(output/'build.json'),'build_sha256':sha(output/'build.json'),
+                    'command':argv,'uid':h.uid,'gid':h.gid,'HOME':env['HOME'],'build_limits':domain.settings}
+            finally:
+                domain.kill()
+                if process is not None and process.poll() is None:process.wait(timeout=5)
+                if not domain.remove():raise RuntimeError('owned compiler domain not removed')
+                h.close()
+        step(state,a.root,'compiler-build-'+name,call)
+        return output/'manifest.json'
+    try:
+        fixture.start();private=load(fixture.manifest_path);fc.Harness=pt.Harness=HostedHarness
+        versions=copy.deepcopy(load(a.root/'frozen-plan.json')['versions'])
+        control=compiler_plan(versions);control.update(schedule=[dict(phase='control',workload='json_object',rate=500,
+            orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
+        control.pop('stop_after_consecutive_unusable_windows')
+        observed=execute('control',control);environment=environment_record(observed,directory/'environment-qualification.json')
+        manifests={'KO3':tuned('KO3','ku','o3'),'KThin':tuned('KThin','ku','thin'),'RThin':tuned('RThin','rust','thin')}
+        validation={}
+        for stack,prefix in [('ku','K'),('rust','R')]:
+            generated=tuned(prefix+'Generate',stack,'generate');training=directory/('http-train-'+stack)
+            step(state,a.root,'compiler-http-train-'+stack,lambda m=generated,o=training,s=stack:pt.run_http(m,o,s,'train',a.tools))
+            name=prefix+'PGO';manifests[name]=tuned(name,stack,'use',training/'receipt.json');heldout=directory/('http-heldout-'+stack)
+            validation[stack]=step(state,a.root,'compiler-http-heldout-'+stack,
+                lambda m=manifests[name],o=heldout,s=stack:pt.run_http(m,o,s,'validate',a.tools))
+        for name,path in manifests.items():
+            m=load(path);stack='ku' if name.startswith('K') else 'rust';binary=m['stacks'][stack]['command'][0]
+            versions[name]=dict(root=str(path.parent),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary))
+        plan=compiler_plan(versions);save(directory/'identities.json',{n:fc.version_identity(plan,n) for n in ['B','R','BD',*manifests]})
+        result=execute('comparison',plan);comparisons=[]
+        pairs=[('KO3','B'),('KThin','B'),('KPGO','B'),('RThin','R'),('RPGO','R'),('KO3','R'),('KThin','RThin'),('KPGO','RPGO'),('BD','B')]
+        for workload in ['cpu','json_object']:
+            for left,right in pairs:
+                contract='direct-diagnostic' if left=='BD' else 'compiler'
+                if left=='BD' and workload!='cpu':continue
+                rows=[r for r in result['rows'] if r['workload']==workload and r['contract']==contract]
+                groups=[{r['name']:r for r in rows if r['group']==g} for g in [1,2,3]]
+                complete=[g for g in groups if left in g and right in g]
+                comparisons.append({'workload':workload,'numerator':left,'denominator':right,'contract':contract,
+                    'interval':fc.paired_interval([fc.metric(g[left],'cpu_us') for g in complete],[fc.metric(g[right],'cpu_us') for g in complete],minimum=3),
+                    'observational_quality_passed':len(complete)==3 and all(r.get('status')=='observed' and r.get('arrival_schedule_quality')==r.get('environment_quality')=='pass' for g in complete for r in [g[left],g[right]]),
+                    'goal_status':'unknown','formal_qualified':False,'default_changed':False})
+        save(directory/'comparisons.json',{'comparisons':comparisons,'HTTP_train_and_heldout':validation,'goal_status':'unknown'})
+        return dict(execution_complete=result['execution_complete'],goal_status='unknown',comparisons=str(directory/'comparisons.json'),
+            environment_quality=environment['quality'],candidate_accepted=False,default_changed=False,
+            functional_acceptance=bool(result['rows']) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in result['rows']))
+    finally:
+        fc.Harness,pt.Harness=old_fc,old_pt
+        state['compiler_database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
+
+
 def acceptance_result(final, capacity, stability, comparison_goal):
     """Capacity/recovery and continuous evidence are independent required axes."""
     rows=capacity.get('capacity',[]);scenes=[]
@@ -274,10 +369,10 @@ def evidence_file(path, root):
     parts=path.relative_to(root).parts
     if len(parts)>2 and parts[1]=='src' and parts[2:5]!=('tests','benchmarks','cross_stack'):return False
     if 'dependencies' in parts:return True
-    if any(x in parts for x in ['tools','cli-cache','rust-cargo','ku-cargo','data','socket','.git','__pycache__']):
-        return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:]==('rust-cargo','release','ku-cross-stack-rust')
+    if any(x in parts for x in ['tools','cli-cache','rust-cargo','ku-cargo','target','data','socket','.git','__pycache__']):
+        return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:] in (('rust-cargo','release','ku-cross-stack-rust'),('target','release','ku-cross-stack-rust'))
     return path.name not in ('ku-performance-v2-evidence.tar.gz','archive.json') and not path.name.endswith('.writing') and (
-        path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum') or 'bin' in parts or path.name=='libpq.so')
+        path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or 'bin' in parts or path.name=='libpq.so')
 
 
 def full_archive(a,state):
@@ -328,7 +423,7 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','compiler','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -342,8 +437,8 @@ def main(argv=None):
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
-        if a.phase=='run':signal.alarm(130*60-30)
-        result=step(state,a.root,a.phase,lambda:(build if a.phase=='build' else run)(a,state),resume=a.phase=='run')
+        if a.phase in ('run','compiler'):signal.alarm(130*60-30)
+        result=step(state,a.root,a.phase,lambda:(build if a.phase=='build' else compiler if a.phase=='compiler' else run)(a,state),resume=a.phase in ('run','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
     print(json.dumps(result));return 0
 

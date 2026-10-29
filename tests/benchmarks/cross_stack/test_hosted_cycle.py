@@ -1,6 +1,8 @@
 """Pure receipts/plans. No compiler, cgroup, database or service is started."""
 from pathlib import Path
 import json
+import os
+from contextlib import ExitStack
 import tarfile
 import tempfile
 import types
@@ -116,6 +118,64 @@ class HostedCycleTests(unittest.TestCase):
             self.assertFalse(result['complete']);self.assertEqual(result['goal_status'],'blocked')
             self.assertTrue(path.exists())
             with tarfile.open(result['path']) as tar:self.assertIn('archive-failure.json',tar.getnames())
+
+
+    def test_compiler_phase_has_48_short_balanced_comparisons_no_formal_or_capacity(self):
+        versions=self.plan()['versions']
+        for n in ['KO3','KThin','KPGO','RThin','RPGO']:versions[n]={'root':'/unused/'+n}
+        plan=h.compiler_plan(versions);jobs=fc.jobs_for(plan,'all')
+        self.assertEqual(len(jobs),48)
+        self.assertTrue(all(j['phase']=='explore' and j['warmup']==5 and j['duration']==15 for j in jobs))
+        self.assertEqual(sum(j['contract']=='direct-diagnostic' for j in jobs),6)
+        self.assertFalse(plan['targets']);self.assertNotIn('capacity',plan);self.assertNotIn('stability',plan)
+        self.assertEqual(plan['stop_after_consecutive_unusable_windows'],2)
+        for entry in plan['schedule'][:2]:
+            for name in entry['orders'][0]:self.assertEqual(len({order.index(name) for order in entry['orders']}),3)
+
+    def test_compiler_http_training_both_sides_and_harness_restored_on_failure(self):
+        import profile_training as pt
+        for failed in [False,True]:
+            with self.subTest(failed=failed),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);(root/'compiler').mkdir();binary=root/'ELF';binary.write_bytes(b'fixture')
+                fixture=root/'fixture/manifest.json';h.save(fixture,{'db_url':'fixture','db_cgroup':'/unused'})
+                base=self.plan();h.save(root/'frozen-plan.json',base)
+                state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}}
+                a=types.SimpleNamespace(root=root,source=root,tools=root)
+                def fake_step(state,root,name,call,**unused):
+                    if name.startswith('compiler-build-'):
+                        variant=name.removeprefix('compiler-build-');stack='ku' if variant.startswith('K') else 'rust'
+                        h.save(root/'compiler'/variant/'manifest.json',{'candidate_base':'1'*40,'stacks':{stack:{'command':[str(binary)]}}})
+                        return {'passed':True}
+                    return call()
+                calls=[]
+                def profile(manifest,out,stack,mode,tools):
+                    calls.append((stack,mode))
+                    if failed and mode=='validate':raise ValueError('heldout failure retained')
+                    return {'passed':True,'mode':mode}
+                old_fc,old_pt=fc.Harness,pt.Harness
+                read_bytes=Path.read_bytes
+                patches.enter_context(patch.object(Path,'read_bytes',lambda p:b'fixture-boot' if str(p)=='/proc/sys/kernel/random/boot_id' else read_bytes(p)))
+                owned=types.SimpleNamespace(start=lambda:None,manifest_path=fixture,stop=lambda:{'stopped':True})
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                patches.enter_context(patch.object(h.db,'Database',return_value=owned))
+                patches.enter_context(patch.object(h,'step',side_effect=fake_step))
+                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'unknown'}))
+                patches.enter_context(patch.object(fc,'execute',return_value={'rows':[],'execution_complete':False}))
+                patches.enter_context(patch.object(fc,'version_identity',return_value={'fixture':True}))
+                patches.enter_context(patch.object(pt,'run_http',side_effect=profile))
+                if failed:
+                    with self.assertRaisesRegex(ValueError,'heldout failure'):h.compiler(a,state)
+                else:
+                    result=h.compiler(a,state);self.assertFalse(result['functional_acceptance']);self.assertFalse(result['default_changed'])
+                    self.assertEqual(calls,[('ku','train'),('ku','validate'),('rust','train'),('rust','validate')])
+                self.assertIs(fc.Harness,old_fc);self.assertIs(pt.Harness,old_pt)
+                self.assertEqual(state['compiler_database_cleanup'],{'stopped':True})
+
+    def test_compiler_archive_keeps_profile_and_elf_but_excludes_target_cache(self):
+        root=Path('/unused')
+        self.assertTrue(h.evidence_file(root/'compiler/RPGO/target/release/ku-cross-stack-rust',root))
+        self.assertFalse(h.evidence_file(root/'compiler/RPGO/target/release/.fingerprint/dependency.json',root))
+        self.assertTrue(h.evidence_file(root/'compiler/http-train-rust/merged.profdata',root))
 
 
 if __name__=='__main__':unittest.main()
