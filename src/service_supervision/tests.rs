@@ -119,48 +119,124 @@ fn tokens_are_bounded_and_per_generation() {
     assert_ne!(first, second);
 }
 
+#[derive(Debug, Default)]
+struct NativeMetricsFixtureEvidence {
+    accepted: bool,
+    request_headers_read: bool,
+    response_headers_written: bool,
+    body_bytes_written: usize,
+    stages: Vec<(&'static str, Duration)>,
+    failure: Option<(&'static str, io::ErrorKind)>,
+}
+
+impl NativeMetricsFixtureEvidence {
+    fn describe(&self) -> String {
+        format!(
+            "accepted={}, request_headers_read={}, response_headers_written={}, body_bytes_written={}, stages={:?}, failure={:?}",
+            self.accepted,
+            self.request_headers_read,
+            self.response_headers_written,
+            self.body_bytes_written,
+            self.stages,
+            self.failure
+        )
+    }
+}
+
 fn native_metrics_fixture(
     body: String,
     length: usize,
     slow: bool,
-) -> (SocketAddr, thread::JoinHandle<(bool, bool)>) {
+) -> (SocketAddr, thread::JoinHandle<NativeMetricsFixtureEvidence>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let began = Instant::now();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
+        let mut evidence = NativeMetricsFixtureEvidence::default();
+        evidence.stages.push(("worker_ready", began.elapsed()));
+        // The single readiness message never waits for a test which has
+        // already retired. A missing receiver also makes the worker retire.
+        if ready_tx.send(()).is_err() {
+            evidence.failure = Some(("worker_ready", io::ErrorKind::BrokenPipe));
+            return evidence;
+        }
         let Some(mut stream) = accept_fixture(listener) else {
-            return (false, false);
+            evidence.failure = Some(("accept", io::ErrorKind::TimedOut));
+            return evidence;
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let request = read_headers(&mut stream, MAX_CONTROL_REQUEST).unwrap();
-        assert!(request.starts_with("GET /__ku/metrics HTTP/1.1\r\n"));
-        assert!(request.contains(&format!("X-Ku-Control-Token: {}\r\n", "d".repeat(64))));
-        if write!(
+        evidence.accepted = true;
+        evidence.stages.push(("accepted", began.elapsed()));
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(1))) {
+            evidence.failure = Some(("read_timeout_setup", error.kind()));
+            return evidence;
+        }
+        if let Err(error) = stream.set_write_timeout(Some(Duration::from_millis(100))) {
+            evidence.failure = Some(("write_timeout_setup", error.kind()));
+            return evidence;
+        }
+        let request = match read_headers_until(
+            &mut stream,
+            MAX_CONTROL_REQUEST,
+            Instant::now() + Duration::from_secs(1),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                evidence.failure = Some(("request_headers", error.kind()));
+                return evidence;
+            }
+        };
+        evidence.request_headers_read = true;
+        evidence
+            .stages
+            .push(("request_headers_read", began.elapsed()));
+        if !request.starts_with("GET /__ku/metrics HTTP/1.1\r\n")
+            || !request.contains(&format!("X-Ku-Control-Token: {}\r\n", "d".repeat(64)))
+        {
+            evidence.failure = Some(("request_headers_validation", io::ErrorKind::InvalidData));
+            return evidence;
+        }
+        if let Err(error) = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: keep-alive\r\n\r\n"
-        )
-        .is_err()
-        {
-            return (true, false);
+        ) {
+            evidence.failure = Some(("response_headers", error.kind()));
+            return evidence;
         }
+        evidence.response_headers_written = true;
+        evidence
+            .stages
+            .push(("response_headers_written", began.elapsed()));
         if slow {
-            let mut body_started = false;
             for byte in body.bytes() {
-                if stream.write_all(&[byte]).is_err() {
-                    break;
+                if let Err(error) = stream.write_all(&[byte]) {
+                    evidence.failure = Some(("response_body", error.kind()));
+                    return evidence;
                 }
-                body_started = true;
+                if evidence.body_bytes_written == 0 {
+                    evidence.stages.push(("first_body_byte", began.elapsed()));
+                }
+                evidence.body_bytes_written += 1;
                 thread::sleep(Duration::from_millis(20));
             }
-            (true, body_started)
         } else {
-            (true, stream.write_all(body.as_bytes()).is_ok())
+            if let Err(error) = stream.write_all(body.as_bytes()) {
+                evidence.failure = Some(("response_body", error.kind()));
+                return evidence;
+            }
+            evidence.body_bytes_written = body.len();
         }
+        evidence.stages.push(("body_finished", began.elapsed()));
+        evidence
     });
+    if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(1)) {
+        drop(ready_rx);
+        let evidence = worker.join().unwrap();
+        panic!(
+            "native metrics fixture did not become ready: {error}; {}",
+            evidence.describe()
+        );
+    }
     (address, worker)
 }
 
@@ -173,10 +249,10 @@ fn native_metrics_has_a_separate_large_bound_without_changing_health() {
         address,
         &"d".repeat(64),
         Instant::now() + Duration::from_secs(1),
-    )
-    .unwrap();
-    assert_eq!(actual, body);
-    worker.join().unwrap();
+    );
+    let evidence = worker.join().unwrap();
+    assert!(actual.is_ok(), "client={actual:?}; {}", evidence.describe());
+    assert_eq!(actual.unwrap(), body, "{}", evidence.describe());
 }
 
 #[test]
@@ -187,17 +263,18 @@ fn native_metrics_rejects_oversize_and_token_echo() {
     ] {
         let length = if body.len() > 2 { body.len() } else { length };
         let (address, worker) = native_metrics_fixture(body, length, false);
-        assert_eq!(
-            native_metrics_at(
-                address,
-                &"d".repeat(64),
-                Instant::now() + Duration::from_secs(1)
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::InvalidData
+        let result = native_metrics_at(
+            address,
+            &"d".repeat(64),
+            Instant::now() + Duration::from_secs(1),
         );
-        worker.join().unwrap();
+        let evidence = worker.join().unwrap();
+        assert_eq!(
+            result.as_ref().err().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData),
+            "client={result:?}; {}",
+            evidence.describe()
+        );
     }
 }
 
@@ -207,22 +284,39 @@ fn native_metrics_body_consumes_the_original_remaining_deadline() {
     // A deadline may expire before connect when a parallel test is descheduled.
     // The fixture must also retire when no client ever reaches accept.
     let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
+    let result = native_metrics_at(address, &"d".repeat(64), Instant::now());
+    let evidence = worker.join().unwrap();
     assert_eq!(
-        native_metrics_at(address, &"d".repeat(64), Instant::now())
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::TimedOut
+        result.as_ref().err().map(io::Error::kind),
+        Some(io::ErrorKind::TimedOut),
+        "client={result:?}; {}",
+        evidence.describe()
     );
-    let (accepted, _) = worker.join().unwrap();
-    assert!(!accepted, "expired request must not connect");
+    assert!(
+        !evidence.accepted,
+        "expired request must not connect: {}",
+        evidence.describe()
+    );
     let (address, worker) = native_metrics_fixture(body.clone(), body.len(), true);
     let began = Instant::now();
     let deadline = began + Duration::from_millis(100);
     thread::sleep(Duration::from_millis(40));
-    assert!(native_metrics_at(address, &"d".repeat(64), deadline).is_err());
-    assert!(began.elapsed() < Duration::from_millis(400));
-    let (_, body_started) = worker.join().unwrap();
-    assert!(body_started, "slow response body was not exercised");
+    let client_began = Instant::now();
+    let remaining = deadline.checked_duration_since(client_began);
+    let result = native_metrics_at(address, &"d".repeat(64), deadline);
+    let elapsed = began.elapsed();
+    let evidence = worker.join().unwrap();
+    let diagnostic = format!(
+        "client={result:?}, before_client={:?}, remaining={remaining:?}, elapsed={elapsed:?}; {}",
+        client_began.duration_since(began),
+        evidence.describe()
+    );
+    assert!(result.is_err(), "{diagnostic}");
+    assert!(elapsed < Duration::from_millis(400), "{diagnostic}");
+    assert!(
+        evidence.body_bytes_written > 0,
+        "slow response body was not exercised (fixture precondition unmet): {diagnostic}"
+    );
 }
 
 #[test]
