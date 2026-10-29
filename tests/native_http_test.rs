@@ -3596,6 +3596,133 @@ int main(int argc,char** argv) {
 }
 
 #[test]
+fn native_http_validates_unmaterialized_headers_and_owns_route_snapshot() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-route-snapshot");
+    let mut generated = native_c_harness::emit_c(
+        directory.path(),
+        r#"
+import "std.http"
+fn main(): null! {
+    app = http.server()
+    app.get("/", fn() { return http.text("ok") })
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#,
+    );
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_application_main(void) {",
+        1,
+    );
+    generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!(
+            "{}\ntypedef struct KuString {{",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    let anchor = "static int ku_http_parse_complete_header(";
+    assert_eq!(generated.matches(anchor).count(), 1);
+    generated = generated.replacen(
+        anchor,
+        &format!(
+            r#"
+static int fixture_fail_token;
+static void* fixture_token_allocate(size_t bytes) {{
+  if(fixture_fail_token) {{ fixture_fail_token=0;return NULL; }}
+  return ku_perf_malloc(bytes);
+}}
+{anchor}"#
+        ),
+        1,
+    );
+    generated = generated.replace(
+        "(KuHttpRouteToken*)malloc(private_bytes)",
+        "(KuHttpRouteToken*)fixture_token_allocate(private_bytes)",
+    );
+    generated.push_str(r#"
+#define CHECK(x) do { if(!(x)) { fprintf(stderr,"route snapshot %d: %s\n",__LINE__,#x); return 91; } } while(0)
+#define STR(x) ku_string_static((const uint8_t*)(x),strlen(x))
+int main(void) {
+  KuHttpServer* server=ku_http_server_new();server->max_body_bytes=4;
+  ku_http_server_add_route(server,STR("GET"),STR("/v/{id}"),(void*)(uintptr_t)1,NULL,0,0);
+  KuHttpBufferBudget budget={0};budget.limit=1048576;CHECK(ku_http_mutex_init(&budget.lock));
+  char header[256]="GET //v///hello/?q=x HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: old\r\nX-Ku-Control-Token: token\r\nX-Request-Id: trace\r\n\r\n";
+  KuHttpInput input={0};input.budget=&budget;
+  int parsed_status=ku_http_parse_complete_header(server,header,strlen(header),&input);
+  if(parsed_status!=0)fprintf(stderr,"unexpected parse status %d\n",parsed_status);
+  CHECK(parsed_status==0);
+  CHECK(input.route && !input.headers && input.route->param_count==1);
+  CHECK(input.route->invoke==(void*)(uintptr_t)1 && !input.route->arity);
+  CHECK(input.metadata_charge==budget.current);
+  memset(header,'z',sizeof(header));
+  /* Extend/reallocate the terminal handler array after parsing. The selection
+     owns its fields and target; neither parser bytes nor array slots survive. */
+  const char* methods[]={"POST","PUT","PATCH","DELETE","OPTIONS","HEAD","CUSTOM"};
+  for(size_t i=0;i<7;i++)ku_http_server_add_route(server,STR(methods[i]),STR("/v/{other}"),(void*)(uintptr_t)(2+i),NULL,1,0);
+  KuHttpHandler selected={0};const char* values[KU_HTTP_MAX_SEGS];size_t lengths[KU_HTTP_MAX_SEGS],count=0;
+  CHECK(ku_http_input_select(server,&input,&selected,values,lengths,&count)==200);
+  CHECK(selected.invoke==(void*)(uintptr_t)1 && selected.arity==0 && count==1);
+  CHECK(!strcmp(selected.param_names[0],"id") && lengths[0]==5 && !memcmp(values[0],"hello",5));
+  KuString token=ku_http_input_control_token(&input);
+  CHECK(token.len==5 && !memcmp(token.ptr,"token",5));
+  CHECK(input.route->rid_length==5 && !memcmp(input.target+input.route->rid_offset,"trace",5));
+  ku_http_input_drop(&input);CHECK(!budget.current);
+  const char* full="POST /v/a HTTP/1.1\r\nHost: local\r\nX-Test: value\r\nContent-Length: 0\r\n\r\n";
+  input=(KuHttpInput){0};input.budget=&budget;
+  CHECK(ku_http_parse_complete_header(server,full,strlen(full),&input)==0 && input.headers);
+  KuValue* host=ku_object_get(input.headers,STR("host"));CHECK(host && host->tag==KU_STR && host->as.s.len==5);
+  ku_http_input_drop(&input);CHECK(!budget.current);
+  const char* invalid[]={
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nHost: y\r\n\r\n",
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nContent-Length: 9999999999999999999999999999\r\n\r\n",
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
+    "GET /v/a HTTP/1.1\r\nHost: x\r\nInvalid: \xff\r\n\r\n"};
+  const int statuses[]={400,400,417,400,413,400};
+  for(size_t i=0;i<sizeof(statuses)/sizeof(statuses[0]);i++) {
+    input=(KuHttpInput){0};input.budget=&budget;
+    CHECK(ku_http_parse_complete_header(server,invalid[i],strlen(invalid[i]),&input)==statuses[i]);
+    ku_http_input_drop(&input);CHECK(!budget.current);
+  }
+  const char* plain="GET /v/a HTTP/1.1\r\nHost: x\r\n\r\n";
+  input=(KuHttpInput){0};input.budget=&budget;fixture_fail_token=1;
+  CHECK(ku_http_parse_complete_header(server,plain,strlen(plain),&input)==500);
+  ku_http_input_drop(&input);CHECK(!budget.current);
+  input=(KuHttpInput){0};input.budget=&budget;budget.limit=1;
+  CHECK(ku_http_parse_complete_header(server,plain,strlen(plain),&input)==503);
+  ku_http_input_drop(&input);CHECK(!budget.current);
+  ku_http_mutex_destroy(&budget.lock);ku_http_server_free(server);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("http-route-snapshot-owned-validation-budget-ok");return 0;
+}
+"#);
+    let path = directory.path().join("route.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "route")
+    else {
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"http-route-snapshot-owned-validation-budget-ok\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn native_http_sync_body_transfer_preserves_owner_and_budget_handoff() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
@@ -3627,6 +3754,7 @@ fn native_http_sync_body_transfer_preserves_owner_and_budget_handoff() {
 typedef struct { uint8_t* ptr; size_t len,capacity; uint8_t storage; } KuString;
 typedef struct { size_t current; } KuHttpBufferBudget;
 typedef struct { int unused; } KuObject;
+typedef struct KuHttpRouteToken KuHttpRouteToken;
 static size_t allocations,body_frees;
 static uintptr_t body_identity;
 static void* fixture_malloc(size_t bytes) { allocations++; return malloc(bytes); }

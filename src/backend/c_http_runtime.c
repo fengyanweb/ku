@@ -919,6 +919,37 @@ static unsigned long long ku_http_deadline_ms(uint32_t timeout_ms) {
   if (~0ULL - now < (unsigned long long)timeout_ms) return ~0ULL;
   return now + (unsigned long long)timeout_ms;
 }
+/* A request owns this compact selection together with its target bytes. Route
+ * callable/name allocations are immutable until server teardown; copying the
+ * callable fields avoids borrowing a reallocatable handler-array element.
+ * No pointer below refers to the parser's header buffer or stack. */
+typedef struct KuHttpRouteToken {
+  void* invoke; void* env; char** param_names;
+  uint32_t status;
+  uint16_t param_count;
+  uint8_t arity,returns_result;
+  uint16_t control_offset,control_length,rid_offset,rid_length;
+  uint8_t rid_truncated;
+  uint16_t ranges[];
+} KuHttpRouteToken;
+static int ku_http_select_route(KuHttpServer* server,const char* method,
+    const char* target,size_t path_len,KuHttpHandler** route,
+    const char** values,size_t* lengths,size_t* count) {
+  *route=NULL;*count=0;
+  if(!server->root)return 404;
+  const char* segments[KU_HTTP_MAX_SEGS];size_t sizes[KU_HTTP_MAX_SEGS],n=0;
+  for(size_t i=0;i<path_len;) {
+    while(i<path_len && target[i]=='/')i++;
+    size_t start=i;while(i<path_len && target[i]!='/')i++;
+    if(i==start)continue;
+    if(n==KU_HTTP_MAX_SEGS)return 414;
+    segments[n]=target+start;sizes[n++]=i-start;
+  }
+  *count=0;
+  *route=ku_http_trie_match(server->root,segments,sizes,n,0,method,values,lengths,count);
+  if(*route)return *count==(*route)->nparams?200:500;
+  return ku_http_trie_path_exists(server->root,segments,sizes,n,0)?405:404;
+}
 /* Shared-I/O request storage. No field borrows a connection buffer or worker
    stack. Once queued, the job owns this input through actual handler return. */
 static int ku_http_buffer_reserve(KuHttpBufferBudget* budget, size_t bytes);
@@ -932,11 +963,12 @@ typedef struct {
   char* body;
   size_t body_len;
   int keep_alive;
+  KuHttpRouteToken* route;
 } KuHttpInput;
 static void ku_http_input_drop(KuHttpInput* input) {
   if (!input) return;
   if (input->headers) ku_object_drop(input->headers);
-  free(input->target);
+  free(input->route ? (void*)input->route : (void*)input->target);
   free(input->body);
   ku_http_buffer_refund(input->budget, input->body_charge);
   ku_http_buffer_refund(input->budget, input->metadata_charge);
@@ -955,6 +987,37 @@ static KuStruct___ku_http_response ku_http_status_response(int64_t status, const
   response.content_type = ku_string_static((const uint8_t*)"text/plain; charset=utf-8", 25);
   response.body = ku_string_static((const uint8_t*)message, strlen(message));
   return response;
+}
+static KuString ku_http_input_control_token(const KuHttpInput* input) {
+  if(input->route)return (KuString){(uint8_t*)input->target+input->route->control_offset,
+      input->route->control_length,0,KU_STRING_STATIC};
+  KuValue* value=input->headers?ku_object_get(input->headers,
+      ku_string_static((const uint8_t*)"x-ku-control-token",18)):NULL;
+  return value && value->tag==KU_STR?value->as.s:(KuString){0};
+}
+static int ku_http_input_select(KuHttpServer* server,const KuHttpInput* input,
+    KuHttpHandler* selected,const char** values,size_t* lengths,size_t* count) {
+  *selected=(KuHttpHandler){0};*count=0;
+  if(input->route) {
+    const KuHttpRouteToken* token=input->route;
+    if(token->status!=200u)return (int)token->status;
+    if(token->param_count>KU_HTTP_MAX_SEGS || token->arity>1u || token->returns_result>2u)return 500;
+    selected->invoke=token->invoke;selected->env=token->env;selected->param_names=token->param_names;
+    selected->nparams=token->param_count;selected->arity=token->arity;
+    selected->returns_result=token->returns_result;*count=token->param_count;
+    for(size_t p=0;p<*count;p++) {
+      size_t offset=token->ranges[p*2u],length=token->ranges[p*2u+1u];
+      if(offset>input->path_len || length>input->path_len-offset)return 500;
+      values[p]=input->target+offset;lengths[p]=length;
+    }
+    return 200;
+  }
+  /* Compatibility for native consumers constructing an input directly. */
+  KuHttpHandler* route=NULL;
+  int status=ku_http_select_route(server,input->method,input->target,input->path_len,
+      &route,values,lengths,count);
+  if(route)*selected=*route;
+  return status;
 }
 /* Pure header interpretation, shared by every socket readiness turn. Framing
    and its byte-limit/CRLF precedence have already been checked by the owner.
@@ -987,6 +1050,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   unsigned long long content_length = 0;
   int content_length_overflow = 0;
   size_t header_fields=0;
+  size_t control_start=0,control_length=0,rid_start=0,rid_length=0;
   input->keep_alive = 1;
   { size_t i = (fl_end < hlen) ? fl_end + 2 : hlen;
     while (i < hlen) {
@@ -1007,6 +1071,12 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
         }
         while (vs < ve && (hdr[vs] == ' ' || hdr[vs] == '\t')) vs++;
         while (ve > vs && (hdr[ve - 1] == ' ' || hdr[ve - 1] == '\t')) ve--;
+        if(ku_http_name_eq(hdr+ls,colon-ls,"x-ku-control-token")) {
+          control_start=vs;control_length=ve-vs;
+        }
+        if(ku_http_name_eq(hdr+ls,colon-ls,"x-request-id")) {
+          rid_start=vs;rid_length=ve-vs;
+        }
         if (ku_http_name_eq(hdr + ls, colon - ls, "host")) {
           host_count++;
           if (host_count != 1 || vs == ve) { return 400; }
@@ -1054,19 +1124,48 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
      fit within the raw block length. Reserve before target/map construction;
      the pre-sized map header and buckets are included. No map growth or
      uncharged old/new rehash overlap occurs during header construction. */
-  size_t header_capacity=ku_http_map_capacity(header_fields);
-  size_t metadata_bound = target_len+1+hlen+sizeof(KuObject)+header_capacity*sizeof(KuEntry);
+  size_t path_len=0;
+  while(path_len<target_len && hdr[target_start+path_len]!='?')path_len++;
+  const char* param_values[KU_HTTP_MAX_SEGS];size_t param_lengths[KU_HTTP_MAX_SEGS],param_count=0;
+  KuHttpHandler* selected=NULL;
+  int route_status=ku_http_select_route(server,input->method,hdr+target_start,path_len,
+      &selected,param_values,param_lengths,&param_count);
+  int public_headers=!server->root || (selected && selected->arity==1);
+  size_t header_capacity=public_headers?ku_http_map_capacity(header_fields):0;
+  size_t control_bytes=control_length<=128u?control_length:0;
+  size_t rid_bytes=rid_length<48u?rid_length:48u;
+  size_t token_bytes=sizeof(KuHttpRouteToken)+param_count*2u*sizeof(uint16_t);
+  size_t private_bytes=token_bytes+target_len+1u+control_bytes+rid_bytes;
+  size_t metadata_bound = private_bytes+(public_headers?
+      hlen+sizeof(KuObject)+header_capacity*sizeof(KuEntry):0);
   if (!ku_http_buffer_reserve(input->budget, metadata_bound)) return 503;
   input->metadata_charge = metadata_bound;
-  char* target = (char*)malloc(target_len + 1);
-  if (!target) return 500;
+  KuHttpRouteToken* token=(KuHttpRouteToken*)malloc(private_bytes);
+  if(!token)return 500;
+  memset(token,0,sizeof(*token));input->route=token;
+  token->status=(uint32_t)route_status;token->param_count=(uint16_t)param_count;
+  if(selected) {
+    token->invoke=selected->invoke;token->env=selected->env;token->param_names=selected->param_names;
+    token->arity=(uint8_t)selected->arity;token->returns_result=(uint8_t)selected->returns_result;
+  }
+  for(size_t p=0;p<param_count;p++) {
+    token->ranges[2u*p]=(uint16_t)(param_values[p]-(hdr+target_start));
+    token->ranges[2u*p+1u]=(uint16_t)param_lengths[p];
+  }
+  char* target=(char*)token+token_bytes;
   input->target = target;
   memcpy(target, hdr + target_start, target_len); target[target_len] = '\0';
+  token->control_offset=(uint16_t)(target_len+1u);
+  token->control_length=(uint16_t)(control_length<=128u?control_length:129u);
+  if(control_bytes)memcpy(target+token->control_offset,hdr+control_start,control_bytes);
+  token->rid_offset=(uint16_t)(target_len+1u+control_bytes);token->rid_length=(uint16_t)rid_bytes;
+  token->rid_truncated=(uint8_t)(rid_length>rid_bytes);
+  if(rid_bytes)memcpy(target+token->rid_offset,hdr+rid_start,rid_bytes);
   /* Header map (lowercased names, trimmed values) matching the interpreter. */
-  KuObject* headers = ku_http_parse_headers(hdr,(int)hlen,header_capacity);
+  KuObject* headers = public_headers?ku_http_parse_headers(hdr,(int)hlen,header_capacity):NULL;
   input->headers = headers;
-  size_t metadata_bytes = target_len+1+sizeof(KuObject)+headers->cap*sizeof(KuEntry);
-  for (size_t slot=0; slot<headers->cap; slot++) {
+  size_t metadata_bytes = private_bytes+(headers?sizeof(KuObject)+headers->cap*sizeof(KuEntry):0);
+  for (size_t slot=0; headers && slot<headers->cap; slot++) {
     KuEntry* entry=&headers->entries[slot];
     if (!entry->used) continue;
     if (entry->key.storage==KU_STRING_OWNED) metadata_bytes+=entry->key.capacity;
@@ -1082,8 +1181,6 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
      public header map and validate the same bytes a second time. */
   if (content_length_overflow) { return 400; }
   if (content_length > (unsigned long long)max_body) { return 413; }
-  char* qmark = strchr(target, '?');
-  size_t path_len = qmark ? (size_t)(qmark - target) : strlen(target);
   input->path_len = path_len;
   size_t request_segments = 0;
   { size_t i = 0;
@@ -1096,6 +1193,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
       }
     }
   }
+  if(route_status==414)return route_status;
   input->body_len = (size_t)content_length;
   if (input->body_len) {
     if (!ku_http_buffer_reserve(input->budget, input->body_len)) return 503;
@@ -1123,31 +1221,14 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
   const char* method = input->method;
   const char* target = input->target;
   size_t path_len = input->path_len;
-  /* Sized off the target limit, not a smaller fixed buffer: normalization only
-     ever adds a leading '/', so this cannot truncate a target that passed the 414
-     check -- and a truncated normalized path would reintroduce exactly the route
-     collision the 414 check exists to prevent. */
-  char norm[KU_HTTP_MAX_TARGET + 2];
-  ku_http_normalize_path(target, path_len, norm, sizeof(norm));
-  const char* segs[KU_HTTP_MAX_SEGS]; size_t seglens[KU_HTTP_MAX_SEGS]; size_t nseg = 0;
-  { size_t nl = strlen(norm); size_t j = 0;
-    while (j < nl) {
-      while (j < nl && norm[j] == '/') j++;
-      size_t st = j;
-      while (j < nl && norm[j] != '/') j++;
-      if (j > st) {
-        if (nseg >= KU_HTTP_MAX_SEGS) { return ku_http_status_response(414, "URI Too Long"); }
-        segs[nseg] = norm + st; seglens[nseg] = j - st; nseg++;
-      }
-    }
-  }
-  const char* param_values[KU_HTTP_MAX_SEGS];
-  size_t param_value_lens[KU_HTTP_MAX_SEGS];
-  size_t param_count = 0;
-  KuHttpHandler* route = ku_http_trie_match(server->root, segs, seglens, nseg, 0, method, param_values, param_value_lens, &param_count);
-  if (route && param_count != route->nparams) {
+  const char* param_values[KU_HTTP_MAX_SEGS];size_t param_value_lens[KU_HTTP_MAX_SEGS],param_count=0;
+  KuHttpHandler selected={0};
+  int route_status=ku_http_input_select(server,input,&selected,param_values,param_value_lens,&param_count);
+  KuHttpHandler* route=route_status==200?&selected:NULL;
+  if(route_status==414)return ku_http_status_response(414,"URI Too Long");
+  if(route_status==500) {
     ku_http_failure_current.reason=KU_HTTP_ERROR_PARSER_INVARIANT;
-    return ku_http_status_response(500, "Internal Server Error");
+    return ku_http_status_response(500,"Internal Server Error");
   }
   if (route) {
     KuStruct___ku_http_response resp = (KuStruct___ku_http_response){0};
@@ -1209,7 +1290,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       return resp;
     }
   } else {
-    if (ku_http_trie_path_exists(server->root, segs, seglens, nseg, 0)) {
+    if (route_status==405) {
       return ku_http_status_response(405, "Method Not Allowed");
     } else {
       return ku_http_status_response(404, "Not Found");
@@ -2102,12 +2183,19 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   if (ku_http_control_request(connection, server)) return;
   if (connection->management) { ku_http_connection_status(connection,server,404); return; }
   ku_http_count_request();
-  KuValue* rid=connection->input.headers ? ku_object_get(connection->input.headers,
-      ku_string_static((const uint8_t*)"x-request-id",12)) : NULL;
-  if(rid && rid->tag==KU_STR) {
-    size_t n=rid->as.s.len;
-    if(n>sizeof(connection->request_id)) { n=sizeof(connection->request_id); connection->request_id_truncated=1; }
-    memcpy(connection->request_id,rid->as.s.ptr,n); connection->request_id_length=(uint32_t)n;
+  if(connection->input.route) {
+    KuHttpRouteToken* token=connection->input.route;
+    connection->request_id_length=token->rid_length;
+    connection->request_id_truncated=token->rid_truncated;
+    if(token->rid_length)memcpy(connection->request_id,connection->input.target+token->rid_offset,token->rid_length);
+  } else {
+    KuValue* rid=connection->input.headers?ku_object_get(connection->input.headers,
+        ku_string_static((const uint8_t*)"x-request-id",12)):NULL;
+    if(rid && rid->tag==KU_STR) {
+      size_t n=rid->as.s.len;
+      if(n>sizeof(connection->request_id)){n=sizeof(connection->request_id);connection->request_id_truncated=1;}
+      memcpy(connection->request_id,rid->as.s.ptr,n);connection->request_id_length=(uint32_t)n;
+    }
   }
   if (!ku_http_utf8_valid((const uint8_t*)connection->input.body, connection->input.body_len)) {
     ku_http_connection_status(connection, server, 400); return;
@@ -2830,31 +2918,11 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   size_t path_len = input->path_len;
   const char* body_buf = input->body;
   size_t body_len = input->body_len;
-  /* Sized off the target limit, not a smaller fixed buffer: normalization only
-     ever adds a leading '/', so this cannot truncate a target that passed the 414
-     check -- and a truncated normalized path would reintroduce exactly the route
-     collision the 414 check exists to prevent. */
-  char norm[KU_HTTP_MAX_TARGET + 2];
-  ku_http_normalize_path(target, path_len, norm, sizeof(norm));
-  const char* segs[KU_HTTP_MAX_SEGS]; size_t seglens[KU_HTTP_MAX_SEGS]; size_t nseg = 0;
-  { size_t nl = strlen(norm); size_t j = 0;
-    while (j < nl) {
-      while (j < nl && norm[j] == '/') j++;
-      size_t st = j;
-      while (j < nl && norm[j] != '/') j++;
-      if (j > st) {
-        if (nseg >= KU_HTTP_MAX_SEGS) { ku_http_connection_status(connection,server,414); return 1; }
-        segs[nseg] = norm + st; seglens[nseg] = j - st; nseg++;
-      }
-    }
-  }
-  const char* param_values[KU_HTTP_MAX_SEGS];
-  size_t param_value_lens[KU_HTTP_MAX_SEGS];
-  size_t param_count = 0;
-  KuHttpHandler* route = ku_http_trie_match(server->root, segs, seglens, nseg, 0, method, param_values, param_value_lens, &param_count);
-
-  if (!route || route->returns_result != 2) return 0;
-  if (param_count != route->nparams) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection,server,500); return 1; }
+  const char* param_values[KU_HTTP_MAX_SEGS];size_t param_value_lens[KU_HTTP_MAX_SEGS],param_count=0;
+  KuHttpHandler selected={0};
+  int route_status=ku_http_input_select(server,input,&selected,param_values,param_value_lens,&param_count);
+  if(route_status!=200 || selected.returns_result!=2)return 0;
+  KuHttpHandler* route=&selected;
   KuStruct___ku_http_request req = {0};
   size_t projection_charge=0;
   if (route->arity == 1) {
@@ -2986,12 +3054,11 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
   KuHttpInput* input = &connection->input;
   const char* prefix = "/__ku/";
   if (input->path_len < 6 || memcmp(input->target, prefix, 6)) return 0;
-  KuValue* header = input->headers ? ku_object_get(input->headers,
-    ku_string_static((const uint8_t*)"x-ku-control-token", 18)) : NULL;
+  KuString header=ku_http_input_control_token(input);
   size_t token_length = strlen(group->control_token);
-  int match = header && header->tag == KU_STR && header->as.s.len == token_length;
+  int match = header.len == token_length;
   unsigned char difference = 0;
-  if (match) for (size_t i=0; i<token_length; i++) difference |= header->as.s.ptr[i] ^ (unsigned char)group->control_token[i];
+  if (match) for (size_t i=0; i<token_length; i++) difference |= header.ptr[i] ^ (unsigned char)group->control_token[i];
   if (!match || difference) { ku_http_connection_status(connection, server, 403); return 1; }
   int metrics = !strcmp(input->method,"GET") && input->path_len == 13 && !memcmp(input->target,"/__ku/metrics",13);
   int drain = !strcmp(input->method,"POST") && input->path_len == 11 && !memcmp(input->target,"/__ku/drain",11);
