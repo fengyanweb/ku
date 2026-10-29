@@ -468,10 +468,8 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
     if(op->phase==KU_PG_ASYNC_RESET_SEND) {
-      /* This fixed command has no parameters. Keep the same lease and drain
-       * contract while avoiding an unnecessary extended-query exchange. */
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE || !ku_pg_connection_is_utf8(op->conn)
-          || !PQsendQuery(op->conn,"DISCARD ALL") || !PQsetSingleRowMode(op->conn))goto reset_failed;
+          || !PQsendQueryParams(op->conn,"DISCARD ALL",0,NULL,NULL,NULL,NULL,0) || !PQsetSingleRowMode(op->conn))goto reset_failed;
       op->reset_sent=1;ku_pg_async_set_phase(op,KU_PG_ASYNC_RESET_FLUSH);
     }
     int reset=op->phase>=KU_PG_ASYNC_RESET_FLUSH;

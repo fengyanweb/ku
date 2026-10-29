@@ -41,14 +41,16 @@ SQL、参数、session reset、数据库错误响应、JSON 默认和 HTTP text 
 同为 sync 的条件下单独比较 `value`/`int`，不把组合收益
 全部算给整数 getter；正常 A/B 的 Go/Rust 不加入对应冗余转换。
 
-## 后续固定 reset 的协议候选
+## 已撤回的固定 reset 协议候选
 
-开发分支仅将无参数常量 `DISCARD ALL` 的发送由 extended 改为 simple query；
-同步与 async 两条 cleanup 共用此规则，业务查询仍使用参数绑定。
-reset 仍发生在同一 exclusive lease 上，保留原操作期限、完整读到终止 NULL、
-事务 IDLE / UTF8 检查和失败驱逐。它不删除 reset，不新增自动 SQL 重试，
-也不将 reset 移到 HTTP 响应之后。该候选需单独对照服务与 PG CPU、
-协议及分配账；协议路径减少不能替代已测出的端到端收益。
+实验提交 `f2ff379` 曾将固定 `DISCARD ALL` 改走 simple query，保留同一 lease、
+期限、完整读到 NULL、IDLE/UTF8 检查和失败驱逐；业务查询仍绑定参数。
+正常 CLI Release 的一次短 A/B：原 Ku 317.843 µs/正确请求，候选 319.273，
+各 2,000 条正确，无错误，候选/原实现为 1.00450。该单对不是重复验收，
+也未证明可靠提速。因此默认代码已撤回该实验，保持原 extended reset。
+实验保存在 `codex/v0.0.19-pg-reset-experiment`，没有改发布标签或主分支。
+JSON 诊断遇到两轮环境干扰，未启动最终五组对照；不能宣称 JSON/PG 追平 Rust。
+原始窗口、构建身份及边界见 `docs/json-pg-memory-followup.md`。
 
 ## 生成独立测量清单
 

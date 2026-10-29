@@ -40,15 +40,19 @@ conversion; record source/binary hashes, `pg_read_mode`, and `pg_execution_mode`
 Do not attribute combined direct-format, JSON-response or async changes to the
 integer getter. Neither comparison adds redundant conversions to Go or Rust.
 
-## Follow-up candidate: fixed reset protocol
+## Rejected fixed-reset protocol candidate
 
-The development candidate sends the parameter-free constant `DISCARD ALL`
-through simple query instead of extended query in both synchronous and async
-cleanup. Business queries keep parameter binding. Reset retains its exclusive
-lease, original deadline, complete terminal-NULL drain, IDLE/UTF8 checks and
-failure eviction. It is not removed, moved after the HTTP response, or followed
-by automatic SQL retries. A protocol change still requires separate service
-CPU, PostgreSQL CPU and allocation/protocol evidence before claiming a gain.
+Commit `f2ff379` tried simple query for the constant DISCARD ALL while retaining
+lease exclusivity, deadlines, terminal-NULL drain, IDLE/UTF8 checks and eviction.
+Business queries remained parameterized. One normal CLI Release A/B screen
+produced 317.843 µs/correct request for original Ku and 319.273 for the candidate
+(2,000 correct requests each, zero errors; B/A 1.00450). This single pair is not
+repeated acceptance and did not establish a reliable gain. The default has
+therefore reverted to the original extended reset. The experiment remains on
+`codex/v0.0.19-pg-reset-experiment`; release tags and main were not changed.
+Two disturbed JSON diagnostic attempts stopped that score; final five-group
+comparison was not started. JSON/PG parity with Rust is not established.
+See `docs/json-pg-memory-followup.en.md` for evidence identities and boundaries.
 
 ## Derived manifests and existing checks
 

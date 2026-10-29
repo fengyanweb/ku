@@ -394,9 +394,9 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
     assert!(cleanup.contains("return !ku_pg_connection_is_utf8(c)"));
     assert!(!cleanup.contains("ku_pg_ensure_utf8"));
     assert!(cleanup.contains("if (tx != KU_PQTRANS_IDLE) return 1"));
-    assert!(
-        cleanup.contains("ku_pg_query_impl(c, ku_string_static((const uint8_t*)\"DISCARD ALL\"")
-    );
+    assert!(cleanup.contains(
+        "ku_pg_query_params_validated_impl(c, ku_string_static((const uint8_t*)\"DISCARD ALL\""
+    ));
     assert!(cleanup.contains("reset_failed || ku_pg_deadline_expired(deadline)"));
     let release = generated
         .split_once("static void ku_pg_client_release(")
@@ -1383,7 +1383,6 @@ static int live_results = 0, live_connections = 0, shutdowns = 0, bad_calls = 0;
 static int both_waits = 0, read_waits = 0, get_gate = 0, restore_mode = T_RESTORE;
 static int mode_on_send = T_OK, fail_nonblocking = 0, parameter_checks = 0;
 static int reset_mode_on_send = T_RESTORE, reset_sends = 0, user_sends = 0;
-static int reset_simple_sends = 0, reset_param_sends = 0, reset_drained = 0;
 static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
 static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
@@ -1602,10 +1601,7 @@ static int send_query(PGconn* conn, const char* sql) {
   if (conn->mode == T_SEND_OVERRUN) clock_ms = test_deadline;
   return conn->mode != T_SEND_FAIL;
 }
-int PQsendQuery(PGconn* conn, const char* sql) {
-  if (strcmp(sql, "DISCARD ALL") == 0) reset_simple_sends++;
-  return send_query(conn, sql);
-}
+int PQsendQuery(PGconn* conn, const char* sql) { return send_query(conn, sql); }
 int PQsetSingleRowMode(PGconn* conn) {
   single_row_calls++;
   if (!conn->mode_window || !conn->active) { bad_calls++; return 0; }
@@ -1615,7 +1611,6 @@ int PQsetSingleRowMode(PGconn* conn) {
 }
 int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {
   param_sends++;
-  if (strcmp(sql, "DISCARD ALL") == 0) reset_param_sends++;
   int valid_empty = count == 0 && !values;
   int valid_two = count == 2 && values && strcmp(sql, "SELECT $1::text, $2::text") == 0
       && strcmp(values[0], "x'; SELECT pg_sleep(999); --") == 0 && strcmp(values[1], "UTF8") == 0
@@ -1656,7 +1651,6 @@ PGresult* PQgetResult(PGconn* conn) {
   if (!get_gate) { bad_calls++; return 0; }
   get_gate = 0;
   if (conn->index == conn->total) {
-    if (conn->is_reset) reset_drained++;
     conn->active = 0;
     if (conn->mode == T_ENCODING) conn->utf8 = 0;
     if (conn->mode == T_RESTORE) conn->utf8 = 1;
@@ -2300,15 +2294,10 @@ int main(void) {
   CHECK(equals(detached_after_reset_failure.value, "last"));
   ku_string_drop(&detached_after_reset_failure.value);
 
-  /* User queries keep parameter binding; the one fixed reset uses simple
-     protocol and reaches terminal NULL before the same lease is reusable. */
+  /* Successful reuse always performs DISCARD ALL. */
   reset_mode_on_send = T_RESTORE; int before_starts = starts; before_resets = reset_sends;
-  int before_params = param_sends, before_simple_resets = reset_simple_sends;
-  int before_param_resets = reset_param_sends, before_drained_resets = reset_drained;
   result = ku_pg_client_query(pool, text("SELECT reset_success"), empty_params);
   CHECK(result.ok && starts == before_starts + 1 && reset_sends == before_resets + 1
-      && param_sends == before_params + 1 && reset_simple_sends == before_simple_resets + 1
-      && reset_param_sends == before_param_resets && reset_drained == before_drained_resets + 1
       && pool->active == 0 && pool->conns[0]);
   ku_drop_pg_result(&result.value);
 
@@ -2520,13 +2509,8 @@ int main(void) {
   KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
   CHECK(opened.ok);KuPgClient* p=opened.value;AsyncBudget b={0};
   int waits_before=both_waits+read_waits;
-  int before_params=param_sends,before_simple_resets=reset_simple_sends;
-  int before_param_resets=reset_param_sends,before_drained_resets=reset_drained;
   KuPgAsyncOp* op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok);
-  CHECK(both_waits+read_waits==waits_before);CHECK(reset_sends==1);
-  CHECK(param_sends==before_params+1 && reset_simple_sends==before_simple_resets+1
-      && reset_param_sends==before_param_resets && reset_drained==before_drained_resets+1);
-  CHECK(p->active==0 && p->waiters==0);
+  CHECK(both_waits+read_waits==waits_before);CHECK(reset_sends==1);CHECK(p->active==0 && p->waiters==0);
   CHECK(op->output.value->rows==1);KuResult_str value=ku_pg_value(op->output.value,0,0);CHECK(value.ok && value.value.len);ku_string_drop(&value.value);
   async_drop_output(op,&b,1);
   mode_on_send=T_NULL_EMPTY_UTF8;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok && op->output.value->rows==2 && op->output.value->cols==3);
