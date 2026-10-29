@@ -954,6 +954,63 @@ fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
 }
 
 #[test]
+fn native_pg_compact_result_growth_oom_and_detached_lifetime_keep_physical_budget() {
+    let directory = TempDir::new("pg-compact-result");
+    let harness = query_stub_harness(&directory)
+        .replacen(
+            "int main(void) {",
+            "static int ku_legacy_query_tests(void) {",
+            1,
+        )
+        .replacen(
+            "#define KU_PG_MAX_RESULT_CELLS 8ULL",
+            "#define KU_PG_MAX_RESULT_CELLS 4096ULL",
+            1,
+        )
+        .replacen(
+            "#define KU_PG_MAX_RESULT_BYTES 16ULL",
+            "#define KU_PG_MAX_RESULT_BYTES 1048576ULL",
+            1,
+        )
+        + &ASYNC_QUERY_SUITE.replace(
+            "int main(void) {",
+            "static int ku_async_sequential_tests(void) {",
+        )
+        + ASYNC_COMPACT_RESULT_SUITE;
+    // PG's malloc hook is installed after common KuString helpers. Route the
+    // real string drop through the same free hook in this lifetime fixture;
+    // otherwise a physically freed getter copy remains in its test ledger.
+    let string_free = "if (value->storage == KU_STRING_OWNED && value->ptr) free(value->ptr);";
+    assert_eq!(harness.matches(string_free).count(), 1);
+    let harness = format!(
+        "static void ku_test_pg_free(void*);\n{}",
+        harness.replacen(
+            string_free,
+            "if (value->storage == KU_STRING_OWNED && value->ptr) ku_test_pg_free(value->ptr);",
+            1,
+        )
+    );
+    let source = directory.path().join("pg-compact-result.c");
+    fs::write(&source, harness).expect("write compact owned PG result harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "pg-compact-result") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("compact owned PG result harness exceeded bounds");
+    assert!(
+        output.status.success(),
+        "compact owned PG result harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg compact result ownership and physical budget closed loop\n"
+    );
+}
+
+#[test]
 fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() {
     let directory = TempDir::new("async-query-large-row");
     let harness=query_stub_harness(&directory)
@@ -2035,7 +2092,10 @@ int main(void) {
     CHECK(error_is(result, "query_error") && sends == before_sends); ku_error_drop(&result.error);
     close_connection(&conn); CHECK(!conn && finishes == before_finishes + 1);
   }
-  const int allocation_modes[] = { T_OOM_RESULT, T_OOM_CELLS, T_OOM_BYTES };
+  /* The common compact result now has one actual allocation. External
+   * cells/bytes growth failures are exercised by ASYNC_COMPACT_RESULT_SUITE;
+   * old ordinal 2/3 no longer names a real allocation in this small query. */
+  const int allocation_modes[] = { T_OOM_RESULT };
   for (size_t i = 0; i < sizeof(allocation_modes) / sizeof(allocation_modes[0]); i++) {
     conn = open_connection(); mode_on_send = allocation_modes[i]; before_sends = sends;
     int before_alloc_failures = injected_allocation_failures;
@@ -2802,6 +2862,84 @@ int main(void) {
   CHECK(ku_test_event_destroy(&pin_entered) && ku_test_event_destroy(&pin_release));
   CHECK(live_connections==0 && live_results==0);
   puts("pg async notification pin closed loop");return 0;
+}
+"#;
+
+const ASYNC_COMPACT_RESULT_SUITE: &str = r#"
+static int compact_values(KuPgResult* r) {
+  KuResult_str value=ku_pg_value(r,0,0);
+  int good=value.ok && equals(value.value,"keep");
+  if(value.ok)ku_string_drop(&value.value);else ku_error_drop(&value.error);
+  KuResult_bool null=ku_pg_is_null(r,0,2);
+  good=good && null.ok && null.value;
+  if(!null.ok)ku_error_drop(&null.error);
+  return good;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;track_runtime_allocations=1;
+  mode_on_send=T_NULL_EMPTY_UTF8;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);AsyncBudget budget={0};KuPgAsyncOp* op=async_create(opened.value,&budget);
+  int before_resets=reset_sends;
+  CHECK(async_finish(op,0) && op->output.ok && reset_sends==before_resets+1 && !live_results);
+  KuResult_pg_result detached=ku_pg_async_take(op);CHECK(detached.ok && detached.value);
+  size_t charge=0;CHECK(ku_pg_result_owned_bytes(detached.value,&charge));
+  CHECK(detached.value->inline_storage==16u*sizeof(KuPgCell)+256u);
+  CHECK(ku_pg_result_is_inline(detached.value,detached.value->cells)
+      && ku_pg_result_is_inline(detached.value,detached.value->bytes));
+  CHECK(budget.bytes==op->input_charge+charge);
+  ku_pg_async_dispose(op,1);CHECK(budget.bytes==charge);
+  ku_pg_client_close_owned(opened.value);
+  CHECK(!live_connections && !live_results && runtime_bytes==charge && live_runtime_allocations==1);
+  /* Values must outlive PQclear, strict reset, operation disposal and pool close. */
+  KuResult_bool null=ku_pg_is_null(detached.value,0,0);CHECK(null.ok && null.value);
+  KuResult_str empty=ku_pg_value(detached.value,0,1);CHECK(empty.ok && !empty.value.len);ku_string_drop(&empty.value);
+  KuResult_str unicode=ku_pg_value(detached.value,0,2);
+  CHECK(unicode.ok && unicode.value.len==6u && !memcmp(unicode.value.ptr,"\xe4\xb8\xad\xe6\x96\x87",6u));
+  ku_string_drop(&unicode.value);ku_drop_pg_result(&detached.value);async_refund(&budget,charge);
+  if(budget.bytes || live_runtime_allocations || runtime_bytes) {
+    fprintf(stderr,"compact detached accounting: budget=%zu live=%d bytes=%zu\n",budget.bytes,live_runtime_allocations,runtime_bytes);
+    for(size_t i=0;i<KU_PG_TEST_ALLOCATION_RECORDS;i++)if(runtime_allocations[i].pointer)
+      fprintf(stderr,"compact retained record: index=%zu bytes=%zu\n",i,runtime_allocations[i].size);
+  }
+  CHECK(!budget.bytes && !live_runtime_allocations && !runtime_bytes);
+
+  KuPgResult* r=ku_pg_result_new(3u,16u,256u);CHECK(r);
+  CHECK(live_runtime_allocations==1 && ku_pg_result_owned_bytes(r,&charge) && charge==runtime_bytes);
+  r->rows=1;r->bytes_len=4;memcpy(r->bytes,"keep",4);
+  r->cells[0]=(KuPgCell){0,4};r->cells[1]=(KuPgCell){4,0};r->cells[2]=(KuPgCell){4,KU_PG_NULL_CELL};
+  KuPgCell* original_cells=r->cells;uint8_t* original_bytes=r->bytes;
+  size_t original_charge=charge;
+  int failures=injected_allocation_failures;
+  fail_runtime_allocation_after=1;CHECK(!ku_pg_result_grow_cells(r,32u));
+  CHECK(!fail_runtime_allocation_after && injected_allocation_failures==failures+1
+      && r->cells==original_cells && compact_values(r));
+  fail_runtime_allocation_after=1;CHECK(!ku_pg_result_grow_bytes(r,512u));
+  CHECK(!fail_runtime_allocation_after && injected_allocation_failures==failures+2
+      && r->bytes==original_bytes && compact_values(r));
+  CHECK(ku_pg_result_owned_bytes(r,&charge) && charge==original_charge && charge==runtime_bytes);
+  size_t planned=0;CHECK(ku_pg_result_plan_bytes(r,32u,512u,&planned));
+  CHECK(ku_pg_result_grow_cells(r,32u) && r->cells!=original_cells && compact_values(r));
+  CHECK(ku_pg_result_owned_bytes(r,&charge) && charge==original_charge+32u*sizeof(KuPgCell)
+      && charge==runtime_bytes);
+  CHECK(ku_pg_result_grow_bytes(r,512u) && r->bytes!=original_bytes && compact_values(r));
+  CHECK(ku_pg_result_owned_bytes(r,&charge) && charge==planned && charge==runtime_bytes);
+  /* The original compact tail remains physically owned after both regions grow. */
+  CHECK(charge==sizeof(*r)+r->inline_storage+32u*sizeof(KuPgCell)+512u);
+  ku_drop_pg_result(&r);CHECK(!r && !live_runtime_allocations && !runtime_bytes);
+
+  /* A large first row takes the old external-buffer fallback. Each actual
+   * allocation failure must leave a valid partial owner that drops exactly once. */
+  r=ku_pg_result_new(3u,32u,512u);CHECK(r && !r->inline_storage && !r->cells && !r->bytes);
+  fail_runtime_allocation_after=1;CHECK(!ku_pg_result_grow_cells(r,32u));
+  CHECK(!r->cells && !fail_runtime_allocation_after);
+  CHECK(ku_pg_result_grow_cells(r,32u));
+  fail_runtime_allocation_after=1;CHECK(!ku_pg_result_grow_bytes(r,512u));
+  CHECK(!r->bytes && !fail_runtime_allocation_after);
+  CHECK(ku_pg_result_owned_bytes(r,&charge) && charge==runtime_bytes);
+  ku_drop_pg_result(&r);CHECK(!live_runtime_allocations && !runtime_bytes);
+  CHECK(!live_connections && !live_results && !bad_calls);
+  puts("pg compact result ownership and physical budget closed loop");return 0;
 }
 "#;
 

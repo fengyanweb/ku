@@ -13938,7 +13938,7 @@ fn emit_pg_types(out: &mut COutput, program: &IrProgram) {
     out.push_str(concat!(
         "typedef struct pg_conn PGconn;\ntypedef struct pg_result PGresult;\n",
         "typedef struct KuPgCell { uint32_t offset; uint32_t len; } KuPgCell;\n",
-        "typedef struct KuPgResult { size_t rows, cols, cell_capacity, bytes_len, bytes_capacity; KuPgCell* cells; uint8_t* bytes; } KuPgResult;\n",
+        "typedef struct KuPgResult { size_t rows, cols, cell_capacity, bytes_len, bytes_capacity; KuPgCell* cells; uint8_t* bytes; size_t inline_storage; } KuPgResult;\n",
         "typedef struct KuPgClient KuPgClient;\n",
         // The Result ABI (emitted next) calls these clone/drop helpers, which are
         // defined later in `emit_pg_runtime`; forward-declare them here.
@@ -14466,8 +14466,52 @@ static int ku_pg_sql_has_explicit_session_control(
         "    PQfinish(h); return attempt;\n",
         "  }\n",
         "}\n",
+        r#"/* PG-only compact storage uses the original small capacities, not query
+ * contents. A single owned block can replace header/cells/bytes allocations.
+ * If a later row exceeds a compact region it moves to an external allocation;
+ * the small original tail stays charged until the result itself is released. */
+typedef char KuPgResultCellAlignment[(sizeof(KuPgResult)%_Alignof(KuPgCell)==0)?1:-1];
+static int ku_pg_result_is_inline(const KuPgResult* result,const void* pointer) {
+  if(!result || !result->inline_storage || !pointer)return 0;
+  uintptr_t base=(uintptr_t)(result+1),address=(uintptr_t)pointer;
+  return address>=base && address-base<result->inline_storage;
+}
+static KuPgResult* ku_pg_result_new(size_t columns,size_t cells,size_t bytes) {
+  size_t tail=cells<=16u && bytes<=256u ? cells*sizeof(KuPgCell)+bytes:0;
+  KuPgResult* result=(KuPgResult*)malloc(sizeof(*result)+tail);
+  if(!result)return NULL;
+  *result=(KuPgResult){0};result->cols=columns;result->inline_storage=tail;
+  if(tail) {
+    result->cell_capacity=cells;result->bytes_capacity=bytes;
+    result->cells=cells?(KuPgCell*)(result+1):NULL;
+    result->bytes=bytes?(uint8_t*)(result+1)+cells*sizeof(KuPgCell):NULL;
+  }
+  return result;
+}
+static int ku_pg_result_grow_cells(KuPgResult* result,size_t capacity) {
+  if(capacity<=result->cell_capacity)return 1;
+  KuPgCell* cells;
+  if(ku_pg_result_is_inline(result,result->cells)) {
+    cells=(KuPgCell*)malloc(capacity*sizeof(*cells));
+    if(cells && result->rows && result->cols)
+      memcpy(cells,result->cells,result->rows*result->cols*sizeof(*cells));
+  } else cells=(KuPgCell*)realloc(result->cells,capacity*sizeof(*cells));
+  if(!cells)return 0;
+  result->cells=cells;result->cell_capacity=capacity;return 1;
+}
+static int ku_pg_result_grow_bytes(KuPgResult* result,size_t capacity) {
+  if(capacity<=result->bytes_capacity)return 1;
+  uint8_t* bytes;
+  if(ku_pg_result_is_inline(result,result->bytes)) {
+    bytes=(uint8_t*)malloc(capacity);
+    if(bytes && result->bytes_len)memcpy(bytes,result->bytes,result->bytes_len);
+  } else bytes=(uint8_t*)realloc(result->bytes,capacity);
+  if(!bytes)return 0;
+  result->bytes=bytes;result->bytes_capacity=capacity;return 1;
+}
+"#,
         "static KuPgResult* ku_move_pg_result(KuPgResult** p) { KuPgResult* m = *p; *p = 0; return m; }\n",
-        "static void ku_drop_pg_result(KuPgResult** p) { if (p && *p) { free((*p)->cells); free((*p)->bytes); free(*p); *p = 0; } }\n",
+        "static void ku_drop_pg_result(KuPgResult** p) { if (p && *p) { if(!ku_pg_result_is_inline(*p,(*p)->cells)) free((*p)->cells); if(!ku_pg_result_is_inline(*p,(*p)->bytes)) free((*p)->bytes); free(*p); *p = 0; } }\n",
         "static KuPgResult* ku_clone_pg_result(KuPgResult* r) { (void)r; fprintf(stderr, \"cannot clone a pg result\\n\"); exit(1); }\n",
         r#"/* The PGconn remains owned by Ku after an error. Shutdown, rather than
    close/PQfinish, makes any ambiguous raw connection incapable of sending more
@@ -14682,26 +14726,23 @@ static int ku_pg_result_append(KuPgResult** target, PGresult* source, unsigned l
   if (next_bytes >= KU_PG_NULL_CELL || next_bytes > SIZE_MAX) return -1;
   if (ku_pg_deadline_expired(deadline)) return -2;
   if (!*target) {
-    *target = (KuPgResult*)malloc(sizeof(KuPgResult));
+    size_t cells=next_cells ? ku_pg_result_capacity(0,(size_t)next_cells,16,(size_t)KU_PG_MAX_RESULT_CELLS):0;
+    size_t bytes=next_bytes ? ku_pg_result_capacity(0,(size_t)next_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES):0;
+    *target = ku_pg_result_new((size_t)cols,cells,bytes);
     if (!*target) return -3;
-    **target = (KuPgResult){0}; (*target)->cols = (size_t)cols;
   }
   KuPgResult* result = *target;
   if (ku_pg_deadline_expired(deadline)) return -2;
   if ((size_t)next_cells > result->cell_capacity) {
     size_t capacity = ku_pg_result_capacity(result->cell_capacity, (size_t)next_cells, 16, (size_t)KU_PG_MAX_RESULT_CELLS);
     if (!capacity || capacity > SIZE_MAX / sizeof(KuPgCell)) return -1;
-    KuPgCell* cells = (KuPgCell*)realloc(result->cells, capacity * sizeof(KuPgCell));
-    if (!cells) return -3;
-    result->cells = cells; result->cell_capacity = capacity;
+    if (!ku_pg_result_grow_cells(result,capacity)) return -3;
   }
   if (ku_pg_deadline_expired(deadline)) return -2;
   if ((size_t)next_bytes > result->bytes_capacity) {
     size_t capacity = ku_pg_result_capacity(result->bytes_capacity, (size_t)next_bytes, 256, (size_t)KU_PG_MAX_RESULT_BYTES);
     if (!capacity) return -1;
-    uint8_t* bytes = (uint8_t*)realloc(result->bytes, capacity);
-    if (!bytes) return -3;
-    result->bytes = bytes; result->bytes_capacity = capacity;
+    if (!ku_pg_result_grow_bytes(result,capacity)) return -3;
   }
   size_t cell = result->rows * result->cols;
   for (int row = 0; row < rows; row++) for (int col = 0; col < cols; col++, cell++) {

@@ -125,20 +125,56 @@ static void ku_pg_diagnostics_sync_acquire_locked(KuPgClient* p,unsigned long lo
   ku_pg_diag_store(&op.waiter.diagnostic.last_progress_ms,started);ku_pg_diag_store(&op.waiter.diagnostic.progress_events,0);
   ku_pg_async_capture_acquire_locked(&op,now);
 }
+/* Charge actual owned allocation, including an original compact tail after
+ * one/both regions move externally. Requested capacity is not the same as
+ * separately allocated capacity when the cells/bytes still live in that tail. */
 static int ku_pg_result_owned_bytes(KuPgResult* result,size_t* bytes) {
-  if (!bytes) return 0;
-  *bytes=0; if (!result) return 1;
-  if (result->rows && result->cols>SIZE_MAX/result->rows) return 0;
-  if (result->rows*result->cols>result->cell_capacity
+  if(!bytes)return 0;
+  *bytes=0;if(!result)return 1;
+  if(result->rows && result->cols>SIZE_MAX/result->rows)return 0;
+  if(result->rows*result->cols>result->cell_capacity
       || result->bytes_len>result->bytes_capacity
       || (!!result->cell_capacity != !!result->cells)
       || (!!result->bytes_capacity != !!result->bytes)
       || result->rows>KU_PG_MAX_RESULT_ROWS || result->cols>KU_PG_MAX_RESULT_COLS
       || result->cell_capacity>KU_PG_MAX_RESULT_CELLS || result->bytes_capacity>KU_PG_MAX_RESULT_BYTES
-      || result->cell_capacity>(SIZE_MAX-sizeof(*result))/sizeof(KuPgCell)) return 0;
-  size_t total=sizeof(*result)+result->cell_capacity*sizeof(KuPgCell);
-  if (result->bytes_capacity>SIZE_MAX-total) return 0;
-  *bytes=total+result->bytes_capacity; return 1;
+      || result->inline_storage>16u*sizeof(KuPgCell)+256u)return 0;
+  size_t total=sizeof(*result)+result->inline_storage;
+  int cells_inline=ku_pg_result_is_inline(result,result->cells);
+  int bytes_inline=ku_pg_result_is_inline(result,result->bytes);
+  uintptr_t base=(uintptr_t)(result+1);
+  if(cells_inline) {
+    size_t offset=(size_t)((uintptr_t)result->cells-base);
+    if((uintptr_t)result->cells%_Alignof(KuPgCell)
+        || result->cell_capacity>(result->inline_storage-offset)/sizeof(KuPgCell))return 0;
+  } else {
+    if(result->cell_capacity>(SIZE_MAX-total)/sizeof(KuPgCell))return 0;
+    total+=result->cell_capacity*sizeof(KuPgCell);
+  }
+  if(bytes_inline) {
+    size_t offset=(size_t)((uintptr_t)result->bytes-base);
+    if(result->bytes_capacity>result->inline_storage-offset)return 0;
+    if(cells_inline) {
+      uintptr_t cell_begin=(uintptr_t)result->cells,byte_begin=(uintptr_t)result->bytes;
+      if(cell_begin<byte_begin+result->bytes_capacity
+          && byte_begin<cell_begin+result->cell_capacity*sizeof(KuPgCell))return 0;
+    }
+  } else {
+    if(result->bytes_capacity>SIZE_MAX-total)return 0;
+    total+=result->bytes_capacity;
+  }
+  *bytes=total;return 1;
+}
+static int ku_pg_result_plan_bytes(KuPgResult* result,size_t cells,size_t bytes,size_t* total) {
+  size_t n=sizeof(KuPgResult)+(result?result->inline_storage:0);
+  int cells_external=!result || cells>result->cell_capacity || !ku_pg_result_is_inline(result,result->cells);
+  int bytes_external=!result || bytes>result->bytes_capacity || !ku_pg_result_is_inline(result,result->bytes);
+  if(cells_external) {
+    if(cells>(SIZE_MAX-n)/sizeof(KuPgCell))return 0;
+    n+=cells*sizeof(KuPgCell);
+  }
+  if(bytes_external) {if(bytes>SIZE_MAX-n)return 0;n+=bytes;}
+  *total=n;return 1;
 }
 static KuError ku_pg_async_limit_error(void) {
   return ku_pg_static_error("resource_limit",sizeof("resource_limit")-1,
@@ -378,16 +414,16 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
     size_t cc=op->query.value?op->query.value->cell_capacity:0,bc=op->query.value?op->query.value->bytes_capacity:0;
     if(cells>cc)cc=ku_pg_result_capacity(cc,cells,16,(size_t)KU_PG_MAX_RESULT_CELLS);
     if(op->row_bytes>bc)bc=ku_pg_result_capacity(bc,op->row_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES);
-    if(cc>(SIZE_MAX-sizeof(KuPgResult))/sizeof(KuPgCell) || bc>SIZE_MAX-sizeof(KuPgResult)-cc*sizeof(KuPgCell))return -1;
-    size_t predicted=sizeof(KuPgResult)+cc*sizeof(KuPgCell)+bc;
+    size_t predicted=0;
+    if(!ku_pg_result_plan_bytes(op->query.value,cc,bc,&predicted))return -1;
     if(predicted<previous)return -3;
     size_t growth=predicted-previous;
     if(growth && !op->budget.reserve(op->budget.context,growth))return -3;
     KuPgResult* result=op->query.value;
-    if(!result) {result=(KuPgResult*)calloc(1,sizeof(*result));op->query.value=result;if(result)result->cols=(size_t)op->row_columns;}
+    if(!result) {result=ku_pg_result_new((size_t)op->row_columns,cc,bc);op->query.value=result;}
     int allocated=result!=NULL;
-    if(allocated && cc>result->cell_capacity) {KuPgCell* grown=(KuPgCell*)realloc(result->cells,cc*sizeof(KuPgCell));if(!grown)allocated=0;else {result->cells=grown;result->cell_capacity=cc;}}
-    if(allocated && bc>result->bytes_capacity) {uint8_t* grown=(uint8_t*)realloc(result->bytes,bc);if(!grown)allocated=0;else {result->bytes=grown;result->bytes_capacity=bc;}}
+    if(allocated && cc>result->cell_capacity)allocated=ku_pg_result_grow_cells(result,cc);
+    if(allocated && bc>result->bytes_capacity)allocated=ku_pg_result_grow_bytes(result,bc);
     size_t actual=0;if(!ku_pg_result_owned_bytes(result,&actual) || actual>predicted)return -3;
     if(predicted>actual)op->budget.refund(op->budget.context,predicted-actual);
     if(!allocated)return -3;
