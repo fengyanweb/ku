@@ -5287,6 +5287,11 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
             enum_ir_type(name)
         }
         TypeName::Custom(name)
+            if name == "KuValue" && !layouts.structs.iter().any(|layout| layout.name == *name) =>
+        {
+            IrType::Named("__ku_value".to_string())
+        }
+        TypeName::Custom(name)
             if name == "HttpRequest"
                 && !layouts.structs.iter().any(|layout| layout.name == *name) =>
         {
@@ -5309,6 +5314,14 @@ fn lower_optional_type(ty: &Option<TypeName>, layouts: &IrLayoutTable) -> IrType
 }
 
 fn lower_layouts(program: &Program) -> IrLayoutTable {
+    let struct_names = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(decl) => Some(decl.name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let enum_names = program
         .items
         .iter()
@@ -5321,15 +5334,21 @@ fn lower_layouts(program: &Program) -> IrLayoutTable {
     let mut enums = Vec::new();
     for item in &program.items {
         match item {
-            Item::Struct(decl) => structs.push(lower_struct_layout(decl, &enum_names)),
-            Item::Enum(decl) => enums.push(lower_enum_layout(decl, &enum_names)),
+            Item::Struct(decl) => {
+                structs.push(lower_struct_layout(decl, &enum_names, &struct_names))
+            }
+            Item::Enum(decl) => enums.push(lower_enum_layout(decl, &enum_names, &struct_names)),
             _ => {}
         }
     }
     IrLayoutTable { structs, enums }
 }
 
-fn lower_struct_layout(decl: &StructDecl, enum_names: &HashSet<String>) -> IrStructLayout {
+fn lower_struct_layout(
+    decl: &StructDecl,
+    enum_names: &HashSet<String>,
+    struct_names: &HashSet<String>,
+) -> IrStructLayout {
     IrStructLayout {
         name: decl.name.clone(),
         fields: decl
@@ -5338,14 +5357,18 @@ fn lower_struct_layout(decl: &StructDecl, enum_names: &HashSet<String>) -> IrStr
             .enumerate()
             .map(|(offset, field)| IrFieldLayout {
                 name: field.name.clone(),
-                ty: lower_layout_type(&field.ty, enum_names),
+                ty: lower_layout_type(&field.ty, enum_names, struct_names),
                 offset,
             })
             .collect(),
     }
 }
 
-fn lower_enum_layout(decl: &EnumDecl, enum_names: &HashSet<String>) -> IrEnumLayout {
+fn lower_enum_layout(
+    decl: &EnumDecl,
+    enum_names: &HashSet<String>,
+    struct_names: &HashSet<String>,
+) -> IrEnumLayout {
     IrEnumLayout {
         name: decl.name.clone(),
         variants: decl
@@ -5361,7 +5384,7 @@ fn lower_enum_layout(decl: &EnumDecl, enum_names: &HashSet<String>) -> IrEnumLay
                     .enumerate()
                     .map(|(offset, field)| IrFieldLayout {
                         name: field.name.clone(),
-                        ty: lower_layout_type(&field.ty, enum_names),
+                        ty: lower_layout_type(&field.ty, enum_names, struct_names),
                         offset,
                     })
                     .collect(),
@@ -5370,33 +5393,51 @@ fn lower_enum_layout(decl: &EnumDecl, enum_names: &HashSet<String>) -> IrEnumLay
     }
 }
 
-fn lower_layout_type(ty: &Option<TypeName>, enum_names: &HashSet<String>) -> IrType {
-    fn lower(ty: &TypeName, enum_names: &HashSet<String>) -> IrType {
+fn lower_layout_type(
+    ty: &Option<TypeName>,
+    enum_names: &HashSet<String>,
+    struct_names: &HashSet<String>,
+) -> IrType {
+    fn lower(
+        ty: &TypeName,
+        enum_names: &HashSet<String>,
+        struct_names: &HashSet<String>,
+    ) -> IrType {
         match ty {
             TypeName::Int => IrType::Int,
             TypeName::Float => IrType::Float,
             TypeName::Bool => IrType::Bool,
             TypeName::String => IrType::Str,
             TypeName::Null => IrType::Null,
-            TypeName::Array(inner) => IrType::Array(Box::new(lower(inner, enum_names))),
-            TypeName::Result(inner) => IrType::Result(Box::new(lower(inner, enum_names))),
+            TypeName::Array(inner) => {
+                IrType::Array(Box::new(lower(inner, enum_names, struct_names)))
+            }
+            TypeName::Result(inner) => {
+                IrType::Result(Box::new(lower(inner, enum_names, struct_names)))
+            }
             TypeName::Function {
                 params,
                 param_modes,
                 return_type,
                 ..
             } => IrType::Closure {
-                params: params.iter().map(|p| lower(p, enum_names)).collect(),
+                params: params
+                    .iter()
+                    .map(|p| lower(p, enum_names, struct_names))
+                    .collect(),
                 param_modes: param_modes.clone(),
-                ret: Box::new(lower(return_type, enum_names)),
+                ret: Box::new(lower(return_type, enum_names, struct_names)),
             },
             TypeName::Union(_) => IrType::Unknown,
             TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
+            TypeName::Custom(name) if name == "KuValue" && !struct_names.contains(name) => {
+                IrType::Named("__ku_value".to_string())
+            }
             TypeName::Custom(name) => IrType::Named(name.clone()),
         }
     }
     ty.as_ref()
-        .map(|ty| lower(ty, enum_names))
+        .map(|ty| lower(ty, enum_names, struct_names))
         .unwrap_or(IrType::Unknown)
 }
 

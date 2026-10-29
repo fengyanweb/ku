@@ -983,6 +983,7 @@ impl Checker {
                 Ok(Type::Struct(name.clone()))
             }
             TypeName::Custom(name) if self.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
+            TypeName::Custom(name) if name == "KuValue" => Ok(Type::KuValue),
             TypeName::Custom(name) if name == "HttpRequest" => Ok(http_request_type()),
             TypeName::Custom(name) if name == "HttpResponse" => Ok(http_response_type()),
             TypeName::Custom(name) => {
