@@ -2305,9 +2305,120 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
     Ok(())
 }
 
+/// Remove only a proven default-zero pre-drop, never ordinary cleanup. The
+/// synchronous entry executes once (no incoming CFG edge), and this pass only
+/// visits its leading Temp instructions before any statement can expose slots.
+/// Default Str/Result/KuValue/Error drops have no deadline, cancellation,
+/// resource-budget or user callback observation; all other types are excluded.
+fn entry_zero_drop_temps(function: &IrFunction) -> HashSet<usize> {
+    let Some(entry) = function.blocks.first() else {
+        return HashSet::new();
+    };
+    if entry.id.0 != 0
+        || function
+            .blocks
+            .iter()
+            .filter(|block| block.id.0 == 0)
+            .count()
+            != 1
+        || function.is_closure_body
+        || !function.captures.is_empty()
+    {
+        return HashSet::new();
+    }
+    let mut writes = HashMap::<usize, usize>::new();
+    for block in &function.blocks {
+        let incoming = match &block.terminator {
+            IrTerminator::Jump(target) | IrTerminator::JumpErr { target, .. } => target.0 == 0,
+            IrTerminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => then_block.0 == 0 || else_block.0 == 0,
+            IrTerminator::ForEach {
+                body_block,
+                after_block,
+                ..
+            } => body_block.0 == 0 || after_block.0 == 0,
+            IrTerminator::ResultBranch {
+                ok_block,
+                err_block,
+                ..
+            } => ok_block.0 == 0 || err_block.0 == 0,
+            IrTerminator::Safepoint {
+                continue_block,
+                timeout_block,
+            } => continue_block.0 == 0 || timeout_block.0 == 0,
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => continue_block.0 == 0 || cleanup_block.0 == 0,
+            IrTerminator::Next
+            | IrTerminator::PropagateErr(_)
+            | IrTerminator::Return(_)
+            | IrTerminator::Unreachable => false,
+        };
+        if incoming {
+            return HashSet::new();
+        }
+        for inst in &block.instructions {
+            match inst {
+                IrInst::Temp { id, .. } | IrInst::BindOk { id, .. } => {
+                    *writes.entry(id.0).or_default() += 1
+                }
+                // No alias/capture/finally inference is attempted for these frames.
+                IrInst::BeginTry { .. }
+                | IrInst::EndTry
+                | IrInst::DefineClosure { .. }
+                | IrInst::CellNew { .. }
+                | IrInst::CellStore { .. }
+                | IrInst::CellRelease(_)
+                | IrInst::Unsupported { .. } => return HashSet::new(),
+                _ => {}
+            }
+        }
+    }
+    let mut referenced = HashSet::new();
+    let mut eligible = HashSet::new();
+    for inst in &entry.instructions {
+        let IrInst::Temp { id, ty, value } = inst else {
+            break;
+        };
+        let mut pending = vec![value];
+        while let Some(expr) = pending.pop() {
+            match &expr.kind {
+                IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => {
+                    referenced.insert(id.0);
+                }
+                IrExprKind::MakeClosure { .. }
+                | IrExprKind::CapturedCell(_)
+                | IrExprKind::CellLoad(_) => return eligible,
+                _ => {}
+            }
+            pending.extend(expr_children(expr));
+        }
+        let zero_is_unobservable = matches!(ty, IrType::Str | IrType::Result(_))
+            || matches!(ty, IrType::Named(name) if name == "__ku_value" || name == "__ku_error_type");
+        let target = format!("t{}", id.0);
+        let is_parameter = function
+            .params
+            .iter()
+            .any(|param| c_ident(&param.name) == target);
+        if zero_is_unobservable
+            && writes.get(&id.0) == Some(&1)
+            && !referenced.contains(&id.0)
+            && !is_parameter
+        {
+            eligible.insert(id.0);
+        }
+    }
+    eligible
+}
+
 fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
     out.check()?;
     let for_each_states = collect_for_each_states(function)?;
+    let initial_temps = entry_zero_drop_temps(function);
     let owned_locals = collect_owned_locals(function, &for_each_states);
     out.push_str(&function_signature(function)?);
     out.push_str(" {\n");
@@ -2371,6 +2482,7 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
             &function.return_type,
             &owned_locals,
             &for_each_states,
+            &initial_temps,
         )?;
     }
     if function.return_type == IrType::Void {
@@ -2391,6 +2503,7 @@ fn emit_block(
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
     for_each_states: &[ForEachState],
+    initial_temps: &HashSet<usize>,
 ) -> KuResult<()> {
     out.check()?;
     if block.id.0 != 0 {
@@ -2403,7 +2516,7 @@ fn emit_block(
         emit_for_each_cleanup(out, state)?;
     }
     for inst in &block.instructions {
-        emit_inst(out, inst, return_type, owned_locals)?;
+        emit_inst(out, inst, return_type, owned_locals, initial_temps)?;
     }
     if block.terminator == IrTerminator::Unreachable
         && matches!(
@@ -2421,6 +2534,7 @@ fn emit_inst(
     inst: &IrInst,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
+    initial_temps: &HashSet<usize>,
 ) -> KuResult<()> {
     out.check()?;
     match inst {
@@ -2460,7 +2574,9 @@ fn emit_inst(
                         c_type(ty)?,
                         c_value_expr(value)?
                     ));
-                    emit_drop_expr(out, ty, &format!("t{}", id.0))?;
+                    if !initial_temps.contains(&id.0) {
+                        emit_drop_expr(out, ty, &format!("t{}", id.0))?;
+                    }
                     out.push_str(&format!("  t{} = __ku_store; }}\n", id.0));
                 }
             } else {
@@ -17666,6 +17782,79 @@ mod tests {
     use super::*;
     use crate::ir::task as task_ir;
     use crate::ir::TempId;
+
+    #[test]
+    fn entry_zero_drop_proof_rejects_reentry_aliases_and_redefinitions() {
+        fn fixture() -> IrFunction {
+            IrFunction {
+                id: FunctionId(0),
+                name: "EntryDrop".into(),
+                params: vec![],
+                return_type: IrType::Void,
+                is_closure_body: false,
+                captures: vec![],
+                blocks: vec![IrBlock {
+                    id: crate::ir::BlockId(0),
+                    name: "entry".into(),
+                    instructions: vec![IrInst::Temp {
+                        id: TempId(0),
+                        ty: IrType::Str,
+                        value: IrExpr {
+                            kind: IrExprKind::Literal("\"x\"".into()),
+                            ty: IrType::Str,
+                        },
+                    }],
+                    terminator: IrTerminator::Return(None),
+                }],
+            }
+        }
+        let good = fixture();
+        assert!(entry_zero_drop_temps(&good).contains(&0));
+        let mut repeated = fixture();
+        repeated.blocks[0].terminator = IrTerminator::Jump(crate::ir::BlockId(0));
+        assert!(entry_zero_drop_temps(&repeated).is_empty());
+        let mut duplicate = fixture();
+        let repeated_definition = duplicate.blocks[0].instructions[0].clone();
+        duplicate.blocks[0].instructions.push(repeated_definition);
+        assert!(entry_zero_drop_temps(&duplicate).is_empty());
+        let mut alias = fixture();
+        alias.blocks[0].instructions.insert(
+            0,
+            IrInst::Temp {
+                id: TempId(1),
+                ty: IrType::Str,
+                value: IrExpr {
+                    kind: IrExprKind::BorrowedTemp(TempId(0)),
+                    ty: IrType::Str,
+                },
+            },
+        );
+        assert!(!entry_zero_drop_temps(&alias).contains(&0));
+        let mut statement = fixture();
+        statement.blocks[0].instructions.insert(
+            0,
+            IrInst::Expr(IrExpr {
+                kind: IrExprKind::Literal("0".into()),
+                ty: IrType::Int,
+            }),
+        );
+        assert!(entry_zero_drop_temps(&statement).is_empty());
+        let mut resource = fixture();
+        if let IrInst::Temp { ty, .. } = &mut resource.blocks[0].instructions[0] {
+            *ty = IrType::Named("__ku_net_client".into());
+        }
+        assert!(entry_zero_drop_temps(&resource).is_empty());
+        let mut captured = fixture();
+        captured.is_closure_body = true;
+        assert!(entry_zero_drop_temps(&captured).is_empty());
+        let mut parameter = fixture();
+        parameter.params.push(crate::ir::IrParam {
+            name: "t0".into(),
+            ty: IrType::Str,
+            mode: ParamMode::Owned,
+        });
+        assert!(entry_zero_drop_temps(&parameter).is_empty());
+    }
 
     fn task_adapter_output_fixture() -> task_ir::TaskProgram {
         let result = IrType::Result(Box::new(IrType::Str));
