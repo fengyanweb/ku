@@ -3,7 +3,7 @@
 
 Prepare from an ordinary CLI Release emission, then link separately:
   python3 http_cost_diagnostic.py prepare server.c server-roles.c --source-commit SHA
-  clang-18 server-roles.c -std=c11 -O2 -g -pthread /absolute/libpq.so -lm \
+  clang-18 server-roles.c -std=c11 -O2 -g -pthread /absolute/libpq.so \
       -Wl,--wrap=pthread_create -o server-roles
 Keep the normal CLI binary for before/after controls and all scoring. The footer
 can retain functions/change layout; its prefix identity is not .text identity.
@@ -11,6 +11,8 @@ can retain functions/change layout; its prefix identity is not .text identity.
 Observe the already-started service (prefer its whole service cgroup):
   python3 http_cost_diagnostic.py sample --pid PID --cgroup /sys/fs/cgroup/owned \
       --seconds 15 --interval 0.1 --output thread-cost.json
+SIGINT/SIGTERM asks this observer to save a final snapshot and exit; it never
+forwards that signal to the observed service. The duration remains an upper bound.
 No process is launched, signalled, frozen or stopped. Raw samples include each
 live TID; deltas require identical process/thread start times at both endpoints.
 Exited/new/missing threads remain unknown, not zero. Cgroup CPU from the existing
@@ -201,6 +203,8 @@ def snapshot(root_pid: int, cgroup: Path | None = None, *, proc: Path = Path('/p
                 issue(f'thread_unavailable:{pid}:{tid}:{type(error).__name__}')
     if not result['processes'] or not result['threads']:
         issue('no_live_threads_observed')
+    if cgroup is not None and not any(row['pid'] == root_pid for row in result['processes']):
+        issue('root_pid_not_observed_in_selected_cgroup')
     result['read_end_monotonic_ns'] = time.monotonic_ns()
     return result
 
@@ -245,7 +249,7 @@ def summarize(first: dict, last: dict, clock_ticks: int) -> dict:
 
 def collect_thread_window(root_pid: int, seconds: float, interval: float = .1,
                           cgroup: Path | None = None, *, max_samples: int = 2048,
-                          max_thread_records: int = 100000) -> dict:
+                          max_thread_records: int = 100000, stop_event=None) -> dict:
     if sys.platform != 'linux':
         raise RuntimeError('thread sampling requires Linux /proc')
     import resource
@@ -257,20 +261,32 @@ def collect_thread_window(root_pid: int, seconds: float, interval: float = .1,
         raise ValueError('interval0.05..5s,samples2..2048,thread records1..250000 required')
     observer_before = resource.getrusage(resource.RUSAGE_SELF)
     start = time.monotonic(); samples = []; records = 0; stopped = None
+    stop_requested = False
     while True:
-        sample = snapshot(root_pid, cgroup); samples.append(sample); records += len(sample['threads'])
+        remaining = max_thread_records - records
+        if remaining <= 0:
+            stopped = 'bounded_sample_or_thread_record_limit'; break
+        sample = snapshot(root_pid, cgroup, max_threads=min(4096, remaining))
+        samples.append(sample); records += len(sample['threads'])
         elapsed = time.monotonic() - start
+        if stop_event is not None and stop_event.is_set():
+            stop_requested = True; break
         if elapsed >= seconds:
             break
         if len(samples) >= max_samples or records >= max_thread_records:
             stopped = 'bounded_sample_or_thread_record_limit'; break
-        time.sleep(min(interval, max(0, seconds - elapsed)))
+        wait = min(interval, max(0, seconds - elapsed))
+        if stop_event is None:
+            time.sleep(wait)
+        else:
+            stop_event.wait(wait)
     ticks = os.sysconf('SC_CLK_TCK')
     observer_after = resource.getrusage(resource.RUSAGE_SELF)
     return {'schema': 'ku-http-thread-cost-v1', 'diagnostic_only': True,
             'root_pid': root_pid, 'cgroup': str(cgroup) if cgroup else None,
             'interval_seconds': interval, 'duration_requested_seconds': seconds,
             'elapsed_seconds': time.monotonic() - start, 'bounded_stop': stopped,
+            'stop_requested': stop_requested,
             'samples': samples, 'summary': summarize(samples[0], samples[-1], ticks),
             'observer': {'pid': os.getpid(),
                          'user_seconds': observer_after.ru_utime - observer_before.ru_utime,
@@ -295,7 +311,19 @@ def main() -> None:
         receipt = prepare_source(args.source, args.destination, args.source_commit)
         print(json.dumps(receipt, ensure_ascii=False, indent=2))
     else:
-        result = collect_thread_window(args.pid, args.seconds, args.interval, args.cgroup)
+        import signal
+        import threading
+        stop = threading.Event()
+        def request_stop(signum, frame):
+            stop.set()
+        previous = {kind: signal.signal(kind, request_stop)
+                    for kind in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            result = collect_thread_window(args.pid, args.seconds, args.interval, args.cgroup,
+                                           stop_event=stop)
+        finally:
+            for kind, handler in previous.items():
+                signal.signal(kind, handler)
         write_json(args.output, result)
         print(json.dumps({'samples': len(result['samples']), 'bounded_stop': result['bounded_stop'],
                           'roles': result['summary']['roles']}, indent=2))
