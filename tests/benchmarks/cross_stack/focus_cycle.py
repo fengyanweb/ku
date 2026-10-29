@@ -952,6 +952,8 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
         return execute_stability(plan_path, output, resume)
     plan_path, output = Path(plan_path), Path(output)
     plan = json.loads(plan_path.read_text())
+    unusable_limit = (integer(plan['stop_after_consecutive_unusable_windows'], 1, 10, 'unusable window stop limit')
+                     if 'stop_after_consecutive_unusable_windows' in plan else None)
     output.mkdir(parents=True, exist_ok=True)
     identity = {'plan_sha256':digest(plan_path),'entry_sha256':digest(__file__),
                 'harness_sha256':digest(Path(__file__).with_name('linux_harness.py')),
@@ -970,8 +972,10 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
         state = {'identity':identity,'windows':{}}
         write_json(output/'state.json', state)
     jobs = jobs_for(plan, phase, workload, names)
-    rows = []
-    for job in jobs:
+    saved_stop = state.get('unusable_window_stop') if unusable_limit is not None else None
+    rows, unusable_causes, unusable_stop = (saved_stop['observed_rows'], saved_stop['causes'],
+        {k:v for k,v in saved_stop.items() if k!='observed_rows'}) if saved_stop else ([], [], None)
+    for job in ([] if saved_stop else jobs):
         if (digest(plan_path)!=identity['plan_sha256'] or digest(__file__)!=identity['entry_sha256']
                 or digest(Path(__file__).with_name('linux_harness.py'))!=identity['harness_sha256']):
             note={'reason':'plan or executing runner source changed; new output required','identity':identity,
@@ -987,7 +991,15 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
                          accounting_valid=None,arrival_schedule_quality='unknown',environment_quality='unknown',
                          measurement_invalid=False,candidate_accepted=False,known_failure=previous_failure)
             else:
-                row = run_one(plan,job,output,state,identity,resume=resume,evidence=(evidence or {}).get(job['id']))
+                prior = (state['windows'].get(job['id']) or [{}])[-1]
+                retained_unusable = (unusable_limit is not None and prior.get('state') == 'completed'
+                    and prior.get('row', {}).get('score_started') is True
+                    and (prior['row'].get('measurement_invalid') is True
+                         or prior['row'].get('arrival_schedule_quality') == 'fail'))
+                # Replaying original scored receipts restores the count and
+                # cannot replace away a stop reached by this frozen plan.
+                row = run_one(plan,job,output,state,identity,resume=resume and not retained_unusable,
+                              evidence=(evidence or {}).get(job['id']))
         except (ValueError,KeyError,OSError) as error:
             # No score is fabricated when a source/build receipt is unavailable.
             row = dict(job,status='identity_or_plan_blocked',error=repr(error),goal_status='blocked',
@@ -1001,11 +1013,23 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
         rows.append(row)
         write_json(output/'summary.json',{'identity':identity,'rows':rows,'goals':compare_goals(plan,rows)})
         print(json.dumps({k:row[k] for k in ('id','status','correct','cpu_us','goal_status') if k in row}),flush=True)
+        if (unusable_limit is not None and row.get('score_started') is True
+                and row.get('functional_valid') is not False and row.get('accounting_valid') is not False):
+            cause = ('confirmed_fault' if row.get('measurement_invalid') is True else
+                     'arrival_failed_unknown_cause' if row.get('arrival_schedule_quality') == 'fail' else None)
+            unusable_causes = unusable_causes+[{'id': job['id'], 'cause': cause}] if cause else []
+            if len(unusable_causes) >= unusable_limit:
+                unusable_stop = {'window_id': job['id'], 'consecutive_unusable_windows': len(unusable_causes),
+                    'causes': unusable_causes, 'reason': 'unusable scored windows reached frozen stop limit; '
+                    'new conditions require a new frozen plan and new output; resume cannot replace this stop'}
+                state['unusable_window_stop'] = dict(unusable_stop, observed_rows=rows)
+                write_json(output/'state.json', state)
+                break
         # Legacy single-phase invocations keep their fail-fast behavior. The
         # explicit multi-phase schedule may finish independent named windows.
         if phase!='all' and row.get('status')!='observed':
             break
-    capacity = capacity_jobs(plan,output,state,identity,resume=resume,evidence=evidence) if phase=='capacity' or phase=='all' and plan.get('capacity') else []
+    capacity = capacity_jobs(plan,output,state,identity,resume=resume,evidence=evidence) if not unusable_stop and (phase=='capacity' or phase=='all' and plan.get('capacity')) else []
     goals = compare_goals(plan, rows)
     observed = bool(rows) and all(r.get('status')=='observed' for r in rows)
     formal = [r for r in rows if r.get('phase')=='final']
@@ -1013,7 +1037,7 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
     groups = {}
     for r in formal:
         groups.setdefault((r['entry'],r['workload'],r['contract']),set()).add(r['group'])
-    design_complete = len(formal)==len(expected_formal) and bool(groups) and all(len(v)>=5 for v in groups.values())
+    design_complete = not unusable_stop and len(formal)==len(expected_formal) and bool(groups) and all(len(v)>=5 for v in groups.values())
     qualified = design_complete and all(r.get('qualification',{}).get('qualified') is True
         and r.get('formal_duration') is True and r.get('natural_reclamation') is True for r in formal)
     controls = [r for r in rows if r.get('phase')=='control']
@@ -1023,8 +1047,8 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
         r.get('qualification',{}).get('qualified') is True for r in controls)
         and spread is not None and spread <= plan.get('control_cpu_max_min',1.10))
     result = {'identity':identity,'rows':rows,'capacity':capacity,'goals':goals,
-              'dispatch_complete':len(rows)==len(jobs),
-              'execution_complete':len(rows)==len(jobs) and all(not r.get('status','').startswith(('blocked_','identity_'))
+              'dispatch_complete':not unusable_stop and len(rows)==len(jobs),
+              'execution_complete':not unusable_stop and len(rows)==len(jobs) and all(not r.get('status','').startswith(('blocked_','identity_'))
                   and not (r.get('score_started') is False and r.get('status')!='observed') for r in rows),
               'formal_qualified':qualified,
               'formal_design_complete':design_complete,
@@ -1037,6 +1061,12 @@ def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'
                              'met' if goals and all(g['goal_status']=='met' for g in goals) else 'unknown'),
               'candidate_accepted':False,'replacement_count':sum(max(0,len(v)-1) for v in state['windows'].values()),
               'scope':'runner completion, formal qualification and goal/adoption are independent; per-request counts are never bootstrap N'}
+    if unusable_limit is not None:
+        result['unusable_window_policy'] = {'limit': unusable_limit, 'consecutive': len(unusable_causes), 'stop': unusable_stop}
+    if unusable_stop:
+        result.update(goal_status='blocked',
+            unexecuted_jobs=[{'id': job['id'], 'reason': unusable_stop['reason']} for job in jobs[len(rows):]],
+            capacity_deferred=bool(phase=='all' and plan.get('capacity')))
     write_json(output/'summary.json',result)
     write_json(output/'qualification.json',dict(result,rows=None))
     return result

@@ -708,6 +708,83 @@ class FocusCycleTests(unittest.TestCase):
             self.assertEqual(calls[-2:],[('B','explore'),('R','explore')])
             self.assertFalse(result['formal_qualified'])
 
+    def test_unusable_score_stop_is_partial_and_resume_cannot_replace_it(self):
+        p=self.plan();p['stop_after_consecutive_unusable_windows']=2
+        p['schedule']=[{'phase':'final','workload':'ok','orders':[['B','R']]*5,
+                       'warmup_seconds':10,'score_seconds':30}]
+        p['capacity']={'must_not_run':True}
+        calls=[];fake=self.fake_window(invalid=True,calls=calls)
+        def scored(*args,**kwargs):
+            return dict(fake(*args,**kwargs),score_started=True)
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'plan.json';path.write_text(json.dumps(p));out=Path(d)/'out'
+            with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                 mock.patch.object(focus_cycle,'window',side_effect=scored), \
+                 mock.patch.object(focus_cycle,'capacity_jobs') as capacity:
+                first=focus_cycle.execute(path,out,'all','ok')
+                resumed=focus_cycle.execute(path,out,'all','ok',resume=True)
+            self.assertEqual(len(calls),2);capacity.assert_not_called()
+            for result in (first,resumed):
+                self.assertEqual(len(result['rows']),2)
+                self.assertEqual(len(result['unexecuted_jobs']),8)
+                self.assertEqual(result['goal_status'],'blocked')
+                self.assertTrue(result['capacity_deferred'])
+                self.assertTrue(all(not result[key] for key in
+                    ('dispatch_complete','execution_complete','formal_design_complete','formal_qualified')))
+                self.assertEqual([c['cause'] for c in result['unusable_window_policy']['stop']['causes']],
+                                 ['confirmed_fault','confirmed_fault'])
+            state=read_json(out/'state.json')
+            self.assertEqual([len(v) for v in state['windows'].values()],[1,1])
+
+    def test_arrival_failure_stops_without_relabeling_unknown_cause_or_unscored_rows(self):
+        p=self.plan();p['stop_after_consecutive_unusable_windows']=2
+        p['schedule']=[{'phase':'explore','workload':'ok','orders':[['B'],['R'],['B'],['R'],['A']],
+                       'warmup_seconds':0,'score_seconds':3}]
+        sequence=iter([{'score_started':False,'measurement_invalid':True},
+            {'score_started':True,'arrival_schedule_quality':'unknown'},
+            {'score_started':True,'arrival_schedule_quality':'fail'},
+            {'score_started':True,'arrival_schedule_quality':'fail'}])
+        calls=[];fake=self.fake_window(calls=calls)
+        def scored(*args,**kwargs):
+            return dict(fake(*args,**kwargs),environment_quality='unknown',**next(sequence))
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'plan.json';path.write_text(json.dumps(p))
+            with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                 mock.patch.object(focus_cycle,'window',side_effect=scored):
+                result=focus_cycle.execute(path,Path(d)/'out','all','ok')
+        self.assertEqual(len(calls),4)
+        self.assertEqual(len(result['unexecuted_jobs']),1)
+        self.assertEqual([c['cause'] for c in result['unusable_window_policy']['stop']['causes']],
+                         ['arrival_failed_unknown_cause','arrival_failed_unknown_cause'])
+        self.assertTrue(all(row['measurement_invalid'] is False and row['environment_quality']=='unknown'
+                            for row in result['rows'][2:]))
+
+    def test_effective_score_resets_and_product_failures_are_not_environment_stops(self):
+        p=self.plan();p['stop_after_consecutive_unusable_windows']=2
+        p['schedule']=[{'phase':'explore','workload':'ok','orders':[['B'],['R'],['A'],['B'],['R']],
+                       'warmup_seconds':0,'score_seconds':3}]
+        sequence=iter([{'measurement_invalid':True},
+            {'measurement_invalid':False,'environment_quality':'unknown'},
+            {'measurement_invalid':True,'functional_valid':False,'status':'functional_failure'},
+            {'measurement_invalid':True,'accounting_valid':False,'status':'accounting_failure'},
+            {'measurement_invalid':True}])
+        calls=[];fake=self.fake_window(calls=calls)
+        def scored(*args,**kwargs):
+            return dict(fake(*args,**kwargs),score_started=True,**next(sequence))
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'plan.json';path.write_text(json.dumps(p))
+            with mock.patch.object(focus_cycle,'version_identity',side_effect=self.binding), \
+                 mock.patch.object(focus_cycle,'window',side_effect=scored):
+                result=focus_cycle.execute(path,Path(d)/'out','all','ok')
+            for limit in (0,11,True):
+                p['stop_after_consecutive_unusable_windows']=limit;path.write_text(json.dumps(p))
+                with self.assertRaises(ValueError):
+                    focus_cycle.execute(path,Path(d)/('invalid-'+str(limit)),'all','ok')
+        self.assertEqual(len(calls),5)
+        self.assertIsNone(result['unusable_window_policy']['stop'])
+        self.assertEqual(result['unusable_window_policy']['consecutive'],1)
+        self.assertEqual(result['goal_status'],'not_met')
+
     def test_resume_keeps_bad_scores_and_allows_only_retained_independent_fault(self):
         p=self.plan();p['schedule']=[{'phase':'explore','workload':'ok','names':['B'],'warmup_seconds':0,'score_seconds':3}]
         for invalid,failed,expected in ((False,False,1),(False,True,1),(True,True,1),(True,False,2)):
