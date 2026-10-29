@@ -7251,26 +7251,34 @@ typedef struct KuHttpConnection {
 "#;
     let checks = r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"persistent owner line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static int fixture_bitmap_consistent(const KuHttpReactor* reactor) {
+  if(!reactor->registered_bits || reactor->registered_word_count!=ku_http_reactor_registered_words(reactor->capacity))return 0;
+  for(size_t i=0;i<reactor->capacity;i++)
+    if(((reactor->registered_bits[i/64u]>>(i%64u))&UINT64_C(1))!=(uint64_t)(reactor->registrations[i].registered!=0))return 0;
+  size_t tail=reactor->capacity%64u;
+  return !tail || !(reactor->registered_bits[reactor->registered_word_count-1u]>>tail);
+}
 static int fixture_external_net_close(int reuse,int both_filters) {
   KuHttpConnection connections[1]={{0}};
   KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
-  CHECK(ku_http_reactor_init(&reactor,&active,1u));
+  CHECK(ku_http_reactor_init(&reactor,&active,61u));
   int retired[2],replacement[2];
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,retired));
   CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
-  int fd=retired[0];size_t old_net=4u;
+  int fd=retired[0];size_t old_net=64u;
   ku_http_reactor_interest(&reactor,old_net,fd,(short)(KU_HTTP_POLL_READ|(both_filters?KU_HTTP_POLL_WRITE:0)),UINT64_MAX-300u,-1);
-  CHECK(!reactor.fault && reactor.registrations[old_net].registered);
+  CHECK(!reactor.fault && reactor.registrations[old_net].registered && fixture_bitmap_consistent(&reactor));
   /* The net owner closes during pump/interests before HTTP reconciles the
    * previous compact snapshot. No HTTP close hook runs on that resource. */
   CHECK(!close(fd));
   if(!reuse) {
     ku_http_reactor_delete(&reactor,old_net);
-    CHECK(!reactor.fault && !reactor.registrations[old_net].registered);
+    CHECK(!reactor.fault && !reactor.registrations[old_net].registered && fixture_bitmap_consistent(&reactor));
   } else {
     CHECK(dup2(replacement[0],fd)==fd);CHECK(!close(replacement[0]));
     ku_http_reactor_interest(&reactor,0u,fd,KU_HTTP_POLL_READ,UINT64_MAX-200u,-1);
-    CHECK(!reactor.fault && reactor.registrations[0].registered);
+    CHECK(!reactor.fault && reactor.registrations[0].registered && fixture_bitmap_consistent(&reactor));
+    CHECK(!reactor.registrations[old_net].registered && !reactor.registered_bits[1]);
     uint64_t current_token=reactor.registrations[0].token;
     /* A new HTTP slot (or new net resource) can register the reused numeric
      * fd before the retired net entry is reconciled. DEL is by numeric fd:
@@ -7319,11 +7327,13 @@ static int fixture_filter_masks(void) {
   items[0].revents=0;
   ku_http_reactor_interest(&reactor,net,pair[0],0,123u,0);
   CHECK(!reactor.fault && ku_http_reactor_wait(&reactor,items,0)==0 && !items[0].revents);
+  CHECK(reactor.registrations[net].registered && fixture_bitmap_consistent(&reactor));
   ku_http_reactor_interest(&reactor,net,pair[0],KU_HTTP_POLL_READ,123u,0);
   CHECK(write(pair[1],"n",1)==1 && ku_http_reactor_wait(&reactor,items,1000)>0);
   CHECK(items[0].revents&KU_HTTP_POLL_READ);
   CHECK(read(pair[0],&byte,1)==1 && byte=='n');
   ku_http_reactor_delete(&reactor,net);CHECK(!reactor.fault);
+  CHECK(fixture_bitmap_consistent(&reactor) && !reactor.registered_bits[0]);
   CHECK(!close(pair[0]) && !close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-dual-filter-mask-transitions-ok");return 0;
 }
@@ -7337,8 +7347,72 @@ static int fixture_closed_event_source(void) {
   CHECK(!close(reactor.descriptor) && !close(pair[0]));
   ku_http_reactor_delete(&reactor,4u);
   CHECK(reactor.fault); /* EBADF must not hide failure of the event source. */
+  CHECK(fixture_bitmap_consistent(&reactor) && !reactor.registered_bits[0]);
   reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-closed-event-source-fault-ok");return 0;
+}
+static int fixture_registration_bitmap(void) {
+  KuHttpConnection connection={0};KuHttpActiveSet active={&connection,1,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_init_pending(&reactor,&active,124u,3u));
+  CHECK(reactor.capacity==131u && reactor.pending_base==128u && reactor.registered_word_count==3u);
+  static const size_t indices[]={0u,63u,64u,127u,128u,130u};
+  int pairs[6][2],replacement[2];
+  for(size_t i=0;i<6u;i++) {
+    CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
+    ku_http_reactor_interest(&reactor,indices[i],pairs[i][0],KU_HTTP_POLL_READ,100u+i,-1);
+    CHECK(!reactor.fault && fixture_bitmap_consistent(&reactor));
+  }
+  CHECK(reactor.registered_bits[0]==(UINT64_C(1)|(UINT64_C(1)<<63)));
+  CHECK(reactor.registered_bits[1]==(UINT64_C(1)|(UINT64_C(1)<<63)));
+  CHECK(reactor.registered_bits[2]==(UINT64_C(1)|(UINT64_C(1)<<2)));
+  CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+  int reused=pairs[1][0];uint64_t old_token=reactor.registrations[63].token;
+  CHECK(!close(reused) && dup2(replacement[0],reused)==reused && !close(replacement[0]));
+  ku_http_reactor_interest(&reactor,129u,reused,KU_HTTP_POLL_READ,999u,0);
+  CHECK(!reactor.fault && fixture_bitmap_consistent(&reactor));
+  CHECK(!reactor.registrations[63].registered && ku_http_reactor_lookup(&reactor,old_token)==SIZE_MAX);
+  ku_http_reactor_delete(&reactor,63u);ku_http_reactor_delete(&reactor,63u);
+  CHECK(!reactor.fault && fixture_bitmap_consistent(&reactor));
+  CHECK(write(replacement[1],"b",1)==1);
+  KuHttpPollFd items[1]={{0}};
+  CHECK(ku_http_reactor_wait(&reactor,items,1000)>0 && (items[0].revents&KU_HTTP_POLL_READ));
+  char byte;CHECK(read(reused,&byte,1)==1 && byte=='b');
+  ku_http_reactor_interest(&reactor,128u,KU_HTTP_INVALID_SOCKET,0,0,-1);
+  ku_http_reactor_delete(&reactor,129u);
+  for(size_t i=0;i<6u;i++)ku_http_reactor_delete(&reactor,indices[i]);
+  CHECK(!reactor.fault && fixture_bitmap_consistent(&reactor));
+  CHECK(!reactor.registered_bits[0] && !reactor.registered_bits[1] && !reactor.registered_bits[2]);
+  int closed=dup(pairs[0][1]);CHECK(closed>=0 && !close(closed));
+  ku_http_reactor_interest(&reactor,130u,closed,KU_HTTP_POLL_READ,1000u,-1);
+  CHECK(reactor.fault && !reactor.registrations[130].registered && fixture_bitmap_consistent(&reactor));
+  for(size_t i=0;i<6u;i++)CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
+  CHECK(!close(replacement[1]));ku_http_reactor_destroy(&reactor);
+  CHECK(!reactor.registered_bits && !reactor.registered_word_count && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("http-registration-bitmap-boundaries-ok");return 0;
+}
+static int fixture_registration_bitmap_init(void) {
+  KuHttpConnection connection={0};KuHttpActiveSet active={&connection,1,NULL};KuHttpReactor reactor;
+  CHECK(ku_http_reactor_registered_words(0u)==0u && ku_http_reactor_registered_words(64u)==1u);
+  CHECK(ku_http_reactor_registered_words(65u)==2u && ku_http_reactor_registered_words(SIZE_MAX)==SIZE_MAX/64u+1u);
+  size_t before=ku_http_reactor_storage_bytes(1u,60u);
+  size_t after=ku_http_reactor_pending_storage_bytes(1u,60u,1u);
+  CHECK(after-before==sizeof(KuHttpRegistration)+sizeof(uint64_t)
+      +(ku_http_reactor_hash_capacity(65u)-ku_http_reactor_hash_capacity(64u))*sizeof(KuHttpRegistrationHash));
+  for(size_t fail=1u;fail<=5u;fail++) {
+    fixture_calloc_attempts=0;fixture_calloc_fail_at=fail;fixture_event_source=-1;
+    CHECK(!ku_http_reactor_init_pending(&reactor,&active,60u,1u));
+    CHECK(fixture_calloc_attempts==5u && !active.reactor && reactor.descriptor==-1);
+    CHECK(!reactor.registrations && !reactor.hash && !reactor.registered_bits && !reactor.registered_word_count && !reactor.work && !reactor.idle_heap);
+    CHECK(fixture_event_source>=0 && fcntl(fixture_event_source,F_GETFD)<0 && errno==EBADF);
+    CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  }
+  fixture_calloc_attempts=0;fixture_calloc_fail_at=0;
+  CHECK(ku_http_reactor_init_pending(&reactor,&active,60u,1u));
+  CHECK(fixture_calloc_attempts==5u && ku_perf_live_allocations==5u && fixture_bitmap_consistent(&reactor));
+  CHECK(ku_perf_live_bytes+sizeof(reactor)==after);
+  ku_http_reactor_destroy(&reactor);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  puts("http-registration-bitmap-init-budget-ok");return 0;
 }
 int main(int argc,char** argv) {
   if(argc>1 && !strcmp(argv[1],"external-net-close")) return fixture_external_net_close(0,0);
@@ -7346,6 +7420,8 @@ int main(int argc,char** argv) {
   if(argc>1 && !strcmp(argv[1],"external-net-reuse-both")) return fixture_external_net_close(1,1);
   if(argc>1 && !strcmp(argv[1],"filter-masks")) return fixture_filter_masks();
   if(argc>1 && !strcmp(argv[1],"closed-event-source")) return fixture_closed_event_source();
+  if(argc>1 && !strcmp(argv[1],"registration-bitmap")) return fixture_registration_bitmap();
+  if(argc>1 && !strcmp(argv[1],"registration-bitmap-init")) return fixture_registration_bitmap_init();
   KuHttpConnection connections[4]={{0}};
   KuHttpActiveSet active={connections,4,NULL};KuHttpReactor reactor;
   CHECK(ku_http_reactor_storage_bytes(4u,0u)>sizeof(reactor));
@@ -7425,16 +7501,44 @@ int main(int argc,char** argv) {
   reactor.next_token=UINT64_MAX-1u;
   ku_http_reactor_interest(&reactor,5u,first[1],KU_HTTP_POLL_READ,0,-1);
   CHECK(reactor.fault && !reactor.registrations[5].registered);
+  CHECK(fixture_bitmap_consistent(&reactor));
   for(int i=0;i<4;i++) {ku_http_reactor_forget(&connections[i]);ku_http_reactor_retire(&connections[i]);}
   CHECK(!reactor.idle_count && !reactor.work_count);
   CHECK(!close(recycled) && !close(first[1]) && !close(second[0]) && !close(second[1]) && !close(replacement[1]));
   ku_http_reactor_destroy(&reactor);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   puts("http-persistent-owner-generation-idle-ok");return 0;
 }
 "#;
     let directory = native_c_harness::TempDir::new("http-persistent-owner");
     let path = directory.path().join("persistent.c");
-    fs::write(&path, format!("{header}{}{checks}", &runtime[begin..end])).unwrap();
+    let allocation_edges = r#"
+static size_t fixture_calloc_attempts,fixture_calloc_fail_at;
+static int fixture_event_source=-1;
+static void* fixture_reactor_calloc(size_t count,size_t bytes) {
+  fixture_calloc_attempts++;
+  if(fixture_calloc_fail_at==fixture_calloc_attempts)return NULL;
+  return ku_perf_calloc(count,bytes);
+}
+#undef calloc
+#define calloc fixture_reactor_calloc
+#if defined(__linux__)
+static int fixture_reactor_event_source(int flags) {return fixture_event_source=epoll_create1(flags);}
+#define epoll_create1 fixture_reactor_event_source
+#else
+static int fixture_reactor_event_source(void) {return fixture_event_source=kqueue();}
+#define kqueue fixture_reactor_event_source
+#endif
+"#;
+    fs::write(
+        &path,
+        format!(
+            "{header}{}{allocation_edges}{}{checks}",
+            native_allocation_harness::ALLOCATION_HOOK,
+            &runtime[begin..end]
+        ),
+    )
+    .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "persistent")
     else {
         assert!(
@@ -7468,6 +7572,8 @@ int main(int argc,char** argv) {
         "external-net-reuse-both",
         "filter-masks",
         "closed-event-source",
+        "registration-bitmap",
+        "registration-bitmap-init",
     ] {
         let output = run_bounded(
             Command::new(&executable).arg(scenario),

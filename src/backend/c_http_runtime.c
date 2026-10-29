@@ -3299,10 +3299,11 @@ typedef struct {
 } KuHttpReadyEvent;
 typedef struct KuHttpReactor {
   int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
-  size_t capacity,hash_capacity,old_net_count,ready_count,pending_base;
+  size_t capacity,hash_capacity,old_net_count,ready_count,pending_base,registered_word_count;
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
+  uint64_t* registered_bits;
   KuHttpRegistrationHash* hash;
   int* work;
   int* idle_heap;
@@ -3321,16 +3322,31 @@ static size_t ku_http_reactor_hash_capacity(size_t capacity) {
   while(result<capacity*2u) result*=2u;
   return result;
 }
+static size_t ku_http_reactor_registered_words(size_t capacity) {
+  /* Divide before rounding: capacity+63 could overflow. The word count
+   * times sizeof(uint64_t) is at most capacity/8+8 and fits size_t. */
+  return capacity/64u+(capacity%64u!=0u);
+}
+static unsigned ku_http_reactor_first_bit(uint64_t bits) {
+  /* Called only for nonzero words. Windows keeps its separate poll backend. */
+#if defined(__GNUC__) || defined(__clang__)
+  return (unsigned)__builtin_ctzll((unsigned long long)bits);
+#else
+  unsigned bit=0;while(!(bits&UINT64_C(1))) {bits>>=1;bit++;}return bit;
+#endif
+}
 static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
   size_t capacity=slots+3u+net;
   return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
       +ku_http_reactor_hash_capacity(capacity)*sizeof(KuHttpRegistrationHash)
+      +ku_http_reactor_registered_words(capacity)*sizeof(uint64_t)
       +slots*2u*sizeof(int);
 }
 static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size_t pending) {
   size_t before=slots+3u+net,after=before+pending;
   return ku_http_reactor_storage_bytes(slots,net)
       +pending*sizeof(KuHttpRegistration)
+      +(ku_http_reactor_registered_words(after)-ku_http_reactor_registered_words(before))*sizeof(uint64_t)
       +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*sizeof(KuHttpRegistrationHash);
 }
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
@@ -3428,18 +3444,28 @@ static void ku_http_reactor_delete(KuHttpReactor* r,size_t index) {
   if(!ku_http_reactor_kernel(r,entry,entry->fd,0,entry->token,1)) r->fault=1;
   ku_http_reactor_hash_remove(r,entry->token);
   *entry=(KuHttpRegistration){0};
+  r->registered_bits[index/64u]&=~(UINT64_C(1)<<(index%64u));
 }
 static void ku_http_reactor_retire_fd_aliases(KuHttpReactor* r,size_t current,KuHttpSocket fd) {
   /* This scan runs only after a NEW kernel registration succeeded, never on
    * stable turns or ordinary MOD. The OS accepted the current identity; an
    * older snapshot with the same number is logically retired WITHOUT DEL,
    * which would otherwise delete the new fd owner. Tokens/generations remain
-   * full-width, so already-returned events for the old identity are rejected. */
-  for(size_t i=0;i<r->capacity;i++) {
-    KuHttpRegistration* old=&r->registrations[i];
-    if(i==current || !old->registered || old->fd!=fd) continue;
-    ku_http_reactor_hash_remove(r,old->token);
-    *old=(KuHttpRegistration){0};
+   * full-width, so already-returned events for the old identity are rejected.
+   * The owner-local bitmap includes zero-mask registrations and skips only
+   * empty slots; it does not narrow the set of fd aliases considered. */
+  for(size_t word=0;word<r->registered_word_count;word++) {
+    uint64_t bits=r->registered_bits[word];
+    while(bits) {
+      unsigned bit=ku_http_reactor_first_bit(bits);bits&=bits-UINT64_C(1);
+      size_t i=word*64u+bit;
+      if(i>=r->capacity) {r->fault=1;return;}
+      KuHttpRegistration* old=&r->registrations[i];
+      if(i==current || !old->registered || old->fd!=fd) continue;
+      ku_http_reactor_hash_remove(r,old->token);
+      *old=(KuHttpRegistration){0};
+      r->registered_bits[word]&=~(UINT64_C(1)<<bit);
+    }
   }
 }
 static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
@@ -3460,6 +3486,7 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   }
   ku_http_reactor_retire_fd_aliases(r,index,fd);
   *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
+  r->registered_bits[index/64u]|=UINT64_C(1)<<(index%64u);
 }
 static int ku_http_reactor_idle(const KuHttpConnection* c) {
   return c->phase==KU_HTTP_IO_HEADER && !c->request_lease && !c->request_queued && !c->buffered && !c->carry_length
@@ -3602,15 +3629,18 @@ static int ku_http_reactor_wait(KuHttpReactor* r,KuHttpPollFd* items,int timeout
 }
 static void ku_http_reactor_destroy(KuHttpReactor* r) {
   if(r->descriptor>=0) close(r->descriptor);
-  free(r->registrations);free(r->hash);free(r->work);free(r->idle_heap);
-  r->descriptor=-1;r->registrations=NULL;r->hash=NULL;r->work=NULL;r->idle_heap=NULL;
+  free(r->registrations);free(r->registered_bits);free(r->hash);free(r->work);free(r->idle_heap);
+  r->descriptor=-1;r->registrations=NULL;r->registered_bits=NULL;r->registered_word_count=0;
+  r->hash=NULL;r->work=NULL;r->idle_heap=NULL;
 }
 static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active,size_t net,size_t pending) {
   memset(r,0,sizeof(*r));r->descriptor=-1;r->slots=active->capacity;r->active=active;
   r->pending_base=(size_t)r->slots+3u+net;
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
+  r->registered_word_count=ku_http_reactor_registered_words(r->capacity);
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
   r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
+  r->registered_bits=(uint64_t*)calloc(r->registered_word_count,sizeof(*r->registered_bits));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
 #if defined(__linux__)
   r->descriptor=epoll_create1(EPOLL_CLOEXEC);
@@ -3618,7 +3648,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->descriptor=kqueue();
   if(r->descriptor>=0 && fcntl(r->descriptor,F_SETFD,FD_CLOEXEC)<0) {close(r->descriptor);r->descriptor=-1;}
 #endif
-  if(r->descriptor<0 || !r->registrations || !r->hash || (r->slots && (!r->work || !r->idle_heap))) {
+  if(r->descriptor<0 || !r->registrations || !r->registered_bits || !r->hash || (r->slots && (!r->work || !r->idle_heap))) {
     ku_http_reactor_destroy(r);return 0;
   }
   active->reactor=r;return 1;
