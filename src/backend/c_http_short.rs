@@ -314,7 +314,17 @@ fn acyclic(function: &IrFunction) -> bool {
             IrTerminator::Return(_) | IrTerminator::Unreachable => vec![],
             _ => return false,
         };
-        if !edges
+        // Bounds below are propagated once in block storage order, not by a
+        // general CFG data-flow solver. Even an acyclic backward edge can make
+        // a later store execute before an already-proven earlier expression.
+        // Keep such layouts on workers rather than underestimating their work.
+        if !edges.iter().all(|next| {
+            function
+                .blocks
+                .iter()
+                .position(|block| block.id == *next)
+                .is_some_and(|target| target > position)
+        }) || !edges
             .into_iter()
             .all(|next| visit(function, next, active, done))
         {
@@ -487,6 +497,75 @@ mod tests {
         assert!(!accepts("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.body) } fn main() {}","Ready"));
         let long = "a".repeat(MAX_STRING + 1);
         assert!(!accepts(&format!("import \"std.http\" fn Ready(): HttpResponse {{ return http.text(\"{long}\") }} fn main() {{}}"),"Ready"));
+    }
+    #[test]
+    fn owner_proof_rejects_acyclic_backward_layout_before_reusing_bounds() {
+        let ast=crate::parser::Parser::new(crate::lexer::Lexer::new(
+            r#"import "std.http" fn Ready(): HttpResponse { return http.text("ok") } fn main() {}"#
+        ).tokenize().unwrap()).parse_program().unwrap();
+        let mut program = crate::ir::lower_program(&ast).unwrap();
+        let index = program
+            .functions
+            .iter()
+            .position(|function| function.name == "Ready")
+            .unwrap();
+        let literal = |text: &str| IrExpr {
+            ty: IrType::Str,
+            kind: IrExprKind::Literal(format!("\"{text}\"")),
+        };
+        let local = || IrExpr {
+            ty: IrType::Str,
+            kind: IrExprKind::Local("text".into()),
+        };
+        let response = IrExpr {
+            ty: IrType::Named("__ku_http_response".into()),
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    ty: IrType::Function,
+                    kind: IrExprKind::Local("http.text".into()),
+                }),
+                args: vec![IrExpr {
+                    ty: IrType::Str,
+                    kind: IrExprKind::Binary {
+                        left: Box::new(local()),
+                        op: crate::ast::BinaryOp::Add,
+                        right: Box::new(local()),
+                    },
+                }],
+                kind: IrCallKind::Intrinsic("http.text".into()),
+            },
+        };
+        // Execution is 0 -> 2 -> 1, with no cycle. A storage-order-only scan
+        // previously bounded the return as two bytes, before seeing the store
+        // that really makes the concatenation 2*MAX_STRING bytes.
+        program.functions[index].blocks = vec![
+            crate::ir::IrBlock {
+                id: BlockId(0),
+                name: "entry".into(),
+                instructions: vec![IrInst::Let {
+                    name: "text".into(),
+                    ty: IrType::Str,
+                    value: literal("a"),
+                }],
+                terminator: IrTerminator::Jump(BlockId(2)),
+            },
+            crate::ir::IrBlock {
+                id: BlockId(1),
+                name: "return".into(),
+                instructions: vec![],
+                terminator: IrTerminator::Return(Some(response)),
+            },
+            crate::ir::IrBlock {
+                id: BlockId(2),
+                name: "grow".into(),
+                instructions: vec![IrInst::Store {
+                    target: IrLValue::Local("text".into()),
+                    value: literal(&"x".repeat(MAX_STRING)),
+                }],
+                terminator: IrTerminator::Jump(BlockId(1)),
+            },
+        ];
+        assert!(!proven(&program, &program.functions[index]));
     }
     #[test]
     fn request_field_proof_rejects_whole_value_escape_and_keeps_direct_fields() {
