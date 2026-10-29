@@ -29,6 +29,53 @@ class KuCompilerCommandTests(unittest.TestCase):
                 compile_variants.ku_cc_command(['clang-18', argument])
 
 
+class HostedWorkflowContracts(unittest.TestCase):
+    """Read-only schema contracts for the opt-in job; no runner is dispatched."""
+
+    def workflow(self):
+        text=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        return text,text.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
+
+    def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
+        text,job=self.workflow()
+        self.assertIn("task-main-path, performance-v2]",text)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'performance-v2'",job)
+        self.assertIn('runs-on: ubuntu-24.04-arm',job)
+        self.assertIn('timeout-minutes: 180',job)
+        self.assertIn('permissions:\n      contents: read',job)
+        self.assertNotIn('strategy:',job)
+        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2')",text)
+        self.assertIn("&& '-performance-v2' || ''",text)
+
+    def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
+        _,job=self.workflow()
+        self.assertIn('actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd',job)
+        self.assertIn('fetch-depth: 0',job);self.assertIn('persist-credentials: false',job)
+        self.assertIn('1.89.0 --no-self-update --component llvm-tools-preview',job)
+        self.assertIn('actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16',job)
+        self.assertIn("go-version: '1.27.2'",job);self.assertIn('cache: false',job)
+        build=job.split('- name: Build frozen',1)[1].split('- name: Run the one',1)[0]
+        run=job.split('- name: Run the one',1)[1].split('- name: Always archive',1)[0]
+        self.assertIn('python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build',build)
+        self.assertNotIn('sudo',build)
+        self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase run',run)
+        self.assertIn('timeout-minutes: 130',run)
+        for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
+            self.assertNotIn(sdk,job)
+
+    def test_evidence_is_always_allowlisted_and_retained_for_one_day(self):
+        _,job=self.workflow()
+        archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
+        self.assertIn('if: always()',archive)
+        self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),1)
+        self.assertIn('retention-days: 1',job)
+        self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
+        self.assertIn('/ku-performance-v2/archive.json',job)
+        self.assertIn('goal_status',archive)
+        self.assertNotIn('path: ${{ runner.temp }}/ku-performance-v2\n',job)
+
+
 class BatchWindowTests(unittest.TestCase):
     """Synthetic outputs exercise gates without running the large CPU workload."""
 

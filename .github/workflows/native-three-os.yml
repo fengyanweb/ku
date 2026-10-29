@@ -6,16 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'full runs all gates; task-main-path checks Task/HTTP; platform scopes reuse unchanged checks'
+        description: 'full runs gates; task-main-path checks Task/HTTP; performance-v2 runs one isolated benchmark cycle'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2]
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'performance-v2' && '-performance-v2' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -400,8 +400,119 @@ jobs:
           "$fixture/program" > "$fixture/actual.txt"
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
+  performance-v2:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'performance-v2'
+    name: Linux ARM64 serial performance evidence (goal status is separate)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      GOTOOLCHAIN: local
+      KU_PERFORMANCE_V2_ROOT: ${{ runner.temp }}/ku-performance-v2
+      KU_PERFORMANCE_V2_BASELINE: 988f32ef496b18b935a3c276ef7933d0563691da
+
+    steps:
+      - name: Check out the exact candidate and baseline history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify runner entry contracts without starting workloads
+        run: python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
+
+      - name: Install only the fixed Rust compiler and LLVM profile tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update --component llvm-tools-preview
+          rustup default 1.89.0
+          rustc --version --verbose
+
+      - name: Install the fixed Go compiler without dependency cache
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+          check-latest: false
+
+      - name: Prepare bounded tool paths and available native diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n apt-get update
+          sudo -n apt-get install -y --no-install-recommends \
+            clang-18 llvm-18 lld-18 libpq-dev postgresql-16 libclang-rt-18-dev linux-tools-common
+          for performance_perf_package in "linux-tools-$(uname -r)" linux-tools-generic; do
+            if apt-cache show "$performance_perf_package" >/dev/null 2>&1; then
+              sudo -n apt-get install -y --no-install-recommends "$performance_perf_package"
+              break
+            fi
+          done
+          mkdir -p "$KU_PERFORMANCE_V2_ROOT/tools/bin"
+          ln -s "${CARGO_HOME:-$HOME/.cargo}" "$KU_PERFORMANCE_V2_ROOT/tools/cargo"
+          ln -s "${RUSTUP_HOME:-$HOME/.rustup}" "$KU_PERFORMANCE_V2_ROOT/tools/rustup"
+          ln -s "$(go env GOROOT)" "$KU_PERFORMANCE_V2_ROOT/tools/go"
+          performance_perf_binary="$(find /usr/lib/linux-tools* -maxdepth 2 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$performance_perf_binary" ]; then
+            ln -s "$performance_perf_binary" "$KU_PERFORMANCE_V2_ROOT/tools/bin/perf"
+          fi
+          printf '%s\n' "$KU_PERFORMANCE_V2_ROOT/tools/bin" >> "$GITHUB_PATH"
+          test "$(stat -c %u "$KU_PERFORMANCE_V2_ROOT")" = "$(id -u)"
+          test "$(stat -c %g "$KU_PERFORMANCE_V2_ROOT")" = "$(id -g)"
+          go version
+
+      - name: Build frozen sources and plans as the benchmark user
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build \
+            --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+            --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+
+      - name: Run the one serial cgroup cycle and preserve each goal status
+        timeout-minutes: 130
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase run \
+            --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+            --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+
+      - name: Always archive the allowlisted evidence and goal_status
+        if: always()
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive \
+            --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+            --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+          sudo -n chown "$(id -u):$(id -g)" \
+            "$KU_PERFORMANCE_V2_ROOT/ku-performance-v2-evidence.tar.gz" "$KU_PERFORMANCE_V2_ROOT/archive.json"
+
+      - name: Retain one short-lived evidence artifact (not a performance pass)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-performance-v2-evidence
+          path: |
+            ${{ runner.temp }}/ku-performance-v2/ku-performance-v2-evidence.tar.gz
+            ${{ runner.temp }}/ku-performance-v2/archive.json
+          retention-days: 1
+          if-no-files-found: error
+
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'task-main-path'
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
