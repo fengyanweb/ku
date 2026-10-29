@@ -33,6 +33,16 @@ def digest(path):
     return result.hexdigest()
 
 
+def ku_cc_command(words):
+    # KU_CC is parsed by Ku, never by a POSIX shell. Its existing grammar only
+    # groups double quotes; shlex.join's single quotes would become literal
+    # filename characters and split a profile directory containing spaces.
+    if any('"' in word or '\n' in word or '\r' in word for word in words):
+        raise ValueError('KU_CC cannot represent a quoted/newline compiler argument')
+    return ' '.join('"'+word+'"' if not word or any(c.isspace() for c in word)
+                    else word for word in words)
+
+
 def save(path, value):
     path = Path(path)
     tmp = path.with_suffix(path.suffix + '.writing')
@@ -217,7 +227,7 @@ def build(manifest_path, output, tools, stack, variant, training_receipt=None):
                 raise ValueError('normal libpq identity changed')
             shutil.copyfile(libpq, private/'libpq.so')
             native_extra = [flag for flag in flags if flag not in ('-O2', '-O3')]
-            compiler_command = shlex.join(['clang-18', *native_extra])
+            compiler_command = ku_cc_command(['clang-18', *native_extra])
             receipt['normal_cli'] = {'path': str(cli), 'sha256': digest(cli),
                 'profile': 'release' if variant in ('normal','o2') else 'fast',
                 'KU_CC': compiler_command, 'profile_contract':

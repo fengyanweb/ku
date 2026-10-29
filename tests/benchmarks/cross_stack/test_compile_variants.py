@@ -15,6 +15,17 @@ from profile_training import PLANS, expected, identity, plan, parse_output
 from build_linux import expand_ku_server
 
 
+class KuCompilerCommandTests(unittest.TestCase):
+    def test_profile_directory_uses_ku_grammar_without_shell_quoting(self):
+        self.assertEqual(compile_variants.ku_cc_command(
+            ['clang-18', '-fprofile-use=/tmp/a b/profile.profdata', '-flto=thin']),
+            'clang-18 "-fprofile-use=/tmp/a b/profile.profdata" -flto=thin')
+        self.assertEqual(compile_variants.ku_cc_command(['clang-18', "a'b"]), "clang-18 a'b")
+        for argument in ['a"b', 'a\nb', 'a\rb']:
+            with self.assertRaisesRegex(ValueError, 'KU_CC'):
+                compile_variants.ku_cc_command(['clang-18', argument])
+
+
 class BatchWindowTests(unittest.TestCase):
     """Synthetic outputs exercise gates without running the large CPU workload."""
 
