@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import signal
 import subprocess
 import time
@@ -51,7 +52,7 @@ def clean_environment(tools):
                 'BENCH_CPU_PROFILE', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS'):
         env.pop(key, None)
     env.update(CARGO_HOME=str(tools/'cargo'), RUSTUP_HOME=str(tools/'rustup'),
-               CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0', GOTOOLCHAIN='local',
+               CARGO_BUILD_JOBS='2', CARGO_INCREMENTAL='0', RUSTUP_AUTO_INSTALL='0', GOTOOLCHAIN='local',
                GOMAXPROCS='2', GOMODCACHE=str(tools/'gomodcache'), GOCACHE=str(tools/'variant-go-cache'), CC='clang-18', CXX='clang++-18')
     env['PATH'] = ':'.join([str(tools/'cargo/bin'), str(tools/'go/bin'), env.get('PATH', '')])
     return env
@@ -113,8 +114,12 @@ def profile_input(path, stack, source_fingerprint):
 def input_files(manifest, stack, tools):
     source = Path(manifest['source_root'])/'tests/benchmarks/cross_stack'
     if stack == 'ku':
-        native = manifest['stacks']['ku']['build']['native']
-        return {str(Path(v['generated_c'])): digest(v['generated_c']) for v in native.values()}
+        build = manifest['stacks']['ku']['build']
+        native = build['native']
+        files = [Path(build['cli'])]
+        for item in native.values():
+            files += [Path(item['source']), Path(item['generated_c'])]
+        return {str(path): digest(path) for path in files}
     base = source/stack
     result = {str(p): digest(p) for p in sorted(base.rglob('*')) if p.is_file()
               and not set(p.relative_to(base).parts)&{'target', 'node_modules', 'bin', 'obj', '__pycache__'}}
@@ -201,16 +206,47 @@ def build(manifest_path, output, tools, stack, variant, training_receipt=None):
             flags = native_flags(stack, variant, profile, profiles)
             artifacts = {}
             native = spec['build']['native']
+            cli = Path(spec['build']['cli']).resolve(strict=True)
+            if digest(cli) != spec['build']['cli_sha256']:
+                raise ValueError('normal Ku CLI identity changed')
+            work, binaries, private = output/'ku-native', output/'bin', output/'libpq'
+            for directory in (work, binaries, private):
+                directory.mkdir()
+            libpq = Path(spec['build']['libpq_source']).resolve(strict=True)
+            if digest(libpq) != spec['build']['libpq_sha256']:
+                raise ValueError('normal libpq identity changed')
+            shutil.copyfile(libpq, private/'libpq.so')
+            native_extra = [flag for flag in flags if flag not in ('-O2', '-O3')]
+            compiler_command = shlex.join(['clang-18', *native_extra])
+            receipt['normal_cli'] = {'path': str(cli), 'sha256': digest(cli),
+                'profile': 'release' if variant in ('normal','o2') else 'fast',
+                'KU_CC': compiler_command, 'profile_contract':
+                'ordinary Release remains O2; explicit Fast is O3; tuning flags are isolated compiler inputs'}
             for name, item in native.items():
-                binary = output/('ku-'+name)
-                argv = ['clang-18', item['generated_c'], '-std=c11', '-pthread', *flags]
-                if name == 'server':
-                    argv.append(spec['build']['libpq_source'])
-                argv += ['-lm', '-o', str(binary)]
-                commands.run('ku-'+name, argv, output, timeout=180)
+                source = work/(name+'.ku')
+                original = Path(item['source']).resolve(strict=True)
+                if digest(original) != item['source_sha256']:
+                    raise ValueError('expanded Ku source changed: '+name)
+                shutil.copyfile(original, source)
+                binary = binaries/('ku-'+name)
+                argv = [str(cli),'build','--backend','c','--profile',
+                    receipt['normal_cli']['profile'],'--emit-c','--verbose','-o',str(binary),str(source)]
+                emitted = commands.run('ku-cli-'+name,argv,work,
+                    env={'KU_CC':compiler_command,'KU_PG_LIB':str(private)},timeout=180)
+                generated = [line.removeprefix('native c ok: ') for line in emitted.splitlines()
+                    if line.startswith('native c ok: ')]
+                if len(generated)!=1 or not any(line=='build ok: '+str(binary) for line in emitted.splitlines()):
+                    raise ValueError('ordinary Ku CLI did not attest C and executable')
+                generated = Path(generated[0]).resolve(strict=True)
+                if work.resolve() not in generated.parents:
+                    raise ValueError('Ku generated C escaped isolated build')
                 artifacts[name] = {'binary': str(binary), 'sha256': digest(binary), 'bytes': binary.stat().st_size}
-                native[name].update(binary=str(binary), binary_sha256=digest(binary))
+                item.update(source=str(source), source_sha256=digest(source),
+                    generated_c=str(generated), generated_c_sha256=digest(generated),
+                    binary=str(binary), binary_sha256=digest(binary),
+                    linking='ordinary Ku CLI; isolated build profile and attested compiler flags')
             spec.update(command=[artifacts['server']['binary']], batch_command=[artifacts['batch']['binary']])
+            spec['build'].update(native_flags=shlex.join(flags), cc=compiler_command)
             receipt['flags'] = flags
             receipt['artifacts'] = artifacts
         elif stack == 'go':
