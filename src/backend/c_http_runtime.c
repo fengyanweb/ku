@@ -927,7 +927,7 @@ typedef struct KuHttpRouteToken {
   void* invoke; void* env; char** param_names;
   uint32_t status;
   uint16_t param_count;
-  uint8_t arity,returns_result;
+  uint8_t arity,returns_result,fields_mask;
   uint16_t control_offset,control_length,rid_offset,rid_length;
   uint8_t rid_truncated;
   uint16_t ranges[];
@@ -1130,7 +1130,9 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   KuHttpHandler* selected=NULL;
   int route_status=ku_http_select_route(server,input->method,hdr+target_start,path_len,
       &selected,param_values,param_lengths,&param_count);
-  int public_headers=!server->root || (selected && selected->arity==1);
+  unsigned int fields_mask=selected && selected->returns_result!=2
+      ?ku_http_handler_request_fields(selected->invoke):63u;
+  int public_headers=!server->root || (selected && selected->arity==1 && (fields_mask&1u));
   size_t header_capacity=public_headers?ku_http_map_capacity(header_fields):0;
   size_t control_bytes=control_length<=128u?control_length:0;
   size_t rid_bytes=rid_length<48u?rid_length:48u;
@@ -1144,6 +1146,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   if(!token)return 500;
   memset(token,0,sizeof(*token));input->route=token;
   token->status=(uint32_t)route_status;token->param_count=(uint16_t)param_count;
+  token->fields_mask=(uint8_t)fields_mask;
   if(selected) {
     token->invoke=selected->invoke;token->env=selected->env;token->param_names=selected->param_names;
     token->arity=(uint8_t)selected->arity;token->returns_result=(uint8_t)selected->returns_result;
@@ -1204,14 +1207,25 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   return 0;
 }
 typedef struct KuHttpJob KuHttpJob;
+/* A native consumer without a parser token keeps the complete public ABI. Task
+   factories likewise retain all fields; only a compiler-proven sync thunk can
+   carry a reduced mask. Validation and framed body ownership are independent. */
+static unsigned int ku_http_input_fields(const KuHttpInput* input) {
+  return input->route?input->route->fields_mask:63u;
+}
 static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
-  size_t target=strlen(input->target),method=strlen(input->method);
-  size_t query_capacity=ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len));
-  size_t parameter_capacity=ku_http_map_capacity(parameters);
-  /* Bounds include duplicate query values until overwritten and all route
-     parameter names/values. Target/header limits bound each arithmetic term. */
-  return 2*sizeof(KuObject)+(query_capacity+parameter_capacity)*sizeof(KuEntry)
-      +target*3+input->body_len+method+parameter_names+sizeof(KuStruct___ku_http_request);
+  unsigned int fields=ku_http_input_fields(input);
+  size_t target=strlen(input->target),bytes=sizeof(KuStruct___ku_http_request);
+  /* Bound every allocated map/string independently. Input/header metadata is
+     already charged; body transfer retains this reservation across input drop. */
+  if(fields&2u)bytes+=sizeof(KuObject)+ku_http_map_capacity(parameters)*sizeof(KuEntry)
+      +parameter_names+input->path_len;
+  if(fields&4u)bytes+=sizeof(KuObject)
+      +ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len))*sizeof(KuEntry)+target*2u;
+  if(fields&8u)bytes+=strlen(input->method);
+  if(fields&16u)bytes+=input->path_len;
+  if(fields&32u)bytes+=input->body_len;
+  return bytes;
 }
 static int ku_http_job_projection(KuHttpJob*,size_t);
 static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms);
@@ -1240,19 +1254,21 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
       if (!ku_http_job_projection(job,ku_http_projection_bytes(input,route->nparams,parameter_names)))
         return ku_http_status_response(503,"Service Unavailable");
-      KuObject* params = ku_object_new(ku_http_map_capacity(route->nparams));
-      for (size_t p = 0; p < route->nparams; p++) {
-        KuString key = ku_http_string_copy(route->param_names[p], strlen(route->param_names[p]));
-        KuString val = ku_http_string_copy(param_values[p], param_value_lens[p]);
-        ku_object_set(params, key, ku_v_str(val));
+      unsigned int fields=ku_http_input_fields(input);
+      KuStruct___ku_http_request req = {0};
+      if(fields&2u) {
+        req.params = ku_object_new(ku_http_map_capacity(route->nparams));
+        for (size_t p = 0; p < route->nparams; p++) {
+          KuString key = ku_http_string_copy(route->param_names[p], strlen(route->param_names[p]));
+          KuString val = ku_http_string_copy(param_values[p], param_value_lens[p]);
+          ku_object_set(req.params, key, ku_v_str(val));
+        }
       }
-      KuStruct___ku_http_request req;
-      req.method = ku_http_string_copy(method, strlen(method));
-      req.path = ku_http_string_copy(target, path_len);
-      req.body = ku_http_input_take_body(input);
-      req.params = params;
-      req.query = ku_http_parse_query(target, path_len);
-      req.headers = input->headers; input->headers = NULL;
+      if(fields&8u)req.method = ku_http_string_copy(method, strlen(method));
+      if(fields&16u)req.path = ku_http_string_copy(target, path_len);
+      if(fields&32u) { req.body = ku_http_input_take_body(input); }
+      if(fields&4u)req.query = ku_http_parse_query(target, path_len);
+      if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
       if (route->returns_result) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);

@@ -3607,6 +3607,9 @@ fn ProofText(): HttpResponse { return http.text("owner".clone()) }
 fn ProofNumber(): HttpResponse { return http.text(str(40 + 2)) }
 fn ProofError(): HttpResponse! { return err("controlled") }
 fn ProofLong(): HttpResponse { i=0 while (i<1000) { i=i+1 } return http.text(str(i)) }
+fn ProofBodyQuery(req: HttpRequest): HttpResponse { return http.text(req.body + req.query.q) }
+fn ProofComplete(req: HttpRequest): HttpResponse { return http.text(req.headers.host + req.params.id + req.method + req.path + req.body + req.query.q) }
+fn ProofWhole(req: HttpRequest): HttpResponse { return ProofComplete(req) }
 fn main(): null! {
     app = http.server()
     app.get("/", fn() { return http.text("ok") })
@@ -3614,6 +3617,8 @@ fn main(): null! {
     app.get("/proof-number",ProofNumber)
     app.get("/proof-error",ProofError)
     app.get("/proof-long",ProofLong)
+    app.post("/body/{id}",ProofBodyQuery)
+    app.post("/whole/{id}",ProofWhole)
     app.listen("127.0.0.1:0")?
     return ok(null)
 }
@@ -3749,6 +3754,40 @@ int main(void) {
     if(mode==2)CHECK(job->response.status==500);
     if(mode==3)CHECK(job->cancelled && !job->started && !job->response.body.ptr);
     ku_http_job_release(job);CHECK(!budget.current);
+  }
+  /* A direct-field sync thunk omits unobserved maps/strings; whole-request
+     transfer conservatively keeps all fields. Framing validation remains before
+     either proof, and the real generated functions consume/drop their owners. */
+  CHECK(ku_http_handler_request_fields((void*)ProofBodyQuery__thunk)==36u);
+  CHECK(ku_http_handler_request_fields((void*)ProofWhole__thunk)==63u);
+  ku_http_server_add_route(server,STR("POST"),STR("/body/{id}"),(void*)ProofBodyQuery__thunk,NULL,1,0);
+  ku_http_server_add_route(server,STR("POST"),STR("/whole/{id}"),(void*)ProofWhole__thunk,NULL,1,0);
+  for(int whole=0;whole<2;whole++) {
+    __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
+    __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
+    const char* projected=whole?"POST /whole/a?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n"
+        :"POST /body/a?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n";
+    KuHttpInput part={0};part.budget=&budget;
+    CHECK(ku_http_parse_complete_header(server,projected,strlen(projected),&part)==0);
+    CHECK(part.route->fields_mask==(whole?63u:36u) && !!part.headers==whole);
+    memcpy(part.body,"hey",3);
+    size_t projected_bytes=ku_http_projection_bytes(&part,1,2);
+    if(!whole) {
+      part.route->fields_mask=63u;
+      CHECK(projected_bytes<ku_http_projection_bytes(&part,1,2));
+      part.route->fields_mask=36u;
+    }
+    KuHttpJob* job=ku_http_job_new(&local_queue,&part);CHECK(job);
+    job->request_deadline=ku_http_deadline_ms(3000u);ku_http_job_run_owner(server,job);
+    const char* expected=whole?"localaPOST/whole/aheyz":"heyz";
+    CHECK(job->completed && job->response.status==200 && job->response.body.len==strlen(expected));
+    CHECK(!memcmp(job->response.body.ptr,expected,strlen(expected)));
+    ku_http_job_release(job);CHECK(!budget.current);
+  }
+  { const char* invalid_projected="POST /body/a?q=z HTTP/1.1\r\nHost: local\r\nBad: \xff\r\n\r\n";
+    KuHttpInput part={0};part.budget=&budget;
+    CHECK(ku_http_parse_complete_header(server,invalid_projected,strlen(invalid_projected),&part)==400);
+    ku_http_input_drop(&part);CHECK(!budget.current);
   }
   __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
   __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
