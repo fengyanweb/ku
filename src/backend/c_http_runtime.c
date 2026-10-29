@@ -3420,7 +3420,7 @@ typedef struct {
 } KuHttpReadyEvent;
 typedef struct KuHttpReactor {
   int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
-  size_t capacity,hash_capacity,old_net_count,ready_count,pending_base;
+  size_t capacity,hash_capacity,fd_capacity,fd_count,old_net_count,ready_count,pending_base;
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
@@ -3501,14 +3501,15 @@ static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
  * a successful NEW replaces a retired external resource before old events are
  * dispatched. Capacity is bounded by the same registration table, not fd value.
  * Open addressing has <=1/2 load; deletion back-shifts instead of accumulating
- * tombstones. No index allocation or growth occurs in a request turn. */
+ * tombstones. Full storage/charge is reserved at startup. The logical prefix
+ * grows before kernel ADD without any new allocation or failure timing. */
 static size_t ku_http_reactor_fd_start(const KuHttpReactor* r,KuHttpSocket fd) {
-  return ku_http_reactor_hash_start(r,(uint64_t)(uintptr_t)fd);
+  return ku_http_reactor_hash_start(r,(uint64_t)(uintptr_t)fd)&(r->fd_capacity-1u);
 }
 static size_t ku_http_reactor_fd_bucket(KuHttpReactor* r,KuHttpSocket fd) {
   size_t start=ku_http_reactor_fd_start(r,fd);
-  for(size_t i=0;i<r->hash_capacity;i++) {
-    size_t at=(start+i)&(r->hash_capacity-1u);
+  for(size_t i=0;i<r->fd_capacity;i++) {
+    size_t at=(start+i)&(r->fd_capacity-1u);
     uint32_t stored=r->fd_entries[at];
     if(!stored)return at;
     size_t index=(size_t)stored-1u;
@@ -3520,14 +3521,34 @@ static size_t ku_http_reactor_fd_bucket(KuHttpReactor* r,KuHttpSocket fd) {
 static void ku_http_reactor_fd_remove(KuHttpReactor* r,size_t index) {
   size_t hole=ku_http_reactor_fd_bucket(r,r->registrations[index].fd);
   if(hole==SIZE_MAX || r->fd_entries[hole]!=(uint32_t)(index+1u)) {r->fault=1;return;}
-  size_t mask=r->hash_capacity-1u,at=(hole+1u)&mask;
-  for(size_t moved=0;moved<r->hash_capacity && r->fd_entries[at];moved++,at=(at+1u)&mask) {
+  size_t mask=r->fd_capacity-1u,at=(hole+1u)&mask;
+  for(size_t moved=0;moved<r->fd_capacity && r->fd_entries[at];moved++,at=(at+1u)&mask) {
     size_t other=(size_t)r->fd_entries[at]-1u;
     if(other>=r->capacity || !r->registrations[other].registered) {r->fault=1;return;}
     size_t home=ku_http_reactor_fd_start(r,r->registrations[other].fd);
     if(((at-home)&mask)>=((hole-home)&mask)) {r->fd_entries[hole]=r->fd_entries[at];hole=at;}
   }
   r->fd_entries[hole]=0;
+  if(!r->fd_count) {r->fault=1;return;}
+  r->fd_count--;
+}
+/* A capacity doubling rehashes stable registrations at most once per level.
+ * The same owner exclusively mutates both tables; no kernel identity changes
+ * until this bounded preflight succeeds. Capacity never shrinks behind a live
+ * identity, and retained high-water storage/charge is reported unchanged. */
+static int ku_http_reactor_fd_prepare(KuHttpReactor* r) {
+  if(r->fd_count<r->fd_capacity/2u)return 1;
+  if(r->fd_capacity>=r->hash_capacity) {r->fault=1;return 0;}
+  size_t grown=r->fd_capacity*2u;
+  memset(r->fd_entries,0,grown*sizeof(*r->fd_entries));r->fd_capacity=grown;
+  size_t count=0;
+  for(size_t i=0;i<r->capacity;i++)if(r->registrations[i].registered) {
+    size_t at=ku_http_reactor_fd_bucket(r,r->registrations[i].fd);
+    if(at==SIZE_MAX || r->fd_entries[at]) {r->fault=1;return 0;}
+    r->fd_entries[at]=(uint32_t)(i+1u);count++;
+  }
+  if(count!=r->fd_count) {r->fault=1;return 0;}
+  return 1;
 }
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
 /* Diagnostic-only oracle: compare exact target identity against the previous
@@ -3632,6 +3653,7 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   if(!ku_http_reactor_hash_add(r,token,index)) {r->fault=1;return;}
   /* Preflight before changing the kernel. This owner cannot concurrently
    * mutate the index, so a successful NEW can publish without a fallible insert. */
+  if(!ku_http_reactor_fd_prepare(r)) {ku_http_reactor_hash_remove(r,token);return;}
   size_t bucket=ku_http_reactor_fd_bucket(r,fd);
   if(bucket==SIZE_MAX) {ku_http_reactor_hash_remove(r,token);r->fault=1;return;}
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
@@ -3641,9 +3663,11 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   if(!ku_http_reactor_kernel(r,entry,fd,events,token,0)) {
     ku_http_reactor_hash_remove(r,token);r->fault=1;return;
   }
+  int new_fd=!r->fd_entries[bucket];
   ku_http_reactor_retire_fd_aliases(r,index,fd,bucket);
   *entry=(KuHttpRegistration){fd,token,generation,events,1,poll_index,0};
   r->fd_entries[bucket]=(uint32_t)(index+1u);
+  if(new_fd)r->fd_count++;
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
   if(!ku_http_reactor_fd_oracle(r,fd,index))r->fault=1;
 #endif
@@ -3801,6 +3825,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
       || pending>UINT32_MAX-3u-(size_t)r->slots-net)return 0;
   r->pending_base=(size_t)r->slots+3u+net;
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
+  r->fd_capacity=r->hash_capacity<32u?r->hash_capacity:32u;
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
   r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
   r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));

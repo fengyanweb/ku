@@ -7508,13 +7508,13 @@ static int fixture_fd_index_clusters(void) {
   KuHttpSocket keys[4];size_t count=0;
   /* Deliberately wrap a collision cluster across the last bucket. */
   for(int fd=0;fd<65536 && count<4u;fd++)
-    if(ku_http_reactor_fd_start(&r,fd)==r.hash_capacity-1u)keys[count++]=fd;
+    if(ku_http_reactor_fd_start(&r,fd)==r.fd_capacity-1u)keys[count++]=fd;
   CHECK(count==4u);
   for(size_t round=0;round<128u;round++) {
     for(size_t i=0;i<4u;i++) {
       r.registrations[i]=(KuHttpRegistration){keys[i],1u+i,round,0,1,-1,0};
       size_t at=ku_http_reactor_fd_bucket(&r,keys[i]);
-      CHECK(at!=SIZE_MAX && !r.fd_entries[at]);r.fd_entries[at]=(uint32_t)(i+1u);
+      CHECK(at!=SIZE_MAX && !r.fd_entries[at]);r.fd_entries[at]=(uint32_t)(i+1u);r.fd_count++;
       CHECK(ku_http_reactor_fd_oracle(&r,keys[i],i));
     }
     const size_t deletion[4]={1u,0u,3u,2u};
@@ -7532,6 +7532,28 @@ static int fixture_fd_index_clusters(void) {
   r.registrations[0]=(KuHttpRegistration){keys[0],1u,0,0,1,-1,0};
   for(size_t i=0;i<r.hash_capacity;i++)r.fd_entries[i]=1u;
   CHECK(ku_http_reactor_fd_bucket(&r,keys[1])==SIZE_MAX && r.fault);
+  ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  /* Low activity touches only the charged table prefix. Growth is a bounded
+     in-place rebuild, without extra malloc or a lower maximum registration cap. */
+  KuHttpConnection larger[64]={{0}};KuHttpActiveSet more={larger,64,NULL};
+  CHECK(ku_http_reactor_init(&r,&more,0u));
+  size_t calls=fixture_alloc_calls,full=r.hash_capacity;
+  CHECK(r.fd_capacity==32u && full>32u && !r.fd_count);
+  for(size_t i=0;i<40u;i++) {
+    CHECK(ku_http_reactor_fd_prepare(&r));
+    r.registrations[i]=(KuHttpRegistration){(int)(10000u+i),i+1u,i,0,1,-1,0};
+    size_t at=ku_http_reactor_fd_bucket(&r,r.registrations[i].fd);
+    CHECK(at<r.fd_capacity && !r.fd_entries[at]);r.fd_entries[at]=(uint32_t)(i+1u);r.fd_count++;
+    for(size_t j=0;j<=i;j++) {
+      size_t found=ku_http_reactor_fd_bucket(&r,r.registrations[j].fd);
+      CHECK(found<r.fd_capacity && r.fd_entries[found]==j+1u);
+    }
+    for(size_t j=r.fd_capacity;j<full;j++)CHECK(!r.fd_entries[j]);
+  }
+  CHECK(r.fd_capacity==128u && fixture_alloc_calls==calls && r.fd_count==40u);
+  for(size_t i=0;i<40u;i++) {ku_http_reactor_fd_remove(&r,i);r.registrations[i]=(KuHttpRegistration){0};}
+  CHECK(!r.fault && !r.fd_count && r.fd_capacity==128u && r.hash_capacity==full);
+  for(size_t i=0;i<full;i++)CHECK(!r.fd_entries[i]);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
 }
