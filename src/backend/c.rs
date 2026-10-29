@@ -862,7 +862,16 @@ fn generate_c_source_with_frames_attempt(
         }
     }
     if program_uses_http(program) {
-        http_short::emit(&mut out, program);
+        let async_names = frames
+            .map(|(tasks, _, _)| {
+                tasks
+                    .functions
+                    .iter()
+                    .map(|function| function.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        http_short::emit(&mut out, program, &async_names);
     }
     emit_http_runtime(&mut out, program)?;
     emit_pg_runtime(&mut out, program);

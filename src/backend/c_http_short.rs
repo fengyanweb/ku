@@ -3,7 +3,10 @@
 //! never a promise about OS scheduling or allocator latency.
 use std::collections::{HashMap, HashSet};
 
-use super::{closure_invoke_symbol, closure_thunk_targets, COutput};
+use super::{
+    closure_invoke_symbol, closure_thunk_targets, expr_children, walk_inst_exprs,
+    walk_terminator_exprs, COutput,
+};
 use crate::ir::{
     BlockId, FunctionId, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrLValue, IrProgram,
     IrTerminator, IrType, TempId,
@@ -342,7 +345,90 @@ fn proven(program: &IrProgram, function: &IrFunction) -> bool {
             && Proof::default().function(program, function, &[]).is_some()
 }
 
-pub(super) fn emit(out: &mut COutput, program: &IrProgram) {
+fn request_fields(function: &IrFunction) -> Option<u32> {
+    let [parameter] = function.params.as_slice() else {
+        return None;
+    };
+    if parameter.ty != IrType::Named("__ku_http_request".into()) {
+        return None;
+    }
+    let name = &parameter.name;
+    let is_request = |expr: &IrExpr| {
+        matches!(&expr.kind,
+        IrExprKind::Local(local) | IrExprKind::BorrowedParam(local) if local == name)
+    };
+    let mut fields = 0u32;
+    let mut nodes = 0usize;
+    let mut inspect = |root: &IrExpr| -> Option<()> {
+        let mut pending = vec![root];
+        while let Some(expr) = pending.pop() {
+            nodes += 1;
+            if nodes > 8192 {
+                return None;
+            }
+            if let IrExprKind::Field { target, name } = &expr.kind {
+                if is_request(target) {
+                    fields |= match name.as_str() {
+                        "headers" => 1,
+                        "params" => 2,
+                        "query" => 4,
+                        "method" => 8,
+                        "path" => 16,
+                        "body" => 32,
+                        _ => return None,
+                    };
+                    continue;
+                }
+            }
+            if is_request(expr) {
+                return None;
+            }
+            pending.extend(expr_children(expr));
+        }
+        Some(())
+    };
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let IrInst::DefineClosure { captures, .. } = instruction {
+                if captures.iter().any(|capture| capture == name) {
+                    return None;
+                }
+            }
+            if let IrInst::Store { target, .. } = instruction {
+                match target {
+                    IrLValue::Local(local) if local == name => return None,
+                    IrLValue::Field { target, .. } => inspect(target)?,
+                    IrLValue::Index { target, index } => {
+                        inspect(target)?;
+                        inspect(index)?;
+                    }
+                    _ => {}
+                }
+            }
+            let mut valid = true;
+            walk_inst_exprs(instruction, &mut |expr| {
+                if inspect(expr).is_none() {
+                    valid = false;
+                }
+            });
+            if !valid {
+                return None;
+            }
+        }
+        let mut valid = true;
+        walk_terminator_exprs(&block.terminator, &mut |expr| {
+            if inspect(expr).is_none() {
+                valid = false;
+            }
+        });
+        if !valid {
+            return None;
+        }
+    }
+    Some(fields)
+}
+
+pub(super) fn emit(out: &mut COutput, program: &IrProgram, async_names: &HashSet<String>) {
     let targets = closure_thunk_targets(program);
     out.push_str("static int ku_http_handler_is_short(void* invoke) {\n");
     for function in &program.functions {
@@ -359,6 +445,20 @@ pub(super) fn emit(out: &mut COutput, program: &IrProgram) {
         }
     }
     out.push_str("  return 0;\n}\n");
+    out.push_str("static unsigned int ku_http_handler_request_fields(void* invoke) {\n");
+    for function in &program.functions {
+        if async_names.contains(&function.name)
+            || (!function.is_closure_body && !targets.iter().any(|target| target.id == function.id))
+        {
+            continue;
+        }
+        if let (Some(mask), Some(symbol)) =
+            (request_fields(function), closure_invoke_symbol(function.id))
+        {
+            out.push_str(&format!("  if(invoke==(void*){symbol}) return {mask}u;\n"));
+        }
+    }
+    out.push_str("  return 63u; /* unknown or Task handler: retain complete request */\n}\n");
 }
 
 #[cfg(test)]
@@ -387,5 +487,26 @@ mod tests {
         assert!(!accepts("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.body) } fn main() {}","Ready"));
         let long = "a".repeat(MAX_STRING + 1);
         assert!(!accepts(&format!("import \"std.http\" fn Ready(): HttpResponse {{ return http.text(\"{long}\") }} fn main() {{}}"),"Ready"));
+    }
+    #[test]
+    fn request_field_proof_rejects_whole_value_escape_and_keeps_direct_fields() {
+        fn mask(source: &str) -> Option<u32> {
+            let ast =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            let program = crate::ir::lower_program(&ast).unwrap();
+            request_fields(
+                program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == "Ready")
+                    .unwrap(),
+            )
+        }
+        assert_eq!(mask("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.body + req.query.id) } fn main() {}"),Some(36));
+        assert_eq!(mask("import \"std.http\" fn Read(req: HttpRequest): HttpResponse { return http.text(req.body) } fn Ready(req: HttpRequest): HttpResponse { return Read(req) } fn main() {}"),None);
+        assert_eq!(mask("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { copy=req.clone() return http.text(copy.body) } fn main() {}"),None);
+        assert_eq!(mask("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.headers.host + req.params.id + req.path + req.method) } fn main() {}"),Some(27));
     }
 }
