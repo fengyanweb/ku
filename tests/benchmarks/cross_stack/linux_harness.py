@@ -346,8 +346,16 @@ def overload_boundary(report, workload):
     if any(reason in gate['reasons'] for reason in ('oom','oom_kill')):
         evidence.append('service_memory_limit')
     fault=any(reason in gate['reasons'] for reason in ('http_500','wrong_body','service_exited'))
-    return {'status':'service_fault_without_capacity_attribution' if fault else ('measurement_invalid_censored' if censored else ('boundary_observed' if evidence else 'pressure_below_observed_boundary')),
-            'boundary_observed':bool(evidence) and not censored and not fault,'evidence':evidence,'qualification':gate,
+    a=report.get('assessment', {})
+    request_failure=bool(a.get('failed_request_outcomes'))
+    quality=a.get('policy_registered') is True and any(a.get(k)!='pass' for k in ('arrival_schedule_quality','environment_quality'))
+    status=('service_fault_without_capacity_attribution' if fault else
+            'request_failure_without_capacity_attribution' if request_failure else
+            ('measurement_invalid_censored' if a.get('measurement_invalid') else 'quality_unknown_censored') if quality else
+            'measurement_invalid_censored' if censored else
+            'boundary_observed' if evidence else 'pressure_below_observed_boundary')
+    return {'status':status,
+            'boundary_observed':bool(evidence) and not censored and not fault and not request_failure and not quality,'evidence':evidence,'qualification':gate,
             'http_500_count':report['ledger'].get('http_500_total',report['ledger'].get('transport_counts',{}).get('status:500',0)),
             'note':'unknown500 is a defect observation, never expected503; no claim of true overload without boundary evidence'}
 
@@ -1134,8 +1142,13 @@ def derive_verified_rates(state, summaries, stacks=STACKS):
 
 def upper_point(rate, result, gate, report):
     reasons=gate.get('reasons',[])
+    assessment=result.get('assessment', {})
     if any(reason in reasons for reason in ('http_500', 'wrong_body', 'service_exited', 'oom', 'oom_kill')):
         kind,censored='service_or_slo_failure',False
+    elif assessment.get('failed_request_outcomes'):
+        kind,censored='request_failure_without_capacity_attribution',False
+    elif assessment.get('policy_registered') is True and any(assessment.get(k)!='pass' for k in ('arrival_schedule_quality','environment_quality')):
+        kind,censored=('measurement_invalid_censored' if assessment.get('measurement_invalid') else 'quality_unknown_censored'),True
     elif result.get('valid_driver') is not True or any(reason in reasons for reason in
             ('invalid_driver_or_not_started','unreconciled_plan','driver_cpu_saturated')):
         kind,censored='driver_invalid_censored',True

@@ -88,7 +88,7 @@ def main():
     args = parser.parse_args()
     plan = json.loads(args.plan.read_text())
     args.out.mkdir(parents=True, exist_ok=True)
-    identity = {'plan_sha256': digest(args.plan), 'phase': args.phase,
+    identity = {'plan_sha256': digest(args.plan), 'entry_sha256': digest(__file__), 'phase': args.phase,
                 'workload': args.workload, 'names': args.names}
     if (args.out/'identity.json').exists():
         raise RuntimeError('output exists; do not overwrite or silently repeat a prior experiment')
@@ -97,13 +97,16 @@ def main():
     names = args.names.split(',')
     if args.phase == 'control':
         orders = [[names[0]]]*3
-        warmup, duration = 5, 10
+        control = plan.get('control', {'warmup_seconds': 5, 'score_seconds': 10})
+        warmup, duration = control['warmup_seconds'], control['score_seconds']
     elif args.phase == 'screen':
         orders = [names]
         warmup, duration = plan['screen']['warmup_seconds'], plan['screen']['score_seconds']
     else:
         orders = [[names['ABR'.index(key)] for key in order] for order in plan['final_orders']]
         warmup, duration = 10, 30
+    if not 0 <= warmup <= 60 or not 1 <= duration <= 300:
+        raise ValueError('warmup0..60s and score1..300s required')
     rows = []
     for group, order in enumerate(orders, 1):
         for name in order:

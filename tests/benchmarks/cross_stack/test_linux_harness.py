@@ -69,7 +69,11 @@ class AssessmentQualityTest(unittest.TestCase):
         self.assertEqual(a['arrival_schedule_quality'], 'fail')
         self.assertFalse(a['measurement_invalid'])
         self.assertFalse(a['candidate_accepted'])
-        self.assertFalse(qualification(r, 'json_object')['eligible_for_formal_candidate'])
+        gate = qualification(r, 'json_object')
+        self.assertFalse(gate['eligible_for_formal_candidate'])
+        self.assertEqual(upper_point(500, r, gate, 'kept/client.json')['gate_kind'],
+                         'quality_unknown_censored')
+        self.assertEqual(overload_boundary(r, 'json_object')['status'], 'quality_unknown_censored')
 
     def test_http500_survives_simultaneous_driver_and_observer_failure(self):
         r = self.report()
@@ -105,6 +109,9 @@ class AssessmentQualityTest(unittest.TestCase):
         self.assertFalse(a['functional_valid'])
         self.assertEqual(a['failed_request_outcomes'], {'timeout': 1})
         self.assertFalse(a['measurement_invalid'])
+        r['assessment'] = a
+        self.assertEqual(overload_boundary(r, 'json_object')['status'],
+                         'request_failure_without_capacity_attribution')
 
     def test_expected_rejection_is_separate_from_correct_goodput(self):
         r = self.report()
