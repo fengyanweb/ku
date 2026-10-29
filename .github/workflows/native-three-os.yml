@@ -425,7 +425,9 @@ jobs:
         run: printf 'KU_PERFORMANCE_V2_ROOT=%s\n' "$RUNNER_TEMP/ku-performance-v2" >> "$GITHUB_ENV"
 
       - name: Verify runner entry contracts without starting workloads
-        run: python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
+        run: |
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
 
       - name: Install only the fixed Rust compiler and LLVM profile tools
         shell: bash
