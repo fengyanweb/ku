@@ -22,6 +22,27 @@ static void ku_task_pg_wake(void* raw) {
   if(ku_task_driver_wake(&job->ticket)!=KU_TASK_DRIVER_OK)pool->fault=KU_TASK_DRIVER_INTERNAL;
   ku_task_blocking_unlock(pool);
 }
+/* Called only by NET_STEP with neither the PG nor Task pool mutex held.
+ * NET_STEP owns the job's physical residency until dispatch publishes its next
+ * state; close/cancel can set flags but cannot recycle this context meanwhile.
+ * The full generation check also fails closed on an inconsistent callback. */
+static int ku_task_pg_fresh_cancel(void* raw,uint64_t generation) {
+  KuTaskBlockingJobV1* job=(KuTaskBlockingJobV1*)raw;
+  KuTaskBlockingPoolV1* pool=job->pg_pool;
+  if(!pool || ku_task_blocking_lock(pool))return 1;
+  int invalid=job->generation!=generation || job->kind!=9u || job->state!=KU_TASK_BLOCKING_NET_STEP;
+  KuPgAsyncOp* operation=invalid?NULL:job->pg_operation;
+  uint64_t (*phase)(void*)=operation?operation->task_phase:NULL;
+  void* context=operation?operation->task_phase_context:NULL;
+  if(!phase || !context)invalid=1;
+  if(invalid)pool->fault=KU_TASK_DRIVER_INTERNAL;
+  int cancelled=invalid || job->cancelled || pool->closing;
+  ku_task_blocking_unlock(pool);
+  /* request_cancel publishes control phase before adapter cleanup sets the
+   * job flag. Preserve that observation too, with no lock held for a callback.
+   * Physical blocking registration pins this control until NET_STEP returns. */
+  return cancelled || phase(context)!=KU_TASK_CONTROL_LIVE;
+}
 static void ku_task_pg_connect_run(KuTaskBlockingJobV1* job,int cancelled) {
   ku_pg_async_connect_run(job->pg_operation,cancelled);
 }
@@ -103,6 +124,7 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
     int attached=job->net_owner && (ticket->driver->external_loops || ticket->driver->io_wait);
     ku_task_driver_unlock(ticket->driver);
     if(attached) {
+      operation->fresh_cancel_context=job;operation->fresh_cancel=ku_task_pg_fresh_cancel;
       job->pg_ready=1;job->net_deadline=operation->deadline;
       status=ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT);
       if(pool->closing || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE)job->cancelled=1;

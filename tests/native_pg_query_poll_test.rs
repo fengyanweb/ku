@@ -556,7 +556,11 @@ static int ku_test_pg_acquire_calls = 0;
 }
 
 fn query_stub_harness(directory: &TempDir) -> String {
-    let generated = emit_c(directory.path(), fixture());
+    query_stub_harness_source(directory, fixture())
+}
+
+fn query_stub_harness_source(directory: &TempDir, source: &str) -> String {
+    let generated = emit_c(directory.path(), source);
     let hook = r#"
 #if defined(_WIN32)
 static int ku_test_pg_poll(WSAPOLLFD*, ULONG, INT);
@@ -1036,6 +1040,56 @@ fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() 
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "pg async large row closed loop\n"
+    );
+}
+
+#[test]
+fn native_pg_task_fresh_cancel_observer_checks_real_job_state_and_generation() {
+    let directory = TempDir::new("pg-task-fresh-cancel");
+    let sync_fixture = fixture()
+        .split_once("fn main(): null! {")
+        .expect("sync fixture main")
+        .0;
+    let source = format!(
+        "import http from \"std.http\"\n{}\n{}",
+        sync_fixture,
+        r#"fn main(): null! {
+    client = pg.client({conninfo: "hostaddr=127.0.0.1", max_connections: 1})?
+    async fn read(): HttpResponse! {
+        result = client.query("SELECT 3", [])?
+        return ok(http.text(result.value(0, 0)?))
+    }
+    app = http.service()
+    app.get("/read", read)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#
+    );
+    let harness = query_stub_harness_source(&directory, &source).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    ) + PG_TASK_FRESH_CANCEL_SUITE;
+    assert!(harness.contains(
+        "operation->fresh_cancel_context=job;operation->fresh_cancel=ku_task_pg_fresh_cancel;"
+    ));
+    let path = directory.path().join("pg-task-fresh-cancel.c");
+    fs::write(&path, harness).expect("write real Task PG observer harness");
+    let Some(executable) = compile_harness(directory.path(), &path, "pg-task-fresh-cancel") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("real Task PG observer harness exceeded bounds");
+    assert!(
+        output.status.success(),
+        "real Task PG observer failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg Task fresh cancel observer closed loop\n"
     );
 }
 
@@ -3029,7 +3083,74 @@ int main(void) {
 }
 "#;
 
+const PG_TASK_FRESH_CANCEL_SUITE: &str = r#"
+static KuTaskBlockingPoolV1* fresh_observed_pool;
+static uint64_t fresh_real_task_phase(void* control) {
+#if defined(_WIN32)
+  CHECK(TryAcquireSRWLockExclusive(&fresh_observed_pool->mutex));
+  ReleaseSRWLockExclusive(&fresh_observed_pool->mutex);
+#else
+  CHECK(!pthread_mutex_trylock(&fresh_observed_pool->mutex));
+  CHECK(!pthread_mutex_unlock(&fresh_observed_pool->mutex));
+#endif
+  return ku_task_pg_diagnostic_phase(control);
+}
+int main(void) {
+  KuTaskBlockingPoolV1 pool={0};KuTaskBlockingJobV1 job={0};
+  KuTaskControlV1 control={0};KuPgAsyncOp operation={0};
+#if defined(_WIN32)
+  InitializeSRWLock(&pool.mutex);
+#else
+  CHECK(!pthread_mutex_init(&pool.mutex,NULL));
+#endif
+  fresh_observed_pool=&pool;
+  ku_task_control_atomic_init(&control.phase,KU_TASK_CONTROL_LIVE);
+  operation.task_phase_context=&control;operation.task_phase=fresh_real_task_phase;
+  job.pg_pool=&pool;job.pg_operation=&operation;job.kind=9u;job.state=KU_TASK_BLOCKING_NET_STEP;
+  job.generation=UINT64_C(4294967297);
+  CHECK(!ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
+  ku_task_control_atomic_store(&control.phase,KU_TASK_CONTROL_REQUESTED_CANCEL);
+  CHECK(!job.cancelled && ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
+  ku_task_control_atomic_store(&control.phase,KU_TASK_CONTROL_LIVE);
+  job.cancelled=1;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);job.cancelled=0;
+  pool.closing=1;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);pool.closing=0;
+  CHECK(ku_task_pg_fresh_cancel(&job,1u) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
+  CHECK(!ku_task_pg_fresh_cancel(&job,job.generation));
+  job.state=KU_TASK_BLOCKING_NET_WAIT;
+  CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
+  job.state=KU_TASK_BLOCKING_NET_STEP;job.kind=8u;
+  CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
+  job.kind=9u;CHECK(!ku_task_pg_fresh_cancel(&job,job.generation));
+  job.pg_operation=NULL;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);
+  pool.fault=0;job.pg_operation=&operation;
+  operation.task_phase=NULL;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);
+  pool.fault=0;operation.task_phase=fresh_real_task_phase;
+  operation.task_phase_context=NULL;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);
+  pool.fault=0;operation.task_phase_context=&control;
+  CHECK(!ku_task_pg_fresh_cancel(&job,job.generation));
+  job.pg_pool=NULL;CHECK(ku_task_pg_fresh_cancel(&job,job.generation));
+#if !defined(_WIN32)
+  CHECK(!pthread_mutex_destroy(&pool.mutex));
+#endif
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes);
+  puts("pg Task fresh cancel observer closed loop");return 0;
+}
+"#;
+
 const ASYNC_TURN_SUITE: &str = r#"
+/* A deterministic pinned-executor substitute. It observes the exact old growth
+ * yield, after allocation but before any result byte/cell has been published. */
+typedef struct AsyncFreshObserver { KuPgAsyncOp* operation;uint64_t generation;size_t calls;int cancel,expire; } AsyncFreshObserver;
+static int async_fresh_observe(void* raw,uint64_t generation) {
+  AsyncFreshObserver* observer=(AsyncFreshObserver*)raw;KuPgAsyncOp* op=observer->operation;
+  if(generation!=observer->generation || !op->query.value || op->row_phase!=3
+      || op->query.value->rows || op->query.value->bytes_len)abort();
+  observer->calls++;if(observer->expire)clock_ms=op->deadline;return observer->cancel;
+}
+static void async_use_fresh_observer(KuPgAsyncOp* op,AsyncFreshObserver* observer) {
+  observer->operation=op;observer->generation=17u;op->waiter.diagnostic.job_generation=observer->generation;
+  op->fresh_cancel_context=observer;op->fresh_cancel=async_fresh_observe;
+}
 static size_t async_turn_steps,async_cell_yields,async_byte_yields;
 static int async_measured_step(KuPgAsyncOp* op,int cancel) {
   async_validated_bytes=async_copied_bytes=async_reported_bytes=async_reported_cells=async_protocol_results=0;
@@ -3064,6 +3185,26 @@ int main(void) {
   ku_string_drop(&last.value);async_drop_output(op,&budget,1);
   CHECK(!budget.bytes && !ku_database_budget_snapshot().pending_operations
       && !ku_database_budget_snapshot().pending_bytes);
+
+  /* The Task observer may eliminate only the compact first-allocation yield.
+   * All byte/cell/protocol quantum assertions above remain active per step. */
+  size_t standalone_steps=async_turn_steps;async_turn_steps=0;
+  AsyncFreshObserver observer={0};op=async_create(pool,&budget);async_use_fresh_observer(op,&observer);
+  CHECK(async_measured_finish(op) && op->output.ok && observer.calls==1u
+      && async_turn_steps<=standalone_steps && op->output.value->rows==257
+      && op->output.value->bytes_len==257u*3u*4u);
+  size_t observed=observer.calls;async_drop_output(op,&budget,1);CHECK(observer.calls==observed && !budget.bytes);
+  for(int failure=0;failure<2;failure++) {
+    clock_ms=1000;observer=(AsyncFreshObserver){0};observer.cancel=!failure;observer.expire=failure;
+    op=async_create(pool,&budget);async_use_fresh_observer(op,&observer);
+    sends_before=user_sends;resets_before=reset_sends;
+    CHECK(async_measured_finish(op) && !op->output.ok && observer.calls==1u
+        && error_is(op->output,"execution_unknown") && user_sends==sends_before+1
+        && reset_sends==resets_before && !pool->conns[0] && !pool->active);
+    observed=observer.calls;async_drop_output(op,&budget,0);
+    CHECK(observer.calls==observed && !budget.bytes && !live_results);
+  }
+  clock_ms=1000;
 
   /* A byte budget spans validation, copying and multiple rows. UTF8 at the
    * end of each cell also crosses a partially consumed shared turn budget. */

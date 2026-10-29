@@ -33,6 +33,9 @@ typedef struct KuPgAsyncOp {
   uint64_t diagnostic_steps,diagnostic_events;
   void* task_phase_context;
   uint64_t (*task_phase)(void*);
+  /* Optional only for a pinned Task executor, never retained by its result. */
+  void* fresh_cancel_context;
+  int (*fresh_cancel)(void*,uint64_t);
   int phase,slot,count,partial,columns,sent,reset_ok,reset_sent,reset_partial;
   int connecting,connect_ready,waiting,broken,taken,diagnostic_progress,diagnostic_sync;
   int diagnostic_libpq_status,diagnostic_libpq_status_present;
@@ -425,7 +428,7 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
     if(predicted<previous)return -3;
     size_t growth=predicted-previous;
     if(growth && !op->budget.reserve(op->budget.context,growth))return -3;
-    KuPgResult* result=op->query.value;
+    KuPgResult* result=op->query.value;int first=result==NULL;
     if(!result) {result=ku_pg_result_new((size_t)op->row_columns,cc,bc);op->query.value=result;}
     int allocated=result!=NULL;
     if(allocated && cc>result->cell_capacity)allocated=ku_pg_result_grow_cells(result,cc);
@@ -434,9 +437,19 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
     if(predicted>actual)op->budget.refund(op->budget.context,predicted-actual);
     if(!allocated)return -3;
     op->row_phase=3;op->row_col=op->row_offset=0;
-    /* Only an actual allocation/growth needs its own bounded owner turn.
-     * Existing capacity changes neither the allocation nor its byte charge. */
-    if(growth)return 0;
+    /* A compact first row may keep its current turn only if its complete copy
+     * fits the remaining shared byte/cell quantum. Re-observe cancellation and
+     * the unchanged absolute deadline at the old growth yield, before copying.
+     * The standalone API has no pinned observer and retains its original yield;
+     * every external growth does too. No other yield/check is removed. */
+    if(growth) {
+      size_t copy_bytes=op->row_bytes-result->bytes_len;
+      size_t copy_cells=op->row_rows?(size_t)op->row_columns:0;
+      if(!first || !result->inline_storage || !op->fresh_cancel
+          || copy_bytes>byte_quantum-turn->bytes || copy_cells>cell_quantum-turn->cells)return 0;
+      if(op->fresh_cancel(op->fresh_cancel_context,op->waiter.diagnostic.job_generation)
+          || ku_pg_deadline_expired(op->deadline))return -6;
+    }
   }
   while(op->row_rows && op->row_col<(size_t)op->row_columns) {
     KuPgResult* result=op->query.value;int col=(int)op->row_col;
@@ -487,6 +500,9 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       int appended=ku_pg_async_materialize(op,&turn);
       if(turn.bytes!=before_bytes || turn.cells!=before_cells || appended==1)op->diagnostic_progress=1;
       if(!appended)return 0;
+      /* Match the next-turn cancellation/expiry result at the removed compact
+       * yield. The statement was sent; no replay or rollback is implied. */
+      if(appended==-6) {ku_pg_async_finish(op,ku_pg_execution_unknown_error(),1);return 1;}
       if(appended==-2 || appended==-3) {ku_pg_async_failure(op);return 1;}
       if(appended!=1) {ku_pg_async_drop_table(op,&op->query.value);op->query.validation=appended;}
       if(op->row_status==KU_PGRES_SINGLE_TUPLE) {op->partial=1;PQclear(op->row);}
