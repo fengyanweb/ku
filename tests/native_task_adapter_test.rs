@@ -4063,6 +4063,17 @@ static int fixture_net_mode=1;
 "#;
 const NET_OWNER_CONSTRUCTOR: &str = r#"
   if (fixture_net_mode) {
+    if(config) {
+      KuValue* host=ku_net_config_get(config,"host");
+      KuValue* port=ku_net_config_get(config,"port");
+      KuValue* timeout=ku_net_config_get(config,"read_timeout_ms");
+      CHECK(config->len==3u && host && host->tag==KU_STR && host->as.s.storage==KU_STRING_OWNED);
+      CHECK(host->as.s.len==9u && !memcmp(host->as.s.ptr,"127.0.0.1",9u));
+      CHECK(port && port->tag==KU_INT && port->as.i==9);
+      CHECK(timeout && timeout->tag==KU_INT && timeout->as.i==50);
+      CHECK(!ku_net_config_get(config,"tls") && !ku_net_config_get(config,"tls_server_name")
+          && !ku_net_config_get(config,"tls_ca_pem"));
+    }
     KuNetClient* fake=(KuNetClient*)ku_net_allocate(allocator,sizeof(KuNetClient));
     if (!fake) return (KuResult_net_client){false,NULL,ku_net_error("out_of_memory","fixture client allocation failed")};
     memset(fake,0,sizeof(*fake)); fake->socket_value=KU_NET_INVALID_SOCKET;
@@ -4115,6 +4126,60 @@ static FixtureLedger net_work_ledger(void) {
 static uint64_t net_deadline(void) {uint64_t now=ku_task_driver_now_ms();CHECK(now!=UINT64_MAX);return now+2000u;}
 static KuTaskDriverSnapshotV1 net_snapshot(void) {
   KuTaskDriverSnapshotV1 snapshot={0};CHECK(ku_task_driver_snapshot(&net_driver,&snapshot)==KU_TASK_DRIVER_OK);return snapshot;
+}
+/* The private snapshot's field types are checked before job admission. Verify
+ * every optional-field mask, all scalar slots and empty/owned-form string
+ * descriptors survive compact storage without a new allocation or a clone. */
+static void net_config_storage_roundtrip(void) {
+  KuTaskBlockingJobV1 job={0};
+  CHECK(sizeof(job.net_config)<9u*sizeof(KuValue));
+  fprintf(stderr,"network-config-layout compact=%zu old_values=%zu job=%zu fixed_2048=%zu\n",
+      sizeof(job.net_config),9u*sizeof(KuValue),sizeof(job),ku_task_blocking_fixed_bytes(2048u));
+  const int64_t integers[5]={INT64_MIN,INT64_MAX,-1,0,UINT32_MAX};
+  FixtureLedger initial=fixture_ledger();
+  for(size_t round=0;round<3u;round++) {
+    KuValue values[9]={0};
+    for(size_t i=0;i<9u;i++) {
+      if(i==0u || i==7u || i==8u) {
+        values[i].tag=KU_STR;
+        values[i].as.s=round==0u ? (KuString){0}
+            : ku_string_static((const uint8_t*)(i==0u ? "A\0B":i==7u ? "\xe4\xb8\xad\xf0\x9f\x99\x82":"pem"),
+                i==0u ? 3u:i==7u ? 7u:3u);
+        if(round==2u) {
+          KuString source=values[i].as.s;uint8_t* copy=(uint8_t*)malloc(source.len);CHECK(copy);
+          memcpy(copy,source.ptr,source.len);values[i].as.s=(KuString){copy,source.len,source.len,KU_STRING_OWNED};
+        }
+      } else if(i==6u) {values[i].tag=KU_BOOL;values[i].as.b=(round&1u)!=0;}
+      else {values[i].tag=KU_INT;values[i].as.i=integers[i-1u];}
+    }
+    for(uint16_t present=0;present<512u;present++) {
+      uint64_t generation=job.generation+1u;memset(&job,0,sizeof(job));job.generation=generation;
+      CHECK(!job.net_present && !job.net_tls && !job.net_config.strings[0].ptr
+          && !job.net_config.strings[1].ptr && !job.net_config.strings[2].ptr);
+      for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i))
+        ku_task_blocking_net_config_store(&job,i,values[i]);
+      job.net_present=present;
+      FixtureLedger before=fixture_ledger();
+      for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i)) {
+        KuValue value=ku_task_blocking_net_config_value(&job,i);CHECK(value.tag==values[i].tag);
+        if(value.tag==KU_STR)CHECK(value.as.s.ptr==values[i].as.s.ptr && value.as.s.len==values[i].as.s.len
+            && value.as.s.capacity==values[i].as.s.capacity && value.as.s.storage==values[i].as.s.storage);
+        else if(value.tag==KU_BOOL)CHECK(value.as.b==values[i].as.b);
+        else CHECK(value.as.i==values[i].as.i);
+      }
+      FixtureLedger after=fixture_ledger();
+      CHECK(before.allocations==after.allocations && before.bytes==after.bytes && !after.overflow);
+      CHECK(job.generation==generation && job.net_present==present);
+    }
+    /* These descriptor-only checks never transfer ownership into a real job.
+     * The original test strings remain owned here until every mask is checked. */
+    memset(&job,0,sizeof(job));
+    for(size_t i=0;i<9u;i++)if(values[i].tag==KU_STR && values[i].as.s.storage==KU_STRING_OWNED)
+      free(values[i].as.s.ptr);
+  }
+  FixtureLedger final=fixture_ledger();
+  CHECK(initial.allocations==final.allocations && initial.bytes==final.bytes && !final.overflow);
+  /* Actual cloned snapshots and their job-owned cleanup are covered by net_case. */
 }
 /* Reuse one physical record across all network kinds, with non-empty owned
  * payloads/errors. Calling a drop for an inactive Result variant would free
@@ -4214,6 +4279,7 @@ static void net_case(int write,int cancel,int limited) {
 }
 int main(void) {
   CHECK(KU_TASK_DRIVER_ABI_VERSION==12u);
+  net_config_storage_roundtrip();
   net_result_storage_reuse();
   net_case(0,0,0);net_case(1,0,0);net_case(0,0,1);net_case(0,1,0);net_case(1,1,0);
   puts("net-job-owners-ok");return 0;

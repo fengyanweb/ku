@@ -69,6 +69,16 @@ enum { KU_TASK_BLOCKING_FREE=0u, KU_TASK_BLOCKING_BUILDING=1u,
        KU_TASK_BLOCKING_DONE=4u, KU_TASK_BLOCKING_NET_WAIT=5u,
        KU_TASK_BLOCKING_NET_STEP=6u };
 typedef struct KuTaskBlockingPoolV1 KuTaskBlockingPoolV1;
+#if KU_TASK_BLOCKING_NETWORK
+/* submit_net validates all nine source fields before reserving a job. The
+ * physical snapshot therefore needs three owned strings and five integers,
+ * not nine general KuValue unions. TLS fits beside the presence mask below.
+ * Snapshot payload allocation, its charge and retirement stay unchanged. */
+typedef struct KuTaskBlockingNetConfigV1 {
+  KuString strings[3]; /* host, tls_server_name, tls_ca_pem */
+  int64_t integers[5]; /* port, connect/read/write timeout, max_read_bytes */
+} KuTaskBlockingNetConfigV1;
+#endif
 typedef struct KuTaskBlockingJobV1 {
   uint64_t generation;
   uint32_t state, cancelled, kind;
@@ -104,8 +114,9 @@ typedef struct KuTaskBlockingJobV1 {
   uint32_t pg_ready;
 #endif
 #if KU_TASK_BLOCKING_NETWORK
-  KuValue net_config[9];
+  KuTaskBlockingNetConfigV1 net_config;
   uint16_t net_present;
+  bool net_tls;
   uint64_t net_deadline;
   int64_t net_requested;
   KuNetClient* net_client;
@@ -116,6 +127,25 @@ typedef struct KuTaskBlockingJobV1 {
   uint32_t net_previous_plus_one,net_next_plus_one;
 #endif
 } KuTaskBlockingJobV1;
+#if KU_TASK_BLOCKING_NETWORK
+/* Private, validated field indices only; callers visit present fields. The
+ * returned KuValue borrows the job's still-owned string snapshot, just as the
+ * former inline KuValue array did while building the temporary config map. */
+static KuValue ku_task_blocking_net_config_value(const KuTaskBlockingJobV1* job,size_t index) {
+  KuValue value={0};
+  if(index==0u || index==7u || index==8u) {
+    value.tag=KU_STR;value.as.s=job->net_config.strings[index==0u ? 0u:index-6u];
+  } else if(index==6u) {value.tag=KU_BOOL;value.as.b=job->net_tls;}
+  else if(index>=1u && index<=5u) {value.tag=KU_INT;value.as.i=job->net_config.integers[index-1u];}
+  return value;
+}
+static void ku_task_blocking_net_config_store(KuTaskBlockingJobV1* job,size_t index,KuValue value) {
+  if(index==0u || index==7u || index==8u)
+    job->net_config.strings[index==0u ? 0u:index-6u]=value.as.s;
+  else if(index==6u)job->net_tls=value.as.b;
+  else if(index>=1u && index<=5u)job->net_config.integers[index-1u]=value.as.i;
+}
+#endif
 typedef struct KuTaskBlockingWorkerV1 {
   KuTaskBlockingPoolV1* pool;
   uint32_t exited, joined, closed;
@@ -384,6 +414,13 @@ static void ku_task_blocking_net_drop_result(KuTaskBlockingJobV1* job) {
   else if (job->kind==6u) ku_result_drop_bytes(&job->net_read_result);
   else ku_result_drop_null(&job->result);
 }
+static void ku_task_blocking_net_drop_config(KuTaskBlockingJobV1* job) {
+  static const unsigned fields[3]={0u,7u,8u};
+  for(size_t i=0;i<3u;i++)if(job->net_present & (uint16_t)(1u<<fields[i])) {
+    ku_task_blocking_free(job->net_config.strings[i].ptr);
+    job->net_config.strings[i]=(KuString){0};
+  }
+}
 static void ku_task_net_resolve(KuTaskBlockingJobV1*,KuObject*,KuTaskBlockingOutputV1*);
 static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
     KuTaskBlockingOutputV1* allocation) {
@@ -405,7 +442,7 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
         KuString key=ku_string_static((const uint8_t*)names[i],strlen(names[i]));
         size_t at=(size_t)ku_obj_hash(key)&15u;
         while (entries[at].used) at=(at+1u)&15u;
-        entries[at]=(KuEntry){key,job->net_config[i],true}; config.len++;
+        entries[at]=(KuEntry){key,ku_task_blocking_net_config_value(job,i),true}; config.len++;
       }
       if(job->net_plain) ku_task_net_resolve(job,&config,allocation);
       else job->net_connect_result=ku_net_client_with_allocator(&config,&allocator);
@@ -424,11 +461,7 @@ static void ku_task_blocking_net_run(KuTaskBlockingJobV1* job, int cancelled,
   __ku_handler_deadline=previous_deadline; __ku_handler_cleanup_deadline=previous_cleanup;
   __ku_handler_timed_out=previous_timeout; __ku_handler_unwind_depth=previous_unwind;
   /* Config and write snapshots use the private prepaid prefix allocator. */
-  for (size_t i=0;i<9u;i++) if ((job->net_present & (uint16_t)(1u<<i))
-      && job->net_config[i].tag==KU_STR) {
-    ku_task_blocking_free(job->net_config[i].as.s.ptr);
-    job->net_config[i].as.s=(KuString){0};
-  }
+  ku_task_blocking_net_drop_config(job);
   ku_task_blocking_free(job->net_write.ptr); job->net_write=(KuBytes){0};
   if (allocation->status!=KU_TASK_DRIVER_OK) {
     ku_task_blocking_net_drop_result(job);
@@ -853,9 +886,7 @@ static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTask
   KuError error=ku_task_blocking_error("cancelled","queued operation was cancelled before execution");
 #if KU_TASK_BLOCKING_NETWORK
   if(job->kind>=5u) {
-    for(size_t i=0;i<9u;i++)if((job->net_present&(uint16_t)(1u<<i)) && job->net_config[i].tag==KU_STR) {
-      ku_task_blocking_free(job->net_config[i].as.s.ptr);job->net_config[i].as.s=(KuString){0};
-    }
+    ku_task_blocking_net_drop_config(job);
     ku_task_blocking_free(job->net_write.ptr);job->net_write=(KuBytes){0};
     ku_drop_net_client(&job->net_client);
     if(job->kind==5u)job->net_connect_result=(KuResult_net_client){false,NULL,error};
@@ -1236,7 +1267,11 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
   if(status!=KU_TASK_DRIVER_OK) {
     ku_task_blocking_unlock(pool);goto ku_net_blocking_rejected;
   }
-  if (kind==5u) { memcpy(job->net_config,copied,sizeof(copied)); job->net_present=present; }
+  if (kind==5u) {
+    for(size_t i=0;i<9u;i++)if(present & (uint16_t)(1u<<i))
+      ku_task_blocking_net_config_store(job,i,copied[i]);
+    job->net_present=present;
+  }
   else {
     /* No allocation or fallible operation after this physical owner move. The
      * existing driver reservation previously counted the very same frame owner. */
