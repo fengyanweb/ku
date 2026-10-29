@@ -110,6 +110,8 @@ def emit(generated, cases, template):
     source = re.sub(r'^int main\(void\) \{', 'static int ku_json_dense_original_main(void) {',
                     source, count=1, flags=re.M)
     arrays = ['\n/* Permanent diagnostic wrapper: original handler/runtime above unchanged. */',
+              '#define KU_JSON_DENSE_HAS_COLD_INPUTS '+str(int('typedef struct KuTaskBlockingInputsV1 {' in source)),
+              '#define KU_JSON_DENSE_HAS_FREE_INDEX '+str(int('uint32_t* free_indices;' in source)),
               'typedef struct { const char* family; const uint8_t* body; size_t body_length; '
               'const uint8_t* rid; size_t rid_length; } KuJsonDenseCase;']
     for index, row in enumerate(cases):
@@ -164,19 +166,31 @@ def validate_layout(layout):
             raise ValueError('invalid compiled dense net config size')
     elif sizes.get('net_config') is not None:
         raise ValueError('disabled dense network has net config size')
-    expected = sizes['KuTaskBlockingPoolV1']+2048*(sizes['KuTaskBlockingJobV1']+sizes['ring_cell'])
+    cold = sizes.get('KuTaskBlockingInputsV1', 0)
+    free_index = sizes.get('free_index_cell', 0)
+    if type(cold) is not int or cold < 0 or type(free_index) is not int or free_index not in (0, 4):
+        raise ValueError('invalid compiled dense cold/free-index size')
+    expected = sizes['KuTaskBlockingPoolV1']+2048*(sizes['KuTaskBlockingJobV1']+cold+sizes['ring_cell']+free_index)
     if type(layout.get('fixed_bytes')) is not int or layout['fixed_bytes'] != expected:
         raise ValueError('compiled dense fixed byte formula mismatch')
     offsets = layout.get('offsetof', {})
-    required = ['generation', 'output_charge', 'ticket', 'path', 'content', 'result', 'exists_value']
+    required = ['generation', 'output_charge', 'ticket', 'result', 'exists_value']
+    required += ['inputs'] if cold else ['path', 'content']
     if features['KU_TASK_BLOCKING_PG']:
         required += ['pg_operation', 'pg_pool', 'pg_ready']
     if features['KU_TASK_BLOCKING_NETWORK']:
-        required += ['net_config', 'net_present', 'net_deadline', 'net_requested', 'net_client',
-                     'net_write', 'net_owner', 'net_addresses']
+        required += ['net_deadline', 'net_requested', 'net_client', 'net_write', 'net_owner', 'net_addresses']
+        if not cold:
+            required += ['net_config', 'net_present']
     for key in required:
         if type(offsets.get(key)) is not int or not 0 <= offsets[key] < sizes['KuTaskBlockingJobV1']:
             raise ValueError('invalid compiled dense offsetof: '+key)
+    if cold:
+        inputs = layout.get('input_offsetof', {})
+        required = ['path', 'content']+(['net_config', 'net_present'] if features['KU_TASK_BLOCKING_NETWORK'] else [])
+        for key in required:
+            if type(inputs.get(key)) is not int or not 0 <= inputs[key] < cold:
+                raise ValueError('invalid compiled dense cold input offsetof: '+key)
     return layout
 
 

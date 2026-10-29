@@ -77,8 +77,8 @@ static void ku_json_dense_hex(KuString bytes) {
   for(size_t i=0;i<bytes.len;i++)fprintf(stdout,"%02x",(unsigned)bytes.ptr[i]);
 }
 /* Called only after the measured loop AND golden retirement. Use names shared
- * by old A and typed-config candidates: net_config can be an array or a struct.
- * In particular, never mention candidate-only net_tls or its typedef here. */
+ * by old A and Q1/Q2 candidates. The emitter identifies inline/cold-plane input
+ * storage; preprocessor guards never name a type/member absent in old A. */
 static void ku_json_dense_layout(void) {
   fputs("{\"schema\":\"ku-json-dense-layout-v1\",\"resident_memory_measurement\":false,",stdout);
   fprintf(stdout,"\"sizeof\":{\"void_pointer\":%zu,\"KuString\":%zu,\"KuValue\":%zu",
@@ -87,28 +87,57 @@ static void ku_json_dense_layout(void) {
   fprintf(stdout,",\"KuTaskBlockingJobV1\":%zu,\"KuTaskBlockingPoolV1\":%zu,\"ring_cell\":%zu,\"net_config\":",
       sizeof(KuTaskBlockingJobV1),sizeof(KuTaskBlockingPoolV1),sizeof(size_t));
 #if KU_TASK_BLOCKING_NETWORK
+#if KU_JSON_DENSE_HAS_COLD_INPUTS
+  fprintf(stdout,"%zu",sizeof(((KuTaskBlockingInputsV1*)0)->net_config));
+#else
   fprintf(stdout,"%zu",sizeof(((KuTaskBlockingJobV1*)0)->net_config));
+#endif
 #else
   fputs("null",stdout);
 #endif
+  fputs(",\"KuTaskBlockingInputsV1\":",stdout);
+#if KU_JSON_DENSE_HAS_COLD_INPUTS
+  fprintf(stdout,"%zu",sizeof(KuTaskBlockingInputsV1));
+#else
+  fputc('0',stdout);
+#endif
+  fputs(",\"free_index_cell\":",stdout);
+#if KU_JSON_DENSE_HAS_FREE_INDEX
+  fprintf(stdout,"%zu",sizeof(uint32_t));
+#else
+  fputc('0',stdout);
+#endif
   fprintf(stdout,"},\"available\":true,\"features\":{\"KU_TASK_BLOCKING_FILES\":%d,\"KU_TASK_BLOCKING_DIRECTORY\":%d,\"KU_TASK_BLOCKING_NETWORK\":%d,\"KU_TASK_BLOCKING_PG\":%d},",
       KU_TASK_BLOCKING_FILES,KU_TASK_BLOCKING_DIRECTORY,KU_TASK_BLOCKING_NETWORK,KU_TASK_BLOCKING_PG);
-  fprintf(stdout,"\"offsetof\":{\"generation\":%zu,\"output_charge\":%zu,\"ticket\":%zu,\"path\":%zu,\"content\":%zu,\"result\":%zu,\"exists_value\":%zu",
+  fprintf(stdout,"\"offsetof\":{\"generation\":%zu,\"output_charge\":%zu,\"ticket\":%zu,\"result\":%zu,\"exists_value\":%zu",
       offsetof(KuTaskBlockingJobV1,generation),offsetof(KuTaskBlockingJobV1,output_charge),
-      offsetof(KuTaskBlockingJobV1,ticket),offsetof(KuTaskBlockingJobV1,path),
-      offsetof(KuTaskBlockingJobV1,content),offsetof(KuTaskBlockingJobV1,result),
+      offsetof(KuTaskBlockingJobV1,ticket),offsetof(KuTaskBlockingJobV1,result),
       offsetof(KuTaskBlockingJobV1,exists_value));
+#if KU_JSON_DENSE_HAS_COLD_INPUTS
+  fprintf(stdout,",\"inputs\":%zu",offsetof(KuTaskBlockingJobV1,inputs));
+#else
+  fprintf(stdout,",\"path\":%zu,\"content\":%zu",offsetof(KuTaskBlockingJobV1,path),offsetof(KuTaskBlockingJobV1,content));
+#endif
 #if KU_TASK_BLOCKING_PG
   fprintf(stdout,",\"pg_operation\":%zu,\"pg_pool\":%zu,\"pg_ready\":%zu",
       offsetof(KuTaskBlockingJobV1,pg_operation),offsetof(KuTaskBlockingJobV1,pg_pool),
       offsetof(KuTaskBlockingJobV1,pg_ready));
 #endif
 #if KU_TASK_BLOCKING_NETWORK
-  fprintf(stdout,",\"net_config\":%zu,\"net_present\":%zu,\"net_deadline\":%zu,\"net_requested\":%zu,\"net_client\":%zu,\"net_write\":%zu,\"net_owner\":%zu,\"net_addresses\":%zu",
-      offsetof(KuTaskBlockingJobV1,net_config),offsetof(KuTaskBlockingJobV1,net_present),
+  fprintf(stdout,",\"net_deadline\":%zu,\"net_requested\":%zu,\"net_client\":%zu,\"net_write\":%zu,\"net_owner\":%zu,\"net_addresses\":%zu",
       offsetof(KuTaskBlockingJobV1,net_deadline),offsetof(KuTaskBlockingJobV1,net_requested),
       offsetof(KuTaskBlockingJobV1,net_client),offsetof(KuTaskBlockingJobV1,net_write),
       offsetof(KuTaskBlockingJobV1,net_owner),offsetof(KuTaskBlockingJobV1,net_addresses));
+#if !KU_JSON_DENSE_HAS_COLD_INPUTS
+  fprintf(stdout,",\"net_config\":%zu,\"net_present\":%zu",offsetof(KuTaskBlockingJobV1,net_config),offsetof(KuTaskBlockingJobV1,net_present));
+#endif
+#endif
+  fputs("},\"input_offsetof\":{",stdout);
+#if KU_JSON_DENSE_HAS_COLD_INPUTS
+  fprintf(stdout,"\"path\":%zu,\"content\":%zu",offsetof(KuTaskBlockingInputsV1,path),offsetof(KuTaskBlockingInputsV1,content));
+#if KU_TASK_BLOCKING_NETWORK
+  fprintf(stdout,",\"net_config\":%zu,\"net_present\":%zu",offsetof(KuTaskBlockingInputsV1,net_config),offsetof(KuTaskBlockingInputsV1,net_present));
+#endif
 #endif
   fprintf(stdout,"},\"fixed_capacity\":2048,\"fixed_bytes\":%zu}",ku_task_blocking_fixed_bytes(2048u));
 #else

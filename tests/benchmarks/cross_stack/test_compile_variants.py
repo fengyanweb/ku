@@ -173,6 +173,44 @@ class JsonDenseEntryTests(unittest.TestCase):
         value.update(context='none', stop_reason='thread_cpu_budget', thread_cpu_ns=1_000_000_000)
         self.assertIn('mechanism-only', parse(value, cpu_seconds=1, context='none')['deadline_context'])
 
+    def test_layout_contract_accepts_inline_q1_and_cold_q2_without_resident_claims(self):
+        # Synthetic protocol fixtures, not compiled target sizeof measurements.
+        for job, config, cold, free in ((744, 360, 0, 0), (528, 136, 0, 4), (352, 136, 184, 4)):
+            with self.subTest(job=job, cold=cold, free=free):
+                offsets = dict(generation=0, output_charge=24, ticket=32, result=96,
+                               exists_value=232, pg_operation=240, pg_pool=248, pg_ready=256,
+                               net_deadline=264, net_requested=272, net_client=280,
+                               net_write=288, net_owner=320, net_addresses=328)
+                if cold:
+                    offsets['inputs'] = 64
+                else:
+                    offsets.update(path=56, content=64, net_config=264, net_present=264+config)
+                layout = {'schema': 'ku-json-dense-layout-v1', 'available': True,
+                          'resident_memory_measurement': False, 'fixed_capacity': 2048,
+                          'sizeof': {'void_pointer': 8, 'KuString': 32, 'KuValue': 40,
+                                     'KuTaskBlockingJobV1': job, 'KuTaskBlockingPoolV1': 2800,
+                                     'net_config': config, 'ring_cell': 8,
+                                     'KuTaskBlockingInputsV1': cold, 'free_index_cell': free},
+                          'features': {'KU_TASK_BLOCKING_FILES': 0, 'KU_TASK_BLOCKING_DIRECTORY': 0,
+                                       'KU_TASK_BLOCKING_NETWORK': 1, 'KU_TASK_BLOCKING_PG': 1},
+                          'offsetof': offsets,
+                          'input_offsetof': dict(path=0, content=8, net_config=40, net_present=176) if cold else {},
+                          'fixed_bytes': 2800+2048*(job+cold+8+free)}
+                self.assertEqual(json_dense.validate_layout(layout), layout)
+                wrong = copy.deepcopy(layout)
+                wrong['fixed_bytes'] -= 2048*4
+                with self.assertRaisesRegex(ValueError, 'fixed byte formula'):
+                    json_dense.validate_layout(wrong)
+                wrong = copy.deepcopy(layout)
+                wrong['resident_memory_measurement'] = True
+                with self.assertRaisesRegex(ValueError, 'layout metadata'):
+                    json_dense.validate_layout(wrong)
+                if cold:
+                    wrong = copy.deepcopy(layout)
+                    wrong['input_offsetof']['content'] = cold
+                    with self.assertRaisesRegex(ValueError, 'cold input offsetof'):
+                        json_dense.validate_layout(wrong)
+
     def test_emission_changes_only_main_name_and_appends_wrapper(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'server.c'
@@ -191,6 +229,13 @@ class JsonDenseEntryTests(unittest.TestCase):
             self.assertIn('KuResult_struct___ku_http_response result=encode(request);', emitted)
             self.assertIn('int expired=__ku_sync_finish_request(&signal);', emitted)
             self.assertIn('handler_ms>remaining ? remaining:handler_ms', emitted)
+            self.assertIn('#define KU_JSON_DENSE_HAS_COLD_INPUTS 0', emitted)
+            self.assertIn('#define KU_JSON_DENSE_HAS_FREE_INDEX 0', emitted)
+            source.write_text('typedef struct KuTaskBlockingInputsV1 { /* fixture */ } KuTaskBlockingInputsV1;\n'
+                              '/* pool member */ uint32_t* free_indices;\n'+runtime)
+            later = json_dense.emit(source, [], Path(__file__).with_name('json_dense.c.inc'))
+            self.assertIn('#define KU_JSON_DENSE_HAS_COLD_INPUTS 1', later)
+            self.assertIn('#define KU_JSON_DENSE_HAS_FREE_INDEX 1', later)
             source.write_text(runtime.replace('encode(KuStruct___ku_http_request req)', 'different(req)'))
             with self.assertRaisesRegex(ValueError, 'ordinary generated'):
                 json_dense.emit(source, [], Path(__file__).with_name('json_dense.c.inc'))
