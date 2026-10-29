@@ -985,6 +985,57 @@ class FocusStabilityTests(unittest.TestCase):
             self.assertTrue((output/'prior-failure.json').exists())
 
 
+class FocusLifecycleRecoveryTests(unittest.TestCase):
+    """Pure accounting counterexamples; no service/build or timed load."""
+
+    def inputs(self):
+        score = {'ledger': {'correct_total': 10, 'planned': 12, 'results': {'correct': 10, 'timeout': 2},
+                            'correct_scheduled_to_complete': {'count': 10, 'p99_ms': 19}},
+                 'qualification': {'qualified': False}, 'service_cost': {
+                     'before': {'cpu_stat': {'usage_usec': 100}},
+                     'after': {'cpu_stat': {'usage_usec': 200}}}}
+        recovery = {'ledger': {'correct_total': 30, 'planned': 31,
+                               'results': {'correct': 30, 'timeout': 1}}}
+        physical = {'cpu_stat': {'usage_usec': 1000}, 'process_count': 1}
+        termination = {'forced': False, 'cgroup_removed': True,
+                       'after': {'cpu_stat': {'usage_usec': 1600}, 'process_count': 0}}
+        return score, recovery, physical, termination
+
+    def test_recovery_lifetime_cpu_uses_both_correct_denominators_without_mutation(self):
+        score, recovery, physical, termination = self.inputs()
+        original = copy.deepcopy((score, recovery))
+        result = focus_cycle.window_lifecycle_cost(score, physical, True, termination, {}, recovery)
+        self.assertAlmostEqual(result['cpu_seconds'], .0015)
+        self.assertAlmostEqual(result['cpu_seconds_per_correct'], .0015/40)
+        self.assertEqual(result['correct_response_denominator'], {'score': 10, 'recovery': 30, 'total': 40})
+        self.assertAlmostEqual(result['post_driver_cpu_seconds'], .0014)
+        self.assertIn('including recovery', result['post_driver_cpu_scope'])
+        self.assertIn('warmup excluded', result['scope'])
+        self.assertEqual((score, recovery), original)
+        self.assertEqual(score['ledger']['correct_total'], 10)
+        self.assertEqual(score['ledger']['correct_scheduled_to_complete']['p99_ms'], 19)
+        self.assertFalse(score['qualification']['qualified'])
+
+    def test_recovery_failures_keep_cpu_and_do_not_increase_correct_denominator(self):
+        score, recovery, physical, termination = self.inputs()
+        recovery['ledger'].update(correct_total=0, results={'timeout': 31})
+        result = focus_cycle.window_lifecycle_cost(score, physical, False, termination, {}, recovery)
+        self.assertAlmostEqual(result['cpu_seconds'], .0015)
+        self.assertAlmostEqual(result['cpu_seconds_per_correct'], .0015/10)
+        self.assertEqual(result['correct_response_denominator']['recovery'], 0)
+        score['ledger']['correct_total'] = 0
+        result = focus_cycle.window_lifecycle_cost(score, physical, False, termination, {}, recovery)
+        self.assertIsNone(result['cpu_seconds_per_correct'])
+        self.assertEqual(result['correct_response_denominator']['total'], 0)
+
+    def test_without_recovery_entire_existing_receipt_is_unchanged(self):
+        score, _, physical, termination = self.inputs()
+        expected = full_lifecycle_cost(score, physical, True, termination, {})
+        result = focus_cycle.window_lifecycle_cost(score, physical, True, termination, {})
+        self.assertEqual(result, expected)
+        self.assertNotIn('correct_response_denominator', result)
+
+
 class DriverOwnedCleanupTests(unittest.TestCase):
     def test_finalizer_recovers_owned_domain_after_interrupted_stop_flag(self):
         with tempfile.TemporaryDirectory() as d:

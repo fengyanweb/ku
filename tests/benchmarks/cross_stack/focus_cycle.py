@@ -158,6 +158,27 @@ def jobs_for(plan, phase, workload='json_object', names=('A', 'B', 'R')):
     return jobs
 
 
+def window_lifecycle_cost(score, physical, quiet, termination, metrics, recovered=None):
+    """Match the lifetime CPU interval to every request stream it contains."""
+    if recovered is None:
+        return full_lifecycle_cost(score, physical, quiet, termination, metrics)
+    counts = {'score': score['ledger']['correct_total'],
+              'recovery': recovered['ledger']['correct_total']}
+    counts['total'] = counts['score']+counts['recovery']
+    # Only the denominator is combined. Original ledgers, score SLOs, latency,
+    # errors, and both endpoint snapshots retain their existing ownership.
+    accounted = {'service_cost': score['service_cost'],
+                 'ledger': {'correct_total': counts['total']}}
+    full = full_lifecycle_cost(accounted, physical, quiet, termination, metrics)
+    full['correct_response_denominator'] = counts
+    full['scope'] = ('whole service domain from score driver launch through recovery, '
+        'physical quiescence and observed exit; all correct score+recovery responses; '
+        'warmup excluded; failed request CPU remains included')
+    full['post_driver_cpu_scope'] = ('after score driver end, including recovery '
+        'requests, final drain and exit; not cleanup-only CPU')
+    return full
+
+
 def window(plan, name, workload, rate, warmup, duration, output, *, job=None, binding=None, recovery=None):
     """One fresh service, original driver, bounded physical cleanup in finally."""
     spec = plan['versions'][name]
@@ -179,7 +200,7 @@ def window(plan, name, workload, rate, warmup, duration, output, *, job=None, bi
            'candidate_accepted': False, 'score_started': False, 'status': 'starting'}
     row.update(window_seconds=duration,warmup_seconds=warmup,
                formal_duration=(job or {}).get('phase')=='final' and duration>=30 and warmup>=10)
-    s = None
+    s, recovered = None, None
     try:
         s = h.start(stack, cores=plan['resources']['service_cores'],
                     memory=plan['resources']['service_memory_bytes'],
@@ -236,7 +257,10 @@ def window(plan, name, workload, rate, warmup, duration, output, *, job=None, bi
             row['recovery']['elapsed_until_quiet_seconds'] = ((time.monotonic_ns()-recovery_cutoff_ns
                 +result['configuration']['origin_monotonic_uncertainty_ns'])/1e9 if recovery_cutoff_ns is not None else None)
         termination = s.stop()
-        full = full_lifecycle_cost(result, physical, quiet, termination, metrics)
+        full = window_lifecycle_cost(result, physical, quiet, termination, metrics, recovered)
+        if recovered is not None:
+            row['full_lifecycle_accounting'] = {'correct_response_denominator': full['correct_response_denominator'],
+                'cpu_scope': full['scope'], 'post_driver_cpu_scope': full['post_driver_cpu_scope']}
         write_json(output/'full-lifecycle.json', full)
         write_json(output/'termination.json', termination)
         natural = service_termination_succeeded(stack, termination)
