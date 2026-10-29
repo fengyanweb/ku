@@ -16,6 +16,7 @@ enum { KU_PG_ASYNC_ACQUIRE=1, KU_PG_ASYNC_CONNECT=2,
 typedef struct KuPgAsyncOp {
   KuPgClient* pool;
   KuPgAsyncBudget budget;
+  KuPgTypedQuery* typed;
   KuPgAsyncWaiter waiter;
   PGconn* conn;
   PGresult* row;
@@ -137,6 +138,7 @@ static void ku_pg_diagnostics_sync_acquire_locked(KuPgClient* p,unsigned long lo
 static int ku_pg_result_owned_bytes(KuPgResult* result,size_t* bytes) {
   if(!bytes)return 0;
   *bytes=0;if(!result)return 1;
+  if(ku_pg_result_is_typed(result))return ku_pg_typed_owned_bytes(result,bytes);
   if(result->rows && result->cols>SIZE_MAX/result->rows)return 0;
   if(result->rows*result->cols>result->cell_capacity
       || result->bytes_len>result->bytes_capacity
@@ -172,6 +174,7 @@ static int ku_pg_result_owned_bytes(KuPgResult* result,size_t* bytes) {
   *bytes=total;return 1;
 }
 static int ku_pg_result_plan_bytes(KuPgResult* result,size_t cells,size_t bytes,size_t* total) {
+  if(result && ku_pg_result_is_typed(result))return 0;
   size_t n=sizeof(KuPgResult)+(result?result->inline_storage:0);
   int cells_external=!result || cells>result->cell_capacity || !ku_pg_result_is_inline(result,result->cells);
   int bytes_external=!result || bytes>result->bytes_capacity || !ku_pg_result_is_inline(result,result->bytes);
@@ -253,7 +256,8 @@ static void ku_pg_async_failure(KuPgAsyncOp* op) {
   ku_pg_async_finish(op,op->sent ? completed ? ku_pg_execution_completed_without_result_error()
       : ku_pg_execution_unknown_error() : ku_pg_query_connection_error(),1);
 }
-static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str params,
+static KuPgAsyncOp* ku_pg_async_create_inputs(KuPgClient* p,KuString sql,KuArray_str params,
+    const KuValue* typed_params,size_t typed_count,KuArray_str param_types,KuArray_str result_types,int typed,
     unsigned long long absolute_deadline,KuPgAsyncBudget budget,
     void (*wake)(void*),void* context,KuError* error) {
   if (!p || !budget.reserve || !budget.refund || !wake || !error) return NULL;
@@ -266,33 +270,47 @@ static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str pa
       : ku_pg_client_error("session_state_unsupported",sizeof("session_state_unsupported")-1,
       "PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client",
       sizeof("PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client")-1);return NULL; }
-  size_t param_bytes=0;
-  if (!ku_pg_validate_query_params(params,&param_bytes,error,deadline)) return NULL;
-  if (params.len>SIZE_MAX/sizeof(char*) || sql.len>SIZE_MAX-1u
-      || param_bytes>SIZE_MAX-params.len) { *error=ku_pg_async_limit_error();return NULL; }
-  size_t sql_bytes=sql.len+1u,values_bytes=params.len*sizeof(char*),storage_bytes=param_bytes+params.len;
+  size_t param_bytes=0,values_bytes=0,count=typed?typed_count:params.len;
+  if(typed) {
+    if(!ku_pg_typed_plan(typed_params,count,param_types,result_types,&values_bytes,&param_bytes,deadline,error))return NULL;
+  } else {
+    if(!ku_pg_validate_query_params(params,&param_bytes,error,deadline))return NULL;
+    if(count>SIZE_MAX/sizeof(char*)) {*error=ku_pg_async_limit_error();return NULL;}
+    values_bytes=count*sizeof(char*);
+  }
+  size_t terminators=typed?(count?1u:0u):count;
+  if(sql.len>SIZE_MAX-1u || param_bytes>SIZE_MAX-terminators) {*error=ku_pg_async_limit_error();return NULL;}
+  size_t sql_bytes=sql.len+1u,storage_bytes=param_bytes+terminators;
   if (sql_bytes>SIZE_MAX-sizeof(KuPgAsyncOp) || values_bytes>SIZE_MAX-sizeof(KuPgAsyncOp)-sql_bytes
       || storage_bytes>SIZE_MAX-sizeof(KuPgAsyncOp)-sql_bytes-values_bytes) { *error=ku_pg_async_limit_error();return NULL; }
   size_t charge=sizeof(KuPgAsyncOp)+sql_bytes+values_bytes+storage_bytes,operation_charge=0;
-  if (!ku_database_operation_begin(sql.len+param_bytes+params.len*sizeof(KuString),&operation_charge)) {
+  size_t pending=typed ? sql.len+values_bytes+storage_bytes:sql.len+param_bytes+count*sizeof(KuString);
+  if (!ku_database_operation_begin(pending,&operation_charge)) {
     *error=ku_pg_async_limit_error();return NULL;
   }
   if (!budget.reserve(budget.context,charge)) {ku_database_operation_end(operation_charge);*error=ku_pg_async_limit_error();return NULL;}
   KuPgAsyncOp* op=(KuPgAsyncOp*)calloc(1,sizeof(*op));
   char* copied_sql=(char*)malloc(sql_bytes);
-  const char** values=values_bytes ? (const char**)malloc(values_bytes):NULL;
+  void* values_storage=values_bytes?malloc(values_bytes):NULL;
+  const char** values=(const char**)values_storage;
+  KuPgTypedQuery* typed_query=typed?(KuPgTypedQuery*)values_storage:NULL;
   char* storage=storage_bytes ? (char*)malloc(storage_bytes):NULL;
-  if (!op || !copied_sql || (values_bytes && !values) || (storage_bytes && !storage)) {
-    free(op);free(copied_sql);free(values);free(storage);budget.refund(budget.context,charge);
+  if (!op || !copied_sql || (values_bytes && !values_storage) || (storage_bytes && !storage)) {
+    free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);
     ku_database_operation_end(operation_charge);*error=ku_pg_out_of_memory_error();return NULL;
   }
   int copied=ku_pg_copy_until(copied_sql,sql.ptr,sql.len,deadline);copied_sql[sql.len]=0;
-  char* cursor=storage;
-  for(size_t i=0;i<params.len && copied;i++) {values[i]=cursor;copied=ku_pg_copy_until(cursor,params.data[i].ptr,params.data[i].len,deadline);cursor[params.data[i].len]=0;cursor+=params.data[i].len+1u;}
-  if(!copied) {free(op);free(copied_sql);free(values);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);*error=ku_pg_query_timeout_error();return NULL;}
-  op->pool=p;op->budget=budget;op->sql=copied_sql;op->values=values;op->params=storage;
+  if(typed && copied) {
+    copied=ku_pg_typed_bind(typed_query,typed_params,count,param_types,result_types,storage,deadline);
+    values=ku_pg_typed_values(typed_query);if(storage_bytes)storage[param_bytes]=0;
+  } else if(!typed) {
+    char* cursor=storage;
+    for(size_t i=0;i<count && copied;i++) {values[i]=cursor;copied=ku_pg_copy_until(cursor,params.data[i].ptr,params.data[i].len,deadline);cursor[params.data[i].len]=0;cursor+=params.data[i].len+1u;}
+  }
+  if(!copied) {free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);*error=ku_pg_query_timeout_error();return NULL;}
+  op->pool=p;op->budget=budget;op->typed=typed_query;op->sql=copied_sql;op->values=values;op->params=storage;
   op->sql_bytes=sql_bytes;op->values_bytes=values_bytes;op->param_bytes=storage_bytes;
-  op->input_charge=charge;op->operation_charge=operation_charge;op->count=(int)params.len;
+  op->input_charge=charge;op->operation_charge=operation_charge;op->count=(int)count;
   op->started_ms=op->observed_ms=now;
   op->waiter.diagnostic.parent_chain_missing=1;
   ku_pg_diag_store(&op->waiter.diagnostic.phase,KU_PG_ASYNC_ACQUIRE);
@@ -303,9 +321,20 @@ static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str pa
   if (deadline<op->acquire_deadline) op->acquire_deadline=deadline;
   op->waiter.wake=wake;op->waiter.context=context;
   ku_pg_mutex_lock(&p->lock);
-  if(p->closing) {ku_pg_mutex_unlock(&p->lock);free(op);free(copied_sql);free(values);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
+  if(p->closing) {ku_pg_mutex_unlock(&p->lock);free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
     *error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);return NULL;}
   p->async_operations++;ku_pg_mutex_unlock(&p->lock);return op;
+}
+static KuPgAsyncOp* ku_pg_async_create(KuPgClient* p,KuString sql,KuArray_str params,
+    unsigned long long absolute_deadline,KuPgAsyncBudget budget,void (*wake)(void*),void* context,KuError* error) {
+  return ku_pg_async_create_inputs(p,sql,params,NULL,0,(KuArray_str){0},(KuArray_str){0},0,
+      absolute_deadline,budget,wake,context,error);
+}
+static KuPgAsyncOp* ku_pg_async_create_one_typed(KuPgClient* p,KuString sql,const KuValue* params,size_t count,
+    KuArray_str param_types,KuArray_str result_types,unsigned long long absolute_deadline,
+    KuPgAsyncBudget budget,void (*wake)(void*),void* context,KuError* error) {
+  return ku_pg_async_create_inputs(p,sql,(KuArray_str){0},params,count,param_types,result_types,1,
+      absolute_deadline,budget,wake,context,error);
 }
 /* Return 1 when a background connect is required, 0 while parked/leased,
  * and -1 after a completed acquisition error. Never waits on a condition. */
@@ -376,7 +405,93 @@ static void ku_pg_async_connected(KuPgAsyncOp* op,unsigned long long now,int can
  * The current libpq single-row PGresult is retained until its bytes have been
  * copied; Ku's detached table never refers into it after PQclear. */
 typedef struct KuPgAsyncTurn { size_t bytes,cells; } KuPgAsyncTurn;
+static int ku_pg_async_materialize_typed(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
+  const size_t byte_quantum=65536u,cell_quantum=64u;
+  if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
+  uint32_t* types=ku_pg_typed_result_types(op->typed);
+  if(!op->row_phase) {
+    int rows=PQntuples(op->row),cols=PQnfields(op->row);
+    if(rows<0 || rows>1 || cols<0 || (size_t)cols!=op->typed->columns)return KU_PG_TYPED_SCHEMA;
+    if(rows && op->typed->rows_seen++)return KU_PG_TYPED_ROWS;
+    op->row_rows=rows;op->row_columns=cols;op->row_bytes=0;
+    op->row_phase=1;op->row_col=op->row_offset=0;
+  }
+  if(op->row_phase==1) {
+    while(op->row_col<(size_t)op->row_columns) {
+      if(ku_pg_deadline_expired(op->deadline))return -2;
+      int col=(int)op->row_col;uint32_t type=types[col],oid=type&KU_PG_TYPED_OID_MASK;
+      if(PQftype(op->row,col)!=oid)return KU_PG_TYPED_OID;
+      if(PQfformat(op->row,col)!=1)return KU_PG_TYPED_FORMAT;
+      if(!op->row_rows) {op->row_col++;if(++turn->cells>=cell_quantum)return 0;continue;}
+      if(PQgetisnull(op->row,0,col)) {
+        if(!(type&KU_PG_TYPED_NULLABLE))return KU_PG_TYPED_NULL;
+        op->row_col++;if(++turn->cells>=cell_quantum)return 0;continue;
+      }
+      int length=PQgetlength(op->row,0,col);size_t fixed=oid==23u?4u:oid==20u?8u:oid==16u?1u:0u;
+      if(length<0 || (fixed && (size_t)length!=fixed))return KU_PG_TYPED_LENGTH;
+      if((size_t)length>KU_PG_MAX_RESULT_BYTES-op->row_bytes)return -1;
+      const uint8_t* source=(const uint8_t*)PQgetvalue(op->row,0,col);
+      if(length && !source)return KU_PG_TYPED_LENGTH;
+      if(oid==16u && source[0]>1u)return KU_PG_TYPED_VALUE;
+      size_t remaining=(size_t)length-op->row_offset;
+      size_t count=remaining<byte_quantum-turn->bytes?remaining:byte_quantum-turn->bytes;
+      int text=oid==25u || oid==1043u;
+      if(text && count<remaining) {
+        size_t end=op->row_offset+count;
+        while(end>op->row_offset && (source[end]&0xc0u)==0x80u)end--;
+        count=end-op->row_offset;if(!count)return 0;
+      }
+      if(count) {
+        turn->bytes+=count;
+        if(text) {
+          int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);
+          if(valid!=1)return valid<0?-2:KU_PG_TYPED_VALUE;
+          if(memchr(source+op->row_offset,0,count))return KU_PG_TYPED_VALUE;
+        }
+        op->row_offset+=count;
+      }
+      if(op->row_offset==(size_t)length) {op->row_bytes+=(size_t)length;op->row_col++;op->row_offset=0;turn->cells++;}
+      if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
+    }
+    op->row_phase=2;
+  }
+  if(op->row_phase==2) {
+    if(!op->row_rows)return 1; /* zero-row terminal only validates its description */
+    if(op->query.value)return KU_PG_TYPED_ROWS;
+    size_t tail=0;if(!ku_pg_typed_result_size(op->typed->columns,op->row_bytes,&tail))return -1;
+    size_t charge=sizeof(KuPgResult)+tail;
+    if(!op->budget.reserve(op->budget.context,charge))return -3;
+    KuPgResult* result=ku_pg_typed_result_new(op->typed->columns,op->row_bytes);
+    if(!result) {op->budget.refund(op->budget.context,charge);return -3;}
+    op->query.value=result;op->row_phase=3;op->row_col=op->row_offset=0;
+    /* Retain the old post-allocation observation point, including control-phase
+     * cancellation. Large rows or bare callers keep the original owner yield. */
+    if(!op->fresh_cancel || tail>384u || op->row_bytes>byte_quantum-turn->bytes
+        || op->typed->columns>cell_quantum-turn->cells)return 0;
+    if(op->fresh_cancel(op->fresh_cancel_context,op->waiter.diagnostic.job_generation)
+        || ku_pg_deadline_expired(op->deadline))return -6;
+  }
+  KuPgResult* result=op->query.value;
+  while(op->row_col<(size_t)op->row_columns) {
+    int col=(int)op->row_col;KuPgCell* cell=&result->cells[op->row_col];
+    if(!op->row_offset) {
+      ku_pg_typed_owner_types(result)[op->row_col]=types[op->row_col];
+      cell->offset=(uint32_t)result->bytes_len;
+      cell->len=PQgetisnull(op->row,0,col)?KU_PG_NULL_CELL:(uint32_t)PQgetlength(op->row,0,col);
+    }
+    if(cell->len==KU_PG_NULL_CELL || !cell->len) {op->row_col++;if(++turn->cells>=cell_quantum)return 0;continue;}
+    size_t remaining=(size_t)cell->len-op->row_offset;
+    size_t count=remaining<byte_quantum-turn->bytes?remaining:byte_quantum-turn->bytes;
+    if(count)memcpy(result->bytes+result->bytes_len,(const uint8_t*)PQgetvalue(op->row,0,col)+op->row_offset,count);
+    result->bytes_len+=count;op->row_offset+=count;turn->bytes+=count;
+    if(op->row_offset==(size_t)cell->len) {op->row_col++;op->row_offset=0;turn->cells++;}
+    if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
+  }
+  result->rows=1u;return 1;
+}
+
 static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
+  if(op->typed)return ku_pg_async_materialize_typed(op,turn);
   const size_t byte_quantum=65536u,cell_quantum=64u;
   if(turn->bytes>=byte_quantum || turn->cells>=cell_quantum)return 0;
   if(!op->row_phase) {
@@ -523,7 +638,10 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       /* Set sent before entering libpq: a failed send can already have placed
        * bytes on the socket. It is never evidence that no side effect occurred. */
       op->sent=1;
-      if(!PQsendQueryParams(op->conn,op->sql,op->count,NULL,op->values,NULL,NULL,0)
+      if(!PQsendQueryParams(op->conn,op->sql,op->count,
+          op->typed?(const void*)ku_pg_typed_parameter_oids(op->typed):NULL,
+          op->count?op->values:NULL,op->typed?ku_pg_typed_lengths(op->typed):NULL,
+          op->typed?ku_pg_typed_formats(op->typed):NULL,op->typed?1:0)
           || !PQsetSingleRowMode(op->conn)) {ku_pg_async_failure(op);return 1;}
       ku_pg_async_set_phase(op,KU_PG_ASYNC_FLUSH);
     }
@@ -562,6 +680,8 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       int status=PQresultStatus(op->query.terminal);
       if(status!=KU_PGRES_COMMAND_OK && status!=KU_PGRES_TUPLES_OK) {
         op->output=(KuResult_pg_result){false,NULL,ku_pg_static_error("query_error",sizeof("query_error")-1,"PostgreSQL query failed",sizeof("PostgreSQL query failed")-1)};
+      } else if(op->typed && (op->query.validation!=1 || op->typed->rows_seen!=1u || !op->query.value)) {
+        op->output=(KuResult_pg_result){false,NULL,ku_pg_typed_error(op->query.validation!=1?op->query.validation:KU_PG_TYPED_ROWS)};
       } else if(op->query.validation!=1 || !op->query.value) {
         op->output=(KuResult_pg_result){false,NULL,ku_pg_execution_completed_without_result_error()};
       } else if(PQtransactionStatus(op->conn)!=KU_PQTRANS_IDLE) {
@@ -641,9 +761,48 @@ static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
   else if(op->output.ok)ku_pg_async_drop_table(op,&op->output.value);
   else ku_error_drop(&op->output.error);
   ku_pg_async_drop_query(op);
-  free(op->sql);free(op->values);free(op->params);
+  free(op->sql);free(op->typed?(void*)op->typed:(void*)op->values);free(op->params);
   size_t charge=op->input_charge,operation_charge=op->operation_charge;
   free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
   ku_pg_mutex_lock(&p->lock);p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p);ku_pg_mutex_unlock(&p->lock);
   if(dispose)ku_pg_client_dispose(p);
+}
+
+/* The synchronous typed API uses the same binary decoder and strict reset FSM.
+ * It acquires via the existing synchronous pool wait, so no new async callback
+ * may outlive this stack. Outside Task there is no per-frame allocation ledger;
+ * PG hard shape limits and the existing process limit remain the memory bound. */
+static int ku_pg_typed_sync_reserve(void* context,size_t bytes) { (void)context;(void)bytes;return 1; }
+static void ku_pg_typed_sync_refund(void* context,size_t bytes) { (void)context;(void)bytes; }
+static void ku_pg_typed_sync_wake(void* context) { (void)context; }
+static KuResult_pg_result ku_pg_client_query_one_typed(KuPgClient* p,KuString sql,
+    const KuValue* params,size_t count,KuArray_str param_types,KuArray_str result_types) {
+  if(!p)return (KuResult_pg_result){false,NULL,ku_pg_client_error("client_closed",sizeof("client_closed")-1,
+      "PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1)};
+  KuError error={0};KuPgAsyncOp* op=ku_pg_async_create_one_typed(p,sql,params,count,param_types,result_types,
+      __ku_handler_deadline,(KuPgAsyncBudget){NULL,ku_pg_typed_sync_reserve,ku_pg_typed_sync_refund},
+      ku_pg_typed_sync_wake,NULL,&error);
+  if(!op)return (KuResult_pg_result){false,NULL,error};
+  op->diagnostic_sync=1;
+  PGconn* conn=NULL;int slot=ku_pg_client_acquire(p,&conn,&error,op->deadline);
+  if(slot<0)ku_pg_async_finish(op,error,0);
+  else {
+    op->slot=slot;op->conn=conn;ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);
+    ku_pg_mutex_lock(&p->lock);ku_pg_async_claim_locked(op,ku_pg_now_ms());ku_pg_mutex_unlock(&p->lock);
+  }
+  unsigned int events=0;
+  while(op->phase!=KU_PG_ASYNC_DONE) {
+    if(ku_pg_async_step(op,events,ku_pg_now_ms(),0))break;
+    int fd=-1;unsigned int interest=0;unsigned long long deadline=op->deadline;
+    int immediate=ku_pg_async_interest(op,&fd,&interest,&deadline);
+    if(immediate) {
+      if(op->interest && fd<0)ku_pg_async_failure(op);
+      events=0;continue;
+    }
+    int ready=ku_pg_wait_socket(fd,interest,deadline);
+    if(ready<0)ku_pg_async_failure(op);
+    events=ready>0?(unsigned int)ready:0u;
+  }
+  /* This operation was never linked as an asynchronous waiter. */
+  KuResult_pg_result output=ku_pg_async_take(op);ku_pg_async_dispose(op,1);return output;
 }

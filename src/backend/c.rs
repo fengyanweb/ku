@@ -14254,6 +14254,7 @@ fn emit_pg_runtime(out: &mut COutput, program: &IrProgram) {
         "extern int PQntuples(const PGresult*);\n",
         "extern int PQnfields(const PGresult*);\n",
         "extern int PQfformat(const PGresult*, int);\n",
+        "extern unsigned int PQftype(const PGresult*, int);\n",
         "extern char* PQgetvalue(const PGresult*, int, int);\n",
         "extern int PQgetisnull(const PGresult*, int, int);\n",
         "extern int PQgetlength(const PGresult*, int, int);\n",
@@ -14733,10 +14734,18 @@ static int ku_pg_sql_has_explicit_session_control(
  * If a later row exceeds a compact region it moves to an external allocation;
  * the small original tail stays charged until the result itself is released. */
 typedef char KuPgResultCellAlignment[(sizeof(KuPgResult)%_Alignof(KuPgCell)==0)?1:-1];
+#define KU_PG_RESULT_TYPED_FLAG ((size_t)(SIZE_MAX/2u+1u))
+static int ku_pg_result_is_typed(const KuPgResult* result) {
+  return result && (result->inline_storage&KU_PG_RESULT_TYPED_FLAG)!=0u;
+}
+static size_t ku_pg_result_inline_bytes(const KuPgResult* result) {
+  return result?result->inline_storage&~KU_PG_RESULT_TYPED_FLAG:0u;
+}
 static int ku_pg_result_is_inline(const KuPgResult* result,const void* pointer) {
-  if(!result || !result->inline_storage || !pointer)return 0;
+  size_t bytes=ku_pg_result_inline_bytes(result);
+  if(!result || !bytes || !pointer)return 0;
   uintptr_t base=(uintptr_t)(result+1),address=(uintptr_t)pointer;
-  return address>=base && address-base<result->inline_storage;
+  return address>=base && address-base<bytes;
 }
 /* First-row classes use only validated shape/bytes, never SQL or field names.
  * Subsequent rows retain the existing bounded geometric growth policy. */
@@ -14760,6 +14769,7 @@ static KuPgResult* ku_pg_result_new(size_t columns,size_t cells,size_t bytes) {
   return result;
 }
 static int ku_pg_result_grow_cells(KuPgResult* result,size_t capacity) {
+  if(ku_pg_result_is_typed(result))return 0;
   if(capacity<=result->cell_capacity)return 1;
   KuPgCell* cells;
   if(ku_pg_result_is_inline(result,result->cells)) {
@@ -14771,6 +14781,7 @@ static int ku_pg_result_grow_cells(KuPgResult* result,size_t capacity) {
   result->cells=cells;result->cell_capacity=capacity;return 1;
 }
 static int ku_pg_result_grow_bytes(KuPgResult* result,size_t capacity) {
+  if(ku_pg_result_is_typed(result))return 0;
   if(capacity<=result->bytes_capacity)return 1;
   uint8_t* bytes;
   if(ku_pg_result_is_inline(result,result->bytes)) {
@@ -14963,6 +14974,7 @@ static size_t ku_pg_result_capacity(size_t current, size_t needed, size_t initia
    A source is one row or a zero-row terminal only.
    Validate the entire incoming row before growing or copying the aggregate. */
 static int ku_pg_result_append(KuPgResult** target, PGresult* source, unsigned long long deadline) {
+  if (*target && ku_pg_result_is_typed(*target)) return -1;
   if (ku_pg_deadline_expired(deadline)) return -2;
   int rows = PQntuples(source); int cols = PQnfields(source);
   if (rows < 0 || rows > 1 || cols < 0) return 0;
@@ -15245,6 +15257,9 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
   return ku_pg_query_params_impl(conn, sql, params, ku_pg_deadline_after_ms(KU_PG_DEFAULT_QUERY_TIMEOUT_MS), 0);
 }
 "#,
+    ));
+    out.push_str(include_str!("c_pg_typed_runtime.c"));
+    out.push_str(concat!(
         "static int64_t ku_pg_rows(KuPgResult* r) { return r ? (int64_t)r->rows : 0; }\n",
         "static int64_t ku_pg_cols(KuPgResult* r) { return r ? (int64_t)r->cols : 0; }\n",
         "static int ku_pg_cell_in_bounds(KuPgResult* r, int64_t row, int64_t col) {\n",
@@ -15256,6 +15271,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
         "}\n",
         "static KuResult_str ku_pg_value(KuPgResult* r, int64_t row, int64_t col) {\n",
         "  if (!ku_pg_cell_in_bounds(r, row, col)) return (KuResult_str){ false, (KuString){0}, ku_pg_value_error() };\n",
+        "  if (ku_pg_result_is_typed(r) && !ku_pg_typed_is_text(r,row,col)) return (KuResult_str){false,{0},ku_pg_typed_error(KU_PG_TYPED_VALUE)};\n",
         "  KuPgCell cell = r->cells[(size_t)row * r->cols + (size_t)col];\n",
         "  if (cell.len == KU_PG_NULL_CELL) return (KuResult_str){ false, (KuString){0}, ku_pg_static_error(\"null_value\", sizeof(\"null_value\") - 1, \"PostgreSQL NULL must be checked with is_null()\", sizeof(\"PostgreSQL NULL must be checked with is_null()\") - 1) };\n",
         "  if (cell.len == 0) return (KuResult_str){ true, (KuString){0}, (KuError){0} };\n",
@@ -15267,6 +15283,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
         r#"/* Canonical JSON integer token only, with no surrounding whitespace.
  * Read the independent owned table; no string owner or JSON value is created. */
 static KuResult_int ku_pg_value_int(KuPgResult* r, int64_t row, int64_t col) {
+  if(ku_pg_result_is_typed(r))return ku_pg_typed_int(r,row,col);
   if (!ku_pg_cell_in_bounds(r,row,col) || !r->cells
       || (size_t)row > (SIZE_MAX-(size_t)col)/r->cols)
     return (KuResult_int){false,0,ku_pg_value_error()};
@@ -15300,6 +15317,7 @@ invalid_integer:
 }
 "#,
         "static KuResult_bool ku_pg_is_null(KuPgResult* r, int64_t row, int64_t col) {\n",
+        "  if(ku_pg_result_is_typed(r)) { uint32_t type=0;KuPgCell cell={0};if(!ku_pg_typed_cell(r,row,col,&type,&cell))return (KuResult_bool){false,0,ku_pg_value_error()};return (KuResult_bool){true,cell.len==KU_PG_NULL_CELL,{0}}; }\n",
         "  if (!ku_pg_cell_in_bounds(r, row, col)) return (KuResult_bool){ false, false, ku_pg_value_error() };\n",
         "  return (KuResult_bool){ true, r->cells[(size_t)row * r->cols + (size_t)col].len == KU_PG_NULL_CELL, (KuError){0} };\n",
         "}\n",

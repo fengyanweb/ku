@@ -1051,6 +1051,55 @@ fn native_pg_first_row_size_classes_cover_shapes_and_growth_without_leaking() {
 }
 
 #[test]
+fn native_pg_typed_single_row_binary_values_validate_types_and_survive_reset() {
+    let directory = TempDir::new("pg-typed-single-row");
+    let globals = format!("{}\nenum {{\n  T_TYPED,T_OK", TYPED_STUB_GLOBALS);
+    let harness=query_stub_harness(&directory)
+        .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
+        .replacen("#define KU_PG_MAX_RESULT_COLS 4ULL", "#define KU_PG_MAX_RESULT_COLS 16ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_CELLS 8ULL", "#define KU_PG_MAX_RESULT_CELLS 1024ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_BYTES 16ULL", "#define KU_PG_MAX_RESULT_BYTES 1048576ULL", 1)
+        .replacen("enum {\n  T_OK", &globals, 1)
+        .replacen("switch (conn->mode) {", "switch (conn->mode) {\n    case T_TYPED: conn->total=typed_rows+1;break;", 1)
+        .replacen("int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {", "int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) { if(format==1){ if(!typed_accept_parameters(count,types,values,lengths,formats))return 0;return send_query(conn,sql); }", 1)
+        .replacen("int PQnfields(const PGresult* result) {", "int PQnfields(const PGresult* result) { if(result->mode==T_TYPED)return 10;", 1)
+        .replacen("static int result_format(const PGresult* result, int column) {", "static int result_format(const PGresult* result, int column) { if(result->mode==T_TYPED)return (typed_errors&2)?0:1;", 1)
+        .replacen("unsigned int PQftype(const PGresult* result,int column) {", "unsigned int PQftype(const PGresult* result,int column) { if(result->mode==T_TYPED)return (typed_errors&1)&&column==0?9999u:typed_column_oids[column];", 1)
+        .replacen("int PQgetisnull(const PGresult* result, int row, int column) {", "int PQgetisnull(const PGresult* result, int row, int column) { if(result->mode==T_TYPED)return column==5 || column==9 || ((typed_errors&8)&&column==0);", 1)
+        .replacen("char* PQgetvalue(const PGresult* result, int row, int column) {", "char* PQgetvalue(const PGresult* result, int row, int column) { if(result->mode==T_TYPED){ if(column==3)return (typed_errors&16)?\"\\xff\":typed_large?typed_large_bytes:typed_source_text;if(column==4)return \"\";if(column==2 && (typed_errors&32))return \"\\2\";return (char*)typed_numbers[column]; }", 1)
+        .replacen("int PQgetlength(const PGresult* result, int row, int column) {", "int PQgetlength(const PGresult* result, int row, int column) { if(result->mode==T_TYPED)return column==0?(typed_errors&4)?3:4:column==1||column==7?8:column==2||column==8?1:column==3?(typed_errors&16)?1:typed_large?131079:14:column==6?4:0;", 1)
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_sequential_tests(void) {")
+        + TYPED_QUERY_SUITE;
+    let string_free = "if (value->storage == KU_STRING_OWNED && value->ptr) free(value->ptr);";
+    assert_eq!(harness.matches(string_free).count(), 1);
+    let harness = format!(
+        "static void ku_test_pg_free(void*);\n{}",
+        harness.replacen(
+            string_free,
+            "if (value->storage == KU_STRING_OWNED && value->ptr) ku_test_pg_free(value->ptr);",
+            1
+        )
+    );
+    let source = directory.path().join("pg-typed-single-row.c");
+    fs::write(&source, harness).expect("write typed PG binary fixture");
+    let Some(executable) = compile_harness(directory.path(), &source, "pg-typed-single-row") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("typed PG binary fixture exceeded bounds");
+    assert!(
+        output.status.success(),
+        "typed PG binary fixture failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg typed single-row binary values and strict lifetime closed loop\n"
+    );
+}
+
+#[test]
 fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() {
     let directory = TempDir::new("async-query-large-row");
     let harness=query_stub_harness(&directory)
@@ -1850,6 +1899,7 @@ static int result_format(const PGresult* result, int column) {
   if (result->mode == T_BINARY_LATE || result->mode == T_BINARY_TERMINAL) return result->number >= 2;
   return result->mode == T_BINARY || result->mode == T_BINARY_ZERO_ROWS || result->mode == T_BINARY_NULL || result->mode == T_BINARY_ERROR;
 }
+unsigned int PQftype(const PGresult* result,int column) { (void)result;(void)column;return 25u; }
 int PQfformat(const PGresult* result, int column) {
   if (column < 0 || column >= PQnfields(result)) { bad_calls++; return -1; }
   return result_format(result, column);
@@ -3352,5 +3402,118 @@ int main(void) {
   ku_pg_client_close_owned(pool);
   CHECK(!budget.bytes && !live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
   puts("pg first-row size classes and physical ownership closed loop");return 0;
+}
+"#;
+
+const TYPED_STUB_GLOBALS: &str = r#"
+static int typed_rows=1,typed_errors,typed_large,typed_parameter_checks;
+static char typed_large_bytes[131080];
+static char typed_source_text[]="\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82 ' \\";
+static const unsigned int typed_column_oids[10]={23u,20u,16u,25u,1043u,25u,23u,20u,16u,20u};
+static const unsigned char typed_numbers[10][8]={{128,0,0,0},{128,0,0,0,0,0,0,0},{1},{0},{0},{0},{127,255,255,255},{127,255,255,255,255,255,255,255},{0},{0}};
+static int typed_accept_parameters(int,const void*,const char* const*,const int*,const int*);
+"#;
+
+const TYPED_QUERY_SUITE: &str = r#"
+static int typed_accept_parameters(int count,const void* raw,const char* const* values,const int* lengths,const int* formats) {
+  static const uint32_t expected[6]={23u,20u,16u,25u,25u,1043u};
+  const uint32_t* types=(const uint32_t*)raw;int valid=count==6 && types && values && lengths && formats;
+  for(int i=0;valid && i<6;i++)valid=types[i]==expected[i] && formats[i]==1;
+  valid=valid && lengths[0]==4 && !memcmp(values[0],"\x80\0\0\0",4u)
+      && lengths[1]==8 && !memcmp(values[1],"\x7f\xff\xff\xff\xff\xff\xff\xff",8u)
+      && lengths[2]==1 && values[2][0]==1 && lengths[3]==14
+      && !memcmp(values[3],"\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82 ' \\",14u)
+      && !values[4] && !lengths[4] && values[5] && !lengths[5];
+  if(!valid)bad_calls++;else typed_parameter_checks++;return valid;
+}
+static KuPgAsyncOp* typed_create(KuPgClient* pool,AsyncBudget* budget) {
+  KuValue values[6]={ku_v_int(INT32_MIN),ku_v_int(INT64_MAX),ku_v_bool(true),ku_v_str(text(typed_source_text)),ku_v_null(),ku_v_str(text(""))};
+  KuString parameters[]={text("int4"),text("int8"),text("bool"),text("text"),text("text?"),text("varchar")};
+  KuString columns[]={text("int4"),text("int8"),text("bool"),text("text"),text("varchar"),text("text?"),text("int4"),text("int8"),text("bool"),text("int8?")};
+  KuError error={0};KuPgAsyncOp* op=ku_pg_async_create_one_typed(pool,text("SELECT $1::int4,$2::int8,$3::bool,$4::text,$6::varchar,$5::text,2147483647::int4,9223372036854775807::int8,false,NULL::int8"),
+      values,6u,(KuArray_str){6u,parameters},(KuArray_str){10u,columns},clock_ms+2000u,
+      (KuPgAsyncBudget){budget,async_reserve,async_refund},async_wake,budget,&error);
+  if(!op || values[0].tag!=KU_INT || values[0].as.i!=INT32_MIN || values[3].as.s.ptr!=(const uint8_t*)typed_source_text
+      || op->values[3]==typed_source_text || memcmp(op->values[3],typed_source_text,14u))abort();
+  return op;
+}
+static int typed_step(KuPgAsyncOp* op,int cancelled) {
+  int done=ku_pg_async_step(op,3u,clock_ms,cancelled);
+  if(!done && op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,cancelled);
+  return done;
+}
+static int typed_values(KuPgResult* result) {
+  KuResult_int a=ku_pg_value_int(result,0,0),b=ku_pg_value_int(result,0,1),c=ku_pg_value_int(result,0,6),d=ku_pg_value_int(result,0,7);
+  CHECK(a.ok && a.value==INT32_MIN && b.ok && b.value==INT64_MIN && c.ok && c.value==INT32_MAX && d.ok && d.value==INT64_MAX);
+  KuResult_bool yes=ku_pg_value_bool(result,0,2),no=ku_pg_value_bool(result,0,8),nil=ku_pg_is_null(result,0,5);
+  CHECK(yes.ok && yes.value && no.ok && !no.value && nil.ok && nil.value);
+  KuResult_str value=ku_pg_value(result,0,3),empty=ku_pg_value(result,0,4);
+  CHECK(value.ok && value.value.len==14u && !memcmp(value.value.ptr,"\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82 ' \\",14u)
+      && empty.ok && !empty.value.len);ku_string_drop(&value.value);ku_string_drop(&empty.value);
+  value=ku_pg_value(result,0,0);CHECK(!value.ok && equals(value.error.code,"typed_value_error"));ku_error_drop(&value.error);
+  a=ku_pg_value_int(result,0,9);CHECK(!a.ok && equals(a.error.code,"null_value"));ku_error_drop(&a.error);
+  return 0;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;track_runtime_allocations=1;mode_on_send=T_TYPED;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);CHECK(opened.ok);
+  KuPgClient* pool=opened.value;AsyncBudget budget={0};KuPgAsyncOp* op=typed_create(pool,&budget);
+  typed_source_text[0]='z';CHECK((uint8_t)op->values[3][0]==0xe4u);typed_source_text[0]=(char)0xe4;
+  CHECK(async_finish(op,0) && op->output.ok && op->output.value->rows==1u && op->output.value->cols==10u
+      && op->output.value->cell_capacity==10u && ku_pg_result_is_typed(op->output.value));
+  KuResult_pg_result detached=ku_pg_async_take(op);size_t physical=0;
+  CHECK(ku_pg_result_owned_bytes(detached.value,&physical) && physical==sizeof(KuPgResult)+120u+40u);
+  ku_pg_async_dispose(op,1);ku_pg_client_close_owned(pool);
+  CHECK(!live_connections && !live_results && budget.bytes==physical && runtime_bytes==physical && live_runtime_allocations==1);
+  CHECK(!typed_values(detached.value));ku_drop_pg_result(&detached.value);async_refund(&budget,physical);
+  CHECK(!budget.bytes && !runtime_bytes && !live_runtime_allocations);
+
+  opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);CHECK(opened.ok);pool=opened.value;
+  for(int i=0;i<6;i++) {
+    typed_errors=1<<i;op=typed_create(pool,&budget);CHECK(async_finish(op,0) && !op->output.ok);
+    CHECK(error_is(op->output,i==3?"null_value":"typed_value_error"));async_drop_output(op,&budget,0);CHECK(!budget.bytes && !live_results);
+  }
+  typed_errors=0;
+  for(int rows=0;rows<=2;rows+=2) {
+    typed_rows=rows;op=typed_create(pool,&budget);CHECK(async_finish(op,0) && error_is(op->output,"row_count_error"));
+    async_drop_output(op,&budget,0);CHECK(!budget.bytes && !live_results);
+  }
+  typed_rows=1;mode_on_send=T_ERROR;op=typed_create(pool,&budget);
+  CHECK(async_finish(op,0) && error_is(op->output,"query_error"));async_drop_output(op,&budget,0);mode_on_send=T_TYPED;
+
+  /* Schema/range rejection precedes allocation or SQL; actual allocation sites
+   * and a post-send row allocation failure retain the original all-zero ledger. */
+  KuValue invalid=ku_v_int(INT64_MAX);KuString int4=text("int4");KuError error={0};int before_sends=user_sends;
+  fail_runtime_allocation_after=1;
+  CHECK(!ku_pg_async_create_one_typed(pool,text("SELECT $1::int4"),&invalid,1u,(KuArray_str){1u,&int4},(KuArray_str){1u,&int4},clock_ms+2000u,
+      (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error)
+      && fail_runtime_allocation_after==1 && user_sends==before_sends && !budget.bytes);
+  fail_runtime_allocation_after=0;ku_error_drop(&error);
+  for(int failure=1;failure<=4;failure++) {
+    KuValue values[1]={ku_v_int(1)};error=(KuError){0};fail_runtime_allocation_after=failure;
+    CHECK(!ku_pg_async_create_one_typed(pool,text("SELECT $1::int4"),values,1u,(KuArray_str){1u,&int4},(KuArray_str){1u,&int4},clock_ms+2000u,
+        (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error)
+        && !fail_runtime_allocation_after && !budget.bytes && user_sends==before_sends);
+    ku_error_drop(&error);
+  }
+  op=typed_create(pool,&budget);fail_runtime_allocation_after=1;
+  CHECK(async_finish(op,0) && error_is(op->output,"execution_unknown") && !fail_runtime_allocation_after);
+  async_drop_output(op,&budget,0);
+
+  typed_large=1;memset(typed_large_bytes,'x',131079u);typed_large_bytes[131079]=0;
+  memcpy(typed_large_bytes+65535,"\xf0\x9f\x99\x82",4u);
+  op=typed_create(pool,&budget);size_t turns=0;
+  while((!op->query.value || !op->query.value->bytes_len) && turns++<1024u)CHECK(!typed_step(op,0));
+  CHECK(op->query.value && op->query.value->bytes_len<op->query.value->bytes_capacity
+      && ku_pg_async_step(op,3u,clock_ms,1) && error_is(op->output,"execution_unknown"));
+  async_drop_output(op,&budget,0);typed_large=0;
+  reset_mode_on_send=T_READ_TIMEOUT;op=typed_create(pool,&budget);turns=0;
+  while(op->phase!=KU_PG_ASYNC_RESET_READ && turns++<1024u)CHECK(!typed_step(op,0));
+  CHECK(op->output.ok && op->phase==KU_PG_ASYNC_RESET_READ);
+  clock_ms=op->deadline;CHECK(ku_pg_async_step(op,0,clock_ms,0) && op->output.ok && !pool->conns[0]);
+  CHECK(!typed_values(op->output.value));async_drop_output(op,&budget,1);
+  ku_pg_client_close_owned(pool);
+  CHECK(!budget.bytes && !live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls && typed_parameter_checks>0);
+  puts("pg typed single-row binary values and strict lifetime closed loop");return 0;
 }
 "#;

@@ -65,9 +65,10 @@ static uint32_t ku_task_blocking_take_pg(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token,KuResult_pg_result* output) {
   return ku_task_blocking_take(ticket,token,0,9u,NULL,output);
 }
-static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
+static uint32_t ku_task_blocking_submit_pg_inputs(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control,KuTaskBlockingTokenV1* token,
-    KuPgClient* client,KuString sql,KuArray_str params,uint64_t deadline,
+    KuPgClient* client,KuString sql,KuArray_str params,const KuValue* typed_params,size_t typed_count,
+    KuArray_str param_types,KuArray_str result_types,int typed,uint64_t deadline,
     void* context,uint32_t (*reconcile)(void*),KuResult_pg_result* output) {
   if(!ticket || !ticket->driver || !control || !token || token->pool || token->charged_bytes
       || !context || !reconcile || !output)return KU_TASK_DRIVER_INVALID_ARGUMENT;
@@ -97,7 +98,10 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
   KuError error={0};KuPgAsyncOp* operation=NULL;
   if(registered)status=reconcile(context);
   if(status==KU_TASK_DRIVER_OK) {
-    operation=ku_pg_async_create(client,sql,params,deadline,(KuPgAsyncBudget){job,ku_task_pg_reserve,ku_task_pg_refund},ku_task_pg_wake,job,&error);
+    KuPgAsyncBudget budget={job,ku_task_pg_reserve,ku_task_pg_refund};
+    operation=typed?ku_pg_async_create_one_typed(client,sql,typed_params,typed_count,param_types,result_types,
+        deadline,budget,ku_task_pg_wake,job,&error)
+        :ku_pg_async_create(client,sql,params,deadline,budget,ku_task_pg_wake,job,&error);
     if(!operation && !error.code.len)error=ku_pg_async_limit_error();
   }
   if(operation) {
@@ -156,4 +160,18 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
   if(reconciled!=KU_TASK_DRIVER_OK)return reconciled;
   if(!error.code.len)error=ku_task_blocking_error("memory_limit","PostgreSQL operation could not be admitted");
   *output=(KuResult_pg_result){false,NULL,error};return KU_TASK_DRIVER_OK;
+}
+
+static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,KuTaskBlockingTokenV1* token,KuPgClient* client,KuString sql,
+    KuArray_str params,uint64_t deadline,void* context,uint32_t (*reconcile)(void*),KuResult_pg_result* output) {
+  return ku_task_blocking_submit_pg_inputs(ticket,control,token,client,sql,params,NULL,0,
+      (KuArray_str){0},(KuArray_str){0},0,deadline,context,reconcile,output);
+}
+static uint32_t ku_task_blocking_submit_pg_one_typed(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control,KuTaskBlockingTokenV1* token,KuPgClient* client,KuString sql,
+    const KuValue* params,size_t count,KuArray_str param_types,KuArray_str result_types,uint64_t deadline,
+    void* context,uint32_t (*reconcile)(void*),KuResult_pg_result* output) {
+  return ku_task_blocking_submit_pg_inputs(ticket,control,token,client,sql,(KuArray_str){0},params,count,
+      param_types,result_types,1,deadline,context,reconcile,output);
 }
