@@ -53,7 +53,7 @@ class AssessmentQualityTest(unittest.TestCase):
     def report(self):
         return {'valid_driver': True, 'configuration': clock(), 'ledger': {
             'planned': 1000, 'attempted': 1000, 'planned_reconciled': True,
-            'all_scheduled_to_terminal': True, 'failure_fraction_planned': 0,
+            'all_scheduled_to_terminal': {'count': 1000, 'p99_ms': 1}, 'failure_fraction_planned': 0,
             'results': {'correct': 1000}, 'http_500_total': 0,
             'scheduled_to_attempt': {'count': 1000, 'p99_ms': 1, 'p999_ms': 4, 'max_ms': 8},
             'correct_scheduled_to_complete': {'count': 1000, 'p99_ms': 1}},

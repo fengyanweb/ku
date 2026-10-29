@@ -172,7 +172,8 @@ class Database:
                 raise RuntimeError("old empty database domain could not be removed")
         if (self.data / "postmaster.pid").exists():
             raise RuntimeError("private data has postmaster.pid without a validated running fixture; inspect state")
-        domain = Domain(self.harness, "database", 1, 512*1048576, "7")
+        domain = Domain(self.harness, "database", 1, 512*1048576,
+                        self.harness.manifest.get("database_cpu_set", "7"))
         state = dict(owner_token=self.owner["owner_token"], data=str(self.data), status="preparing",
                      cgroup=str(domain.path), pid=None, port=PORT, address="127.0.0.1", db_name="bench",
                      started_wall_ns=time.time_ns(), limits=domain.settings)

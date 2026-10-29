@@ -981,9 +981,10 @@ def result_assessment(result, policy=None, environment=None):
         reasons.append('functional_evidence_missing')
     if cost.get('service_exited'):
         reasons.append('service_exited')
+    # all_scheduled_to_terminal is a latency histogram in the actual V5
+    # schema, not a boolean. Counts are already reconciled by the driver.
     accounting = (result.get('valid_driver') is True and
-                  ledger.get('planned_reconciled') is True and
-                  ledger.get('all_scheduled_to_terminal', True) is True)
+                  ledger.get('planned_reconciled') is True)
     if not accounting:
         reasons.append('accounting_or_preparation_failed')
 
