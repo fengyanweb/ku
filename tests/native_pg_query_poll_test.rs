@@ -1181,14 +1181,29 @@ fn native_pg_task_fresh_cancel_observer_checks_real_job_state_and_generation() {
 #[test]
 fn native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges() {
     let directory = TempDir::new("async-query-turns");
-    let harness = query_stub_harness(&directory)
+    let generated = query_stub_harness(&directory);
+    // The text and typed materializers are mutually exclusive. Instrument both;
+    // a first-match hook would silently miss text after adding the typed helper.
+    assert_eq!(
+        generated
+            .matches("int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);")
+            .count(),
+        2
+    );
+    assert_eq!(
+        generated
+            .matches("if(count)memcpy(result->bytes+result->bytes_len")
+            .count(),
+        2
+    );
+    let harness = generated
         .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
         .replacen("#define KU_PG_MAX_RESULT_ROWS 4ULL", "#define KU_PG_MAX_RESULT_ROWS 1024ULL", 1)
         .replacen("#define KU_PG_MAX_RESULT_CELLS 8ULL", "#define KU_PG_MAX_RESULT_CELLS 4096ULL", 1)
         .replacen("#define KU_PG_MAX_RESULT_BYTES 16ULL", "#define KU_PG_MAX_RESULT_BYTES 1048576ULL", 1)
         .replacen("typedef struct KuPgAsyncTurn", "static size_t async_validated_bytes,async_copied_bytes,async_reported_bytes,async_reported_cells,async_protocol_results;\ntypedef struct KuPgAsyncTurn", 1)
-        .replacen("int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);", "async_validated_bytes+=count;int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);", 1)
-        .replacen("if(count)memcpy(result->bytes+result->bytes_len", "if(count)async_copied_bytes+=count;\n    if(count)memcpy(result->bytes+result->bytes_len", 1)
+        .replace("int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);", "async_validated_bytes+=count;int valid=ku_pg_utf8_valid(source+op->row_offset,count,op->deadline);")
+        .replace("if(count)memcpy(result->bytes+result->bytes_len", "if(count)async_copied_bytes+=count;\n    if(count)memcpy(result->bytes+result->bytes_len")
         .replacen("int appended=ku_pg_async_materialize(op,&turn);", "int appended=ku_pg_async_materialize(op,&turn);async_reported_bytes=turn.bytes;async_reported_cells=turn.cells;", 1)
         .replacen("enum {\n  T_OK", "static int async_fixture_rows,async_fixture_null_empty,async_fixture_invalid_row;static char async_fixture_data[4001];\nenum {\n  T_ASYNC_ROWS,T_OK", 1)
         .replacen("switch (conn->mode) {", "switch (conn->mode) {\n    case T_ASYNC_ROWS: conn->total=async_fixture_rows+1;break;", 1)
@@ -3263,7 +3278,11 @@ static int async_measured_step(KuPgAsyncOp* op,int cancel) {
   int done=ku_pg_async_step(op,3u,clock_ms,cancel);
   if(async_validated_bytes+async_copied_bytes>65536u
       || async_reported_bytes!=async_validated_bytes+async_copied_bytes
-      || async_reported_cells>64u || async_protocol_results>32u)abort();
+      || async_reported_cells>64u || async_protocol_results>32u) {
+    fprintf(stderr,"PG turn budget: validated=%zu copied=%zu reported=%zu cells=%zu protocol=%zu\n",
+        async_validated_bytes,async_copied_bytes,async_reported_bytes,async_reported_cells,async_protocol_results);
+    abort();
+  }
   if(async_reported_cells==64u)async_cell_yields++;
   if(async_reported_bytes==65536u)async_byte_yields++;
   async_turn_steps++;
