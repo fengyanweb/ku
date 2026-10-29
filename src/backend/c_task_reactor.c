@@ -196,7 +196,7 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
         /* Preserve the pinned stable job; never free a callback's storage to
          * satisfy a deadline. Report a bounded physical-retirement failure. */
         if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
-        pool->fault=KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;pool->closing=1;
+        pool->fault=KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;ku_task_blocking_set_closing_locked(pool,1u);
         (void)ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT);
         ku_task_blocking_signal(pool);ku_task_blocking_unlock(pool);
         return KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;

@@ -7775,8 +7775,16 @@ static int fixture_normal(void) {
   uint64_t deadline=fixture_deadline();
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,deadline);
   CHECK(runtime && runtime->capacity==1u && runtime->driver.external_loops);
-  CHECK(fixture_calloc_attempts==5u && ku_perf_live_allocations==5u);
+  CHECK(fixture_calloc_attempts==6u && ku_perf_live_allocations==6u);
   CHECK(runtime->driver.binding_keys && runtime->driver.binding_cells==2u*runtime->driver.capacity);
+  CHECK(runtime->free_handle_count==1u&&runtime->free_handles);
+  KuHttpTaskHandle* handle=ku_http_task_handle_acquire(runtime,0u);
+  CHECK(handle&&handle->used&&runtime->active_handles==1u&&!runtime->free_handle_count);
+  CHECK(!ku_http_task_handle_acquire(runtime,0u)&&!runtime->driver.fault);
+  ku_http_task_handle_release(runtime,handle);
+  CHECK(!runtime->active_handles&&runtime->free_handle_count==1u);
+  CHECK(ku_http_task_handle_acquire(runtime,0u)==handle);
+  ku_http_task_handle_release(runtime,handle);
   CHECK(!runtime->driver.resident && !runtime->active_handles && runtime->fixed_reserved
       && runtime->driver.reserved_bytes==runtime->extra_fixed);
   CHECK(ku_http_task_runtime_close(runtime,deadline)==KU_TASK_DRIVER_OK);
@@ -7794,10 +7802,10 @@ int main(void) {
   CHECK(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes);
   /* Every runtime/table calloc can fail before native acquisition. A following
    * normal creation/free proves this failure did not leave retained backing. */
-  for(size_t allocation=1u;allocation<=5u;allocation++) {
+  for(size_t allocation=1u;allocation<=6u;allocation++) {
     fixture_reset(allocation,0);
     CHECK(!ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,fixture_deadline()));
-    CHECK(fixture_calloc_attempts==((allocation>=2u && allocation<=4u) ? 4u : allocation));
+    CHECK(fixture_calloc_attempts==((allocation>=2u && allocation<=5u) ? 5u : allocation));
     CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
     CHECK(!fixture_mutex_inits && !fixture_cond_attempts && !fixture_attr_inits);
     CHECK(!fixture_normal());
@@ -7806,7 +7814,7 @@ int main(void) {
   for(size_t round=0;round<3u;round++) {
     size_t failed_condition=1u+round%2u;fixture_reset(0,failed_condition);
     CHECK(!ku_http_task_runtime_new(1u,1u,8u*1024u*1024u,NULL,fixture_wake,fixture_deadline()));
-    CHECK(fixture_calloc_attempts==5u && fixture_cond_attempts==failed_condition);
+    CHECK(fixture_calloc_attempts==6u && fixture_cond_attempts==failed_condition);
     CHECK(fixture_mutex_inits==1u && fixture_cond_inits==failed_condition-1u);
     int reclaimed=!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow
       && fixture_mutex_drops==fixture_mutex_inits && fixture_cond_drops==fixture_cond_inits
@@ -8102,7 +8110,7 @@ int main(void) {
         && !pool->workers_exited && !pool->workers_joined && !pool->resident && !pool->queued && !pool->running);
     EXPECT(runtime->driver.initialized==KU_TASK_DRIVER_STORAGE_LIVE && runtime->fixed_reserved
         && !runtime->driver.blocking_pool && runtime->driver.shutdown_deadline==UINT64_MAX);
-    EXPECT(ku_perf_live_allocations==7u && ku_perf_live_bytes==runtime->driver.fixed_bytes+runtime->extra_fixed
+    EXPECT(ku_perf_live_allocations==8u && ku_perf_live_bytes==runtime->driver.fixed_bytes+runtime->extra_fixed
         +ku_task_blocking_fixed_bytes(runtime->driver.capacity));
   }
   EXPECT(ku_test_event_set(&fixture_release));

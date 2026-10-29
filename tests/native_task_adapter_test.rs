@@ -1710,6 +1710,7 @@ async fn main(): null! { return ok(null) }
 }
 
 const BLOCKING_FIXTURE_HOOKS: &str = r#"
+#define KU_TASK_BLOCKING_DIAGNOSTIC_CHECKS 1
 static KuTestEvent fixture_io_entered,fixture_io_release;
 static int fixture_gate_io;
 static size_t fixture_io_calls,fixture_fail_blocking_in=SIZE_MAX;
@@ -2377,12 +2378,35 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
   for(size_t cap=1;cap<=16384u;cap=cap==1u?16384u:16385u) {
     memset(&pool,0,sizeof(pool));
     CHECK(ku_task_blocking_init(&pool,cap,1u,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
-    size_t bytes=cap*(sizeof(KuTaskBlockingJobV1)+sizeof(size_t));
+    size_t bytes=cap*(sizeof(KuTaskBlockingJobV1)+sizeof(size_t)+sizeof(uint32_t));
     CHECK(pool.storage_bytes==bytes && pool.capacity==cap);
     CHECK((void*)pool.jobs==pool.storage && pool.ring==(size_t*)((uint8_t*)pool.storage+cap*sizeof(*pool.jobs)));
+    CHECK(pool.free_indices==(uint32_t*)(pool.ring+cap)&&pool.free_count==cap&&!pool.retired_slots);
     CHECK(pool.workers_created==1u && fixture_ledger().allocations==1u && fixture_ledger().bytes==bytes);
+    CHECK(!ku_task_blocking_lock(&pool));
+    CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    for(size_t i=0;i<cap;i++) {
+      size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK&&index==i);
+    }
+    size_t unavailable=SIZE_MAX;
+    CHECK(ku_task_blocking_claim_locked(&pool,&unavailable)==KU_TASK_DRIVER_LIMIT&&unavailable==SIZE_MAX);
+    CHECK(!pool.free_count&&pool.resident==cap&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    /* BUILDING rejection has no worker/callback pin; return exactly once. */
+    for(size_t i=0;i<cap;i++)CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[i],i)==KU_TASK_DRIVER_OK);
+    CHECK(pool.free_count==cap&&!pool.resident&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[0],0u)==KU_TASK_DRIVER_INTERNAL);
+    CHECK(pool.fault==KU_TASK_DRIVER_INTERNAL&&pool.free_count==cap&&!pool.resident);
+    pool.fault=0; /* Only the isolated invalid-call fixture resets its fault. */
+    CHECK(ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    size_t exhausted=pool.free_indices[pool.free_count-1u];pool.jobs[exhausted].generation=UINT64_MAX-1u;
+    size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK&&index==exhausted);
+    CHECK(pool.jobs[index].generation==UINT64_MAX);
+    CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[index],index)==KU_TASK_DRIVER_OK);
+    CHECK(pool.retired_slots==1u&&pool.free_count==cap-1u&&ku_task_blocking_oracle_locked(&pool)==KU_TASK_DRIVER_OK);
+    if(cap==1u)CHECK(ku_task_blocking_claim_locked(&pool,&unavailable)==KU_TASK_DRIVER_LIMIT);
+    ku_task_blocking_unlock(&pool);
     CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
-    CHECK(!pool.initialized && !pool.storage && !pool.jobs && !pool.ring);
+    CHECK(!pool.initialized && !pool.storage && !pool.jobs && !pool.ring&&!pool.free_indices);
     CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   }
 }
@@ -4056,6 +4080,7 @@ async fn main(): null! { return ok(null) }
 }
 
 const NET_OWNER_HOOKS: &str = r#"
+#define KU_TASK_BLOCKING_DIAGNOSTIC_CHECKS 1
 static KuTestEvent fixture_net_entered,fixture_net_release,fixture_net_drained;
 static size_t fixture_net_closes,fixture_net_calls,fixture_net_output_bytes;
 static uint64_t fixture_net_observed_deadline;
@@ -4270,6 +4295,9 @@ static void net_case(int write,int cancel,int limited) {
   ku_task_outcome_drop(&outcome);CHECK(ku_task_value_drop(&task,net_deadline())==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_wait_idle(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
   CHECK(!net_snapshot().resident && !net_snapshot().reserved_bytes);
+  CHECK(!ku_task_blocking_lock(&net_pool));
+  CHECK(ku_task_blocking_oracle_locked(&net_pool)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&net_pool);
   CHECK(ku_task_driver_shutdown(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);
   CHECK(ku_task_blocking_finish(&net_pool,net_deadline())==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_join(&net_driver,net_deadline())==KU_TASK_DRIVER_OK);

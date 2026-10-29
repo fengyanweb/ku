@@ -68,6 +68,9 @@ enum { KU_TASK_BLOCKING_FREE=0u, KU_TASK_BLOCKING_BUILDING=1u,
        KU_TASK_BLOCKING_QUEUED=2u, KU_TASK_BLOCKING_RUNNING=3u,
        KU_TASK_BLOCKING_DONE=4u, KU_TASK_BLOCKING_NET_WAIT=5u,
        KU_TASK_BLOCKING_NET_STEP=6u };
+#if KU_TASK_BLOCKING_PG
+enum { KU_TASK_BLOCKING_PG_CANCELLED=1u,KU_TASK_BLOCKING_PG_STEPPING=2u };
+#endif
 typedef struct KuTaskBlockingPoolV1 KuTaskBlockingPoolV1;
 #if KU_TASK_BLOCKING_NETWORK
 /* submit_net validates all nine source fields before reserving a job. The
@@ -82,6 +85,9 @@ typedef struct KuTaskBlockingNetConfigV1 {
 typedef struct KuTaskBlockingJobV1 {
   uint64_t generation;
   uint32_t state, cancelled, kind;
+#if KU_TASK_BLOCKING_PG
+  KuAtomicRefcount pg_cancelled_view;
+#endif
   size_t output_charge;
   KuTaskDriverTicketV1 ticket;
 #if KU_TASK_BLOCKING_FILES
@@ -163,6 +169,11 @@ typedef struct KuTaskBlockingSnapshotV1 {
 } KuTaskBlockingSnapshotV1;
 struct KuTaskBlockingPoolV1 {
   uint32_t initialized, resources, closing, fault;
+  size_t free_count,retired_slots;
+  size_t output_charge_total,cancelled_running,net_wait_count,net_step_count;
+#if KU_TASK_BLOCKING_PG
+  KuAtomicRefcount pg_closing_view;
+#endif
   size_t capacity, worker_target, workers_created, workers_exited, workers_joined;
   size_t head, queued, running, resident, peak_resident, peak_queued, peak_running;
   uint64_t accepted, rejected, rejected_queue, finished;
@@ -176,6 +187,7 @@ struct KuTaskBlockingPoolV1 {
   void* storage; size_t storage_bytes;
   KuTaskBlockingJobV1* jobs;
   size_t* ring;
+  uint32_t* free_indices;
 #if KU_TASK_BLOCKING_NETWORK
   size_t net_waiting[KU_TASK_DRIVER_MAX_WORKERS];
   uint32_t net_head_plus_one[KU_TASK_DRIVER_MAX_WORKERS];
@@ -183,8 +195,91 @@ struct KuTaskBlockingPoolV1 {
   KuTaskBlockingWorkerV1 workers[64u];
 };
 static size_t ku_task_blocking_fixed_bytes(size_t capacity) {
-  if(capacity>(SIZE_MAX-sizeof(KuTaskBlockingPoolV1))/(sizeof(KuTaskBlockingJobV1)+sizeof(size_t)))return SIZE_MAX;
-  return sizeof(KuTaskBlockingPoolV1)+capacity*(sizeof(KuTaskBlockingJobV1)+sizeof(size_t));
+  const size_t stride=sizeof(KuTaskBlockingJobV1)+sizeof(size_t)+sizeof(uint32_t);
+  if(capacity>(SIZE_MAX-sizeof(KuTaskBlockingPoolV1))/stride)return SIZE_MAX;
+  return sizeof(KuTaskBlockingPoolV1)+capacity*stride;
+}
+/* All ordinary writers hold the pool mutex. PG's pinned NET_STEP observer
+ * reads only these acquire/release mirrors, never the mutex-owned flags. */
+static void ku_task_blocking_set_closing_locked(KuTaskBlockingPoolV1* pool,uint32_t value) {
+  pool->closing=value;
+#if KU_TASK_BLOCKING_PG
+  ku_task_control_atomic_store(&pool->pg_closing_view,value!=0u);
+#endif
+}
+static uint32_t ku_task_blocking_cancel_job_locked(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job) {
+  if(!job->cancelled && job->state==KU_TASK_BLOCKING_RUNNING) {
+    if(pool->cancelled_running>=pool->capacity)goto invalid;
+    pool->cancelled_running++;
+  }
+  job->cancelled=1u;
+#if KU_TASK_BLOCKING_PG
+  ku_task_control_atomic_store(&job->pg_cancelled_view,KU_TASK_BLOCKING_PG_CANCELLED
+      | (job->state==KU_TASK_BLOCKING_NET_STEP ? KU_TASK_BLOCKING_PG_STEPPING:0u));
+#endif
+  return KU_TASK_DRIVER_OK;
+invalid:
+  pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
+}
+static uint32_t ku_task_blocking_state_locked(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job,uint32_t next) {
+  uint32_t before=job->state;
+  if(before>KU_TASK_BLOCKING_NET_STEP || next>KU_TASK_BLOCKING_NET_STEP)goto invalid;
+  size_t* old_count=before==KU_TASK_BLOCKING_NET_WAIT ? &pool->net_wait_count
+      : before==KU_TASK_BLOCKING_NET_STEP ? &pool->net_step_count:NULL;
+  size_t* new_count=next==KU_TASK_BLOCKING_NET_WAIT ? &pool->net_wait_count
+      : next==KU_TASK_BLOCKING_NET_STEP ? &pool->net_step_count:NULL;
+  int old_cancel=job->cancelled && before==KU_TASK_BLOCKING_RUNNING;
+  int new_cancel=job->cancelled && next==KU_TASK_BLOCKING_RUNNING;
+  if((old_count!=new_count && old_count && !*old_count)
+      || (old_count!=new_count && new_count && *new_count>=pool->capacity)
+      || (old_cancel && !new_cancel && !pool->cancelled_running)
+      || (!old_cancel && new_cancel && pool->cancelled_running>=pool->capacity))goto invalid;
+  if(old_count!=new_count) {if(old_count)(*old_count)--;if(new_count)(*new_count)++;}
+  if(old_cancel!=new_cancel) {if(new_cancel)pool->cancelled_running++;else pool->cancelled_running--;}
+  job->state=next;
+#if KU_TASK_BLOCKING_PG
+  ku_task_control_atomic_store(&job->pg_cancelled_view,
+      (job->cancelled ? KU_TASK_BLOCKING_PG_CANCELLED:0u)
+      | (next==KU_TASK_BLOCKING_NET_STEP ? KU_TASK_BLOCKING_PG_STEPPING:0u));
+#endif
+  return KU_TASK_DRIVER_OK;
+invalid:
+  pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
+}
+/* One pop per ordinary claim. Exhausted generations are never returned, so
+ * even the all-retired case does not rescan cold job storage. */
+static uint32_t ku_task_blocking_claim_locked(KuTaskBlockingPoolV1* pool,size_t* index) {
+  if(!pool->free_count)return KU_TASK_DRIVER_LIMIT;
+  if(pool->free_count>pool->capacity || pool->resident>=pool->capacity)goto invalid;
+  size_t slot=pool->free_indices[pool->free_count-1u];
+  if(slot>=pool->capacity)goto invalid;
+  KuTaskBlockingJobV1* job=&pool->jobs[slot];
+  if(job->state!=KU_TASK_BLOCKING_FREE || job->generation==UINT64_MAX)goto invalid;
+  pool->free_count--;job->generation++;
+#if KU_TASK_BLOCKING_PG
+  ku_task_control_atomic_init(&job->pg_cancelled_view,0u);
+#endif
+  if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_BUILDING)!=KU_TASK_DRIVER_OK)goto invalid;
+  pool->resident++;if(pool->resident>pool->peak_resident)pool->peak_resident=pool->resident;
+  *index=slot;return KU_TASK_DRIVER_OK;
+invalid:
+  pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
+}
+/* Only after result ownership and all physical worker/callback pins retire.
+ * The matching driver receipt has been handed off/refunded by the caller. */
+static uint32_t ku_task_blocking_return_locked(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job,size_t index) {
+  if(index>=pool->capacity || job!=&pool->jobs[index] || !pool->resident
+      || job->state==KU_TASK_BLOCKING_FREE || job->output_charge>pool->output_charge_total
+      || pool->free_count>=pool->capacity || pool->retired_slots>=pool->capacity)goto invalid;
+  uint64_t generation=job->generation;
+  if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_FREE)!=KU_TASK_DRIVER_OK)goto invalid;
+  pool->output_charge_total-=job->output_charge;
+  memset(job,0,sizeof(*job));job->generation=generation;pool->resident--;
+  if(generation==UINT64_MAX)pool->retired_slots++;
+  else pool->free_indices[pool->free_count++]=(uint32_t)index;
+  return KU_TASK_DRIVER_OK;
+invalid:
+  pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
 }
 static int ku_task_blocking_lock(KuTaskBlockingPoolV1* pool) {
 #if defined(_WIN32)
@@ -251,7 +346,7 @@ static uint32_t ku_task_blocking_net_state_locked(KuTaskBlockingPoolV1* pool,
       pool->net_head_plus_one[owner]=member;pool->net_waiting[owner]=count+1u;
     }
   }
-  job->state=next;return KU_TASK_DRIVER_OK;
+  return ku_task_blocking_state_locked(pool,job,next);
 invalid:
   pool->fault=KU_TASK_DRIVER_INTERNAL;return KU_TASK_DRIVER_INTERNAL;
 }
@@ -328,16 +423,17 @@ static uint32_t ku_task_blocking_output_reserve(KuTaskBlockingOutputV1* output,s
   KuTaskBlockingJobV1* job=output->job;
   uint32_t status=job->cancelled || output->pool->closing ? KU_TASK_DRIVER_CLOSED
       : bytes>SIZE_MAX-job->output_charge ? KU_TASK_DRIVER_LIMIT
+      : bytes>SIZE_MAX-output->pool->output_charge_total ? KU_TASK_DRIVER_LIMIT
       : ku_task_driver_blocking_grow_charge(&job->ticket,bytes);
-  if (status==KU_TASK_DRIVER_OK) job->output_charge+=bytes;
+  if (status==KU_TASK_DRIVER_OK) {job->output_charge+=bytes;output->pool->output_charge_total+=bytes;}
   ku_task_blocking_unlock(output->pool); return status;
 }
 static void ku_task_blocking_output_refund(KuTaskBlockingOutputV1* output,size_t bytes) {
   if (ku_task_blocking_lock(output->pool)) { output->status=KU_TASK_DRIVER_INTERNAL; return; }
-  if (bytes>output->job->output_charge) output->status=KU_TASK_DRIVER_INTERNAL;
+  if (bytes>output->job->output_charge || bytes>output->pool->output_charge_total) output->status=KU_TASK_DRIVER_INTERNAL;
   else {
     uint32_t status=ku_task_driver_blocking_refund_charge(&output->job->ticket,bytes);
-    if (status==KU_TASK_DRIVER_OK) output->job->output_charge-=bytes;
+    if (status==KU_TASK_DRIVER_OK) {output->job->output_charge-=bytes;output->pool->output_charge_total-=bytes;}
     else output->status=status;
   }
   ku_task_blocking_unlock(output->pool);
@@ -485,7 +581,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
   for (;;) {
     while (!pool->queued && !pool->closing) {
       if (ku_task_blocking_wait(pool,UINT64_MAX)<0) {
-        pool->fault=KU_TASK_DRIVER_INTERNAL; pool->closing=1; break;
+        pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_set_closing_locked(pool,1u); break;
       }
     }
     if (!pool->queued && pool->closing) break;
@@ -493,9 +589,12 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     pool->head=(pool->head+1u)%pool->capacity; pool->queued--;
     KuTaskBlockingJobV1* job=&pool->jobs[index];
     if (job->state!=KU_TASK_BLOCKING_QUEUED) {
-      pool->fault=KU_TASK_DRIVER_INTERNAL; pool->closing=1; break;
+      pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_set_closing_locked(pool,1u); break;
     }
-    job->state=KU_TASK_BLOCKING_RUNNING; pool->running++;
+    if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_RUNNING)!=KU_TASK_DRIVER_OK) {
+      ku_task_blocking_set_closing_locked(pool,1u);break;
+    }
+    pool->running++;
     if (pool->running>pool->peak_running) pool->peak_running=pool->running;
     void* path=job->path;
     KuString content=job->content;
@@ -579,9 +678,9 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
         job->kind==9u ||
 #endif
         job->net_resolved ? KU_TASK_BLOCKING_NET_WAIT : KU_TASK_BLOCKING_DONE)!=KU_TASK_DRIVER_OK)
-      job->state=KU_TASK_BLOCKING_DONE;
+      (void)ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_DONE);
 #else
-    job->state=KU_TASK_BLOCKING_DONE;
+    (void)ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_DONE);
 #endif
     pool->running--;
     if (job->state==KU_TASK_BLOCKING_DONE && pool->finished!=UINT64_MAX) pool->finished++;
@@ -634,7 +733,11 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   uint32_t prepared=ku_task_blocking_prepare_base();
   if (prepared!=KU_TASK_DRIVER_OK) return prepared;
   pool->initialized=KU_TASK_DRIVER_STORAGE_REAPING;
-  pool->capacity=capacity; pool->worker_target=workers; pool->closing=1;
+  pool->capacity=capacity; pool->worker_target=workers;
+#if KU_TASK_BLOCKING_PG
+  ku_task_control_atomic_init(&pool->pg_closing_view,1u);
+#endif
+  ku_task_blocking_set_closing_locked(pool,1u);
   size_t fixed=ku_task_blocking_fixed_bytes(capacity);
   if(fixed==SIZE_MAX)return KU_TASK_DRIVER_LIMIT;
   pool->storage_bytes=fixed-sizeof(*pool);
@@ -642,6 +745,8 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   if(!pool->storage)return KU_TASK_BLOCKING_OUT_OF_MEMORY;
   pool->jobs=(KuTaskBlockingJobV1*)pool->storage;
   pool->ring=(size_t*)((uint8_t*)pool->storage+capacity*sizeof(*pool->jobs));
+  pool->free_indices=(uint32_t*)(pool->ring+capacity);pool->free_count=capacity;
+  for(size_t i=0;i<capacity;i++)pool->free_indices[i]=(uint32_t)(capacity-1u-i);
 #if defined(_WIN32)
   InitializeSRWLock(&pool->mutex); pool->resources|=KU_TASK_DRIVER_SYNC_MUTEX;
   InitializeConditionVariable(&pool->condition); pool->resources|=KU_TASK_DRIVER_SYNC_STATE;
@@ -662,7 +767,7 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
 #endif
 #endif
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
-  pool->initialized=KU_TASK_DRIVER_STORAGE_LIVE; pool->closing=0;
+  pool->initialized=KU_TASK_DRIVER_STORAGE_LIVE; ku_task_blocking_set_closing_locked(pool,0u);
   uint32_t status=KU_TASK_DRIVER_OK;
   for (size_t i=0;i<workers;i++) {
     uint64_t now=ku_task_driver_now_ms();
@@ -701,7 +806,7 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
     if (now==UINT64_MAX || now>=deadline)
       status=now==UINT64_MAX ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;
   }
-  if (status!=KU_TASK_DRIVER_OK) { pool->closing=1; pool->fault=status; ku_task_blocking_signal(pool); }
+  if (status!=KU_TASK_DRIVER_OK) { ku_task_blocking_set_closing_locked(pool,1u); pool->fault=status; ku_task_blocking_signal(pool); }
   ku_task_blocking_unlock(pool); return status;
 }
 static uint32_t ku_task_blocking_close(void* raw) {
@@ -711,7 +816,7 @@ static uint32_t ku_task_blocking_close(void* raw) {
     return KU_TASK_DRIVER_OK;
   if (pool->initialized!=KU_TASK_DRIVER_STORAGE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
-  pool->closing=1; ku_task_blocking_signal(pool);
+  ku_task_blocking_set_closing_locked(pool,1u); ku_task_blocking_signal(pool);
   ku_task_blocking_unlock(pool); return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_task_blocking_ready(void* raw) {
@@ -784,15 +889,52 @@ static uint32_t ku_task_blocking_finish(KuTaskBlockingPoolV1* pool, uint64_t dea
 #else
   pool->resources=0;
 #endif
-  free(pool->storage);pool->storage=NULL;pool->storage_bytes=0;pool->jobs=NULL;pool->ring=NULL;
+  free(pool->storage);pool->storage=NULL;pool->storage_bytes=0;pool->jobs=NULL;pool->ring=NULL;pool->free_indices=NULL;pool->free_count=0;
   pool->initialized=KU_TASK_DRIVER_STORAGE_ZERO;
   return failure ? failure : KU_TASK_DRIVER_OK;
 }
+#if defined(KU_TASK_BLOCKING_DIAGNOSTIC_CHECKS)
+/* Diagnostic-only old full scan: never present in normal service scoring. */
+static uint32_t ku_task_blocking_oracle_locked(KuTaskBlockingPoolV1* pool) {
+  if(!pool || pool->capacity>KU_TASK_DRIVER_MAX_SLOTS || pool->free_count>pool->capacity)goto invalid;
+  uint8_t seen[KU_TASK_DRIVER_MAX_SLOTS]={0};
+  for(size_t i=0;i<pool->free_count;i++) {
+    size_t index=pool->free_indices[i];
+    if(index>=pool->capacity || seen[index] || pool->jobs[index].state!=KU_TASK_BLOCKING_FREE
+        || pool->jobs[index].generation==UINT64_MAX)goto invalid;
+    seen[index]=1u;
+  }
+  size_t resident=0,retired=0,output=0,cancelled=0,wait=0,step=0;
+  for(size_t i=0;i<pool->capacity;i++) {
+    KuTaskBlockingJobV1* job=&pool->jobs[i];
+    if(job->state==KU_TASK_BLOCKING_FREE) {
+      if(job->generation==UINT64_MAX) {if(seen[i])goto invalid;retired++;}
+      else if(!seen[i])goto invalid;
+      continue;
+    }
+    if(seen[i] || job->state>KU_TASK_BLOCKING_NET_STEP || !job->generation
+        || job->output_charge>SIZE_MAX-output)goto invalid;
+    resident++;output+=job->output_charge;
+    cancelled+=job->cancelled && job->state==KU_TASK_BLOCKING_RUNNING;
+    wait+=job->state==KU_TASK_BLOCKING_NET_WAIT;step+=job->state==KU_TASK_BLOCKING_NET_STEP;
+  }
+  if(resident!=pool->resident || retired!=pool->retired_slots
+      || resident+retired+pool->free_count!=pool->capacity || output!=pool->output_charge_total
+      || cancelled!=pool->cancelled_running || wait!=pool->net_wait_count || step!=pool->net_step_count)goto invalid;
+  return KU_TASK_DRIVER_OK;
+invalid:
+  if(pool)pool->fault=KU_TASK_DRIVER_INTERNAL;
+  return KU_TASK_DRIVER_INTERNAL;
+}
+#endif
 static uint32_t ku_task_blocking_snapshot(KuTaskBlockingPoolV1* pool,
     KuTaskBlockingSnapshotV1* output) {
   if (!pool || !output || pool->initialized!=KU_TASK_DRIVER_STORAGE_LIVE
       || ku_task_frame_ranges_overlap(pool,sizeof(*pool),output,sizeof(*output))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
+#if defined(KU_TASK_BLOCKING_DIAGNOSTIC_CHECKS)
+  if(ku_task_blocking_oracle_locked(pool)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
+#endif
   *output=(KuTaskBlockingSnapshotV1){pool->resident,pool->queued,pool->running,
       pool->peak_resident,pool->peak_queued,pool->peak_running,pool->accepted,
       pool->rejected,pool->rejected_queue,pool->finished,pool->workers_created,
@@ -856,7 +998,7 @@ static uint32_t ku_task_blocking_reconcile_charge(const KuTaskDriverTicketV1* ti
  * free owned snapshots now, even when every worker is blocked elsewhere.
  * Its driver obligation remains until the sole executor consumes DONE. */
 static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTaskBlockingJobV1* job,size_t index) {
-  job->cancelled=1;
+  if(ku_task_blocking_cancel_job_locked(pool,job)!=KU_TASK_DRIVER_OK)return KU_TASK_DRIVER_INTERNAL;
 #if KU_TASK_BLOCKING_PG
   if(job->kind==9u) {
     job->pg_ready=1;
@@ -900,7 +1042,7 @@ static uint32_t ku_task_blocking_cancel_queued(KuTaskBlockingPoolV1* pool,KuTask
 #endif
   if(job->kind==1u)job->read_result=(KuResult_str){false,{0},error};
   else job->result=(KuResult_null){false,0,error};
-  job->state=KU_TASK_BLOCKING_DONE;
+  if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_DONE)!=KU_TASK_DRIVER_OK)return KU_TASK_DRIVER_INTERNAL;
   if(pool->finished!=UINT64_MAX)pool->finished++;
   uint32_t status=ku_task_driver_wake(&job->ticket);
   if(status!=KU_TASK_DRIVER_OK)pool->fault=KU_TASK_DRIVER_INTERNAL;
@@ -981,9 +1123,9 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
       else if (kind==1u) *(KuResult_str*)output=job->read_result;
       else if (kind==3u) *(KuResult_bool*)output=(KuResult_bool){job->result.ok,job->exists_value,job->result.error};
       else *(KuResult_null*)output=job->result;
-      uint64_t generation=job->generation;
-      memset(job,0,sizeof(*job)); job->generation=generation;
-      pool->resident--;
+      if(ku_task_blocking_return_locked(pool,job,token->slot)!=KU_TASK_DRIVER_OK) {
+        ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
+      }
       *token=(KuTaskBlockingTokenV1){0};
       ku_task_blocking_signal(pool);
     } else if (job->state==KU_TASK_BLOCKING_BUILDING) status=KU_TASK_DRIVER_INVALID_STATE;
@@ -1035,11 +1177,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
   uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
   size_t index=0;
-  if (status==KU_TASK_DRIVER_OK) {
-    for (;index<pool->capacity;index++) if (pool->jobs[index].state==KU_TASK_BLOCKING_FREE
-        && pool->jobs[index].generation!=UINT64_MAX) break;
-    if (index==pool->capacity) status=KU_TASK_DRIVER_LIMIT;
-  }
+  if (status==KU_TASK_DRIVER_OK) status=ku_task_blocking_claim_locked(pool,&index);
   if (status!=KU_TASK_DRIVER_OK) {
     if (pool->rejected!=UINT64_MAX) pool->rejected++;
     if (status==KU_TASK_DRIVER_LIMIT && pool->rejected_queue!=UINT64_MAX) pool->rejected_queue++;
@@ -1049,9 +1187,8 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     return KU_TASK_DRIVER_OK;
   }
   KuTaskBlockingJobV1* job=&pool->jobs[index];
-  job->generation++; job->state=KU_TASK_BLOCKING_BUILDING; job->ticket=*ticket; job->kind=kind;
+  job->ticket=*ticket; job->kind=kind;
   *token=(KuTaskBlockingTokenV1){pool,index,0,job->generation};
-  pool->resident++; if (pool->resident>pool->peak_resident) pool->peak_resident=pool->resident;
   ku_task_blocking_unlock(pool);
   status=ku_task_driver_blocking_register(ticket);
   int registered=status==KU_TASK_DRIVER_OK;
@@ -1080,7 +1217,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
   }
   job=&pool->jobs[index];
   job->path=native; job->content=(KuString){copy,content.len,content.len,KU_STRING_OWNED};
-  job->state=KU_TASK_BLOCKING_QUEUED;
+  if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_QUEUED)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
   pool->ring[(pool->head+pool->queued)%pool->capacity]=index; pool->queued++;
   if (pool->queued>pool->peak_queued) pool->peak_queued=pool->queued;
   if (pool->accepted!=UINT64_MAX) pool->accepted++;
@@ -1094,9 +1231,8 @@ ku_blocking_rejected:
   if (builder.status!=KU_TASK_DRIVER_OK) status=builder.status;
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
   job=&pool->jobs[index];
-  uint64_t generation=job->generation;
-  memset(job,0,sizeof(*job)); job->generation=generation;
-  pool->resident--; if (pool->rejected!=UINT64_MAX) pool->rejected++;
+  if(ku_task_blocking_return_locked(pool,job,index)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
+  if (pool->rejected!=UINT64_MAX) pool->rejected++;
   ku_task_blocking_signal(pool); ku_task_blocking_unlock(pool);
   if (registered && ku_task_driver_blocking_retired(ticket)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;
   *token=(KuTaskBlockingTokenV1){0};
@@ -1201,11 +1337,7 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
   uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
   size_t index=0;
-  if (status==KU_TASK_DRIVER_OK) {
-    for (;index<pool->capacity;index++) if (pool->jobs[index].state==KU_TASK_BLOCKING_FREE
-        && pool->jobs[index].generation!=UINT64_MAX) break;
-    if (index==pool->capacity) status=KU_TASK_DRIVER_LIMIT;
-  }
+  if (status==KU_TASK_DRIVER_OK) status=ku_task_blocking_claim_locked(pool,&index);
   if (status!=KU_TASK_DRIVER_OK) {
     if (pool->rejected!=UINT64_MAX) pool->rejected++;
     if (status==KU_TASK_DRIVER_LIMIT && pool->rejected_queue!=UINT64_MAX) pool->rejected_queue++;
@@ -1215,10 +1347,9 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
     return KU_TASK_DRIVER_OK;
   }
   KuTaskBlockingJobV1* job=&pool->jobs[index];
-  job->generation++; job->state=KU_TASK_BLOCKING_BUILDING; job->ticket=*ticket;
+  job->ticket=*ticket;
   job->kind=kind; job->net_deadline=deadline; job->net_requested=requested;
   *token=(KuTaskBlockingTokenV1){pool,index,0,job->generation};
-  pool->resident++; if (pool->resident>pool->peak_resident) pool->peak_resident=pool->resident;
   ku_task_blocking_unlock(pool);
   status=ku_task_driver_blocking_register(ticket);
   int registered=status==KU_TASK_DRIVER_OK;
@@ -1295,9 +1426,9 @@ ku_net_blocking_rejected:
   ku_task_blocking_release(&builder,write_copy);
   if (builder.status!=KU_TASK_DRIVER_OK) status=builder.status;
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
-  job=&pool->jobs[index]; uint64_t generation=job->generation;
-  memset(job,0,sizeof(*job)); job->generation=generation;
-  pool->resident--; if (pool->rejected!=UINT64_MAX) pool->rejected++;
+  job=&pool->jobs[index];
+  if(ku_task_blocking_return_locked(pool,job,index)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
+  if (pool->rejected!=UINT64_MAX) pool->rejected++;
   ku_task_blocking_signal(pool); ku_task_blocking_unlock(pool);
   if (registered && ku_task_driver_blocking_retired(ticket)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;
   *token=(KuTaskBlockingTokenV1){0};

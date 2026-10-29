@@ -195,7 +195,8 @@ typedef struct KuHttpTaskRuntime {
   KuTaskDriverSlotV1* slots;
   size_t* ring;
   KuHttpTaskHandle* handles;
-  size_t capacity,active_handles,extra_fixed;
+  uint32_t* free_handles;
+  size_t capacity,active_handles,free_handle_count,extra_fixed;
   uint32_t fixed_reserved;
   @BLOCKING_FIELD@
 } KuHttpTaskRuntime;
@@ -212,18 +213,32 @@ static void ku_http_task_blocking_metrics(void* raw,uint64_t output[16]) {
 static KuHttpTaskHandle* ku_http_task_handle_acquire(KuHttpTaskRuntime* runtime,size_t owner) {
   if(ku_task_driver_lock(&runtime->driver)) return NULL;
   KuHttpTaskHandle* handle=NULL;
-  if(!runtime->driver.closing && !runtime->driver.fault)
-    for(size_t i=0;i<runtime->capacity;i++) if(!runtime->handles[i].used) {
-      handle=&runtime->handles[i]; handle->used=1; handle->owner=owner;
-      runtime->active_handles++; break;
+  if(!runtime->driver.closing && !runtime->driver.fault && runtime->free_handle_count) {
+    if(runtime->free_handle_count>runtime->capacity || runtime->active_handles>=runtime->capacity)
+      runtime->driver.fault=KU_TASK_DRIVER_INTERNAL;
+    else {
+      size_t index=runtime->free_handles[runtime->free_handle_count-1u];
+      if(index>=runtime->capacity || runtime->handles[index].used)runtime->driver.fault=KU_TASK_DRIVER_INTERNAL;
+      else {
+        runtime->free_handle_count--;handle=&runtime->handles[index];
+        handle->used=1;handle->owner=owner;runtime->active_handles++;
+      }
     }
+  }
   ku_task_driver_unlock(&runtime->driver); return handle;
 }
 static void ku_http_task_handle_release(KuHttpTaskRuntime* runtime,KuHttpTaskHandle* handle) {
   if(ku_task_driver_lock(&runtime->driver)) return;
   void* environment=NULL;
-  if(!handle->used || !runtime->active_handles) runtime->driver.fault=KU_TASK_DRIVER_INTERNAL;
-  else { runtime->active_handles--; environment=handle->environment; memset(handle,0,sizeof(*handle)); }
+  uintptr_t base=(uintptr_t)runtime->handles,address=(uintptr_t)handle;
+  size_t index=address>=base ? (size_t)((address-base)/sizeof(*handle)):runtime->capacity;
+  if(address<base || (address-base)%sizeof(*handle) || index>=runtime->capacity
+      || !handle->used || !runtime->active_handles || runtime->free_handle_count>=runtime->capacity)
+    runtime->driver.fault=KU_TASK_DRIVER_INTERNAL;
+  else {
+    runtime->active_handles--;environment=handle->environment;memset(handle,0,sizeof(*handle));
+    runtime->free_handles[runtime->free_handle_count++]=(uint32_t)index;
+  }
   ku_task_driver_unlock(&runtime->driver);
   /* A physical retirement receipt precedes every release of a live handle.
    * Frame cancellation may already have dropped its local capture token. */
@@ -248,7 +263,7 @@ static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_l
   size_t driver_fixed=ku_task_driver_fixed_storage_bytes(task_capacity);
   if(!driver_fixed)return NULL;
   size_t startup_fixed=driver_fixed+sizeof(KuHttpTaskRuntime)-sizeof(KuTaskDriverV1)
-      +capacity*sizeof(KuHttpTaskHandle)@BLOCKING_PREFLIGHT@;
+      +capacity*(sizeof(KuHttpTaskHandle)+sizeof(uint32_t))@BLOCKING_PREFLIGHT@;
   if(startup_fixed>byte_limit)return NULL;
   KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)calloc(1,sizeof(*runtime));
   if(!runtime) return NULL;
@@ -256,9 +271,13 @@ static void* ku_http_task_runtime_new(size_t loops,size_t capacity,size_t byte_l
   runtime->slots=(KuTaskDriverSlotV1*)calloc(task_capacity,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(task_capacity,sizeof(*runtime->ring));
   runtime->handles=(KuHttpTaskHandle*)calloc(capacity,sizeof(*runtime->handles));
-  if(!runtime->slots || !runtime->ring || !runtime->handles) goto ku_http_task_init_failed;
+  runtime->free_handles=(uint32_t*)calloc(capacity,sizeof(*runtime->free_handles));
+  if(!runtime->slots || !runtime->ring || !runtime->handles || !runtime->free_handles) goto ku_http_task_init_failed;
+  runtime->free_handle_count=capacity;
+  for(size_t i=0;i<capacity;i++)runtime->free_handles[i]=(uint32_t)(capacity-1u-i);
   /* attach_blocking accounts its own fixed storage exactly once. */
-  runtime->extra_fixed=sizeof(*runtime)-sizeof(runtime->driver)+capacity*sizeof(*runtime->handles);
+  runtime->extra_fixed=sizeof(*runtime)-sizeof(runtime->driver)
+      +capacity*(sizeof(*runtime->handles)+sizeof(*runtime->free_handles));
   uint32_t status=ku_task_driver_init_external(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
       runtime->slots,task_capacity,runtime->ring,task_capacity,
       byte_limit,loops,startup_deadline,event_context,event_wake);
@@ -295,7 +314,7 @@ ku_http_task_init_failed:
       ku_http_task_init_cleanup_failed("driver resources remain");
   } else if(runtime->driver.initialized!=KU_TASK_DRIVER_STORAGE_ZERO)
     ku_http_task_init_cleanup_failed("unexpected driver state");
-  free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return NULL;
+  free(runtime->free_handles);free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return NULL;
 }
 /* Token-authenticated management reads this bounded snapshot without the
  * HTTP group mutex; driver callbacks take the group mutex in the other order. */
@@ -480,7 +499,7 @@ static uint32_t ku_http_task_runtime_free(void* raw,uint64_t deadline) {
   status=ku_task_driver_destroy(&runtime->driver);
   if(status!=KU_TASK_DRIVER_OK) return status;
   @BLOCKING_DISPOSE@
-  free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return KU_TASK_DRIVER_OK;
+  free(runtime->free_handles);free(runtime->handles); free(runtime->ring); free(runtime->slots); free(runtime); return KU_TASK_DRIVER_OK;
 }
 "#;
 
@@ -513,16 +532,11 @@ const BLOCKING_METRICS: &str = r#"
   output[3]=pool->peak_resident;output[4]=pool->peak_queued;output[5]=pool->peak_running;
   output[6]=pool->accepted;output[7]=pool->rejected;output[8]=pool->finished;
   output[10]=pool->workers_created;output[11]=pool->workers_exited;
-  for(size_t i=0;i<pool->capacity;i++) {
-    KuTaskBlockingJobV1* job=&pool->jobs[i];
-    if(job->state==KU_TASK_BLOCKING_FREE)continue;
-    output[9]+=job->output_charge;
-    if(job->cancelled && job->state==KU_TASK_BLOCKING_RUNNING)output[12]++;
-#if KU_TASK_BLOCKING_NETWORK
-    if(job->state==KU_TASK_BLOCKING_NET_WAIT)output[13]++;
-    if(job->state==KU_TASK_BLOCKING_NET_STEP)output[14]++;
+  output[9]=pool->output_charge_total;output[12]=pool->cancelled_running;
+  output[13]=pool->net_wait_count;output[14]=pool->net_step_count;
+#if defined(KU_TASK_BLOCKING_DIAGNOSTIC_CHECKS)
+  if(ku_task_blocking_oracle_locked(pool)!=KU_TASK_DRIVER_OK)pool->fault=KU_TASK_DRIVER_INTERNAL;
 #endif
-  }
   ku_task_blocking_unlock(pool);
 "#;
 const BLOCKING_FREE: &str = r#"
