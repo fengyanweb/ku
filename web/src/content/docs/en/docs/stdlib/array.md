@@ -2,7 +2,7 @@
 title: Arrays
 description: Typed arrays, lookup, mapping, and non-mutating collection operations.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 2

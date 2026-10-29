@@ -2,7 +2,7 @@
 title: 文件与目录
 description: 使用 std.fs 读写 UTF-8 文件、判断路径状态和读取目录。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['src/stdlib/fs.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 5

@@ -1,7 +1,7 @@
 ---
 title: Errors and troubleshooting
 description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources:
   [
@@ -103,7 +103,7 @@ import json from "std.json"
 
 fn main() {
     try {
-        json.parse("[1,]")?
+        json.decode("[1,]")?
     } catch (error) {
         println(error.domain)
         println(error.code)
@@ -112,7 +112,7 @@ fn main() {
 }
 ```
 
-This teaching program intentionally triggers a recoverable parse failure. A reported `byte N` is a zero based UTF-8 byte offset. It is not a character count around Chinese text or emoji.
+This program intentionally triggers and catches a recoverable parse error, then exits normally. The example uses `ku run`; the same input returns `json/parse_error` across backends that support JSON, but `message` may differ. The interpreter includes a `json parse failed: ` prefix that native C may omit. Handle errors by `domain/code` rather than matching the complete message. A reported `byte N` is a zero based UTF-8 byte offset. It is not a character count around Chinese text or emoji.
 
 ## A native build is rejected
 

@@ -1,18 +1,19 @@
 ---
 title: 'کتابخانهٔ استاندارد'
 description: 'ماژول‌های کتابخانهٔ استاندارد Ku، امضاهای اصلی و محدودیت‌های مسیرهای اجرا.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. این نقاط ورود اصلی با کد منبع تطبیق داده شده‌اند؛ این صفحه مرجع جامع API نیست. [قرارداد نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) رفتار را تعریف می‌کند. محدودیت‌های مسیرهای اجرا را در [جدول پشتیبانی](/fa/docs/support/) ببینید.
+[مرجع نحو](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) کتابخانهٔ استاندارد را توضیح می‌دهد. محدودیت‌های مسیرهای اجرا را در [جدول پشتیبانی](/fa/docs/support/) ببینید.
 
 ## واردسازی ماژول‌ها
 
@@ -74,24 +75,3 @@ fn main(): null! {
 ابتدا یک `message.txt` با کدگذاری UTF-8 کنار کد منبع بسازید. فایل ناموجود یا خواندن ناموفق، خطا می‌دهد. این نمونه به آن فایل ورودی وابسته است. `try_read` و `try_write` همچنان نام‌های مستعار سازگار با نوع نتیجهٔ یکسان هستند.
 
 `read_dir` مسیرهای مرتب‌شده با مالکیت مستقل می‌دهد؛ سقف آن 10,000 ورودی و 1,000,000 بایت برای مجموع مسیرهاست. عملیات فایل در زیرمجموعهٔ محدود Task بومی از مخزن پس‌زمینهٔ ثابت استفاده می‌کند. این موضوع انتظار عمومی شبکه از همان سازوکار را اثبات نمی‌کند.
-
-## نگهداری مرجع
-
-فرادادهٔ رابط عمومی در [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs) قرار دارد. این داده‌ها همراه پیاده‌سازی‌ها و قراردادها بررسی می‌شوند. این وب‌سایت فعلاً مرجع دستی گزینش‌شده‌ای را نگه می‌دارد؛ وجود فرمان `ku doc` تأیید نشده است.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

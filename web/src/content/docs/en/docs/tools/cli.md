@@ -2,15 +2,8 @@
 title: 'Command-line tools'
 description: 'Ku checking, execution, building, project and package commands.'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
-sources:
-  [
-    'src/cli.rs',
-    'docs/package.md',
-    'docs/process-execution.md',
-    'src/service_supervision.rs',
-    'src/backend/c_http_runtime.c',
-  ]
+verifiedAt: '2026-10-23'
+sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 ---
 
 Use `ku --version` to identify the executable and `ku --help` to inspect available options.

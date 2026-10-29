@@ -5,3 +5,6 @@ dist/
 .env.*
 !.env.example
 .DS_Store
+/ku-website-v*.zip
+/ku-website-v*.zip.sha256
+/.package-*/

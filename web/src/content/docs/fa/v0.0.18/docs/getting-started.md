@@ -1,17 +1,20 @@
 ---
-title: شروع کار
-description: نوشتن Hello Ku، بررسی کد منبع و شناخت تفاوت تفسیر و کامپایل.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'شروع کار'
+description: 'نوشتن Hello Ku، بررسی کد منبع و شناخت تفاوت تفسیر و کامپایل.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: fa/v0.0.18/docs/getting-started
 ---
 
-این مستندات محدودهٔ نهایی پیش‌انتشار آزمایشی v0.0.18 را شرح می‌دهند. وضعیت انتشار واقعی و فایل‌های دانلود در GitHub Releases ثبت می‌شوند. این صفحه از نحو پایه و فرمان‌های CLI موجود در v0.0.17 استفاده می‌کند. ابتدا [Ku را نصب کنید](/fa/v0.0.18/docs/install/) و مطمئن شوید `ku --version` اجرا می‌شود.
+ابتدا [Ku را نصب کنید](/fa/v0.0.18/docs/install/) و مطمئن شوید `ku --version` اجرا می‌شود.
 
 ## نوشتن اولین برنامه
 
@@ -86,4 +89,4 @@ ku run
 
 نقطهٔ ورود بسته در `ku.mod` تنظیم می‌شود. `ku create --list` الگوهای موجود را فهرست می‌کند. در حال حاضر فرمان‌های `ku test` و `ku fmt` وجود ندارند.
 
-با [راهنمای زبان](/fa/v0.0.18/docs/guide/language/)، [عیب‌یابی](/fa/v0.0.18/docs/guide/errors/) و [پشتیبانی از مسیرهای اجرا](/fa/v0.0.18/docs/support/) ادامه دهید. خروجی‌های این صفحه نمونه‌های مورد انتظارند و جایگزین بررسی نصب در پلتفرم شما نیستند.
+با [راهنمای زبان](/fa/v0.0.18/docs/guide/language/)، [عیب‌یابی](/fa/v0.0.18/docs/guide/errors/) و [پشتیبانی از مسیرهای اجرا](/fa/v0.0.18/docs/support/) ادامه دهید.

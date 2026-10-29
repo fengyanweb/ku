@@ -1,7 +1,7 @@
 ---
 title: JSON 参考
 description: Ku JSON 编码、解码、KuValue 转换、错误标识和后端支持范围。
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources:
   [
@@ -18,7 +18,7 @@ sidebar:
   order: 4
 ---
 
-`json.encode` / `json.decode` 是本版接口，分别复用 `stringify` / `parse`；兼容名继续保留。默认保持旧底层实现，不使用 yyjson。
+`std.json` 提供 JSON 编码与解码。通用同步 `json.encode` 对值进行只读编码，`json.decode` 将 JSON 文本解析为独立持有内容的动态值；两者返回 Result。`stringify`、`parse` 和 `try_parse` 作为兼容名称保留。这些接口均包含在 0.0.19 中。当前仍使用旧 JSON 默认实现，不使用 yyjson。
 
 ## 导入与接口
 
@@ -28,27 +28,27 @@ import json from "std.json"
 
 | 接口                         | 返回       | 含义                               |
 | ---------------------------- | ---------- | ---------------------------------- |
-| `json.stringify(&value:any)` | `str!`     | 只读编码，返回新的紧凑 JSON 文本   |
-| `json.parse(text:str)`       | `KuValue!` | 严格解析，返回独立持有内容的动态值 |
-| `json.try_parse(text:str)`   | `KuValue!` | `parse` 的兼容别名                 |
-| `json.encode(&value:any)`    | `str!`     | 当前开发分支中 `stringify` 的别名  |
-| `json.decode(text:str)`      | `KuValue!` | 当前开发分支中 `parse` 的别名      |
+| `json.encode(&value:any)`    | `str!`     | 只读编码，返回新的紧凑 JSON 文本   |
+| `json.decode(text:str)`      | `KuValue!` | 严格解析，返回独立持有内容的动态值 |
+| `json.stringify(&value:any)` | `str!`     | `encode` 的兼容名称                |
+| `json.parse(text:str)`       | `KuValue!` | `decode` 的兼容名称                |
+| `json.try_parse(text:str)`   | `KuValue!` | `decode` 的兼容名称                |
 
 `!` 表示返回 Result。用 `?` 传播错误，或用 `try/catch` 处理；通用同步编码接口不消费或修改输入；下文 native Task 字面量子集有单独的所有权限制。
 
 ## 编码与读取
 
-以下是完整基础示例；更广泛的开发分支回归样例见[examples/json.ku](https://github.com/fengyanweb/ku/blob/main/examples/json.ku)。
+以下是完整基础示例；更多情况见[examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku)。
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -101,7 +101,7 @@ Ku
 
 解释器、默认打包 runner 和同步 native C 支持上面的通用接口。native Task 只支持下文编码子集，不支持通用解析/解码；LLVM 不提供此库。默认 runner 的 import 仍依赖原始源码位置。
 
-本页签名与边界来自源码和规范核对；运行验证需绑定具体版本、commit 与后端。完整行为见[JSON 语法合同](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md#127-json)。
+完整行为见[JSON 语法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json)。
 
 ## Native Task 中的标量 JSON 对象
 

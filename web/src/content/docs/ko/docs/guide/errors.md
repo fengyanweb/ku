@@ -1,18 +1,19 @@
 ---
 title: '오류 및 문제 해결'
 description: 'Ku 설치, 가져오기, 소유권, JSON, 백엔드 기능 오류를 진단합니다.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 실험적 개발 과정에서 컴파일러 진단은 달라질 수 있습니다. 문제를 보고할 때 CLI 버전, Git 커밋, 백엔드, 전체 명령, 최소 소스를 포함하세요.
+실험적 개발 과정에서 컴파일러 진단은 달라질 수 있습니다. 문제를 보고할 때 CLI 버전, Git 커밋, 백엔드, 전체 명령, 최소 소스를 포함하세요.
 
 ## Ku 실행 파일 확인
 
@@ -72,6 +73,8 @@ fn main() {
 
 `-o` 없는 `ku build --native file.ku`는 C만 출력합니다. 실행 파일을 컴파일하고 링크하려면 `ku build --backend c file.ku`를 사용하고 대상 C 도구 모음을 설치하세요.
 
-데이터베이스 오류 `execution_unknown`과 `execution_completed_without_result`는 자동 재실행의 근거가 되어서는 안 됩니다. 요청과 업무 증거를 보존하고 실제 실행 상태부터 확인하세요. 로컬 웹사이트 검증에는 프로덕션 데이터베이스 연결이 필요하지 않습니다.
+데이터베이스 오류 `execution_unknown`과 `execution_completed_without_result`는 자동 재실행의 근거가 되어서는 안 됩니다. 요청과 업무 증거를 보존하고 실제 실행 상태부터 확인하세요.
 
 자세한 내용은 [저장소 진단 안내](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)를 참고하세요.
+
+JSON 오류의 domain/code는 백엔드 간 같지만 message 전체는 다를 수 있습니다. ku run과 runner에는 json parse failed:가 붙고 네이티브 C에는 없을 수 있습니다. 전체 문구가 아니라 domain/code로 판단하세요.

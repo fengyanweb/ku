@@ -1,20 +1,21 @@
 ---
-title: JSON リファレンス
-description: Ku の JSON エンコード、デコード、KuValue 変換、エラーコード、バックエンド対応。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'JSON リファレンス'
+description: 'Ku の JSON エンコード、デコード、KuValue 変換、エラーコード、バックエンド対応。'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/json.rs
-  - src/stdlib/metadata.rs
-  - docs/syntax.md
-  - examples/json.ku
-  - docs/v0.0.18.md
+  [
+    'src/stdlib/json.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'examples/json.ku',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ja/v0.0.18/docs/stdlib/json
 ---
 
-> v0.0.18 の追加情報は現在英語で掲載しています。既存の翻訳は保持しています。 [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` は JSON をエンコード・デコードします。`json.encode` は入力を読み取り専用で借用し、`json.decode` は内容を独立所有する `KuValue` を生成します。どちらも Result を返します。`stringify`、`parse`、`try_parse` は互換名です。
 
 ## インポートとインターフェース
 
@@ -27,24 +28,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | 読み取り専用で新しいコンパクトな JSON テキストにエンコード |
 | `json.parse(text:str)`       | `KuValue!` | 独立した所有の動的な値へ厳密に解析                         |
 | `json.try_parse(text:str)`   | `KuValue!` | `parse` の互換エイリアス                                   |
-| `json.encode(&value:any)`    | `str!`     | 開発ブランチの `stringify` エイリアス                      |
-| `json.decode(text:str)`      | `KuValue!` | 開発ブランチの `parse` エイリアス                          |
+| `json.encode(&value:any)`    | `str!`     | 本版に含まれる `stringify` の別名                          |
+| `json.decode(text:str)`      | `KuValue!` | 本版に含まれる `parse` の別名                              |
 
 `!` は Result を表します。`?` でエラーを伝播するか、`try/catch` で処理します。エンコードは入力を消費せず、変更もしません。
 
 ## 値をエンコードして読む
 
-次は完全な基本例です。開発ブランチの [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku) には、より広範な回帰検証例があります。
+完全な基本例です。ほかの使い方は [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -76,7 +77,7 @@ Ku
 | 重複するオブジェクトキー | 解析時は最後の値を保持                                                             |
 | キーの順序               | エンコード時は UTF-8 バイト順にソート                                              |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` は `1` にエンコードされる場合があります。整数形式の float が int64 を超える場合は `.0` を追加し、`1e20` は `100000000000000000000.0` となって再デコードできます。有限 binary64 の元の表記、float タグ、負のゼロの符号は保持されません。この修正は本版に含まれます。
 
 ## エラー
 
@@ -86,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 インタープリター、既定のパッケージ化ランナー、同期ネイティブ C バックエンドには JSON 実装があります。**制限付きネイティブ Task サブセットと LLVM は JSON に対応していません。** 既定のランナーでは、インポートしたソースの元の場所への依存が残ります。JSON 対応は、完全に独立したパッケージを意味しません。
 
-このページのシグネチャと制約は、ソースおよび仕様と照合しました。実行検証ではバージョン、コミット、バックエンドを明記する必要があります。完全な [JSON 構文仕様](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json)をご覧ください。
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md#127-json).

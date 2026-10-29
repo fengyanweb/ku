@@ -2,10 +2,13 @@ import { versions } from './versions';
 export const project = {
   name: 'Ku',
   repository: 'https://github.com/fengyanweb/ku',
-  release: `https://github.com/fengyanweb/ku/releases/tag/${versions.releaseTag}`,
-  version: versions.current,
+  release: versions.releaseUrl,
+  version: versions.languageVersion,
   releasedVersion: versions.released,
-  verifiedAt: '2026-10-28',
+  releaseTag: versions.releaseTag,
+  releaseCommit: versions.releaseCommit,
+  docsSourceRef: versions.docsSourceRef,
+  verifiedAt: versions.verifiedAt,
   feedbackEmail: 'kagura.gc@qq.com',
 } as const;
 

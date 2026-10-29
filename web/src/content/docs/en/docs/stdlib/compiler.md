@@ -2,7 +2,7 @@
 title: 'Lexer and parser utilities'
 description: 'Debugging with lexer.scan and parser.parse.'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['src/stdlib/mod.rs', 'src/stdlib/metadata.rs']
 sidebar:
   order: 12

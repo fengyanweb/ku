@@ -2,8 +2,8 @@
 title: 'Versions and release notes'
 description: 'Versions and release notes'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
-sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.19.md']
+verifiedAt: '2026-10-23'
+sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
 ## 0.0.19
@@ -14,21 +14,17 @@ Ku 0.0.19 is an experimental prerelease for controlled evaluation, with matching
 
 The three-platform release gates and downloaded-package checks have passed; packages and checksums are available in the Release. Native programs should be rebuilt after upgrading; package targets remain macOS ARM64, Linux x64 and Windows x64.
 
-## 0.0.18 revision 1 (historical)
+## 0.0.18
 
-Release tag `v0.0.18-r1` retains CLI and extension version `0.0.18`. It fixes chained calls, large float literals, `time.date(Time)` and extension metadata. The [original release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) remains available.
+Ku 0.0.18 is an experimental release. It includes limited native Tasks, timers and background I/O, HTTP/1.1 connection reuse, JSON encoding and decoding, and explicit whole-program limits through `ku supervise`.
 
-That experimental prerelease included bounded Task/waiting and shutdown fixes, HTTP connection reuse and buffers, large-float JSON round trips and explicit `ku supervise` workers.
+This edition includes fixes for native C floating-point literals and large-float builds, single evaluation of call-chain receivers, Result checking for `time.date(Time)`, and VS Code version lookup and completion. Recompile affected native programs after updating. Reinstall an older `ku-language-0.0.18.vsix` even if VS Code shows the same extension version.
 
-[Downloads and checksums](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [Fixed docs](/en/v0.0.18/) · [Known limits](/en/docs/support/)
+[Install Ku](/en/v0.0.18/docs/install/) · [Download 0.0.18](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [Supported platforms and known issues](/en/v0.0.18/docs/support/)
 
-**Known HTTP issue: historical 504s, not reproduced by this round's short tests; root cause unconfirmed; formal 30-minute acceptance has not passed.** Complete M:N, general network scheduling and the complete database platform matrix remain incomplete.
+## v0.0.17
 
-## 0.0.17
-
-Synchronous borrowing, braced while in the self-hosted parser subset and cross-platform tooling corrections.
-
-[Download and release notes](https://github.com/fengyanweb/ku/releases/tag/v0.0.17) · [Fixed docs](/en/v0.0.17/)
+Synchronous read-only borrowing, braced while in the self-hosted parser subset, and cross-platform test tooling fixes. See its [release notes](https://github.com/fengyanweb/ku/releases/tag/v0.0.17); historical APIs may differ from the current version.
 
 ## Early development records
 

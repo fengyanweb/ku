@@ -1,27 +1,26 @@
 ---
 title: '프로젝트 및 기여'
 description: 'Ku 프로젝트 상태, 공개 소스, 라이선스 범위, 재현 가능한 문제 보고.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-현재 문서는 실험적 사전 릴리스 Ku 0.0.19를 대상으로 하며 CLI와 VS Code 확장 버전도 동일합니다. 공개 상태, 파일 및 체크섬은 실제 GitHub Release에서 확인하세요.
-
-**Ku programming language / Ku 编程语言** · CLI: `ku`.
+Ku는 프로그래밍 언어와 도구 체인입니다. 인터프리터, 기본 실행 가능한 runner, 지원 부분집합의 네이티브 C 컴파일을 제공합니다.
 
 ## 소스 및 라이선스
 
-[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
+Ku와 VS Code 확장은 **Apache-2.0** 라이선스로 배포됩니다. [소스 코드](https://github.com/fengyanweb/ku), [0.0.19 릴리스](https://github.com/fengyanweb/ku/releases/tag/v0.0.19), [라이선스 전문](https://github.com/fengyanweb/ku/blob/v0.0.19/LICENSE)을 확인하세요.
 
-Ku와 VS Code 확장은 Apache License 2.0으로 제공됩니다. [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE)와 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)를 확인하세요. 타사 구성 요소에는 각각의 저작권 및 라이선스가 적용됩니다.
+제삼자 구성 요소에는 각자의 라이선스가 적용됩니다. 릴리스 패키지에는 해당 라이선스 전문과 고지가 포함됩니다.
 
 ## 문제 보고
 
@@ -38,10 +37,8 @@ Ku와 VS Code 확장은 Apache License 2.0으로 제공됩니다. [LICENSE](http
 
 ## 기여하기 전에
 
-언어 동작은 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)과 [의미 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)이 정의합니다. CI, 구현, 계약을 함께 확인하세요. 작업 로그의 목표는 구현된 기능이 아닙니다.
+변경 범위를 좁게 유지하고 최소 재현 예제, 영향 범위, 검증 결과를 포함하세요. 코드, 문서, 예제는 같은 버전을 기준으로 작성해야 합니다. 기여 내용은 유지 관리자의 검토 후 병합됩니다.
 
-변경 범위를 좁히고 재현 방법, 원인, 범위, 검증을 설명하세요. 웹사이트 내용을 관련 소스와 함께 검토합니다. 기존 테스트, 작업 트리 변경, 고유한 증거를 보존하세요. 기여 수락과 라이선스 조건은 유지 관리자가 결정하며 이 웹사이트는 기여 계약을 만들어 내지 않습니다.
-
-이 웹사이트는 정적입니다. 본문, 탐색, 코드에는 업무 백엔드가 필요하지 않습니다. 검색은 브라우저에서 Pagefind 인덱스를 불러옵니다. 사이트는 Ku 코드의 원격 실행을 제공하지 않습니다.
+이 사이트는 Ku 코드의 온라인 실행을 제공하지 않습니다.
 
 [시작하기](/ko/docs/getting-started/), [지원 범위](/ko/docs/support/), [릴리스 노트](/ko/releases/)로 이어가세요.

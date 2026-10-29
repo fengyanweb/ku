@@ -1,7 +1,7 @@
 ---
 title: 错误与排查
 description: 定位 Ku 安装、导入、所有权、JSON 与后端能力错误。
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources:
   [
@@ -103,7 +103,7 @@ import json from "std.json"
 
 fn main() {
     try {
-        json.parse("[1,]")?
+        json.decode("[1,]")?
     } catch (error) {
         println(error.domain)
         println(error.code)
@@ -112,7 +112,7 @@ fn main() {
 }
 ```
 
-示例故意触发 JSON 解析错误并捕获，程序正常退出。解析错误的 `byte N` 为从 0 开始的 UTF-8 字节位置，中文或 emoji 前后的字节偏移不等于字符数。
+示例故意触发 JSON 解析错误并捕获，程序正常退出。此片段以 `ku run` 为例；同一输入在支持 JSON 的后端都返回 `json/parse_error`，但 `message` 可不同：解释器消息带 `json parse failed: ` 前缀，native C 的消息可省略该前缀。程序应按 `domain/code` 处理错误，不依赖完整消息文本。解析错误的 `byte N` 为从 0 开始的 UTF-8 字节位置，中文或 emoji 前后的字节偏移不等于字符数。
 
 ## native 编译被拒绝
 
@@ -120,6 +120,6 @@ fn main() {
 
 `ku build --native file.ku` 不带 `-o` 时仅写 C 文件。希望编译和链接二进制时使用 `ku build --backend c file.ku`，并确认目标 C 工具链存在。
 
-数据库的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自动重放；保留请求和业务证据，先核对真实执行状态。官网本地验证不需要连接生产数据库。
+数据库的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自动重放；保留请求和业务证据，先核对真实执行状态。
 
 更多规则见[仓库诊断说明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)。

@@ -17,19 +17,39 @@ const readJson = (path) =>
   JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
 const languages = readJson('./src/i18n/languages.json');
 const versioning = readJson('./src/data/versions.json');
+const archivePages = readJson('./src/data/archive-pages.json');
 const packageMetadata = readJson('./package.json');
 const lockMetadata = readJson('./package-lock.json');
 if (
   versioning.current !== versioning.released ||
+  versioning.current !== versioning.languageVersion ||
   versioning.current !== packageMetadata.version ||
   versioning.current !== lockMetadata.version ||
-  versioning.current !== lockMetadata.packages?.['']?.version ||
-  ('languageVersion' in versioning &&
-    versioning.current !== versioning.languageVersion)
+  versioning.current !== lockMetadata.packages?.['']?.version
 )
   throw new Error(
     'Website package, lockfile and current release versions must agree.',
   );
+// Each archived version has its own source and URL. Never redirect it to
+// current documentation or generate its contents from the current release.
+for (const archive of versioning.archives) {
+  if (
+    !existsSync(
+      new URL(`./src/content/versions/${archive.slug}.json`, import.meta.url),
+    )
+  )
+    throw new Error(`Missing preserved documentation archive: ${archive.slug}`);
+  const pages = archivePages[archive.slug];
+  if (!Array.isArray(pages) || pages.length === 0)
+    throw new Error(`Missing archived page inventory: ${archive.slug}`);
+  for (const page of pages) {
+    if (
+      !page.split('/').includes(archive.slug) ||
+      !existsSync(new URL(`./src/content/docs/${page}`, import.meta.url))
+    )
+      throw new Error(`Missing archived page: ${page}`);
+  }
+}
 const translations = Object.fromEntries(
   Object.keys(languages).map((locale) => [
     locale,
@@ -169,8 +189,11 @@ export default defineConfig({
         SiteTitle: './src/components/DocSiteTitle.astro',
         PageTitle: './src/components/DocPageTitle.astro',
         LanguageSelect: './src/components/DocLanguageSelect.astro',
-        ThemeSelect: './src/components/DocThemeSelect.astro',
         Footer: './src/components/DocFooter.astro',
+        SocialIcons: './src/components/DocSocialIcons.astro',
+        ThemeSelect: './src/components/DocThemeSelect.astro',
+        Search: './src/components/DocSearch.astro',
+        Banner: './src/components/DocBanner.astro',
       },
       expressiveCode: {
         shiki: { langs: [kuGrammar] },

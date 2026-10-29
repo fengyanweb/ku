@@ -2,7 +2,7 @@
 title: VS Code
 description: Install the Ku extension and configure running, checking, formatting and completion.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'editors/vscode-ku/package.json',
@@ -17,12 +17,12 @@ The Ku extension provides syntax highlighting, snippets, completion, formatting 
 
 ## Install
 
-Download your platform archive from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19), then extract it. Each archive contains `ku-language-0.0.19.vsix` alongside the CLI. The VSIX is inside the archive, rather than a separate Release asset; consult that release page for actual availability.
+Download your platform archive from the [0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19), then extract it. Each archive contains `ku-language-0.0.19.vsix` alongside the CLI. The VSIX is inside the archive, rather than a separate Release asset.
 
 In VS Code, open **Extensions → … → Install from VSIX…**, select that file, then run **Developer: Reload Window**. You can also install from the extracted directory:
 
 ```sh
-code --install-extension ./ku-language-0.0.19.vsix
+code --install-extension ./ku-language-0.0.19.vsix --force
 ```
 
 This installation uses the released VSIX directly; it does not require a Marketplace listing.
@@ -57,7 +57,7 @@ Use **Ku: Check Current File**, then **Ku Run**. Compiler diagnostics appear in 
 | Ku: Check Current File | Check syntax and types                    |
 | Ku: Show IR            | Inspect the intermediate representation   |
 | Ku: Build Current File | Build with the CLI's default build path   |
-| Ku: Build Native C     | Build with the native C backend           |
+| Ku: Build Native C     | Generate C source (without linking)       |
 | Ku: Package GC         | Run the CLI package-cache cleanup command |
 | Ku: Show Version       | Show the resolved CLI version             |
 
@@ -72,3 +72,5 @@ Completion uses the extension's built-in API list and selected receiver names. I
 ## Update
 
 Install the VSIX from the version of Ku you use, then reload VS Code. The public v0.0.19 archive contains the extension shipped with that release. Later repository changes to completion and hover text take effect only after the extension is rebuilt and installed; they do not update an already downloaded VSIX automatically.
+
+To build an executable, run `ku build --backend c main.ku -o app` in a terminal; use `app.exe` on Windows.

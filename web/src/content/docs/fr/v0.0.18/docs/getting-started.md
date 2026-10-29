@@ -1,18 +1,20 @@
 ---
-title: Premiers pas
-description: Écrivez Hello Ku, vérifiez votre code et distinguez interprétation
-  et compilation.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Premiers pas'
+description: 'Écrivez Hello Ku, vérifiez votre code et distinguez interprétation et compilation.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: fr/v0.0.18/docs/getting-started
 ---
 
-Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Cette page utilise la syntaxe de base et les commandes CLI déjà présentes dans v0.0.17. Commencez par [installer Ku](/fr/v0.0.18/docs/install/) et vérifiez que `ku --version` fonctionne.
+Commencez par [installer Ku](/fr/v0.0.18/docs/install/) et vérifiez que `ku --version` fonctionne.
 
 ## Écrire votre premier programme
 
@@ -87,4 +89,4 @@ ku run
 
 Le point d'entrée du paquet est configuré dans `ku.mod`. `ku create --list` affiche les modèles disponibles. Il n'existe actuellement aucune commande `ku test` ou `ku fmt`.
 
-Poursuivez avec le [guide du langage](/fr/v0.0.18/docs/guide/language/), le [dépannage](/fr/v0.0.18/docs/guide/errors/) et la [prise en charge des backends](/fr/v0.0.18/docs/support/). Les sorties présentées sont des exemples attendus et ne remplacent pas la vérification de l'installation sur votre plateforme.
+Poursuivez avec le [guide du langage](/fr/v0.0.18/docs/guide/language/), le [dépannage](/fr/v0.0.18/docs/guide/errors/) et la [prise en charge des backends](/fr/v0.0.18/docs/support/).

@@ -1,8 +1,8 @@
 ---
 title: 'Przewodnik po języku'
 description: 'Poznaj zmienne, funkcje, przepływ sterowania, własność, moduły i obsługiwalne błędy Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Przewodnik wprowadza podstawową składnię. Nadrzędne pozostają [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) i [kontrakt semantyki](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) repozytorium. To fragmenty dydaktyczne; różnice opisuje [obsługa zapleczy](/pl/docs/support/).
+Przewodnik wprowadza podstawową składnię. Nadrzędne pozostają [specyfikacja składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) i [specyfikacja semantyki](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) repozytorium. To fragmenty dydaktyczne; różnice opisuje [obsługa zapleczy](/pl/docs/support/).
 
 ## Zmienne i typy
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` iteruje od `0` do `4`. `if` i `while` wymagają warunków typu `bool`. Dla wielu instrukcji użyj klamer. Wyrażenia rozgałęziające używają `match`; nie ma `switch`.
 
+<a id="ownership"></a>
+
 ## Własność i pożyczanie tylko do odczytu
+
+Wartości Owned są domyślnie przenoszone i deterministycznie zwalniane po opuszczeniu zakresu właściciela. Niezależna kopia wymaga `.clone()`. Ku nie wprowadza globalnego śledzącego GC; współdzielone struktury wewnętrzne, np. środowiska domknięć, mogą używać zliczania referencji i mieć koszty wykonania. Synchroniczne pożyczanie tylko do odczytu deklaruje `&name: T`. Zwykły parametr Owned może przenieść wartość nawet wtedy, gdy tylko ją czyta. Wywołanie pozostaje `length(value)`, bez `&value`; pożyczanie async nie jest obsługiwane.
 
 `int`, `float`, `bool` i `null` są wartościami Copy. Łańcuchy, tablice, obiekty, struktury, wyliczenia, Results i wartości funkcji są Owned. Przypisanie i zwykłe argumenty domyślnie przenoszą wartości z własnością. Gdy potrzebujesz niezależnej wartości, użyj `.clone()`. Tasks nie można klonować.
 

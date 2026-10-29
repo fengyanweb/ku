@@ -1,18 +1,19 @@
 ---
 title: 'Libreria standard'
 description: 'Trova moduli della libreria standard Ku, firme essenziali e limiti dei backend.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v0.0.18. La pubblicazione effettiva e i download sono registrati in GitHub Releases. Questi punti di ingresso essenziali sono stati confrontati con il sorgente; non è una documentazione API esaustiva. Il [contratto sintattico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) definisce il comportamento. Consulta la [matrice di supporto](/it/docs/support/) per i limiti dei backend.
+Il [riferimento di sintassi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) descrive la libreria standard. Consulta la [matrice di supporto](/it/docs/support/) per i limiti dei backend.
 
 ## Importa moduli
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Crea prima un file UTF-8 `message.txt` accanto al sorgente. Un file assente o una lettura fallita restituisce un errore. Questo esempio dipende da quel file di input. `try_read` e `try_write` restano alias compatibili con gli stessi tipi di risultato.
 
 `read_dir` restituisce percorsi ordinati con proprietà indipendente, con un limite di 10.000 voci e 1.000.000 di byte totali dei percorsi. Le operazioni sui file del sottoinsieme Task nativo ristretto usano un pool fisso in background. Questo non dimostra attese di rete generiche tramite lo stesso meccanismo.
-
-## Manutenzione della documentazione
-
-I metadati delle interfacce pubbliche si trovano in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Sono verificati insieme a implementazioni e contratti. Il sito mantiene attualmente una documentazione manuale selezionata; l'esistenza di un comando `ku doc` non è stata confermata.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

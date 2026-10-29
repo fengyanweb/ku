@@ -1,18 +1,19 @@
 ---
 title: 'Hatalar ve sorun giderme'
 description: 'Ku kurulumu, içe aktarma, sahiplik, JSON ve arka uç yetenek hatalarını tanılayın.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Derleyici tanıları deneysel geliştirme sırasında değişebilir. Sorun bildirirken CLI sürümünü, Git commitini, arka ucu, tam komutu ve en küçük kaynak örneğini ekleyin.
+Derleyici tanıları deneysel geliştirme sırasında değişebilir. Sorun bildirirken CLI sürümünü, Git commitini, arka ucu, tam komutu ve en küçük kaynak örneğini ekleyin.
 
 ## Ku yürütülebilir dosyasını belirleyin
 
@@ -72,6 +73,8 @@ Bu öğretici program bilerek kurtarılabilir ayrıştırma hatası üretir. Bil
 
 `ku build --native file.ku`, `-o` olmadan yalnızca C yazar. Bir yürütülebilir dosya derleyip bağlamak için `ku build --backend c file.ku` kullanın ve hedef C araçlarını kurun.
 
-Veritabanı hataları `execution_unknown` ve `execution_completed_without_result` otomatik yeniden yürütmeyi tetiklememelidir. İstek ve iş işlemine ait kanıtları koruyun ve önce gerçek yürütme durumunu belirleyin. Yerel web sitesini doğrulamak üretim veritabanı bağlantısı gerektirmez.
+Veritabanı hataları `execution_unknown` ve `execution_completed_without_result` otomatik yeniden yürütmeyi tetiklememelidir. İstek ve iş işlemine ait kanıtları koruyun ve önce gerçek yürütme durumunu belirleyin.
 
 Ayrıntılar için [depodaki tanı kılavuzuna](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md) bakın.
+
+JSON hatalarının domain/code alanları arka uçlarda aynıdır, fakat message farklı olabilir. ku run ve runner json parse failed: önekini ekleyebilir, yerel C eklemeyebilir. Tam metin yerine domain/code karşılaştırın.

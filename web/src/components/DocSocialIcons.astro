@@ -1,0 +1,24 @@
+---
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+import { localeFromPath, translate } from '../i18n/locales';
+const locale = localeFromPath(Astro.url.pathname);
+const t = translate(locale);
+---
+
+<a class="donation-link" href={`/${locale}/support/`}>
+  {t.supportKu}
+</a>
+<Default />
+
+<style>
+  .donation-link {
+    color: var(--sl-color-text-accent);
+    font-size: var(--sl-text-sm);
+    font-weight: 600;
+    white-space: nowrap;
+    text-decoration: none;
+  }
+  .donation-link:hover {
+    text-decoration: underline;
+  }
+</style>

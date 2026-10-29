@@ -2,7 +2,7 @@
 title: '包与模块'
 description: '组织源码、导入标准库与管理依赖。'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['docs/package.md', 'src/package.rs']
 sidebar:
   order: 3
@@ -64,4 +64,4 @@ fn main() {
 
 registry 依赖需要明确的 HTTPS 地址与固定的 Ed25519 公钥。`ku package resolve` 更新求解与 lock；`--locked` 按已有 lock 解析，`--offline` 只使用本地缓存。`ku package pack` 生成包，`publish` / `yank` 会向配置的 registry 写入，需要相应凭据。
 
-完整字段、版本范围与自托管接入见仓库[Package 参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/package.md)。不要把这里的本地示例视为已经部署公共包服务。
+完整字段、版本范围与自托管接入见仓库[Package 参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/package.md)。

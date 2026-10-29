@@ -1,15 +1,17 @@
 ---
 import Default from '@astrojs/starlight/components/PageTitle.astro';
-import { localeFromPath, translate } from '../i18n/locales';
+import VersionNotice from 'starlight-versions/components/VersionNotice.astro';
+import VersionNavigation from './VersionNavigation.astro';
+import LanguageNotice from './LanguageNotice.astro';
+import { localeFromPath } from '../i18n/locales';
 import { archiveFromPath } from '../data/versions';
-const locale = localeFromPath(Astro.url.pathname);
-const t = translate(locale);
 const archive = archiveFromPath(Astro.url.pathname);
 ---
 
 <Default />
-<div class="ku-page-meta">
-  <span>
-    {archive ? t.snapshot.replace('{version}', archive.label) : t.next}
-  </span>
-</div>
+<LanguageNotice locale={localeFromPath(Astro.url.pathname)} documentFallback />
+{archive && (
+  <VersionNavigation>
+    <VersionNotice />
+  </VersionNavigation>
+)}

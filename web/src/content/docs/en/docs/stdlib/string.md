@@ -2,7 +2,7 @@
 title: Strings
 description: Unicode text, searching, slicing, transformations, and backend support.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 1

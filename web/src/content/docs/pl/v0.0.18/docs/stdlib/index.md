@@ -1,18 +1,20 @@
 ---
-title: Biblioteka standardowa
-description: Moduły biblioteki standardowej Ku, podstawowe sygnatury i
-  ograniczenia zapleczy.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Biblioteka standardowa'
+description: 'Moduły biblioteki standardowej Ku, podstawowe sygnatury i ograniczenia zapleczy.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: pl/v0.0.18/docs/stdlib
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Te podstawowe punkty wejścia sprawdzono ze źródłami; nie jest to wyczerpujący opis API. Zachowanie definiuje [kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md). Ograniczenia zapleczy opisuje [macierz obsługi](/pl/v0.0.18/docs/support/).
+[Specyfikacja składni](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) opisuje bibliotekę standardową. Ograniczenia zapleczy podaje [macierz obsługi](/pl/v0.0.18/docs/support/).
 
 ## Importowanie modułów
 
@@ -74,7 +76,3 @@ fn main(): null! {
 Najpierw utwórz plik UTF-8 `message.txt` obok źródła. Brak pliku lub nieudany odczyt zwraca błąd. Przykład zależy od tego pliku wejściowego. `try_read` i `try_write` pozostają zgodnymi aliasami z tymi samymi typami wyniku.
 
 `read_dir` zwraca posortowane ścieżki o niezależnej własności, ograniczone do 10 000 wpisów i 1 000 000 bajtów ścieżek łącznie. Ograniczone natywne operacje plikowe Task używają stałej puli tła. Nie dowodzi to ogólnego oczekiwania sieciowego tym samym mechanizmem.
-
-## Utrzymywanie dokumentacji
-
-Metadane publicznego interfejsu znajdują się w [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Są sprawdzane razem z implementacjami i kontraktami. Witryna utrzymuje obecnie ręcznie redagowany opis; nie potwierdzono istniejącego polecenia `ku doc`.

@@ -3,14 +3,7 @@ title: '示例集'
 description: '按任务查找可以运行的 Ku 示例。'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
-sources:
-  [
-    'examples/README.md',
-    'examples/http_server.ku',
-    'examples/json.ku',
-    'tests/fixtures/http_pg_lifecycle_async.ku',
-    'src/ir/task_lower.rs',
-  ]
+sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
 ---
 
 这些示例按任务组织。每个链接包含完整程序、运行方式以及后端要求。需要输入文件、服务器或数据库时，页面会明确列出准备步骤。
@@ -28,7 +21,7 @@ sources:
 | 数据库查询      | [PG / Redis / MySQL](/zh-cn/docs/stdlib/database/)；native C 与真实服务       |
 | 二进制与 TCP    | [bytes](/zh-cn/docs/stdlib/bytes/) / [net](/zh-cn/docs/stdlib/net/)；native C |
 
-仓库 [examples 目录](https://github.com/fengyanweb/ku/tree/main/examples)还有更完整的应用示例。诸如持续运行服务、压力负载或数据库示例有各自依赖，不适合把整个目录作为无条件批量执行命令。
+仓库 [examples 目录](https://github.com/fengyanweb/ku/tree/v0.0.19/examples)还有更完整的应用示例。
 
 ## Native Task 示例
 

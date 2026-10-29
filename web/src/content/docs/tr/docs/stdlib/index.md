@@ -1,18 +1,19 @@
 ---
 title: 'Standart kütüphane'
 description: 'Ku standart kütüphane modüllerini, temel imzaları ve arka uç sınırlarını bulun.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu temel giriş noktaları kaynak kodla karşılaştırıldı; kapsamlı bir API başvurusu değildir. Davranışı [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) tanımlar. Arka uç sınırları için [destek matrisine](/tr/docs/support/) bakın.
+[Sözdizimi başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) standart kütüphaneyi açıklar. Arka uç sınırları için [destek matrisine](/tr/docs/support/) bakın.
 
 ## Modülleri içe aktarma
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Önce kaynak dosyanın yanında UTF-8 `message.txt` oluşturun. Olmayan dosya veya başarısız okuma hata döndürür. Bu örnek o girdi dosyasına bağımlıdır. `try_read` ve `try_write` aynı sonuç türlerine sahip uyumlu takma adlar olarak kalır.
 
 `read_dir` sıralanmış ve bağımsız sahiplikli yollar döndürür; sınırlar 10.000 girdi ve toplam 1.000.000 yol baytıdır. Sınırlı yerel Task dosya işlemleri sabit bir arka plan havuzu kullanır. Bu durum aynı mekanizmayla genel ağ beklemesini kanıtlamaz.
-
-## Başvurunun bakımı
-
-Açık arayüz metaverisi [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs) içindedir. Uygulamalar ve sözleşmelerle birlikte denetlenir. Bu site şu anda elle seçilmiş bir başvuru tutar; mevcut bir `ku doc` komutu doğrulanmamıştır.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

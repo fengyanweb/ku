@@ -2,7 +2,7 @@
 title: 'Packages and modules'
 description: 'Organize source, import libraries and manage dependencies.'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['docs/package.md', 'src/package.rs']
 sidebar:
   order: 3
@@ -64,4 +64,4 @@ Local development dependencies use `dep.name.source = "file://absolute/path"`. C
 
 Registry dependencies need an explicit HTTPS URL and pinned Ed25519 public key. `ku package resolve` updates resolution and the lock; `--locked` uses the existing lock and `--offline` uses cached packages only. `ku package pack` creates an artifact. `publish` and `yank` write to the configured registry and require credentials.
 
-See the repository's [package reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/package.md) for all fields, version ranges and self-hosted setup. This local example does not imply a deployed public package service.
+See the repository's [package reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/package.md) for all fields, version ranges and self-hosted setup.

@@ -22,6 +22,8 @@ sidebar:
 
 `std.http` provides an HTTP client, route registration, and complete response values. Save the server and client below in separate files.
 
+The first server and client examples use **the interpreter (`ku run`) or the default runner**. Native C supports synchronous JSON responses but not the module-level HTTP client. Use the [native C example](#native-c) or the [named async handler example](#named-async-native-handlers) for native programs.
+
 ## Start a server
 
 Save as `server.ku`, then run `ku run server.ku`. Port 8080 must be available. Stop the server with Ctrl+C.
@@ -101,7 +103,7 @@ An HTTP 404 or 500 is an `Ok(HttpResponse)`, not a failed Result. Check `respons
 
 ## Client interfaces
 
-The names below describe signatures; `HttpResponse` is a response object, not a public type annotation.
+The names below describe client signatures and response values. The dedicated [native async handler path](#named-async-native-handlers) also accepts `HttpRequest` and `HttpResponse` annotations; that does not make the module-level HTTP client available in native code.
 
 | Call                           | Return          | Description                                                                    |
 | ------------------------------ | --------------- | ------------------------------------------------------------------------------ |
@@ -149,7 +151,7 @@ Client errors use domain `http`; codes include `invalid_method`, `invalid_url`, 
 | `req.headers` | object of strings | Request headers; lowercase names |
 | `req.body`    | str               | UTF-8 request body               |
 
-Use `req.query.get_or("q", "")` for an optional field in interpreted code. Ordinary missing-key reads fail in the interpreter; native HTTP request-map field reads currently return an empty string for a missing key. Do not rely on a missing required field being rejected consistently across these paths. Inline `fn(req)` gives the checker the request-field context. A public nominal `HttpRequest` parameter type is not available.
+Use `req.query.get_or("q", "")` for an optional field in interpreted code. Ordinary missing-key reads fail in the interpreter; native HTTP request-map field reads currently return an empty string for a missing key. Do not rely on a missing required field being rejected consistently across these paths. Inline `fn(req)` gives the checker the request-field context. The interpreter and default runner do not expose a nominal `HttpRequest` parameter type for ordinary handlers; native async handler annotations are described below.
 
 ## Responses and status codes
 
@@ -224,6 +226,8 @@ fn main(): null! {
 ```
 
 The listener holds the bound socket until it is run, explicitly closed, or its last owning value leaves scope. It cannot be restarted after `run` or `close`. `close` is not a concurrent shutdown handle for an already running server.
+
+<span id="native-c"></span>
 
 ## Execution support
 

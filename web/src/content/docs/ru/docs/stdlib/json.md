@@ -1,21 +1,20 @@
 ---
 title: 'Справочник JSON'
 description: 'Кодирование и декодирование JSON, преобразование KuValue, коды ошибок и поддержка бэкендов Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/json.rs',
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.19.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-> Дополнения для v0.0.18 ниже пока приведены на английском; остальной перевод сохранён. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` кодирует и декодирует JSON. `json.encode` заимствует вход только для чтения; `json.decode` создаёт независимо владеющий `KuValue`. Оба возвращают Result. `stringify`, `parse` и `try_parse` сохраняются для совместимости.
 
 ## Импорт и интерфейсы
 
@@ -28,24 +27,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | Кодирование только для чтения в новый компактный текст JSON    |
 | `json.parse(text:str)`       | `KuValue!` | Строгий разбор в динамическое значение с независимым владением |
 | `json.try_parse(text:str)`   | `KuValue!` | Совместимый псевдоним `parse`                                  |
-| `json.encode(&value:any)`    | `str!`     | Псевдоним `stringify` в ветке разработки                       |
-| `json.decode(text:str)`      | `KuValue!` | Псевдоним `parse` в ветке разработки                           |
+| `json.encode(&value:any)`    | `str!`     | Псевдоним `stringify`, включённый в этот выпуск                |
+| `json.decode(text:str)`      | `KuValue!` | Псевдоним `parse`, включённый в этот выпуск                    |
 
 `!` обозначает Result. Используйте `?` для передачи ошибок или `try/catch` для обработки. Кодирование не потребляет и не изменяет входное значение.
 
 ## Кодирование и чтение значений
 
-Это полный базовый пример. Ветка разработки содержит более широкий регрессионный пример в [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
+Полный базовый пример; другие применения в [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -77,7 +76,7 @@ Ku
 | Повторные ключи объекта | При разборе сохраняется последнее значение                                                             |
 | Порядок ключей          | Кодирование сортирует по порядку байтов UTF-8                                                          |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` может кодироваться как `1`. Если целочисленная запись float выходит за int64, кодировщик добавляет `.0`: `1e20` становится `100000000000000000000.0` и декодируется обратно. Конечные binary64 не сохраняют исходное написание, метку float и знак отрицательного нуля. Исправление включено в выпуск.
 
 ## Ошибки
 
@@ -87,4 +86,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 Реализации JSON есть в интерпретаторе, упакованном средстве запуска по умолчанию и синхронном нативном C-бэкенде. **Ограниченное нативное подмножество Task и LLVM не поддерживают JSON.** Импорты обычного средства запуска всё ещё зависят от расположения исходных файлов; поддержка JSON не означает полностью независимый пакет.
 
-Сигнатуры и ограничения этой страницы сверены с исходным кодом и контрактами. При проверке выполнения нужно указывать версию, коммит и бэкенд. См. полный [контракт синтаксиса JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

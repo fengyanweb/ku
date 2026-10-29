@@ -1,19 +1,21 @@
 ---
-title: Guide du langage
-description: Découvrez les variables, fonctions, flux de contrôle, règles de
-  propriété, modules et erreurs récupérables de Ku.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Guide du langage'
+description: 'Découvrez les variables, fonctions, flux de contrôle, règles de propriété, modules et erreurs récupérables de Ku.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/semantics.md
-  - examples/function.ku
-  - examples/control_flow.ku
-  - examples/result.ku
+  [
+    'docs/syntax.md',
+    'docs/semantics.md',
+    'examples/function.ku',
+    'examples/control_flow.ku',
+    'examples/result.ku',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: fr/v0.0.18/docs/guide/language
 ---
 
-Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Ce guide présente la syntaxe essentielle. Le [contrat syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) et le [contrat sémantique](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) du dépôt restent les références faisant autorité. Ces fragments sont pédagogiques ; consultez la [prise en charge des backends](/fr/v0.0.18/docs/support/) pour les différences.
+Ce guide présente la syntaxe essentielle. Le [référence syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) et le [référence sémantique](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/semantics.md) du dépôt restent les références faisant autorité. Ces fragments sont pédagogiques ; consultez la [prise en charge des backends](/fr/v0.0.18/docs/support/) pour les différences.
 
 ## Variables et types
 
@@ -55,7 +57,11 @@ if (total == 10) {
 
 `for i in 5` parcourt les valeurs de `0` à `4`. `if` et `while` exigent des conditions de type `bool`. Utilisez des accolades pour plusieurs instructions. Les expressions de branchement utilisent `match` ; il n'existe pas de `switch`.
 
+<a id="ownership"></a>
+
 ## Propriété et emprunts en lecture seule
+
+Les valeurs Owned sont déplacées par défaut et libérées de façon déterministe à la fin de leur portée propriétaire. Une copie indépendante demande `.clone()`. Ku n’introduit pas de GC global par traçage ; des structures internes partagées, notamment les environnements de fermeture, peuvent utiliser le comptage de références et avoir un coût d’exécution. L’emprunt synchrone en lecture seule est déclaré par `&name: T`. Un paramètre Owned ordinaire peut déplacer la valeur même s’il ne fait que la lire. L’appel reste `length(value)`, sans `&value` ; les emprunts async ne sont pas pris en charge.
 
 `int`, `float`, `bool` et `null` sont des valeurs Copy. Les chaînes, tableaux, objets, structs, enums, Results et valeurs de fonction sont Owned. Les affectations et les arguments ordinaires déplacent les valeurs possédées par défaut. Utilisez `.clone()` pour obtenir une valeur indépendante. Les Tasks ne peuvent pas être clonées.
 

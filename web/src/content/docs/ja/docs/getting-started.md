@@ -1,12 +1,19 @@
 ---
 title: 'はじめに'
 description: 'Hello Ku を書き、ソースをチェックし、インタープリター実行とコンパイルの違いを理解します。'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
+sources:
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 ---
 
-本書は実験的プレリリース v0.0.18 の確定した範囲を説明します。実際の公開状況とダウンロードは GitHub Releases を確認してください。このページでは、v0.0.17 に存在する基本構文と CLI コマンドを使用します。まず [Ku をインストール](/ja/docs/install/)して、`ku --version` が実行できることを確認してください。
+まず [Ku をインストール](/ja/docs/install/)して、`ku --version` が実行できることを確認してください。
 
 ## 最初のプログラムを書く
 
@@ -81,4 +88,4 @@ ku run
 
 パッケージのエントリーは `ku.mod` で設定します。`ku create --list` で利用可能なテンプレートを一覧表示できます。現在、`ku test` と `ku fmt` コマンドはありません。
 
-続いて、[言語ガイド](/ja/docs/guide/language/)、[トラブルシューティング](/ja/docs/guide/errors/)、[バックエンドの対応範囲](/ja/docs/support/)をご覧ください。ここに示す出力は期待値の例であり、お使いのプラットフォームでのインストール検証に代わるものではありません。
+続いて、[言語ガイド](/ja/docs/guide/language/)、[トラブルシューティング](/ja/docs/guide/errors/)、[バックエンドの対応範囲](/ja/docs/support/)をご覧ください。

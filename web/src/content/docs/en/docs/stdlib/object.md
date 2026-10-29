@@ -2,7 +2,7 @@
 title: Objects
 description: String-key objects, strict lookup, explicit defaults, and JSON dynamic values.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['src/stdlib/object.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 3

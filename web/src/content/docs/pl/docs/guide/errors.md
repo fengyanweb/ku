@@ -1,18 +1,19 @@
 ---
 title: 'Błędy i rozwiązywanie problemów'
 description: 'Diagnozuj błędy instalacji Ku, importów, własności, JSON i możliwości zaplecza.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Diagnostyka kompilatora może się zmieniać podczas eksperymentalnego rozwoju. W zgłoszeniu problemu podaj wersję CLI, commit Git, zaplecze, pełne polecenie i minimalne źródło.
+Diagnostyka kompilatora może się zmieniać podczas eksperymentalnego rozwoju. W zgłoszeniu problemu podaj wersję CLI, commit Git, zaplecze, pełne polecenie i minimalne źródło.
 
 ## Rozpoznaj plik wykonywalny Ku
 
@@ -72,6 +73,8 @@ Pomyślny `ku check` potwierdza wyłącznie przejście sprawdzania frontendu. Na
 
 `ku build --native file.ku` bez `-o` jedynie zapisuje C. Aby skompilować i skonsolidować plik wykonywalny, użyj `ku build --backend c file.ku` i zainstaluj docelowy zestaw narzędzi C.
 
-Błędy bazy danych `execution_unknown` i `execution_completed_without_result` nie mogą powodować automatycznego ponawiania. Zachowaj dowody żądania i operacji biznesowej, a następnie ustal rzeczywisty stan wykonania. Weryfikacja lokalnej witryny nie wymaga połączenia z produkcyjną bazą danych.
+Błędy bazy danych `execution_unknown` i `execution_completed_without_result` nie mogą powodować automatycznego ponawiania. Zachowaj dowody żądania i operacji biznesowej, a następnie ustal rzeczywisty stan wykonania.
 
 Więcej szczegółów: [przewodnik diagnostyczny repozytorium](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).
+
+Błędy JSON mają zgodne domain/code między zapleczami, ale message może się różnić. ku run i runner mogą dodawać json parse failed:, a natywne C nie. Porównuj domain/code, nie całą wiadomość.

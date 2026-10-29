@@ -1,18 +1,13 @@
 ---
 title: Getting started
-description: Write Hello Ku, check your source, and distinguish interpretation
-  from compilation.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+description: Write Hello Ku, check your source, and distinguish interpretation from compilation.
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
+sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.18.md']
 slug: en/v0.0.18/docs/getting-started
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. This page uses basic syntax and CLI commands already present in v0.0.17. [Install Ku](/en/v0.0.18/docs/install/) first and confirm that `ku --version` runs.
+[Install Ku](/en/v0.0.18/docs/install/) first and confirm that `ku --version` reports `ku 0.0.18`.
 
 ## Write your first program
 
@@ -87,4 +82,4 @@ ku run
 
 The package entry is configured in `ku.mod`. `ku create --list` lists available templates. There are currently no `ku test` or `ku fmt` commands.
 
-Continue with the [language guide](/en/v0.0.18/docs/guide/language/), [troubleshooting](/en/v0.0.18/docs/guide/errors/), and [backend support](/en/v0.0.18/docs/support/). The outputs here are expected examples and do not replace installation verification on your platform.
+Continue with the [language guide](/en/v0.0.18/docs/guide/language/), [troubleshooting](/en/v0.0.18/docs/guide/errors/), and [backend support](/en/v0.0.18/docs/support/).

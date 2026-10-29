@@ -22,6 +22,8 @@ sidebar:
 
 `std.http` 提供 HTTP 客户端、路由注册和完整响应对象。下面的服务端和客户端分别保存为两个文件。
 
+下面的服务端与客户端示例使用**解释器（`ku run`）或默认 runner**。native C 支持同步 JSON 响应，但不提供模块级 HTTP 客户端。原生程序可参考[同步 native C 示例](#native-c)或[具名 async handler 示例](#具名-async-native-handler)。
+
 ## 启动服务
 
 保存为 `server.ku`，执行 `ku run server.ku`。运行前确保端口 8080 空闲，结束时按 Ctrl+C。
@@ -101,7 +103,7 @@ HTTP 404、500 等状态仍然返回 `Ok(HttpResponse)`，应检查 `response.st
 
 ## 客户端接口
 
-下列签名中的 `HttpResponse` 表示响应对象，不是可以直接写在参数上的公开名义类型。
+下列签名描述客户端接口与响应值。专门的 [native async handler 路径](#具名-async-native-handler)也接受 `HttpRequest` 和 `HttpResponse` 类型注解，但不表示模块级 HTTP 客户端可用于 native。
 
 | 调用                           | 返回            | 作用                                           |
 | ------------------------------ | --------------- | ---------------------------------------------- |
@@ -149,7 +151,7 @@ HTTP 404、500 等状态仍然返回 `Ok(HttpResponse)`，应检查 `response.st
 | `req.headers` | 字符串值对象 | 请求 header，名称小写 |
 | `req.body`    | str          | UTF-8 请求体          |
 
-解释器中可选查询参数使用 `req.query.get_or("q", "")`。普通缺键读取在解释器中报错，而 native HTTP 请求映射的字段读取目前在缺键时返回空字符串。不要依赖这两条路径一致地拒绝缺失必填字段。使用内联 `fn(req)`，检查器才能从路由上下文识别请求字段。目前没有公开的 `HttpRequest` 名义参数类型。
+解释器中可选查询参数使用 `req.query.get_or("q", "")`。普通缺键读取在解释器中报错，而 native HTTP 请求映射的字段读取目前在缺键时返回空字符串。不要依赖这两条路径一致地拒绝缺失必填字段。使用内联 `fn(req)`，检查器才能从路由上下文识别请求字段。解释器和默认 runner 的普通 handler 路径没有公开的 `HttpRequest` 名义参数类型；native async handler 的类型注解见下文。
 
 ## 响应与状态码
 
@@ -224,6 +226,8 @@ fn main(): null! {
 ```
 
 listener 持有绑定的 socket，直到开始运行、显式关闭或最后一个持有它的值离开作用域。运行或关闭后不能重新启动。`close` 不是正在运行服务的并发停止句柄。
+
+<span id="native-c"></span>
 
 ## 执行支持
 

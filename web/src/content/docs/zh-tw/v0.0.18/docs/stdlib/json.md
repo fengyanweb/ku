@@ -1,20 +1,21 @@
 ---
 title: JSON 參考
 description: Ku JSON 編碼、解碼、KuValue 轉換、錯誤標識和後端支援範圍。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/json.rs
-  - src/stdlib/metadata.rs
-  - docs/syntax.md
-  - examples/json.ku
-  - docs/v0.0.18.md
+  [
+    'src/stdlib/json.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'examples/json.ku',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: zh-tw/v0.0.18/docs/stdlib/json
 ---
 
-> 以下 v0.0.18 新增發布資訊暫以英文提供；既有譯文保留。 [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` 提供 JSON 編解碼。`json.encode` 只讀編碼輸入，`json.decode` 產生獨立持有內容的 `KuValue`，兩者皆返回 Result。`stringify`、`parse` 與 `try_parse` 保留相容。
 
 ## 匯入與介面
 
@@ -27,24 +28,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | 唯讀編碼，回傳新的精簡 JSON 文字   |
 | `json.parse(text:str)`       | `KuValue!` | 嚴格解析，回傳獨立持有內容的動態值 |
 | `json.try_parse(text:str)`   | `KuValue!` | `parse` 的兼容別名                 |
-| `json.encode(&value:any)`    | `str!`     | 目前開發分支中 `stringify` 的別名  |
-| `json.decode(text:str)`      | `KuValue!` | 目前開發分支中 `parse` 的別名      |
+| `json.encode(&value:any)`    | `str!`     | 本版 `stringify` 的別名            |
+| `json.decode(text:str)`      | `KuValue!` | 本版 `parse` 的別名                |
 
 `!` 表示回傳 Result。用 `?` 傳播錯誤，或用 `try/catch` 處理；編碼不會消費或修改輸入。
 
 ## 編碼與讀取
 
-以下是完整基礎範例；更廣泛的開發分支回歸範例見[examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku)。
+以下為完整基本範例；更多用法見 [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -76,7 +77,7 @@ Ku
 | 重復物件鍵  | 解析保留最後一個值                                             |
 | 鍵順序      | 編碼按 UTF-8 位元組序穩定排序                                  |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` 可能編碼為 `1`。浮點值若會產生超出 int64 的整數文字，編碼器會補 `.0`，因此 `1e20` 編碼為 `100000000000000000000.0` 並能再次解碼。有限 binary64 不保留原始寫法、浮點標籤或負零符號；此修正已包含於本版。
 
 ## 錯誤
 
@@ -86,4 +87,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 解釋器、預設打包 runner 和同步 native C 已有 JSON 實作。**受限 native Task 子集與 LLVM 不支援 JSON。** 預設 runner 的 import 原始碼依賴仍存在，不能因 JSON 支援就宣稱完整獨立打包。
 
-本頁簽名與邊界來自原始碼和規範核對；執行驗證需綁定具體版本、commit 與後端。完整行為見[JSON 語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json)。
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md#127-json).

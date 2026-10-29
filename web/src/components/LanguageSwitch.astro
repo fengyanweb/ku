@@ -50,9 +50,12 @@ const t = translate(locale);
       return (
         <li>
           <a
-            href={destination.path}
+            href={
+              destination.path +
+              (destination.fallback ? '?ku_language_fallback=1' : '')
+            }
             lang={localeDefinitions[key].lang}
-            hreflang={localeDefinitions[key].lang}
+            hreflang={localeDefinitions[destination.locale].lang}
             aria-current={key === locale ? 'true' : undefined}
             data-ku-language={key}
             data-ku-anchors={JSON.stringify(destination.anchors)}

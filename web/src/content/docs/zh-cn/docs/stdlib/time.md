@@ -2,16 +2,8 @@
 title: 时间与计时
 description: 使用 std.time 读取时钟、处理日期格式、计算时长和等待。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
-sources:
-  [
-    'src/stdlib/time.rs',
-    'src/stdlib/metadata.rs',
-    'docs/syntax.md',
-    'src/ir/task_lower.rs',
-    'src/backend/c.rs',
-    'src/runtime/interpreter.rs',
-  ]
+verifiedAt: '2026-10-23'
+sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 6
 ---
@@ -115,8 +107,6 @@ time.sleep(duration:Duration): null!
 
 `time.date()` 直接返回本地今天的日期；`time.date(value)?` 按本地时区提取日期，与 `time.date(value, "local")?` 等价。带参数的 `date` 重载均返回 Result，非法 Time、超出日历范围或非法时区会返回错误。
 
-单参数重载的 Result 检查规则在 `v0.0.18-r1` 修订版中修复。使用初版 v0.0.18 时，请调用 `time.date(value, "local")?`。
-
 `time.add/sub` 按时长移动时间点，`diff(left, right)` 计算 `left - right`，`compare` 返回 -1、0 或 1。`weekday` 用 1 表示周一、7 表示周日。`parts` 返回 `kind`、`year`、`month`、`day`、`hour`、`minute`、`second`、`millis`（毫秒分量）、`weekday`、`zone`。
 
 ## 格式与时区
@@ -147,7 +137,7 @@ time.sleep(duration:Duration): null!
 
 完整日历和时长 API 支持 `ku run` 与默认打包 runner。同步 native C 当前支持 `now()`、`instant()`、`elapsed(Time)`、`millis()` / `millis(Time)`（Time 来自 `instant()`）和 `steady_millis()`，不支持完整日历解析、格式化、自造 Time 对象与同步 sleep。native Task 有单独受限的整数 sleep 路径；LLVM 不提供完整时间库。
 
-<a id="native-task-wait"></a>
+<span id="native-task-wait"></span>
 
 ## Native Task 等待
 

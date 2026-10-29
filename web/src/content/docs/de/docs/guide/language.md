@@ -1,8 +1,8 @@
 ---
 title: 'Sprachleitfaden'
 description: 'Lernen Sie Ku-Variablen, Funktionen, Kontrollfluss, Ownership, Module und behebbare Fehler kennen.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Dieser Leitfaden führt die grundlegende Syntax ein. Maßgeblich bleiben der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) und der [Semantikvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) des Repositorys. Die Fragmente dienen dem Lernen; Unterschiede stehen unter [Backend-Unterstützung](/de/docs/support/).
+Dieser Leitfaden führt die grundlegende Syntax ein. Maßgeblich bleiben der [Syntaxreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) und der [Semantikreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) des Repositorys. Die Fragmente dienen dem Lernen; Unterschiede stehen unter [Backend-Unterstützung](/de/docs/support/).
 
 ## Variablen und Typen
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` iteriert von `0` bis einschließlich `4`. `if` und `while` erfordern Bedingungen vom Typ `bool`. Verwenden Sie für mehrere Anweisungen geschweifte Klammern. Verzweigungsausdrücke verwenden `match`; ein `switch` gibt es nicht.
 
+<a id="ownership"></a>
+
 ## Ownership und schreibgeschütztes Ausleihen
+
+Owned-Werte werden standardmäßig verschoben und beim Ende ihres besitzenden Gültigkeitsbereichs deterministisch gedroppt. Unabhängige Kopien benötigen `.clone()`. Ku verwendet keinen globalen Tracing-GC; gemeinsam genutzte interne Strukturen wie Closure-Umgebungen können jedoch Referenzzählung und Laufzeitkosten verursachen. Synchrone schreibgeschützte Leihen werden mit `&name: T` deklariert. Gewöhnliche Owned-Parameter können auch beim bloßen Lesen verschoben werden. Aufrufe bleiben `length(value)`, ohne `&value`; async-Leihen werden nicht unterstützt.
 
 `int`, `float`, `bool` und `null` sind Copy-Werte. Strings, Arrays, Objekte, Structs, Enums, Results und Funktionswerte sind Owned. Zuweisungen und gewöhnliche Argumente verschieben Owned-Werte standardmäßig. Verwenden Sie `.clone()`, wenn Sie einen unabhängigen Wert benötigen. Tasks können nicht geklont werden.
 

@@ -1,21 +1,20 @@
 ---
 title: 'Αναφορά JSON'
 description: 'Κωδικοποίηση και αποκωδικοποίηση JSON στο Ku, μετατροπή KuValue, κωδικοί σφαλμάτων και υποστήριξη backend.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/json.rs',
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.19.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-> Οι νέες πληροφορίες για τη v0.0.18 ακολουθούν προς το παρόν στα αγγλικά· η υπόλοιπη μετάφραση διατηρείται. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+Το `std.json` κωδικοποιεί και αποκωδικοποιεί JSON. Το `json.encode` δανείζεται την είσοδο μόνο για ανάγνωση· το `json.decode` δημιουργεί ανεξάρτητα κατεχόμενο `KuValue`. Και τα δύο επιστρέφουν Result. Τα `stringify`, `parse`, `try_parse` διατηρούνται για συμβατότητα.
 
 ## Εισαγωγή και διεπαφές
 
@@ -28,24 +27,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | Κωδικοποίηση μόνο για ανάγνωση σε νέο συμπαγές κείμενο JSON |
 | `json.parse(text:str)`       | `KuValue!` | Αυστηρή ανάλυση σε δυναμική τιμή με ανεξάρτητη κυριότητα    |
 | `json.try_parse(text:str)`   | `KuValue!` | Ψευδώνυμο συμβατότητας για το `parse`                       |
-| `json.encode(&value:any)`    | `str!`     | Ψευδώνυμο του `stringify` στον κλάδο ανάπτυξης              |
-| `json.decode(text:str)`      | `KuValue!` | Ψευδώνυμο του `parse` στον κλάδο ανάπτυξης                  |
+| `json.encode(&value:any)`    | `str!`     | Ψευδώνυμο του `stringify` που περιλαμβάνεται στην έκδοση    |
+| `json.decode(text:str)`      | `KuValue!` | Ψευδώνυμο του `parse` που περιλαμβάνεται στην έκδοση        |
 
 Το `!` δηλώνει Result. Χρησιμοποιήστε `?` για προώθηση σφαλμάτων ή `try/catch` για χειρισμό τους. Η κωδικοποίηση δεν καταναλώνει ούτε τροποποιεί την είσοδο.
 
 ## Κωδικοποίηση και ανάγνωση τιμών
 
-Αυτό είναι πλήρες βασικό παράδειγμα. Ο κλάδος ανάπτυξης έχει ευρύτερο παράδειγμα ελέγχου παλινδρόμησης στο [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
+Πλήρες βασικό παράδειγμα· περισσότερες χρήσεις στο [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -77,7 +76,7 @@ Ku
 | Διπλά κλειδιά αντικειμένου | Η ανάλυση κρατά την τελευταία τιμή                                                              |
 | Σειρά κλειδιών             | Η κωδικοποίηση ταξινομεί βάσει σειράς byte UTF-8                                                |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+Το `1.0` μπορεί να κωδικοποιηθεί ως `1`. Αν το ακέραιο κείμενο ενός float υπερβαίνει int64, προστίθεται `.0`: το `1e20` γίνεται `100000000000000000000.0` και αποκωδικοποιείται ξανά. Πεπερασμένα binary64 δεν διατηρούν αρχική γραφή, ετικέτα float ή πρόσημο αρνητικού μηδενός. Η διόρθωση περιλαμβάνεται.
 
 ## Σφάλματα
 
@@ -87,4 +86,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 Ο διερμηνευτής, ο προεπιλεγμένος συσκευασμένος εκκινητής και ο σύγχρονος εγγενής backend C διαθέτουν υλοποιήσεις JSON. **Το περιορισμένο εγγενές υποσύνολο Task και το LLVM δεν υποστηρίζουν JSON.** Οι εισαγωγές του προεπιλεγμένου εκκινητή εξακολουθούν να εξαρτώνται από τις θέσεις πηγής· η υποστήριξη JSON δεν συνεπάγεται πλήρως ανεξάρτητο πακέτο.
 
-Οι υπογραφές και τα όρια αυτής της σελίδας ελέγχθηκαν με πηγές και συμβάσεις. Η επαλήθευση εκτέλεσης πρέπει να ονομάζει έκδοση, commit και backend. Δείτε την πλήρη [σύμβαση σύνταξης JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

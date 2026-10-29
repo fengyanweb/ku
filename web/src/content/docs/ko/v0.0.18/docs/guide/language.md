@@ -1,18 +1,21 @@
 ---
-title: 언어 안내
-description: Ku의 변수, 함수, 제어 흐름, 소유권, 모듈, 복구 가능한 오류를 배웁니다.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: '언어 안내'
+description: 'Ku의 변수, 함수, 제어 흐름, 소유권, 모듈, 복구 가능한 오류를 배웁니다.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/semantics.md
-  - examples/function.ku
-  - examples/control_flow.ku
-  - examples/result.ku
+  [
+    'docs/syntax.md',
+    'docs/semantics.md',
+    'examples/function.ku',
+    'examples/control_flow.ku',
+    'examples/result.ku',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ko/v0.0.18/docs/guide/language
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 이 안내는 핵심 문법을 소개합니다. 저장소의 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)과 [의미 계약](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md)이 기준입니다. 아래는 학습용 코드 조각입니다. 차이점은 [백엔드 지원](/ko/v0.0.18/docs/support/)을 참고하세요.
+이 안내는 핵심 문법을 소개합니다. 저장소의 [문법 명세](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md)과 [의미 명세](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/semantics.md)이 기준입니다. 아래는 학습용 코드 조각입니다. 차이점은 [백엔드 지원](/ko/v0.0.18/docs/support/)을 참고하세요.
 
 ## 변수와 타입
 
@@ -54,7 +57,11 @@ if (total == 10) {
 
 `for i in 5`는 `0`부터 `4`까지 반복합니다. `if`와 `while` 조건에는 `bool`이 필요합니다. 여러 문장은 중괄호로 묶습니다. 분기 표현식은 `match`를 사용하며 `switch`는 없습니다.
 
+<a id="ownership"></a>
+
 ## 소유권과 읽기 전용 대여
+
+Owned 값은 기본 이동하며 소유 범위가 끝나면 결정적으로 drop됩니다. 독립 복제에는 `.clone()`이 필요합니다. 전역 추적 GC를 도입하지 않지만 클로저 환경 같은 내부 공유 구조는 참조 카운팅과 런타임 비용을 가질 수 있습니다. 동기 읽기 전용 빌림은 `&name: T`로 선언합니다. 일반 Owned 매개변수는 읽기만 해도 값을 이동할 수 있습니다. 호출은 `length(value)`이며 `&value`가 아닙니다. async 빌림은 지원하지 않습니다.
 
 `int`, `float`, `bool`, `null`은 Copy 값입니다. 문자열, 배열, 객체, 구조체, 열거형, Result, 함수 값은 Owned입니다. 대입과 일반 인자는 기본적으로 소유 값을 이동합니다. 독립적인 값이 필요하면 `.clone()`을 사용하세요. Task는 복제할 수 없습니다.
 

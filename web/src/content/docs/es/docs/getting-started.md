@@ -1,12 +1,19 @@
 ---
 title: 'Primeros pasos'
 description: 'Escribe Hello Ku, comprueba tu código y distingue la interpretación de la compilación.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
+sources:
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Esta página utiliza sintaxis básica y comandos de CLI ya presentes en v0.0.17. Primero [instala Ku](/es/docs/install/) y confirma que `ku --version` funciona.
+Primero [instala Ku](/es/docs/install/) y confirma que `ku --version` funciona.
 
 ## Escribe tu primer programa
 
@@ -81,4 +88,4 @@ ku run
 
 El punto de entrada del paquete se configura en `ku.mod`. `ku create --list` enumera las plantillas disponibles. Actualmente no existen los comandos `ku test` ni `ku fmt`.
 
-Continúa con la [guía del lenguaje](/es/docs/guide/language/), la [resolución de problemas](/es/docs/guide/errors/) y la [compatibilidad de backends](/es/docs/support/). Las salidas mostradas aquí son ejemplos esperados y no sustituyen la verificación de la instalación en tu plataforma.
+Continúa con la [guía del lenguaje](/es/docs/guide/language/), la [resolución de problemas](/es/docs/guide/errors/) y la [compatibilidad de backends](/es/docs/support/).

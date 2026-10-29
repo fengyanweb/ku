@@ -2,7 +2,7 @@
 title: Files and directories
 description: Read and write UTF-8 files, check paths, and list directories with std.fs.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['src/stdlib/fs.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 5

@@ -1,21 +1,20 @@
 ---
 title: 'Referência de JSON'
 description: 'Codificação e decodificação JSON no Ku, conversão KuValue, códigos de erro e suporte dos backends.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/json.rs',
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.19.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-> As atualizações de v0.0.18 abaixo estão por enquanto em inglês; o restante da tradução foi preservado. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` codifica e decodifica JSON. `json.encode` empresta a entrada somente para leitura; `json.decode` cria um `KuValue` com propriedade independente. Ambos retornam Result. `stringify`, `parse` e `try_parse` continuam compatíveis.
 
 ## Importação e interfaces
 
@@ -28,24 +27,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`     | Codificação somente para leitura em novo texto JSON compacto      |
 | `json.parse(text:str)`       | `KuValue!` | Análise estrita em um valor dinâmico com propriedade independente |
 | `json.try_parse(text:str)`   | `KuValue!` | Alias de compatibilidade de `parse`                               |
-| `json.encode(&value:any)`    | `str!`     | Alias de `stringify` no ramo de desenvolvimento                   |
-| `json.decode(text:str)`      | `KuValue!` | Alias de `parse` no ramo de desenvolvimento                       |
+| `json.encode(&value:any)`    | `str!`     | Alias de `stringify` incluído nesta versão                        |
+| `json.decode(text:str)`      | `KuValue!` | Alias de `parse` incluído nesta versão                            |
 
 `!` indica Result. Use `?` para propagar erros ou `try/catch` para tratá-los. A codificação não consome nem altera a entrada.
 
 ## Codifique e leia valores
 
-Este é um exemplo básico completo. O ramo de desenvolvimento contém um exemplo de regressão mais abrangente em [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
+Exemplo básico completo; mais usos em [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -77,7 +76,7 @@ As entradas suportadas incluem strings, booleanos, inteiros, números finitos de
 | Chaves de objeto duplicadas | A análise conserva o último valor                                                                    |
 | Ordem das chaves            | A codificação ordena pela ordem de bytes UTF-8                                                       |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` pode ser codificado como `1`. Se o texto inteiro de um float ultrapassar int64, o codificador acrescenta `.0`: `1e20` vira `100000000000000000000.0` e pode ser decodificado novamente. Valores binary64 finitos não preservam grafia original, marca float ou sinal do zero negativo. A correção está incluída.
 
 ## Erros
 
@@ -87,4 +86,4 @@ Os erros recuperáveis usam o domínio `json`. Os códigos comuns são `parse_er
 
 O interpretador, o executor empacotado padrão e o backend C nativo síncrono têm implementações de JSON. **O subconjunto Task nativo restrito e LLVM não suportam JSON.** As importações do executor padrão ainda dependem das localizações dos fontes; suporte a JSON não implica um pacote totalmente independente.
 
-As assinaturas e os limites desta página foram conferidos no código e nos contratos. A verificação de execução deve indicar versão, commit e backend. Consulte o [contrato completo da sintaxe JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

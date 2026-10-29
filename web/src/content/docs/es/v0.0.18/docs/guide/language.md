@@ -1,19 +1,21 @@
 ---
-title: Guía del lenguaje
-description: Aprende las variables, funciones, flujo de control, propiedad,
-  módulos y errores recuperables de Ku.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Guía del lenguaje'
+description: 'Aprende las variables, funciones, flujo de control, propiedad, módulos y errores recuperables de Ku.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/semantics.md
-  - examples/function.ku
-  - examples/control_flow.ku
-  - examples/result.ku
+  [
+    'docs/syntax.md',
+    'docs/semantics.md',
+    'examples/function.ku',
+    'examples/control_flow.ku',
+    'examples/result.ku',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: es/v0.0.18/docs/guide/language
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Esta guía presenta la sintaxis esencial. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/semantics.md) del repositorio siguen siendo las referencias autorizadas. Son fragmentos didácticos; consulta las diferencias en la [compatibilidad de backends](/es/v0.0.18/docs/support/).
+Esta guía presenta la sintaxis esencial. El [referencia de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) y el [referencia semántica](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/semantics.md) del repositorio siguen siendo las referencias autorizadas. Son fragmentos didácticos; consulta las diferencias en la [compatibilidad de backends](/es/v0.0.18/docs/support/).
 
 ## Variables y tipos
 
@@ -55,7 +57,11 @@ if (total == 10) {
 
 `for i in 5` itera desde `0` hasta `4`. `if` y `while` requieren condiciones de tipo `bool`. Usa llaves para varias instrucciones. Las expresiones de ramificación utilizan `match`; no existe `switch`.
 
+<a id="ownership"></a>
+
 ## Propiedad y préstamos de solo lectura
+
+Los valores Owned se mueven por defecto y se liberan de forma determinista al terminar su ámbito propietario. Las copias independientes requieren `.clone()`. Ku no incorpora un GC global por trazado; estructuras internas compartidas, como entornos de cierres, pueden usar conteo de referencias y tener costes de ejecución. Los préstamos síncronos de solo lectura se declaran con `&name: T`. Un parámetro Owned normal puede mover el valor aunque solo lo lea. La llamada sigue siendo `length(value)`, sin `&value`; no se admiten préstamos async.
 
 `int`, `float`, `bool` y `null` son valores Copy. Las cadenas, los arrays, objetos, structs, enums, Results y valores de función son Owned. Las asignaciones y los argumentos normales mueven los valores con propiedad de forma predeterminada. Utiliza `.clone()` cuando necesites un valor independiente. Los Tasks no pueden clonarse.
 

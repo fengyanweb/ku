@@ -1,8 +1,8 @@
 ---
 title: 語言指南
 description: 學習 Ku 的變數、函式、控制流、所有權、模組與可恢復錯誤。
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡介紹核心寫法，完整規則以倉庫[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[語義合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)為準。下列為教學片段，後端差異見[支援矩陣](/zh-tw/docs/support/)。
+這裡介紹核心寫法，完整規則以倉庫[語法參考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[語義參考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)為準。下列為教學片段，後端差異見[支援矩陣](/zh-tw/docs/support/)。
 
 ## 變數與型別
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` 遍歷 `0` 到 `4`。`if` 與 `while` 條件必須是 `bool`；多語句 body 使用花括號。分支表達式使用 `match`，沒有 `switch`。
 
+<a id="ownership"></a>
+
 ## 所有權與唯讀借用
+
+Owned 值預設 move，擁有者作用域結束時確定性 drop；獨立副本須顯式 `.clone()`。Ku 不引入全域 tracing GC，但閉包環境等內部共享結構可能使用參考計數，仍有執行期管理成本。同步只讀借用由 `&name: T` 參數簽名宣告；普通 Owned 參數即使只讀仍可能移動值。呼叫仍寫 `length(value)`，不寫 `&value`；async 借用不支援。
 
 `int`、`float`、`bool`、`null` 是 Copy 值。字串、陣列、物件、結構體、enum、Result 與函式值按 Owned 處理，賦值和普通傳參預設 move；需要保留獨立值時顯式 `.clone()`。Task 不可 clone。
 

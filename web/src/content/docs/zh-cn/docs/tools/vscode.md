@@ -2,7 +2,7 @@
 title: VS Code
 description: 安装 Ku 插件，配置运行、检查、格式化和代码补全。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'editors/vscode-ku/package.json',
@@ -17,12 +17,12 @@ Ku 插件为 VS Code 1.85 及以上版本提供语法高亮、代码片段、补
 
 ## 安装插件
 
-从 [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) 下载对应系统的压缩包并解压。每个平台包都包含 `ku-language-0.0.19.vsix` 和 CLI。VSIX 位于压缩包内，没有单独的 Release 下载文件；实际附件以对应发行页为准。
+从 [0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) 下载对应系统的压缩包并解压。每个平台包都包含 `ku-language-0.0.19.vsix` 和 CLI。VSIX 位于压缩包内，没有单独的 Release 下载文件。
 
 在 VS Code 中打开**扩展 → … → 从 VSIX 安装…**，选择该文件，然后执行 **Developer: Reload Window**。也可以在解压目录执行：
 
 ```sh
-code --install-extension ./ku-language-0.0.19.vsix
+code --install-extension ./ku-language-0.0.19.vsix --force
 ```
 
 这种方式直接安装已发布的 VSIX，不依赖 Marketplace 上架。
@@ -57,7 +57,7 @@ fn main() {
 | Ku: Check Current File | 检查语法与类型                      |
 | Ku: Show IR            | 查看中间表示                        |
 | Ku: Build Current File | 使用 CLI 默认构建路径编译           |
-| Ku: Build Native C     | 使用 native C 后端编译              |
+| Ku: Build Native C     | 生成 C 源码（不链接可执行文件）     |
 | Ku: Package GC         | 执行 CLI 的包缓存清理命令           |
 | Ku: Show Version       | 查看实际找到的 CLI 版本             |
 
@@ -72,3 +72,5 @@ fn main() {
 ## 更新
 
 安装与你使用的 Ku 版本对应的 VSIX，并重新加载 VS Code。公开的 v0.0.19 压缩包包含该版发布时的插件。仓库后续对补全、悬浮说明的修改，需要重新构建和安装插件才会生效，不会自动改变已经下载的 VSIX。
+
+需要生成可执行文件时，在终端运行 `ku build --backend c main.ku -o app`；Windows 使用 `app.exe`。

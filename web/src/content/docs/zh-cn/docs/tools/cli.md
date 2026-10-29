@@ -2,15 +2,8 @@
 title: '命令行工具'
 description: 'Ku 检查、运行、构建、项目与包命令。'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
-sources:
-  [
-    'src/cli.rs',
-    'docs/package.md',
-    'docs/process-execution.md',
-    'src/service_supervision.rs',
-    'src/backend/c_http_runtime.c',
-  ]
+verifiedAt: '2026-10-23'
+sources: ['src/cli.rs', 'docs/package.md', 'docs/process-execution.md']
 ---
 
 本页列出日常开发命令。先运行 `ku --version` 确认版本，`ku --help` 查看实际选项。

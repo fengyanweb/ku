@@ -1,18 +1,19 @@
 ---
 title: 'Fehler und Fehlerbehebung'
 description: 'Diagnostizieren Sie Fehler bei Installation, Imports, Ownership, JSON und Backend-Fähigkeiten von Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Compilerdiagnosen können sich während der experimentellen Entwicklung ändern. Geben Sie bei Problemmeldungen CLI-Version, Git-Commit, Backend, vollständigen Befehl und minimalen Quelltext an.
+Compilerdiagnosen können sich während der experimentellen Entwicklung ändern. Geben Sie bei Problemmeldungen CLI-Version, Git-Commit, Backend, vollständigen Befehl und minimalen Quelltext an.
 
 ## Die ausführbare Ku-Datei identifizieren
 
@@ -72,6 +73,8 @@ Ein erfolgreiches `ku check` belegt nur, dass die Frontend-Prüfung erfolgreich 
 
 `ku build --native file.ku` ohne `-o` schreibt nur C. Zum Kompilieren und Linken einer ausführbaren Datei verwenden Sie `ku build --backend c file.ku` und installieren die C-Toolchain für das Zielsystem.
 
-Die Datenbankfehler `execution_unknown` und `execution_completed_without_result` dürfen keine automatische Wiederholung auslösen. Bewahren Sie Anfrage- und Geschäftsnachweise auf und klären Sie zuerst den tatsächlichen Ausführungszustand. Zur Prüfung der lokalen Website ist keine Verbindung zu einer Produktionsdatenbank erforderlich.
+Die Datenbankfehler `execution_unknown` und `execution_completed_without_result` dürfen keine automatische Wiederholung auslösen. Bewahren Sie Anfrage- und Geschäftsnachweise auf und klären Sie zuerst den tatsächlichen Ausführungszustand.
 
 Weitere Einzelheiten finden Sie im [Diagnoseleitfaden des Repositorys](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).
+
+Bei JSON-Fehlern stimmen domain/code zwischen den Backends überein, die genaue message kann abweichen. ku run und der Standard-Runner können den Präfix json parse failed: ausgeben, natives C nicht. Prüfen Sie domain/code statt vollständiger Meldungstexte.

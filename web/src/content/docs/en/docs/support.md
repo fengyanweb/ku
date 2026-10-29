@@ -38,7 +38,7 @@ See [HTTP](/en/docs/stdlib/http/), [JSON](/en/docs/stdlib/json/), [time](/en/doc
 
 An async call submits work and returns a one-use Task handle. `await` obtains its result; it does not define when execution first starts. The native Task path supports its listed primitive/string/flat-array operations, Results, Task start/move/await, timers and selected bounded I/O. It also supports named async HTTP handlers and the narrowly documented PG capture path. This is not full M:N execution, every async closure/capture combination, general JSON manipulation or a universal network scheduler.
 
-Owned inputs, cancellation, shared cleanup deadlines and supported operations still apply. A successful arithmetic Task does not establish support for a whole library. Follow the [Task guide](/en/docs/guide/concurrency/) and the [concurrency contract](https://github.com/fengyanweb/ku/blob/main/docs/concurrency.md).
+Owned inputs, cancellation, shared cleanup deadlines and supported operations still apply. A successful arithmetic Task does not establish support for a whole library. Follow the [Task guide](/en/docs/guide/concurrency/) and the [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md).
 
 ## Application budgets and process limits
 

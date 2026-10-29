@@ -1,21 +1,20 @@
 ---
 title: 'مرجع JSON'
 description: 'کدگذاری و کدگشایی JSON در Ku، تبدیل KuValue، کدهای خطا و پشتیبانی از مسیرهای اجرا.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/json.rs',
     'src/stdlib/metadata.rs',
     'docs/syntax.md',
     'examples/json.ku',
-    'docs/v0.0.19.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-> اطلاعات تازهٔ v0.0.18 در ادامه فعلاً به انگلیسی آمده است؛ بقیهٔ ترجمه حفظ می‌شود. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
-
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` برای کدگذاری و کدگشایی JSON است. `json.encode` ورودی را فقط‌خواندنی قرض می‌گیرد؛ `json.decode` یک `KuValue` با مالکیت مستقل می‌سازد. هر دو Result برمی‌گردانند. نام‌های سازگار `stringify`، `parse` و `try_parse` حفظ شده‌اند.
 
 ## واردسازی و رابط‌ها
 
@@ -28,24 +27,24 @@ import json from "std.json"
 | `json.stringify(&value:any)` | `str!`      | کدگذاری فقط‌خواندنی به متن JSON فشردهٔ جدید         |
 | `json.parse(text:str)`       | `KuValue!`  | تجزیهٔ سخت‌گیرانه به مقدار پویای دارای مالکیت مستقل |
 | `json.try_parse(text:str)`   | `KuValue!`  | نام مستعار سازگار برای `parse`                      |
-| `json.encode(&value:any)`    | `str!`      | نام مستعار `stringify` در شاخهٔ توسعه               |
-| `json.decode(text:str)`      | `KuValue!`  | نام مستعار `parse` در شاخهٔ توسعه                   |
+| `json.encode(&value:any)`    | `str!`      | نام مستعار `stringify` موجود در این نسخه            |
+| `json.decode(text:str)`      | `KuValue!`  | نام مستعار `parse` موجود در این نسخه                |
 
 `!` نشان‌دهندهٔ Result است. از `?` برای انتقال خطا یا `try/catch` برای رسیدگی استفاده کنید. کدگذاری ورودی را مصرف یا تغییر نمی‌دهد.
 
 ## کدگذاری و خواندن مقدارها
 
-این یک نمونهٔ پایهٔ کامل است. شاخهٔ توسعه در [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku) نمونهٔ بازگشت‌سنجی گسترده‌تری دارد.
+نمونهٔ پایهٔ کامل؛ کاربردهای بیشتر در [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -77,7 +76,7 @@ Ku
 | کلیدهای تکراری شیء | تجزیه آخرین مقدار را نگه می‌دارد                                                    |
 | ترتیب کلید         | کدگذاری بر اساس ترتیب بایت UTF-8 مرتب می‌کند                                        |
 
-A float such as `1.0` may encode as `1`. When an integer-looking float is outside int64, the encoder adds `.0` to keep decoding on the float path: `1e20` encodes as `100000000000000000000.0` and decodes again. Finite binary64 values do not preserve original spelling, a float tag or the sign of negative zero.
+`1.0` ممکن است به `1` کدگذاری شود. اگر نمایش صحیح float از int64 بیرون باشد، کدگذار `.0` می‌افزاید: `1e20` به `100000000000000000000.0` تبدیل می‌شود و دوباره کدگشایی می‌شود. binary64 متناهی نگارش اصلی، برچسب float و علامت صفر منفی را حفظ نمی‌کند. این اصلاح در نسخه موجود است.
 
 ## خطاها
 
@@ -87,4 +86,4 @@ A float such as `1.0` may encode as `1`. When an integer-looking float is outsid
 
 مفسر، اجراکنندهٔ بسته‌بندی‌شدهٔ پیش‌فرض و مسیر C بومی همگام، پیاده‌سازی JSON دارند. **زیرمجموعهٔ محدود Task بومی و LLVM از JSON پشتیبانی نمی‌کنند.** واردسازی در اجراکنندهٔ پیش‌فرض همچنان به محل کد منبع وابسته است؛ پشتیبانی JSON به معنای بستهٔ کاملاً مستقل نیست.
 
-امضاها و محدودیت‌های این صفحه با کد منبع و قراردادها تطبیق داده شده‌اند. بررسی اجرا باید نسخه، commit و مسیر اجرا را مشخص کند. [قرارداد کامل نحو JSON](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json) را ببینید.
+[std.json](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md#127-json).

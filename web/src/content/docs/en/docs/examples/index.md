@@ -3,14 +3,7 @@ title: 'Examples'
 description: 'Find runnable Ku examples by task.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
-sources:
-  [
-    'examples/README.md',
-    'examples/http_server.ku',
-    'examples/json.ku',
-    'tests/fixtures/http_pg_lifecycle_async.ku',
-    'src/ir/task_lower.rs',
-  ]
+sources: ['examples/README.md', 'examples/http_server.ku', 'examples/json.ku']
 ---
 
 Examples are organized by task. Each linked page supplies a complete program, execution instructions and backend requirements. File, server and database prerequisites are stated explicitly.
@@ -28,7 +21,7 @@ Examples are organized by task. Each linked page supplies a complete program, ex
 | Database queries            | [PG / Redis / MySQL](/en/docs/stdlib/database/); native C and real services      |
 | Binary data and TCP         | [bytes](/en/docs/stdlib/bytes/) / [net](/en/docs/stdlib/net/); native C          |
 
-The repository's [examples directory](https://github.com/fengyanweb/ku/tree/main/examples) contains larger examples. Long-running services, load generators and database programs have their own prerequisites; do not run the entire directory as an unconditional batch.
+The repository's [examples directory](https://github.com/fengyanweb/ku/tree/v0.0.19/examples) contains larger examples.
 
 ## Native Task examples
 

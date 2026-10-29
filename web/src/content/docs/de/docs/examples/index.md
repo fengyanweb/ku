@@ -1,12 +1,12 @@
 ---
 title: 'Beispiele (English)'
-description: 'Runnable examples documented in English.'
+description: 'Die erweiterten Beispiele liegen derzeit auf Englisch vor. Die verlinkten englischen Seiten nennen Backend und benötigte Dateien, Server oder Datenbanken.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
-sources: ['examples/README.md']
+sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
 ---
 
-The expanded examples are currently documented in English. Each reference lists the required backend and any file, server or database prerequisites.
+Die erweiterten Beispiele liegen derzeit auf Englisch vor. Die verlinkten englischen Seiten nennen Backend und benötigte Dateien, Server oder Datenbanken. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).
 
 - [Hello Ku](/en/docs/getting-started/)
 - [HTTP server and client](/en/docs/stdlib/http/)

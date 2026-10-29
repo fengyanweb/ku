@@ -38,7 +38,7 @@ sources:
 
 调用 async 函数会提交任务并返回一次性 Task 句柄；`await` 取回结果，不规定任务何时首次执行。native Task 路径支持已列明的基础类型、字符串、平面数组、Result、Task 启动/移动/等待、定时器和部分有界 I/O，也支持具名 async HTTP handler 及文档限定的 PG 捕获路径。这不代表完整 M:N、任意 async 闭包/捕获组合、通用 JSON 操作或通用网络调度器。
 
-输入所有权、取消、共享清理截止期限和操作子集仍然有效。算术 Task 成功不能证明整个库都可用于 Task。请结合 [Task 指南](/zh-cn/docs/guide/concurrency/)和[并发合同](https://github.com/fengyanweb/ku/blob/main/docs/concurrency.md)阅读。
+输入所有权、取消、共享清理截止期限和操作子集仍然有效。算术 Task 成功不能证明整个库都可用于 Task。请结合 [Task 指南](/zh-cn/docs/guide/concurrency/)和[并发合同](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md)阅读。
 
 ## 应用预算与进程限制
 

@@ -1,12 +1,19 @@
 ---
 title: '시작하기'
 description: 'Hello Ku를 작성하고 소스를 검사하며 인터프리터 실행과 컴파일의 차이를 알아봅니다.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
+sources:
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 이 페이지는 v0.0.17에 이미 있는 기본 문법과 CLI 명령을 사용합니다. 먼저 [Ku를 설치](/ko/docs/install/)하고 `ku --version`이 실행되는지 확인하세요.
+먼저 [Ku를 설치](/ko/docs/install/)하고 `ku --version`이 실행되는지 확인하세요.
 
 ## 첫 프로그램 작성
 
@@ -81,4 +88,4 @@ ku run
 
 패키지 진입점은 `ku.mod`에 설정합니다. `ku create --list`는 사용 가능한 템플릿을 나열합니다. 현재 `ku test`와 `ku fmt` 명령은 없습니다.
 
-[언어 안내](/ko/docs/guide/language/), [문제 해결](/ko/docs/guide/errors/), [백엔드 지원](/ko/docs/support/)으로 이어가세요. 여기에 나온 출력은 예상 예시이며 사용 중인 플랫폼의 설치 검증을 대신하지 않습니다.
+[언어 안내](/ko/docs/guide/language/), [문제 해결](/ko/docs/guide/errors/), [백엔드 지원](/ko/docs/support/)으로 이어가세요.

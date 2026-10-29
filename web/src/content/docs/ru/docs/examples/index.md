@@ -1,12 +1,12 @@
 ---
 title: 'Примеры (English)'
-description: 'Runnable examples documented in English.'
+description: 'Расширенные примеры пока описаны по-английски. Следующие ссылки явно ведут к английским страницам, где указаны бэкенд и необходимые файлы, серверы или базы данных.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-21'
-sources: ['examples/README.md']
+sources: ['examples/README.md', 'docs/v0.0.18-r1.md']
 ---
 
-The expanded examples are currently documented in English. Each reference lists the required backend and any file, server or database prerequisites.
+Расширенные примеры пока описаны по-английски. Следующие ссылки явно ведут к английским страницам, где указаны бэкенд и необходимые файлы, серверы или базы данных. [examples/README.md](https://github.com/fengyanweb/ku/blob/v0.0.19/examples/README.md).
 
 - [Hello Ku](/en/docs/getting-started/)
 - [HTTP server and client](/en/docs/stdlib/http/)

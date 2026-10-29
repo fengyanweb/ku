@@ -1,17 +1,20 @@
 ---
-title: Primii pași
-description: Scrie Hello Ku, verifică sursa și deosebește interpretarea de compilare.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Primii pași'
+description: 'Scrie Hello Ku, verifică sursa și deosebește interpretarea de compilare.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - examples/hello.ku
-  - README.md
-  - docs/syntax.md
-  - docs/v0.0.18.md
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: ro/v0.0.18/docs/getting-started
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Această pagină folosește sintaxa de bază și comenzi CLI deja existente în v0.0.17. Mai întâi [instalează Ku](/ro/v0.0.18/docs/install/) și confirmă că `ku --version` funcționează.
+Mai întâi [instalează Ku](/ro/v0.0.18/docs/install/) și confirmă că `ku --version` funcționează.
 
 ## Primul program
 
@@ -86,4 +89,4 @@ ku run
 
 Punctul de intrare al pachetului este configurat în `ku.mod`. `ku create --list` enumeră șabloanele disponibile. În prezent nu există comenzile `ku test` sau `ku fmt`.
 
-Continuă cu [ghidul limbajului](/ro/v0.0.18/docs/guide/language/), [depanarea](/ro/v0.0.18/docs/guide/errors/) și [suportul backendurilor](/ro/v0.0.18/docs/support/). Rezultatele de aici sunt exemple așteptate și nu înlocuiesc verificarea instalării pe platforma ta.
+Continuă cu [ghidul limbajului](/ro/v0.0.18/docs/guide/language/), [depanarea](/ro/v0.0.18/docs/guide/errors/) și [suportul backendurilor](/ro/v0.0.18/docs/support/).
