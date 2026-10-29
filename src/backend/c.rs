@@ -6548,6 +6548,9 @@ static bool ku_json_write_byte(
       error, "json.stringify output is too large");
 }
 
+/* Keep the string cursor in locals within reserved capacity. Publish before a
+   realloc/error/return; every realloc refreshes data/cap. Preparation stays at
+   the original write boundaries, preserving reserve-OOM vs UTF8/limit order. */
 static bool ku_json_write_string(
     KuJsonBuffer* output,
     KuString string,
@@ -6555,7 +6558,29 @@ static bool ku_json_write_string(
   if (string.len && !string.ptr) {
     return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
   }
-  if (!ku_json_write_byte(output, '"', error)) return false;
+  uint8_t* data = output->data;
+  size_t pos = output->len;
+  size_t capacity = output->cap;
+#define KU_JSON_STRING_FAIL(code, message) do { \
+    output->len = pos; \
+    return ku_json_fail(error, code, message); \
+  } while (0)
+#define KU_JSON_STRING_RESERVE(count) do { \
+    size_t incoming = (count); \
+    if (incoming > KU_JSON_MAX_OUTPUT_BYTES \
+        || pos > KU_JSON_MAX_OUTPUT_BYTES - incoming) { \
+      KU_JSON_STRING_FAIL("stringify_error", "json.stringify output is too large"); \
+    } \
+    if (pos > capacity || incoming > capacity - pos) { \
+      output->len = pos; \
+      if (!ku_json_buffer_reserve(output, pos + incoming, KU_JSON_MAX_OUTPUT_BYTES, \
+              error, "json.stringify output is too large")) return false; \
+      data = output->data; \
+      capacity = output->cap; \
+    } \
+  } while (0)
+  KU_JSON_STRING_RESERVE(1);
+  data[pos++] = '"';
   const uint8_t* current = string.ptr ? string.ptr : (const uint8_t*)"";
   const uint8_t* end = current + string.len;
   const uint8_t* span = current;
@@ -6563,10 +6588,9 @@ static bool ku_json_write_string(
     uint8_t byte = *current;
     if (byte >= 0x20 && byte != '"' && byte != '\\') {
       if (byte < 0x80) {
-        /* Do not inspect a whole word beyond the output allowance. A later
-           invalid UTF-8 byte must not replace an earlier output-limit error.
-           Non-ASCII starts bypass this ASCII-only speculative load entirely. */
-        size_t room = KU_JSON_MAX_OUTPUT_BYTES - output->len;
+        /* Bound speculative reads by both the actual input and output limit.
+           Invalid UTF8 after an over-limit prefix must not replace that error. */
+        size_t room = KU_JSON_MAX_OUTPUT_BYTES - pos;
         size_t pending = (size_t)(current - span);
         if (pending <= room && room - pending >= sizeof(uint64_t)) {
           size_t scan_len = room - pending;
@@ -6582,40 +6606,49 @@ static bool ku_json_write_string(
       } else {
         size_t width = ku_json_utf8_width(current, end);
         if (!width) {
-          return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+          KU_JSON_STRING_FAIL("stringify_error", "invalid utf-8 in json string");
         }
         current += width;
       }
-      /* Preserve the output bound before inspecting any following byte; a
-         long valid prefix cannot bypass the old size error with a later invalid
-         UTF-8 sequence. No borrowed bytes escape this synchronous writer. */
-      if ((size_t)(current-span) > KU_JSON_MAX_OUTPUT_BYTES-output->len)
-        return ku_json_fail(error, "stringify_error", "json.stringify output is too large");
+      if ((size_t)(current - span) > KU_JSON_MAX_OUTPUT_BYTES - pos)
+        KU_JSON_STRING_FAIL("stringify_error", "json.stringify output is too large");
       continue;
     }
-    if (current != span && !ku_json_buffer_append(output, span,
-          (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
-          "json.stringify output is too large")) return false;
+    if (current != span) {
+      size_t len = (size_t)(current - span);
+      KU_JSON_STRING_RESERVE(len);
+      memcpy(data + pos, span, len);
+      pos += len;
+    }
     if (byte == '"' || byte == '\\') {
-      uint8_t escaped[2] = { '\\', byte };
-      if (!ku_json_buffer_escape(output, escaped, 2, error)) return false;
+      KU_JSON_STRING_RESERVE(2);
+      data[pos++] = '\\'; data[pos++] = byte;
     } else if (byte == '\n' || byte == '\r' || byte == '\t') {
-      uint8_t escaped[2] = { '\\', byte == '\n' ? 'n' : (byte == '\r' ? 'r' : 't') };
-      if (!ku_json_buffer_escape(output, escaped, 2, error)) return false;
+      KU_JSON_STRING_RESERVE(2);
+      data[pos++] = '\\';
+      data[pos++] = byte == '\n' ? 'n' : (byte == '\r' ? 'r' : 't');
     } else {
       static const uint8_t hex[] = "0123456789abcdef";
-      uint8_t escaped[6] = { '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15] };
-      if (!ku_json_buffer_escape(output, escaped, sizeof(escaped), error)) return false;
+      KU_JSON_STRING_RESERVE(6);
+      data[pos++] = '\\'; data[pos++] = 'u'; data[pos++] = '0';
+      data[pos++] = '0'; data[pos++] = hex[byte >> 4]; data[pos++] = hex[byte & 15];
     }
     current++;
-    span=current;
+    span = current;
   }
-  if (current != span && !ku_json_buffer_append(output, span,
-        (size_t)(current-span), KU_JSON_MAX_OUTPUT_BYTES, error,
-        "json.stringify output is too large")) return false;
-  return ku_json_write_byte(output, '"', error);
+  if (current != span) {
+    size_t len = (size_t)(current - span);
+    KU_JSON_STRING_RESERVE(len);
+    memcpy(data + pos, span, len);
+    pos += len;
+  }
+  KU_JSON_STRING_RESERVE(1);
+  data[pos++] = '"';
+  output->len = pos;
+  return true;
+#undef KU_JSON_STRING_RESERVE
+#undef KU_JSON_STRING_FAIL
 }
-
 static bool ku_json_write_object(
     KuJsonBuffer* output,
     KuObject* object,

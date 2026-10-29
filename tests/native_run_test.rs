@@ -5655,6 +5655,32 @@ int main(void) {
     CHECK(!ku_json_write_string(&buffer,ku_string_static(examples[i],lengths[i]),&error));
     CHECK(json_word_error(error,"out_of_memory","json allocation failed"));
     CHECK(buffer.data==previous && buffer.cap==cap);
+    CHECK(buffer.len==(i==3?1:cap));
+    ku_json_buffer_drop(&buffer);ku_error_drop(&error);CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  ku_json_test_fail_reserve=0;
+  // The local writer cursor must publish exactly the last completed write on
+  // every failed growth, including ordinary, 2-byte and 6-byte boundaries.
+  static const uint8_t cursor_input[]={'a','"','\n','b',0,'c'};
+  static const uint8_t cursor_output[]={'"','a','\\','"','\\','n','b','\\','u','0','0','0','0','c','"'};
+  static const size_t cursor_stages[]={1,1,2,2,1,6,1,1};
+  for(size_t cap=3;cap<=20;cap++)for(int fail=0;fail<=1;fail++) {
+    uint8_t* storage=(uint8_t*)malloc(cap);CHECK(storage);memcpy(storage,"pre",3);
+    KuJsonBuffer buffer={storage,3,cap};KuError error={0};
+    ku_json_test_fail_reserve=fail;
+    bool ok=ku_json_write_string(&buffer,ku_string_static(cursor_input,sizeof(cursor_input)),&error);
+    size_t committed=3;
+    for(size_t stage=0;stage<sizeof(cursor_stages)/sizeof(cursor_stages[0]);stage++) {
+      if(fail && cursor_stages[stage]>cap-committed)break;
+      committed+=cursor_stages[stage];
+    }
+    CHECK(ok==(committed==3+sizeof(cursor_output)));
+    CHECK(buffer.len==committed && !memcmp(buffer.data,"pre",3));
+    CHECK(!memcmp(buffer.data+3,cursor_output,committed-3));
+    if(!ok) {
+      CHECK(buffer.data==storage && buffer.cap==cap);
+      CHECK(json_word_error(error,"out_of_memory","json allocation failed"));
+    }
     ku_json_buffer_drop(&buffer);ku_error_drop(&error);CHECK(NO_LIVE_ALLOCATIONS());
   }
   ku_json_test_fail_reserve=0;
