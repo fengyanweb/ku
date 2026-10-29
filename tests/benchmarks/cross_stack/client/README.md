@@ -227,3 +227,39 @@ Dedicated waiting services read target+64 active and target+128 connection limit
 from the same ordinary config as other stacks. Their receipts verify Ku's real
 protected `limits`; neither an environment variable nor Task driver capacity is
 proof that the HTTP admission limit changed.
+
+## Constant HTTP diagnostic only
+
+`--path-override /constant --response-literal 'h4:constant'` is an explicit,
+paired diagnostic oracle. It accepts one existing workload, never `mixed` or
+`task_mix`. The origin path is at most8KiB, must be URI-escaped, and cannot
+contain a query or fragment; the original unique RID and workload query values
+are still appended, with both request-ID headers retained. The response literal
+is at most64KiB; an explicitly selected empty string validates only an empty body.
+The normal method/body, HTTP200 requirement, complete-body read, connection pool,
+absolute deadlines, accounting, rejection classification and no-retry policy stay
+in effect. The full response must equal the literal; a matching prefix fails.
+
+```sh
+cross-stack-client --protocol /absolute/frozen/protocol.json \
+  --corpora-dir /absolute/repository/tests/benchmarks/cross_stack/corpora \
+  --address 127.0.0.1:8080 --workload ok \
+  --path-override /constant --response-literal 'h4:constant' \
+  --duration 10 --rate 500 --concurrency 32 --queue 128 --timeout 3 \
+  --rid-prefix 1 --output /absolute/new/constant-diagnostic.json
+```
+
+The report adds `diagnostic_only:true`, `normal_score_eligible:false`, the exact
+path and response length/SHA-256. It does not validate an echoed RID in the fixed
+body. These windows belong only to the separately identified H4 constant-route
+comparison, never the original `/ok` or real-business main tables. Services do
+not register `/constant` by default: create isolated benchmark-source copies,
+retain the normal admission/deadline/cancellation/resource paths, and record
+expanded-source/generated-C/ELF identities. A generated-C registry-off control
+must be labelled a diagnostic artifact, not a normal product build or release.
+Without both flags, request generation, response validation and report fields
+retain their original behavior.
+
+固定响应入口仅用于 H4 常量路由的独立诊断。必须成对传入路径与完整预期正文，
+混合负载禁止使用；响应多一个字节也算错误。报告会标注不能进入正式业务主表，
+不能把常量路由结果冒充原 `/ok` 或真实业务性能。

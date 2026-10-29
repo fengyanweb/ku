@@ -1145,3 +1145,123 @@ func TestTaskMixResetRetiresExactlyOneTCPLease(t *testing.T) {
 		t.Fatal("owned reset peer failed to exit")
 	}
 }
+
+func TestConstantHTTPDiagnosticRequiresBoundedPairedOverrides(t *testing.T) {
+	base := testConfig(t)
+	if err := validateConstantDiagnostic(base); err != nil {
+		t.Fatal(err)
+	}
+	constant := base
+	constant.responseLiteralSet, constant.pathOverrideSet = true, true
+	constant.responseLiteral, constant.pathOverride = "h4:constant", "/constant"
+	for _, path := range []string{"/", "/constant", "/escaped%20path", "/%E4%B8%AD%E6%96%87", "/" + strings.Repeat("a", maxDiagnosticPath-1)} {
+		c := constant
+		c.pathOverride = path
+		if err := validateConstantDiagnostic(c); err != nil {
+			t.Fatalf("valid path %q: %v", path, err)
+		}
+	}
+	for _, path := range []string{"", "constant", "http://example.test/constant", "//example.test/constant", "/constant?x=1", "/constant#fragment", "/with space", "/bad\r\nheader", "/bad%escape", "/" + strings.Repeat("a", maxDiagnosticPath)} {
+		c := constant
+		c.pathOverride = path
+		if err := validateConstantDiagnostic(c); err == nil {
+			t.Fatalf("accepted invalid path %q", path)
+		}
+	}
+	for _, workload := range []string{"mixed", "task_mix"} {
+		c := constant
+		c.workload = workload
+		if err := validateConstantDiagnostic(c); err == nil {
+			t.Fatalf("accepted mixed oracle override %s", workload)
+		}
+	}
+	for _, onlyResponse := range []bool{false, true} {
+		c := constant
+		c.responseLiteralSet, c.pathOverrideSet = onlyResponse, !onlyResponse
+		if err := validateConstantDiagnostic(c); err == nil {
+			t.Fatal("accepted an unpaired diagnostic override")
+		}
+	}
+	c := constant
+	c.responseLiteral = strings.Repeat("a", maxBody)
+	if err := validateConstantDiagnostic(c); err != nil {
+		t.Fatal(err)
+	}
+	c.responseLiteral += "a"
+	if err := validateConstantDiagnostic(c); err == nil {
+		t.Fatal("accepted an oversized response literal")
+	}
+	j := job{kind: "ok", rid: "0000000010000003"}
+	method, path, body := requestSpec(constant, j)
+	if method != "GET" || path != "/constant?rid="+j.rid || body != nil {
+		t.Fatalf("diagnostic request lost its original method/RID: %s %s %q", method, path, body)
+	}
+	if err := validate(constant, j, []byte(constant.responseLiteral)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validate(constant, j, []byte(constant.responseLiteral+"garbage")); err == nil {
+		t.Fatal("accepted a prefix instead of the complete fixed body")
+	}
+	if err := validate(constant, job{kind: "cpu", rid: j.rid}, []byte(constant.responseLiteral)); err == nil {
+		t.Fatal("constant oracle accepted another stream")
+	}
+	constant.responseLiteral = ""
+	if err := validateConstantDiagnostic(constant); err != nil {
+		t.Fatal("explicit empty response literal must be supported", err)
+	}
+	if err := validate(constant, j, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validate(constant, j, []byte("x")); err == nil {
+		t.Fatal("empty literal accepted a nonempty response")
+	}
+	method, path, _ = requestSpec(base, j)
+	if method != "GET" || path != "/ok?rid="+j.rid {
+		t.Fatal("default request path changed")
+	}
+	if err := validate(base, j, []byte("h4:constant")); err == nil {
+		t.Fatal("default body oracle was weakened")
+	}
+}
+
+func TestConstantHTTPDiagnosticUsesFullBodyOracleAndExplicitReport(t *testing.T) {
+	c := testConfig(t)
+	c.responseLiteralSet, c.pathOverrideSet = true, true
+	c.pathOverride, c.responseLiteral = "/constant", "h4:constant"
+	var requests atomic.Uint32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/constant" || r.URL.Query().Get("rid") == "" || r.Header.Get("X-Request-ID") != r.URL.Query().Get("rid") {
+			t.Error("diagnostic path/RID transport differs")
+		}
+		_, _ = io.WriteString(w, "h4:constant")
+	}))
+	defer server.Close()
+	c.address = strings.TrimPrefix(server.URL, "http://")
+	report, err := run(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || report["diagnostic_only"] != true || report["normal_score_eligible"] != false {
+		t.Fatalf("missing diagnostic ledger/eligibility: %+v", report)
+	}
+	ledger := report["ledger"].(map[string]any)
+	if ledger["correct_total"] != uint64(1) {
+		t.Fatalf("fixed correct body was not counted: %+v", ledger)
+	}
+	configuration := report["configuration"].(map[string]any)
+	oracle := configuration["constant_http_diagnostic"].(map[string]any)
+	if oracle["path_override"] != "/constant" || oracle["response_literal_bytes"] != len(c.responseLiteral) || len(oracle["response_literal_sha256"].(string)) != 64 || configuration["no_retry"] != true {
+		t.Fatalf("wrong bounded diagnostic identity: %+v", configuration)
+	}
+	// A successful HTTP200 with the wrong complete body remains an error, and
+	// it cannot be replayed as another request through the shared pool.
+	c.responseLiteral = "different"
+	w := testWorker(c, testLedger())
+	j := job{kind: "ok", rid: "1", scheduled: time.Now()}
+	result := w.request(j, j.scheduled)
+	w.pool.close()
+	if result.category != "body_error" || result.stage != "validate" || requests.Load() != 2 {
+		t.Fatalf("wrong diagnostic body was accepted/retried: %+v", result)
+	}
+}

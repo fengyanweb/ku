@@ -36,6 +36,7 @@ import (
 
 const maxHeader = 32768
 const maxBody = 65536
+const maxDiagnosticPath = 8192
 
 // Fixed cells cover every nonnegative int64 duration without dropping counts.
 const maxHistogramKeys = 256 + 43*128
@@ -66,6 +67,8 @@ type corpus struct {
 	hash    string
 }
 type config struct {
+	responseLiteral, pathOverride string
+	responseLiteralSet, pathOverrideSet bool
 	address, workload, protocolPath, corporaDir, corpusPath, output, events string
 	duration, timeout, idle                                                 time.Duration
 	rate                                                                    float64
@@ -1113,6 +1116,37 @@ func inputAt(c config, j job) (int, int) {
 	}
 	return e.Work[j.index%uint64(len(e.Work))], e.Seeds[(j.index/uint64(len(e.Work)))%uint64(len(e.Seeds))]
 }
+// The override is deliberately a separate diagnostic contract. Empty response
+// literals are valid only when explicitly selected; defaults remain unchanged.
+func validateConstantDiagnostic(c config) error {
+	if !c.responseLiteralSet && !c.pathOverrideSet {
+		return nil
+	}
+	if !c.responseLiteralSet || !c.pathOverrideSet {
+		return fmt.Errorf("constant HTTP diagnostic requires both --response-literal and --path-override")
+	}
+	if c.workload == "mixed" || c.workload == "task_mix" {
+		return fmt.Errorf("constant HTTP diagnostic requires one non-mixed, non-task_mix workload")
+	}
+	if len(c.responseLiteral) > maxBody {
+		return fmt.Errorf("response literal exceeds64KiB")
+	}
+	path := c.pathOverride
+	if len(path) == 0 || len(path) > maxDiagnosticPath || !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") || strings.ContainsAny(path, "?#") {
+		return fmt.Errorf("path override must be an origin path of1..8192bytes without query or fragment")
+	}
+	for _, value := range []byte(path) {
+		if value <= 0x20 || value == 0x7f {
+			return fmt.Errorf("path override contains an unescaped control or space")
+		}
+	}
+	parsed, err := url.ParseRequestURI(path)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.EscapedPath() != path {
+		return fmt.Errorf("path override is not a valid escaped origin path")
+	}
+	return nil
+}
+
 func requestSpec(c config, j job) (string, string, []byte) {
 	e := c.protocol.Endpoints[j.kind]
 	query := url.Values{"rid": {j.rid}}
@@ -1128,7 +1162,11 @@ func requestSpec(c config, j job) (string, string, []byte) {
 	case j.kind == "db":
 		query.Set("key", strconv.FormatUint(j.index%uint64(c.protocol.Database.Rows)+1, 10))
 	}
-	return e.Method, e.Path + "?" + query.Encode(), body
+	path := e.Path
+	if c.pathOverrideSet {
+		path = c.pathOverride
+	}
+	return e.Method, path + "?" + query.Encode(), body
 }
 func decode(p []byte) (any, error) {
 	d := json.NewDecoder(bytes.NewReader(p))
@@ -1144,6 +1182,15 @@ func decode(p []byte) (any, error) {
 	return v, nil
 }
 func validate(c config, j job, body []byte) error {
+	if c.responseLiteralSet {
+		if j.kind != c.workload {
+			return fmt.Errorf("diagnostic oracle cannot validate a different workload")
+		}
+		if string(body) != c.responseLiteral {
+			return fmt.Errorf("wrong complete diagnostic body: %s", truncate(string(body)))
+		}
+		return nil
+	}
 	expected := ""
 	switch j.kind {
 	case "ok":
@@ -1187,6 +1234,9 @@ func validate(c config, j job, body []byte) error {
 }
 
 func load(c *config) error {
+	if err := validateConstantDiagnostic(*c); err != nil {
+		return err
+	}
 	raw, e := os.ReadFile(c.protocolPath)
 	if e != nil {
 		return e
@@ -1279,6 +1329,9 @@ func load(c *config) error {
 	return nil
 }
 func run(c config) (map[string]any, error) {
+	if err := validateConstantDiagnostic(c); err != nil {
+		return nil, err
+	}
 	if c.workload == "task_mix" {
 		if e := validateTaskMix(c); e != nil {
 			return nil, e
@@ -1379,6 +1432,19 @@ func run(c config) (map[string]any, error) {
 	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": finalResources.dials, "pool_idle_expirations": finalResources.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(finalResources.dials, 1)), "peak_connections": finalResources.peakLive, "connections_after_cleanup": finalResources.live, "peak_inflight": finalResources.peakActive, "active_after_cleanup": finalResources.active, "queue_peak": finalResources.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
 	clocks := out["configuration"].(map[string]any)
+	if c.responseLiteralSet {
+		literalHash := sha256.Sum256([]byte(c.responseLiteral))
+		out["diagnostic_only"] = true
+		out["normal_score_eligible"] = false
+		out["diagnostic_scope"] = "constant HTTP H4 qualification only; excludes generic/real-business main tables"
+		clocks["constant_http_diagnostic"] = map[string]any{
+			"path_override":          c.pathOverride,
+			"response_literal_bytes": len(c.responseLiteral),
+			"response_literal_sha256": hex.EncodeToString(literalHash[:]),
+			"oracle":                 "HTTP200 plus exact complete fixed body; no dynamic RID body echo",
+			"request_identity":       "original unique RID query and request headers retained",
+		}
+	}
 	out["descriptor_preparation"] = descriptors.report(l.origin, anchor)
 	out["worker_preparation"] = map[string]any{
 		"ready_workers":          preparation.workers,
@@ -1443,6 +1509,8 @@ func parse() (config, error) {
 	flag.StringVar(&c.corpusPath, "corpus", "", "override selected JSON corpus path, frozen hash still verified")
 	flag.StringVar(&c.output, "output", "", "exclusive-create JSON output, stdout if omitted")
 	flag.StringVar(&c.events, "events", "", "exclusive-create finite planned CSV, 256MiB backing; export after request completion")
+	flag.StringVar(&c.responseLiteral, "response-literal", "", "diagnostic only: exact complete response <=64KiB; requires --path-override")
+	flag.StringVar(&c.pathOverride, "path-override", "", "diagnostic only: escaped origin path <=8KiB, no query/fragment; requires --response-literal")
 	flag.Float64Var(&duration, "duration", 30, "arrival window seconds (0..3600)")
 	flag.Float64Var(&c.rate, "rate", 100, "open arrivals per second (positive, total <=10000000)")
 	flag.Float64Var(&c.cpuRate, "cpu-rate", 0, "task_mix independent CPU arrivals/sec; --rate is short arrivals/sec")
@@ -1454,6 +1522,17 @@ func parse() (config, error) {
 	flag.IntVar(&idleMS, "keepalive-idle-ms", 500, "retire expired shared idle connections before the next distinct plan")
 	flag.Uint64Var(&c.prefix, "rid-prefix", 0, "numeric run prefix 1..999999999; zero generates random prefix")
 	flag.Parse()
+	flag.Visit(func(value *flag.Flag) {
+		switch value.Name {
+		case "response-literal":
+			c.responseLiteralSet = true
+		case "path-override":
+			c.pathOverrideSet = true
+		}
+	})
+	if err := validateConstantDiagnostic(c); err != nil {
+		return c, err
+	}
 	if _, _, e := net.SplitHostPort(c.address); e != nil {
 		return c, e
 	}
