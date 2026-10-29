@@ -40,13 +40,13 @@ def frozen_plan(versions):
     for kind,rate,contract,orders,n,d,limit in entries:
         schedule.append(dict(phase='final',workload=kind,rate=rate,contract=contract,
                              orders=orders,warmup_seconds=10,score_seconds=30))
-        for metric in ['cpu_us','memory.steady_median_bytes']:
+        for metric in ['full_cpu_us','memory.steady_median_bytes']:
             targets.append(dict(phase='final',workload=kind,contract=contract,numerator=n,
-                denominator=d,maximum_ratio=limit if metric=='cpu_us' else 1,metric=metric,minimum_pairs=5))
+                denominator=d,maximum_ratio=limit if metric=='full_cpu_us' else 1,metric=metric,minimum_pairs=5))
         if contract in ('pg-shared','typed-pg'):
             targets.append(dict(phase='final',workload=kind,contract=contract,numerator=n,
                 denominator='RS' if contract=='pg-shared' else 'RPS',maximum_ratio=.90 if contract=='pg-shared' else 1,
-                metric='cpu_us',minimum_pairs=5,display_contract='pg-strict' if contract=='pg-shared' else 'typed-pg-strict'))
+                metric='full_cpu_us',minimum_pairs=5,display_contract='pg-strict' if contract=='pg-shared' else 'typed-pg-strict'))
             targets.append(dict(targets[-1],metric='memory.steady_median_bytes',maximum_ratio=1))
     return dict(versions=versions,resources=RESOURCES,quality_policy=POLICY,rates={'json_object':500,'db':200,'ok':2000,'cpu':80},
         schedule=schedule,targets=targets,resume={'maximum_replacements':0},bootstrap_resamples=20000,
@@ -219,7 +219,7 @@ def run(a,state):
             if not state['steps'].get('stability'):
                 execute('stability',plan,'stability') # once-only; no resume/replacement of continuous evidence
         else:state['deferred']={'capacity':'confirmed function/accounting failure','stability':'same candidate; not retried'}
-        core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='cpu_us' else 1) for t in plan['targets']
+        core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='full_cpu_us' else 1) for t in plan['targets']
             if t['numerator']=='B' and ((t['contract']=='dom' and t['denominator']=='R') or (t['contract']=='pg-shared' and t['denominator']=='RS'))]
         core_plan=dict(plan,targets=core_targets);core=fc.compare_goals(core_plan,final.get('rows',[]))
         scenes=[[g for g in core if g['target']['contract']==contract] for contract in ['dom','pg-shared']]
@@ -319,7 +319,7 @@ def compiler(a,state):
                 groups=[{r['name']:r for r in rows if r['group']==g} for g in [1,2,3]]
                 complete=[g for g in groups if left in g and right in g]
                 comparisons.append({'workload':workload,'numerator':left,'denominator':right,'contract':contract,
-                    'interval':fc.paired_interval([fc.metric(g[left],'cpu_us') for g in complete],[fc.metric(g[right],'cpu_us') for g in complete],minimum=3),
+                    'metric':'full_cpu_us','interval':fc.paired_interval([fc.metric(g[left],'full_cpu_us') for g in complete],[fc.metric(g[right],'full_cpu_us') for g in complete],minimum=3),
                     'observational_quality_passed':len(complete)==3 and all(r.get('status')=='observed' and r.get('arrival_schedule_quality')==r.get('environment_quality')=='pass' for g in complete for r in [g[left],g[right]]),
                     'goal_status':'unknown','formal_qualified':False,'default_changed':False})
         save(directory/'comparisons.json',{'comparisons':comparisons,'HTTP_train_and_heldout':validation,'goal_status':'unknown'})

@@ -19,6 +19,7 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_five_registered_groups_and_pg_sharing_are_actual_windows(self):
         plan=self.plan();jobs=fc.jobs_for(plan,'final');self.assertEqual(len(jobs),80)
+        self.assertEqual({t['metric'] for t in plan['targets']},{'full_cpu_us','memory.steady_median_bytes'})
         pg=[x for x in jobs if x['contract']=='pg-shared']
         for group in range(1,6):self.assertEqual(sorted(x['name'] for x in pg if x['group']==group),['A0','B','R','RS'])
         self.assertFalse(any(x['name']=='BD' for x in jobs))
@@ -109,7 +110,7 @@ class HostedCycleTests(unittest.TestCase):
             self.assertEqual(cap['maximum_rates'][kind],start*cap['factor']**5)
         strict=[x for x in self.plan()['targets'] if x.get('display_contract')=='pg-strict']
         self.assertEqual({x['denominator'] for x in strict},{'RS'})
-        self.assertEqual({x['maximum_ratio'] for x in strict if x['metric']=='cpu_us'},{.90})
+        self.assertEqual({x['maximum_ratio'] for x in strict if x['metric']=='full_cpu_us'},{.90})
 
     def test_oversize_archive_returns_explicit_failure_not_silent_truncation(self):
         with tempfile.TemporaryDirectory() as d:
@@ -160,7 +161,12 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h.db,'Database',return_value=owned))
                 patches.enter_context(patch.object(h,'step',side_effect=fake_step))
                 patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'unknown'}))
-                patches.enter_context(patch.object(fc,'execute',return_value={'rows':[],'execution_complete':False}))
+                def measured(plan_path,*unused,**kwargs):
+                    jobs=fc.jobs_for(h.load(plan_path),'all')
+                    return {'execution_complete':False,'rows':[dict(j,cpu_us=1 if j['name']=='KO3' else 100,full_cpu_us=100,
+                        functional_valid=False,accounting_valid=True,status='observed',arrival_schedule_quality='pass',environment_quality='pass') for j in jobs]}
+                patches.enter_context(patch.object(fc,'execute',side_effect=measured))
+                patches.enter_context(patch.object(fc,'paired_interval',side_effect=lambda a,b,**kw:{'estimate':sum(a)/sum(b) if a and b else None}))
                 patches.enter_context(patch.object(fc,'version_identity',return_value={'fixture':True}))
                 patches.enter_context(patch.object(pt,'run_http',side_effect=profile))
                 if failed:
@@ -168,6 +174,9 @@ class HostedCycleTests(unittest.TestCase):
                 else:
                     result=h.compiler(a,state);self.assertFalse(result['functional_acceptance']);self.assertFalse(result['default_changed'])
                     self.assertEqual(calls,[('ku','train'),('ku','validate'),('rust','train'),('rust','validate')])
+                    report=h.load(root/'compiler/comparisons.json')
+                    self.assertTrue(all(c['metric']=='full_cpu_us' for c in report['comparisons']))
+                    self.assertTrue(all(c['interval']['estimate']==1 for c in report['comparisons']))
                 self.assertIs(fc.Harness,old_fc);self.assertIs(pt.Harness,old_pt)
                 self.assertEqual(state['compiler_database_cleanup'],{'stopped':True})
 
