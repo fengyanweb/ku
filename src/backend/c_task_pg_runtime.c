@@ -71,10 +71,7 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
   uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT:KU_TASK_DRIVER_OK;
   size_t index=0;
-  if(status==KU_TASK_DRIVER_OK) {
-    for(;index<pool->capacity;index++)if(pool->jobs[index].state==KU_TASK_BLOCKING_FREE && pool->jobs[index].generation!=UINT64_MAX)break;
-    if(index==pool->capacity)status=KU_TASK_DRIVER_LIMIT;
-  }
+  if(status==KU_TASK_DRIVER_OK)status=ku_task_blocking_claim_locked(pool,&index);
   if(status!=KU_TASK_DRIVER_OK) {
     if(pool->rejected!=UINT64_MAX)pool->rejected++;
     if(status==KU_TASK_DRIVER_LIMIT && pool->rejected_queue!=UINT64_MAX)pool->rejected_queue++;
@@ -82,10 +79,9 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
       ku_task_blocking_error(status==KU_TASK_DRIVER_LIMIT?"blocking_queue_full":"blocking_pool_stopped",
       status==KU_TASK_DRIVER_LIMIT?"blocking queue is full":"blocking pool is closing")};return KU_TASK_DRIVER_OK;
   }
-  KuTaskBlockingJobV1* job=&pool->jobs[index];job->generation++;job->state=KU_TASK_BLOCKING_BUILDING;
+  KuTaskBlockingJobV1* job=&pool->jobs[index];
   job->kind=9u;job->ticket=*ticket;job->pg_pool=pool;
   *token=(KuTaskBlockingTokenV1){pool,index,0,job->generation};
-  pool->resident++;if(pool->resident>pool->peak_resident)pool->peak_resident=pool->resident;
   ku_task_blocking_unlock(pool);
   status=ku_task_driver_blocking_register(ticket);int registered=status==KU_TASK_DRIVER_OK;
   KuError error={0};KuPgAsyncOp* operation=NULL;
@@ -127,7 +123,8 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
       operation->fresh_cancel_context=job;operation->fresh_cancel=ku_task_pg_fresh_cancel;
       job->pg_ready=1;job->net_deadline=operation->deadline;
       status=ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_NET_WAIT);
-      if(pool->closing || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE)job->cancelled=1;
+      if(pool->closing || ku_task_control_atomic_load(&control->phase)!=KU_TASK_CONTROL_LIVE)
+        if(ku_task_blocking_cancel_job_locked(pool,job)!=KU_TASK_DRIVER_OK)status=KU_TASK_DRIVER_INTERNAL;
       if(pool->accepted!=UINT64_MAX)pool->accepted++;
       (void)ku_task_driver_wake(ticket);ku_task_blocking_unlock(pool);
       status=ku_task_driver_set_intent(ticket,KU_TASK_DRIVER_WAIT);
@@ -139,7 +136,9 @@ static uint32_t ku_task_blocking_submit_pg(const KuTaskDriverTicketV1* ticket,
     error=ku_task_blocking_error("reactor_unavailable","PostgreSQL query requires an attached owner reactor");
   }
   if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
-  uint64_t generation=job->generation;memset(job,0,sizeof(*job));job->generation=generation;pool->resident--;
+  if(ku_task_blocking_return_locked(pool,job,index)!=KU_TASK_DRIVER_OK) {
+    ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;
+  }
   if(pool->rejected!=UINT64_MAX)pool->rejected++;
   ku_task_blocking_signal(pool);ku_task_blocking_unlock(pool);
   if(registered && ku_task_driver_blocking_retired(ticket)!=KU_TASK_DRIVER_OK)return KU_TASK_DRIVER_INTERNAL;
