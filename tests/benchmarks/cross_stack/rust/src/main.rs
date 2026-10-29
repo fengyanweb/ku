@@ -96,6 +96,7 @@ struct App {
     pg_mode: pg_mode::Mode,
     pg_api: pg_mode::Api,
     json_mode: JsonMode,
+    request_timeout: Duration,
     peer: u16,
 }
 fn bounded(name: &str, default: usize, low: usize, high: usize) -> usize {
@@ -252,6 +253,12 @@ async fn serve(
     } else {
         None
     };
+    let request_timeout = Duration::from_millis(bounded(
+        "BENCH_REQUEST_TIMEOUT_MS",
+        DEADLINE.as_millis() as usize,
+        1,
+        300_000,
+    ) as u64);
     let app = Arc::new(App {
         active: Arc::new(Semaphore::new(active)),
         pending: Arc::new(Semaphore::new(pending)),
@@ -261,6 +268,7 @@ async fn serve(
         cpu_trace: Arc::new(cpu_work::Trace::new(cpu_config.trace)),
         runtime_plan,
         counters: Counters::new(),
+        request_timeout,
         pg_mode,
         pg_api,
         json_mode,
@@ -284,7 +292,7 @@ async fn serve(
     let listen_address = listener.local_addr()?;
     eprintln!(
         "{}",
-        json!({"ready":true,"stack":"rust","descriptor_preparation":descriptor_preparation,"runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"listen_address":listen_address,"listen_backlog_requested":listen_plan.requested_backlog(),"listen_backlog_explicit":listen_plan.explicit(),"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {45000} else {3000}})
+        json!({"ready":true,"stack":"rust","descriptor_preparation":descriptor_preparation,"runtime_topology":runtime_plan.name(),"async_workers":runtime_plan.async_worker_threads(),"main_thread_role":runtime_plan.main_thread_role(),"blocking_workers_max":cpu_workers,"db_pool_total":db_slots,"max_active":active,"max_pending":pending,"listen_address":listen_address,"listen_backlog_requested":listen_plan.requested_backlog(),"listen_backlog_explicit":listen_plan.explicit(),"cpu_mode":cpu_config.mode.name(),"cpu_chunk":cpu_config.chunk,"event_interval":cpu_config.event_interval,"cpu_trace":cpu_config.trace,"request_deadline_ms":if cpu_config.mode == cpu_work::Mode::Legacy {request_timeout.as_millis() as u64} else {3000}})
     );
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown())
@@ -376,7 +384,7 @@ async fn admission(State(app): State<Arc<App>>, mut request: Request, next: Next
     let response = if let Some(deadline) = deadline {
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await
     } else {
-        timeout(DEADLINE, operation).await
+        timeout(app.request_timeout, operation).await
     };
     let response =
         response.unwrap_or_else(|_| text(StatusCode::GATEWAY_TIMEOUT, "request deadline"));

@@ -184,3 +184,5 @@ checksum；历史 `repeat=64` 结果保留为 R&D，不进入正式表。每轮�
 `node_modules`/`__pycache__` 用完删除。清理只作用于本次拥有的私有目录、进程和 cgroup。
 本基准入口不部署官网、不隐式重跑旧 36 次内存验证，也不恢复暂停的通用值复制／释放
 及 AST 分析。官网内容与打包按独立授权进行，不能用它替代运行证据。
+
+Rust 参考可显式设置 `BENCH_REQUEST_TIMEOUT_MS`（1–300000；默认仍为45000）来与 Ku 的 `KU_HTTP_REQUEST_TIMEOUT_MS` 对齐。它覆盖原 Legacy 请求准入与执行等待；CPU cooperative/bounded 模式仍使用其既有3000ms绝对期限。正式计划必须记录实际值，不能靠延长期限降低错误率。

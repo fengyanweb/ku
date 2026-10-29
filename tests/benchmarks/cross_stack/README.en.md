@@ -252,3 +252,5 @@ processes and cgroups. The benchmark does not deploy the website, implicitly rer
 the old 36 memory checks, or resume the paused generic-value copy/release and AST
 analyses. Website edits and packaging require separate scope; they do not replace
 runtime evidence.
+
+The Rust reference accepts explicit `BENCH_REQUEST_TIMEOUT_MS` (1–300000; unchanged default 45000) to match Ku `KU_HTTP_REQUEST_TIMEOUT_MS`. It covers Legacy admission/execution; cooperative/bounded CPU modes retain their existing 3000ms absolute deadline. Freeze the actual values in the plan; increasing a deadline cannot count as an optimization.
