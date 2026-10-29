@@ -3643,7 +3643,11 @@ fn main(): null! {
         anchor,
         &format!(
             r#"
-static int fixture_fail_token;
+static int fixture_fail_token,fixture_fail_event;
+static void* fixture_event_allocate(size_t bytes) {{
+  if(fixture_fail_event) {{fixture_fail_event=0;return NULL;}}
+  return ku_perf_calloc(1,bytes);
+}}
 static void* fixture_token_allocate(size_t bytes) {{
   if(fixture_fail_token) {{ fixture_fail_token=0;return NULL; }}
   return ku_perf_malloc(bytes);
@@ -3655,6 +3659,10 @@ static void* fixture_token_allocate(size_t bytes) {{
     generated = generated.replace(
         "(KuHttpRouteToken*)malloc(private_bytes)",
         "(KuHttpRouteToken*)fixture_token_allocate(private_bytes)",
+    );
+    generated = generated.replace(
+        "void* storage=calloc(1,ku_http_queue_events_bytes((size_t)cap));",
+        "void* storage=fixture_event_allocate(ku_http_queue_events_bytes((size_t)cap));",
     );
     generated.push_str(r#"
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"route snapshot %d: %s\n",__LINE__,#x); return 91; } } while(0)
@@ -3789,6 +3797,51 @@ int main(void) {
     CHECK(ku_http_parse_complete_header(server,invalid_projected,strlen(invalid_projected),&part)==400);
     ku_http_input_drop(&part);CHECK(!budget.current);
   }
+  /* Coalesced events use only the stable queue/C pin. No event retain may
+     stop the physical worker release from making only_owner observable. */
+  fixture_fail_event=1;CHECK(!ku_http_queue_events_init(&local_queue,4));
+  CHECK(!local_queue.event_slots && !local_queue.resident && !budget.current);
+  CHECK(ku_http_queue_events_init(&local_queue,4) && !ku_http_queue_events_init(&local_queue,4));
+  KuHttpJob* held[4]={0};uint64_t retired_epoch=0;size_t index=0;uint64_t epoch=0;unsigned int reasons=0;
+  for(size_t i=0;i<4u;i++) {
+    KuHttpInput empty={0};empty.budget=&budget;
+    held[i]=ku_http_job_new(&local_queue,&empty);CHECK(held[i] && ku_http_job_bind(held[i],i));
+    ku_refcount_retain(&held[i]->owners,"fixture worker");
+    ku_http_job_publish(held[i],KU_HTTP_JOB_STARTED);
+    ku_http_job_publish(held[i],KU_HTTP_JOB_COMPLETED);
+  }
+  CHECK(local_queue.event_count==4 && local_queue.event_peak==4 && local_queue.event_coalesced==4u);
+  retired_epoch=held[0]->event_epoch;
+  ku_http_job_release(held[0]);CHECK(ku_http_job_only_owner(held[0]));
+  CHECK(local_queue.event_count==4); /* RETIRED merges without a self-blocking pin. */
+  CHECK(ku_http_queue_event_pop(&local_queue,&index,&epoch,&reasons));
+  CHECK(index==0u && epoch==retired_epoch && reasons==(KU_HTTP_JOB_STARTED|KU_HTTP_JOB_COMPLETED|KU_HTTP_JOB_RETIRED));
+  /* A new publication after pop/clear queues exactly one fresh identity. */
+  ku_http_job_publish(held[0],KU_HTTP_JOB_CONTROL);CHECK(local_queue.event_count==4);
+  ku_http_job_unbind(held[0]);ku_http_job_release(held[0]);held[0]=NULL;
+  KuHttpInput empty={0};empty.budget=&budget;held[0]=ku_http_job_new(&local_queue,&empty);
+  CHECK(held[0] && ku_http_job_bind(held[0],0u) && held[0]->event_epoch!=retired_epoch);
+  ku_http_queue_event_publish(&local_queue,0u,retired_epoch,KU_HTTP_JOB_RETIRED);
+  CHECK(local_queue.event_count==4 && local_queue.event_stale>=1u);
+  ku_http_job_publish(held[0],KU_HTTP_JOB_COMPLETED);CHECK(local_queue.event_count==4);
+  for(size_t i=1;i<4u;i++) {ku_http_job_release(held[i]);CHECK(ku_http_job_only_owner(held[i]));}
+  int saw_reused=0;
+  while(ku_http_queue_event_pop(&local_queue,&index,&epoch,&reasons)) {
+    CHECK(index<4u && epoch==held[index]->event_epoch);
+    if(index==0u) {CHECK(reasons==KU_HTTP_JOB_COMPLETED);saw_reused=1;}
+    else CHECK(reasons==(KU_HTTP_JOB_STARTED|KU_HTTP_JOB_COMPLETED|KU_HTTP_JOB_RETIRED));
+  }
+  CHECK(saw_reused && !local_queue.event_count);
+  /* Sole RETIRED, with no later network publication, remains deliverable. */
+  ku_refcount_retain(&held[0]->owners,"fixture worker");ku_http_job_release(held[0]);
+  CHECK(ku_http_job_only_owner(held[0]) && ku_http_queue_event_pop(&local_queue,&index,&epoch,&reasons));
+  CHECK(index==0u && epoch==held[0]->event_epoch && reasons==KU_HTTP_JOB_RETIRED);
+  for(size_t i=0;i<4u;i++) {ku_http_job_unbind(held[i]);ku_http_job_release(held[i]);}
+  CHECK(!local_queue.resident && !budget.current && !local_queue.event_count);
+  empty=(KuHttpInput){0};empty.budget=&budget;KuHttpJob* exhausted=ku_http_job_new(&local_queue,&empty);
+  CHECK(exhausted);local_queue.event_epoch=UINT64_MAX;
+  CHECK(!ku_http_job_bind(exhausted,0u) && !exhausted->event_epoch);ku_http_job_release(exhausted);
+  CHECK(!local_queue.resident && !local_queue.event_count && !budget.current);
   __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
   __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
   ku_http_queue_free(&local_queue);ku_http_wake_close(&local_wake);ku_http_net_cleanup();
@@ -7459,7 +7512,7 @@ fn native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlin
 #define KU_HTTP_POLL_WRITE POLLOUT
 typedef int KuHttpSocket;
 typedef struct pollfd KuHttpPollFd;
-enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_ASYNC=8,KU_HTTP_IO_REQUEST_WAIT=10 };
+enum { KU_HTTP_IO_HEADER=1,KU_HTTP_IO_BODY=2,KU_HTTP_IO_JOB=3,KU_HTTP_IO_WRITE=4,KU_HTTP_IO_CLOSED_JOB=5,KU_HTTP_IO_REUSE_WAIT=7,KU_HTTP_IO_ASYNC=8,KU_HTTP_IO_REQUEST_WAIT=10 };
 struct KuHttpConnection;
 typedef struct KuHttpActiveSet {
   struct KuHttpConnection* connections;
@@ -7469,12 +7522,17 @@ typedef struct KuHttpActiveSet {
 typedef struct KuHttpConnection {
   KuHttpActiveSet* active_set;
   struct KuHttpReactor* reactor;
-  int work_position,idle_position,active_position;
+  int work_position,idle_position,active_position,parked_class;
+  unsigned long long maintenance_deadline;
   int phase,reused,peer_read_paused,socket_value,request_lease,request_queued;
   size_t buffered,carry_length;
   void* job;void* async_task;
   uint64_t request_deadline,deadline,connection_generation,request_wait_probe_deadline;
+
 } KuHttpConnection;
+/* The field-only model supplies the production snapshot helper's already
+   computed deadline; full job locking/retirement is covered by the route gate. */
+static unsigned long long ku_http_connection_job_deadline(KuHttpConnection* c) {return c->maintenance_deadline;}
 #define KU_HTTP_REACTOR_FD_ORACLE 1
 static size_t fixture_alloc_calls,fixture_fail_alloc,fixture_live_allocs,fixture_live_bytes;
 static struct {void* pointer;size_t bytes;} fixture_allocations[8];
@@ -7784,6 +7842,24 @@ int main(int argc,char** argv) {
     }
   }
   CHECK(!reactor.fault);
+  /* Worker jobs leave the per-turn worklist but retain kernel peer-error
+     observation and their exact cached request/cleanup/probe timer key. */
+  connections[0].job=(void*)(uintptr_t)1;connections[0].phase=KU_HTTP_IO_JOB;
+  connections[0].maintenance_deadline=1500u;ku_http_reactor_refresh(&connections[0]);
+  CHECK(reactor.parked_jobs==1 && connections[0].parked_class==2 && connections[0].work_position==-1);
+  CHECK(reactor.idle_count==2 && reactor.work_count==2 && ku_http_reactor_idle_deadline(&reactor)==1500u);
+  const int waiting[]={KU_HTTP_IO_REUSE_WAIT,KU_HTTP_IO_CLOSED_JOB};
+  for(size_t i=0;i<2u;i++) {
+    connections[0].phase=waiting[i];connections[0].maintenance_deadline=UINT64_MAX;
+    ku_http_reactor_refresh(&connections[0]);
+    CHECK(!reactor.fault && reactor.parked_jobs==1 && connections[0].work_position==-1);
+    CHECK(ku_http_reactor_idle_deadline(&reactor)==2000u && !reactor.registrations[0].registered);
+  }
+  /* A concrete completion or RETIRED event promotes only its bound C record. */
+  ku_http_reactor_idle_remove(&reactor,&connections[0]);ku_http_reactor_work_add(&reactor,&connections[0]);
+  CHECK(!reactor.parked_jobs && reactor.work_count==3 && connections[0].idle_position==-1);
+  connections[0].job=NULL;connections[0].phase=KU_HTTP_IO_HEADER;
+  ku_http_reactor_refresh(&connections[0]);CHECK(reactor.idle_count==2 && !reactor.parked_jobs);
   reactor.next_token=UINT64_MAX-1u;
   ku_http_reactor_interest(&reactor,5u,first[1],KU_HTTP_POLL_READ,0,-1);
   CHECK(reactor.fault && !reactor.registrations[5].registered);
