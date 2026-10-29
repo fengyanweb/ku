@@ -3139,22 +3139,42 @@ int main(void) {
 #else
   CHECK(!pthread_mutex_init(&pool.mutex,NULL));
 #endif
-  fresh_observed_pool=&pool;
+  fresh_observed_pool=&pool;pool.capacity=1u;
+  ku_task_control_atomic_init(&pool.pg_closing_view,0u);
+  ku_task_control_atomic_init(&job.pg_cancelled_view,0u);
   ku_task_control_atomic_init(&control.phase,KU_TASK_CONTROL_LIVE);
   operation.task_phase_context=&control;operation.task_phase=fresh_real_task_phase;
-  job.pg_pool=&pool;job.pg_operation=&operation;job.kind=9u;job.state=KU_TASK_BLOCKING_NET_STEP;
+  job.pg_pool=&pool;job.pg_operation=&operation;job.kind=9u;job.state=KU_TASK_BLOCKING_BUILDING;
   job.generation=UINT64_C(4294967297);
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_state_locked(&pool,&job,KU_TASK_BLOCKING_NET_STEP)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_control_atomic_load(&job.pg_cancelled_view)==KU_TASK_BLOCKING_PG_STEPPING);
   CHECK(!ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
   ku_task_control_atomic_store(&control.phase,KU_TASK_CONTROL_REQUESTED_CANCEL);
   CHECK(!job.cancelled && ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
   ku_task_control_atomic_store(&control.phase,KU_TASK_CONTROL_LIVE);
-  job.cancelled=1;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);job.cancelled=0;
-  pool.closing=1;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);pool.closing=0;
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_cancel_job_locked(&pool,&job)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_control_atomic_load(&job.pg_cancelled_view)==(KU_TASK_BLOCKING_PG_CANCELLED|KU_TASK_BLOCKING_PG_STEPPING)
+      && ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
+  /* Reset this exclusively owned synthetic job before the next independent case. */
+  CHECK(!ku_task_blocking_lock(&pool));job.cancelled=0;
+  ku_task_control_atomic_store(&job.pg_cancelled_view,KU_TASK_BLOCKING_PG_STEPPING);
+  ku_task_blocking_set_closing_locked(&pool,1u);ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && !pool.fault);
+  CHECK(!ku_task_blocking_lock(&pool));ku_task_blocking_set_closing_locked(&pool,0u);ku_task_blocking_unlock(&pool);
   CHECK(ku_task_pg_fresh_cancel(&job,1u) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
   CHECK(!ku_task_pg_fresh_cancel(&job,job.generation));
-  job.state=KU_TASK_BLOCKING_NET_WAIT;
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_state_locked(&pool,&job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);
+  CHECK(!ku_task_control_atomic_load(&job.pg_cancelled_view));
   CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
-  job.state=KU_TASK_BLOCKING_NET_STEP;job.kind=8u;
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_state_locked(&pool,&job,KU_TASK_BLOCKING_NET_STEP)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);job.kind=8u;
   CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);pool.fault=0;
   job.kind=9u;CHECK(!ku_task_pg_fresh_cancel(&job,job.generation));
   job.pg_operation=NULL;CHECK(ku_task_pg_fresh_cancel(&job,job.generation) && pool.fault==KU_TASK_DRIVER_INTERNAL);

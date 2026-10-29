@@ -29,15 +29,25 @@ static void ku_task_pg_wake(void* raw) {
 static int ku_task_pg_fresh_cancel(void* raw,uint64_t generation) {
   KuTaskBlockingJobV1* job=(KuTaskBlockingJobV1*)raw;
   KuTaskBlockingPoolV1* pool=job->pg_pool;
-  if(!pool || ku_task_blocking_lock(pool))return 1;
-  int invalid=job->generation!=generation || job->kind!=9u || job->state!=KU_TASK_BLOCKING_NET_STEP;
+  if(!pool)return 1;
+  /* state_locked publishes this view before dispatch drops the pool mutex.
+   * Within the pinned owner step generation/kind/operation are immutable.
+   * Cancellation and close writers publish only their atomic mirrors here. */
+  size_t view=ku_task_control_atomic_load(&job->pg_cancelled_view);
+  int invalid=!(view&KU_TASK_BLOCKING_PG_STEPPING)
+      || job->generation!=generation || job->kind!=9u;
   KuPgAsyncOp* operation=invalid?NULL:job->pg_operation;
   uint64_t (*phase)(void*)=operation?operation->task_phase:NULL;
   void* context=operation?operation->task_phase_context:NULL;
   if(!phase || !context)invalid=1;
-  if(invalid)pool->fault=KU_TASK_DRIVER_INTERNAL;
-  int cancelled=invalid || job->cancelled || pool->closing;
-  ku_task_blocking_unlock(pool);
+  if(invalid) {
+    if(!ku_task_blocking_lock(pool)) {
+      pool->fault=KU_TASK_DRIVER_INTERNAL;ku_task_blocking_unlock(pool);
+    }
+    return 1;
+  }
+  int cancelled=(view&KU_TASK_BLOCKING_PG_CANCELLED)
+      || ku_task_control_atomic_load(&pool->pg_closing_view);
   /* request_cancel publishes control phase before adapter cleanup sets the
    * job flag. Preserve that observation too, with no lock held for a callback.
    * Physical blocking registration pins this control until NET_STEP returns. */
