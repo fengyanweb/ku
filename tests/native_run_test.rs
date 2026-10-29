@@ -5486,6 +5486,185 @@ int main(void) {
 }
 
 #[test]
+fn native_json_word_blocks_and_short_writes_preserve_bounds_and_error_order() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-word-boundaries"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import json from "std.json"
+fn main(): null! {
+    println(json.encode("")?)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write JSON block-boundary fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    // Fail the actual reserve allocation site, including its first allocation
+    // and growth, while retaining the shared live-allocation ledger. No fixed
+    // ordinal is assumed to keep identifying the same source statement.
+    let reserve = "static bool ku_json_buffer_reserve(";
+    assert!(generated.contains(reserve));
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static int ku_json_test_fail_reserve = 0;
+static void* ku_json_test_realloc(void* p, size_t n) {{
+  if (ku_json_test_fail_reserve) return NULL;
+  return realloc(p, n);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(allocation).count(), 1);
+    let generated = generated.replacen(
+        allocation,
+        "uint8_t* data = (uint8_t*)ku_json_test_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-word-boundaries",
+        r#"
+static int json_word_error(KuError error,const char* code,const char* message) {
+  size_t n=strlen(message);
+  return ku_string_equal(error.domain,ku_string_static((const uint8_t*)"json",4))
+      && ku_string_equal(error.code,ku_string_static((const uint8_t*)code,strlen(code)))
+      && error.message.len>=n && !memcmp(error.message.ptr,message,n);
+}
+static size_t json_expected_ascii(uint8_t byte,uint8_t* out) {
+  if(byte=='"' || byte=='\\') {out[0]='\\';out[1]=byte;return 2;}
+  if(byte=='\n' || byte=='\r' || byte=='\t') {
+    out[0]='\\';out[1]=byte=='\n'?'n':byte=='\r'?'r':'t';return 2;
+  }
+  if(byte<0x20) {
+    static const char hex[]="0123456789abcdef";
+    out[0]='\\';out[1]='u';out[2]='0';out[3]='0';
+    out[4]=(uint8_t)hex[byte>>4];out[5]=(uint8_t)hex[byte&15];return 6;
+  }
+  out[0]=byte;return 1;
+}
+static int json_word_roundtrip(size_t offset,size_t prefix,size_t suffix,int inserted) {
+  size_t len=prefix+(inserted>=0)+suffix;
+  uint8_t raw[96],text[128];memset(raw,'a',len);
+  if(inserted>=0)raw[prefix]=(uint8_t)inserted;
+  // The end of the input is the allocation end: there is no readable padding.
+  uint8_t* allocation=(uint8_t*)malloc(offset+len);CHECK(allocation);
+  uint8_t* input=allocation+offset;if(len)memcpy(input,raw,len);
+  size_t at=0;text[at++]='"';
+  for(size_t i=0;i<len;i++)at+=json_expected_ascii(raw[i],text+at);
+  text[at++]='"';
+  KuValue value=ku_v_str(ku_string_static(input,len));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(encoded.ok && encoded.value.len==at && !memcmp(encoded.value.ptr,text,at));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len && (!len || !memcmp(input,raw,len)));
+  // Parse from a separately unaligned, exact-size allocation as well.
+  uint8_t* json_allocation=(uint8_t*)malloc(offset+at);CHECK(json_allocation);
+  memcpy(json_allocation+offset,text,at);
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(json_allocation+offset,at));
+  CHECK(decoded.ok && decoded.value.tag==KU_STR && decoded.value.as.s.len==len);
+  ku_value_drop(&value);free(allocation);free(json_allocation);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  // Results must outlive both inputs and the serialized output.
+  CHECK(!len || !memcmp(decoded.value.as.s.ptr,raw,len));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+static int json_word_invalid(size_t offset,size_t prefix,size_t suffix,uint8_t byte) {
+  size_t len=prefix+suffix+1;uint8_t raw[96];memset(raw,'a',len);raw[prefix]=byte;
+  uint8_t* allocation=(uint8_t*)malloc(offset+len+2);CHECK(allocation);
+  uint8_t* text=allocation+offset;text[0]='"';memcpy(text+1,raw,len);text[len+1]='"';
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(text,len+2));
+  CHECK(!decoded.ok && json_word_error(decoded.error,"parse_error",
+      byte<0x20?"control character in json string":"invalid utf-8 in json string"));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);free(allocation);
+  if(byte>=0x80) {
+    // A single non-ASCII byte followed only by ASCII/EOF is always invalid UTF8.
+    allocation=(uint8_t*)malloc(offset+len);CHECK(allocation);memcpy(allocation+offset,raw,len);
+    KuValue value=ku_v_str(ku_string_static(allocation+offset,len));
+    KuResult_str encoded=ku_json_stringify(value);
+    CHECK(!encoded.ok && json_word_error(encoded.error,"stringify_error","invalid utf-8 in json string"));
+    CHECK(!memcmp(allocation+offset,raw,len));
+    ku_value_drop(&value);ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);free(allocation);
+  }
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+int main(void) {
+  static const size_t prefixes[]={0,1,6,7,8,9,15,16,17,23,24,31,32};
+  static const size_t suffixes[]={0,1,7,8};
+  for(size_t offset=0;offset<8;offset++) {
+    for(size_t len=0;len<=33;len++) {
+      CHECK(!json_word_roundtrip(offset,len,0,-1));
+      uint8_t* allocation=(uint8_t*)malloc(offset+len+1);CHECK(allocation);
+      uint8_t* text=allocation+offset;text[0]='"';memset(text+1,'a',len);
+      KuResult_kuvalue bad=ku_json_parse(ku_string_static(text,len+1));
+      CHECK(!bad.ok && json_word_error(bad.error,"parse_error","unterminated json string"));
+      ku_value_drop(&bad.value);ku_error_drop(&bad.error);free(allocation);CHECK(NO_LIVE_ALLOCATIONS());
+    }
+    for(size_t p=0;p<sizeof(prefixes)/sizeof(prefixes[0]);p++)
+      for(size_t s=0;s<sizeof(suffixes)/sizeof(suffixes[0]);s++)
+        for(unsigned byte=0;byte<256;byte++) {
+          if(byte<0x80)CHECK(!json_word_roundtrip(offset,prefixes[p],suffixes[s],(int)byte));
+          if(byte<0x20 || byte>=0x80)CHECK(!json_word_invalid(offset,prefixes[p],suffixes[s],(uint8_t)byte));
+        }
+  }
+  // The old scalar writer observes a size error on the first prefix byte over
+  // budget, before a later invalid UTF8 byte. At exactly the prefix bound, the
+  // next invalid UTF8 byte still wins. The block path must preserve both cases.
+  uint8_t* output=(uint8_t*)malloc(KU_JSON_MAX_OUTPUT_BYTES);CHECK(output);
+  for(size_t room=0;room<=24;room++)for(size_t prefix=0;prefix<=24;prefix++) {
+    uint8_t input[32];memset(input,'a',prefix);input[prefix]=0x80;
+    KuJsonBuffer buffer={output,KU_JSON_MAX_OUTPUT_BYTES-room,KU_JSON_MAX_OUTPUT_BYTES};KuError error={0};
+    CHECK(!ku_json_write_string(&buffer,ku_string_static(input,prefix+1),&error));
+    CHECK(json_word_error(error,"stringify_error",room==0 || prefix>room-1
+        ?"json.stringify output is too large":"invalid utf-8 in json string"));
+    CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
+    static const uint8_t escape_bytes[]={0,'\n','"','\\'};
+    for(size_t e=0;e<sizeof(escape_bytes);e++) {
+      input[prefix]=escape_bytes[e];input[prefix+1]=0x80;
+      size_t escape_len=escape_bytes[e]==0?6:2;
+      buffer=(KuJsonBuffer){output,KU_JSON_MAX_OUTPUT_BYTES-room,KU_JSON_MAX_OUTPUT_BYTES};error=(KuError){0};
+      CHECK(!ku_json_write_string(&buffer,ku_string_static(input,prefix+2),&error));
+      CHECK(json_word_error(error,"stringify_error",room<1+prefix+escape_len
+          ?"json.stringify output is too large":"invalid utf-8 in json string"));
+      CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
+    }
+  }
+  free(output);CHECK(NO_LIVE_ALLOCATIONS());
+  // Reserve OOM must not consume input, lose old allocation, or be overwritten
+  // by the later malformed byte. Exercise first allocation,byte,2/6 escape and
+  // ordinary-span growth without depending on allocation ordinal numbers.
+  uint8_t invalid[20]={'"'};memset(invalid+1,'a',17);invalid[18]=0x80;invalid[19]='"';
+  ku_json_test_fail_reserve=1;
+  KuResult_kuvalue parsed=ku_json_parse(ku_string_static(invalid,sizeof(invalid)));
+  CHECK(!parsed.ok && json_word_error(parsed.error,"out_of_memory","json allocation failed"));
+  ku_value_drop(&parsed.value);ku_error_drop(&parsed.error);CHECK(NO_LIVE_ALLOCATIONS());
+  KuResult_str first=ku_json_stringify(ku_v_str(ku_string_static((const uint8_t*)"",0)));
+  CHECK(!first.ok && json_word_error(first.error,"out_of_memory","json allocation failed"));
+  ku_string_drop(&first.value);ku_error_drop(&first.error);CHECK(NO_LIVE_ALLOCATIONS());
+  static const uint8_t examples[][3]={{0},{'"'},{'\n'},{'a','\n',0x80},{0}};
+  static const size_t lengths[]={1,1,1,3,0};
+  for(size_t i=0;i<5;i++) {
+    ku_json_test_fail_reserve=0;
+    size_t cap=i==3?1:64;uint8_t* previous=(uint8_t*)malloc(cap);CHECK(previous);
+    KuJsonBuffer buffer={previous,i==3?0:cap-1,cap};KuError error={0};
+    ku_json_test_fail_reserve=1;
+    CHECK(!ku_json_write_string(&buffer,ku_string_static(examples[i],lengths[i]),&error));
+    CHECK(json_word_error(error,"out_of_memory","json allocation failed"));
+    CHECK(buffer.data==previous && buffer.cap==cap);
+    ku_json_buffer_drop(&buffer);ku_error_drop(&error);CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  ku_json_test_fail_reserve=0;
+  CHECK(!json_word_roundtrip(7,16,8,'\n'));return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn native_json_accepts_raw_del_and_c1_but_rejects_c0() {
     let dir = unique_temp_dir("json-raw-controls");
     fs::write(dir.join("legal.json"), [b'"', 0x7f, 0xc2, 0x85, b'"'])
