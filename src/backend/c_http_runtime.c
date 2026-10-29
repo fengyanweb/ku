@@ -1631,12 +1631,16 @@ static void ku_http_job_release(KuHttpJob* job) {
   ku_http_wake_notify(queue->wake);
 }
 static int ku_http_job_only_owner(KuHttpJob* job) {
-  size_t current = ku_atomic_refcount_load(&job->owners);
-  for (;;) {
-    size_t expected = current;
-    if (ku_atomic_refcount_compare_exchange_acq_rel(&job->owners, &expected, current)) return current == 1;
-    current = expected;
-  }
+  /* The calling connection already owns a reference. The only additional
+   * retain is queue_push, completed by this owner before worker publication;
+   * workers cannot create a new owner after retiring their reference. Acquire
+   * observes that release and its preceding cleanup, without a write-back RMW.
+   * The shared/general reference-count implementation is unchanged. */
+#if defined(_MSC_VER)
+  return (size_t)_InterlockedCompareExchange64(&job->owners,0,0)==1u;
+#else
+  return atomic_load_explicit(&job->owners,memory_order_acquire)==1u;
+#endif
 }
 static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
   /* Exactly once at actual handler invocation, preserving native's original
