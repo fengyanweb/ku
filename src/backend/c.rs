@@ -6313,15 +6313,18 @@ static KuResult_kuvalue ku_json_parse(KuString text) {
   return ku_json_try_parse(text);
 }
 
-static int ku_json_entry_compare(const void* left_ptr, const void* right_ptr) {
-  const KuEntry* left = *(const KuEntry* const*)left_ptr;
-  const KuEntry* right = *(const KuEntry* const*)right_ptr;
+static inline int ku_json_entry_order(const KuEntry* left, const KuEntry* right) {
   size_t shared = left->key.len < right->key.len ? left->key.len : right->key.len;
   int order = shared ? memcmp(left->key.ptr, right->key.ptr, shared) : 0;
   if (order != 0) return order;
   if (left->key.len < right->key.len) return -1;
   if (left->key.len > right->key.len) return 1;
   return 0;
+}
+
+static int ku_json_entry_compare(const void* left_ptr, const void* right_ptr) {
+  return ku_json_entry_order(*(const KuEntry* const*)left_ptr,
+      *(const KuEntry* const*)right_ptr);
 }
 
 static bool ku_json_write_value(
@@ -6436,7 +6439,21 @@ static bool ku_json_write_object(
   for (size_t index = 0; index < object->cap && found < count; index++) {
     if (object->entries[index].used) entries[found++] = &object->entries[index];
   }
-  qsort(entries, found, sizeof(KuEntry*), ku_json_entry_compare);
+  if (found <= 8) {
+    /* At most28 comparisons/moves in stack scratch; zero/one need no sort.
+       Compare original UTF8 byte spans, including length and embedded NUL. */
+    for (size_t index = 1; index < found; index++) {
+      KuEntry* entry = entries[index];
+      size_t position = index;
+      while (position && ku_json_entry_order(entries[position - 1], entry) > 0) {
+        entries[position] = entries[position - 1];
+        position--;
+      }
+      entries[position] = entry;
+    }
+  } else {
+    qsort(entries, found, sizeof(KuEntry*), ku_json_entry_compare);
+  }
   for (size_t index = 0; index < found; index++) {
     bool ok = (index == 0 || ku_json_write_byte(output, ',', error))
         && ku_json_write_string(output, entries[index]->key, error)

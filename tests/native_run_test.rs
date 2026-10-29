@@ -5852,6 +5852,14 @@ fn native_json_stringify_sorts_object_keys_stably() {
 fn main(): null! {
     value = json.parse("{\"z\":0,\"é\":1,\"aa\":2,\"a\":3}")?
     println(json.stringify(value)?)
+    println(json.stringify(json.parse("{}")?)?)
+    println(json.stringify(json.parse("{\"only\":1}")?)?)
+    small = json.parse("{\"h\":8,\"g\":7,\"f\":6,\"e\":5,\"d\":4,\"c\":3,\"b\":2,\"a\":1}")?
+    println(json.stringify(small)?)
+    large = json.parse("{\"i\":9,\"h\":8,\"g\":7,\"f\":6,\"e\":5,\"d\":4,\"c\":3,\"b\":2,\"a\":1}")?
+    println(json.stringify(large)?)
+    duplicate = json.parse("{\"b\":1,\"a\":2,\"b\":3}")?
+    println(json.stringify(duplicate)?)
     return ok(null)
 }
 "#,
@@ -5865,7 +5873,7 @@ fn main(): null! {
     let (stdout, code) = run_binary(&exe);
     assert_eq!(
         stdout.replace('\r', ""),
-        "{\"a\":3,\"aa\":2,\"z\":0,\"é\":1}\n"
+        "{\"a\":3,\"aa\":2,\"z\":0,\"é\":1}\n{}\n{\"only\":1}\n{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8}\n{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9}\n{\"a\":2,\"b\":3}\n"
     );
     assert_eq!(code, Some(0));
 
