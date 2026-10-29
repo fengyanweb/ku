@@ -6,18 +6,23 @@ A new implementation/build needs a new frozen plan/output. Explore is allowed
 without formal environmental qualification; that never turns it into a claim.
 """
 import argparse
+import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import signal
+import statistics
+import threading
 import time
 from linux_harness import (Harness, full_lifecycle_cost, quiet_metrics, write_json,
                            qualification, upper_point, overload_boundary, paired_interval,
-                           service_termination_succeeded, measurement_clock, result_assessment)
+                           service_termination_succeeded, measurement_clock, result_assessment,
+                           Domain, ExternalDomain, Sampler, GIB)
 
-PHASES = ('control', 'screen', 'ablation', 'explore', 'final', 'capacity')
+PHASES = ('control', 'screen', 'ablation', 'explore', 'final', 'capacity', 'stability')
 
 
 def digest(path):
@@ -126,7 +131,7 @@ def jobs_for(plan, phase, workload='json_object', names=('A', 'B', 'R')):
             entries.append(dict(phase=current, workload=workload, orders=orders, **config))
     for entry_index, entry in enumerate(entries):
         current = entry['phase']
-        if current not in PHASES or current == 'capacity':
+        if current not in PHASES or current in ('capacity', 'stability'):
             raise ValueError('fixed schedule phase must be control/screen/ablation/explore/final')
         if phase != 'all' and current != phase:
             continue
@@ -480,7 +485,447 @@ def compare_goals(plan, rows):
     return results
 
 
+def stability_config(plan):
+    """A separate once-only continuous run, never inferred from short windows."""
+    config = copy.deepcopy(plan['stability'])
+    if config.get('frozen_final') is not True or config.get('name') not in plan['versions']:
+        raise ValueError('stability requires an explicitly frozen final version')
+    if plan['versions'][config['name']].get('stack', 'ku') != 'ku':
+        raise ValueError('stability currently requires the Ku management metrics contract')
+    integer(config['seconds'], 1800, 3600, 'stability seconds')
+    integer(config['segment_seconds'], 60, 300, 'stability segment seconds')
+    if config['seconds'] % config['segment_seconds'] or config['seconds']//config['segment_seconds'] < 6:
+        raise ValueError('stability needs at least six complete segments')
+    for key, high in (('mixed_rate', 10000), ('short_rate', 10000), ('cpu_rate', 1000)):
+        bounded(config[key], .1, high, key)
+    if config['seconds'] * sum(config[k] for k in ('mixed_rate', 'short_rate', 'cpu_rate')) > 10_000_000:
+        raise ValueError('stability total arrival plans exceed10000000')
+    if config.get('short_slo_ms') != 20:
+        raise ValueError('stability short SLO must remain20ms')
+    bounded(config['maximum_start_skew_seconds'], 0, 5, 'stability start skew')
+    bounded(config['maximum_segment_gap_seconds'], 0, 30, 'stability segment gap')
+    resources = plan['resources']
+    if (resources['driver_cores'] != 1 or resources['driver_cpuset'] != '2'
+            or resources.get('driver_memory_bytes', GIB) != GIB
+            or resources['service_cores'] != 2 or resources['service_memory_bytes'] != GIB):
+        raise ValueError('stability requires service2cores/1GiB and shared driver parent1core/1GiB/cpu2')
+    limits = config['growth_limits']
+    for key, high in (('service_memory_bytes', GIB), ('coordinator_rss_bytes', GIB),
+                      ('service_fd', 65536), ('service_threads', 4096)):
+        integer(limits[key], 0, high, 'stability growth '+key)
+    return config
+
+
+def stability_service_cost(before, after, reports):
+    """One nonoverlapping service interval divided by ALL correct responses."""
+    correct = sum(report['ledger']['correct_total'] for report in reports)
+    cpu = after['cpu_stat']['usage_usec'] - before['cpu_stat']['usage_usec']
+    if cpu < 0:
+        raise ValueError('stability service CPU counter reset')
+    return {'before': before, 'after': after, 'lifetime_cpu_seconds': cpu/1e6,
+            'cpu_seconds_per_correct': cpu/1e6/correct if correct else None,
+            'correct_total': correct,
+            'scope': 'one whole-service first-to-last interval; overlapping client service/observer CPU is never summed'}
+
+
+def stability_stream(report, kind):
+    """Keep the original axes and all failures; add the normal Task SLO gate."""
+    assessment = report['assessment']
+    original = qualification(report, kind)
+    task_reasons = []
+    if kind == 'task_mix':
+        for name, limit in (('ok', 20), ('cpu', 3000)):
+            view = report.get('by_type', {}).get(name, {})
+            normal = view.get('normal_planned')
+            failure = view.get('normal_failure_fraction_planned')
+            p99 = view.get('correct_scheduled_to_complete', {}).get('p99_ms')
+            if (type(normal) is not int or normal <= 0 or type(failure) not in (int, float)
+                    or not math.isfinite(failure) or not 0 <= failure <= .001):
+                task_reasons.append(name+'_normal_success_below_99.9_percent_or_missing')
+            if type(p99) not in (int, float) or not math.isfinite(p99) or not 0 <= p99 <= limit:
+                task_reasons.append(name+'_p99_missing_or_over_slo')
+        config = report.get('configuration', {})
+        if (config.get('cpu_cancel_every') != 10 or config.get('cpu_cancel_delay_us') != 250
+                or config.get('task_mix_short_SLO_ms') != 20):
+            task_reasons.append('task_mix_frozen_contract_mismatch')
+        cancellation = report.get('by_type', {}).get('cpu', {}).get('planned_cancellation', {})
+        planned = cancellation.get('planned')
+        if (type(planned) is not int or planned <= 0 or cancellation.get('sent') != planned
+                or cancellation.get('reset_issued') != planned
+                or cancellation.get('results') != {'planned_reset': planned}):
+            task_reasons.append('planned_cpu_reset_not_fully_issued_or_other_terminal_outcomes')
+        clock = measurement_clock(config)
+        if not clock['available']:
+            task_reasons.append(clock['reason'])
+        if report.get('diagnostic_only') is True or report.get('normal_score_eligible') is False:
+            task_reasons.append('diagnostic_contract_excluded')
+    # Generic failure_fraction includes planned RST, so retain that original
+    # gate as evidence but apply the driver's separate normal denominator here.
+    slo = not task_reasons if kind == 'task_mix' else original['qualified']
+    qualified = (slo and assessment['functional_valid'] and assessment['accounting_valid']
+                 and assessment['arrival_schedule_quality'] == 'pass'
+                 and assessment['environment_quality'] == 'pass'
+                 and not assessment['measurement_invalid'])
+    return {'assessment': assessment, 'original_qualification': original,
+            'normal_request_slo_passed': slo, 'normal_request_slo_reasons': task_reasons,
+            'qualified': qualified, 'correct': report['ledger']['correct_total'],
+            'planned': report['ledger']['planned'], 'results': report['ledger'].get('results', {}),
+            'by_type': report.get('by_type', {}),
+            'cancel_scope': 'planned TCP RST is not proof of per-request execution stop; final quiet checks aggregate retirement'}
+
+
+def stability_coordinator():
+    status = Path('/proc/self/status').read_text().splitlines()
+    fields = {line.split(':', 1)[0]: line.split(':', 1)[1].strip() for line in status if ':' in line}
+    return {'pid': os.getpid(), 'rss_bytes': int(fields['VmRSS'].split()[0])*1024,
+            'fd': len(list(Path('/proc/self/fd').iterdir())), 'threads': int(fields['Threads']),
+            'scope': 'coordinator only, outside measured service/driver/database domains'}
+
+
+def stability_metrics_coverage(metrics):
+    groups = ('loops', 'tasks', 'task_blocking', 'task_driver', 'database', 'buffer_bytes', 'output')
+    event_fields = []
+    def fields(value, prefix='', depth=0):
+        if depth > 3:
+            return
+        if isinstance(value, dict):
+            for key, child in list(value.items())[:256]:
+                path = prefix+'.'+key if prefix else key
+                if 'event' in key.lower() or 'ring' in key.lower():
+                    event_fields.append(path)
+                fields(child, path, depth+1)
+        elif isinstance(value, list) and value:
+            fields(value[0], prefix+'[*]', depth+1)
+    fields(metrics)
+    return {'groups': {key: 'present' if key in metrics else 'not_exposed' for key in groups},
+            'event_related_fields': event_fields,
+            'completion_event_queue': 'unclassified_raw_fields' if event_fields else 'not_exposed',
+            'completion_event_queue_zero_proven': False,
+            'scope': 'only present documented counters are checked; missing/H3-specific counters are never inferred as zero'}
+
+
+def stability_growth(checkpoints, limits):
+    """Bounded endpoint trend, not a general absence-of-leaks claim."""
+    result = {}
+    for key, getter in (
+            ('service_memory_bytes', lambda r: r['service']['memory_current']),
+            ('service_fd', lambda r: r['service']['fd']),
+            ('service_threads', lambda r: r['service']['threads']),
+            ('coordinator_rss_bytes', lambda r: r['coordinator']['rss_bytes'])):
+        values = [getter(row) for row in checkpoints]
+        valid = len(values) >= 6 and all(type(v) is int and v >= 0 for v in values)
+        delta = statistics.median(values[-3:])-statistics.median(values[:3]) if valid else None
+        result[key] = {'values': values, 'last3_minus_first3_median': delta,
+                       'maximum_growth': limits[key], 'passed': valid and delta <= limits[key]}
+    return {'passed': all(row['passed'] for row in result.values()), 'metrics': result,
+            'scope': 'segment-end observations under load; bounded median growth, not proof of all-path leak freedom'}
+
+
+def stability_join(threads, parent, *, cancel=False, seconds=30):
+    """Kill only the private driver subtree before reaping interrupted clients."""
+    kill_error = None
+    if cancel:
+        try:
+            parent.kill()
+        except Exception as error:
+            kill_error = error
+    deadline = time.monotonic()+seconds
+    for thread in threads:
+        thread.join(timeout=max(0, deadline-time.monotonic()))
+    if any(thread.is_alive() for thread in threads):
+        parent.kill()
+        raise RuntimeError('owned stability client cleanup did not finish within bounded join')
+    if kill_error:
+        raise RuntimeError('private driver parent kill failed after clients were joined') from kill_error
+
+
+def stability_clients(clients, service, config, output, parent):
+    ready, done = threading.Event(), threading.Event()
+    cancelled, launch_lock = threading.Event(), threading.Lock()
+    results, errors, threads = {}, {}, []
+    original_launches = {kind: client.launch for kind, client in clients.items()}
+    for kind, client in clients.items():
+        original = original_launches[kind]
+        def guarded_launch(*args, _original=original, **kwargs):
+            with launch_lock:
+                if cancelled.is_set():
+                    raise RuntimeError('owned driver launch cancelled before exec')
+                return _original(*args, **kwargs)
+        client.launch = guarded_launch
+    def work(kind, client, rate):
+        try:
+            ready.wait()
+            results[kind] = client.client(service, kind, rate, config['segment_seconds'],
+                                         output/kind, concurrency=4096, timeout=3,
+                                         events=True, runtime_metrics=False, idle_ms=500)
+        except BaseException as error:
+            errors[kind] = repr(error)
+        finally:
+            done.set()
+    for kind, rate in (('mixed', config['mixed_rate']), ('task_mix', config['short_rate'])):
+        thread = threading.Thread(target=work, args=(kind, clients[kind], rate),
+                                  name='stability-'+kind, daemon=True)
+        threads.append(thread)
+    try:
+        for thread in threads:
+            thread.start()
+        ready.set()
+        deadline = time.monotonic()+config['segment_seconds']+35
+        while any(thread.is_alive() for thread in threads):
+            if errors:
+                raise RuntimeError('stability driver failure: '+repr(errors))
+            if time.monotonic() >= deadline:
+                raise RuntimeError('stability driver coordinator deadline')
+            done.wait(.05)
+            done.clear()
+        stability_join(threads, parent)
+        if errors or len(results) != 2:
+            raise RuntimeError('stability driver failure: '+repr(errors))
+        return results
+    except BaseException:
+        ready.set()
+        # cgroup.kill is a point-in-time action. Serialize with Popen and stop
+        # future launches first, including a client still preparing its report.
+        with launch_lock:
+            cancelled.set()
+        stability_join([thread for thread in threads if thread.ident is not None], parent, cancel=True)
+        raise
+    finally:
+        if all(not thread.is_alive() for thread in threads):
+            for kind, client in clients.items():
+                client.launch = original_launches[kind]
+
+
+def stability_parent_cleanup(parent):
+    parent.kill()
+    children = [path for path in parent.path.iterdir() if path.is_dir()] if parent.path.exists() else []
+    if len(children) > 4:
+        raise RuntimeError('unexpected child count in private stability parent')
+    removed = []
+    for path in children:
+        child = ExternalDomain(path, 'owned-driver')
+        Domain.kill(child)
+        removed.append({'path': str(path), 'removed': Domain.remove(child)})
+    return {'children': removed, 'cgroup_removed': parent.remove(),
+            'scope': 'only the random private driver parent and its owned children'}
+
+
+def stability_window(plan, output, config, binding, unchanged):
+    """One service, simultaneous streams, finite segments and one CPU denominator."""
+    name = config['name']
+    spec, resources = plan['versions'][name], plan['resources']
+    h = Harness(spec['root'], output/'coordinator')
+    clients, service, parent, sampler = {}, None, None, None
+    reports, checkpoints = [], []
+    row = {'name': name, 'phase': 'stability', 'status': 'starting', 'binding': binding,
+           'configuration': config, 'segments': [], 'checkpoints': checkpoints,
+           'candidate_accepted': False, 'execution_complete': False, 'qualified': False,
+           'service_restarts': 0, 'score_started': False,
+           'duration_scope': 'same service without restart; sum of planned arrival segments; actual overlaps/gaps retained'}
+    try:
+        if (h.manifest.get('driver_cores') != 1 or h.manifest.get('driver_cpuset') != '2'
+                or h.manifest.get('quality_policy') != plan['quality_policy']):
+            raise ValueError('frozen stability driver/arrival contract differs from manifest')
+        if not h.db_domain:
+            raise ValueError('stability mixed requires the declared database resource domain')
+        database = {key: (h.db_domain.path/key).read_text().strip()
+                    for key in ('cpu.max', 'cpuset.cpus.effective', 'memory.max', 'memory.swap.max')}
+        row['database_limits'] = database
+        if database['cpuset.cpus.effective'] != '3' or database['memory.max'] != str(GIB//2):
+            raise ValueError('stability database requires cpu3 and512MiB; actual limits retained in preflight')
+        parent = Domain(h, 'stability-drivers', 1, GIB, '2')
+        if not (parent.path/'cgroup.kill').exists():
+            raise ValueError('stability requires hierarchical cgroup.kill for owned driver cancellation')
+        required = {'cpu', 'memory', 'pids', 'cpuset'}
+        available = set((parent.path/'cgroup.controllers').read_text().split())
+        if not required <= available:
+            raise ValueError('stability driver parent controllers unavailable')
+        (parent.path/'cgroup.subtree_control').write_text(' '.join('+'+key for key in sorted(required)))
+        row['driver_parent'] = {'path': str(parent.path), 'limits': parent.settings,
+            'scope': 'one shared hierarchical1core/1GiB/cpu2 budget; child totals and parent totals are not additive'}
+        for kind in ('mixed', 'task_mix'):
+            client = Harness(spec['root'], output/('driver-'+kind))
+            client.manifest = copy.deepcopy(client.manifest)
+            client.cgroup_root = parent.path
+            if kind == 'task_mix':
+                client.manifest['client']['command'] += ['--cpu-rate', str(config['cpu_rate']),
+                    '--cpu-cancel-every', '10', '--cpu-cancel-delay-us', '250']
+            receipt = {'source_manifest_sha256': client.identity['manifest_sha256'],
+                'effective_client': client.manifest['client'], 'parent': str(parent.path),
+                'child_limits': {'cpu.max': '100000 100000', 'memory.max': GIB, 'cpuset': '2'},
+                'scope': 'derived client-only in-memory configuration; original frozen manifest unchanged'}
+            receipt_sha = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
+            client.identity = dict(client.identity, manifest_sha256=receipt_sha)
+            write_json(client.output/'derived-driver.json', dict(receipt, sha256=receipt_sha))
+            clients[kind] = client
+        service = h.start('ku', cores=resources['service_cores'], memory=resources['service_memory_bytes'],
+                          output=output/'service', extra_env=spec.get('env', {}))
+        service.startup['reuse'] = 'one unchanged service throughout stability; never frozen or restarted'
+        write_json(output/'service/service.json', service.startup)
+        before, driver_before = service.domain.snapshot(), parent.snapshot()
+        initial_metrics = service.metrics()
+        row['initial_checkpoint'] = {'service': before, 'driver_parent': driver_before,
+            'metrics': initial_metrics, 'metrics_coverage': stability_metrics_coverage(initial_metrics),
+            'coordinator': stability_coordinator()}
+        sampler = Sampler([service.domain, parent, h.db_domain], output/'resources.json',
+                          interval=5, maximum=config['seconds']//5+128).start()
+        row['score_started'] = True
+        for index in range(config['seconds']//config['segment_seconds']):
+            unchanged()
+            segment_output = output/('segment-%02d'%(index+1))
+            result = stability_clients(clients, service, config, segment_output, parent)
+            reports.extend({'ledger': {'correct_total': report['ledger']['correct_total']}}
+                           for report in result.values())
+            segment = {'index': index+1, 'streams': {}, 'service_pid': service.process.pid}
+            origins = {}
+            for kind, report in result.items():
+                segment['streams'][kind] = dict(stability_stream(report, kind),
+                                               report=str(segment_output/kind/'client.json'))
+                anchor = measurement_clock(report['configuration'])
+                if anchor['available']:
+                    origins[kind] = anchor['origin_ns']
+            if len(origins) == 2:
+                segment['origins_monotonic_ns'] = origins
+                segment['start_skew_seconds'] = (max(origins.values())-min(origins.values()))/1e9
+                segment['overlap_seconds'] = max(0, config['segment_seconds']-segment['start_skew_seconds'])
+                if row['segments'] and 'origins_monotonic_ns' in row['segments'][-1]:
+                    previous = row['segments'][-1]['origins_monotonic_ns']
+                    segment['per_stream_gap_seconds'] = {kind: (origins[kind]-previous[kind])/1e9-config['segment_seconds'] for kind in origins}
+            segment['simultaneous_arrival_quality'] = (len(origins) == 2
+                and segment['start_skew_seconds'] <= config['maximum_start_skew_seconds']
+                and all(-.002 <= gap <= config['maximum_segment_gap_seconds']
+                        for gap in segment.get('per_stream_gap_seconds', {}).values()))
+            row['segments'].append(segment)
+            segment_metrics = service.metrics()
+            checkpoints.append({'segment': index+1, 'monotonic_ns': time.monotonic_ns(),
+                'service': service.domain.snapshot(), 'driver_parent': parent.snapshot(),
+                'database': h.db_domain.snapshot(), 'metrics': segment_metrics,
+                'metrics_coverage': stability_metrics_coverage(segment_metrics),
+                'coordinator': stability_coordinator()})
+            write_json(output/'progress.json', row)
+            print(json.dumps({'phase': 'stability', 'segment': index+1,
+                              'streams': {kind: view['qualified'] for kind, view in segment['streams'].items()}}), flush=True)
+        after, driver_after = service.domain.snapshot(), parent.snapshot()
+        cost = stability_service_cost(before, after, reports)
+        cost['runtime_before'] = initial_metrics
+        row['service_cost'] = cost
+        row['same_service_observed_seconds'] = (after['monotonic_ns']-before['monotonic_ns'])/1e9
+        row['planned_arrival_seconds_per_stream'] = config['seconds']
+        row['observed_simultaneous_arrival_seconds'] = sum(segment.get('overlap_seconds', 0) for segment in row['segments'])
+        elapsed = (driver_after['monotonic_ns']-driver_before['monotonic_ns'])/1e9
+        fraction = (driver_after['cpu_stat']['usage_usec']-driver_before['cpu_stat']['usage_usec'])/1e6/elapsed if elapsed > 0 else None
+        row['driver_parent'].update(before=driver_before, after=driver_after,
+            fraction_of_shared_quota=fraction, saturated=fraction is not None and fraction >= .9)
+        deadline, quiet, metrics = time.monotonic()+5, False, {}
+        while time.monotonic() < deadline:
+            metrics = service.metrics()
+            quiet = quiet_metrics('ku', metrics)
+            if quiet:
+                break
+            time.sleep(.1)
+        physical = service.domain.snapshot()
+        sampler.stop()
+        row['sampler'] = {'error': sampler.error, 'overflow': sampler.overflow}
+        sampler = None
+        termination = service.stop()
+        row['termination'] = termination
+        aggregate = {'service_cost': cost, 'ledger': {'correct_total': cost['correct_total']}}
+        row['full_lifecycle'] = full_lifecycle_cost(aggregate, physical, quiet, termination, metrics)
+        row['growth'] = stability_growth(checkpoints, config['growth_limits'])
+        row['quiet'] = quiet
+        row['final_metrics_coverage'] = stability_metrics_coverage(metrics)
+        row['natural_reclamation'] = quiet and service_termination_succeeded('ku', termination)
+        unchanged()
+        row['execution_complete'] = True
+        row['status'] = 'observed'
+        row['qualified'] = (all(stream['qualified'] for segment in row['segments'] for stream in segment['streams'].values())
+            and all(segment['simultaneous_arrival_quality'] for segment in row['segments'])
+            and row['natural_reclamation'] and row['growth']['passed'] and fraction is not None and fraction < .9
+            and (after['monotonic_ns']-before['monotonic_ns'])/1e9 >= config['seconds']
+            and not row['sampler']['error'] and not row['sampler']['overflow'])
+        return row
+    except BaseException as error:
+        row.update(status='coordinator_interrupted' if isinstance(error, (KeyboardInterrupt, SystemExit)) else 'execution_error',
+                   error=repr(error), coordinator_interrupted=isinstance(error, (KeyboardInterrupt, SystemExit)))
+        row['partial_streams'] = []
+        for path in sorted(output.glob('segment-*/**/client.json'))[:120]:
+            try:
+                report = json.loads(path.read_text())
+                assessment = report.get('assessment') or result_assessment(report, plan['quality_policy'],
+                    h.manifest.get('environment_qualification'))
+                row['partial_streams'].append({'report': str(path), 'assessment': assessment,
+                    'ledger': report.get('ledger', {}), 'note': 'failed and interrupted observations retained; never substitute a successful segment'})
+            except (ValueError, OSError, KeyError) as partial_error:
+                row['partial_streams'].append({'report': str(path), 'read_error': repr(partial_error)})
+        raise
+    finally:
+        if sampler:
+            try:
+                sampler.stop()
+                row['sampler'] = {'error': sampler.error, 'overflow': sampler.overflow}
+            except BaseException as error:
+                row['sampler'] = {'error': repr(error), 'overflow': None}
+            if row['sampler']['error'] or row['sampler']['overflow']:
+                row['qualified'] = False
+        if parent:
+            try:
+                row['driver_cleanup'] = stability_parent_cleanup(parent)
+            except BaseException as error:
+                row['driver_cleanup'] = {'error': repr(error), 'cgroup_removed': False}
+            if not row['driver_cleanup'].get('cgroup_removed'):
+                row['qualified'] = False
+        try:
+            row['service_cleanup'] = h.close()
+        except BaseException as error:
+            row['service_cleanup'] = {'error': repr(error)}
+            row['qualified'] = False
+        try:
+            row['coordinator_final'] = stability_coordinator()
+        except Exception as error:
+            row['coordinator_final'] = {'error': repr(error)}
+            row['qualified'] = False
+        write_json(output/'stability.json', row)
+
+
+def execute_stability(plan_path, output, resume=False):
+    plan_path, output = Path(plan_path), Path(output)
+    plan = json.loads(plan_path.read_text())
+    config = stability_config(plan)
+    if resume:
+        raise ValueError('stability is once-only; interrupted evidence cannot be resumed or silently replaced')
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise ValueError('stability requires a new empty output; no unchanged reruns or overwritten evidence')
+    paths = [plan_path, Path(__file__), Path(__file__).with_name('linux_harness.py')]
+    identity = {'phase': 'stability', 'plan_sha256': digest(paths[0]),
+                'entry_sha256': digest(paths[1]), 'harness_sha256': digest(paths[2])}
+    binding = version_identity(plan, config['name'])
+    write_json(output/'identity.json', dict(identity, binding=binding))
+    def unchanged():
+        actual = [digest(path) for path in paths]
+        if actual != [identity[key] for key in ('plan_sha256', 'entry_sha256', 'harness_sha256')] or version_identity(plan, config['name']) != binding:
+            raise RuntimeError('frozen stability plan/runner/artifact changed; retained run cannot count')
+    try:
+        row = stability_window(plan, output, config, binding, unchanged)
+    except BaseException as error:
+        if (output/'stability.json').exists():
+            row = json.loads((output/'stability.json').read_text())
+        else:
+            row = {'status': 'identity_or_plan_blocked', 'error': repr(error),
+                   'score_started': False, 'qualified': False}
+        write_json(output/'summary.json', {'identity': identity, 'rows': [row],
+                   'execution_complete': False, 'formal_qualified': False, 'candidate_accepted': False})
+        raise
+    result = {'identity': identity, 'rows': [row], 'execution_complete': row['execution_complete'],
+              'formal_qualified': row['qualified'], 'candidate_accepted': False,
+              'scope': 'one continuous frozen Ku stability observation; not the full comparative acceptance matrix'}
+    write_json(output/'summary.json', result)
+    return result
+
+
 def execute(plan_path, output, phase, workload='json_object', names=('A','B','R'), resume=False, evidence=None):
+    if phase == 'stability':
+        return execute_stability(plan_path, output, resume)
     plan_path, output = Path(plan_path), Path(output)
     plan = json.loads(plan_path.read_text())
     output.mkdir(parents=True, exist_ok=True)
@@ -594,7 +1039,8 @@ def main():
     result = execute(args.plan,args.out,args.phase,args.workload,tuple(args.names.split(',')),args.resume,evidence)
     if not result['execution_complete'] or not all(r.get('status')=='observed' for r in result['rows']):
         return 2
-    if args.phase=='control' and not result['control_qualified'] or args.phase=='final' and not result['formal_qualified']:
+    if (args.phase=='control' and not result['control_qualified']
+            or args.phase in ('final','stability') and not result['formal_qualified']):
         return 3
     return 0
 

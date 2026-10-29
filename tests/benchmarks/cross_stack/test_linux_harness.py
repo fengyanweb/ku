@@ -817,6 +817,174 @@ class FocusCycleTests(unittest.TestCase):
             focus_cycle.compare_goals(p,rows+[rows[0]])
 
 
+class FocusStabilityTests(unittest.TestCase):
+    """Only synthetic reports/threads; these never create cgroups or services."""
+
+    def plan(self):
+        plan = FocusCycleTests().plan()
+        plan['stability'] = {'name': 'B', 'frozen_final': True, 'seconds': 1800,
+            'segment_seconds': 300, 'mixed_rate': 500, 'short_rate': 800, 'cpu_rate': 10,
+            'short_slo_ms': 20, 'maximum_start_skew_seconds': 2, 'maximum_segment_gap_seconds': 10,
+            'growth_limits': {'service_memory_bytes': 64<<20, 'coordinator_rss_bytes': 32<<20,
+                              'service_fd': 32, 'service_threads': 8}}
+        return plan
+
+    def task_report(self):
+        report = AssessmentQualityTest().report()
+        report['configuration'].update(cpu_cancel_every=10, cpu_cancel_delay_us=250,
+                                       task_mix_short_SLO_ms=20)
+        report['ledger'].update(correct_total=990, failure_fraction_planned=.01,
+                                results={'correct': 990, 'planned_reset': 10})
+        report['by_type'] = {
+            'ok': {'normal_planned': 900, 'normal_failure_fraction_planned': 0,
+                   'correct_scheduled_to_complete': {'count': 900, 'p99_ms': 19}},
+            'cpu': {'normal_planned': 90, 'normal_failure_fraction_planned': 0,
+                    'correct_scheduled_to_complete': {'count': 90, 'p99_ms': 100},
+                    'planned_cancellation': {'planned': 10, 'sent': 10, 'reset_issued': 10,
+                                             'results': {'planned_reset': 10}}}}
+        report['assessment'] = result_assessment(report, AssessmentQualityTest.policy,
+                                                AssessmentQualityTest.environment)
+        return report
+
+    def test_continuous_duration_and_one_shared_parent_are_required(self):
+        plan = self.plan()
+        self.assertEqual(focus_cycle.stability_config(plan)['seconds'], 1800)
+        for field, value in (('seconds', 1799), ('segment_seconds', 301),
+                             ('short_slo_ms', 21), ('frozen_final', False),
+                             ('maximum_start_skew_seconds', 6)):
+            changed = copy.deepcopy(plan)
+            changed['stability'][field] = value
+            with self.assertRaises(ValueError):
+                focus_cycle.stability_config(changed)
+        for key, value in (('driver_cores', 2), ('driver_cpuset', '2-3'),
+                           ('driver_memory_bytes', 2<<30)):
+            changed = copy.deepcopy(plan)
+            changed['resources'][key] = value
+            with self.assertRaisesRegex(ValueError, 'shared driver parent'):
+                focus_cycle.stability_config(changed)
+
+    def test_overlapping_clients_never_double_count_service_cpu(self):
+        before = {'cpu_stat': {'usage_usec': 1_000_000}}
+        after = {'cpu_stat': {'usage_usec': 4_000_000}}
+        reports = [{'ledger': {'correct_total': n}, 'service_cost': {
+            'lifetime_cpu_seconds': 1000, 'cpu_seconds_per_correct': 1000}}
+                   for n in (10, 20)]
+        cost = focus_cycle.stability_service_cost(before, after, reports)
+        self.assertEqual(cost['lifetime_cpu_seconds'], 3)
+        self.assertEqual(cost['correct_total'], 30)
+        self.assertAlmostEqual(cost['cpu_seconds_per_correct'], .1)
+        with self.assertRaisesRegex(ValueError, 'counter reset'):
+            focus_cycle.stability_service_cost(after, before, reports)
+
+    def test_planned_resets_use_normal_denominator_but_remain_in_original_gate(self):
+        report = self.task_report()
+        stream = focus_cycle.stability_stream(report, 'task_mix')
+        self.assertTrue(stream['qualified'])
+        self.assertFalse(stream['original_qualification']['qualified'])
+        self.assertEqual(stream['results']['planned_reset'], 10)
+        report['by_type']['cpu']['planned_cancellation']['reset_issued'] = 9
+        self.assertFalse(focus_cycle.stability_stream(report, 'task_mix')['qualified'])
+
+    def test_errors_and_timeouts_survive_observer_invalidity_and_rst(self):
+        for failure in ('timeout', 'connection_error', 'body_error', 'server_error'):
+            report = self.task_report()
+            report['ledger']['results'][failure] = 1
+            report['service_cost']['sampler_error'] = 'recorded observer fault'
+            report['assessment'] = result_assessment(report, AssessmentQualityTest.policy,
+                                                    AssessmentQualityTest.environment)
+            stream = focus_cycle.stability_stream(report, 'task_mix')
+            self.assertFalse(stream['qualified'])
+            self.assertFalse(stream['assessment']['functional_valid'])
+            self.assertEqual(stream['assessment']['failed_request_outcomes'][failure], 1)
+            self.assertEqual(stream['results'][failure], 1)
+
+    def test_short_tail_does_not_hide_behind_cpu_or_invalid_histogram(self):
+        for value in (None, 20.01, float('nan')):
+            report = self.task_report()
+            report['by_type']['ok']['correct_scheduled_to_complete']['p99_ms'] = value
+            self.assertFalse(focus_cycle.stability_stream(report, 'task_mix')['qualified'])
+
+    def test_cancel_kills_private_parent_before_join(self):
+        trace = []
+        class Thread:
+            def join(self, timeout): trace.append('join')
+            def is_alive(self): return False
+        parent = types.SimpleNamespace(kill=lambda: trace.append('owned-parent-kill'))
+        focus_cycle.stability_join([Thread(), Thread()], parent, cancel=True)
+        self.assertEqual(trace, ['owned-parent-kill', 'join', 'join'])
+
+    def test_child_failure_cancels_and_joins_both_owned_clients(self):
+        trace = []
+        parent = types.SimpleNamespace(kill=lambda: trace.append('owned-parent-kill'))
+        class Client:
+            def __init__(self, fail): self.fail = fail
+            def launch(self): return None
+            def client(self, *args, **kwargs):
+                if self.fail: raise RuntimeError('synthetic driver failure')
+                return {'raw': 'retained'}
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, 'driver failure'):
+                focus_cycle.stability_clients({'mixed': Client(True), 'task_mix': Client(False)},
+                    object(), self.plan()['stability'], Path(directory), parent)
+        self.assertIn('owned-parent-kill', trace)
+        import threading
+        self.assertFalse(any(thread.name.startswith('stability-') for thread in threading.enumerate()))
+
+    def test_cancel_prevents_driver_launch_after_parent_kill(self):
+        import threading
+        killed, late_prepared = threading.Event(), threading.Event()
+        trace = []
+        parent = types.SimpleNamespace(kill=lambda: (trace.append('kill'), killed.set()))
+        class Client:
+            def __init__(self, fail): self.fail = fail
+            def launch(self): trace.append('late-launch-must-not-happen')
+            def client(self, *args, **kwargs):
+                if self.fail:
+                    self.prepared = late_prepared.wait(1)
+                    raise RuntimeError('synthetic cancellation')
+                late_prepared.set()
+                if not killed.wait(1): raise RuntimeError('expected parent kill')
+                self.launch()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, 'driver failure'):
+                focus_cycle.stability_clients({'mixed': Client(True), 'task_mix': Client(False)},
+                    object(), self.plan()['stability'], Path(directory), parent)
+        self.assertIn('kill', trace)
+        self.assertNotIn('late-launch-must-not-happen', trace)
+        self.assertFalse(any(thread.name.startswith('stability-') for thread in threading.enumerate()))
+
+    def test_growth_uses_observed_endpoints_and_frozen_thresholds(self):
+        checkpoints = [{'service': {'memory_current': n, 'fd': 5, 'threads': 2},
+                        'coordinator': {'rss_bytes': 10}} for n in (10, 11, 12, 50, 51, 52)]
+        limits = dict(self.plan()['stability']['growth_limits'], service_memory_bytes=20)
+        growth = focus_cycle.stability_growth(checkpoints, limits)
+        self.assertFalse(growth['passed'])
+        self.assertEqual(growth['metrics']['service_memory_bytes']['last3_minus_first3_median'], 40)
+        self.assertFalse(focus_cycle.stability_growth(checkpoints[:5], limits)['passed'])
+
+    def test_absent_optional_event_and_driver_metrics_never_become_zero_evidence(self):
+        coverage = focus_cycle.stability_metrics_coverage({'loops': [{'queued': 0}]})
+        self.assertEqual(coverage['groups']['task_driver'], 'not_exposed')
+        self.assertEqual(coverage['completion_event_queue'], 'not_exposed')
+        self.assertFalse(coverage['completion_event_queue_zero_proven'])
+        coverage = focus_cycle.stability_metrics_coverage({'loops': [{'completion_events': 7}]})
+        self.assertEqual(coverage['event_related_fields'], ['loops[*].completion_events'])
+        self.assertFalse(coverage['completion_event_queue_zero_proven'])
+
+    def test_stability_cannot_resume_or_overwrite_previous_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'plan.json'
+            path.write_text(json.dumps(self.plan()))
+            with self.assertRaisesRegex(ValueError, 'once-only'):
+                focus_cycle.execute_stability(path, Path(directory)/'unused', resume=True)
+            output = Path(directory)/'output'
+            output.mkdir()
+            (output/'prior-failure.json').write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'empty output'):
+                focus_cycle.execute_stability(path, output)
+            self.assertTrue((output/'prior-failure.json').exists())
+
+
 class DriverOwnedCleanupTests(unittest.TestCase):
     def test_finalizer_recovers_owned_domain_after_interrupted_stop_flag(self):
         with tempfile.TemporaryDirectory() as d:

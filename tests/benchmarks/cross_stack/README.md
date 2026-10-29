@@ -186,3 +186,55 @@ checksum；历史 `repeat=64` 结果保留为 R&D，不进入正式表。每轮�
 及 AST 分析。官网内容与打包按独立授权进行，不能用它替代运行证据。
 
 Rust 参考可显式设置 `BENCH_REQUEST_TIMEOUT_MS`（1–300000；默认仍为45000）来与 Ku 的 `KU_HTTP_REQUEST_TIMEOUT_MS` 对齐。它覆盖原 Legacy 请求准入与执行等待；CPU cooperative/bounded 模式仍使用其既有3000ms绝对期限。正式计划必须记录实际值，不能靠延长期限降低错误率。
+
+## 最终候选连续稳定性（focus_cycle）
+
+`focus_cycle.py --phase stability --plan /absolute/frozen-plan.json --out /absolute/new-output`
+只启动一个冻结 Ku 服务，两个原 V5 客户端同时施加 `mixed` 与 `task_mix`。本入口不构建，
+不改产品、原 manifest 或数据库重试规则，不部署。已有 `versions.B` 的源码、CLI、生成 C、
+ELF、driver 和依赖 SHA 收据继续逐段核对。正式执行由调用方串行安排，不能与其他性能窗口并行。
+该阶段显式调用，不被 `--phase all` 隐式启动；不接受 `--resume`，输出必须为空，失败证据不能覆写。
+
+冻结计划除原 `versions`、`quality_policy` 外，使用以下配置；增长门槛必须在执行前明确冻结：
+
+```json
+{
+  "resources": {
+    "service_cores": 2, "service_memory_bytes": 1073741824,
+    "driver_cores": 1, "driver_cpuset": "2", "driver_memory_bytes": 1073741824
+  },
+  "stability": {
+    "name": "B", "frozen_final": true, "seconds": 1800, "segment_seconds": 300,
+    "mixed_rate": 500, "short_rate": 800, "cpu_rate": 10, "short_slo_ms": 20,
+    "maximum_start_skew_seconds": 2, "maximum_segment_gap_seconds": 10,
+    "growth_limits": {
+      "service_memory_bytes": 67108864, "coordinator_rss_bytes": 33554432,
+      "service_fd": 32, "service_threads": 8
+    }
+  }
+}
+```
+
+服务固定 CPU0–1/2core/1GiB；两个 driver 子域**共同**受 CPU2/1core/1GiB parent 限制，
+不是各自独占一核，parent CPU 与子域 CPU 不相加。现有数据库域须为 CPU3/512MiB，实际
+cpu.max、swap 与其他限制原样记录。原 manifest 仍完整保留，派生 client-only 参数单独留收据。
+Task CPU 每10个计划一次 TCP RST，完整请求发送后250µs触发；原3秒客户端绝对期限不变。
+mixed 保留原各类 SLO；Task 短请求 p99≤20ms、普通 CPU p99≤3000ms，普通成功比例≥99.9%。
+计划取消必须完整发送并发出 RST，其记录不作为正确响应；其他超时、错误和无效窗口不删除。
+
+总计划到达时长1800–3600秒，至少6段，每段60–300秒，同一个服务全程不重启、不冻结。
+分段间包含原 driver 回收和 CSV 输出，记录每流实际 origin、两流重叠、段间空窗；不得把
+“同服务1800秒+每流1800秒计划到达”表述为无间隙的1800秒同时到达。启动偏差、空窗超冻结
+门槛时不通过。资源5秒采样有界保留，每段末记录公开 server/owner/Task/PG/buffer 指标、
+协调器 RSS/FD/线程和资源域快照。未公开的 Task driver、完成事件队列等列入 coverage，
+缺失不补0，也不据此声称已证明回收。增长比较末3段与首3段中位数，只说明本轮覆盖路径。
+
+服务 CPU 只取一次全程首末差值，分母是两流所有正确响应；重叠客户端各自的 service/observer
+CPU 保留在原报告，不能相加。结束后等待原 quiet 指标、正常退出，额外保留完整生命周期成本；
+中断先终止本轮 driver parent 并 join 两线程，再正常停止自有服务，清理私有 child/parent。
+原始 CSV、client.json、resources.json、分段收据及失败都保留；总体 `qualified` 与是否采用候选分开。
+退出码0表示本阶段通过，2表示返回了未完成记录，3表示完成但门槛未通过；执行异常也会保留
+证据并非零退出。这些状态不代表完整版本发布验收。
+
+Synthetic regression: `python3 -B -m unittest test_linux_harness.FocusStabilityTests` from this directory.
+These tests use reports and owned threads only; they do not start a service, database, or30-minute run.
