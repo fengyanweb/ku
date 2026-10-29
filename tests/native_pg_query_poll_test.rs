@@ -887,8 +887,8 @@ fn native_pg_async_acquire_failures_keep_bounded_correlated_snapshots() {
                     panic!("partial JSON sample is not complete");
                 };
                 assert!(
-                    matches!(fields.get("sequence"), Some(ku::value::Value::Int(sequence)) if *sequence == 8 - offset as i64),
-                    "export must keep newest complete samples first"
+                    matches!(fields.get("sequence"), Some(ku::value::Value::Int(sequence)) if *sequence == 1 + offset as i64),
+                    "export must preserve first failure then state changes and latest"
                 );
                 assert!(
                     matches!(fields.get("slots"), Some(ku::value::Value::Array(slots)) if slots.len() == 8)
@@ -899,7 +899,7 @@ fn native_pg_async_acquire_failures_keep_bounded_correlated_snapshots() {
             }
         }
     }
-    assert!(lines[0].contains("\"overwritten\":1") && lines[0].contains("\"contention_drops\":1"));
+    assert!(lines[0].contains("\"overwritten\":7") && lines[0].contains("\"contention_drops\":1"));
     assert!(
         lines[0].contains("\"http_task_slot\":42")
             && lines[0].contains("\"lease_generation_saturated\":1")
@@ -2390,7 +2390,7 @@ int main(void) {
   CHECK(result.ok && starts == before_starts + 1 && pool->active == 0 && pool->conns[0]); ku_drop_pg_result(&result.value);
   PGconn* unused = 0; KuError acquire_error = {0};
   CHECK(ku_pg_client_acquire(pool, &unused, &acquire_error, clock_ms) < 0 && !unused && pool->active == 0);
-  KuPgDiagnosticSnapshot* sync_timeout_sample=&ku_pg_diagnostics.samples[(ku_pg_diagnostics.next+7u)%8u];
+  KuPgDiagnosticSnapshot* sync_timeout_sample=ku_pg_diag_latest_locked();
   CHECK(sync_timeout_sample->sync_identity_missing && sync_timeout_sample->task_phase_missing && sync_timeout_sample->phase==KU_PG_ASYNC_ACQUIRE);
   ku_error_drop(&acquire_error);
 
@@ -2447,7 +2447,7 @@ int main(void) {
   CHECK(ku_pg_client_acquire(
           flight_pool, &budget_connection, &budget_error, clock_ms + 5) < 0
       && !budget_connection && equals(budget_error.code, "acquire_timeout"));
-  sync_timeout_sample=&ku_pg_diagnostics.samples[(ku_pg_diagnostics.next+7u)%8u];
+  sync_timeout_sample=ku_pg_diag_latest_locked();
   CHECK(sync_timeout_sample->sync_identity_missing && sync_timeout_sample->phase==KU_PG_ASYNC_CONNECT && sync_timeout_sample->active==1);
   ku_error_drop(&budget_error); clock_ms += 1001;
   flight_pool->connect_timeout_ms = 5; budget_error = (KuError){0};
@@ -2634,11 +2634,16 @@ int main(void) {
     CHECK(!waiting[i]->sent && ku_string_equal(waiting[i]->output.error.code,ku_string_static((const uint8_t*)"acquire_timeout",15)));
     async_drop_output(waiting[i],&budgets[i],0);
   }
-  CHECK(ku_pg_diag_load(&ku_pg_diagnostics.failures)==9 && ku_pg_diagnostics.count==8 && ku_pg_diagnostics.overwritten==1);
-  KuPgDiagnosticSnapshot* s=&ku_pg_diagnostics.samples[(ku_pg_diagnostics.next+7u)%8u];
+  CHECK(ku_pg_diag_load(&ku_pg_diagnostics.failures)==9 && ku_pg_diagnostics.count==2 && !ku_pg_diagnostics.changes && ku_pg_diagnostics.overwritten==7);
+  KuPgDiagnosticSnapshot* s=ku_pg_diag_latest_locked();
   CHECK(s->phase==KU_PG_ASYNC_ACQUIRE && s->observed_ms==1250 && s->acquire_deadline_ms==1250 && s->started_ms==1000);
   CHECK(s->active==1 && s->reset==1 && !s->idle && !s->empty && !s->owner_missing && s->waiters==1);
-  CHECK(s->slots[0].task_generation==11 && s->slots[0].phase==KU_PG_ASYNC_RESET_READ);
+  CHECK(s->slots[0].task_generation==11 && s->slots[0].phase==KU_PG_ASYNC_RESET_READ
+      && !s->slots[0].worker_enqueue_ms && !s->slots[0].worker_start_ms
+      && !s->slots[0].worker_finish_ms); /* client_open supplied this warm lease. */
+  CHECK(ku_pg_diagnostics.samples[0].sequence==1 && ku_pg_diagnostics.samples[0].task_slot==10
+      && ku_pg_diagnostics.samples[0].waiters==9 && s->sequence==9
+      && !ku_pg_diagnostics.change_capacity_drops);
   CHECK(s->task_slot==18 && s->http_task_slot==42 && s->http_task_generation==71 && !s->parent_chain_missing);
   CHECK(s->queue_head_task_slot==18 && s->queue_head_task_generation==108 && s->lease_generation_saturated);
   /* A competing management read must never block failure publication. */
@@ -2648,16 +2653,52 @@ int main(void) {
   CHECK(ku_pg_diag_load(&ku_pg_diagnostics.contention_drops)==1 && ku_pg_diag_load(&ku_pg_diagnostics.failures)==10);
   async_drop_output(dropped,&dropped_budget,0);
   CHECK(!print_pg_diagnostic_json(131072));
+  /* Request identity, absolute timing and precise queue length must not exhaust
+   * category slots before a genuinely new phase/worker stage is observed. */
+  CHECK(ku_pg_diag_try_lock());
+  KuPgDiagnosticSnapshot varied=ku_pg_diagnostics.samples[0];
+  for(uint64_t sequence=10u;sequence<138u;sequence++) {
+    varied.sequence=sequence;varied.task_slot=sequence;varied.task_generation=sequence+100u;
+    varied.job_generation=sequence+200u;varied.observed_ms=sequence+2000u;varied.waiters=sequence;
+    for(size_t j=0;j<varied.slot_samples;j++) {
+      varied.slots[j].generation=sequence+j;varied.slots[j].task_generation=sequence+j+100u;
+      if(varied.slots[j].worker_start_ms)varied.slots[j].worker_start_ms=sequence+3000u;
+      if(varied.slots[j].worker_finish_ms)varied.slots[j].worker_finish_ms=sequence+4000u;
+    }
+    for(size_t j=0;j<varied.waiter_samples;j++) {
+      varied.queue[j].task_slot=sequence+j;varied.queue[j].task_generation=sequence+j+500u;
+      varied.queue[j].job_generation=sequence+j+600u;
+    }
+    ku_pg_diag_retain_locked(&varied);
+  }
+  CHECK(!ku_pg_diagnostics.changes && ku_pg_diagnostics.count==2
+      && ku_pg_diagnostics.samples[0].sequence==1u && ku_pg_diag_latest_locked()->sequence==137u);
+  varied.sequence=138u;varied.phase=KU_PG_ASYNC_CONNECT;varied.worker_enqueue_ms=5000u;
+  ku_pg_diag_retain_locked(&varied);
+  varied.sequence=139u;varied.worker_start_ms=5001u;ku_pg_diag_retain_locked(&varied);
+  varied.sequence=140u;varied.worker_finish_ms=5002u;varied.connect_ready=1;ku_pg_diag_retain_locked(&varied);
+  CHECK(ku_pg_diagnostics.changes==3 && ku_pg_diagnostics.samples[1].sequence==138u
+      && !ku_pg_diagnostics.samples[1].worker_start_ms && ku_pg_diagnostics.samples[2].worker_start_ms==5001u
+      && !ku_pg_diagnostics.samples[2].worker_finish_ms && ku_pg_diagnostics.samples[3].worker_finish_ms==5002u);
+  varied.sequence=141u;varied.closing=1;ku_pg_diag_retain_locked(&varied);
+  varied.sequence=142u;varied.sent=1;ku_pg_diag_retain_locked(&varied);
+  varied.sequence=143u;varied.idle=1;ku_pg_diag_retain_locked(&varied);
+  CHECK(ku_pg_diagnostics.changes==6 && !ku_pg_diagnostics.change_capacity_drops);
+  varied.sequence=144u;varied.connecting=1;ku_pg_diag_retain_locked(&varied);
+  CHECK(ku_pg_diagnostics.count==8 && ku_pg_diagnostics.change_capacity_drops==1
+      && ku_pg_diagnostics.samples[0].sequence==1u && ku_pg_diag_latest_locked()->sequence==144u
+      && ku_pg_diagnostics.samples[1].sequence==138u && ku_pg_diagnostics.samples[3].sequence==140u);
+  ku_pg_diag_unlock();
   /* Serialize every scalar at maximum width and every member slot. The real
    * management caller also exercises the explicit bounded fallback below. */
   for(size_t i=0;i<8;i++) {
     memset(&ku_pg_diagnostics.samples[i],0xff,sizeof(ku_pg_diagnostics.samples[i]));
     ku_pg_diagnostics.samples[i].slot_samples=8;ku_pg_diagnostics.samples[i].waiter_samples=8;
-    ku_pg_diagnostics.samples[i].sequence=(i+8u-ku_pg_diagnostics.next)%8u+1u;
+    ku_pg_diagnostics.samples[i].sequence=i+1u;
   }
   CHECK(!print_pg_diagnostic_json(131072));
-  /* A response budget smaller than the HTTP channel still exports the newest
-   * complete one/two samples, rolling back only the unfinished next object. */
+  /* A smaller response still preserves the first complete failure and rolls
+   * back only the unfinished next state-change/latest object. */
   CHECK(!print_pg_diagnostic_json(24576));CHECK(!print_pg_diagnostic_json(512));
   CHECK(ku_pg_diag_load(&ku_pg_diagnostics.serialization_truncations)==2);
   CHECK(ku_pg_diag_try_lock());CHECK(!print_pg_diagnostic_json(131072));ku_pg_diag_unlock();
@@ -2689,9 +2730,18 @@ int main(void) {
     PGconn* old=p->conns[0];p->conns[0]=NULL;PQfinish(old);
     CHECK(!ku_pg_async_step(op,0,clock_ms,0));
     CHECK(op->phase==KU_PG_ASYNC_CONNECT && op->connecting && !op->connect_ready);
+    /* This bare pump calls the real deferred-connect worker entry, but has no
+     * Task queue/job. Enqueue remains explicitly missing rather than invented. */
+    op->waiter.diagnostic.job_generation=UINT64_C(4294967297);
+    CHECK(!ku_pg_diag_load(&op->waiter.diagnostic.worker_enqueue_ms)
+        && !ku_pg_diag_load(&op->waiter.diagnostic.worker_start_ms)
+        && !ku_pg_diag_load(&op->waiter.diagnostic.worker_finish_ms));
     if(KU_TEST_CONNECT_OOM)fail_connect_on_attempt=1;
     ku_pg_async_connect_run(op,0);
     CHECK(op->connect_ready && p->active==1);
+    CHECK(!ku_pg_diag_load(&op->waiter.diagnostic.worker_enqueue_ms)
+        && ku_pg_diag_load(&op->waiter.diagnostic.worker_start_ms)==1000u
+        && ku_pg_diag_load(&op->waiter.diagnostic.worker_finish_ms)==1000u);
     if(KU_TEST_CONNECT_OOM)CHECK(!op->connected.conn && op->connected.outcome==KU_PG_CONNECT_OUT_OF_MEMORY && !fail_connect_on_attempt);
     else CHECK(op->connected.conn);
   }
@@ -2711,6 +2761,12 @@ int main(void) {
   } else {
     CHECK(ku_string_equal(op->output.error.code,ku_string_static((const uint8_t*)"acquire_timeout",15)));
     CHECK(ku_pg_diag_load(&ku_pg_diagnostics.failures)==failures_before+1u && ku_pg_diagnostics.count==samples_before+1u);
+    if(KU_TEST_EXPIRED_CONNECT) {
+      KuPgDiagnosticSnapshot* recorded=ku_pg_diag_latest_locked();
+      CHECK(recorded->job_generation==UINT64_C(4294967297) && recorded->phase==KU_PG_ASYNC_CONNECT
+          && !recorded->worker_enqueue_ms && recorded->worker_start_ms==1000u
+          && recorded->worker_finish_ms==1000u);
+    }
   }
   CHECK(op->slot<0 && !op->connecting && !p->active && !p->connect_in_flight);
   CHECK(!!p->conns[0]==!KU_TEST_EXPIRED_CONNECT);

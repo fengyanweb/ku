@@ -228,6 +228,8 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
   }
 #if KU_TASK_BLOCKING_PG
   if(queue_connect) {
+    /* Timestamp the actual bounded worker enqueue, not the older step entry. */
+    ku_pg_diag_store(&job->pg_operation->waiter.diagnostic.worker_enqueue_ms,ku_pg_now_ms());
     pool->ring[(pool->head+pool->queued)%pool->capacity]=index;pool->queued++;
     if(pool->queued>pool->peak_queued)pool->peak_queued=pool->queued;
     ku_task_blocking_signal(pool);

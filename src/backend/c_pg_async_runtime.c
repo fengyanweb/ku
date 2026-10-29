@@ -59,6 +59,8 @@ static void ku_pg_async_diagnostic_member(KuPgDiagnosticMember* out,KuPgAsyncWai
   out->acquired_ms=d->acquired_ms;out->published=d->published;out->consumed=d->consumed;
   out->notified=(uint64_t)waiter->notified;out->in_flight=(uint64_t)waiter->in_flight;
   out->progress_events=ku_pg_diag_load(&d->progress_events);
+  out->job_generation=d->job_generation;out->worker_enqueue_ms=ku_pg_diag_load(&d->worker_enqueue_ms);
+  out->worker_start_ms=ku_pg_diag_load(&d->worker_start_ms);out->worker_finish_ms=ku_pg_diag_load(&d->worker_finish_ms);
 }
 /* Capture before unlink/reservation rollback: those actions can wake a new
  * borrower and erase precisely the queue/lease state that needs explaining.
@@ -66,7 +68,7 @@ static void ku_pg_async_diagnostic_member(KuPgDiagnosticMember* out,KuPgAsyncWai
 static void ku_pg_async_capture_acquire_locked(KuPgAsyncOp* op,unsigned long long now) {
   KuPgClient* p=op->pool;uint64_t sequence=ku_pg_diag_increment(&ku_pg_diagnostics.failures);
   if(!ku_pg_diag_try_lock()) {ku_pg_diag_increment(&ku_pg_diagnostics.contention_drops);return;}
-  KuPgDiagnosticSnapshot* s=&ku_pg_diagnostics.samples[ku_pg_diagnostics.next];memset(s,0,sizeof(*s));
+  KuPgDiagnosticSnapshot candidate={0};KuPgDiagnosticSnapshot* s=&candidate;
   s->sequence=sequence;s->observed_ms=now;s->started_ms=op->started_ms;
   s->last_progress_ms=ku_pg_diag_load(&op->waiter.diagnostic.last_progress_ms);
   s->deadline_ms=op->deadline;s->acquire_deadline_ms=op->acquire_deadline;s->connect_deadline_ms=op->connect_deadline;
@@ -74,6 +76,8 @@ static void ku_pg_async_capture_acquire_locked(KuPgAsyncOp* op,unsigned long lon
   KuPgDiagnosticLease* d=&op->waiter.diagnostic;
   s->task_slot=d->task_slot;s->task_generation=d->task_generation;s->http_task_slot=d->http_task_slot;s->http_task_generation=d->http_task_generation;
   s->owner=d->owner;s->job_generation=d->job_generation;s->parent_depth=d->parent_depth;s->parent_chain_missing=d->parent_chain_missing;
+  s->worker_enqueue_ms=ku_pg_diag_load(&d->worker_enqueue_ms);s->worker_start_ms=ku_pg_diag_load(&d->worker_start_ms);
+  s->worker_finish_ms=ku_pg_diag_load(&d->worker_finish_ms);
   s->task_phase_missing=op->task_phase==NULL;if(op->task_phase)s->task_phase=op->task_phase(op->task_phase_context);
   s->sync_identity_missing=(uint64_t)op->diagnostic_sync;
   s->interest=op->interest;s->events=op->diagnostic_events;s->steps=op->diagnostic_steps;s->sent=(uint64_t)op->sent;
@@ -108,8 +112,7 @@ static void ku_pg_async_capture_acquire_locked(KuPgAsyncOp* op,unsigned long lon
   }
   s->waiters_truncated=p->waiters>s->waiter_samples;
   if(p->async_head) {s->queue_head_task_slot=p->async_head->diagnostic.task_slot;s->queue_head_task_generation=p->async_head->diagnostic.task_generation;s->queue_head_notified=(uint64_t)p->async_head->notified;}
-  if(ku_pg_diagnostics.count<8u)ku_pg_diagnostics.count++;else if(ku_pg_diagnostics.overwritten!=UINT64_MAX)ku_pg_diagnostics.overwritten++;
-  ku_pg_diagnostics.next=(ku_pg_diagnostics.next+1u)%8u;ku_pg_diag_unlock();
+  ku_pg_diag_retain_locked(s);ku_pg_diag_unlock();
 }
 /* The synchronous path has no registered Task identity. Its cold witness is
  * the same shape, with missing identity/owner explicit rather than invented.
@@ -332,9 +335,12 @@ static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
 /* Only the bounded worker invokes this function. It touches no source frame.
  * Publication back to NET_WAIT is protected by the enclosing job mutex. */
 static void ku_pg_async_connect_run(KuPgAsyncOp* op,int cancelled) {
+  ku_pg_diag_store(&op->waiter.diagnostic.worker_start_ms,ku_pg_now_ms());
   if(cancelled) op->connected=(KuPgConnectAttempt){NULL,KU_PG_CONNECT_TIMED_OUT};
   else op->connected=ku_pg_connect_until(op->pool->conninfo,op->connect_deadline);
-  ku_pg_diag_store(&op->waiter.diagnostic.last_progress_ms,ku_pg_now_ms());
+  unsigned long long finished=ku_pg_now_ms();
+  ku_pg_diag_store(&op->waiter.diagnostic.worker_finish_ms,finished);
+  ku_pg_diag_store(&op->waiter.diagnostic.last_progress_ms,finished);
   (void)ku_pg_diag_increment(&op->waiter.diagnostic.progress_events);
   op->connect_ready=1;
 }
