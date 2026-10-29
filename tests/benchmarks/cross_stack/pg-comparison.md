@@ -1,12 +1,15 @@
 # PostgreSQL 两种明确对照合同
 
-这些模式只用于私有基准。产品 PG、SQL 和 normal 默认没有变化。
+[English](pg-comparison.en.md)
+
+这些模式只用于私有基准。业务 SQL 和 normal 模式的会话清理合同不变；
+后续开发候选的协议路径变化单列说明。
 显式 `BENCH_PG_MODE` 只接受空值、`normal`、`reset-equivalent`；其他值启动失败。
 不能把 reset-equivalent 当成 Go/Rust 的惯用默认成本。
 
 | 表 | Ku | Go | Rust |
 | --- | --- | --- | --- |
-| A normal | 现有 libpq text/single-row → Ku 自有表 → 字段字符串与数值 JSON 转换；每 lease `DISCARD ALL` | 原 pgx Exec text → int/string → encoding/json；原归池检查，无新增 reset | 原 query_typed binary INT4/String → serde_json；原 Fast recycle，无新增 reset |
+| A normal | libpq text/single-row → Ku 自有表 → `value_int` 读 id/score、拥有型 `value` 读 label；每 lease `DISCARD ALL` | 原 pgx Exec text → int/string → encoding/json；原归池检查，无新增 reset | 原 query_typed binary INT4/String → serde_json；原 Fast recycle，无新增 reset |
 | B reset-equivalent | 相同 Ku 路径，不新增第二次 reset | 一次显式 Acquire → 同一 lease QueryRow/Scan → 同一 lease DISCARD ALL → 排空后归池 | 一次 pool.get → 同一 Object query_typed → owned int/String → 同一 Object batch_execute DISCARD ALL → ReadyForQuery 后归池 |
 
 B 表 Go/Rust 从操作入口开始共用 2s 绝对期限，获取 lease 至多 250ms；
@@ -21,19 +24,31 @@ A 表原期限不变：Go 沿用原 HTTP 45s context、连接 2s；Rust pool wai
 无论关闭是否被 PG 接收，都不代表先前操作必然回滚。这里的业务 SQL 是固定
 只读 SELECT；不能把它的结果推广成写入自动恢复保证。
 
-保留各自惯用文本/二进制结果 API。B 不让 Go/Rust 仿造 Ku 两次数字 JSON
-解析，也不删除 Ku 的 session reset。固定 SQL/1024 行私库/池总量16/返回值
+保留各自惯用文本/二进制结果 API；B 不要求 Go/Rust 仿造旧 value 模式的
+两次数值 JSON 解析，也不删除 Ku 的 session reset。固定 SQL/1024 行私库/池总量16/返回值
 与独立正文校验不变。session、协议、转换成本差异在两表中分别列明。
 
 ## Ku 结果读取独立候选
 
-`build_linux.py --ku-pg-read value` 是默认，保留旧夹具两次数值 JSON 转换。
-`--ku-pg-read int` 只把 id/score 的 `value→json.decode→as_int` 换成
-`result.value_int(0,0)?` / `result.value_int(0,2)?`；label 仍用拥有型 `value`。
+当前默认是 `--ku-pg-execution async --ku-pg-read int`，使用受支持的
+具名 async HTTP handler、`result.value_int(0,0)?` / `result.value_int(0,2)?`；
+label 仍用拥有型 `value`。这已经包含在 0.0.19，不能算作后续的新优化。
+`--ku-pg-execution sync --ku-pg-read value` 是保留旧夹具的诊断方式，
+对 id/score 使用 `value→json.decode→as_int`，不是当前默认；async 不接受 value。
 SQL、参数、session reset、数据库错误响应、JSON 默认和 HTTP text API 不变。
 它可以与 `--ku-format direct`、`--ku-json response` 组合，但各自产物/展开源
-哈希及 `pg_read_mode` 必须记录。先用单变量 `value`/`int` 比较，不把组合收益
+哈希及 `pg_read_mode` / `pg_execution_mode` 必须记录。做旧接口诊断时先在
+同为 sync 的条件下单独比较 `value`/`int`，不把组合收益
 全部算给整数 getter；正常 A/B 的 Go/Rust 不加入对应冗余转换。
+
+## 后续固定 reset 的协议候选
+
+开发分支仅将无参数常量 `DISCARD ALL` 的发送由 extended 改为 simple query；
+同步与 async 两条 cleanup 共用此规则，业务查询仍使用参数绑定。
+reset 仍发生在同一 exclusive lease 上，保留原操作期限、完整读到终止 NULL、
+事务 IDLE / UTF8 检查和失败驱逐。它不删除 reset，不新增自动 SQL 重试，
+也不将 reset 移到 HTTP 响应之后。该候选需单独对照服务与 PG CPU、
+协议及分配账；协议路径减少不能替代已测出的端到端收益。
 
 ## 生成独立测量清单
 

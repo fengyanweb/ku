@@ -15185,7 +15185,9 @@ static void ku_pg_client_capture_release(KuPgClient* p) {
                original operation budget; reset failure only evicts this slot
                because the user's detached result is already complete. */
             "  int reset_broken = 0;\n",
-            "  KuResult_pg_result reset = ku_pg_query_params_validated_impl(c, ku_string_static((const uint8_t*)\"DISCARD ALL\", sizeof(\"DISCARD ALL\") - 1), (KuArray_str){0}, 0, deadline, &reset_broken);\n",
+            // The fixed reset has no bound values. The ordinary pump retains
+            // its nonblocking deadline/drain checks with simple protocol.
+            "  KuResult_pg_result reset = ku_pg_query_impl(c, ku_string_static((const uint8_t*)\"DISCARD ALL\", sizeof(\"DISCARD ALL\") - 1), deadline, &reset_broken);\n",
             "  int reset_failed = reset_broken || !reset.ok;\n",
             "  if (reset.ok) ku_drop_pg_result(&reset.value); else ku_error_drop(&reset.error);\n",
             "  if (reset_failed || ku_pg_deadline_expired(deadline) || PQstatus(c) != KU_PG_CONNECTION_OK || PQtransactionStatus(c) != KU_PQTRANS_IDLE) return 1;\n",
