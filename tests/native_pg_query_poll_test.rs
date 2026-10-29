@@ -1232,12 +1232,10 @@ fn native_pg_async_rows_share_owner_turn_budgets_without_empty_growth_charges() 
     );
 }
 
-#[test]
-#[ignore = "explicit opt-in: KU_PG_TEST_CONNINFO_FILE must parse as loopback before any connection"]
-fn native_pg_query_poller_live_loopback_roundtrip() {
+fn run_pg_live_loopback(name: &str, suite: &str, pipeline: bool) -> Option<String> {
     let Some(connfile) = env::var_os("KU_PG_TEST_CONNINFO_FILE").map(PathBuf::from) else {
         eprintln!("skip: set KU_PG_TEST_CONNINFO_FILE to a local test connection file");
-        return;
+        return None;
     };
     assert!(
         connfile.is_file(),
@@ -1252,20 +1250,28 @@ fn native_pg_query_poller_live_loopback_roundtrip() {
     let mut locations = locations.lines();
     let libdir = PathBuf::from(locations.next().expect("pg_config libdir").trim());
     let bindir = PathBuf::from(locations.next().expect("pg_config bindir").trim());
-    let directory = TempDir::new("query-live");
+    let directory = TempDir::new(name);
     let generated = emit_c(directory.path(), fixture());
     let mut harness = generated.replacen(
         "int main(void) {",
         "static int ku_generated_main(void) {",
         1,
     );
-    harness.push_str(LIVE_LOOPBACK);
-    let source = directory.path().join("query-live.c");
+    if pipeline {
+        // Interpose only this isolated experiment. Production keeps its original
+        // send path and never enables pipeline mode.
+        let anchor = "extern int PQsetSingleRowMode(PGconn*);";
+        assert_eq!(harness.matches(anchor).count(), 1);
+        harness = harness.replacen(anchor,
+            "static int p8_reset_sends;\nstatic int p8_send(PGconn*, const char*, int, const void*, const char* const*, const int*, const int*, int);\n#define PQsendQueryParams p8_send\nextern int PQsetSingleRowMode(PGconn*);", 1);
+        harness.push_str("\n#undef PQsendQueryParams\n");
+    }
+    harness.push_str(suite);
+    let source = directory.path().join(format!("{name}.c"));
     fs::write(&source, harness).expect("write live PG harness without embedded credentials");
-    let Some(executable) =
-        compile_harness_with_libpq(directory.path(), &source, "query-live", &libdir)
+    let Some(executable) = compile_harness_with_libpq(directory.path(), &source, name, &libdir)
     else {
-        return;
+        return None;
     };
     let mut command = Command::new(executable);
     command
@@ -1299,7 +1305,7 @@ fn native_pg_query_poller_live_loopback_roundtrip() {
         .expect("live PG test must not wait indefinitely");
     if output.status.code() == Some(77) {
         eprintln!("skip: connection file is not an explicit loopback configuration; no connection attempted");
-        return;
+        return None;
     }
     assert!(
         output.status.success(),
@@ -1308,10 +1314,34 @@ fn native_pg_query_poller_live_loopback_roundtrip() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
-        "pg query live loopback closed loop\n"
-    );
+    Some(String::from_utf8_lossy(&output.stdout).replace('\r', ""))
+}
+
+#[test]
+#[ignore = "explicit opt-in: KU_PG_TEST_CONNINFO_FILE must parse as loopback before any connection"]
+fn native_pg_query_poller_live_loopback_roundtrip() {
+    let Some(output) = run_pg_live_loopback("query-live", LIVE_LOOPBACK, false) else {
+        return;
+    };
+    assert_eq!(output, "pg query live loopback closed loop\n");
+}
+
+#[test]
+#[ignore = "explicit protocol experiment: KU_PG_TEST_CONNINFO_FILE must parse as loopback before any connection"]
+fn native_pg_finite_pipeline_live_loopback_preserves_conditional_reset_boundary() {
+    let (common, _) = LIVE_LOOPBACK
+        .split_once("int main(void) {")
+        .expect("live guard and helpers");
+    let suite = format!("{common}{FINITE_PIPELINE_LOOPBACK}");
+    let Some(output) = run_pg_live_loopback("finite-pipeline-live", &suite, true) else {
+        return;
+    };
+    // Preserve the bounded trace with --nocapture. It contains phase counts only,
+    // never the private conninfo or server diagnostics.
+    eprint!("{output}");
+    assert!(output.contains("\"default_changed\":false"));
+    assert!(output.contains("\"strict_default_equivalent\":false"));
+    assert!(output.ends_with("pg finite pipeline conditional-reset contract closed loop\n"));
 }
 
 const LIVE_LOOPBACK: &str = r#"
@@ -1431,6 +1461,134 @@ int main(void) {
   ku_drop_pg_client(&pool); LIVE_CHECK(!pool);
   puts("pg query live loopback closed loop");
   return 0;
+}
+"#;
+
+// Explicit, bounded protocol experiment; not an alternate product execution path.
+const FINITE_PIPELINE_LOOPBACK: &str = r#"
+extern int PQenterPipelineMode(PGconn*);
+extern int PQexitPipelineMode(PGconn*);
+extern int PQpipelineSync(PGconn*);
+extern int PQpipelineStatus(const PGconn*);
+static int p8_send(PGconn* connection,const char* sql,int count,const void* types,
+    const char* const* values,const int* lengths,const int* formats,int format) {
+  if(!strcmp(sql,"DISCARD ALL"))p8_reset_sends++;
+  return PQsendQueryParams(connection,sql,count,types,values,lengths,formats,format);
+}
+typedef struct P8Trace {
+  int queued,sync_requests,sync_results,single_rows,tuples,command_ok,errors,aborted;
+  int first_idle,first_utf8,reset_ok,pipeline_off,idle,utf8,expired,results,closed;
+} P8Trace;
+static int p8_pipeline(const char* conninfo,const char* sql,unsigned long long milliseconds,P8Trace* trace) {
+  KuPgConnectAttempt opened=ku_pg_connect_until(conninfo,ku_pg_now_ms()+2000u);
+  LIVE_CHECK(opened.conn);PGconn* conn=opened.conn;
+  LIVE_CHECK(PQsetnonblocking(conn,1)==0 && PQenterPipelineMode(conn));
+  unsigned long long deadline=ku_pg_now_ms()+milliseconds;
+  if(ku_pg_deadline_expired(deadline))goto expired;
+  LIVE_CHECK(PQsendQueryParams(conn,sql,0,NULL,NULL,NULL,NULL,0));trace->queued++;
+  if(ku_pg_deadline_expired(deadline))goto expired;
+  LIVE_CHECK(PQpipelineSync(conn));trace->sync_requests++;
+  if(ku_pg_deadline_expired(deadline))goto expired;
+  LIVE_CHECK(PQsendQueryParams(conn,"DISCARD ALL",0,NULL,NULL,NULL,NULL,0));trace->queued++;
+  if(ku_pg_deadline_expired(deadline))goto expired;
+  LIVE_CHECK(PQpipelineSync(conn));trace->sync_requests++;
+  /* Select the first queued business command before retrieving any result. */
+  LIVE_CHECK(PQsetSingleRowMode(conn));
+  for(size_t work=0;work<32u;) {
+    if(ku_pg_deadline_expired(deadline))goto expired;
+    int flushed=PQflush(conn);LIVE_CHECK(flushed>=0);
+    if(flushed) {
+      int ready=ku_pg_wait_socket(PQsocket(conn),3,deadline);
+      if(!ready)goto expired;LIVE_CHECK(ready>0);
+      if(ready&1)LIVE_CHECK(PQconsumeInput(conn));
+      continue;
+    }
+    if(PQisBusy(conn)) {
+      int ready=ku_pg_wait_socket(PQsocket(conn),1,deadline);
+      if(!ready)goto expired;LIVE_CHECK(ready>0 && PQconsumeInput(conn));
+      continue;
+    }
+    PGresult* result=PQgetResult(conn);work++;
+    if(!result) {if(trace->sync_results==2)break;continue;}
+    trace->results++;int status=PQresultStatus(result);
+    if(status==10) {
+      trace->sync_results++;
+      if(trace->sync_results==1) {
+        trace->first_idle=PQtransactionStatus(conn)==KU_PQTRANS_IDLE;
+        trace->first_utf8=ku_pg_connection_is_utf8(conn);
+      }
+    } else if(status==11)trace->aborted++;
+    else if(status==KU_PGRES_SINGLE_TUPLE)trace->single_rows++;
+    else if(status==KU_PGRES_TUPLES_OK)trace->tuples++;
+    else if(status==KU_PGRES_COMMAND_OK) {
+      trace->command_ok++;if(trace->sync_results==1)trace->reset_ok=1;
+    } else if(status==KU_PGRES_FATAL_ERROR)trace->errors++;
+    else {PQclear(result);PQfinish(conn);return 1;}
+    PQclear(result);
+  }
+  LIVE_CHECK(trace->sync_results==2 && PQexitPipelineMode(conn));
+  trace->pipeline_off=PQpipelineStatus(conn)==0;
+  trace->idle=PQtransactionStatus(conn)==KU_PQTRANS_IDLE;trace->utf8=ku_pg_connection_is_utf8(conn);
+  LIVE_CHECK(trace->pipeline_off && PQgetResult(conn)==NULL);
+  PQfinish(conn);trace->closed=1;return 0;
+expired:
+  trace->expired=1;PQfinish(conn);trace->closed=1;return 0;
+}
+static int p8_reserve(void* raw,size_t bytes) {size_t* value=(size_t*)raw;if(bytes>SIZE_MAX-*value)return 0;*value+=bytes;return 1;}
+static void p8_refund(void* raw,size_t bytes) {size_t* value=(size_t*)raw;if(bytes>*value)abort();*value-=bytes;}
+static void p8_wake(void* raw) {(void)raw;}
+static int p8_old_encoding(const char* conninfo,int* retained,int* evicted,int* resets) {
+  KuResult_pg_client opened=ku_pg_client_open(ku_test_text(conninfo),1,8,1000,1000,2000);LIVE_CHECK(opened.ok);
+  KuPgClient* pool=opened.value;size_t charge=0;KuError error={0};int before=p8_reset_sends;
+  KuPgAsyncOp* op=ku_pg_async_create(pool,ku_test_text("SELECT set_config('client_encoding','LATIN1',false)"),
+      (KuArray_str){0},ku_pg_now_ms()+2000u,(KuPgAsyncBudget){&charge,p8_reserve,p8_refund},p8_wake,NULL,&error);
+  LIVE_CHECK(op);
+  for(size_t turns=0;op->phase!=KU_PG_ASYNC_DONE && turns<512u;turns++) {
+    if(ku_pg_async_step(op,3u,ku_pg_now_ms(),0))break;
+    if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,0);
+    int fd=-1;unsigned int interest=0;unsigned long long deadline=0;
+    if(!ku_pg_async_interest(op,&fd,&interest,&deadline)) {
+      int ready=ku_pg_wait_socket(fd,interest,deadline);LIVE_CHECK(ready>=0);
+    }
+  }
+  LIVE_CHECK(op->phase==KU_PG_ASYNC_DONE && op->output.ok);
+  *retained=ku_test_value(op->output.value,"LATIN1");*evicted=pool->conns[0]==NULL;*resets=p8_reset_sends-before;
+  KuResult_pg_result result=ku_pg_async_take(op);size_t bytes=0;LIVE_CHECK(ku_pg_result_owned_bytes(result.value,&bytes));
+  ku_drop_pg_result(&result.value);p8_refund(&charge,bytes);ku_pg_async_dispose(op,1);ku_pg_client_close_owned(pool);
+  LIVE_CHECK(!charge);return 0;
+}
+static void p8_trace_json(const char* name,P8Trace* trace,int comma) {
+  printf("%s\"%s\":{\"commands_queued\":%d,\"sync_requests\":%d,\"sync_results\":%d,\"single_rows\":%d,\"tuples\":%d,\"command_ok\":%d,\"errors\":%d,\"aborted\":%d,\"first_idle\":%d,\"first_utf8\":%d,\"reset_ok\":%d,\"pipeline_off\":%d,\"idle\":%d,\"utf8\":%d,\"deadline_expired\":%d,\"closed\":%d}",
+      comma?",":"",name,trace->queued,trace->sync_requests,trace->sync_results,trace->single_rows,trace->tuples,
+      trace->command_ok,trace->errors,trace->aborted,trace->first_idle,trace->first_utf8,trace->reset_ok,
+      trace->pipeline_off,trace->idle,trace->utf8,trace->expired,trace->closed);
+}
+int main(void) {
+  const char* path=getenv("KU_PG_TEST_CONNINFO_FILE");LIVE_CHECK(path);
+  FILE* file=fopen(path,"rb");LIVE_CHECK(file);char conninfo[8193];size_t size=fread(conninfo,1,sizeof(conninfo)-1u,file);
+  int read_failed=ferror(file);fclose(file);LIVE_CHECK(!read_failed && size<sizeof(conninfo)-1u);conninfo[size]=0;
+  if(strlen(conninfo)!=size || !ku_test_conninfo_is_loopback(conninfo))return 77;
+  int retained=0,evicted=0,resets=0;
+  LIVE_CHECK(!p8_old_encoding(conninfo,&retained,&evicted,&resets));
+  LIVE_CHECK(retained && evicted && !resets);
+  P8Trace normal={0},syntax={0},encoding={0},transaction={0},deadline={0};
+  LIVE_CHECK(!p8_pipeline(conninfo,"SELECT 42",2000u,&normal));
+  LIVE_CHECK(normal.sync_results==2 && normal.single_rows==1 && normal.tuples==1 && normal.reset_ok
+      && normal.pipeline_off && normal.idle && normal.utf8 && !normal.errors);
+  LIVE_CHECK(!p8_pipeline(conninfo,"SELECT FROM",2000u,&syntax));
+  LIVE_CHECK(syntax.errors==1 && syntax.reset_ok && syntax.sync_results==2 && syntax.pipeline_off && syntax.idle && syntax.utf8);
+  LIVE_CHECK(!ku_pg_sql_has_explicit_session_control(ku_test_text("SELECT set_config('client_encoding','LATIN1',false)"),ku_pg_now_ms()+2000u));
+  LIVE_CHECK(!p8_pipeline(conninfo,"SELECT set_config('client_encoding','LATIN1',false)",2000u,&encoding));
+  LIVE_CHECK(encoding.queued==2 && encoding.reset_ok && encoding.pipeline_off && encoding.idle && encoding.utf8);
+  LIVE_CHECK(ku_pg_sql_has_explicit_session_control(ku_test_text("BEGIN"),ku_pg_now_ms()+2000u)==1);
+  LIVE_CHECK(!p8_pipeline(conninfo,"BEGIN",2000u,&transaction));
+  LIVE_CHECK(transaction.errors==1 && !transaction.reset_ok && !transaction.idle && transaction.pipeline_off && transaction.closed);
+  LIVE_CHECK(!p8_pipeline(conninfo,"SELECT pg_sleep(0.6)",100u,&deadline));LIVE_CHECK(deadline.expired && deadline.closed);
+  printf("{\"pg_pipeline_contract\":{\"default_changed\":false,\"strict_default_equivalent\":false,\"scope\":\"isolated protocol experiment; no CPU/performance claim\",\"original_async_encoding\":{\"result_retained\":%d,\"lease_evicted\":%d,\"reset_commands\":%d},",retained,evicted,resets);
+  p8_trace_json("normal",&normal,0);p8_trace_json("syntax_error",&syntax,1);p8_trace_json("encoding_change",&encoding,1);
+  p8_trace_json("explicit_transaction_raw_probe",&transaction,1);p8_trace_json("deadline",&deadline,1);
+  puts(",\"limits\":{\"commands_per_lease\":2,\"results\":32,\"no_statement_replay\":true,\"unknown_write_not_rollback\":true}}}");
+  puts("pg finite pipeline conditional-reset contract closed loop");return 0;
 }
 "#;
 
