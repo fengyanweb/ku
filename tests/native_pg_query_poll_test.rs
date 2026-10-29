@@ -748,6 +748,38 @@ fn native_pg_async_successful_waiter_hands_remaining_idle_lease_to_later_waiter(
     run_async_acquire_waiter_handoff(2);
 }
 
+#[test]
+fn native_pg_async_normal_release_notifies_one_waiter_and_drains_queue() {
+    let directory = TempDir::new("async-query-single-notify");
+    let harness = query_stub_harness(&directory).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    ) + &ASYNC_QUERY_SUITE.replace(
+        "int main(void) {",
+        "static int ku_async_sequential_tests(void) {",
+    ) + ASYNC_RELEASE_NOTIFY_SUITE;
+    let source = directory.path().join("async-query-single-notify.c");
+    fs::write(&source, harness).expect("write PG normal notification harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "async-query-single-notify")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("PG normal notification test exceeded bounds");
+    assert!(
+        output.status.success(),
+        "PG normal notification harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg normal notification closed loop\n"
+    );
+}
+
 fn run_async_acquire_lock_deadline(connect: bool, out_of_memory: bool) {
     let directory = TempDir::new("async-acquire-lock-deadline");
     let harness = query_stub_harness(&directory)
@@ -910,8 +942,7 @@ fn native_pg_async_acquire_failures_keep_bounded_correlated_snapshots() {
     assert!(lines[4].contains("\"export_busy\":true") && lines[4].contains("\"samples\":[]"));
 }
 
-#[test]
-fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
+fn run_async_notification_pin(normal_release: bool) {
     let directory = TempDir::new("async-query-notification-pin");
     let harness = query_stub_harness(&directory)
         // The sequential lock-depth probe is not a cross-thread counter.
@@ -927,6 +958,10 @@ fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
         + &ASYNC_QUERY_SUITE.replace(
             "int main(void) {",
             "static int ku_async_sequential_tests(void) {",
+        )
+        + &format!(
+            "\n#define KU_TEST_PIN_NORMAL_RELEASE {}\n",
+            u8::from(normal_release)
         )
         + ASYNC_NOTIFICATION_PIN_SUITE;
     let source = directory.path().join("async-query-notification-pin.c");
@@ -951,6 +986,16 @@ fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "pg async notification pin closed loop\n"
     );
+}
+
+#[test]
+fn native_pg_async_notification_pins_survive_close_and_owner_cancellation() {
+    run_async_notification_pin(false);
+}
+
+#[test]
+fn native_pg_async_notification_pins_survive_normal_release_and_owner_cancellation() {
+    run_async_notification_pin(true);
 }
 
 #[test]
@@ -1395,7 +1440,9 @@ static int injected_allocation_failures = 0;
 static int fail_runtime_allocation_after = 0, single_row_calls = 0, read_ahead_calls = 0;
 static int track_runtime_allocations = 0, live_runtime_allocations = 0;
 static int expire_oom_after_shutdown = 0;
-#define KU_PG_TEST_ALLOCATION_RECORDS 16
+/* Five simultaneous operations exceed the old 16-entry fixture ledger.
+ * This only sizes test bookkeeping, not a runtime allocation limit. */
+#define KU_PG_TEST_ALLOCATION_RECORDS 32
 static struct { void* pointer; size_t size; } runtime_allocations[KU_PG_TEST_ALLOCATION_RECORDS];
 static size_t runtime_bytes = 0, runtime_peak_bytes = 0;
 static unsigned long long last_wait_budget = 0;
@@ -2478,6 +2525,13 @@ static void async_refund(void* context,size_t bytes) {
   AsyncBudget* b=(AsyncBudget*)context;b->refunds++;if(!bytes)b->zero_refunds++;if(bytes>b->bytes)abort();b->bytes-=bytes;
 }
 static void async_wake(void* context) {((AsyncBudget*)context)->wakes++;}
+typedef struct HandoffWake { KuPgAsyncOp* op; AsyncBudget* budget; } HandoffWake;
+static void handoff_wake(void* context) {
+  HandoffWake* wake=(HandoffWake*)context;
+  /* The notification owns its callback pin and publishes outside the PG lock. */
+  if(ku_test_pg_pool_lock_depth || !wake->op->waiter.in_flight)abort();
+  async_wake(wake->budget);
+}
 static KuPgAsyncOp* async_create(KuPgClient* p,AsyncBudget* b) {
   KuError e={0};KuPgAsyncOp* op=ku_pg_async_create(p,ku_string_static((const uint8_t*)"SELECT 3",8),
       (KuArray_str){0},clock_ms+2000,(KuPgAsyncBudget){b,async_reserve,async_refund},async_wake,b,&e);
@@ -2665,13 +2719,6 @@ int main(void) {
 const ASYNC_ACQUIRE_HANDOFF_SUITE: &str = r#"
 #define KU_TEST_HANDOFF_CANCEL (KU_TEST_HANDOFF_KIND==1)
 #define KU_TEST_HANDOFF_SUCCESS (KU_TEST_HANDOFF_KIND==2)
-typedef struct HandoffWake { KuPgAsyncOp* op; AsyncBudget* budget; } HandoffWake;
-static void handoff_wake(void* context) {
-  HandoffWake* wake=(HandoffWake*)context;
-  /* The notification owns its callback pin and publishes outside the PG lock. */
-  if(ku_test_pg_pool_lock_depth || !wake->op->waiter.in_flight)abort();
-  async_wake(wake->budget);
-}
 static size_t handoff_idle_leases(KuPgClient* p) {
   size_t idle=0;
   for(size_t i=0;i<p->size;i++)if(p->conns[i] && !p->in_use[i])idle++;
@@ -2776,6 +2823,61 @@ int main(void) {
 }
 "#;
 
+const ASYNC_RELEASE_NOTIFY_SUITE: &str = r#"
+static int release_waiter_ready(KuPgAsyncOp* op) {
+  int fd=-2;unsigned int events=99u;unsigned long long deadline=0;
+  int ready=ku_pg_async_interest(op,&fd,&events,&deadline);
+  if(fd!=-1 || events || deadline!=op->acquire_deadline)abort();
+  return ready;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
+  track_runtime_allocations=1;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,250,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;
+  AsyncBudget held_budget={0},budgets[4]={0};HandoffWake wakes[4];KuPgAsyncOp* waiting[4];
+  KuPgAsyncOp* held=async_create(p,&held_budget);CHECK(!ku_pg_async_step(held,0,clock_ms,0));
+  CHECK(held->sent && held->phase==KU_PG_ASYNC_READ && p->active==1);
+  for(size_t i=0;i<4;i++) {
+    waiting[i]=async_create(p,&budgets[i]);wakes[i]=(HandoffWake){waiting[i],&budgets[i]};
+    waiting[i]->waiter.wake=handoff_wake;waiting[i]->waiter.context=&wakes[i];
+    CHECK(!ku_pg_async_step(waiting[i],0,clock_ms,0));
+    CHECK(waiting[i]->waiting && !release_waiter_ready(waiting[i]) && !budgets[i].wakes);
+  }
+  CHECK(p->waiters==4);
+  int before_resets=reset_sends,before_user_sends=user_sends;
+  held->conn->mode=T_OK;mode_on_send=T_OK;
+  CHECK(async_finish(held,0) && held->output.ok);
+  CHECK(reset_sends==before_resets+1 && p->active==0 && p->waiters==4);
+  size_t release_wakes=0,release_ready=0;
+  for(size_t i=0;i<4;i++) {
+    release_wakes+=budgets[i].wakes;release_ready+=release_waiter_ready(waiting[i])!=0;
+  }
+  CHECK(release_wakes==1 && release_ready==1);
+  async_drop_output(held,&held_budget,1);
+  for(size_t i=0;i<4;i++) {
+    /* A real notification must make acquisition ready. Never manually step an
+     * unnotified waiter or alter a lease/notification flag to force progress. */
+    CHECK(release_waiter_ready(waiting[i]) && waiting[i]->waiter.notified);
+    mode_on_send=T_READ_TIMEOUT;
+    CHECK(!ku_pg_async_step(waiting[i],0,clock_ms,0));
+    CHECK(waiting[i]->sent && waiting[i]->phase==KU_PG_ASYNC_READ && p->active==1);
+    CHECK(!waiting[i]->waiter.linked && !waiting[i]->waiter.in_flight);
+    for(size_t j=i+1;j<4;j++)CHECK(!release_waiter_ready(waiting[j]) && !budgets[j].wakes);
+    waiting[i]->conn->mode=T_OK;mode_on_send=T_OK;
+    CHECK(async_finish(waiting[i],0) && waiting[i]->output.ok);
+    CHECK(waiting[i]->acquire_deadline==1250u && clock_ms==1000u && budgets[i].wakes==1);
+    async_drop_output(waiting[i],&budgets[i],1);
+  }
+  CHECK(user_sends==before_user_sends+4 && reset_sends==before_resets+5);
+  CHECK(p->active==0 && p->waiters==0 && p->async_operations==0);
+  ku_pg_client_close_owned(p);
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  CHECK(!ku_test_pg_pool_lock_depth && !ku_test_pg_finishes_while_pool_locked);
+  puts("pg normal notification closed loop");return 0;
+}
+"#;
+
 const ASYNC_NOTIFICATION_PIN_SUITE: &str = r#"
 static KuTestEvent pin_entered,pin_release;
 static void pinned_wake(void* context) {
@@ -2783,6 +2885,10 @@ static void pinned_wake(void* context) {
   if(!ku_test_event_set(&pin_entered) || !ku_test_event_wait(&pin_release,5000))abort();
 }
 static int close_for_pin(void* context) {ku_pg_client_close_owned((KuPgClient*)context);return 0;}
+static int normal_release_for_pin(void* context) {
+  KuPgAsyncOp* held=(KuPgAsyncOp*)context;
+  return async_finish(held,0) && held->output.ok ? 0 : 1;
+}
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
   CHECK(ku_test_event_init(&pin_entered) && ku_test_event_init(&pin_release));
@@ -2791,14 +2897,22 @@ int main(void) {
   KuPgAsyncOp* held=async_create(p,&held_budget);CHECK(!ku_pg_async_step(held,0,clock_ms,0));
   KuPgAsyncOp* waiting=async_create(p,&wait_budget);waiting->waiter.wake=pinned_wake;
   CHECK(!ku_pg_async_step(waiting,0,clock_ms,0));CHECK(waiting->waiting);
-  KuTestThread thread;CHECK(ku_test_thread_start(&thread,close_for_pin,p));
+  KuTestThread thread;
+  if(KU_TEST_PIN_NORMAL_RELEASE) {
+    held->conn->mode=T_OK;mode_on_send=T_OK;
+    CHECK(ku_test_thread_start(&thread,normal_release_for_pin,held));
+  } else CHECK(ku_test_thread_start(&thread,close_for_pin,p));
   CHECK(ku_test_event_wait(&pin_entered,5000));
   CHECK(ku_pg_async_step(waiting,0,clock_ms,1));
   CHECK(!ku_pg_async_can_dispose(waiting));
   ku_pg_mutex_lock(&p->lock);CHECK(!waiting->waiter.linked && waiting->waiter.in_flight==1 && p->async_operations==2);ku_pg_mutex_unlock(&p->lock);
   CHECK(ku_test_event_set(&pin_release));CHECK(ku_test_thread_join(&thread,5000));
   CHECK(ku_pg_async_can_dispose(waiting));async_drop_output(waiting,&wait_budget,0);
-  CHECK(async_finish(held,1));async_drop_output(held,&held_budget,0);
+  if(KU_TEST_PIN_NORMAL_RELEASE) {
+    CHECK(thread.outcome==0 && held->output.ok && held->phase==KU_PG_ASYNC_DONE);
+    async_drop_output(held,&held_budget,1);
+    CHECK(p->active==0 && p->waiters==0 && p->async_operations==0);ku_pg_client_close_owned(p);
+  } else { CHECK(async_finish(held,1));async_drop_output(held,&held_budget,0); }
   CHECK(ku_test_event_destroy(&pin_entered) && ku_test_event_destroy(&pin_release));
   CHECK(live_connections==0 && live_results==0);
   puts("pg async notification pin closed loop");return 0;
