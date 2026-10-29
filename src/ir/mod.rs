@@ -3053,7 +3053,8 @@ impl<'a> FunctionLowerer<'a> {
             IrType::Named(n) if n == metadata::BYTES => "bytes",
             IrType::Named(n) if n == metadata::NET_CLIENT => "net",
             IrType::Named(n)
-                if n == "__ku_pg_client" && matches!(name.as_str(), "query" | "close") =>
+                if n == "__ku_pg_client"
+                    && matches!(name.as_str(), "query" | "query_one_typed" | "close") =>
             {
                 "pg_client"
             }
@@ -3061,7 +3062,7 @@ impl<'a> FunctionLowerer<'a> {
                 if n == "__ku_pg_result"
                     && matches!(
                         name.as_str(),
-                        "rows" | "cols" | "value" | "value_int" | "is_null"
+                        "rows" | "cols" | "value" | "value_int" | "value_bool" | "is_null"
                     ) =>
             {
                 "pg_result"
@@ -3130,6 +3131,13 @@ impl<'a> FunctionLowerer<'a> {
                 _ => None,
             };
             let mut value = self.lower_expr_with_expected(arg, expected.as_ref())?;
+            if module == "pg_client"
+                && name == "query_one_typed"
+                && index == 1
+                && !ir_expr_is_place(&value)
+            {
+                value = self.emit_temp(value)?;
+            }
             if remaining_effects != 0 {
                 // Later callbacks may also replace an earlier argument's
                 // binding. Freeze each evaluated value left-to-right, not just

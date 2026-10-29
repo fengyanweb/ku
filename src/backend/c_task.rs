@@ -484,6 +484,7 @@ impl<'a> FrameEmitter<'a> {
                         && !*borrowed
                         && (matches!(ty, IrType::Str | IrType::Result(_))
                             || crate::ir::task::flat_array(ty)
+                            || crate::ir::task::pg_params_array(ty)
                             || crate::ir::task::error_type(ty)
                             || crate::ir::task::local_bytes_type(ty)
                             || crate::ir::task::local_net_type(ty)
@@ -522,7 +523,7 @@ impl<'a> FrameEmitter<'a> {
                 != (task_mask != 0
                     || exit_bridge
                     || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
-                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -724,6 +725,7 @@ impl<'a> FrameEmitter<'a> {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
                         || crate::ir::task::flat_array(ty)
+                        || crate::ir::task::pg_params_array(ty)
                         || crate::ir::task::error_type(ty)
                         || crate::ir::task::local_bytes_type(ty)
                         || crate::ir::task::local_net_type(ty)
@@ -2923,12 +2925,25 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     client,
                     sql,
                     params,
+                    typed,
                     dst,
                     ready,
                     cleanup,
                 } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
-                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t pg_status=ku_task_host_pg_query((KuTaskAdapterHostV1*)clock->host,{},{},{},&{});\n  if (pg_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (pg_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*client),self.place(*sql),self.place(*params),self.place(*dst)));
+                    let call = if let Some((param_types, result_types)) = typed {
+                        let params = self.place(*params);
+                        format!("ku_task_host_pg_query_one_typed((KuTaskAdapterHostV1*)clock->host,{},{},{params}.data,{params}.len,{},{},&{})",self.place(*client),self.place(*sql),self.place(*param_types),self.place(*result_types),self.place(*dst))
+                    } else {
+                        format!(
+                            "ku_task_host_pg_query((KuTaskAdapterHostV1*)clock->host,{},{},{},&{})",
+                            self.place(*client),
+                            self.place(*sql),
+                            self.place(*params),
+                            self.place(*dst)
+                        )
+                    };
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t pg_status={call};\n  if (pg_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (pg_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
@@ -3213,7 +3228,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
                 self.set_init(out, *dst, true);
                 for (index, source) in elements.iter().enumerate() {
-                    let value = if element.as_ref() == &IrType::Str {
+                    let source_type = self.slot_type(*source)?;
+                    let boxed_pg = crate::ir::task::pg_params_array(self.slot_type(*dst)?);
+                    let value = if boxed_pg {
+                        // Construction is verifier-restricted to scalar leaves.
+                        // Strings move into the vector; no generic clone occurs.
+                        super::ku_value_wrap(
+                            source_type,
+                            &c_move_value(source_type, &self.place(*source))?,
+                        )?
+                    } else if element.as_ref() == &IrType::Str {
                         c_move_value(element, &self.place(*source))?
                     } else {
                         self.place(*source)
@@ -3221,7 +3245,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     out.push_str(&format!(
                         "  {place}.data[{index}]={value}; {place}.len++;\n"
                     ));
-                    if element.as_ref() == &IrType::Str {
+                    if source_type == &IrType::Str {
                         self.set_init(out, *source, false);
                     }
                 }
@@ -3580,6 +3604,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     ),
                     Pg::ValueInt => format!(
                         "ku_pg_value_int({source},{},{})",
+                        self.place(row.unwrap()),
+                        self.place(col.unwrap())
+                    ),
+                    Pg::ValueBool => format!(
+                        "ku_pg_value_bool({source},{},{})",
                         self.place(row.unwrap()),
                         self.place(col.unwrap())
                     ),
@@ -4031,7 +4060,11 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
     }
     match ty {
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => Ok(()),
-        IrType::Array(_) if crate::ir::task::flat_array(ty) => Ok(()),
+        IrType::Array(_)
+            if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) =>
+        {
+            Ok(())
+        }
         IrType::Result(_) => require_result_type(ty),
         _ => Err(unsupported(
             "native task frame R1 does not support this slot type",
@@ -4104,7 +4137,7 @@ pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
         IrType::Str => Ok(format!(
             "({place}).ptr == NULL && ({place}).len == 0 && ({place}).capacity == 0 && ({place}).storage == 0"
         )),
-        IrType::Array(_) if crate::ir::task::flat_array(ty) => Ok(format!(
+        IrType::Array(_) if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) => Ok(format!(
             "({place}).data == NULL && ({place}).len == 0 && ({place}).capacity == 0"
         )),
         IrType::Result(inner) => Ok(format!(

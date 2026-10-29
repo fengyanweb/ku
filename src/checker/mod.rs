@@ -3276,6 +3276,64 @@ impl Checker {
         ))))
     }
 
+    fn apply_pg_client_query_one_typed_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
+        expect_arg_count("pg_client.query_one_typed", args.len(), 5, span)?;
+        let client = match checked_receiver {
+            Some(ty) => ty.clone(),
+            None => self.check_expr(&args[0])?,
+        };
+        let expected_client = Type::Native(metadata::PG_CLIENT.to_string());
+        if client != expected_client {
+            return Err(type_error(args[0].span, &expected_client, &client));
+        }
+        let sql = self.check_expr(&args[1])?;
+        if sql != Type::String {
+            return Err(type_error(args[1].span, &Type::String, &sql));
+        }
+        // Contextual boxing belongs only to this API. Each expression is
+        // checked once, in source order; ordinary mixed arrays stay unchanged.
+        let expected_params = Type::Array(Box::new(Type::KuValue));
+        if let ExprKind::Array(elements) = &args[2].kind {
+            for element in elements {
+                let actual = self.consume_expr(element)?;
+                if !matches!(
+                    actual,
+                    Type::Int | Type::Bool | Type::Null | Type::String | Type::KuValue
+                ) {
+                    return Err(KuError::runtime("typed PostgreSQL parameters accept only int, bool, str, null or a checked KuValue", element.span));
+                }
+            }
+        } else {
+            let actual = self.check_expr(&args[2])?;
+            if actual != expected_params {
+                return Err(type_error(args[2].span, &expected_params, &actual));
+            }
+        }
+        for schema in &args[3..] {
+            let actual = self.check_expr(schema)?;
+            let expected = Type::Array(Box::new(Type::String));
+            if actual != expected
+                && !matches!(&schema.kind, ExprKind::Array(elements) if elements.is_empty())
+            {
+                return Err(type_error(schema.span, &expected, &actual));
+            }
+        }
+        self.reject_effectful_args_on_captured_native_receiver(
+            &args[0],
+            &client,
+            &args[1..],
+            span,
+        )?;
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::PG_RESULT.to_string(),
+        ))))
+    }
+
     fn check_http_handler(
         &mut self,
         method: &str,
@@ -4153,7 +4211,8 @@ impl Checker {
             Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
             Type::KuValue if matches!(name.as_str(), "as_int" | "as_str" | "take") => "kuvalue",
             Type::Native(native)
-                if native == metadata::PG_CLIENT && matches!(name.as_str(), "query" | "close") =>
+                if native == metadata::PG_CLIENT
+                    && matches!(name.as_str(), "query" | "query_one_typed" | "close") =>
             {
                 "pg_client"
             }
@@ -4161,7 +4220,7 @@ impl Checker {
                 if native == metadata::PG_RESULT
                     && matches!(
                         name.as_str(),
-                        "rows" | "cols" | "value" | "value_int" | "is_null"
+                        "rows" | "cols" | "value" | "value_int" | "value_bool" | "is_null"
                     ) =>
             {
                 "pg_result"
@@ -4260,6 +4319,9 @@ impl Checker {
         }
         if signature.name == "pg.client" {
             return self.apply_pg_client_signature(args, span);
+        }
+        if signature.name == "pg_client.query_one_typed" {
+            return self.apply_pg_client_query_one_typed_signature(args, span, checked_receiver);
         }
         if signature.name == "pg_client.query" {
             return self.apply_pg_client_query_signature(args, span, checked_receiver);

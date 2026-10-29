@@ -211,12 +211,17 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 client,
                 sql,
                 params,
+                typed,
                 dst,
                 ..
             } => {
                 map(client);
                 map(sql);
                 map(params);
+                if let Some((a, b)) = typed {
+                    map(a);
+                    map(b);
+                }
                 map(dst);
             }
             TaskTerminator::TryResult {

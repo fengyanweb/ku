@@ -100,7 +100,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -1184,6 +1184,7 @@ impl<'a> FunctionLowerer<'a> {
             ));
         }
         self.budget.analysis(elements.len(), span)?;
+        let boxed_pg = matches!(&expected, Some(IrType::Named(name)) if name == "__ku_value");
         let mut element_type = expected;
         let mut sources = Vec::with_capacity(elements.len());
         for expression in elements {
@@ -1198,12 +1199,17 @@ impl<'a> FunctionLowerer<'a> {
                     span,
                 ));
             };
-            if !matches!(ty, IrType::Int | IrType::Bool | IrType::Str)
-                || element_type.as_ref().is_some_and(|expected| expected != ty)
-            {
+            if if boxed_pg {
+                !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str)
+            } else {
+                !matches!(ty, IrType::Int | IrType::Bool | IrType::Str)
+                    || element_type.as_ref().is_some_and(|expected| expected != ty)
+            } {
                 return Err(unsupported("mixed or nested array elements", span));
             }
-            element_type = Some(ty.clone());
+            if !boxed_pg {
+                element_type = Some(ty.clone());
+            }
             sources.push(self.copy_or_move(value)?);
         }
         let ty = element_type.ok_or_else(|| {
@@ -1724,24 +1730,47 @@ impl<'a> FunctionLowerer<'a> {
     ) -> KuResult<SlotId> {
         let capture = matches!(&self.function.slots[source.0].ty, TaskSlotType::Value {ty,..} if task::pg_capture_type(ty));
         if capture {
-            if name != "query" || args.len() != 2 || self.in_finally_body {
+            let is_typed = name == "query_one_typed";
+            if !(name == "query" || is_typed)
+                || args.len() != if is_typed { 4 } else { 2 }
+                || self.in_finally_body
+            {
                 return Err(unsupported(
-                    "a PostgreSQL capture supports only query(sql,params) outside finally",
+                    "PostgreSQL query/sql/params/schema signature outside finally",
                     span,
                 ));
             }
             let sql = self.expression(&args[0], depth + 1)?;
+            let params_type = IrType::Array(Box::new(if is_typed {
+                IrType::Named("__ku_value".into())
+            } else {
+                IrType::Str
+            }));
             let params = self.direct_argument_expression(
                 &args[1],
-                &value_slot(IrType::Array(Box::new(IrType::Str))),
+                &value_slot(params_type.clone()),
                 depth + 1,
             )?;
+            let typed = if is_typed {
+                let strings = value_slot(IrType::Array(Box::new(IrType::Str)));
+                let a = self.direct_argument_expression(&args[2], &strings, depth + 1)?;
+                let b = self.direct_argument_expression(&args[3], &strings, depth + 1)?;
+                if self.function.slots[a.0].ty != strings || self.function.slots[b.0].ty != strings
+                {
+                    return Err(unsupported(
+                        "PostgreSQL typed schema requires string arrays",
+                        span,
+                    ));
+                }
+                Some((a, b))
+            } else {
+                None
+            };
             if self.function.slots[sql.0].ty != value_slot(IrType::Str)
-                || self.function.slots[params.0].ty
-                    != value_slot(IrType::Array(Box::new(IrType::Str)))
+                || self.function.slots[params.0].ty != value_slot(params_type)
             {
                 return Err(unsupported(
-                    "PostgreSQL query requires SQL and string parameters",
+                    "PostgreSQL query requires SQL and matching parameter array",
                     span,
                 ));
             }
@@ -1756,6 +1785,7 @@ impl<'a> FunctionLowerer<'a> {
                 client: source,
                 sql,
                 params,
+                typed,
                 dst,
                 ready,
                 cleanup,
@@ -1766,6 +1796,14 @@ impl<'a> FunctionLowerer<'a> {
             }
             if !matches!(args[1].kind, ExprKind::Variable(_)) {
                 self.emit(TaskOp::Drop { slot: params })?;
+            }
+            if let Some((a, b)) = typed {
+                if !matches!(args[2].kind, ExprKind::Variable(_)) {
+                    self.emit(TaskOp::Drop { slot: a })?;
+                }
+                if !matches!(args[3].kind, ExprKind::Variable(_)) {
+                    self.emit(TaskOp::Drop { slot: b })?;
+                }
             }
             return Ok(dst);
         }
@@ -1779,6 +1817,10 @@ impl<'a> FunctionLowerer<'a> {
             "value_int" => (
                 task::TaskPgResultOperation::ValueInt,
                 IrType::Result(Box::new(IrType::Int)),
+            ),
+            "value_bool" => (
+                task::TaskPgResultOperation::ValueBool,
+                IrType::Result(Box::new(IrType::Bool)),
             ),
             "is_null" => (
                 task::TaskPgResultOperation::IsNull,

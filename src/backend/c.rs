@@ -3335,7 +3335,14 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             let len = values.len();
             let values = values
                 .iter()
-                .map(c_value_expr)
+                .map(|value| {
+                    let expression = c_value_expr(value)?;
+                    if ir_type_is_ku_value(element) {
+                        ku_value_wrap(&value.ty, &expression)
+                    } else {
+                        Ok(expression)
+                    }
+                })
                 .collect::<KuResult<Vec<_>>>()?
                 .join(", ");
             Ok(format!(
@@ -16422,6 +16429,18 @@ fn c_pg_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
             c_expr(arg(1)?)?,
             c_expr(arg(2)?)?
         )),
+        "query_one_typed" => {
+            // Lowering materializes a computed parameter array once. All five
+            // public arguments are borrowed; this header expansion cannot move it.
+            let params = c_expr(arg(2)?)?;
+            Ok(format!(
+                "ku_pg_client_query_one_typed({}, {}, ({params}).data, ({params}).len, {}, {})",
+                c_expr(arg(0)?)?,
+                c_expr(arg(1)?)?,
+                c_expr(arg(3)?)?,
+                c_expr(arg(4)?)?
+            ))
+        }
         "rows" => Ok(format!("ku_pg_rows({})", c_expr(arg(0)?)?)),
         "cols" => Ok(format!("ku_pg_cols({})", c_expr(arg(0)?)?)),
         "value" => Ok(format!(
@@ -16432,6 +16451,12 @@ fn c_pg_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
         )),
         "value_int" => Ok(format!(
             "ku_pg_value_int({}, {}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?,
+            c_expr(arg(2)?)?
+        )),
+        "value_bool" => Ok(format!(
+            "ku_pg_value_bool({}, {}, {})",
             c_expr(arg(0)?)?,
             c_expr(arg(1)?)?,
             c_expr(arg(2)?)?

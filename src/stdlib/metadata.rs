@@ -131,11 +131,13 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "http.statusText"
             | "pg.client"
             | "pg_client.query"
+            | "pg_client.query_one_typed"
             | "pg_client.close"
             | "pg_result.rows"
             | "pg_result.cols"
             | "pg_result.value"
             | "pg_result.value_int"
+            | "pg_result.value_bool"
             | "pg_result.is_null"
             | "mysql.client"
             | "mysql.query"
@@ -286,8 +288,15 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             str_arg(),
             ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
         ],
+        ("pg_client", "query_one_typed") => vec![
+            ArgRule::Is(TypePattern::Native(PG_CLIENT)),
+            str_arg(),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::KuValue))),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+        ],
         ("pg_result", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
-        ("pg_result", "value" | "value_int" | "is_null") => vec![
+        ("pg_result", "value" | "value_int" | "value_bool" | "is_null") => vec![
             ArgRule::Is(TypePattern::Native(PG_RESULT)),
             int_arg(),
             int_arg(),
@@ -358,11 +367,15 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "text" | "html" | "json" | "empty" | "redirect") => http_response_pattern(),
         ("http", "statusText") => TypePattern::String,
         ("pg", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_CLIENT))),
-        ("pg_client", "query") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT))),
+        ("pg_client", "query" | "query_one_typed") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT)))
+        }
         ("pg_result", "rows" | "cols") => TypePattern::Int,
         ("pg_result", "value") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("pg_result", "value_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
-        ("pg_result", "is_null") => TypePattern::ResultOf(Box::new(TypePattern::Bool)),
+        ("pg_result", "value_bool" | "is_null") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Bool))
+        }
         ("pg_client", "close") => TypePattern::Null,
         ("mysql", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CLIENT))),
         ("redis", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(REDIS_CLIENT))),
@@ -575,8 +588,8 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("time", "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request")
         | ("pg", "client")
-        | ("pg_client", "query")
-        | ("pg_result", "value" | "value_int" | "is_null")
+        | ("pg_client", "query" | "query_one_typed")
+        | ("pg_result", "value" | "value_int" | "value_bool" | "is_null")
         | ("mysql", "client")
         | ("redis", "client")
         | ("bytes", "from_str" | "from_array")

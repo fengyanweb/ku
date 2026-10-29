@@ -685,6 +685,20 @@ static uint32_t ku_task_host_pg_query(KuTaskAdapterHostV1* host,
           client.client,sql,params,client.deadline,host->allocation_context,host->reconcile_charge,output);
   return ku_task_host_net_status(status);
 }
+static uint32_t ku_task_host_pg_query_one_typed(KuTaskAdapterHostV1* host,
+    KuTaskPgCapture client, KuString sql, const KuValue* params, size_t count,
+    KuArray_str param_types, KuArray_str result_types, KuResult_pg_result* output) {
+  if(!ku_task_host_net_valid(host) || !client.client || !client.env || !client.deadline || !output)
+    return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if(ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)
+    return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_take_pg(host->ticket,host->blocking,output)
+      : ku_task_blocking_submit_pg_one_typed(host->ticket,host->control,host->blocking,
+          client.client,sql,params,count,param_types,result_types,client.deadline,
+          host->allocation_context,host->reconcile_charge,output);
+  return ku_task_host_net_status(status);
+}
 static KuResult_str ku_task_host_pg_value(KuTaskAdapterHostV1* host,
     KuPgResult* result, int64_t row, int64_t col) {
   if(!ku_task_host_net_valid(host))

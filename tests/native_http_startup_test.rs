@@ -549,3 +549,149 @@ fn main(): null! {
         .is_some());
     }
 }
+
+#[test]
+fn native_http_typed_pg_query_materializes_scalar_parameters_and_pins_schemas() {
+    let source = r#"
+import http from "std.http"
+import pg from "std.pg"
+fn main(): null! {
+    client = pg.client({conninfo:"hostaddr=127.0.0.1",max_connections:1})?
+    async fn database(req:HttpRequest):HttpResponse! {
+        key = req.query.key.clone()
+        size = key.byte_len()
+        result = client.query_one_typed("SELECT $1::int8,$2::bool,$3::text,$4::text",[size,true,key,null],["int8","bool","text","text?"],["int8","bool","text","text?"])?
+        number = result.value_int(0,0)?
+        flag = result.value_bool(0,1)?
+        label = result.value(0,2)?
+        missing = result.is_null(0,3)?
+        if (number != size || !flag || !missing) { fail "typed result mismatch" }
+        return ok(http.text(label))
+    }
+    app = http.server()
+    app.get("/db",database)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#;
+    let mut ast = parsed(source);
+    ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:pg".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&ast).unwrap();
+    let (setup, bindings) = ir::lower_mixed_http_setup(&ast).unwrap();
+    let tasks = ir::task_lower::lower_bound_service_handlers(&ast, &bindings).unwrap();
+    let plan = ir::task::verify_and_plan(&tasks, Default::default()).unwrap();
+    let handler = &tasks.functions[0];
+    let (params, param_types, result_types) = handler
+        .states
+        .iter()
+        .find_map(|state| {
+            if let ir::task::TaskTerminator::PgQuery {
+                params,
+                typed: Some((a, b)),
+                ..
+            } = state.terminator
+            {
+                Some((params, a, b))
+            } else {
+                None
+            }
+        })
+        .expect("typed PG poll terminator");
+    for slot in [params, param_types, result_types] {
+        assert!(
+            plan.functions[0].slots.contains(&slot),
+            "query input must survive suspension/retirement"
+        );
+    }
+    let generated = c::generate_mixed_http_c_source(&setup, &tasks, &Default::default()).unwrap();
+    assert!(generated.contains("ku_task_host_pg_query_one_typed("));
+    assert!(generated.contains("ku_task_blocking_submit_pg_one_typed("));
+    assert!(generated.contains("ku_pg_value_bool("));
+    assert!(generated.contains("sizeof(KuValue)"));
+    assert!(generated.contains("tag!=KU_NULL && tag!=KU_INT && tag!=KU_BOOL && tag!=KU_STR"));
+    assert!(!generated.contains("ku_clone_pg_client(captured"));
+    // Schema operands are part of the verifier, not unchecked pointers hidden
+    // behind the host bridge. Corrupting their type must fail before C output.
+    let mut invalid = tasks.clone();
+    invalid.functions[0].slots[param_types.0].ty = ir::task::TaskSlotType::Value {
+        ty: ir::IrType::Int,
+        borrowed: false,
+    };
+    assert!(ir::task::verify_and_plan(&invalid, Default::default()).is_err());
+    for replacement in ["[size,true,1.5,null]", "[size,true,[1],null]"] {
+        let bad = source.replace("[size,true,key,null]", replacement);
+        let mut invalid = parsed(&bad);
+        invalid.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: "std:pg".into(),
+                span: Default::default(),
+            }),
+        );
+        assert!(Checker::new().check(&invalid).is_err(), "{replacement}");
+    }
+    // Public typed borrowing also lowers through ordinary synchronous IR. The
+    // generated wrapper expands one already-materialized array header.
+    let sync = r#"
+import pg from "std.pg"
+fn main():null! {
+    client=pg.client({conninfo:"hostaddr=127.0.0.1",max_connections:1})?
+    result=client.query_one_typed("SELECT $1::int8,$2::bool,$3::text,$4::text",[7,true,"owned",null],["int8","bool","text","text?"],["int8","bool","text","text?"])?
+    flag=result.value_bool(0,1)?
+    if (!flag) { fail "typed bool mismatch" }
+    return ok(null)
+}
+"#;
+    ku::cli::check_source("typed-pg-sync.ku", sync).unwrap();
+    let mut sync_ast = parsed(sync);
+    sync_ast.items.insert(
+        0,
+        ku::ast::Item::Module(ku::ast::ModuleDecl {
+            name: "std:pg".into(),
+            span: Default::default(),
+        }),
+    );
+    Checker::new().check(&sync_ast).unwrap();
+    let sync_ir = ir::lower_program(&sync_ast).unwrap();
+    let sync_generated = c::generate_c_source(&sync_ir).unwrap();
+    assert!(sync_generated.contains("ku_pg_client_query_one_typed("));
+    assert!(sync_generated.contains("ku_array_make_kuvalue(4"));
+    let libdir = std::env::var_os("KU_PG_LIB")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut discovery = Command::new("pg_config");
+            discovery.arg("--libdir");
+            let found = run_bounded(&mut discovery, RUN_TIMEOUT, RUN_LIMITS).ok()?;
+            found
+                .status
+                .success()
+                .then(|| std::path::PathBuf::from(String::from_utf8(found.stdout).unwrap().trim()))
+        });
+    if let Some(libdir) = libdir {
+        let directory = TempDir::new("typed-pg-http-bridge-link");
+        let path = directory.path().join("typed-pg-http.c");
+        fs::write(&path, generated).unwrap();
+        assert!(native_harness::compile_harness_with_libpq(
+            directory.path(),
+            &path,
+            "typed-pg-http",
+            &libdir
+        )
+        .is_some());
+        let sync_path = directory.path().join("typed-pg-sync.c");
+        fs::write(&sync_path, sync_generated).unwrap();
+        assert!(native_harness::compile_harness_with_libpq(
+            directory.path(),
+            &sync_path,
+            "typed-pg-sync",
+            &libdir
+        )
+        .is_some());
+    }
+}

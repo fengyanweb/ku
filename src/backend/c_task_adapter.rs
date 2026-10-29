@@ -88,6 +88,7 @@ fn supported_type(ty: &IrType) -> bool {
 fn owned(ty: &IrType) -> bool {
     matches!(ty, IrType::Str | IrType::Result(_))
         || crate::ir::task::flat_array(ty)
+        || crate::ir::task::pg_params_array(ty)
         || crate::ir::task::error_type(ty)
         || crate::ir::task::local_bytes_type(ty)
         || crate::ir::task::local_net_type(ty)
@@ -114,6 +115,10 @@ fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> S
         IrType::Array(inner) if inner.as_ref() == &IrType::Str => format!(
             "  for (size_t array_index=0;array_index<({place}).len;array_index++) {{\n{}  }}\n",
             body(&format!("({place}).data[array_index]"))
+        ),
+        IrType::Array(_) if crate::ir::task::pg_params_array(ty) => format!(
+            "  for (size_t array_index=0;array_index<({place}).len;array_index++) {{ if (({place}).data[array_index].tag==KU_STR) {{\n{}  }} }}\n",
+            body(&format!("({place}).data[array_index].as.s"))
         ),
         IrType::Result(inner) => format!(
             "  if (({place}).ok) {{\n{}  }} else {{\n{}{}{}  }}\n",
@@ -163,7 +168,12 @@ fn active_charge(ty: &IrType, place: &str, total: &str) -> String {
         let leaves = active_strings(ty, place, &|leaf| {
             format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
         });
-        return format!("  {{ KuTaskAdapterBufferV1 vector={{0}}; checked=ku_task_adapter_array_buffer(({place}).data,({place}).len,({place}).capacity,sizeof({c_element}),KU_TASK_FRAME_ALIGNOF({c_element}),&vector); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (vector.bytes>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=vector.bytes;\n{leaves}  }}\n");
+        let tags = if crate::ir::task::pg_params_array(ty) {
+            format!("  for (size_t index=0;index<({place}).len;index++) {{ uint8_t tag=({place}).data[index].tag; if(tag!=KU_NULL && tag!=KU_INT && tag!=KU_BOOL && tag!=KU_STR) return KU_TASK_DRIVER_INVALID_ARGUMENT; }}\n")
+        } else {
+            String::new()
+        };
+        return format!("  {{ KuTaskAdapterBufferV1 vector={{0}}; checked=ku_task_adapter_array_buffer(({place}).data,({place}).len,({place}).capacity,sizeof({c_element}),KU_TASK_FRAME_ALIGNOF({c_element}),&vector); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (vector.bytes>SIZE_MAX-{total}) return KU_TASK_DRIVER_LIMIT; {total}+=vector.bytes;\n{tags}{leaves}  }}\n");
     }
     active_strings(ty, place, &|leaf| {
         format!("  checked=ku_task_adapter_string_charge({leaf},&{total}); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
@@ -395,7 +405,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     });
     let dynamic_projection = blocking
         || crate::ir::task::array_result(&function.result) || crate::ir::task::http_type(&function.result)
-        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
+        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty) || crate::ir::task::pg_params_array(ty) || crate::ir::task::array_result(ty) || crate::ir::task::http_type(ty)))
         || function.states.iter().any(|state| {
             state
                 .operations

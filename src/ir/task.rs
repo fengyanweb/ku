@@ -106,6 +106,7 @@ pub enum TaskPgResultOperation {
     Cols,
     Value,
     ValueInt,
+    ValueBool,
     IsNull,
 }
 
@@ -414,6 +415,9 @@ pub enum TaskTerminator {
         client: SlotId,
         sql: SlotId,
         params: SlotId,
+        /// Present only for native binary exact-one queries. These owned
+        /// schema arrays remain pinned with SQL/params until physical retirement.
+        typed: Option<(SlotId, SlotId)>,
         dst: SlotId,
         ready: StateId,
         cleanup: StateId,
@@ -579,7 +583,17 @@ fn parameter_type(ty: &IrType) -> bool {
         || pg_capture_type(ty)
 }
 fn value_type(ty: &IrType) -> bool {
-    parameter_type(ty) || local_bytes_type(ty) || local_net_type(ty) || local_pg_type(ty)
+    parameter_type(ty)
+        || pg_params_array(ty)
+        || local_bytes_type(ty)
+        || local_net_type(ty)
+        || local_pg_type(ty)
+}
+
+/// A local-only typed PostgreSQL parameter vector. It cannot become a Task
+/// parameter/result, and its construction accepts only scalar tagged leaves.
+pub(crate) fn pg_params_array(ty: &IrType) -> bool {
+    matches!(ty, IrType::Array(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_value"))
 }
 
 pub(crate) fn flat_array(ty: &IrType) -> bool {
@@ -647,7 +661,7 @@ pub(crate) fn replaces_owned_value(
     slot == dst
         && matches!(function.slots.get(dst.0), Some(TaskSlot {
             ty: TaskSlotType::Value { ty, borrowed: false }
-        }) if matches!(ty, IrType::Str | IrType::Result(_)) || flat_array(ty) || error_type(ty) || http_type(ty))
+        }) if matches!(ty, IrType::Str | IrType::Result(_)) || flat_array(ty) || pg_params_array(ty) || error_type(ty) || http_type(ty))
 }
 
 fn slot_type(slot: &TaskSlot) -> KuResult<(&IrType, bool)> {
@@ -982,7 +996,7 @@ fn validate_shape(
     let mut has_error_projection = http_type(&function.result) || array_result(&function.result) || function
         .slots
         .iter()
-        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || array_result(ty) || http_type(ty)));
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || pg_params_array(ty) || array_result(ty) || http_type(ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -1089,14 +1103,21 @@ fn validate_shape(
                     let IrType::Array(element) = destination else {
                         return Err(invalid("ArrayMake requires a flat array destination"));
                     };
-                    if borrowed || !flat_array(destination) {
+                    if borrowed || !(flat_array(destination) || pg_params_array(destination)) {
                         return Err(invalid("ArrayMake requires an owned flat array"));
                     }
                     budget.spend_many(elements.len())?;
                     let mut consumed = 0;
                     for source in elements {
                         let (ty, borrowed) = slot_type(get_slot(*source)?)?;
-                        if source == dst || borrowed || ty != element.as_ref() {
+                        if source == dst
+                            || borrowed
+                            || if pg_params_array(destination) {
+                                !primitive(ty)
+                            } else {
+                                ty != element.as_ref()
+                            }
+                        {
                             return Err(invalid("ArrayMake element type mismatch"));
                         }
                         if !copy_type(ty) {
@@ -1495,7 +1516,9 @@ fn validate_shape(
                         TaskPgResultOperation::Rows | TaskPgResultOperation::Cols => IrType::Int,
                         TaskPgResultOperation::Value => IrType::Result(Box::new(IrType::Str)),
                         TaskPgResultOperation::ValueInt => IrType::Result(Box::new(IrType::Int)),
-                        TaskPgResultOperation::IsNull => IrType::Result(Box::new(IrType::Bool)),
+                        TaskPgResultOperation::ValueBool | TaskPgResultOperation::IsNull => {
+                            IrType::Result(Box::new(IrType::Bool))
+                        }
                     };
                     if source == dst
                         || source_borrowed
@@ -1792,16 +1815,33 @@ fn validate_shape(
                 client,
                 sql,
                 params,
+                typed,
                 dst,
                 ..
             } => {
                 has_blocking = true;
+                let expected_params = if typed.is_some() {
+                    IrType::Array(Box::new(IrType::Named("__ku_value".into())))
+                } else {
+                    IrType::Array(Box::new(IrType::Str))
+                };
+                if let Some((param_types, result_types)) = typed {
+                    for schema in [param_types, result_types] {
+                        if schema == dst
+                            || slot_type(get_slot(*schema)?)?
+                                != (&IrType::Array(Box::new(IrType::Str)), false)
+                        {
+                            return Err(invalid(
+                                "typed PgQuery requires initialized owned string schema arrays",
+                            ));
+                        }
+                    }
+                }
                 let (client_type, client_borrowed) = slot_type(get_slot(*client)?)?;
                 if client_borrowed
                     || !pg_capture_type(client_type)
                     || slot_type(get_slot(*sql)?)? != (&IrType::Str, false)
-                    || slot_type(get_slot(*params)?)?
-                        != (&IrType::Array(Box::new(IrType::Str)), false)
+                    || slot_type(get_slot(*params)?)? != (&expected_params, false)
                     || slot_type(get_slot(*dst)?)?
                         != (
                             &IrType::Result(Box::new(IrType::Named("__ku_pg_result".into()))),
@@ -1809,7 +1849,7 @@ fn validate_shape(
                         )
                     || [client, sql, params].contains(&dst)
                 {
-                    return Err(invalid("PgQuery requires a pinned captured client, SQL, string params and owned result"));
+                    return Err(invalid("PgQuery requires a pinned captured client, SQL, correctly typed params and owned result"));
                 }
             }
             TaskTerminator::Await { task, dst, .. } => {
@@ -2873,8 +2913,14 @@ fn live_states(
                     client,
                     sql,
                     params,
+                    typed,
                     ..
-                } => live |= bit(client) | bit(sql) | bit(params),
+                } => {
+                    live |= bit(client)
+                        | bit(sql)
+                        | bit(params)
+                        | typed.map_or(0, |(a, b)| bit(a) | bit(b))
+                }
                 TaskTerminator::BlockingNet { inputs, .. } => {
                     live |= inputs
                         .iter()
@@ -3245,11 +3291,15 @@ fn validate_ownership_and_plan(
                     client,
                     sql,
                     params,
+                    typed,
                     dst,
                     ..
                 } = block.terminator
                 {
-                    let required = bit(client) | bit(sql) | bit(params);
+                    let required = bit(client)
+                        | bit(sql)
+                        | bit(params)
+                        | typed.map_or(0, |(a, b)| bit(a) | bit(b));
                     if state.must & required != required || state.may & bit(dst) != 0 {
                         return Err(invalid(
                             "PgQuery reads an uninitialized operand or overwrites a live result",
@@ -3302,8 +3352,14 @@ fn validate_ownership_and_plan(
                         client,
                         sql,
                         params,
+                        typed,
                         ..
-                    } => bit(client) | bit(sql) | bit(params),
+                    } => {
+                        bit(client)
+                            | bit(sql)
+                            | bit(params)
+                            | typed.map_or(0, |(a, b)| bit(a) | bit(b))
+                    }
                     TaskTerminator::BlockingNet { inputs, .. } => inputs
                         .iter()
                         .flatten()
@@ -4085,12 +4141,17 @@ fn source_term_slots(term: &mut TaskTerminator, visit: &mut impl FnMut(&mut Slot
             client,
             sql,
             params,
+            typed,
             dst,
             ..
         } => {
             visit(client);
             visit(sql);
             visit(params);
+            if let Some((a, b)) = typed {
+                visit(a);
+                visit(b);
+            }
             visit(dst);
         }
         TaskTerminator::BlockingNet { inputs, dst, .. } => {
