@@ -5645,9 +5645,35 @@ static void ku_json_buffer_drop(KuJsonBuffer* buffer) {
   *buffer = (KuJsonBuffer){0};
 }
 
-static bool ku_json_buffer_append(
+/* Called only when the current capacity cannot hold a bounded write. Keep
+   growth/OOM handling together; callers acquire data pointers after this may
+   realloc, never before it. The existing 64-byte/doubling policy is unchanged. */
+static bool ku_json_buffer_reserve(
     KuJsonBuffer* buffer,
-    const uint8_t* bytes,
+    size_t needed,
+    size_t limit,
+    KuError* error,
+    const char* limit_message) {
+  if (needed > limit) {
+    return ku_json_fail(error, "stringify_error", limit_message);
+  }
+  size_t next = buffer->cap ? buffer->cap : 64;
+  while (next < needed) {
+    size_t grown = next > limit / 2 ? limit : next * 2;
+    if (grown <= next) {
+      return ku_json_fail(error, "stringify_error", limit_message);
+    }
+    next = grown;
+  }
+  uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);
+  if (!data) return ku_json_fail(error, "out_of_memory", "json allocation failed");
+  buffer->data = data;
+  buffer->cap = next;
+  return true;
+}
+
+static inline bool ku_json_buffer_prepare(
+    KuJsonBuffer* buffer,
     size_t len,
     size_t limit,
     KuError* error,
@@ -5656,32 +5682,52 @@ static bool ku_json_buffer_append(
     return ku_json_fail(error, "stringify_error", limit_message);
   }
   size_t needed = buffer->len + len;
-  if (needed > buffer->cap) {
-    size_t next = buffer->cap ? buffer->cap : 64;
-    while (next < needed) {
-      size_t grown = next > limit / 2 ? limit : next * 2;
-      if (grown <= next) {
-        return ku_json_fail(error, "stringify_error", limit_message);
-      }
-      next = grown;
-    }
-    uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);
-    if (!data) return ku_json_fail(error, "out_of_memory", "json allocation failed");
-    buffer->data = data;
-    buffer->cap = next;
-  }
+  return needed <= buffer->cap
+      || ku_json_buffer_reserve(buffer, needed, limit, error, limit_message);
+}
+
+static inline bool ku_json_buffer_append(
+    KuJsonBuffer* buffer,
+    const uint8_t* bytes,
+    size_t len,
+    size_t limit,
+    KuError* error,
+    const char* limit_message) {
+  if (!ku_json_buffer_prepare(buffer, len, limit, error, limit_message)) return false;
   if (len) memcpy(buffer->data + buffer->len, bytes, len);
-  buffer->len = needed;
+  buffer->len += len;
   return true;
 }
 
-static bool ku_json_buffer_byte(
+static inline bool ku_json_buffer_byte(
     KuJsonBuffer* buffer,
     uint8_t byte,
     size_t limit,
     KuError* error,
     const char* limit_message) {
-  return ku_json_buffer_append(buffer, &byte, 1, limit, error, limit_message);
+  if (!ku_json_buffer_prepare(buffer, 1, limit, error, limit_message)) return false;
+  buffer->data[buffer->len++] = byte;
+  return true;
+}
+
+/* Only fixed two- and six-byte escapes use this path. Ordinary long spans
+   retain bulk memcpy, while short writes avoid a dynamic-length copy call. */
+static inline bool ku_json_buffer_escape(
+    KuJsonBuffer* buffer,
+    const uint8_t* bytes,
+    size_t len,
+    KuError* error) {
+  if (!ku_json_buffer_prepare(buffer, len, KU_JSON_MAX_OUTPUT_BYTES, error,
+          "json.stringify output is too large")) return false;
+  uint8_t* out = buffer->data + buffer->len;
+  out[0] = bytes[0];
+  out[1] = bytes[1];
+  if (len == 6) {
+    out[2] = bytes[2]; out[3] = bytes[3];
+    out[4] = bytes[4]; out[5] = bytes[5];
+  }
+  buffer->len += len;
+  return true;
 }
 
 static KuString ku_json_buffer_take_string(KuJsonBuffer* buffer) {
@@ -6302,17 +6348,14 @@ static bool ku_json_write_string(
           "json.stringify output is too large")) return false;
     if (byte == '"' || byte == '\\') {
       uint8_t escaped[2] = { '\\', byte };
-      if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
-              error, "json.stringify output is too large")) return false;
+      if (!ku_json_buffer_escape(output, escaped, 2, error)) return false;
     } else if (byte == '\n' || byte == '\r' || byte == '\t') {
       uint8_t escaped[2] = { '\\', byte == '\n' ? 'n' : (byte == '\r' ? 'r' : 't') };
-      if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
-              error, "json.stringify output is too large")) return false;
+      if (!ku_json_buffer_escape(output, escaped, 2, error)) return false;
     } else {
       static const uint8_t hex[] = "0123456789abcdef";
       uint8_t escaped[6] = { '\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15] };
-      if (!ku_json_buffer_append(output, escaped, sizeof(escaped), KU_JSON_MAX_OUTPUT_BYTES,
-              error, "json.stringify output is too large")) return false;
+      if (!ku_json_buffer_escape(output, escaped, sizeof(escaped), error)) return false;
     }
     current++;
     span=current;
