@@ -1573,6 +1573,7 @@ typedef struct KuHttpQueue {
   KuHttpCondition not_empty;
   KuHttpWake* wake;
   int owner_work_pending; /* Only the matching event owner reads/writes this. */
+  unsigned int owner_inline_remaining;
 } KuHttpQueue;
 static int ku_http_queue_is_current_owner(const KuHttpQueue* queue);
 static void ku_http_queue_notify(KuHttpQueue* queue) {
@@ -1686,6 +1687,21 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
   ku_http_queue_notify(job->queue);
+}
+/* Only compiler-proven bounded work enters here, once, before any worker
+ * publication. Save every synchronous execution TLS field: a local request
+ * must not inherit or contaminate the event owner's surrounding native frame. */
+static void ku_http_job_run_owner(KuHttpServer* server,KuHttpJob* job) {
+  long depth=__ku_call_depth;
+  unsigned long long deadline=__ku_handler_deadline,cleanup=__ku_handler_cleanup_deadline;
+  int timed_out=__ku_handler_timed_out;unsigned long unwind=__ku_handler_unwind_depth;
+  KuSyncExitSignal signal=__ku_sync_return_signal;KuHttpFailure failure=ku_http_failure_current;
+  __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
+  __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
+  ku_http_job_run(server,job);
+  __ku_call_depth=depth;__ku_handler_deadline=deadline;__ku_handler_cleanup_deadline=cleanup;
+  __ku_handler_timed_out=timed_out;__ku_handler_unwind_depth=unwind;
+  __ku_sync_return_signal=signal;ku_http_failure_current=failure;
 }
 static int ku_http_queue_push(KuHttpQueue* queue, KuHttpJob* job) {
   int accepted = 0;
@@ -2220,6 +2236,12 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   connection->job = job;
   connection->phase = KU_HTTP_IO_JOB;
   connection->deadline = 0;
+  if(ku_http_queue_is_current_owner(queue) && queue->owner_inline_remaining
+      && job->input.route && job->input.route->status==200u
+      && ku_http_handler_is_short(job->input.route->invoke)) {
+    queue->owner_inline_remaining--;
+    ku_http_job_run_owner(server,job);return;
+  }
   if (!workers || !ku_http_queue_push(queue, job)) {
     ku_http_count_transport_close(connection,KU_HTTP_CLOSE_QUEUE_NOT_ADMITTED);
     ku_http_connection_close(connection);
@@ -3917,6 +3939,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   ku_http_mutex_unlock(&group->lock);
   ku_http_wake_notify(&group->wake);
   for (;;) {
+    queue.owner_inline_remaining=32u;
     ku_http_mutex_lock(&queue.lock);
     size_t queued = (size_t)queue.count, running = queue.running, resident = queue.resident;
     size_t queued_bytes=queue.queued_bytes, peak_queued_bytes=queue.peak_queued_bytes;

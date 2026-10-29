@@ -3603,9 +3603,17 @@ fn native_http_validates_unmaterialized_headers_and_owns_route_snapshot() {
         directory.path(),
         r#"
 import "std.http"
+fn ProofText(): HttpResponse { return http.text("owner".clone()) }
+fn ProofNumber(): HttpResponse { return http.text(str(40 + 2)) }
+fn ProofError(): HttpResponse! { return err("controlled") }
+fn ProofLong(): HttpResponse { i=0 while (i<1000) { i=i+1 } return http.text(str(i)) }
 fn main(): null! {
     app = http.server()
     app.get("/", fn() { return http.text("ok") })
+    app.get("/proof-text",ProofText)
+    app.get("/proof-number",ProofNumber)
+    app.get("/proof-error",ProofError)
+    app.get("/proof-long",ProofLong)
     app.listen("127.0.0.1:0")?
     return ok(null)
 }
@@ -3711,7 +3719,40 @@ int main(void) {
   CHECK(ku_http_poll(&item,1,0)==1 && (item.revents&KU_HTTP_POLL_READ));
   CHECK(ku_http_queue_take_owner_work(&queue)==1);
   ku_http_wake_drain(&wake);item.revents=0;CHECK(ku_http_poll(&item,1,0)==0);
-  ku_http_wake_close(&wake);ku_http_net_cleanup();
+  ku_http_wake_close(&wake);
+  CHECK(ku_http_handler_is_short((void*)ProofText__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofNumber__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofError__thunk));
+  CHECK(!ku_http_handler_is_short((void*)ProofLong__thunk));
+  /* Exercise real generated bodies and cleanup with a deliberately populated
+     outer TLS frame; every field must survive success, Result error and expiry. */
+  KuHttpWake local_wake={0};CHECK(ku_http_wake_init(&local_wake));
+  KuHttpQueue local_queue={0};CHECK(ku_http_queue_init(&local_queue,4,&local_wake));
+  void* invokes[]={(void*)ProofText__thunk,(void*)ProofNumber__thunk,(void*)ProofError__thunk};
+  for(int mode=0;mode<4;mode++) {
+    KuHttpInput local_input={0};local_input.budget=&budget;budget.limit=1048576;
+    CHECK(ku_http_parse_complete_header(server,plain,strlen(plain),&local_input)==0);
+    local_input.route->invoke=invokes[mode%3];local_input.route->returns_result=mode%3==2;
+    KuHttpJob* job=ku_http_job_new(&local_queue,&local_input);CHECK(job);
+    job->request_deadline=mode==3?1:ku_http_deadline_ms(3000u);
+    __ku_call_depth=7;__ku_handler_deadline=11;__ku_handler_cleanup_deadline=13;
+    __ku_handler_timed_out=1;__ku_handler_unwind_depth=3;
+    KuSyncExitSignal previous={0};previous.kind=KU_SYNC_EXIT_ARITHMETIC_FATAL;
+    previous.arithmetic_status=2;__ku_sync_return_signal=previous;
+    ku_http_job_run_owner(server,job);
+    CHECK(__ku_call_depth==7 && __ku_handler_deadline==11 && __ku_handler_cleanup_deadline==13);
+    CHECK(__ku_handler_timed_out==1 && __ku_handler_unwind_depth==3);
+    CHECK(__ku_sync_return_signal.kind==previous.kind && __ku_sync_return_signal.arithmetic_status==2);
+    CHECK(job->completed && ku_http_job_only_owner(job));
+    if(mode==0)CHECK(job->response.status==200 && job->response.body.len==5 && !memcmp(job->response.body.ptr,"owner",5));
+    if(mode==1)CHECK(job->response.status==200 && job->response.body.len==2 && !memcmp(job->response.body.ptr,"42",2));
+    if(mode==2)CHECK(job->response.status==500);
+    if(mode==3)CHECK(job->cancelled && !job->started && !job->response.body.ptr);
+    ku_http_job_release(job);CHECK(!budget.current);
+  }
+  __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
+  __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
+  ku_http_queue_free(&local_queue);ku_http_wake_close(&local_wake);ku_http_net_cleanup();
   ku_http_mutex_destroy(&budget.lock);ku_http_server_free(server);
   CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   puts("http-route-snapshot-owned-validation-budget-ok");return 0;
@@ -7057,7 +7098,7 @@ fn main(): null! {
     let gate_text = gate.to_str().expect("UTF-8 temporary gate path");
     let source = r#"
 import http from "std.http"
-fn held(): HttpResponse {return http.text("real-handler-complete")}
+fn held(req: HttpRequest): HttpResponse {return http.text("real-handler-complete")}
 fn main(): null! {
     app=http.server({max_connections:1,max_active_requests:1,max_pending_requests:2,
         idle_timeout_ms:5000,handler_timeout_ms:10000})

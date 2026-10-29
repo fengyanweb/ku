@@ -9,6 +9,8 @@ use output::COutput;
 mod checked_int;
 #[path = "c_database_budget.rs"]
 mod database_budget;
+#[path = "c_http_short.rs"]
+mod http_short;
 #[path = "c_service_output.rs"]
 mod service_output;
 #[path = "c_sync.rs"]
@@ -858,6 +860,9 @@ fn generate_c_source_with_frames_attempt(
             }
             out.push_str("  return NULL;\n}\n");
         }
+    }
+    if program_uses_http(program) {
+        http_short::emit(&mut out, program);
     }
     emit_http_runtime(&mut out, program)?;
     emit_pg_runtime(&mut out, program);
