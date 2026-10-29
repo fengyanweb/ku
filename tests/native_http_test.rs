@@ -7098,7 +7098,10 @@ fn main(): null! {
     let gate_text = gate.to_str().expect("UTF-8 temporary gate path");
     let source = r#"
 import http from "std.http"
-fn held(req: HttpRequest): HttpResponse {return http.text("real-handler-complete")}
+fn held(req: HttpRequest): HttpResponse {
+    if (req.method == "GET") { return http.text("real-handler-complete") }
+    return http.empty()
+}
 fn main(): null! {
     app=http.server({max_connections:1,max_active_requests:1,max_pending_requests:2,
         idle_timeout_ms:5000,handler_timeout_ms:10000})
