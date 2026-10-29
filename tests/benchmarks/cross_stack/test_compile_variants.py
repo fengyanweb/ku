@@ -2,13 +2,16 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+import types
 from unittest.mock import patch
 import batch
 import compile_variants
 import json_dense
+import profile_training
 from compile_variants import profile_input, native_flags
 from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
@@ -460,6 +463,120 @@ class ProfileReceiptTests(unittest.TestCase):
                 self.assertFalse(any('fast-math' in x or 'wrapv' in x or 'march=native' in x for x in flags))
                 if variant=='thin':
                     self.assertIn('-Wl,--thinlto-jobs=2',flags)
+
+
+class HttpProfileTrainingTests(unittest.TestCase):
+    """Synthetic transports and receipts only: no socket, service or compiler."""
+
+    def test_reserved_http_recipes_have_different_business_inputs_and_stable_batch(self):
+        train, held = (profile_training.http_recipe(mode) for mode in ('train', 'validate'))
+        for key in ('payload', 'cpu_units', 'seed', 'db_key', 'rid_prefix', 'ascii_json'):
+            self.assertNotEqual(train['input'][key], held['input'][key])
+        self.assertEqual(list(train['input']['payload']), ['counter','data'])
+        self.assertEqual(list(held['input']['payload']), ['data','counter'])
+        self.assertNotEqual(identity(train['input']), identity(held['input']))
+        self.assertEqual(train['seconds_per_workload'], 2)
+        self.assertEqual(plan('train')['kind'], 'serial_batch_compiler_train')
+
+    def test_explicit_error_contracts_rst_and_following_health_are_separate(self):
+        from urllib.parse import parse_qs, urlsplit
+        recipe = profile_training.http_recipe('train')
+        class Response:
+            def __init__(self, status, body): self.status,self.body = status,body
+            def begin(self): pass
+            def read(self, maximum): return self.body
+        for stack in ('ku','rust'):
+            expected_error=recipe['negative_expected_status']['invalid_json'][stack]
+            class Connection:
+                def __init__(self,*args,**kwargs): self.sock=self
+                def connect(self): pass
+                def sendall(self,value): pass
+                def setsockopt(self,*args): pass
+                def close(self): pass
+                def request(self,method,path,body=None,headers=None): self.path,self.body=path,body
+                def getresponse(self):
+                    path=urlsplit(self.path); query=parse_qs(path.query); rid=query['rid'][0]
+                    if self.body==b'{': return Response(expected_error,b'explicit handler error')
+                    if path.path=='/ok': value='ok:'+rid
+                    elif path.path=='/work':
+                        value=rid+':'+format(expected({'iterations':len(query['work'][0])*1000,'seed':len(query['seed'][0])}),'08d')
+                    elif path.path=='/db':
+                        key=int(query['key'][0]); value={'id':key,'score':key*17,'label':f'item-{key}-中文🙂','rid':rid}
+                    else:
+                        source=json.loads(self.body);value={'id':rid,'counter':source['counter']+1,'data':source['data']}
+                    return Response(200,json.dumps(value).encode() if isinstance(value,dict) else value.encode())
+            rows=[]
+            with patch.object(profile_training.http.client,'HTTPConnection',Connection), \
+                 patch.object(profile_training.http.client,'HTTPResponse',return_value=Response(400,b'framing')), \
+                 patch.object(profile_training.time,'sleep'):
+                profile_training.http_probes('never-contacted:1',recipe,stack,rows)
+            self.assertEqual(len(rows),8)
+            self.assertEqual([r['actual_status'] for r in rows if r.get('expected_negative')],[expected_error,400])
+            self.assertFalse(rows[-2]['correct'])
+            self.assertTrue(rows[-2]['request_fully_sent'])
+            self.assertTrue(rows[-1]['after_errors_and_cancel'])
+
+    def test_http_normal_exit_precedes_merge_and_use_requires_http_reserved_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);binary=root/'server';binary.write_bytes(b'\x7fELF'+bytes(60))
+            source=root/'source';source.write_text('frozen source')
+            build={'stack':'ku','variant':'generate','passed':True,'source_files_unchanged':True,
+                'source_fingerprint':'f'*64,'source_inputs':{str(source):compile_variants.digest(source)},
+                'executable_artifacts':{str(binary):{'sha256':compile_variants.digest(binary)}},
+                'compiler_version':'synthetic clang target=aarch64-linux','compiler_launcher_sha256':'c'*64}
+            build_path=root/'build.json';build_path.write_text(json.dumps(build))
+            manifest={'stacks':{'ku':{'command':[str(binary)],'compiler_variant':{
+                'stack':'ku','variant':'generate','receipt':str(build_path),'source_fingerprint':'f'*64}}},
+                'client':{'command':['not-executed-driver']}}
+            manifest_path=root/'manifest.json';manifest_path.write_text(json.dumps(manifest));trace=[]
+            class Harness:
+                def __init__(self,*args):
+                    self.manifest=copy.deepcopy(manifest);self.uid=os.getuid();self.gid=os.getgid()
+                    self.protocol=Path(profile_training.__file__).with_name('protocol.json')
+                    self.identity={};self.db_domain=types.SimpleNamespace(path=root/'owned-db');self.service=None
+                def start(self,*args,**kwargs):
+                    path=root/'private-service';path.mkdir()
+                    def stop():
+                        trace.append('normal-exit');path.rmdir()
+                        return {'forced':False,'cgroup_removed':True,'exit_code':0}
+                    self.service=types.SimpleNamespace(address='unused:1',startup={'command':[str(binary)]},
+                        domain=types.SimpleNamespace(path=path),metrics=lambda:{},stop=stop)
+                    return self.service
+                def client(self,service,kind,rate,duration,output,**kwargs):
+                    trace.append('driver-'+kind)
+                    return {'valid_driver':True,'ledger':{'planned_reconciled':True,'correct_total':20,
+                        'planned':20,'results':{'correct':20}},'configuration':{'workload':kind}}
+                def close(self):
+                    trace.append('close')
+                    if self.service and self.service.domain.path.exists(): self.service.stop()
+                    return []
+            def merge(spec,env,tools,output,stack,result):
+                self.assertIn('normal-exit',trace);trace.append('merge')
+                profile=output/'merged.profdata';profile.write_bytes(b'synthetic parsed profile')
+                result.update(profile_path=str(profile),profile_sha256=compile_variants.digest(profile),
+                              profile_bytes=profile.stat().st_size,profile_complete=True)
+            with patch.object(profile_training,'Harness',Harness),patch.object(profile_training,'http_probes'), \
+                 patch.object(profile_training,'quiet_metrics',return_value=True), \
+                 patch.object(profile_training,'merge_profile',side_effect=merge) as merger:
+                training=profile_training.run_http(manifest_path,root/'train','ku','train',root/'tools')
+                self.assertTrue(training['passed']);self.assertEqual(merger.call_count,1)
+                self.assertEqual(profile_input(root/'train/receipt.json','ku','f'*64)[0],(root/'train/merged.profdata').resolve())
+                manifest['stacks']['ku']['compiler_variant']['variant']='use'
+                manifest_path.write_text(json.dumps(manifest));build.update(variant='use',training_receipt=training)
+                build_path.write_text(json.dumps(build))
+                held=profile_training.run_http(manifest_path,root/'held','ku','validate',root/'tools')
+                self.assertTrue(held['passed']);self.assertFalse(held['profile_complete'])
+                self.assertEqual(merger.call_count,1)
+                broken={'valid_driver':True,'ledger':{'planned_reconciled':True,'correct_total':19,
+                    'planned':20,'results':{'correct':19,'server_error':1}},'configuration':{}}
+                with patch.object(Harness,'client',return_value=broken), self.assertRaisesRegex(ValueError,'not entirely correct'):
+                    profile_training.run_http(manifest_path,root/'failed','ku','validate',root/'tools')
+                failed=json.loads((root/'failed/receipt.json').read_text())
+                self.assertFalse(failed['passed']);self.assertFalse(failed['all_business_results_correct'])
+                self.assertFalse((root/'private-service').exists());self.assertEqual(merger.call_count,1)
+                build['training_receipt']['transport']='batch';build_path.write_text(json.dumps(build))
+                with self.assertRaisesRegex(ValueError,'not batch training'):
+                    profile_training.run_http(manifest_path,root/'wrong','ku','validate',root/'tools')
 
 
 if __name__=='__main__':
