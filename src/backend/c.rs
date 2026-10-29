@@ -5827,6 +5827,52 @@ static bool ku_json_parse_value(
     KuValue* value,
     KuError* error);
 
+/* A complete unescaped string already has its final byte length. Validate it
+   once with the ordinary scanner, then allocate exactly that owned payload.
+   Return 0 without moving the parser for escapes/errors/limit edges: replaying
+   the ordinary parser preserves an earlier prefix-allocation failure over a
+   later syntax error. A -1 result is the exact allocation's structured OOM. */
+static inline int ku_json_parse_unescaped_string(
+    KuJsonParser* parser, KuString* value, KuError* error) {
+  const uint8_t* start = parser->current;
+  const uint8_t* current = start;
+  const uint8_t* end = parser->end;
+  while (current < end) {
+    uint8_t byte = *current;
+    if (byte == '"') {
+      size_t len = (size_t)(current - start);
+      if (len == 0) {
+        *value = ku_string_static((const uint8_t*)"", 0);
+      } else {
+        uint8_t* owned = (uint8_t*)malloc(len);
+        if (!owned) {
+          /* The ordinary span append fails with current at this quote. */
+          parser->current = current;
+          ku_json_fail(error, "out_of_memory", "json allocation failed");
+          return -1;
+        }
+        memcpy(owned, start, len);
+        *value = (KuString){ owned, len, len, KU_STRING_OWNED };
+      }
+      parser->current = current + 1;
+      return 1;
+    }
+    size_t length = (size_t)(current - start);
+    if (byte < 0x20 || byte == '\\' || length >= KU_JSON_MAX_INPUT_BYTES) return 0;
+    if (byte < 0x80) {
+      size_t room = KU_JSON_MAX_INPUT_BYTES - length;
+      const uint8_t* scan_end = (size_t)(end - current) < room ? end : current + room;
+      const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
+      current = ascii == current ? current + 1 : ascii;
+    } else {
+      size_t width = ku_json_utf8_width(current, end);
+      if (!width || width > KU_JSON_MAX_INPUT_BYTES - length) return 0;
+      current += width;
+    }
+  }
+  return 0;
+}
+
 static bool ku_json_parse_string(
     KuJsonParser* parser,
     KuString* value,
@@ -5836,6 +5882,8 @@ static bool ku_json_parse_string(
     return ku_json_fail(error, "parse_error", "expected json string");
   }
   parser->current++;
+  int unescaped = ku_json_parse_unescaped_string(parser, value, error);
+  if (unescaped) return unescaped > 0;
   KuJsonBuffer buffer = {0};
   while (parser->current < parser->end) {
     uint8_t byte = *parser->current++;

@@ -5665,6 +5665,103 @@ int main(void) {
 }
 
 #[test]
+fn native_json_unescaped_strings_allocate_exact_owned_bytes_and_replay_errors() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-exact-owned"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        "import json from \"std.json\"\nfn main(): null! {\n    json.decode(\"\\\"\\\"\")?\n    return ok(null)\n}\n",
+    )
+    .expect("write exact JSON string fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    let reserve = "static bool ku_json_buffer_reserve(";
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static int ku_json_exact_fail = 0, ku_json_reserve_fail = 0;
+static size_t ku_json_exact_calls = 0, ku_json_exact_bytes = 0;
+static void* ku_json_exact_alloc(size_t len) {{
+  ku_json_exact_calls++; ku_json_exact_bytes += len;
+  return ku_json_exact_fail ? NULL : malloc(len);
+}}
+static void* ku_json_replay_realloc(void* value, size_t len) {{
+  return ku_json_reserve_fail ? NULL : realloc(value, len);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let exact = "uint8_t* owned = (uint8_t*)malloc(len);";
+    assert_eq!(generated.matches(exact).count(), 1);
+    let generated = generated.replacen(
+        exact,
+        "uint8_t* owned = (uint8_t*)ku_json_exact_alloc(len);",
+        1,
+    );
+    let reserve_allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(reserve_allocation).count(), 1);
+    let generated = generated.replacen(
+        reserve_allocation,
+        "uint8_t* data = (uint8_t*)ku_json_replay_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-exact-owned",
+        r#"
+static int json_exact_case(const uint8_t* body,size_t len) {
+  uint8_t* input=(uint8_t*)malloc(len+2);CHECK(input);
+  input[0]='"';if(len)memcpy(input+1,body,len);input[len+1]='"';
+  size_t calls=ku_json_exact_calls,bytes=ku_json_exact_bytes;
+  KuResult_kuvalue result=ku_json_parse(ku_string_static(input,len+2));
+  CHECK(result.ok && result.value.tag==KU_STR && result.value.as.s.len==len);
+  CHECK(ku_json_exact_calls-calls==(len?1:0) && ku_json_exact_bytes-bytes==len);
+  if(len) {
+    CHECK(result.value.as.s.storage==KU_STRING_OWNED && result.value.as.s.capacity==len);
+    CHECK(result.value.as.s.ptr!=input && !memcmp(result.value.as.s.ptr,body,len));
+  } else CHECK(result.value.as.s.storage==KU_STRING_STATIC && !result.value.as.s.capacity);
+  memset(input,0,len+2);free(input);
+  if(len)CHECK(!memcmp(result.value.as.s.ptr,body,len));
+  ku_value_drop(&result.value);ku_error_drop(&result.error);CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+static int json_exact_error(const uint8_t* input,size_t len,const char* code) {
+  KuResult_kuvalue result=ku_json_parse(ku_string_static(input,len));
+  CHECK(!result.ok && ku_string_equal(result.error.code,
+      ku_string_static((const uint8_t*)code,strlen(code))));
+  ku_value_drop(&result.value);ku_error_drop(&result.error);CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+int main(void) {
+  static const size_t lengths[]={0,1,7,8,15,16,31,32,63,64,65,1024};
+  uint8_t body[1024];memset(body,'x',sizeof(body));
+  for(size_t i=0;i<sizeof(lengths)/sizeof(lengths[0]);i++)CHECK(!json_exact_case(body,lengths[i]));
+  static const uint8_t unicode[]={0xe4,0xb8,0xad,0xe6,0x96,0x87,0xf0,0x9f,0x99,0x82};
+  CHECK(!json_exact_case(unicode,sizeof(unicode)));
+  ku_json_exact_fail=1;
+  CHECK(!json_exact_error((const uint8_t*)"\"valid\"",7,"out_of_memory"));
+  /* Fast-path rejection must replay valid-prefix allocations before a later
+     invalid UTF8, escape, C0 or missing quote can become the visible error. */
+  ku_json_reserve_fail=1;
+  static const uint8_t invalid_utf8[]={'"','a',0x80,'"'};
+  CHECK(!json_exact_error(invalid_utf8,sizeof(invalid_utf8),"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc\\x\"",7,"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc\n\"",6,"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc",4,"out_of_memory"));
+  ku_json_reserve_fail=0;
+  CHECK(!json_exact_error(invalid_utf8,sizeof(invalid_utf8),"parse_error"));
+  ku_json_exact_fail=0;
+  size_t calls=ku_json_exact_calls;
+  KuResult_kuvalue escaped=ku_json_parse(ku_string_static((const uint8_t*)"\"a\\u0000b\"",10));
+  CHECK(escaped.ok && escaped.value.as.s.len==3 && escaped.value.as.s.ptr[1]==0);
+  CHECK(ku_json_exact_calls==calls);
+  ku_value_drop(&escaped.value);ku_error_drop(&escaped.error);CHECK(NO_LIVE_ALLOCATIONS());
+  CHECK(!json_exact_case(body,65));return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn native_json_accepts_raw_del_and_c1_but_rejects_c0() {
     let dir = unique_temp_dir("json-raw-controls");
     fs::write(dir.join("legal.json"), [b'"', 0x7f, 0xc2, 0x85, b'"'])
