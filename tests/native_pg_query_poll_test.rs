@@ -1389,6 +1389,108 @@ static int ku_test_value(KuPgResult* result, const char* value) {
   if (read.ok) ku_string_drop(&read.value); else ku_error_drop(&read.error); return equal;
 }
 #define LIVE_CHECK(value) do { if (!(value)) { fprintf(stderr, "live PG check failed at line %d\n", __LINE__); return 1; } } while (0)
+static int ku_test_typed_live_idle(KuPgClient* pool) {
+  return pool && pool->conns[0] && !pool->in_use[0] && pool->active==0
+      && PQstatus(pool->conns[0])==KU_PG_CONNECTION_OK
+      && PQtransactionStatus(pool->conns[0])==KU_PQTRANS_IDLE
+      && ku_pg_connection_is_utf8(pool->conns[0]);
+}
+static int ku_test_typed_live_row(KuPgResult* row,const uint8_t* text,size_t length) {
+  if(!row || ku_pg_rows(row)!=1 || ku_pg_cols(row)!=10)return 0;
+  const int64_t integers[]={INT32_MIN,INT32_MAX,INT64_MIN,INT64_MAX};
+  for(size_t i=0;i<4u;i++) {
+    KuResult_int value=ku_pg_value_int(row,0,(int64_t)i);
+    if(!value.ok) {ku_error_drop(&value.error);return 0;}
+    if(value.value!=integers[i])return 0;
+  }
+  for(size_t i=4u;i<6u;i++) {
+    KuResult_bool value=ku_pg_value_bool(row,0,(int64_t)i);
+    if(!value.ok) {ku_error_drop(&value.error);return 0;}
+    if(value.value!=(i==4u))return 0;
+  }
+  for(size_t i=6u;i<8u;i++) {
+    KuResult_str value=ku_pg_value(row,0,(int64_t)i);
+    if(!value.ok) {ku_error_drop(&value.error);return 0;}
+    int valid=value.value.len==length && (!length || !memcmp(value.value.ptr,text,length));
+    ku_string_drop(&value.value);if(!valid)return 0;
+  }
+  KuResult_bool null_cell=ku_pg_is_null(row,0,8),empty_cell=ku_pg_is_null(row,0,9);
+  if(!null_cell.ok || !empty_cell.ok) {
+    if(!null_cell.ok)ku_error_drop(&null_cell.error);if(!empty_cell.ok)ku_error_drop(&empty_cell.error);return 0;
+  }
+  if(!null_cell.value || empty_cell.value)return 0;
+  KuResult_str empty=ku_pg_value(row,0,9);
+  if(!empty.ok) {ku_error_drop(&empty.error);return 0;}
+  int valid=empty.value.len==0;ku_string_drop(&empty.value);return valid;
+}
+static int ku_test_typed_live(KuPgClient** owned_pool) {
+  KuPgClient* pool=*owned_pool;LIVE_CHECK(ku_test_typed_live_idle(pool));
+  /* Both text OIDs bind real owned UTF8 bytes, including quotes and backslash.
+   * The parameter headers are read-only aliases; only this source owns them. */
+  static const uint8_t utf8[]="\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82 '\\\n";
+  KuString source=ku_string_alloc(sizeof(utf8)-1u);memcpy(source.ptr,utf8,sizeof(utf8)-1u);
+  KuValue values[]={ku_v_int(INT32_MIN),ku_v_int(INT32_MAX),ku_v_int(INT64_MIN),ku_v_int(INT64_MAX),
+      ku_v_bool(true),ku_v_bool(false),ku_v_str(source),ku_v_str(source),ku_v_null(),ku_v_str(ku_test_text(""))};
+  KuString types[]={ku_test_text("int4"),ku_test_text("int4"),ku_test_text("int8"),ku_test_text("int8"),
+      ku_test_text("bool"),ku_test_text("bool"),ku_test_text("text"),ku_test_text("varchar"),ku_test_text("text?"),ku_test_text("varchar")};
+  KuArray_str declared={10u,types};
+  KuResult_pg_result result=ku_pg_client_query_one_typed(pool,
+      ku_test_text("SELECT $1::int4,$2::int4,$3::int8,$4::int8,$5::bool,$6::bool,$7::text,$8::varchar,$9::text,$10::varchar"),
+      values,10u,declared,declared);
+  LIVE_CHECK(result.ok && ku_test_typed_live_idle(pool));
+  LIVE_CHECK(values[0].as.i==INT32_MIN && values[3].as.i==INT64_MAX
+      && values[6].as.s.ptr==source.ptr && values[7].as.s.ptr==source.ptr);
+  LIVE_CHECK(ku_test_typed_live_row(result.value,utf8,sizeof(utf8)-1u));
+  KuPgResult* retained=result.value;
+  ku_string_drop(&source); /* PQclear/reset and freeing input cannot invalidate the row. */
+  memset(values,0,sizeof(values));
+  KuString int4=ku_test_text("int4"),text=ku_test_text("text"),nullable=ku_test_text("text?");
+  KuArray_str one_int={1u,&int4},one_text={1u,&text},one_nullable={1u,&nullable},none={0};
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 1::int4 WHERE false"),NULL,0,none,one_int);
+  LIVE_CHECK(ku_test_code(result,"row_count_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT i::int4 FROM generate_series(1,2) AS i"),NULL,0,none,one_int);
+  LIVE_CHECK(ku_test_code(result,"row_count_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  /* Two preceding rows violate cardinality, then SQL fails: the later server
+   * error must be drained and win instead of returning the retained first row. */
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT (10/(3-i))::int4 FROM generate_series(1,3) AS i"),NULL,0,none,one_int);
+  LIVE_CHECK(ku_test_code(result,"query_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 1::numeric"),NULL,0,none,one_int);
+  LIVE_CHECK(ku_test_code(result,"typed_value_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT NULL::text"),NULL,0,none,one_text);
+  LIVE_CHECK(ku_test_code(result,"null_value") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT NULL::text"),NULL,0,none,one_nullable);
+  LIVE_CHECK(result.ok && ku_test_typed_live_idle(pool));
+  KuResult_bool is_null=ku_pg_is_null(result.value,0,0);LIVE_CHECK(is_null.ok && is_null.value);ku_drop_pg_result(&result.value);
+  static const uint8_t nul_bytes[]={'a',0,'b'},invalid_utf8[]={0xff};
+  for(size_t kind=0;kind<2u;kind++) {
+    KuString parameter_type=ku_test_text(kind?"varchar":"text");KuArray_str schema={1u,&parameter_type};
+    for(size_t invalid=0;invalid<2u;invalid++) {
+      const uint8_t* bytes=invalid?invalid_utf8:nul_bytes;size_t length=invalid?sizeof(invalid_utf8):sizeof(nul_bytes);
+      KuValue parameter=ku_v_str(ku_string_static(bytes,length));
+      result=ku_pg_client_query_one_typed(pool,ku_test_text(kind?"SELECT $1::varchar":"SELECT $1::text"),&parameter,1u,schema,schema);
+      LIVE_CHECK(ku_test_code(result,"typed_value_error") && ku_test_typed_live_idle(pool)
+          && parameter.tag==KU_STR && parameter.as.s.ptr==bytes && parameter.as.s.len==length);ku_error_drop(&result.error);
+    }
+  }
+  KuValue too_large=ku_v_int(INT64_MAX);
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT $1::int4"),&too_large,1u,one_int,one_int);
+  LIVE_CHECK(ku_test_code(result,"typed_value_error") && ku_test_typed_live_idle(pool));ku_error_drop(&result.error);
+  /* One original absolute D covers the real server wait; do not increase it
+   * between query, drain or reset. Termination is not a database rollback claim. */
+  unsigned long long started=__ku_handler_now_ms();__ku_handler_deadline=started+100u;
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 7::int4 FROM pg_sleep(2)"),NULL,0,none,one_int);
+  __ku_handler_deadline=0;
+  LIVE_CHECK(ku_test_code(result,"execution_unknown") && __ku_handler_now_ms()-started<1500u
+      && !pool->conns[0] && !pool->in_use[0] && pool->active==0);ku_error_drop(&result.error);
+  /* No SQL retry: this is a distinct next request after the discarded lease. */
+  result=ku_pg_client_query_one_typed(pool,ku_test_text("SELECT 8::int4"),NULL,0,none,one_int);
+  LIVE_CHECK(result.ok && ku_test_typed_live_idle(pool));
+  KuResult_int next=ku_pg_value_int(result.value,0,0);LIVE_CHECK(next.ok && next.value==8);ku_drop_pg_result(&result.value);
+  LIVE_CHECK(ku_test_typed_live_row(retained,utf8,sizeof(utf8)-1u));
+  ku_drop_pg_client(owned_pool);LIVE_CHECK(!*owned_pool);
+  LIVE_CHECK(ku_test_typed_live_row(retained,utf8,sizeof(utf8)-1u));
+  ku_drop_pg_result(&retained);LIVE_CHECK(!retained);return 0;
+}
 int main(void) {
   const char* path = getenv("KU_PG_TEST_CONNINFO_FILE");
   LIVE_CHECK(path != 0);
@@ -1458,7 +1560,7 @@ int main(void) {
   LIVE_CHECK(result.ok && ku_test_value(result.value, "5") && pool->conns[0] && !pool->in_use[0] && pool->active == 0); ku_drop_pg_result(&result.value);
   result = ku_pg_client_query(pool, ku_test_text("SELECT $1::text"), params);
   LIVE_CHECK(result.ok && ku_test_value(result.value, "x'; SELECT pg_sleep(999); --")); ku_drop_pg_result(&result.value);
-  ku_drop_pg_client(&pool); LIVE_CHECK(!pool);
+  LIVE_CHECK(!ku_test_typed_live(&pool) && !pool);
   puts("pg query live loopback closed loop");
   return 0;
 }
