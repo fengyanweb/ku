@@ -14574,8 +14574,8 @@ static int ku_pg_sql_has_explicit_session_control(
         "    PQfinish(h); return attempt;\n",
         "  }\n",
         "}\n",
-        r#"/* PG-only compact storage uses the original small capacities, not query
- * contents. A single owned block can replace header/cells/bytes allocations.
+        r#"/* PG-only compact storage uses validated first-row size classes, not query
+ * contents. One owned block contains the selected header/cells/bytes storage.
  * If a later row exceeds a compact region it moves to an external allocation;
  * the small original tail stays charged until the result itself is released. */
 typedef char KuPgResultCellAlignment[(sizeof(KuPgResult)%_Alignof(KuPgCell)==0)?1:-1];
@@ -14583,6 +14583,15 @@ static int ku_pg_result_is_inline(const KuPgResult* result,const void* pointer) 
   if(!result || !result->inline_storage || !pointer)return 0;
   uintptr_t base=(uintptr_t)(result+1),address=(uintptr_t)pointer;
   return address>=base && address-base<result->inline_storage;
+}
+/* First-row classes use only validated shape/bytes, never SQL or field names.
+ * Subsequent rows retain the existing bounded geometric growth policy. */
+static size_t ku_pg_result_first_capacity(size_t needed,size_t initial,size_t compact_limit,size_t limit) {
+  if(!needed || needed>limit || !initial || initial>compact_limit)return 0;
+  size_t capacity=needed<=compact_limit?initial:compact_limit;
+  if(capacity>limit)capacity=limit;
+  while(capacity<needed)capacity=capacity>limit/2u?limit:capacity*2u;
+  return capacity;
 }
 static KuPgResult* ku_pg_result_new(size_t columns,size_t cells,size_t bytes) {
   size_t tail=cells<=16u && bytes<=256u ? cells*sizeof(KuPgCell)+bytes:0;
@@ -14834,8 +14843,8 @@ static int ku_pg_result_append(KuPgResult** target, PGresult* source, unsigned l
   if (next_bytes >= KU_PG_NULL_CELL || next_bytes > SIZE_MAX) return -1;
   if (ku_pg_deadline_expired(deadline)) return -2;
   if (!*target) {
-    size_t cells=next_cells ? ku_pg_result_capacity(0,(size_t)next_cells,16,(size_t)KU_PG_MAX_RESULT_CELLS):0;
-    size_t bytes=next_bytes ? ku_pg_result_capacity(0,(size_t)next_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES):0;
+    size_t cells=ku_pg_result_first_capacity((size_t)next_cells,1u,16u,(size_t)KU_PG_MAX_RESULT_CELLS);
+    size_t bytes=ku_pg_result_first_capacity((size_t)next_bytes,16u,256u,(size_t)KU_PG_MAX_RESULT_BYTES);
     *target = ku_pg_result_new((size_t)cols,cells,bytes);
     if (!*target) return -3;
   }

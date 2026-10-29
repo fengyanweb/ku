@@ -421,8 +421,10 @@ static int ku_pg_async_materialize(KuPgAsyncOp* op,KuPgAsyncTurn* turn) {
     size_t previous=0;if(!ku_pg_result_owned_bytes(op->query.value,&previous))return -1;
     size_t cells=op->row_next_rows*(size_t)op->row_columns;
     size_t cc=op->query.value?op->query.value->cell_capacity:0,bc=op->query.value?op->query.value->bytes_capacity:0;
-    if(cells>cc)cc=ku_pg_result_capacity(cc,cells,16,(size_t)KU_PG_MAX_RESULT_CELLS);
-    if(op->row_bytes>bc)bc=ku_pg_result_capacity(bc,op->row_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES);
+    if(cells>cc)cc=op->query.value ? ku_pg_result_capacity(cc,cells,16,(size_t)KU_PG_MAX_RESULT_CELLS)
+        : ku_pg_result_first_capacity(cells,1u,16u,(size_t)KU_PG_MAX_RESULT_CELLS);
+    if(op->row_bytes>bc)bc=op->query.value ? ku_pg_result_capacity(bc,op->row_bytes,256,(size_t)KU_PG_MAX_RESULT_BYTES)
+        : ku_pg_result_first_capacity(op->row_bytes,16u,256u,(size_t)KU_PG_MAX_RESULT_BYTES);
     size_t predicted=0;
     if(!ku_pg_result_plan_bytes(op->query.value,cc,bc,&predicted))return -1;
     if(predicted<previous)return -3;

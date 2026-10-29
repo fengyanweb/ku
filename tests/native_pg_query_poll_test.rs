@@ -1015,6 +1015,42 @@ fn native_pg_compact_result_growth_oom_and_detached_lifetime_keep_physical_budge
 }
 
 #[test]
+fn native_pg_first_row_size_classes_cover_shapes_and_growth_without_leaking() {
+    let directory = TempDir::new("pg-first-row-classes");
+    let harness = query_stub_harness(&directory)
+        .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
+        .replacen("#define KU_PG_MAX_RESULT_ROWS 4ULL", "#define KU_PG_MAX_RESULT_ROWS 64ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_COLS 4ULL", "#define KU_PG_MAX_RESULT_COLS 32ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_CELLS 8ULL", "#define KU_PG_MAX_RESULT_CELLS 4096ULL", 1)
+        .replacen("#define KU_PG_MAX_RESULT_BYTES 16ULL", "#define KU_PG_MAX_RESULT_BYTES 1048576ULL", 1)
+        .replacen("enum {\n  T_OK", "static int first_class_columns,first_class_rows,first_class_large,first_class_changed;static char first_class_bytes[1025];\nenum {\n  T_FIRST_CLASS,T_OK", 1)
+        .replacen("switch (conn->mode) {", "switch (conn->mode) {\n    case T_FIRST_CLASS: conn->total=first_class_rows+1;break;", 1)
+        .replacen("int PQnfields(const PGresult* result) {", "int PQnfields(const PGresult* result) { if(result->mode==T_FIRST_CLASS)return first_class_columns+(first_class_changed && result->number>1);", 1)
+        .replacen("int PQgetisnull(const PGresult* result, int row, int column) {", "int PQgetisnull(const PGresult* result, int row, int column) { if(result->mode==T_FIRST_CLASS)return !first_class_large && column%3==0;", 1)
+        .replacen("char* PQgetvalue(const PGresult* result, int row, int column) {", "char* PQgetvalue(const PGresult* result, int row, int column) { if(result->mode==T_FIRST_CLASS)return first_class_large?first_class_bytes:column%3==1?\"\":\"\\xe4\\xb8\\xad\\xe6\\x96\\x87\\xf0\\x9f\\x99\\x82\";", 1)
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_sequential_tests(void) {")
+        + ASYNC_FIRST_CLASS_SUITE;
+    let source = directory.path().join("pg-first-row-classes.c");
+    fs::write(&source, harness).expect("write first-row PG class harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "pg-first-row-classes")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("PG first-row class harness exceeded bounds");
+    assert!(
+        output.status.success(),
+        "PG first-row class harness failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg first-row size classes and physical ownership closed loop\n"
+    );
+}
+
+#[test]
 fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() {
     let directory = TempDir::new("async-query-large-row");
     let harness=query_stub_harness(&directory)
@@ -2994,13 +3030,13 @@ int main(void) {
   CHECK(async_finish(op,0) && op->output.ok && reset_sends==before_resets+1 && !live_results);
   KuResult_pg_result detached=ku_pg_async_take(op);CHECK(detached.ok && detached.value);
   size_t charge=0;CHECK(ku_pg_result_owned_bytes(detached.value,&charge));
-  CHECK(detached.value->inline_storage==16u*sizeof(KuPgCell)+256u);
-  CHECK(ku_pg_result_is_inline(detached.value,detached.value->cells)
+  CHECK(detached.value->inline_storage==4u*sizeof(KuPgCell)+16u);
+  CHECK(!ku_pg_result_is_inline(detached.value,detached.value->cells)
       && ku_pg_result_is_inline(detached.value,detached.value->bytes));
   CHECK(budget.bytes==op->input_charge+charge);
   ku_pg_async_dispose(op,1);CHECK(budget.bytes==charge);
   ku_pg_client_close_owned(opened.value);
-  CHECK(!live_connections && !live_results && runtime_bytes==charge && live_runtime_allocations==1);
+  CHECK(!live_connections && !live_results && runtime_bytes==charge && live_runtime_allocations==2);
   /* Values must outlive PQclear, strict reset, operation disposal and pool close. */
   KuResult_bool null=ku_pg_is_null(detached.value,0,0);CHECK(null.ok && null.value);
   KuResult_str empty=ku_pg_value(detached.value,0,1);CHECK(empty.ok && !empty.value.len);ku_string_drop(&empty.value);
@@ -3249,5 +3285,52 @@ int main(void) {
       && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
   ku_pg_client_close_owned(pool);CHECK(!live_connections && !live_results && !bad_calls);
   puts("pg async shared turns closed loop");return 0;
+}
+"#;
+
+const ASYNC_FIRST_CLASS_SUITE: &str = r#"
+int main(void) {
+  clock_ms=1000;clock_step=0;track_runtime_allocations=1;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* pool=opened.value;AsyncBudget budget={0};
+  const int columns[]={0,1,2,15,16,17};const size_t capacities[]={0,1,2,16,16,32};
+  for(size_t i=0;i<sizeof(columns)/sizeof(columns[0]);i++) {
+    CHECK(ku_pg_result_first_capacity((size_t)columns[i],1u,16u,4096u)==capacities[i]);
+    for(size_t j=0;j<4u;j++) {
+      const int rows[]={0,1,2,7};first_class_columns=columns[i];first_class_rows=rows[j];
+      mode_on_send=T_FIRST_CLASS;
+      size_t baseline_bytes=runtime_bytes;int baseline_live=live_runtime_allocations;
+      KuPgAsyncOp* op=async_create(pool,&budget);CHECK(async_finish(op,0) && op->output.ok);
+      KuPgResult* result=op->output.value;
+      CHECK(result->rows==(size_t)first_class_rows && result->cols==(size_t)first_class_columns
+          && result->bytes_len==(size_t)first_class_rows*((size_t)first_class_columns/3u)*10u);
+      if(first_class_rows==1)CHECK(result->cell_capacity==capacities[i]);
+      for(size_t row=0;row<result->rows;row++)for(size_t col=0;col<result->cols;col++) {
+        KuPgCell cell=result->cells[row*result->cols+col];
+        if(col%3u==0)CHECK(cell.len==KU_PG_NULL_CELL);
+        else if(col%3u==1)CHECK(!cell.len);
+        else CHECK(cell.len==10u && !memcmp(result->bytes+cell.offset,"\xe4\xb8\xad\xe6\x96\x87\xf0\x9f\x99\x82",10u));
+      }
+      size_t physical=0;CHECK(ku_pg_result_owned_bytes(result,&physical)
+          && budget.bytes==op->input_charge+physical);
+      async_drop_output(op,&budget,1);
+      CHECK(!budget.bytes && runtime_bytes==baseline_bytes && live_runtime_allocations==baseline_live && !live_results);
+    }
+  }
+  CHECK(!ku_pg_result_first_capacity(4097u,1u,16u,4096u));
+  CHECK(ku_pg_result_first_capacity(1u,16u,256u,1048576u)==16u
+      && ku_pg_result_first_capacity(17u,16u,256u,1048576u)==32u
+      && ku_pg_result_first_capacity(257u,16u,256u,1048576u)==512u);
+  first_class_columns=1;first_class_rows=2;first_class_large=1;memset(first_class_bytes,'x',1024u);
+  mode_on_send=T_FIRST_CLASS;KuPgAsyncOp* op=async_create(pool,&budget);
+  CHECK(async_finish(op,0) && op->output.ok && op->output.value->rows==2u
+      && op->output.value->bytes_len==2048u && !op->output.value->inline_storage);
+  async_drop_output(op,&budget,1);first_class_large=0;
+  first_class_columns=15;first_class_rows=2;first_class_changed=1;
+  op=async_create(pool,&budget);CHECK(async_finish(op,0) && !op->output.ok);
+  async_drop_output(op,&budget,0);first_class_changed=0;
+  ku_pg_client_close_owned(pool);
+  CHECK(!budget.bytes && !live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  puts("pg first-row size classes and physical ownership closed loop");return 0;
 }
 "#;
