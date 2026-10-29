@@ -18,6 +18,7 @@ from linux_harness import (arrival_cpu, business_send_end, measurement_clock, qu
                            paired_capacity_goodput, declared_case_stacks, sustained_case,
                            benchmark_limits, cases, GIB, MIB, java_shutdown_receipt,
                            service_termination_succeeded, JAVA_SHUTDOWN_PREFIX, JAVA_SHUTDOWN_STAGES)
+from linux_harness import result_assessment
 
 
 def clock(origin=100_000_000_000, uncertainty=1000):
@@ -43,6 +44,89 @@ class DispatchGateTest(unittest.TestCase):
         legacy = generation_gate(driver, cost, 0, 1_000_000_000)
         self.assertFalse(legacy["passed"])
         self.assertIn("legacy", legacy["basis"])
+
+
+class AssessmentQualityTest(unittest.TestCase):
+    policy = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
+    environment = {'quality': 'pass', 'evidence': 'control-three-windows.json'}
+
+    def report(self):
+        return {'valid_driver': True, 'configuration': clock(), 'ledger': {
+            'planned': 1000, 'attempted': 1000, 'planned_reconciled': True,
+            'all_scheduled_to_terminal': True, 'failure_fraction_planned': 0,
+            'results': {'correct': 1000}, 'http_500_total': 0,
+            'scheduled_to_attempt': {'count': 1000, 'p99_ms': 1, 'p999_ms': 4, 'max_ms': 8},
+            'correct_scheduled_to_complete': {'count': 1000, 'p99_ms': 1}},
+            'service_cost': {'before': {'memory_events': {}}, 'after': {'memory_events': {}}}}
+
+    def test_accounting_is_not_arrival_quality_and_lateness_is_not_its_own_cause(self):
+        r = self.report()
+        r['ledger']['scheduled_to_attempt']['p99_ms'] = 338
+        r['assessment'] = a = result_assessment(r, self.policy, self.environment)
+        self.assertTrue(r['valid_driver'])
+        self.assertTrue(a['functional_valid'])
+        self.assertTrue(a['accounting_valid'])
+        self.assertEqual(a['arrival_schedule_quality'], 'fail')
+        self.assertFalse(a['measurement_invalid'])
+        self.assertFalse(a['candidate_accepted'])
+        self.assertFalse(qualification(r, 'json_object')['eligible_for_formal_candidate'])
+
+    def test_http500_survives_simultaneous_driver_and_observer_failure(self):
+        r = self.report()
+        r['valid_driver'] = False
+        r['ledger']['results'] = {'correct': 999, 'server_error': 1}
+        r['ledger']['http_500_total'] = 1
+        r['service_cost']['sampler_error'] = 'independently recorded observer exception'
+        a = result_assessment(r, self.policy, self.environment)
+        self.assertFalse(a['functional_valid'])
+        self.assertFalse(a['accounting_valid'])
+        self.assertTrue(a['measurement_invalid'])
+        self.assertEqual(a['failed_request_outcomes'], {'server_error': 1})
+        gate = qualification(r, 'json_object')
+        self.assertEqual(upper_point(500, r, gate, 'kept/client.json')['gate_kind'],
+                         'service_or_slo_failure')
+        self.assertEqual(overload_boundary(r, 'json_object')['status'],
+                         'service_fault_without_capacity_attribution')
+
+    def test_missing_histogram_or_qualification_evidence_is_unknown(self):
+        r = self.report()
+        del r['ledger']['scheduled_to_attempt']
+        a = result_assessment(r, self.policy, {'quality': 'pass'})
+        self.assertEqual(a['arrival_schedule_quality'], 'unknown')
+        self.assertEqual(a['environment_quality'], 'unknown')
+        self.assertFalse(a['measurement_invalid'])
+        self.assertEqual(result_assessment(self.report())['arrival_schedule_quality'], 'unknown')
+
+    def test_failed_request_is_not_removed_when_its_delay_source_is_unknown(self):
+        r = self.report()
+        r['ledger']['results'] = {'correct': 999, 'timeout': 1}
+        r['ledger']['scheduled_to_attempt']['max_ms'] = 500
+        a = result_assessment(r, self.policy, self.environment)
+        self.assertFalse(a['functional_valid'])
+        self.assertEqual(a['failed_request_outcomes'], {'timeout': 1})
+        self.assertFalse(a['measurement_invalid'])
+
+    def test_expected_rejection_is_separate_from_correct_goodput(self):
+        r = self.report()
+        r['ledger']['results'] = {'correct': 990, 'rejected_503': 10}
+        a = result_assessment(r, self.policy, self.environment)
+        self.assertTrue(a['functional_valid'])
+        self.assertFalse(a['candidate_accepted'])
+
+    def test_oom_and_unfrozen_policy_are_never_accepted(self):
+        r = self.report()
+        r['service_cost']['after']['memory_events']['oom_kill'] = 1
+        a = result_assessment(r, self.policy, self.environment)
+        self.assertFalse(a['functional_valid'])
+        self.assertEqual(a['environment_quality'], 'fail')
+        self.assertFalse(result_assessment(self.report())['policy_registered'])
+
+    def test_thresholds_are_validated_not_silently_widened(self):
+        for value in (-1, float('nan'), float('inf'), True):
+            policy = copy.deepcopy(self.policy)
+            policy['arrival_limits_ms']['max_ms'] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                result_assessment(self.report(), policy, self.environment)
 
 
 class QuietMetricsTest(unittest.TestCase):

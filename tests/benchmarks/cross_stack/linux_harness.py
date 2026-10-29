@@ -346,7 +346,7 @@ def overload_boundary(report, workload):
     if any(reason in gate['reasons'] for reason in ('oom','oom_kill')):
         evidence.append('service_memory_limit')
     fault=any(reason in gate['reasons'] for reason in ('http_500','wrong_body','service_exited'))
-    return {'status':'measurement_invalid_censored' if censored else ('service_fault_without_capacity_attribution' if fault else ('boundary_observed' if evidence else 'pressure_below_observed_boundary')),
+    return {'status':'service_fault_without_capacity_attribution' if fault else ('measurement_invalid_censored' if censored else ('boundary_observed' if evidence else 'pressure_below_observed_boundary')),
             'boundary_observed':bool(evidence) and not censored and not fault,'evidence':evidence,'qualification':gate,
             'http_500_count':report['ledger'].get('http_500_total',report['ledger'].get('transport_counts',{}).get('status:500',0)),
             'note':'unknown500 is a defect observation, never expected503; no claim of true overload without boundary evidence'}
@@ -831,7 +831,10 @@ class Harness:
             if existing.name in ('events.csv.gz', 'client.log', 'resources.json'):
                 existing.rename(existing.with_name(existing.name + '.interrupted-' + str(time.time_ns())))
         os.chown(output, self.uid, self.gid)
-        domain = Domain(self, 'driver', 3, GIB, self.manifest.get('driver_cpuset', '4-6'))
+        driver_cores = self.manifest.get('driver_cores', 3)
+        if type(driver_cores) is not int or driver_cores < 1:
+            raise ValueError('driver_cores must be a positive integer')
+        domain = Domain(self, 'driver', driver_cores, GIB, self.manifest.get('driver_cpuset', '4-6'))
         spec = self.manifest['client']
         replacements = {'root': self.root}
         command = [template(x, replacements) for x in spec['command']]
@@ -842,7 +845,7 @@ class Harness:
             command += ['--events', str(output / 'events.csv.gz')]
         env = os.environ.copy()
         env.update({k: str(v) for k, v in spec.get('env', {}).items()})
-        env.setdefault('GOMAXPROCS', '3')
+        env.setdefault('GOMAXPROCS', str(driver_cores))
         domains = [service.domain, domain] + ([self.db_domain] if self.db_domain else [])
         sampler = Sampler(domains, output / 'resources.json').start()
         runtime_stop = threading.Event()
@@ -902,11 +905,11 @@ class Harness:
         if first_driver:
             elapsed=(driver_after['monotonic_ns']-first_driver['monotonic_ns'])/1e9
             driver_cpu=(driver_after['cpu_stat'].get('usage_usec',0)-first_driver['cpu_stat'].get('usage_usec',0))/1e6
-            fraction=driver_cpu/(3*elapsed) if elapsed>0 else None
+            fraction=driver_cpu/(driver_cores*elapsed) if elapsed>0 else None
         else:
             elapsed=driver_cpu=fraction=None
         result['service_cost']['driver_headroom']={'domain_cpu_seconds':driver_cpu,
-            'domain_lifetime_seconds':elapsed,'quota_cores':3,'fraction_of_quota':fraction,
+            'domain_lifetime_seconds':elapsed,'quota_cores':driver_cores,'fraction_of_quota':fraction,
             'saturated':fraction is not None and fraction>=.9,
             'gate':'average whole-driver CPU >=90% of its quota censors server capacity; bursts and queueing still require raw-evidence review'}
         if runtime_metrics:
@@ -935,6 +938,9 @@ class Harness:
             per_interval.append({'label':label,'total':throttle_delta(observations[0],observations[-1]) if observations else None,
                 'maximum_interval_throttled_usec':max((d['throttled_usec'] for d in deltas),default=None)})
         result['service_cost']['all_domain_throttling']=per_interval
+        result['assessment'] = result_assessment(
+            result, self.manifest.get('quality_policy'),
+            self.manifest.get('environment_qualification'))
         write_json(report, result)
         return result
     def close(self):
@@ -946,6 +952,96 @@ class Harness:
                 except Exception as error:
                     results.append({'error': repr(error), 'stack': service.stack})
         return results
+
+def result_assessment(result, policy=None, environment=None):
+    """Independent outcome axes; schedule failure alone never proves its cause.
+
+    valid_driver keeps its original preparation/accounting meaning. An explicit
+    policy is required for arrival thresholds, and environment pass requires a
+    referenced qualification record. Even a confirmed observer fault must not
+    erase HTTP500, wrong bodies, crashes or other failed request outcomes.
+    Acceptance is a later paired-window decision, never inferred here.
+    """
+    ledger = result.get('ledger', {})
+    cost = result.get('service_cost', {})
+    reasons = []
+    outcomes = ledger.get('results')
+    allowed = {'correct', 'planned_reset', 'rejected_503', 'rejected_429'}
+    known = isinstance(outcomes, dict) and bool(outcomes)
+    failures = ({key: value for key, value in outcomes.items()
+                 if type(value) is int and value > 0 and key not in allowed}
+                if known else {})
+    functional = known and not failures and not cost.get('service_exited', False)
+    if ledger.get('http_500_total', ledger.get('transport_counts', {}).get('status:500', 0)):
+        functional = False
+        reasons.append('http_500')
+    if failures:
+        reasons.extend('request_outcome:' + key for key in sorted(failures))
+    if not known:
+        reasons.append('functional_evidence_missing')
+    if cost.get('service_exited'):
+        reasons.append('service_exited')
+    accounting = (result.get('valid_driver') is True and
+                  ledger.get('planned_reconciled') is True and
+                  ledger.get('all_scheduled_to_terminal', True) is True)
+    if not accounting:
+        reasons.append('accounting_or_preparation_failed')
+
+    arrival = 'unknown'
+    if policy is None:
+        reasons.append('arrival_thresholds_not_frozen')
+    else:
+        thresholds = policy.get('arrival_limits_ms', {})
+        if set(thresholds) != {'p99_ms', 'p999_ms', 'max_ms'} or any(
+                type(v) not in (int, float) or not math.isfinite(v) or v < 0
+                for v in thresholds.values()):
+            raise ValueError('quality policy requires finite nonnegative p99/p999/max thresholds')
+        hist = ledger.get('scheduled_to_attempt', {})
+        attempted = ledger.get('attempted')
+        complete = (type(attempted) is int and attempted > 0 and
+                    hist.get('count') == attempted and attempted == ledger.get('planned') and
+                    all(type(hist.get(k)) in (int, float) and math.isfinite(hist[k])
+                        and hist[k] >= 0 for k in thresholds))
+        if complete:
+            exceeded = [key for key, limit in thresholds.items() if hist[key] > limit]
+            arrival = 'fail' if exceeded else 'pass'
+            reasons.extend('arrival_limit:' + key for key in exceeded)
+        else:
+            reasons.append('arrival_histogram_incomplete')
+
+    env = 'unknown'
+    independent = False
+    if environment is not None:
+        if environment.get('quality') not in ('pass', 'fail', 'unknown'):
+            raise ValueError('environment quality must be pass,fail or unknown')
+        if environment.get('evidence'):
+            env = environment['quality']
+            independent = (environment.get('measurement_fault_confirmed') is True)
+        else:
+            reasons.append('environment_evidence_missing')
+    if not cost.get('before') or not cost.get('after'):
+        env = 'unknown'
+        reasons.append('resource_endpoints_missing')
+    collector_fault = bool(cost.get('sampler_overflow') or cost.get('sampler_error'))
+    if collector_fault:
+        env = 'fail'
+        reasons.append('resource_observation_invalid')
+    if any(sample.get('frozen') is True for sample in (cost.get('before', {}), cost.get('after', {}))):
+        env = 'fail'
+        reasons.append('unexpected_service_freeze')
+    before, after = cost.get('before', {}), cost.get('after', {})
+    for name in ('oom', 'oom_kill'):
+        if after.get('memory_events', {}).get(name, 0) > before.get('memory_events', {}).get(name, 0):
+            functional, env = False, 'fail'
+            reasons.append(name)
+    return {'functional_valid': bool(functional), 'accounting_valid': accounting,
+            'arrival_schedule_quality': arrival, 'environment_quality': env,
+            'policy_registered': policy is not None,
+            'candidate_accepted': False, 'failed_request_outcomes': failures,
+            'measurement_invalid': independent or collector_fault,
+            'reasons': list(dict.fromkeys(reasons)),
+            'basis': 'quality relative to frozen policy; unknown cause is not an external-fault finding'}
+
 
 def qualification(result, workload):
     """Small-tail samples stay explicit, never silently treated as p99 evidence."""
@@ -973,6 +1069,11 @@ def qualification(result, workload):
         reasons.append('resource_endpoints_missing')
     if cost.get('sampler_overflow') or cost.get('sampler_error'):
         reasons.append('resource_observation_invalid')
+    assessment = result.get('assessment')
+    if assessment is not None and assessment.get('policy_registered') is True:
+        for key in ('arrival_schedule_quality', 'environment_quality'):
+            if assessment.get(key) != 'pass':
+                reasons.append(key + ':' + str(assessment.get(key, 'unknown')))
     before, after = cost.get('before', {}), cost.get('after', {})
     for name in ('oom', 'oom_kill'):
         if after.get('memory_events', {}).get(name, 0) > before.get('memory_events', {}).get(name, 0):
@@ -1032,7 +1133,9 @@ def derive_verified_rates(state, summaries, stacks=STACKS):
 
 def upper_point(rate, result, gate, report):
     reasons=gate.get('reasons',[])
-    if result.get('valid_driver') is not True or any(reason in reasons for reason in
+    if any(reason in reasons for reason in ('http_500', 'wrong_body', 'service_exited', 'oom', 'oom_kill')):
+        kind,censored='service_or_slo_failure',False
+    elif result.get('valid_driver') is not True or any(reason in reasons for reason in
             ('invalid_driver_or_not_started','unreconciled_plan','driver_cpu_saturated')):
         kind,censored='driver_invalid_censored',True
     elif any(reason in reasons for reason in ('resource_endpoints_missing','resource_observation_invalid',
