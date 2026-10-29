@@ -113,6 +113,11 @@ jobs:
       - name: Verify native HTTP async TCP owner waits under sanitizers
         run: cargo test --locked --test native_http_test native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker -- --exact --nocapture --test-threads=1
 
+      - name: Verify JSON UTF-8 boundaries and reactor fd ownership under sanitizers
+        run: |
+          cargo test --locked --test native_run_test native_json_raw_utf8_boundaries_reject_invalid_bytes_and_release_buffers -- --exact --nocapture --test-threads=1
+          cargo test --locked --test native_http_test native_http_persistent_owner_rejects_recycled_events_and_indexes_idle_deadlines -- --exact --nocapture --test-threads=1
+
       - name: Verify scheduler probe rows and actual cancellation reclamation under sanitizers
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 

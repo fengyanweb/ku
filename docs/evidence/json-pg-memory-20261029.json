@@ -1,0 +1,950 @@
+{
+  "schema": "ku-json-pg-memory-continuation-v1",
+  "date": "2026-10-29",
+  "product_commit": "93a0a77",
+  "retained_backend_change": "first256 to64 only; oldJSON/PG/reactor restored",
+  "default_modes": "helpers/text/async/int C11O2",
+  "dense": {
+    "samples": 7212,
+    "lost_samples": 0,
+    "event": "cpu-clock F497 dwarf8192 16M",
+    "top20_self": [
+      {
+        "symbol": "ku_json_write_string",
+        "self_samples": 1188,
+        "fraction": 0.16472545757071547
+      },
+      {
+        "symbol": "ku_json_utf8_scalar",
+        "self_samples": 1088,
+        "fraction": 0.15085967831392125
+      },
+      {
+        "symbol": "ku_json_buffer_append",
+        "self_samples": 907,
+        "fraction": 0.12576261785912368
+      },
+      {
+        "symbol": "__memcpy_generic",
+        "self_samples": 657,
+        "fraction": 0.0910981697171381
+      },
+      {
+        "symbol": "ku_json_parse_string",
+        "self_samples": 615,
+        "fraction": 0.08527454242928452
+      },
+      {
+        "symbol": "ku_json_parse_value",
+        "self_samples": 400,
+        "fraction": 0.05546311702717693
+      },
+      {
+        "symbol": "ku_json_write_value",
+        "self_samples": 303,
+        "fraction": 0.04201331114808652
+      },
+      {
+        "symbol": "_int_malloc",
+        "self_samples": 206,
+        "fraction": 0.028563505268996116
+      },
+      {
+        "symbol": "memcpy@plt",
+        "self_samples": 126,
+        "fraction": 0.01747088186356073
+      },
+      {
+        "symbol": "encode",
+        "self_samples": 121,
+        "fraction": 0.01677759290072102
+      },
+      {
+        "symbol": "_int_free",
+        "self_samples": 116,
+        "fraction": 0.01608430393788131
+      },
+      {
+        "symbol": "__GI___libc_malloc",
+        "self_samples": 105,
+        "fraction": 0.014559068219633943
+      },
+      {
+        "symbol": "__GI___libc_realloc",
+        "self_samples": 105,
+        "fraction": 0.014559068219633943
+      },
+      {
+        "symbol": "__GI___libc_free",
+        "self_samples": 102,
+        "fraction": 0.014143094841930116
+      },
+      {
+        "symbol": "ku_value_array_try_push_owned",
+        "self_samples": 87,
+        "fraction": 0.012063227953410981
+      },
+      {
+        "symbol": "__GI___memcmpeq",
+        "self_samples": 84,
+        "fraction": 0.011647254575707155
+      },
+      {
+        "symbol": "__libc_calloc",
+        "self_samples": 79,
+        "fraction": 0.010953965612867444
+      },
+      {
+        "symbol": "ku_value_drop",
+        "self_samples": 76,
+        "fraction": 0.010537992235163616
+      },
+      {
+        "symbol": "ku_object_try_set_owned",
+        "self_samples": 73,
+        "fraction": 0.010122018857459789
+      },
+      {
+        "symbol": "ku_obj_hash",
+        "self_samples": 65,
+        "fraction": 0.009012756516916251
+      }
+    ],
+    "unknown_self_samples": 0,
+    "exclusive_callchain_buckets": {
+      "other_or_unattributed": 1003,
+      "decode_chain_inclusive_exclusive_bucket": 2559,
+      "encode_chain_inclusive_exclusive_bucket": 3304,
+      "owned_request_copy_wrapper": 47,
+      "owned_cleanup_without_parse_or_write_frame": 230,
+      "diagnostic_correctness_comparison": 69
+    },
+    "utf8_self_origin": {
+      "parser": 563,
+      "writer": 525
+    },
+    "append_self_origin": {
+      "encode_chain_inclusive_exclusive_bucket": 670,
+      "decode_chain_inclusive_exclusive_bucket": 237
+    },
+    "limits": "dense 80% object/10% array/10% escape; wrapper owned input preparation and full output memcmp included; phase chain buckets are approximate with incomplete unwinding, never sum overlapping inclusive functions; not HTTP attribution or score"
+  },
+  "JSON_confirmation": {
+    "rows": [
+      {
+        "group": 1,
+        "tag": "A",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 239.8248,
+        "full_lifecycle_cpu_us": 239.8336,
+        "memory": {
+          "steady_median_bytes": 4839424.0,
+          "observed_peak_bytes": 5345280,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 417.391942,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 4.233015814933333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.78,
+          "p95_ms": 1.88,
+          "p999_ms": 371.2,
+          "p99_ms": 144,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 489.935377,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 6.113249208133333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.16,
+          "p95_ms": 5.4,
+          "p999_ms": 427.52,
+          "p99_ms": 227.84,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 1,
+        "tag": "B",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 123.59253333333334,
+        "full_lifecycle_cpu_us": 123.603,
+        "memory": {
+          "steady_median_bytes": 4263936.0,
+          "observed_peak_bytes": 4739072,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 26.723366,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.7204462617999999,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.68,
+          "p95_ms": 1.14,
+          "p999_ms": 9.6,
+          "p99_ms": 1.63,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 33.573332,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 1.0484865981333333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.97,
+          "p95_ms": 1.6,
+          "p999_ms": 16.16,
+          "p99_ms": 4.06,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 1,
+        "tag": "R",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 97.74453333333332,
+        "full_lifecycle_cpu_us": 97.76400000000001,
+        "memory": {
+          "steady_median_bytes": 1376256.0,
+          "observed_peak_bytes": 2211840,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 53.602464,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.6843315860666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.65,
+          "p95_ms": 1.2,
+          "p999_ms": 27.84,
+          "p99_ms": 1.28,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 55.234536,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.9153088569333333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.85,
+          "p95_ms": 1.43,
+          "p999_ms": 29.28,
+          "p99_ms": 2,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 2,
+        "tag": "B",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 241.51726666666664,
+        "full_lifecycle_cpu_us": 241.54153333333335,
+        "memory": {
+          "steady_median_bytes": 4796416,
+          "observed_peak_bytes": 5066752,
+          "sample_count": 28,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 319.373043,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 3.546054037,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.8,
+          "p95_ms": 3.46,
+          "p999_ms": 234.24,
+          "p99_ms": 113.92,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 377.378429,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 5.3188057928,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.13,
+          "p95_ms": 9,
+          "p999_ms": 312.32,
+          "p99_ms": 146.56,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 2,
+        "tag": "R",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 97.14546666666666,
+        "full_lifecycle_cpu_us": 97.15926666666667,
+        "memory": {
+          "steady_median_bytes": 1961984.0,
+          "observed_peak_bytes": 2490368,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 56.214969,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.6648491066666666,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.7,
+          "p95_ms": 1.13,
+          "p999_ms": 26.72,
+          "p99_ms": 1.23,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 59.659574,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.9002341841333333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.88,
+          "p95_ms": 1.37,
+          "p999_ms": 28.64,
+          "p99_ms": 1.92,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 2,
+        "tag": "A",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 228.59413333333333,
+        "full_lifecycle_cpu_us": 228.60173333333333,
+        "memory": {
+          "steady_median_bytes": 4300800.0,
+          "observed_peak_bytes": 5238784,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 442.979219,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 5.599160064133333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.65,
+          "p95_ms": 1.9,
+          "p999_ms": 404.48,
+          "p99_ms": 224,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 558.048335,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 8.220364558266667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.13,
+          "p95_ms": 5.48,
+          "p999_ms": 491.52,
+          "p99_ms": 340.48,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 3,
+        "tag": "R",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 103.34366666666666,
+        "full_lifecycle_cpu_us": 103.39240000000001,
+        "memory": {
+          "steady_median_bytes": 1298432.0,
+          "observed_peak_bytes": 1683456,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 9.175936,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.6068150106000001,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.64,
+          "p95_ms": 1.18,
+          "p999_ms": 1.38,
+          "p99_ms": 1.26,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 9.955495,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.8456440112666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.86,
+          "p95_ms": 1.43,
+          "p999_ms": 2.72,
+          "p99_ms": 1.59,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 3,
+        "tag": "A",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 141.64306666666664,
+        "full_lifecycle_cpu_us": 141.65,
+        "memory": {
+          "steady_median_bytes": 4122624.0,
+          "observed_peak_bytes": 4681728,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 85.617519,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.7814935298,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.7,
+          "p95_ms": 1.13,
+          "p999_ms": 46.72,
+          "p99_ms": 2.45,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 92.854044,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 1.1836578890666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.94,
+          "p95_ms": 1.51,
+          "p999_ms": 63.04,
+          "p99_ms": 7.8,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 3,
+        "tag": "B",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 241.83373333333333,
+        "full_lifecycle_cpu_us": 241.8402,
+        "memory": {
+          "steady_median_bytes": 4866048,
+          "observed_peak_bytes": 5431296,
+          "sample_count": 28,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 609.117916,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 6.7146563504,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.67,
+          "p95_ms": 2.92,
+          "p999_ms": 547.84,
+          "p99_ms": 248.32,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 657.221605,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 9.499851524,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.08,
+          "p95_ms": 8.16,
+          "p999_ms": 624.64,
+          "p99_ms": 366.08,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 4,
+        "tag": "A",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 119.39633333333333,
+        "full_lifecycle_cpu_us": 119.42533333333334,
+        "memory": {
+          "steady_median_bytes": 4085760.0,
+          "observed_peak_bytes": 4694016,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 21.349877,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.5434893364666666,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.57,
+          "p95_ms": 1.11,
+          "p999_ms": 3.3,
+          "p99_ms": 1.17,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 23.977572,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.8072424208,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.8,
+          "p95_ms": 1.4,
+          "p999_ms": 5.44,
+          "p99_ms": 1.62,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 4,
+        "tag": "R",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 102.54366666666667,
+        "full_lifecycle_cpu_us": 102.58026666666667,
+        "memory": {
+          "steady_median_bytes": 1742848.0,
+          "observed_peak_bytes": 2281472,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 52.090704,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.648979223,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.65,
+          "p95_ms": 1.18,
+          "p999_ms": 25.6,
+          "p99_ms": 1.27,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 55.259621,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.8815724638,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.84,
+          "p95_ms": 1.42,
+          "p999_ms": 29.92,
+          "p99_ms": 1.93,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 4,
+        "tag": "B",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 232.37786666666665,
+        "full_lifecycle_cpu_us": 232.38913333333335,
+        "memory": {
+          "steady_median_bytes": 4198400.0,
+          "observed_peak_bytes": 4661248,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 60.682637,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 1.0572342679333333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.71,
+          "p95_ms": 1.97,
+          "p999_ms": 39.68,
+          "p99_ms": 12.4,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 97.229252,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 2.223300892666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.04,
+          "p95_ms": 8.52,
+          "p999_ms": 64.64,
+          "p99_ms": 31.52,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 5,
+        "tag": "B",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 499.4842,
+        "full_lifecycle_cpu_us": 499.49806666666666,
+        "memory": {
+          "steady_median_bytes": 5122048.0,
+          "observed_peak_bytes": 5738496,
+          "sample_count": 27,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 1023.338129,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 11.8438676262,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.83,
+          "p95_ms": 16.56,
+          "p999_ms": 532.48,
+          "p99_ms": 337.92,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 1197.56436,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 19.740239434533333,
+          "minimum_resolution_us": 10,
+          "p50_ms": 2.02,
+          "p95_ms": 44.16,
+          "p999_ms": 921.6,
+          "p99_ms": 481.28,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 5,
+        "tag": "A",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 147.4384,
+        "full_lifecycle_cpu_us": 147.46159999999998,
+        "memory": {
+          "steady_median_bytes": 4300800.0,
+          "observed_peak_bytes": 4653056,
+          "sample_count": 29,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 22.294124,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 0.6847575206666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.68,
+          "p95_ms": 1.23,
+          "p999_ms": 9.36,
+          "p99_ms": 2.29,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 44.660102,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 1.1261190028666668,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.97,
+          "p95_ms": 2.12,
+          "p999_ms": 20.8,
+          "p99_ms": 6.72,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      },
+      {
+        "group": 5,
+        "tag": "R",
+        "correct": 15000,
+        "valid_driver": true,
+        "cpu_us": 351.17313333333334,
+        "full_lifecycle_cpu_us": 351.19773333333336,
+        "memory": {
+          "steady_median_bytes": 2543616,
+          "observed_peak_bytes": 3129344,
+          "sample_count": 28,
+          "scope": "whole service cgroup current memory sampled within arrival window; steady middle60%; peak is observed not exact allocation highwater"
+        },
+        "send_delay": {
+          "count": 15000,
+          "max_ms": 80.985033,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 1.7891675244666667,
+          "minimum_resolution_us": 10,
+          "p50_ms": 0.77,
+          "p95_ms": 5.92,
+          "p999_ms": 55.36,
+          "p99_ms": 26.4,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        },
+        "latency": {
+          "count": 15000,
+          "max_ms": 87.781885,
+          "maximum_relative_bucket_width": 0.0078125,
+          "mean_ms": 3.7417362656666664,
+          "minimum_resolution_us": 10,
+          "p50_ms": 1.57,
+          "p95_ms": 13.68,
+          "p999_ms": 76.48,
+          "p99_ms": 42.56,
+          "quantiles": "conservative upper bucket edge; never averaged across rounds",
+          "representation": "v5-fixed-log128"
+        }
+      }
+    ],
+    "cpu_ratios_descriptive_only": {
+      "B/A": {
+        "status": "estimated",
+        "unit": "paired interleaved window",
+        "pairs": [
+          [
+            123.59253333333334,
+            239.8248
+          ],
+          [
+            241.51726666666664,
+            228.59413333333333
+          ],
+          [
+            241.83373333333333,
+            141.64306666666664
+          ],
+          [
+            232.37786666666665,
+            119.39633333333333
+          ],
+          [
+            499.4842,
+            147.4384
+          ]
+        ],
+        "ratios": [
+          0.5153450908051767,
+          1.0565330927127905,
+          1.7073460708277994,
+          1.946273056961548,
+          3.3877483749145405
+        ],
+        "estimate": 1.4370886014279904,
+        "lower95": 0.792810001156122,
+        "upper95": 2.4019505513991044,
+        "seed": 20261028,
+        "resamples": 20000,
+        "method": "paired-window percentile bootstrap of geometric mean ratio",
+        "assumption": "windows approximate independent stationary replicates; serial dependence or common drift can invalidate coverage"
+      },
+      "B/R": {
+        "status": "estimated",
+        "unit": "paired interleaved window",
+        "pairs": [
+          [
+            123.59253333333334,
+            97.74453333333332
+          ],
+          [
+            241.51726666666664,
+            97.14546666666666
+          ],
+          [
+            241.83373333333333,
+            103.34366666666666
+          ],
+          [
+            232.37786666666665,
+            102.54366666666667
+          ],
+          [
+            499.4842,
+            351.17313333333334
+          ]
+        ],
+        "ratios": [
+          1.2644444565697794,
+          2.486140372307646,
+          2.3400924423686664,
+          2.266135727543713,
+          1.4223303339264564
+        ],
+        "estimate": 1.8836012128437618,
+        "lower95": 1.464153302229157,
+        "upper95": 2.382103611896136,
+        "seed": 20261028,
+        "resamples": 20000,
+        "method": "paired-window percentile bootstrap of geometric mean ratio",
+        "assumption": "windows approximate independent stationary replicates; serial dependence or common drift can invalidate coverage"
+      },
+      "A/R": {
+        "status": "estimated",
+        "unit": "paired interleaved window",
+        "pairs": [
+          [
+            239.8248,
+            97.74453333333332
+          ],
+          [
+            228.59413333333333,
+            97.14546666666666
+          ],
+          [
+            141.64306666666664,
+            103.34366666666666
+          ],
+          [
+            119.39633333333333,
+            102.54366666666667
+          ],
+          [
+            147.4384,
+            351.17313333333334
+          ]
+        ],
+        "ratios": [
+          2.4535878562347566,
+          2.353111690921244,
+          1.3706022946092487,
+          1.1643462459895133,
+          0.4198453298534417
+        ],
+        "estimate": 1.3107063899693348,
+        "lower95": 0.7267725801396738,
+        "upper95": 2.1476324279424204,
+        "seed": 20261028,
+        "resamples": 20000,
+        "method": "paired-window percentile bootstrap of geometric mean ratio",
+        "assumption": "windows approximate independent stationary replicates; serial dependence or common drift can invalidate coverage"
+      }
+    },
+    "candidate_accepted": false,
+    "width_reverted": "93a0a77",
+    "stationarity_warning": true
+  },
+  "pg_decision": {
+    "experiment_commit": "dec9a47234663347d5228dc193ce1cce75184b86",
+    "withdrawn_commit": "27d9d5762549a2061eec70b5930e5e73829670ac",
+    "retained_branch": "codex/v0.0.19-pg-notify-experiment",
+    "correct_each": 6000,
+    "driver_valid_each": true,
+    "service_errors_each": 0,
+    "normal_exit_and_quiescence_each": true,
+    "baseline_cpu_us": 301.6135,
+    "candidate_cpu_us": 316.0018333333333,
+    "ratio": 1.0477045401924427,
+    "conclusion": "No end-to-end gain shown in one cheap screen; withdraw, not a claim of stable regression.",
+    "mechanism": "Normal async notification count4 to1 proved; not CPU share or cause of89acquire_timeout.",
+    "duplicate_favorable_screen_run": false
+  },
+  "bitmap": {
+    "reverted": "710a288",
+    "http500": 89,
+    "full_retained_snapshots": 12,
+    "root_cause": "unknown; first CONNECT and later ACQUIRE differ; no complete thread witness"
+  },
+  "fixed_memory": {
+    "connection_size_before": 1112,
+    "after": 920,
+    "capacity": 4096,
+    "same_threads": 23,
+    "correct_connections": 3000,
+    "current_before": 7426048,
+    "current_after": 6918144,
+    "anon_before": 6270976,
+    "anon_after": 5697536,
+    "RSS_before": 12636160,
+    "RSS_after": 12062720
+  },
+  "final_native_functional": {
+    "final_product_commit": "93a0a77",
+    "CLI_sha256": "0dceb82115c23d8a038dc337a4777198113a7796c0d8b1af97a88e93bcc612ad",
+    "binary_sha256": "facc8146d1115e178a40da4381d60dcdea170cbba2cb8e78cb87e7a1c070fc9b",
+    "generated_c_sha256": "0b7e77b231464f8aafea1639d40cd089f5fd13e86af43a5c3f5e9310487d728f",
+    "text_sha256": "362561015cf9f91363449cf113dceb36a1b3ffe5525423b5de1d24642d493bff",
+    "same_text_as_memory_screen_M": true,
+    "cases": [
+      {
+        "workload": "ok",
+        "correct": 200,
+        "expected": 200,
+        "results": {
+          "correct": 200
+        },
+        "valid_driver": true
+      },
+      {
+        "workload": "json_object",
+        "correct": 200,
+        "expected": 200,
+        "results": {
+          "correct": 200
+        },
+        "valid_driver": true
+      },
+      {
+        "workload": "db",
+        "correct": 100,
+        "expected": 100,
+        "results": {
+          "correct": 100
+        },
+        "valid_driver": true
+      },
+      {
+        "workload": "cpu",
+        "correct": 20,
+        "expected": 20,
+        "results": {
+          "correct": 20
+        },
+        "valid_driver": true
+      }
+    ],
+    "quiet": true,
+    "scope": "functional normal CLI smoke only, not a score or replacement for aborted confirmation"
+  },
+  "remaining": [
+    "JSON/PG CPU parity",
+    "PG default and same-reset final paired comparisons",
+    "4path memory vsRust goals",
+    "stable tail/full acceptance"
+  ],
+  "scope": "development branch only,no main runtime merge,no deployment,no production DB or schema migration; pausedValue/AST unchanged; raw evidence delivered as private local portable archive"
+}

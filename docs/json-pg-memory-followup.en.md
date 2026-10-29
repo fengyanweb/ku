@@ -1,75 +1,115 @@
-# Post-0.0.19: JSON, PostgreSQL and fixed memory
+# 0.0.19 continuation: JSON, PostgreSQL and fixed memory
 
 [简体中文](json-pg-memory-followup.md) · 2026-10-29
 
-**Performance targets remain incomplete.** One reproduced startup-configuration bug is fixed. A PostgreSQL protocol experiment showed no service CPU benefit and was reverted. JSON keeps the old implementation. Paused Value/AST work, release tags and website deployment remain unchanged.
+**One same-capacity fixed-memory improvement is retained. JSON and PostgreSQL CPU-parity targets remain unpassed.** Three CPU candidates were withdrawn because end-to-end evidence did not support adoption. Runtime work stays on `codex/v0.0.19-json-pg-memory`: no runtime merge to main, release, website deployment or production-database operation.
 
-## Scope and identities
+## Outcomes
 
-The relevant runtime paths in frozen `d8c33bca3c629ce82d0d35709c6931f16c86d05b` and release `73e9f2fef6861b0bc1ce441471726b926a8a174b` match. A is built through the ordinary Release CLI: helpers/text/async/int, C11 O2. No withdrawn A3/A4, direct/O3 or yyjson experiment was enabled.
-
-Development stays on `codex/v0.0.19-json-pg-memory`, away from main. Existing dirty source in the primary checkout is preserved. Website-only [PR #9](https://github.com/fengyanweb/ku/pull/9) merged as `6aedaf4b0c4e68612c49a23a8607f0c9901bb4ff`; its source SHA inventory matches the retained 930-page build/link/asset/mobile/example checks. It was not deployed.
-
-## JSON cost ledger
-
-The JSON route is synchronous HTTP. Its actual path transfers body ownership, decodes, reads the scalar counter, takes the data subtree, releases the remaining root, builds the envelope, encodes, moves into http.text, and releases owned data. Subtree take, UTF8 spans, integer formatting and body transfer were already implemented.
-
-The existing allocation hook measures the actual generated Transform using a 1,048-byte object and a 32-byte owned RID. The HTTP driver's RID length is recorded separately; this is a mechanism fixture, not the whole HTTP process allocation ledger.
-
-| Stage | Allocation/reallocation calls | Requested bytes | Explicit memcpy bytes |
-| --- | ---: | ---: | ---: |
-| Decode | 28 | 7,800 | 892 |
-| Counter, take, remaining-root cleanup | 0 | 0 | 0 |
-| Envelope including owned RID read | 3 | 696 | 32 |
-| Encode | 4: first allocation plus three growths | 3,264 | 1,087 |
-| Total | 35 | 11,760 | 2,011 |
-
-Peak tracked payload is 8,152 bytes; object, array and escaped variants finish with zero live tracked allocations. Requested bytes include the full new realloc request. Copy counts exclude libc relocation, struct assignments, HTTP projection and transport. These figures are neither RSS nor proof of process-wide leak absence.
-
-Normal and symbol-bearing profile ELF `.text` SHA is `b5aacdd91c550ae738b4f137fd82beefb424b18b69d5f6afd23f58dd2a9a5d68`; generated C SHA is `d2456e0c438a221d950f3f01744193f0af74cd4c6bf144404a996695719a5073`. Ordinary A ELF SHA is `d1e0b719e542172a6806c0398f87e28bc533b4ca743dd342581b2151910eed56`, profile ELF `c2f7d6b55cc8390d7ad29d0942fae8506a2315e201d74b98c6a8e9ab63283170`. An early objcopy dump rewrote normal ELF metadata; the ordinary CLI restored the original binary before A/B screening. Earlier captured text was identical.
-
-The low-overhead profile has 95 SELF samples and no loss: kernel 45, Ku 26, libc 24. Only nine captured stacks are inside JSON, insufficient for ranking small candidates; unresolved libc/callers remain unknown. The first collection lost 11.42%; the second after-control had an invalid driver and timeouts. Both failed attempts are preserved. Before/sample figures were not selected as a valid pair. JSON was not patched from this evidence.
-
-## PostgreSQL: rejected protocol experiment
-
-Commit `f2ff379` tried simple query for constant DISCARD ALL while retaining parameterized business SQL, exclusive lease, original deadline, terminal-NULL drain, IDLE/UTF8 checks, eviction and owned result lifetime. Rust defaults use deadpool-postgres Fast without this reset. Rust's explicit equal-reset mode must remain a separate comparison.
-
-One ordinary CLI Release screen used 200 requests/s, five-second warmup and ten-second measurement. Service, driver and private database had separate resource domains; A exited and its domain was removed before B started.
-
-| Metric | Original A | Candidate B |
-| --- | ---: | ---: |
-| Correct / planned | 2,000 / 2,000 | 2,000 / 2,000 |
-| Service CPU µs/correct | 317.843 | 319.273 |
-| PG CPU µs/correct, separate sampled boundary | 294.115 | 286.603 |
-| Steady median service memory.current bytes | 4,085,760 | 4,044,800 |
-| Scheduled-to-complete p99 bucket ceiling ms | 3.14 | 2.86 |
-| Maximum send delay ms | 7.957292 | 8.743190 |
-| Supplemental post-driver CPU seconds | 0.000117 | 0.000149 |
-
-Both drivers were valid with zero errors, quiet resource counters, normal exit and successful domain removal. B/A=1.00450 did not show service CPU improvement. One pair cannot establish significance, stable memory savings or a Rust ranking. `bee69ea` restores the original extended-reset default; the experiment remains in history and on `codex/v0.0.19-pg-reset-experiment`. It was not repeatedly rerun for a favorable score.
-
-Reused regression command: 21 passed, one opt-in live test not enabled there. The existing LIVE_LOOPBACK fixture then passed separately against the candidate's ordinary generated C and private PostgreSQL, covering parameters, owned Unicode/NULL, multiple results, errors, timeout eviction and later queries. Protocol-call counts come from the existing stub and are not claimed as a live wire trace. Business SQL is never automatically retried.
-
-A separate PG profile has 1,142 on-CPU samples and zero loss. Its CPU cost was materially above the controls, so it is diagnostic only. Query/reset CPU, pool waits and extra state-machine progression cannot be uniquely attributed from totals. Database CPU and poll counts are not service CPU attribution.
-
-## Fixed resources and retained bug fix
-
-The 23 threads are main 1, output 1, event loops 4, synchronous HTTP workers 16, and one Task background worker. The external Task driver creates no additional pool. JSON/ordinary routes need the handler pool; disabling it would change capability. Sleeping threads do not establish busy polling.
-
-An idle sample has memory.current 3,448,832 bytes: anon 2,211,840 and kernel 974,848, including kernel_stack 360,448, pagetables 204,800 and slab 369,576. Do not add included kernel components twice; kernel counters may update in batches. RSS is 8,368 KiB and PSS 4,002 KiB under different accounting. Guest pswpin/out deltas were zero and service smaps Swap was zero during the first attempt, despite substantial host swapping. This does not attribute a particular delay to Ku swap-out. Reserved capacities, allocator retention and resident bytes remain distinct; no speculative pool trimming or memory-saving claim was made.
-
-**Fix `b8f3497`:** explicit two event loops with an omitted blocking-thread count previously defaulted to two and then deducted the Task background worker, rejecting startup. HTTP now includes that reservation in its implicit default under the existing total budget. Explicitly insufficient counts still fail; ordinary Task-root behavior and benchmark B17 are unchanged. Six configuration combinations and existing startup-failure, pure-native 200/404/405, mixed async/file/deadline/shutdown checks passed across seven test functions. Format and diff checks passed. No production database migration was needed.
-
-## Remaining work and evidence boundaries
-
-| Goal | Status | Next required evidence |
+| Area | Confirmed | Boundary |
 | --- | --- | --- |
-| JSON CPU/memory at or below Rust | Not established; no new default optimization | Sufficient stable on-CPU samples before selecting a candidate |
-| PG default and equal-reset parity | Not established; protocol candidate reverted | Dynamic query/reset, libpq/Task/reactor cost supporting a new candidate |
-| Fixed-memory reduction | Not established; audit and startup fix completed | Actual resident structure/allocator attribution with equal capabilities |
-| Final five-group A/B/R and shared-path guards | Not started | An environment without the demonstrated driver failure; screening is not acceptance |
-| Necessary CI | Inspect actual development commit checks | Main's separate macOS fixture-precondition failure must not be labeled success |
+| JSON profile | Actual generated handler,7212 cpu-clock SELF samples,zero loss,zero unresolved SELF symbols; string writing,UTF8,append/copy are major items | Dense execution is not HTTP scoring; inclusive stacks overlap; not every phase is attributed |
+| JSON candidate | Removing unused scalar computation removes real O2 work; one cheap A/U pair was146.180→138.814 us/correct | Five groups did not confirm benefit; width candidate reverted in93a0a77. Old JSON implementation and engine remain, necessary raw-byte regression retained |
+| PostgreSQL | Bitmap reduces empty-table scanning; normal async signaling demonstrably wakes4 waiters for one released connection | Bitmap screen had89 HTTP500 errors; single-notify screen301.614→316.002 us/correct showed no gain. Both reverted; neither a proven stable regression nor a fix for89timeouts |
+| Fixed memory | ab051e8 reduces status-line buffer256→64B/connection. Same4096capacity,23threads and3000correct connected requests: current−507904B,anon/RSS−573440B after high water and close | Local resident saving, not all-workload or Rust-memory parity; capacity was not reduced |
+| Metrics fixture | Added accept/header/first-body/stage/error witnesses; retain result and join before asserting | Original100ms deadline,40ms wait,400ms bound unchanged; historic main failure still not uniquely reconstructed |
+| Rust gap | One prearranged five-group JSON comparison retained in full | Nonstationarity and send delays prevent stable ranking. Final PG normal/strict-reset comparison was not completed; historical scores do not fill the gap |
 
-Website main [CI](https://github.com/fengyanweb/ku/actions/runs/40828377118) passed Windows/Linux suites, lint, sanitizer and package/PG checks. Its one macOS lib failure asserts that the slow body was never exercised; evidence upload subsequently failed because expected files were absent. Error-return and the 400ms upper-bound assertions had passed. Accept/header/first-byte detail was not retained, so the exact precondition failure remains unknown. No product deadline bug is established and no unrelated product refactor was added.
+Final product source93a0a77 differs fromc9ce1dc in the backend only by the status-line buffer. PG,reactor and JSON runtime experiments are restored. Paused generic Value copy/drop and AST work, withdrawn A3/A4 and yyjson remain untouched. No longer timeout, lower check cadence or SQL retry.
 
-Local evidence is under `/Users/mac/Documents/Ku/实施/JSON_PG_后续_2026-10-28/`: plan, allocation ledger, profile/PC analyses, host time series and `raw/` request/perf/C/ELF/window/checksum records. Compressed originals retain their decompressed SHA. Raw stack dumps remain private rather than being uploaded unreviewed to Git; database connection details are excluded. Temporary scripts, probes and duplicate build products are removed after verification. Existing source, tests, dirty work and necessary failure evidence are preserved. Historical scores, structural counts and short screens are not presented as final performance or production acceptance.
+## JSON CPU evidence and bounded experiments
+
+The dense harness called the actual generated `encode(KuStruct___ku_http_request)` fromc9ce1dc C corresponding to the normal CLI. It legally created/transferred an owned body,query map and RID on every iteration and used normal cleanup. Twenty varying cases cover objects,arrays,escaping,Unicode/emoji,NUL and numeric boundaries;16-byte HTTP RID and32-byte diagnostic RID are separate. There were1,783,808 complete output comparisons,15.003814 thread-CPU seconds and15.552275 wall seconds. cpu-clock497Hz,DWARF8192 produced7212samples and0lost. Matching libc6-dbg2.39-0ubuntu8.9 resolved SELF symbols without upgrading libc.
+
+Logical SELF uses the first rendered frame per sample,possibly inline; denominator7212:
+
+| Function | Samples | Fraction |
+| --- | ---: | ---: |
+| ku_json_write_string |1188|16.4725%|
+| ku_json_utf8_scalar |1088|15.0860%|
+| ku_json_buffer_append |907|12.5763%|
+| __memcpy_generic |657|9.1098%|
+| ku_json_parse_string |615|8.5275%|
+| ku_json_parse_value |400|5.5463%|
+| ku_json_write_value |303|4.2013%|
+| _int_malloc |206|2.8564%|
+| memcpy@plt |126|1.7471%|
+| encode |121|1.6778%|
+
+First non-inline physical-frame attribution is different,including1204 write_string,1044 append and480 parse_value; it cannot be added to this table. Raw perf,captured chains,PC→generated C/DWARF mappings and disassembly are preserved. Resolved symbols do not establish complete attribution. Dense loops alter cache locality,allocator reuse and scheduling; their CPU cannot be subtracted from HTTP CPU.
+
+The existing allocation ledger remains:decode28/35 allocation calls and7800requested bytes;encode4 calls and3264requested bytes. These are neither CPU fractions nor resident memory. The width-only experiment retained all legal-byte boundaries,invalid-byte errors,OOM precedence and cleanup. Its cheap HTTP pair had15000correct responses each and no errors,about5.04% lower CPU at one point,but264192B higher median memory. Five-group results did not support adoption; the old scalar helper is again default.
+
+The capacity-hint experiment started root containers of at least2 fields at128 rather than64B. All76 cases matched bytes/semantics and349 OOM positions cleaned up/recovered. The fixed object used4→3 allocation calls,but small objects doubled peak64→128B and a large single span requested more bytes. It was rejected before product/HTTP scoring. There was no second full tree traversal,permanent large cache or borrowed short-lived input.
+
+## Five groups after ordinary native builds
+
+A is a reused verified normalc9ce1dc CLI Release artifact;B is the subsequently withdrawn UTF8-width+first64 combination;R is Rust normal. Modes are helpers/text/async/int,C11O2,clang18.1.3,same protocol/data/DB/resource limits. Each window warms10s and scores30s at500/s. A fresh instance starts only after its predecessor exits and removes its domain; no frozen other-language services or overlapping builds. Order:A-B-R,B-R-A,R-A-B,A-R-B,B-A-R. No probes,sampling,diagnostic counters orO3 in scores.
+
+Service CPU us/correct;every window15000correct,valid_driver=true,zero body/transport/HTTP errors:
+
+| Group | A | B(withdrawn) | R |
+| --- | ---: | ---: | ---: |
+| 1 | 239.825 | 123.593 | 97.745 |
+| 2 | 228.594 | 241.517 | 97.145 |
+| 3 | 141.643 | 241.834 | 103.344 |
+| 4 | 119.396 | 232.378 | 102.544 |
+| 5 | 147.438 | 499.484 | 351.173 |
+
+All225000responses were correct. Paired-window geometric means and descriptive bootstrap bounds:B/A1.4371[0.7928,2.4020],B/R1.8836[1.4642,2.3821],A/R1.3107[0.7268,2.1476],20000 resamples,seed20261028. Independent stationary-window assumptions are visibly doubtful. These are not stable causal estimates,proof of slowdown/parity or a language ranking. B is not the final default.
+
+The completed `/ok` guard had60000correct per side and94.064→120.051us/correct,failing the intended3% point guard. The coordinator interrupted CPU-guard A during scoring;final PG comparison never started. Interruption/cleanup is retained as operator action,not a product failure or pass. No replacement windows hide results. Full performance acceptance did not pass.
+
+## Environment: confirmed,supported,unknown
+
+This task launched no host Node process. Each completed window had one guest service,one Go driver and the private PG fixture;previous services exited. Limits:service4cores/1GiB,driver CPUs4–6/1GiB,DB CPU7/512MiB;guest memory about4.093GB,host8GiB. Host and guest memory cannot be added.
+
+Host monitoring captured several unrelated high-CPU Node processes and active swap traffic. Around JSON group5B,the32s host bracket recorded1020723200B swap-in and1447165952B swap-out;observed summed Node RSS peaked around946MB and may include shared pages. Guest available memory stayed at least about3.50GB,guest swap total was0,and service/driver major-fault deltas were0. Host paging does not prove Ku was swapped out;minor faults are not automatically swap faults.
+
+That window's actual driver send-delay p99 bucket was337.92ms,max1023.338ms;correct completion p99 bucket481.28ms,max1197.564ms. All JSON valid_driver flags remain true:preparation/accounting passed,but that flag does not establish timely arrivals or stationarity. Environmental confounding is supported;which host pages were paged,exact thread ready/wait time and each request's cause remain unknown. The89PG errors remain service/candidate failures,not discarded as environmental invalidity.
+
+Remaining scoring was stopped rather than repeated. No seven-language,history504,30min or36-memory-recovery rerun. The next decision requires reproducible isolated windows with stable send timing,or host/guest scheduling evidence sufficient to separate cost drift. Current data cannot justify a default CPU-speedup claim.
+
+## PostgreSQL minimum cost table and decisions
+
+| Component | Confirmed dynamic/work evidence | Unknown |
+| --- | --- | --- |
+| Pool | Separate diagnostic3000claims:2992reuse,8connect,97enqueue,3000healthy release. Coarse create→claim wall sum1148ms,max175ms includes scheduling/connect,not pure queue wait | Lock CPU,precise queue wait,phase CPU |
+| Query |3000business sends;9000materialize calls;3000growth yields;78451validated/copied bytes each;3000result/cell/byte allocation or growth calls each | CPU fraction of conversion/allocation;counts are not time |
+| Reset |3000DISCARD ALL sends and3000terminal successes,0failures;original deadline,same lease,complete drain/session validation | Reset-only CPU versus shared libpq work |
+| Shared libpq/Task/reactor | Old1142samples:service335,kernel581,libc155,libpq46,vdso25;44alias SELF from Task-net. New counters:3247NEW,10088429scanned slots,0retired aliases | Old sampling was perturbed;not precise current CPU shares;query/reset/kernel/scheduling cannot be uniquely split |
+| DB server | Independent domain/CPU/time-window raw records;query/reset counts separate | SQL versus network/wakeup/background CPU;must not add DB CPU to service CPU |
+
+Bitmap e142c3d's first real PG screen had89HTTP500s,all`database_error:acquire_timeout`,with valid driver. It was reverted in710a288 and preserved on an experimental branch. Only12full failure snapshots remain:the first4retained snapshots areCONNECT,the other8ACQUIRE and consumed14–25notifications. Full thread CPU/stacks were not captured;root cause is unknown. Static equivalence review does not turn this failed screen into a pass.
+
+The subsequent single-notify candidate dec9a47 reduced one-release wake/ready4→1. Fourteen isolated old/new cases and20candidate regressions passed,with1live opt-in not enabled;coverage included real interest-driven handoff,cancel/expiry,multiple idle leases,128-waiter close and callback pinning. Ordinary CLI N/Q each returned6000correct,valid driver and normal cleanup;301.6135→316.0018us/correct showed no gain. It was reverted in27d9d57 and kept in history/experimental branch. One pair is not a stable regression and notification amplification has not explained89timeouts. The previously rejected simple-query-reset experiment remains withdrawn;business SQL is never retried.
+
+## Actual fixed-memory change
+
+Linux ARM64 KuHttpConnection1112→920B removes786432requested bytes at unchanged4096capacity. After3000correct connected requests and close:
+
+| Metric | first256 | first64 | Delta |
+| --- | ---: | ---: | ---: |
+| memory.current |7426048|6918144|-507904|
+| anon |6270976|5697536|-573440|
+| RSS |12636160|12062720|-573440|
+
+Connections finally reached0,threads remained23,and natural exit/domain reclamation passed. Status is normalized100..599;longest built-in reason431 is31B,complete line including NUL47B<64. Existing negative/truncated formatting cleanup remains.
+
+Other fixed objects include blocking jobs/ring1540096B,Task slots638976B,reactor registrations596544B and hash524288B. They are allocated at startup and released after corresponding owner/handler/Task physical retirement;complete size/first-touch/lifetime tables are retained. The source-level65536B portable poll snapshot is already O2-eliminated and cannot be claimed again. No thread,queue or connection capacity was cut. Virtual stacks,requested bytes,RSS and cgroup charges remain distinct.
+
+Final93a0a77's ordinary Linux CLI artifact passed `/ok`200,JSON200,PG100,CPU20:520correct with physical quiet,natural exit and domain reclamation. Its full `.text` matches the independent M memory-screen artifact. This is functional verification,not CPU scoring. Normal CLI,C and ELF identities/logs are in the evidence receipt.
+
+## Validation,delivery and open scope
+
+Final Rustfmt,clippy/type check anddiff check passed;20JSON regressions passed again after withdrawal. Status-line/partial-vector and3metrics-witness tests passed. Detector results identify candidate versus final source;Linux final CI is the actual submitted revision's Checks,not an old run.
+
+Necessary permanent regressions extend existing test files. Temporary probes/scripts/copies/builds/private DB are cleaned;compact raw/failure evidence remains. No schema/migration or production data change. Paused modules and old JSON default remain. No promise turns every third-party-library OOM into an ordinary Result.
+
+Primary workspace recheck against443existing-file baseline found442unchanged,README separately modified,0missing. NewLICENSE/NOTICE/README.en.md are preserved. The user's pre-existing dirty multicore document in the development checkout retains its SHA.
+
+**Open:JSON/PG CPU parity,final default/strict-reset PG five groups,four-path memory versus Rust,and stable-tail/full performance acceptance.** This delivery confirms a local memory improvement and bounded diagnostic/candidate decisions,not completion of allv0.0.19performance goals.
+
+## Transferable evidence
+
+[Structured Git summary](evidence/json-pg-memory-20261029.json). The private delivery folder `性能续执行_2026-10-29` and its self-contained archive contain bilingual reports,index,compressed rawperf/chains/PC/C mapping/disassembly,per-window client/events/resources/runtime/exit records,environment alignment,candidate/OOM/regression and final-functional receipts. Compression preserves uncompressed SHA. No private DB config/URI or diagnostic scripts are uploaded to Git;raw stacks/host inventory stay in the local package. Older2026-10-28results remain separate. CI link and cleanup receipt are updated in the delivery evidence.
