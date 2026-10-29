@@ -5940,14 +5940,14 @@ static bool ku_json_parse_string(
     const uint8_t* start = parser->current;
     const uint8_t* end = parser->end;
     while (parser->current < end) {
-      const uint8_t* ascii = ku_json_scan_ascii(parser->current, end);
-      if (ascii != parser->current) {
-        parser->current = ascii;
-        continue;
-      }
       uint8_t next = *parser->current;
       if (next < 0x20 || next == '"' || next == '\\') break;
       if (next < 0x80) {
+        const uint8_t* ascii = ku_json_scan_ascii(parser->current, end);
+        if (ascii != parser->current) {
+          parser->current = ascii;
+          continue;
+        }
         parser->current++;
         continue;
       }
@@ -6311,25 +6311,26 @@ static bool ku_json_write_string(
   const uint8_t* end = current + string.len;
   const uint8_t* span = current;
   while (current < end) {
-    /* Do not inspect a whole word beyond the output allowance. A later invalid
-       UTF-8 byte must not replace an earlier output-limit error. Near the bound
-       retain the original scalar ordering, including validation before width. */
-    size_t room = KU_JSON_MAX_OUTPUT_BYTES - output->len;
-    size_t pending = (size_t)(current - span);
-    if (pending <= room && room - pending >= sizeof(uint64_t)) {
-      size_t scan_len = room - pending;
-      const uint8_t* scan_end = (size_t)(end - current) < scan_len
-          ? end : current + scan_len;
-      const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
-      if (ascii != current) {
-        current = ascii;
-        continue;
-      }
-    }
     uint8_t byte = *current;
     if (byte >= 0x20 && byte != '"' && byte != '\\') {
-      if (byte < 0x80) current++;
-      else {
+      if (byte < 0x80) {
+        /* Do not inspect a whole word beyond the output allowance. A later
+           invalid UTF-8 byte must not replace an earlier output-limit error.
+           Non-ASCII starts bypass this ASCII-only speculative load entirely. */
+        size_t room = KU_JSON_MAX_OUTPUT_BYTES - output->len;
+        size_t pending = (size_t)(current - span);
+        if (pending <= room && room - pending >= sizeof(uint64_t)) {
+          size_t scan_len = room - pending;
+          const uint8_t* scan_end = (size_t)(end - current) < scan_len
+              ? end : current + scan_len;
+          const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
+          if (ascii != current) {
+            current = ascii;
+            continue;
+          }
+        }
+        current++;
+      } else {
         size_t width = ku_json_utf8_width(current, end);
         if (!width) {
           return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
