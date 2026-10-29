@@ -1,27 +1,26 @@
 ---
 title: 'Projekt i współtworzenie'
 description: 'Stan Ku, publiczne źródła, granice licencji i odtwarzalne zgłoszenia problemów.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-Bieżąca dokumentacja dotyczy Ku 0.0.19, eksperymentalnego wydania wstępnego z tą samą wersją CLI i rozszerzenia VS Code. Dostępność, pliki i sumy kontrolne określa faktyczny GitHub Release.
-
-**Ku programming language / Ku 编程语言** · CLI: `ku`.
+Ku to język programowania i zestaw narzędzi: interpreter, domyślny wykonywalny runner i natywna kompilacja C obsługiwanego podzbioru.
 
 ## Źródła i licencjonowanie
 
-[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
+Ku i rozszerzenie VS Code są udostępniane na licencji **Apache-2.0**. Zobacz [kod źródłowy](https://github.com/fengyanweb/ku), [wydanie 0.0.19](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) i [tekst licencji](https://github.com/fengyanweb/ku/blob/v0.0.19/LICENSE).
 
-Ku i rozszerzenie VS Code są dostępne na licencji Apache License 2.0. Zobacz [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) i [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Składniki firm trzecich zachowują własne prawa autorskie i licencje.
+Komponenty zewnętrzne zachowują własne licencje. Pakiety wydania zawierają odpowiednie teksty licencji i informacje.
 
 ## Zgłoś problem
 
@@ -38,10 +37,8 @@ Nie przesyłaj tokenów, haseł, prawdziwych ciągów połączenia ani logów z 
 
 ## Przed współtworzeniem
 
-[Kontrakt składni](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) i [kontrakt semantyki](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) definiują zachowanie języka. Sprawdzaj CI, implementację i kontrakty łącznie. Cel w dzienniku prac nie jest zaimplementowaną funkcją.
+Ogranicz zakres zmian i dołącz minimalny przykład odtwarzający problem oraz wyniki odpowiednich sprawdzeń. Kod, dokumentacja i przykłady powinny dotyczyć tej samej wersji. Opiekunowie sprawdzają zmiany przed ich połączeniem.
 
-Utrzymuj wąski zakres zmian i wyjaśniaj odtworzenie, przyczynę, zakres i weryfikację. Sprawdzaj treści strony razem z odpowiednim kodem. Zachowaj istniejące testy, zmiany drzewa roboczego i unikalne dowody. Opiekun określa przyjęcie wkładu i warunki licencji; witryna nie wymyśla umowy współtworzenia.
-
-Ta witryna jest statyczna. Tekst, nawigacja i kod nie wymagają zaplecza biznesowego. Wyszukiwanie ładuje indeks Pagefind w przeglądarce; strona nie umożliwia zdalnego wykonywania kodu Ku.
+Witryna nie umożliwia wykonywania kodu Ku online.
 
 Przejdź do [pierwszych kroków](/pl/docs/getting-started/), [granic obsługi](/pl/docs/support/) i [informacji o wydaniach](/pl/releases/).

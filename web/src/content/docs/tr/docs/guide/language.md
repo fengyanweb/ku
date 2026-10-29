@@ -1,8 +1,8 @@
 ---
 title: 'Dil kılavuzu'
 description: 'Ku değişkenlerini, işlevlerini, kontrol akışını, sahipliği, modülleri ve kurtarılabilir hataları öğrenin.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu kılavuz temel sözdizimini tanıtır. Deponun [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) ve [anlam sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) belirleyici olmaya devam eder. Bunlar öğretici parçalardır; farklar için [arka uç desteğine](/tr/docs/support/) bakın.
+Bu kılavuz temel sözdizimini tanıtır. Deponun [sözdizimi başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) ve [anlam başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) belirleyici olmaya devam eder. Bunlar öğretici parçalardır; farklar için [arka uç desteğine](/tr/docs/support/) bakın.
 
 ## Değişkenler ve türler
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5`, `0` ile `4` arasında yineler. `if` ve `while`, `bool` koşullar ister. Birden fazla deyim için süslü parantez kullanın. Dallanma ifadeleri `match` kullanır; `switch` yoktur.
 
+<a id="ownership"></a>
+
 ## Sahiplik ve salt okunur ödünç alma
+
+Owned değerler varsayılan taşınır ve sahip kapsamı bittiğinde belirlenimci drop uygulanır. Bağımsız kopya `.clone()` gerektirir. Ku genel izlemeli GC kullanmaz; closure ortamları gibi paylaşılan iç yapılar referans sayımı ve çalışma zamanı maliyeti kullanabilir. Eşzamanlı salt okunur ödünç alma `&name: T` imzasıyla bildirilir. Normal Owned parametre yalnızca okusa bile değeri taşıyabilir. Çağrı `length(value)` kalır, `&value` kullanılmaz; async ödünç alma desteklenmez.
 
 `int`, `float`, `bool` ve `null`, Copy değerleridir. Dizgiler, diziler, nesneler, yapılar, enumlar, Results ve işlev değerleri Owned türündedir. Atama ve sıradan argümanlar sahip olunan değerleri varsayılan olarak taşır. Bağımsız bir değer gerektiğinde `.clone()` kullanın. Tasks klonlanamaz.
 

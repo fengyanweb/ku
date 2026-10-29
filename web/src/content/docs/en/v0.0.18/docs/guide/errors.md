@@ -1,18 +1,21 @@
 ---
 title: Errors and troubleshooting
-description: Diagnose Ku installation, imports, ownership, JSON, and backend
-  capability errors.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/diagnostics.md
-  - docs/syntax.md
-  - src/error.rs
-  - src/stdlib/json.rs
+  [
+    'docs/diagnostics.md',
+    'docs/syntax.md',
+    'src/error.rs',
+    'src/stdlib/json.rs',
+  ]
+sidebar:
+  order: 2
 slug: en/v0.0.18/docs/guide/errors
 ---
 
-This documentation describes the frozen scope of the v0.0.18 experimental prerelease. Actual publication and downloadable assets are recorded in GitHub Releases. Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.
+Compiler diagnostics can change during experimental development. Include the CLI version, Git commit, backend, full command, and minimal source when reporting a problem.
 
 ## Identify the Ku executable
 
@@ -44,7 +47,7 @@ The output is **JSON Lines**, with one diagnostic per line. Fields include `leve
 | `E0913`    | Borrowed async parameter            | Use an owned parameter; clone at the caller if the original is needed         |
 | `E0918`    | Writing `&value` at the call site   | Pass an ordinary argument; the signature declares borrowing                   |
 
-This summarizes registered diagnostics, rather than listing every error. The current authoritative registry is [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+This summarizes registered diagnostics, rather than listing every error. The current authoritative registry is [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/src/error.rs).
 
 ## Runtime errors use a separate contract
 
@@ -55,7 +58,7 @@ import json from "std.json"
 
 fn main() {
     try {
-        json.parse("[1,]")?
+        json.decode("[1,]")?
     } catch (error) {
         println(error.domain)
         println(error.code)
@@ -64,7 +67,7 @@ fn main() {
 }
 ```
 
-This teaching program intentionally triggers a recoverable parse failure. A reported `byte N` is a zero based UTF-8 byte offset. It is not a character count around Chinese text or emoji.
+This program intentionally triggers and catches a recoverable parse error, then exits normally. The example uses `ku run`; the same input returns `json/parse_error` across backends that support JSON, but `message` may differ. The interpreter includes a `json parse failed: ` prefix that native C may omit. Handle errors by `domain/code` rather than matching the complete message. A reported `byte N` is a zero based UTF-8 byte offset. It is not a character count around Chinese text or emoji.
 
 ## A native build is rejected
 
@@ -72,6 +75,6 @@ Passing `ku check` only establishes that frontend checking succeeded. Native C a
 
 `ku build --native file.ku` without `-o` only writes C. To compile and link an executable, use `ku build --backend c file.ku` and install the target C toolchain.
 
-Database errors `execution_unknown` and `execution_completed_without_result` must not trigger automatic replay. Retain request and business evidence and establish the actual execution state first. Verifying the local website does not require a production database connection.
+Database errors `execution_unknown` and `execution_completed_without_result` must not trigger automatic replay. Retain request and business evidence and establish the actual execution state first.
 
-For more detail, see the [repository diagnostic guide](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+For more detail, see the [repository diagnostic guide](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/diagnostics.md).

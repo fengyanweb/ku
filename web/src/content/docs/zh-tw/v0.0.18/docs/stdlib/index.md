@@ -1,17 +1,20 @@
 ---
 title: 標準函式庫概覽
 description: 按用途查找 Ku 標準函式庫、基礎介面與不同後端的使用邊界。
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: zh-tw/v0.0.18/docs/stdlib
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。這裡是經過原始碼核對的核心入口，不是全部 API 的完整參考。具體行為遵循[語法合同](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md)，後端範圍見[支援矩陣](/zh-tw/v0.0.18/docs/support/)。
+標準函式庫行為見[語法參考](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md)，各後端限制見[支援矩陣](/zh-tw/v0.0.18/docs/support/)。
 
 ## 匯入模組
 
@@ -73,7 +76,3 @@ fn main(): null! {
 在源文件同目錄準備 UTF-8 的 `message.txt`。不存在或讀取失敗時回傳錯誤；該範例不是不依賴輸入文件的自包含程序。`try_read` / `try_write` 是保留的同型別兼容別名。
 
 `read_dir` 回傳排序後的獨立路徑陣列，最多 10,000 項、路徑文字合計 1,000,000 位元組。受限 native Task 文件操作使用固定後台池；這不代表網絡呼叫已經使用同一通用等待機制。
-
-## 參考如何維護
-
-目前公開介面元資料位於 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs)，實作與規範一起用於核查。本網站暫時維護人工整理的核心參考；目前沒有已確認的 `ku doc` 命令。

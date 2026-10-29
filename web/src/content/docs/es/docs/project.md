@@ -1,27 +1,26 @@
 ---
 title: 'Proyecto y contribuciones'
 description: 'Estado del proyecto Ku, código público, límites de licencia e informes de problemas reproducibles.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
     'docs/v0.0.19.md',
     'docs/syntax.md',
   ]
 ---
 
-La documentación actual corresponde a Ku 0.0.19, una versión preliminar experimental con la misma versión de CLI y extensión de VS Code. La disponibilidad, los archivos y las sumas de comprobación dependen del GitHub Release real.
-
-**Ku programming language / Ku 编程语言** · CLI: `ku`.
+Ku es un lenguaje de programación y una cadena de herramientas: intérprete, runner ejecutable predeterminado y compilación C nativa de un subconjunto admitido.
 
 ## Código fuente y licencia
 
-[GitHub](https://github.com/fengyanweb/ku) · [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)
+Ku y su extensión para VS Code se distribuyen bajo **Apache-2.0**. Consulta el [código fuente](https://github.com/fengyanweb/ku), la [versión 0.0.19](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) y el [texto de la licencia](https://github.com/fengyanweb/ku/blob/v0.0.19/LICENSE).
 
-Ku y la extensión de VS Code usan Apache License 2.0. Consulta [LICENSE](https://github.com/fengyanweb/ku/blob/main/LICENSE) y [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE). Los componentes de terceros conservan sus propios derechos de autor y licencias.
+Los componentes de terceros conservan sus propias licencias. Los paquetes incluyen los textos y avisos correspondientes.
 
 ## Informa de un problema
 
@@ -38,10 +37,8 @@ No envíes tokens, contraseñas, cadenas de conexión reales ni registros con da
 
 ## Antes de contribuir
 
-El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) y el [contrato semántico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) definen el comportamiento del lenguaje. Revisa conjuntamente CI, implementación y contratos. Un objetivo del registro de trabajo no es una función implementada.
+Mantén los cambios enfocados e incluye una reproducción mínima, el alcance y las comprobaciones pertinentes. El código, la documentación y los ejemplos deben corresponder a la misma versión. Los responsables revisan las contribuciones antes de integrarlas.
 
-Limita los cambios y explica reproducción, causa, alcance y validación. Revisa el contenido del sitio junto al código correspondiente. Conserva las pruebas existentes, los cambios del árbol de trabajo y las evidencias únicas. El mantenedor decide la aceptación de contribuciones y los acuerdos de licencia; este sitio no inventa un acuerdo de contribución.
-
-Este sitio es estático. Sus textos, navegación y código no requieren un backend empresarial. La búsqueda carga un índice Pagefind en el navegador; el sitio no ofrece ejecución remota de código Ku.
+El sitio no ofrece ejecución de código Ku en línea.
 
 Continúa con [primeros pasos](/es/docs/getting-started/), [límites de compatibilidad](/es/docs/support/) y [notas de versiones](/es/releases/).

@@ -1,18 +1,19 @@
 ---
 title: 'Errores y resolución de problemas'
 description: 'Diagnostica errores de instalación, importaciones, propiedad, JSON y capacidades de los backends de Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Los diagnósticos del compilador pueden cambiar durante el desarrollo experimental. Al informar de un problema, incluye la versión de la CLI, el commit de Git, el backend, el comando completo y un código fuente mínimo.
+Los diagnósticos del compilador pueden cambiar durante el desarrollo experimental. Al informar de un problema, incluye la versión de la CLI, el commit de Git, el backend, el comando completo y un código fuente mínimo.
 
 ## Identifica el ejecutable de Ku
 
@@ -72,6 +73,8 @@ Superar `ku check` solo acredita que la comprobación del frontend fue correcta.
 
 `ku build --native file.ku` sin `-o` solo escribe C. Para compilar y enlazar un ejecutable, utiliza `ku build --backend c file.ku` e instala la cadena de herramientas de C para el destino.
 
-Los errores de base de datos `execution_unknown` y `execution_completed_without_result` no deben provocar una repetición automática. Conserva las pruebas de la solicitud y de la operación de negocio y determina primero el estado real de ejecución. Verificar el sitio web local no requiere una conexión con una base de datos de producción.
+Los errores de base de datos `execution_unknown` y `execution_completed_without_result` no deben provocar una repetición automática. Conserva las pruebas de la solicitud y de la operación de negocio y determina primero el estado real de ejecución.
 
 Para más detalles, consulta la [guía de diagnósticos del repositorio](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).
+
+Los errores JSON conservan domain/code entre backends, pero message puede diferir. ku run y el runner pueden añadir json parse failed:, mientras C nativo no. Compara domain/code, no el texto completo.

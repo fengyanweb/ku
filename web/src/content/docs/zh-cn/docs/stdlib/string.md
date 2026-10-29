@@ -2,7 +2,7 @@
 title: 字符串
 description: Unicode 文本长度、查找、切片、转换及后端支持。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources: ['src/stdlib/string.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 1

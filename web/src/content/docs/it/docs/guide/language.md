@@ -1,8 +1,8 @@
 ---
 title: 'Guida al linguaggio'
 description: 'Impara variabili, funzioni, flusso di controllo, proprietà, moduli ed errori recuperabili di Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v0.0.18. La pubblicazione effettiva e i download sono registrati in GitHub Releases. Questa guida introduce la sintassi essenziale. Il [contratto sintattico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) e il [contratto semantico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) del repository rimangono autorevoli. Sono frammenti didattici; per le differenze consulta il [supporto dei backend](/it/docs/support/).
+Questa guida introduce la sintassi essenziale. Il [riferimento sintattico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) e il [riferimento semantico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) del repository rimangono autorevoli. Sono frammenti didattici; per le differenze consulta il [supporto dei backend](/it/docs/support/).
 
 ## Variabili e tipi
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` itera da `0` a `4` inclusi. `if` e `while` richiedono condizioni `bool`. Usa parentesi graffe per più istruzioni. Le espressioni di diramazione usano `match`; non esiste `switch`.
 
+<a id="ownership"></a>
+
 ## Proprietà e prestito in sola lettura
+
+I valori Owned vengono spostati per impostazione predefinita e rilasciati deterministicamente al termine dell’ambito proprietario. Le copie indipendenti richiedono `.clone()`. Ku non introduce un GC globale a tracciamento; strutture interne condivise come gli ambienti delle closure possono usare conteggio dei riferimenti e avere costi runtime. Il prestito sincrono in sola lettura è dichiarato con `&name: T`. Un parametro Owned ordinario può spostare il valore anche quando lo legge soltanto. La chiamata resta `length(value)`, senza `&value`; i prestiti async non sono supportati.
 
 `int`, `float`, `bool` e `null` sono valori Copy. Stringhe, array, oggetti, struct, enum, Results e valori di funzione sono Owned. Le assegnazioni e gli argomenti ordinari spostano i valori posseduti per impostazione predefinita. Usa `.clone()` quando serve un valore indipendente. I Task non possono essere clonati.
 

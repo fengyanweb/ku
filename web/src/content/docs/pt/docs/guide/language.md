@@ -1,8 +1,8 @@
 ---
 title: 'Guia da linguagem'
 description: 'Aprenda variáveis, funções, fluxo de controle, propriedade, módulos e erros recuperáveis do Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Esta documentação descreve o escopo congelado da pré-versão experimental v0.0.18. A publicação efetiva e os downloads estão registrados no GitHub Releases. Este guia apresenta a sintaxe essencial. O [contrato de sintaxe](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) e o [contrato semântico](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) do repositório continuam sendo as referências oficiais. São fragmentos didáticos; consulte as diferenças no [suporte dos backends](/pt/docs/support/).
+Este guia apresenta a sintaxe essencial. O [referência de sintaxe](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) e o [referência semântica](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) do repositório continuam sendo as referências oficiais. São fragmentos didáticos; consulte as diferenças no [suporte dos backends](/pt/docs/support/).
 
 ## Variáveis e tipos
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` itera de `0` até `4`, inclusive. `if` e `while` exigem condições `bool`. Use chaves para várias instruções. As expressões de ramificação usam `match`; não existe `switch`.
 
+<a id="ownership"></a>
+
 ## Propriedade e empréstimo somente para leitura
+
+Valores Owned são movidos por padrão e liberados deterministicamente ao terminar o escopo proprietário. Cópias independentes exigem `.clone()`. Ku não introduz GC global por rastreamento; estruturas internas compartilhadas, como ambientes de closures, podem usar contagem de referências e ter custos de execução. Empréstimos síncronos somente de leitura são declarados por `&name: T`. Um parâmetro Owned comum pode mover o valor mesmo se apenas o ler. A chamada continua `length(value)`, sem `&value`; empréstimos async não são aceitos.
 
 `int`, `float`, `bool` e `null` são valores Copy. Strings, arrays, objetos, structs, enums, Results e valores de função são Owned. Atribuições e argumentos comuns movem valores com propriedade por padrão. Use `.clone()` quando precisar de um valor independente. Tasks não podem ser clonados.
 

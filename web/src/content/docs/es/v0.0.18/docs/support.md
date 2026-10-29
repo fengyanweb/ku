@@ -1,19 +1,19 @@
 ---
-title: Compatibilidad de plataformas y backends
-description: Distingue las plataformas publicadas de Ku, intérprete, ejecutor, C
-  nativo, subconjunto de Tasks y compatibilidad LLVM.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Compatibilidad de plataformas y backends'
+description: 'Distingue las plataformas publicadas de Ku, intérprete, ejecutor, C nativo, subconjunto de Tasks y compatibilidad LLVM.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/syntax.md
-  - docs/v0.0.18.md
-  - docs/v0.0.18-worklog.md
-  - docs/protocol-foundation.md
-  - .github/workflows/native-three-os.yml
+  [
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-worklog.md',
+    'docs/protocol-foundation.md',
+    '.github/workflows/native-three-os.yml',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: es/v0.0.18/docs/support
 ---
-
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases.
 
 ## Plataformas de CLI publicadas
 
@@ -21,7 +21,7 @@ La versión preliminar experimental v0.0.18 cubre Windows x64 (MSVC), Linux x64 
 
 ## Rutas de ejecución
 
-| Capacidad                                                             | Intérprete `ku run`                  | Ejecutor predeterminado `ku build`        | C nativo síncrono                                                  | Tasks nativos en desarrollo                       | Prototipo de texto LLVM     |
+| Capacidad                                                             | Intérprete `ku run`                  | Ejecutor predeterminado `ku build`        | C nativo síncrono                                                  | Task nativo (subconjunto)                         | Prototipo de texto LLVM     |
 | --------------------------------------------------------------------- | ------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------- | --------------------------- |
 | Lenguaje básico, funciones, flujo de control                          | Implementado                         | Ruta del intérprete                       | Subconjunto implementado                                           | Subconjunto tipado restringido                    | Prototipo limitado          |
 | JSON                                                                  | Admitido                             | Admitido                                  | Admitido                                                           | No admitido                                       | No admitido                 |
@@ -34,9 +34,9 @@ Las compilaciones predeterminadas requieren la cadena de herramientas de Rust co
 
 ## El subconjunto nativo de Tasks
 
-La rama de desarrollo actual tiene una ruta de código restringida para `async fn main(): null!`. Cubre los tipos primitivos enumerados expresamente, cadenas, arrays planos, Results de una sola capa, inicio/movimiento/await de Tasks, parte del flujo de control y operaciones limitadas de archivos y directorios en segundo plano. No es un backend async completo en el paquete publicado v0.0.18.
+Esta versión incluye la ruta C nativa restringida `async fn main(): null!`: primitivas enumeradas, cadenas, arrays planos, Results de un nivel, inicio/movimiento/await de Task, parte del control de flujo y operaciones acotadas de archivos/directorios en segundo plano. TCP/TLS local usa un pool bloqueante fijo. No equivale a readiness de red general ni a M:N completo; consulta la referencia de concurrencia de esta versión.
 
-Siguen pendientes las esperas de red genéricas de Tasks, la ejecución M:N completa, las combinaciones arbitrarias de heap dinámico, todas las combinaciones de capturas/funciones async y las pruebas prolongadas completas. Consulta el subconjunto exacto aceptado y rechazado en el [contrato de concurrencia](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md).
+Siguen pendientes las esperas de red genéricas de Tasks, la ejecución M:N completa, las combinaciones arbitrarias de heap dinámico, todas las combinaciones de capturas/funciones async y las pruebas prolongadas completas. Consulta el subconjunto exacto aceptado y rechazado en el [contrato de concurrencia](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md).
 
 ## Límites de bases de datos y red
 
@@ -48,35 +48,27 @@ Redis utiliza TCP sin cifrar. MySQL carece de una verificación uniforme de cert
 
 El analizador léxico y el parser autohospedados de Ku tienen subconjuntos limitados y comprobaciones diferenciales. Un parser, comprobador, IR y backend autohospedados completos siguen sin terminar; Rust continúa proporcionando la cadena de herramientas de arranque. La versión 0.0.x no promete compatibilidad de código fuente ni de la ABI C/FFI generada.
 
-Los registros de trabajo y los resultados anteriores de CI solo acreditan su alcance y commit declarados. Usa las [notas de versiones](/es/v0.0.18/releases/) para separar los cambios publicados del trabajo de desarrollo. Este sitio no informa como superadas todas las comprobaciones de CI de la rama actual, las cargas de producción ni las validaciones de bases de datos.
+## Alcance y límites de v0.0.18
 
-> Las novedades de v0.0.18 aparecen a continuación en inglés; se conserva el resto de la traducción. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
+- JSON: `encode`/`decode` comparten `stringify`/`parse`, incluida la corrección de ida y vuelta de `1e20`.
+- Task nativo mantiene el subconjunto acotado; correcciones de admisión y limpieza al cerrar no equivalen a M:N completo ni a suspensión de red general.
+- HTTP ofrece readiness de sockets, colas, respuestas y keep-alive acotados y diagnósticos acotados opcionales; no implica aceptación de todas las cargas.
+- `ku supervise` controla workers de programas completos, admisión, bytes de colas, salida y limpieza; no hay un worker por petición o Task ni se aplica automáticamente a `ku run`.
 
-## v0.0.18 release scope and known limits
+**Problema HTTP conocido:** Pueden producirse errores HTTP 504 intermitentes. La causa aún no está confirmada.
 
-This release freezes already implemented and verified functionality. It remains an **experimental prerelease**, not a production-readiness claim. [The v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) is the authority for actual publication, assets and checksums; a skipped publishing job is not release evidence.
+### Límites de memoria de procesos
 
-- JSON keeps the previous implementation as its default. `json.encode` / `json.decode` share the `stringify` / `parse` entry points. The float round-trip correction for `1e20` is included; yyjson replacement and performance exploration have ended.
-- Task/native async support remains the documented bounded subset. Shutdown admission and cleanup fixes do not imply a complete M:N runtime or universal network suspension.
-- HTTP uses bounded socket readiness, queues and response handling, with keep-alive support and optional bounded diagnostic records. These changes do not imply that all workload acceptance has passed.
-- `ku supervise` controls whole-program workers, admission, queue bytes, output and cleanup. It is not one worker per HTTP request or per Task, and it is not automatically applied to ordinary `ku run`.
+| Límites de memoria de procesos | `ku supervise`                                                                                                                                                                                                                                            |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux                          | Memoria contabilizada por cgroup v2; requiere raíz de dominio delegada y escribible con `memory`, `pids`, `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` y `cgroup.kill`. La falta de permisos o controles impide iniciar la aplicación. |
+| Windows                        | Job Objects anidados limitan workers y grupo según memoria virtual comprometida, no RSS. Se comprueba el compromiso inicial antes de liberar el hilo suspendido; la política del host puede rechazar la asignación al Job.                                |
+| macOS                          | Este aislamiento no está admitido de forma nativa y se rechaza antes de ejecutar. Usa un host o VM Linux configurado adecuadamente; no hay transferencia automática a una VM.                                                                             |
 
-**Known HTTP issue:** HTTP 504 occurred historically, including a seven-request cluster. This round's 60-second and 180-second short tests did not reproduce it. The root cause is unconfirmed, and formal 30-minute stability acceptance has not passed. It is retained as a known issue for v0.0.18 and is not a separate release blocker. The earliest three historical 504s lack enough evidence for a unique reconstruction. Do not describe the issue as repaired or long-term stability as accepted.
+El dominio del worker contabiliza asignaciones Ku y de bibliotecas externas. cgroup Linux y compromiso Windows son medidas diferentes. `memory.max` puede permitir excesos transitorios; no se garantiza un techo absoluto de toda la memoria física en todo instante.
 
-**Deferred, not completed:** complete M:N, general Task network scheduling, the complete database platform matrix, and further long-running workload acceptance belong to later versions. General value copy/release follow-up and AST analysis remain paused. No unrelated memory-limit validation is being repeated.
+El coordinador no tiene límite estricto de memoria del SO; reservas y contabilidad de admisión no son RSS preciso. No se mide exactamente todo el heap de cada Task ni se atribuyen con precisión pools, cachés y bibliotecas. Bases externas, host/VM, compiladores y `ku run` ordinario no están limitados automáticamente por el presupuesto del worker.
 
-### Process memory boundary
+Si el SO termina un worker, se informa el fallo y la reserva solo vuelve tras confirmar la limpieza. Algunas asignaciones fallan anticipadamente, pero el agotamiento de bibliotecas externas no siempre produce Result ordinario. **Las operaciones de base de datos nunca se repiten automáticamente**; salir del worker no demuestra rollback y sus efectos pueden ser desconocidos.
 
-| Host | `ku supervise` guarantee and prerequisite |
-| --- | --- |
-| Linux | cgroup v2 kernel charged memory; a writable, delegated domain root with `memory` and `pids` enabled is required. Required interfaces include `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max` and `cgroup.kill`. Missing controls or permissions cause refusal before application execution. |
-| Windows | Nested Job Object limits for individual workers and the worker group, measured as committed virtual memory, not RSS. Initial process commit is checked before its suspended application thread is released. Host policy can reject Job assignment. |
-| macOS | This isolation mode is not supported natively and is explicitly rejected before starting the application. Use a suitably configured Linux host/VM when required; there is no automatic VM bridge. |
-
-Worker accounting covers applicable Ku and third-party library allocations in that worker's resource domain. Linux cgroup accounting and Windows commit are different metrics. Linux `memory.max` may permit transient overshoot; these mechanisms do not promise an absolute ceiling on all physical memory at every instant.
-
-The coordinator itself has no OS memory hard limit. Its bounded admission/control reserve is an accounting policy, not a coordinator RSS limit. A single Task's entire heap is not precisely metered; shared connection pools, caches and library allocations cannot be exactly attributed to each Task. External databases, the host/VM and build compilers lie outside the worker domain.
-
-When an OS limit terminates a worker, the coordinator reports failure and only returns reserved capacity after confirmed cleanup. Some allocation failures can be reported before allocation, but third-party exhaustion is not guaranteed to become an ordinary Result. **Database operations are never automatically retried**; an exited worker does not prove rollback, and side effects may be unknown.
-
-See the [process execution contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/process-execution.md), [concurrency contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/concurrency.md) and [HTTP acceptance record](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/http-stability-acceptance.md). Cross-platform CI and installation checks establish only their reported targets and scope, not a completed real-database matrix.
+[`ku supervise`](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/process-execution.md) · [Task](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/concurrency.md) · [HTTP 504](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/http-stability-acceptance.md)

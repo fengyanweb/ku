@@ -2,7 +2,7 @@
 title: 数组
 description: 同类型数组、索引、映射及返回新数组的集合操作。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources: ['src/stdlib/array.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 2

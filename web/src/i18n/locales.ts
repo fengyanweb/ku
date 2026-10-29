@@ -21,7 +21,7 @@ export function translate(locale: Locale): Translation {
       return value
         .replaceAll('{currentVersion}', versions.current)
         .replaceAll('{releasedVersion}', versions.released)
-        .replaceAll('{languageVersion}', versions.current)
+        .replaceAll('{languageVersion}', versions.languageVersion)
         .replaceAll('{releaseTag}', versions.releaseTag);
     if (Array.isArray(value)) return value.map(interpolate);
     if (value && typeof value === 'object')

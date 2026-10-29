@@ -1,18 +1,19 @@
 ---
 title: 'Τυπική βιβλιοθήκη'
 description: 'Βρείτε μονάδες της τυπικής βιβλιοθήκης Ku, βασικές υπογραφές και όρια backend.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Η τεκμηρίωση περιγράφει το οριστικοποιημένο εύρος της πειραματικής προέκδοσης v0.0.18. Η πραγματική δημοσίευση και οι λήψεις καταγράφονται στα GitHub Releases. Αυτά τα βασικά σημεία εισόδου ελέγχθηκαν έναντι του πηγαίου κώδικα· δεν πρόκειται για εξαντλητική αναφορά API. Η [σύμβαση σύνταξης](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) ορίζει τη συμπεριφορά. Δείτε τον [πίνακα υποστήριξης](/el/docs/support/) για τα όρια backend.
+Η [αναφορά σύνταξης](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) περιγράφει την τυπική βιβλιοθήκη. Δείτε τον [πίνακα υποστήριξης](/el/docs/support/) για τα όρια backend.
 
 ## Εισαγωγή μονάδων
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Πρώτα δημιουργήστε ένα `message.txt` UTF-8 δίπλα στην πηγή. Απόν αρχείο ή αποτυχημένη ανάγνωση επιστρέφει σφάλμα. Το παράδειγμα εξαρτάται από αυτό το αρχείο εισόδου. Τα `try_read` και `try_write` παραμένουν συμβατά ψευδώνυμα με τους ίδιους τύπους αποτελέσματος.
 
 Το `read_dir` επιστρέφει ταξινομημένες διαδρομές με ανεξάρτητη κυριότητα, με όριο 10.000 εγγραφών και συνολικά 1.000.000 byte διαδρομών. Οι περιορισμένες εγγενείς λειτουργίες αρχείων Task χρησιμοποιούν σταθερή δεξαμενή παρασκηνίου. Αυτό δεν αποδεικνύει γενική αναμονή δικτύου μέσω του ίδιου μηχανισμού.
-
-## Συντήρηση της αναφοράς
-
-Τα μεταδεδομένα δημόσιας διεπαφής βρίσκονται στο [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Ελέγχονται μαζί με υλοποιήσεις και συμβάσεις. Ο ιστότοπος διατηρεί προς το παρόν χειροκίνητα επιλεγμένη αναφορά· δεν έχει επιβεβαιωθεί υπάρχουσα εντολή `ku doc`.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

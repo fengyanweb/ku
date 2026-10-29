@@ -2,16 +2,8 @@
 title: Time and timers
 description: Read clocks, format dates, calculate durations, and wait with std.time.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
-sources:
-  [
-    'src/stdlib/time.rs',
-    'src/stdlib/metadata.rs',
-    'docs/syntax.md',
-    'src/ir/task_lower.rs',
-    'src/backend/c.rs',
-    'src/runtime/interpreter.rs',
-  ]
+verifiedAt: '2026-10-23'
+sources: ['src/stdlib/time.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 6
 ---
@@ -115,8 +107,6 @@ time.sleep(duration:Duration): null!
 
 `time.date()` returns today's local date directly. `time.date(value)?` extracts a date in the local zone, equivalent to `time.date(value, "local")?`. All overloads with arguments return a Result; invalid Time objects, out-of-range timestamps, or invalid zones return errors.
 
-The one-argument overload's Result type checking is fixed in the `v0.0.18-r1` revision. With the original v0.0.18 release, use `time.date(value, "local")?`.
-
 `time.add` / `sub` shift an instant by a duration, `diff(left, right)` computes `left - right`, and `compare` returns -1, 0, or 1. `weekday` returns 1 for Monday through 7 for Sunday. `parts` returns `kind`, `year`, `month`, `day`, `hour`, `minute`, `second`, `millis` (the millisecond component), `weekday`, and `zone`.
 
 ## Formats and zones
@@ -146,8 +136,6 @@ Recoverable errors have domain `time`, with codes such as `invalid_date`, `inval
 ## Execution support
 
 The full calendar/duration API above is for `ku run` and the default packaged runner. Synchronous native C currently supports `now()`, `instant()`, `elapsed(Time)`, `millis()` / `millis(Time)` for values produced by `instant()`, and `steady_millis()`. Calendar parsing, formatting, configuration-like Time objects, and synchronous sleep are not part of that native subset. Native Task has its separately restricted integer sleep path; LLVM does not provide this complete library.
-
-<a id="native-task-wait"></a>
 
 ## Native Task wait
 

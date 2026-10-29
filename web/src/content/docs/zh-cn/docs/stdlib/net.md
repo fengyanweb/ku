@@ -2,7 +2,7 @@
 title: TCP 与 TLS 客户端
 description: 有界 native TCP 客户端配置、二进制读写、TLS 与生命周期。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'docs/protocol-foundation.md']
 sidebar:

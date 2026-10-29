@@ -1,18 +1,19 @@
 ---
 title: 錯誤與排查
 description: 定位 Ku 安裝、匯入、所有權、JSON 與後端能力錯誤。
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-本文檔對應 v0.0.18 實驗預發行版的凍結範圍；實際公開狀態與下載資產以 GitHub Release 為準。編譯器診斷可能隨實驗版本收斂。報告問題時同時提供 CLI 版本、Git commit、後端、完整命令和最小原始碼，避免把不同版本的行為混在一起。
+編譯器診斷可能隨實驗版本收斂。報告問題時同時提供 CLI 版本、Git commit、後端、完整命令和最小原始碼，避免把不同版本的行為混在一起。
 
 ## 先確認執行的是哪一個 Ku
 
@@ -72,6 +73,8 @@ fn main() {
 
 `ku build --native file.ku` 不帶 `-o` 時僅寫 C 文件。希望編譯和鏈接二進制時使用 `ku build --backend c file.ku`，並確認目標 C 工具鏈存在。
 
-資料庫的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自動重放；保留請求和業務證據，先核對真實執行狀態。官網本地驗證不需要連接生產資料庫。
+資料庫的 `execution_unknown` / `execution_completed_without_result` 表示不能安全自動重放；保留請求和業務證據，先核對真實執行狀態。
 
 更多規則見[倉庫診斷說明](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md)。
+
+JSON 錯誤的 domain/code 在各後端一致，但 message 全文可能不同。ku run 與 runner 可能帶有 json parse failed: 前綴，原生 C 可能沒有。請依 domain/code 判斷，不依賴完整訊息逐字一致。

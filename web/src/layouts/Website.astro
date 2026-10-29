@@ -23,8 +23,10 @@ const language = localeDefinitions[locale];
 const localized = locales.includes(Astro.url.pathname.split('/')[1] as Locale);
 const links = [
   [t.documentation, `/${locale}/docs/getting-started/`],
+  [t.languageGuide, `/${locale}/docs/guide/language/`],
   [t.libraryGroup, `/${locale}/docs/stdlib/`],
   [t.releases, `/${locale}/releases/`],
+  [t.supportKu, `/${locale}/support/`],
 ];
 const messages = {
   searchEmpty: t.searchEmpty,
@@ -126,13 +128,13 @@ const messages = {
         <a href={`/${locale}/docs/support/`}>{t.support}</a>
         <a href={`${project.repository}/issues`}>{t.reportIssue} ↗</a>
         <a href={`mailto:${project.feedbackEmail}`}>{t.emailFeedback}</a>
-        <a href={`/${locale}/support/`}>{t.supportKu}</a>
       </nav>
       <div class="footer-note">
         {t.experimental}
         <br />
         <span>
-          Ku {project.version} · {t.sourceAvailable}
+          {project.version} ·{' '}
+          <a href={`/${locale}/docs/project/`}>{t.sourceAvailable}</a>
         </span>
       </div>
     </footer>

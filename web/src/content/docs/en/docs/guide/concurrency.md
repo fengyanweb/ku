@@ -3,19 +3,16 @@ title: 'Tasks and async calls'
 description: 'Task startup, await, errors and lifetime.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
-sources:
-  [
-    'docs/concurrency.md',
-    'docs/semantics.md',
-    'src/runtime/interpreter.rs',
-    'src/runtime/task.rs',
-    'src/ir/task_lower.rs',
-  ]
+sources: ['docs/concurrency.md', 'docs/semantics.md']
 sidebar:
   order: 1
 ---
 
-Calling an async function submits work and returns a one-use Task handle. Work may run before `await`; submission is not a guarantee of immediate execution or ordering. `await` obtains its result; `T!` errors still require `?` or `try/catch`.
+A Task is the single-use handle returned by an async function call. Calling submits the task; work may run before `await`, but submission does not guarantee immediate execution or ordering. `await` retrieves its result. Recoverable errors in `T!` still use `?` or `try/catch`.
+
+## Start and await
+
+Save as `tasks.ku` and run `ku run tasks.ku`:
 
 ```ku
 async fn Double(value: int): int! {
@@ -31,27 +28,36 @@ async fn main(): null! {
 }
 ```
 
-Save as `tasks.ku` and run `ku run tasks.ku`. It prints `40` and `42`; the example is also within the restricted native Task subset.
+Expected output: `40`, then `42`. This program also fits the 0.0.19 native Task subset. Compile with `ku build --backend c tasks.ku -o tasks`; choose `tasks.exe` on Windows. This does not demonstrate asynchronous access to every library.
 
-## Ownership and completion
+## Transfer data
 
-A Task moves; it cannot be cloned or awaited twice. When its owning scope exits, unfinished child tasks receive cancellation. Cancellation attempts `finally` cleanup within a shared one-second deadline. Cancellation and timeout are not ordinary Results caught as business errors.
+Owned arguments transfer ownership into an async call. Clone explicitly if the caller needs its own value. A Task can only move, cannot be cloned, and is consumed by one await. `&name: T` declares a synchronous borrowed parameter; async functions cannot declare borrowed parameters or retain a borrow across await. There are no application `task.spawn`, `Task.new`, `thread.spawn`, or detach APIs.
 
-`&` borrowing is synchronous; async functions cannot declare borrowed parameters. An async task must own its input data.
+## Operations that can wait
 
-## Result is not Task
+This table applies to **0.0.19**. The default runner follows the interpreter; native Task uses a separate bounded typed subset.
 
-| Expression       | Meaning                                                                        |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `Double(20)`     | A Task handle for the async call                                               |
-| `await first`    | Consume that handle and obtain the declared result, here `int!`                |
-| `(await first)?` | Propagate a recoverable error or obtain the integer                            |
-| `time.sleep(1)?` | One supported wait returning `null!`, not a handle that needs a second `await` |
+| Operation                 | Interpreter / default runner                               | Restricted native Task                                                                                              |
+| ------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| async calls and await     | Single-use Tasks                                           | Listed combinations of primitives, strings, flat arrays, single-layer Results, and function values                  |
+| Integer `time.sleep(ms)?` | Blocking-worker wait                                       | Driver timer; no file background worker occupied                                                                    |
+| Files and directories     | Interpreter operations; not a blanket suspension guarantee | `read/try_read/write/try_write/exists/read_dir` through a fixed background pool                                     |
+| TCP / TLS client          | No corresponding native client                             | Local `net.client/read/write/close` through the fixed background pool; TLS requires a matching pack                 |
+| HTTP                      | Separate HTTP I/O thread, serial Ku handlers               | Named async HTTP handlers with supported request/response types; not a general Task HTTP client                     |
+| Database                  | No database access                                         | Supported PG query suspension within named async HTTP handlers; no general asynchronous Redis/MySQL API             |
+| JSON / dynamic values     | General JSON encode/decode                                 | Encode scalar object literals only; no general JSON decode, arbitrary dynamic heap combinations, or Task containers |
 
-A synchronous function returning `T!` is not made asynchronous by `?`. In the native HTTP PG subset, `client.query(...)?` is a compiler-supported suspension, also distinct from a user Task handle.
+File, TCP, and TLS operations already inside the OS or a foreign library cannot be forcibly killed. Resources return only after the real operation finishes and late results are cleaned up. Native Task connections and bytes must remain local to the current frame; they cannot be Task arguments, return values, or container elements.
 
-## Waiting and backends
+## Scheduling
 
-[time.sleep](/en/docs/stdlib/time/) and supported file operations use their respective execution paths. Complete M:N, general network suspension and arbitrary dynamic heap combinations are not implemented. This arithmetic example does not imply async support for every library, database or `net` call. Supported named [async HTTP handlers](/en/docs/stdlib/http/#named-async-native-handlers), [PG query suspension](/en/docs/stdlib/database/#async-pg) and [scalar JSON encoding](/en/docs/stdlib/json/#scalar-json-objects-in-native-tasks) each have narrower contracts.
+The interpreter and native Task use bounded workers and queues. Interpreter HTTP uses one I/O owner and serial Ku handlers; native HTTP separates connection I/O from handler execution. Complete M:N and general network suspension are not implemented. See the [supported execution paths](/en/docs/support/) for the narrower HTTP, PG and JSON contracts.
 
-`ku supervise` manages whole-program workers, a different unit from a Task handle. See [support and process limits](/en/docs/support/).
+## Cancellation and cleanup
+
+When an owning scope exits, unfinished child Tasks it still owns receive cancellation. A valid move transfers cleanup responsibility. Completed but unawaited results are released too. Cancellation attempts finally cleanup under a shared absolute deadline, normally one second; remaining user statements need not run after that budget expires.
+
+Cancellation and timeout are control termination, not ordinary Results caught as business errors. Cancellation cleanup cannot create Tasks, await, or submit new timers, network waits, or blocking jobs. Cancelling a Task does not prove that an already started OS operation has undone its side effects.
+
+`ku supervise` controls whole-program workers rather than Task handles. See [support and process limits](/en/docs/support/) and the detailed [concurrency reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/concurrency.md).

@@ -1,19 +1,22 @@
 ---
 title: JSON reference
-description: Ku JSON encoding, decoding, KuValue conversion, error codes, and
-  backend support.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+description: Ku JSON encoding, decoding, KuValue conversion, error codes, and backend support.
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/json.rs
-  - src/stdlib/metadata.rs
-  - docs/syntax.md
-  - examples/json.ku
-  - docs/v0.0.18.md
+  [
+    'src/stdlib/json.rs',
+    'src/stdlib/metadata.rs',
+    'docs/syntax.md',
+    'examples/json.ku',
+    'docs/v0.0.18.md',
+  ]
+sidebar:
+  order: 4
 slug: en/v0.0.18/docs/stdlib/json
 ---
 
-`json.encode` / `json.decode` are available in v0.0.18 and share the `stringify` / `parse` implementations. Compatibility names remain available. The previous JSON implementation remains the default; yyjson is not used.
+`std.json` encodes and decodes JSON. `json.encode` reads its input without consuming it; `json.decode` parses text into an independently owned dynamic value. Both return Result. `stringify`, `parse`, and `try_parse` remain compatibility names. All of these interfaces are included in 0.0.18.
 
 ## Import and interfaces
 
@@ -23,27 +26,27 @@ import json from "std.json"
 
 | Interface                    | Returns    | Meaning                                                  |
 | ---------------------------- | ---------- | -------------------------------------------------------- |
-| `json.stringify(&value:any)` | `str!`     | Read only encoding into new compact JSON text            |
-| `json.parse(text:str)`       | `KuValue!` | Strict parsing into an independently owned dynamic value |
-| `json.try_parse(text:str)`   | `KuValue!` | Compatibility alias for `parse`                          |
-| `json.encode(&value:any)`    | `str!`     | Development branch alias for `stringify`                 |
-| `json.decode(text:str)`      | `KuValue!` | Development branch alias for `parse`                     |
+| `json.encode(&value:any)`    | `str!`     | Read-only encoding into new compact JSON text            |
+| `json.decode(text:str)`      | `KuValue!` | Strict parsing into an independently owned dynamic value |
+| `json.stringify(&value:any)` | `str!`     | Compatibility name for `encode`                          |
+| `json.parse(text:str)`       | `KuValue!` | Compatibility name for `decode`                          |
+| `json.try_parse(text:str)`   | `KuValue!` | Compatibility name for `decode`                          |
 
 `!` denotes Result. Use `?` to propagate errors or `try/catch` to handle them. Encoding does not consume or mutate the input.
 
 ## Encode and read values
 
-This is a complete basic example. The development branch has a broader regression example in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18/examples/json.ku).
+This is a complete basic example. A more complete example is available in [examples/json.ku](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/examples/json.ku).
 
 ```ku
 import json from "std.json"
 
 fn main(): null! {
     value = { name: "Ku", count: 7 }
-    text = json.stringify(value)?
+    text = json.encode(value)?
     println(text)
 
-    decoded = json.parse(text)?
+    decoded = json.decode(text)?
     println(decoded["name"]?.as_str()?)
     println(decoded["count"]?.as_int()? + 1)
     return ok(null)
@@ -85,4 +88,4 @@ Recoverable errors use the `json` domain. Common codes are `parse_error`, `strin
 
 The interpreter, default packaged runner, and synchronous native C backend have JSON implementations. **The restricted native Task subset and LLVM do not support JSON.** Default runner imports still depend on their source locations; JSON support does not imply a fully independent package.
 
-Signatures and limits on this page were checked against source and contracts. Execution verification must name the version, commit, and backend. See the complete [JSON syntax contract](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md#127-json).
+See the complete [JSON syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md#127-json).

@@ -420,7 +420,7 @@ p {
 .code-sticker {
   position: absolute;
   right: -14px;
-  bottom: 3px;
+  bottom: -32px;
   pointer-events: none;
   display: flex;
   gap: 10px;

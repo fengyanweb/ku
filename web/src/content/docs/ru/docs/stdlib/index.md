@@ -1,18 +1,19 @@
 ---
 title: 'Стандартная библиотека'
 description: 'Модули стандартной библиотеки Ku, основные сигнатуры и ограничения бэкендов.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Документация описывает зафиксированный объём экспериментального предварительного выпуска v0.0.18. Фактическая публикация и файлы загрузки указаны в GitHub Releases. Эти основные точки входа сверены с исходным кодом; это не исчерпывающий справочник API. Поведение определяет [контракт синтаксиса](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md). Ограничения бэкендов приведены в [матрице поддержки](/ru/docs/support/).
+[Спецификация синтаксиса](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) описывает стандартную библиотеку. Ограничения бэкендов приведены в [матрице поддержки](/ru/docs/support/).
 
 ## Импорт модулей
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Сначала создайте UTF-8-файл `message.txt` рядом с исходным кодом. Отсутствующий файл или неудачное чтение возвращает ошибку. Пример зависит от этого входного файла. `try_read` и `try_write` остаются совместимыми псевдонимами с теми же типами результата.
 
 `read_dir` возвращает отсортированные пути с независимым владением; пределы — 10 000 записей и 1 000 000 байт путей суммарно. Ограниченные файловые операции нативных Task используют фиксированный фоновый пул. Это не подтверждает универсальное сетевое ожидание через тот же механизм.
-
-## Поддержание справочника
-
-Метаданные публичного интерфейса находятся в [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Они проверяются вместе с реализациями и контрактами. Этот сайт пока поддерживает вручную отобранный справочник; существующая команда `ku doc` не подтверждена.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

@@ -1,27 +1,28 @@
 ---
 title: Project and contribution
 description: Ku project status, public source, licensing boundaries, and reproducible issue reports.
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
     'docs/v0.0.19.md',
     'docs/syntax.md',
-    'LICENSE',
-    'NOTICE',
   ]
 ---
 
-The project is **Ku programming language / Ku 编程语言**, with the CLI named `ku`. Ku is a small programming language and interpreter under development. Use the release page to identify published versions and their platform assets.
+The project is **Ku programming language / Ku 编程语言**, with the CLI named `ku`. Ku is a programming language and toolchain with explicit ownership and Result-based error handling. Run through the interpreter, build an executable runner, or compile supported programs through the native C backend. The current version is Ku 0.0.19.
+
+<span id="license"></span>
 
 ## Source and licensing
 
-View the [GitHub source](https://github.com/fengyanweb/ku) and [releases](https://github.com/fengyanweb/ku/releases). Ku is licensed under [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE). Read the repository [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE) and the license included with your particular release or source checkout.
+Ku and its VS Code extension are released under **Apache-2.0**. See the [source](https://github.com/fengyanweb/ku), [0.0.19 release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and [license text](https://github.com/fengyanweb/ku/blob/v0.0.19/LICENSE).
 
-Third-party components retain their own copyrights and license terms. Their notices and license materials remain separate from Ku's license; retain the materials required for the components you redistribute.
+Third-party components retain their own licenses. Release packages include the corresponding license texts and notices.
 
 ## Report a problem
 
@@ -38,10 +39,10 @@ Do not submit tokens, passwords, real connection strings, or logs containing sen
 
 ## Before contributing
 
-The [syntax contract](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md) and [semantic contract](https://github.com/fengyanweb/ku/blob/main/docs/semantics.md) define language behavior. Check CI, implementation, and contracts together. A work log target is not an implemented feature.
+The [syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) and [language semantics](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) define language behavior. Distinguish published behavior from development branch changes when choosing a contribution.
 
-Keep changes focused and explain reproduction, cause, scope, and validation. Review website content alongside the relevant source. The maintainer determines contribution acceptance; this website does not invent a separate contribution agreement.
+Keep changes focused and explain reproduction, cause, scope, and validation. Code, documentation and examples should target the same version. Maintainers review proposed changes before merging.
 
-This website is static. Its prose, navigation, and code do not require a business backend. Search loads a Pagefind index in the browser; the site does not provide remote Ku code execution.
+The website does not currently provide an online Ku interpreter.
 
 Continue with [getting started](/en/docs/getting-started/), [support boundaries](/en/docs/support/), and [release notes](/en/releases/).

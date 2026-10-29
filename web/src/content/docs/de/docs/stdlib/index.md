@@ -1,18 +1,19 @@
 ---
 title: 'Standardbibliothek'
 description: 'Finden Sie Ku-Standardbibliotheksmodule, grundlegende Signaturen und Backend-Grenzen.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Diese Dokumentation beschreibt den eingefrorenen Umfang der experimentellen Vorabversion v0.0.18. Der tatsächliche Veröffentlichungsstatus und die Downloads stehen in GitHub Releases. Diese grundlegenden Einstiegspunkte wurden anhand des Quelltexts geprüft; dies ist keine vollständige API-Referenz. Der [Syntaxvertrag](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) definiert das Verhalten. Backend-Grenzen stehen in der [Unterstützungsmatrix](/de/docs/support/).
+Die [Syntaxreferenz](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) beschreibt die Standardbibliothek. Backend-Grenzen stehen in der [Unterstützungsmatrix](/de/docs/support/).
 
 ## Module importieren
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Erstellen Sie zuerst eine UTF-8-Datei `message.txt` neben dem Quelltext. Eine fehlende Datei oder ein fehlgeschlagener Lesevorgang gibt einen Fehler zurück. Dieses Beispiel hängt von dieser Eingabedatei ab. `try_read` und `try_write` bleiben kompatible Aliasse mit denselben Ergebnistypen.
 
 `read_dir` gibt sortierte Pfade mit unabhängigem Besitz zurück, begrenzt auf 10.000 Einträge und insgesamt 1.000.000 Pfadbytes. Eingeschränkte native Task-Dateioperationen verwenden einen festen Hintergrundpool. Das belegt kein generisches Warten auf Netzwerkvorgänge über denselben Mechanismus.
-
-## Die Referenz pflegen
-
-Metadaten öffentlicher Schnittstellen liegen in [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Sie werden zusammen mit Implementierungen und Verträgen geprüft. Diese Website pflegt derzeit eine ausgewählte manuelle Referenz; ein vorhandener Befehl `ku doc` wurde nicht bestätigt.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

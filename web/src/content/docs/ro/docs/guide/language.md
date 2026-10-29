@@ -1,8 +1,8 @@
 ---
 title: 'Ghidul limbajului'
 description: 'Învață variabilele, funcțiile, controlul execuției, proprietatea, modulele și erorile recuperabile Ku.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,10 +10,11 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Ghidul introduce sintaxa de bază. [Contractul de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) și [contractul semantic](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) ale depozitului rămân normative. Acestea sunt fragmente didactice; diferențele sunt descrise la [suportul backendurilor](/ro/docs/support/).
+Ghidul introduce sintaxa de bază. [Referința de sintaxă](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) și [referința semantică](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) ale depozitului rămân normative. Acestea sunt fragmente didactice; diferențele sunt descrise la [suportul backendurilor](/ro/docs/support/).
 
 ## Variabile și tipuri
 
@@ -55,7 +56,11 @@ if (total == 10) {
 
 `for i in 5` iterează de la `0` la `4`. `if` și `while` necesită condiții `bool`. Folosește acolade pentru mai multe instrucțiuni. Expresiile de ramificare folosesc `match`; nu există `switch`.
 
+<a id="ownership"></a>
+
 ## Proprietate și împrumut doar pentru citire
+
+Valorile Owned se mută implicit și sunt eliberate determinist la ieșirea din domeniul proprietar. Copiile independente cer `.clone()`. Ku nu introduce un GC global cu urmărire; structurile interne partajate, ca mediile închiderilor, pot folosi numărarea referințelor și au costuri de execuție. Împrumutul sincron doar pentru citire se declară prin `&name: T`. Un parametru Owned obișnuit poate muta valoarea chiar dacă doar o citește. Apelul rămâne `length(value)`, fără `&value`; împrumuturile async nu sunt suportate.
 
 `int`, `float`, `bool` și `null` sunt valori Copy. Șirurile, tablourile, obiectele, structurile, enumerările, Results și valorile funcție sunt Owned. Atribuirea și argumentele obișnuite mută implicit valorile deținute. Folosește `.clone()` când ai nevoie de o valoare independentă. Tasks nu pot fi clonate.
 

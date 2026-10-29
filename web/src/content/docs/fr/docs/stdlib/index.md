@@ -1,18 +1,19 @@
 ---
 title: 'Bibliothèque standard'
 description: 'Trouvez les modules de la bibliothèque standard Ku, leurs signatures essentielles et les limites des backends.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Cette documentation décrit le périmètre figé de la préversion expérimentale v0.0.18. La publication effective et les téléchargements sont consignés dans GitHub Releases. Ces points d'entrée essentiels ont été vérifiés dans les sources ; il ne s'agit pas d'une référence API exhaustive. Le [contrat syntaxique](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) définit le comportement. Consultez la [matrice de prise en charge](/fr/docs/support/) pour les limites des backends.
+La [référence de syntaxe](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) décrit la bibliothèque standard. Consultez la [matrice de prise en charge](/fr/docs/support/) pour les limites des backends.
 
 ## Importer des modules
 
@@ -74,24 +75,3 @@ fn main(): null! {
 Créez d'abord un fichier UTF-8 `message.txt` à côté du source. Un fichier absent ou un échec de lecture renvoie une erreur. Cet exemple dépend de ce fichier d'entrée. `try_read` et `try_write` restent des alias compatibles ayant les mêmes types de résultat.
 
 `read_dir` renvoie des chemins triés possédés indépendamment, dans la limite de 10 000 entrées et de 1 000 000 d'octets de chemins au total. Les opérations de fichiers du sous-ensemble natif Task restreint utilisent un pool fixe en arrière-plan. Cela n'établit pas une attente réseau générique via le même mécanisme.
-
-## Entretenir la référence
-
-Les métadonnées d'interfaces publiques se trouvent dans [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs). Elles sont vérifiées avec les implémentations et les contrats. Ce site maintient actuellement une référence manuelle sélectionnée ; l'existence d'une commande `ku doc` n'a pas été confirmée.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

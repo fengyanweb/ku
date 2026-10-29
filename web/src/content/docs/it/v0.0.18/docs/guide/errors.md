@@ -1,18 +1,20 @@
 ---
-title: Errori e risoluzione dei problemi
-description: Diagnostica errori di installazione, importazione, proprietà, JSON
-  e capacità dei backend Ku.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Errori e risoluzione dei problemi'
+description: 'Diagnostica errori di installazione, importazione, proprietà, JSON e capacità dei backend Ku.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - docs/diagnostics.md
-  - docs/syntax.md
-  - src/error.rs
-  - src/stdlib/json.rs
+  [
+    'docs/diagnostics.md',
+    'docs/syntax.md',
+    'src/error.rs',
+    'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: it/v0.0.18/docs/guide/errors
 ---
 
-Questa documentazione descrive l’ambito fissato della versione preliminare sperimentale v0.0.18. La pubblicazione effettiva e i download sono registrati in GitHub Releases. Le diagnostiche del compilatore possono cambiare durante lo sviluppo sperimentale. Quando segnali un problema, includi versione CLI, commit Git, backend, comando completo e sorgente minimo.
+Le diagnostiche del compilatore possono cambiare durante lo sviluppo sperimentale. Quando segnali un problema, includi versione CLI, commit Git, backend, comando completo e sorgente minimo.
 
 ## Identifica l'eseguibile Ku
 
@@ -44,7 +46,7 @@ L'output è in formato **JSON Lines**, con una diagnostica per riga. I campi inc
 | `E0913`     | Parametro async preso in prestito            | Usare un parametro con proprietà; clonare nel chiamante se serve l'originale          |
 | `E0918`     | Scrittura di `&value` nel punto di chiamata  | Passare un argomento normale; la firma dichiara il prestito                           |
 
-Questa è una sintesi delle diagnostiche registrate, non l'elenco di tutti gli errori. Il registro autorevole attuale è [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/error.rs).
+Questa è una sintesi delle diagnostiche registrate, non l'elenco di tutti gli errori. Il registro autorevole attuale è [src/error.rs](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/src/error.rs).
 
 ## Gli errori di esecuzione seguono un contratto separato
 
@@ -72,6 +74,8 @@ Superare `ku check` dimostra soltanto il successo dei controlli del frontend. C 
 
 `ku build --native file.ku` senza `-o` scrive soltanto C. Per compilare e collegare un eseguibile, usa `ku build --backend c file.ku` e installa la toolchain C per la destinazione.
 
-Gli errori di database `execution_unknown` e `execution_completed_without_result` non devono provocare una ripetizione automatica. Conserva le evidenze della richiesta e dell'operazione di business e determina prima lo stato di esecuzione reale. Verificare il sito locale non richiede una connessione a un database di produzione.
+Gli errori di database `execution_unknown` e `execution_completed_without_result` non devono provocare una ripetizione automatica. Conserva le evidenze della richiesta e dell'operazione di business e determina prima lo stato di esecuzione reale.
 
-Per maggiori dettagli, consulta la [guida alle diagnostiche del repository](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/diagnostics.md).
+Per maggiori dettagli, consulta la [guida alle diagnostiche del repository](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/diagnostics.md).
+
+Gli errori JSON mantengono domain/code tra backend, ma message può differire. ku run e runner possono aggiungere json parse failed:, il C nativo no. Confronta domain/code, non il testo completo.

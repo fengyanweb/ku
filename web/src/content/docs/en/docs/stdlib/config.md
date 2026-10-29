@@ -2,7 +2,7 @@
 title: Configuration files
 description: Load .env and flat YAML configuration from source-relative files with std.config.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources: ['src/stdlib/config.rs', 'src/stdlib/metadata.rs', 'docs/syntax.md']
 sidebar:
   order: 7

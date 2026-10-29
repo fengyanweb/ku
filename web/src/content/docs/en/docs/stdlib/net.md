@@ -2,7 +2,7 @@
 title: TCP and TLS clients
 description: Bounded native TCP client configuration, binary I/O, TLS, and lifecycle.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-23'
 sources:
   ['src/stdlib/metadata.rs', 'src/backend/c.rs', 'docs/protocol-foundation.md']
 sidebar:

@@ -28,8 +28,10 @@ The package command defaults to the confirmed origin `https://ku.baiduc.fun`; se
 ## Versions and content
 
 - `src/data/versions.json` controls displayed versions, download tags and historical documentation. Package and lockfile versions must match; the build checks this before rendering.
-- Archived documentation retains its own content and navigation. Never regenerate historical pages from current documentation.
+- Current documentation is 0.0.19. Versions 0.0.18 and 0.0.17 retain their own archived pages and URLs. Do not redirect an old version to current documentation or regenerate it from new content.
+- `src/data/archive-pages.json` records preserved historical pages. A missing page fails the build. Register a new archive explicitly; do not regenerate this inventory from an incomplete directory.
 - The site supports 16 languages; detailed module references are maintained first in Simplified Chinese and English. Check and run changed examples with the matching Ku release.
+- Language changes preserve the document version and topic. Missing translations use the matching English document with an explicit notice. Version changes retain an available matching document or use that version’s documentation entry. Both preserve queries and valid target anchors.
 - Installation pages link to the three published platform bundles. Do not advertise unavailable installers or download URLs.
 - The WeChat donation image lives at `public/images/wechat-donation.png` and appears only on the Support Ku page. Feedback goes to GitHub Issues or `kagura.gc@qq.com`.
 

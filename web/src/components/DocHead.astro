@@ -1,9 +1,14 @@
 ---
-import { localeDefinitions } from '../i18n/locales';
+import { localeDefinitions, localeFromPath, translate } from '../i18n/locales';
 import { translationsForPath } from '../i18n/routes';
 import { archiveFromPath, versions } from '../data/versions';
 const archive = archiveFromPath(Astro.url.pathname);
-const versionLabel = archive?.label ?? versions.current;
+const versionLabel = archive
+  ? translate(localeFromPath(Astro.url.pathname)).snapshot.replace(
+      '{version}',
+      archive.label,
+    )
+  : versions.current;
 const head = Astro.locals.starlightRoute.head.filter(
   ({ tag, attrs }) =>
     !(

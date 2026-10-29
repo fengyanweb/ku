@@ -1,18 +1,20 @@
 ---
-title: Biblioteca estándar
-description: Encuentra módulos de la biblioteca estándar de Ku, firmas
-  esenciales y límites de los backends.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Biblioteca estándar'
+description: 'Encuentra módulos de la biblioteca estándar de Ku, firmas esenciales y límites de los backends.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: es/v0.0.18/docs/stdlib
 ---
 
-Esta documentación describe el alcance fijado de la versión preliminar experimental v0.0.18. La publicación real y las descargas constan en GitHub Releases. Estas interfaces esenciales se han contrastado con el código fuente; no es una referencia exhaustiva de API. El [contrato de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) define el comportamiento. Consulta los límites de los backends en la [matriz de compatibilidad](/es/v0.0.18/docs/support/).
+La [referencia de sintaxis](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) describe la biblioteca estándar. Consulta los límites de los backends en la [matriz de compatibilidad](/es/v0.0.18/docs/support/).
 
 ## Importa módulos
 
@@ -74,7 +76,3 @@ fn main(): null! {
 Primero crea un archivo UTF-8 `message.txt` junto al código fuente. Si el archivo no existe o falla la lectura, se devuelve un error. Este ejemplo depende de ese archivo de entrada. `try_read` y `try_write` siguen siendo alias compatibles con los mismos tipos de resultado.
 
 `read_dir` devuelve rutas ordenadas con propiedad independiente, limitadas a 10.000 entradas y 1.000.000 de bytes de ruta en total. Las operaciones de archivos del subconjunto nativo restringido de Tasks utilizan un pool fijo en segundo plano. Esto no acredita esperas de red genéricas mediante el mismo mecanismo.
-
-## Mantenimiento de la referencia
-
-Los metadatos de las interfaces públicas están en [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs). Se comprueban junto a implementaciones y contratos. El sitio mantiene actualmente una referencia manual seleccionada; no se ha confirmado la existencia de un comando `ku doc`.

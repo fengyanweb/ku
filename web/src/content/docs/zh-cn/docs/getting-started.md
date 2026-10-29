@@ -1,12 +1,12 @@
 ---
 title: 快速开始
 description: 用 Ku 编写 Hello Ku，检查源码并了解解释运行与构建的区别。
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
-先完成[安装](/zh-cn/docs/install/)，并确认 `ku --version` 可执行。
+先完成[安装](/zh-cn/docs/install/)，并确认 `ku --version` 输出 `ku 0.0.19`。
 
 ## 写下第一个程序
 
@@ -84,16 +84,3 @@ ku run
 包通过 `ku.mod` 指定入口。`ku create --list` 查看真实模板列表；当前没有 `ku test` 或 `ku fmt` 命令。
 
 继续阅读[语言指南](/zh-cn/docs/guide/language/)、[错误与排查](/zh-cn/docs/guide/errors/)和[后端支持](/zh-cn/docs/support/)。
-
-## 接下来按任务阅读
-
-| 目标                   | 入口                                                                      | 执行要求                                  |
-| ---------------------- | ------------------------------------------------------------------------- | ----------------------------------------- |
-| 理解值、所有权与错误   | [语言指南](/zh-cn/docs/guide/language/)                                   | 从 `check` 与 `run` 开始                  |
-| 编码数据、读取动态字段 | [JSON](/zh-cn/docs/stdlib/json/)                                          | 通用同步接口或明确受限的 native Task 示例 |
-| 提供 HTTP 服务         | [HTTP](/zh-cn/docs/stdlib/http/)                                          | 同步解释器示例或单独编译的 native handler |
-| 等待、测量耗时         | [时间](/zh-cn/docs/stdlib/time/) / [Task](/zh-cn/docs/guide/concurrency/) | 按后端选择可用的时钟与等待                |
-| 查询数据库             | [数据库](/zh-cn/docs/stdlib/database/)                                    | Native C、原生库、真实服务及私有凭据      |
-| 管理常驻服务及限制     | [CLI](/zh-cn/docs/tools/cli/) / [支持范围](/zh-cn/docs/support/)          | 显式配置进程监督及 OS 前提                |
-
-示例会标明后端和外部依赖。先运行一个完整程序；无条件批量运行全部示例也会启动服务器和连接数据库。

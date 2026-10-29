@@ -1,17 +1,20 @@
 ---
-title: Standart kütüphane
-description: Ku standart kütüphane modüllerini, temel imzaları ve arka uç sınırlarını bulun.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Standart kütüphane'
+description: 'Ku standart kütüphane modüllerini, temel imzaları ve arka uç sınırlarını bulun.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - src/stdlib/metadata.rs
-  - src/stdlib/mod.rs
-  - docs/syntax.md
-  - docs/protocol-foundation.md
+  [
+    'src/stdlib/metadata.rs',
+    'src/stdlib/mod.rs',
+    'docs/syntax.md',
+    'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: tr/v0.0.18/docs/stdlib
 ---
 
-Bu belgeler v0.0.18 deneysel ön sürümünün dondurulmuş kapsamını açıklar. Gerçek yayımlanma durumu ve indirmeler GitHub Releases üzerinde yer alır. Bu temel giriş noktaları kaynak kodla karşılaştırıldı; kapsamlı bir API başvurusu değildir. Davranışı [sözdizimi sözleşmesi](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/syntax.md) tanımlar. Arka uç sınırları için [destek matrisine](/tr/v0.0.18/docs/support/) bakın.
+[Sözdizimi başvurusu](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/syntax.md) standart kütüphaneyi açıklar. Arka uç sınırları için [destek matrisine](/tr/v0.0.18/docs/support/) bakın.
 
 ## Modülleri içe aktarma
 
@@ -73,7 +76,3 @@ fn main(): null! {
 Önce kaynak dosyanın yanında UTF-8 `message.txt` oluşturun. Olmayan dosya veya başarısız okuma hata döndürür. Bu örnek o girdi dosyasına bağımlıdır. `try_read` ve `try_write` aynı sonuç türlerine sahip uyumlu takma adlar olarak kalır.
 
 `read_dir` sıralanmış ve bağımsız sahiplikli yollar döndürür; sınırlar 10.000 girdi ve toplam 1.000.000 yol baytıdır. Sınırlı yerel Task dosya işlemleri sabit bir arka plan havuzu kullanır. Bu durum aynı mekanizmayla genel ağ beklemesini kanıtlamaz.
-
-## Başvurunun bakımı
-
-Açık arayüz metaverisi [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.18/src/stdlib/metadata.rs) içindedir. Uygulamalar ve sözleşmelerle birlikte denetlenir. Bu site şu anda elle seçilmiş bir başvuru tutar; mevcut bir `ku doc` komutu doğrulanmamıştır.

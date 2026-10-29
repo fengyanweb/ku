@@ -4,13 +4,22 @@ import type { Locale } from '../i18n/locales';
 interface Props {
   locale: Locale;
   fallback?: boolean;
+  documentFallback?: boolean;
 }
-const { locale, fallback = false } = Astro.props;
+const { locale, fallback = false, documentFallback = false } = Astro.props;
 ---
 
-{fallback ? (
-  <p id="ku-language-fallback" class="fallback" role="status">
-    {messages[locale].fallback}
+{fallback || documentFallback ? (
+  <p
+    id="ku-language-fallback"
+    class="fallback"
+    role="status"
+    data-pagefind-ignore
+    data-ku-language-fallback
+  >
+    {documentFallback
+      ? messages[locale].documentFallback
+      : messages[locale].fallback}
   </p>
 ) : (
   <p class="notice">{messages[locale].notice}</p>
@@ -31,7 +40,22 @@ const { locale, fallback = false } = Astro.props;
     color: var(--ku-ink);
     font-size: 0.9rem;
   }
-  .fallback:target {
+  .fallback:target,
+  .fallback.is-fallback {
     display: block;
   }
 </style>
+
+<script>
+  function showFallbackNotice() {
+    const active =
+      new URL(location.href).searchParams.get('ku_language_fallback') === '1';
+    document
+      .querySelectorAll<HTMLElement>('[data-ku-language-fallback]')
+      .forEach((notice) => {
+        notice.classList.toggle('is-fallback', active);
+      });
+  }
+  showFallbackNotice();
+  window.addEventListener('pageshow', showFallbackNotice);
+</script>

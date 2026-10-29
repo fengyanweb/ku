@@ -1,5 +1,6 @@
 import { getCollection, render } from 'astro:content';
-import { locales, type Locale } from './locales';
+import { locales, localeFromPath, type Locale } from './locales';
+import { archiveFromPath, unversionedPath } from '../data/versions';
 
 export interface LanguagePage {
   path: string;
@@ -60,6 +61,51 @@ export const languagePages: LanguagePage[] = [
   ...documentPages.filter((page): page is LanguagePage => !!page),
 ];
 
+const documentPaths = new Set(
+  documentPages.filter((page) => !!page).map((page) => page!.path),
+);
+const documentByPath = new Map(
+  documentPages
+    .filter((page): page is LanguagePage => !!page)
+    .map((page) => [page.path, page]),
+);
+
+// Version navigation stays within documentation. A marketing home is not a
+// replacement for an absent document, even when that URL exists.
+export function versionDestination(path: string, targetSlug?: string): string {
+  return versionDestinationInfo(path, targetSlug).path;
+}
+
+export function versionDestinationInfo(path: string, targetSlug?: string) {
+  const locale = localeFromPath(path);
+  const prefix = `/${locale}/${targetSlug ? `${targetSlug}/` : ''}`;
+  const topic = unversionedPath(path)
+    .split('/')
+    .slice(2)
+    .filter(Boolean)
+    .join('/');
+  const samePage = `${prefix}${topic}${topic ? '/' : ''}`;
+  if (documentPaths.has(samePage))
+    return { ...documentByPath.get(samePage)!, fallback: false };
+
+  const englishSamePage = `/en/${targetSlug ? `${targetSlug}/` : ''}${topic}${topic ? '/' : ''}`;
+  if (documentPaths.has(englishSamePage))
+    return { ...documentByPath.get(englishSamePage)!, fallback: true };
+
+  const entry = targetSlug ? prefix : `${prefix}docs/getting-started/`;
+  if (documentPaths.has(entry))
+    return { ...documentByPath.get(entry)!, fallback: false };
+
+  // Older versions do not have every translation. Use a real English entry
+  // instead of advertising a generated fallback as a translated document.
+  const englishEntry = targetSlug
+    ? `/en/${targetSlug}/`
+    : '/en/docs/getting-started/';
+  if (documentPaths.has(englishEntry))
+    return { ...documentByPath.get(englishEntry)!, fallback: true };
+  throw new Error(`Missing documentation entry for ${targetSlug ?? 'current'}`);
+}
+
 export function translationsForPath(path: string) {
   const current = languagePages.find((page) => page.path === path);
   if (!current) return [];
@@ -76,12 +122,29 @@ export function languageDestination(path: string, locale: Locale) {
         (page) => page.locale === locale && page.topic === topic,
       )
     : undefined;
-  return page
-    ? { ...page, fallback: false }
-    : {
-        path: `/${locale}/#ku-language-fallback`,
-        locale,
-        anchors: ['ku-language-fallback'],
-        fallback: true,
-      };
+  if (page) return { ...page, fallback: false };
+
+  // A missing translation must preserve the document's version and topic.
+  // Marketing pages have their own language-home fallback below.
+  if (
+    locales.includes(sourceLocale) &&
+    (documentPaths.has(path) ||
+      topic.startsWith('docs/') ||
+      topic === 'releases' ||
+      archiveFromPath(path))
+  ) {
+    const english = documentByPath.get(`/en/${topic}/`);
+    if (english) return { ...english, fallback: true };
+    const archive = archiveFromPath(path);
+    const entry = documentByPath.get(
+      archive ? `/en/${archive.slug}/` : '/en/docs/getting-started/',
+    );
+    if (entry) return { ...entry, fallback: true };
+  }
+  return {
+    path: `/${locale}/`,
+    locale,
+    anchors: ['ku-language-fallback'],
+    fallback: true,
+  };
 }

@@ -1,18 +1,19 @@
 ---
 title: 'Erori și depanare'
 description: 'Diagnostichează erorile de instalare Ku, importuri, proprietate, JSON și capabilități ale backendurilor.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/diagnostics.md',
     'docs/syntax.md',
     'src/error.rs',
     'src/stdlib/json.rs',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-Documentația descrie domeniul fixat al prelansării experimentale v0.0.18. Publicarea efectivă și descărcările sunt înregistrate în GitHub Releases. Diagnosticele compilatorului se pot schimba în dezvoltarea experimentală. Include versiunea CLI, commitul Git, backendul, comanda completă și sursa minimă când raportezi o problemă.
+Diagnosticele compilatorului se pot schimba în dezvoltarea experimentală. Include versiunea CLI, commitul Git, backendul, comanda completă și sursa minimă când raportezi o problemă.
 
 ## Identifică executabilul Ku
 
@@ -72,6 +73,8 @@ Trecerea `ku check` confirmă doar că verificarea frontendului a reușit. C nat
 
 `ku build --native file.ku` fără `-o` scrie doar C. Pentru compilarea și linkarea unui executabil, folosește `ku build --backend c file.ku` și instalează instrumentele C pentru țintă.
 
-Erorile de bază de date `execution_unknown` și `execution_completed_without_result` nu trebuie să declanșeze repetare automată. Păstrează dovezile cererii și operației de afaceri, apoi stabilește starea reală a execuției. Verificarea site-ului local nu necesită conectarea la o bază de date de producție.
+Erorile de bază de date `execution_unknown` și `execution_completed_without_result` nu trebuie să declanșeze repetare automată. Păstrează dovezile cererii și operației de afaceri, apoi stabilește starea reală a execuției.
 
 Pentru detalii, vezi [ghidul de diagnostic din depozit](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/diagnostics.md).
+
+Erorile JSON au aceleași domain/code între backenduri, dar message poate diferi. ku run și runner pot adăuga json parse failed:, pe când C nativ nu. Compară domain/code, nu mesajul integral.

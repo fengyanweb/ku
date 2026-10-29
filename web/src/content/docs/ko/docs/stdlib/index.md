@@ -1,18 +1,19 @@
 ---
 title: '표준 라이브러리'
 description: 'Ku 표준 라이브러리 모듈, 주요 시그니처, 백엔드 제한.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'src/stdlib/metadata.rs',
     'src/stdlib/mod.rs',
     'docs/syntax.md',
     'docs/protocol-foundation.md',
+    'docs/v0.0.18-r1.md',
   ]
 ---
 
-이 문서는 실험적 사전 릴리스 v0.0.18의 확정된 범위를 설명합니다. 실제 공개 상태와 다운로드는 GitHub Releases에서 확인하세요. 주요 진입점을 소스와 대조했으며 모든 API를 다루는 참조 문서는 아닙니다. 동작은 [문법 계약](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)이 정의합니다. 백엔드 제한은 [지원 표](/ko/docs/support/)를 참고하세요.
+표준 라이브러리는 [문법 참조](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)를, 백엔드별 제한은 [지원 표](/ko/docs/support/)를 참고하세요.
 
 ## 모듈 가져오기
 
@@ -74,24 +75,3 @@ fn main(): null! {
 먼저 소스 옆에 UTF-8 `message.txt`를 만드세요. 파일이 없거나 읽기에 실패하면 오류를 반환합니다. 이 예시는 해당 입력 파일에 의존합니다. `try_read`와 `try_write`는 같은 결과 타입을 갖는 호환 별칭입니다.
 
 `read_dir`는 정렬된 독립 소유 경로를 반환하며 최대 10,000개 항목, 총 경로 길이 1,000,000바이트로 제한됩니다. 제한된 네이티브 Task 파일 작업은 고정 백그라운드 풀을 사용합니다. 같은 메커니즘으로 범용 네트워크 대기가 구현되었다는 뜻은 아닙니다.
-
-## 참조 문서 유지 관리
-
-공개 인터페이스 메타데이터는 [src/stdlib/metadata.rs](https://github.com/fengyanweb/ku/blob/v0.0.19/src/stdlib/metadata.rs)에 있습니다. 구현과 계약을 함께 대조합니다. 이 웹사이트는 현재 내용을 선별한 수동 참조 문서를 유지합니다. 기존 `ku doc` 명령은 확인되지 않았습니다.
-
-## API reference (English)
-
-Detailed module references and runnable examples are currently available in English:
-
-- [http](/en/docs/stdlib/http/)
-- [time](/en/docs/stdlib/time/)
-- [fs](/en/docs/stdlib/fs/)
-- [config](/en/docs/stdlib/config/)
-- [string](/en/docs/stdlib/string/)
-- [array](/en/docs/stdlib/array/)
-- [object](/en/docs/stdlib/object/)
-- [json](/en/docs/stdlib/json/)
-- [bytes](/en/docs/stdlib/bytes/)
-- [net](/en/docs/stdlib/net/)
-- [database](/en/docs/stdlib/database/)
-- [compiler](/en/docs/stdlib/compiler/)

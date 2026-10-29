@@ -1,7 +1,6 @@
 {
   "current": "0.0.19",
   "released": "0.0.19",
-  "releaseTag": "v0.0.19",
   "archives": [
     {
       "slug": "v0.0.18",
@@ -11,5 +10,12 @@
       "slug": "v0.0.17",
       "label": "0.0.17"
     }
-  ]
+  ],
+  "languageVersion": "0.0.19",
+  "releaseTag": "v0.0.19",
+  "releaseChannel": "experimental",
+  "releaseCommit": "73e9f2fef6861b0bc1ce441471726b926a8a174b",
+  "docsSourceRef": "v0.0.19",
+  "releaseUrl": "https://github.com/fengyanweb/ku/releases/tag/v0.0.19",
+  "verifiedAt": "2026-10-28"
 }

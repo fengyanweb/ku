@@ -1,24 +1,22 @@
 ---
-title: Installazione e download
-description: Scarica la versione preliminare sperimentale Ku 0.0.18 e comprendi
-  i requisiti di piattaforma e compilazione.
-kuVersion: '0.0.18 / experimental prerelease'
-verifiedAt: '2026-10-20'
+title: 'Installazione e download'
+description: 'Scarica la versione preliminare sperimentale Ku 0.0.18 e comprendi i requisiti di piattaforma e compilazione.'
+kuVersion: '0.0.18'
+verifiedAt: '2026-10-23'
 sources:
-  - Cargo.toml
-  - docs/v0.0.18.md
-  - docs/history.md
-  - .github/scripts/export-release.py
+  [
+    'Cargo.toml',
+    'docs/v0.0.18.md',
+    'docs/history.md',
+    '.github/scripts/export-release.py',
+    'docs/v0.0.18-r1.md',
+  ]
 slug: it/v0.0.18/docs/install
 ---
 
-> Gli aggiornamenti v0.0.18 seguono per ora in inglese; il resto della traduzione è mantenuto. [English](/en/v0.0.18/docs/support/) · [简体中文](/zh-cn/v0.0.18/docs/support/)
-
-This page targets the **v0.0.18 experimental prerelease**. Use the actual [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) and its assets; documentation alone does not establish completed publication or production readiness.
-
 ## Scegli la piattaforma
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.18 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18). `native_ci-*` artifacts are CI examples, not CLI installers.
+[Scarica Ku 0.0.18](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · `SHA256SUMS` · `.manifest.json`
 
 | Sistema | Architettura          | Archivio                                     |
 | ------- | --------------------- | -------------------------------------------- |
@@ -26,7 +24,7 @@ Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.
 | Windows | x64 / MSVC            | `ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz`   |
 | Linux   | x64 / GNU             | `ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz` |
 
-Non sono stati verificati archivi per altre piattaforme. Il supporto alla compilazione incrociata non significa che ogni sistema operativo o architettura disponga di un pacchetto pubblicato.
+Sono disponibili pacchetti precompilati per queste tre piattaforme. La compilazione incrociata non implica un pacchetto pubblicato per ogni sistema.
 
 ## Estrai e verifica
 
@@ -46,6 +44,118 @@ Su Windows PowerShell:
 
 La versione riportata dovrebbe essere `0.0.18`. Se vuoi, aggiungi questa directory a `PATH`, quindi esegui `ku --version`. Installa il file incluso `ku-language-0.0.18.vsix` per l'integrazione con VS Code.
 
+Installazione da copiare: macOS richiede curl, tar e shasum; Linux curl, tar, awk e sha256sum; Windows PowerShell e tar.exe. I blocchi verificano SHA256 ed eseguono Hello Ku. PATH cambia solo nel subshell POSIX o viene ripristinato in PowerShell, mai globalmente. La fonte Windows è UTF-8 senza BOM e gestisce percorsi con spazi.
+
+### macOS · Apple Silicon
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-aarch64-apple-darwin.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  shasum -a 256 -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Linux · x64 GNU
+
+```sh
+(
+  set -eu
+  base="https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1"
+  archive="ku-v0.0.18-x86_64-unknown-linux-gnu.tar.gz"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/Ku install.XXXXXX")"
+  cd "$work"
+  curl --fail --location --output "$archive" "$base/$archive"
+  curl --fail --location --output SHA256SUMS "$base/SHA256SUMS"
+  awk -v name="$archive" '$2 == name { print }' SHA256SUMS > archive.sha256
+  test "$(wc -l < archive.sha256 | tr -d ' ')" = 1
+  sha256sum -c archive.sha256
+  mkdir "Ku 0.0.18"
+  tar -xzf "$archive" -C "Ku 0.0.18"
+  cd "Ku 0.0.18"
+  export PATH="$PWD:$PATH"
+  ku --version
+  cat > hello.ku <<'KU'
+fn main() {
+    println("Hello Ku")
+}
+KU
+  ku check hello.ku
+  ku run hello.ku
+  printf 'Ku directory: %s\n' "$PWD"
+)
+```
+
+### Windows · x64
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$base = 'https://github.com/fengyanweb/ku/releases/download/v0.0.18-r1'
+$archive = 'ku-v0.0.18-x86_64-pc-windows-msvc.tar.gz'
+$work = Join-Path ([IO.Path]::GetTempPath()) ('Ku install ' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work | Out-Null
+$archivePath = Join-Path $work $archive
+$sumsPath = Join-Path $work 'SHA256SUMS'
+Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath
+Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath
+$pattern = '^[0-9a-fA-F]{64}\s+' + [regex]::Escape($archive) + '$'
+$lines = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match $pattern })
+if ($lines.Count -ne 1) { throw 'Missing or ambiguous SHA256SUMS entry' }
+$expected = ($lines[0] -split '\s+')[0]
+$actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+if ($actual -ne $expected) { throw 'SHA256 mismatch; do not extract or run' }
+$kuDir = Join-Path $work 'Ku 0.0.18'
+New-Item -ItemType Directory -Path $kuDir | Out-Null
+tar -xzf $archivePath -C $kuDir
+if ($LASTEXITCODE -ne 0) { throw 'Archive extraction failed' }
+$hello = @'
+fn main() {
+    println("Hello Ku")
+}
+'@
+[IO.File]::WriteAllText((Join-Path $kuDir 'hello.ku'), $hello + "`n", [Text.UTF8Encoding]::new($false))
+$previousPath = $env:Path
+Push-Location -LiteralPath $kuDir
+try {
+    $env:Path = "$kuDir;$env:Path"
+    ku.exe --version
+    if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+    ku.exe check hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Source check failed' }
+    ku.exe run hello.ku
+    if ($LASTEXITCODE -ne 0) { throw 'Program failed' }
+} finally {
+    $env:Path = $previousPath
+    Pop-Location
+}
+Write-Output "Ku directory: $kuDir"
+```
+
+```text
+ku 0.0.18
+Hello Ku
+```
+
 ## Requisiti di esecuzione e compilazione
 
 | Operazione                              | Requisiti aggiuntivi                                                                              |
@@ -57,21 +167,33 @@ La versione riportata dovrebbe essere `0.0.18`. Se vuoi, aggiungi questa directo
 
 Il runner predefinito incorpora solo il sorgente di ingresso. I moduli importati continuano a caricarsi dalle posizioni originali. Il rilascio di un grafo completo di importazioni locali indipendente dal sorgente richiede la compilazione nativa C e resta soggetto ai [limiti di supporto dei backend](/it/v0.0.18/docs/support/).
 
-## Prova il codice di sviluppo
-
-Da una copia locale del repository:
+Il runner predefinito invoca rustc. Seleziona esplicitamente Rust 1.89.0 secondo RELEASE.json e gli rlibs inclusi; un Rust predefinito diverso può causare E0514. Ku deve essere nel PATH temporaneo.
 
 ```sh
+rustup run 1.89.0 ku build hello.ku
+```
+
+PowerShell:
+
+```powershell
+rustup run 1.89.0 ku.exe build hello.ku
+```
+
+## Compilare i sorgenti corrispondenti
+
+I seguenti comandi compilano il codice sorgente pubblicato.
+
+```sh
+git clone --branch v0.0.18-r1 --depth 1 https://github.com/fengyanweb/ku.git
+cd ku
 cargo +1.89.0 run --locked --release -- --version
 cargo +1.89.0 run --locked --release -- run examples/hello.ku
 ```
 
-The CLI and Cargo version for this release is `0.0.18`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
-
 ## Disinstalla
 
-Per un'installazione da archivio, rimuovi la directory estratta, annulla le voci `PATH` aggiunte e disinstalla l'estensione VS Code. Prima conserva i sorgenti e la configurazione che hai creato lì. Non sono stati verificati un programma di installazione separato con un clic, un'installazione tramite gestore di pacchetti o un comando `ku uninstall`.
+L’installazione usa archivi. Salva sorgenti e impostazioni creati nella cartella di installazione, quindi rimuovi cartella, voci `PATH` aggiunte ed estensione VS Code.
 
-Passo successivo: [esegui il tuo primo programma](/it/v0.0.18/docs/getting-started/). Fonte del contratto di installazione: [archivi delle versioni](https://github.com/fengyanweb/ku/blob/v0.0.18/docs/history.md).
+Passo successivo: [esegui il tuo primo programma](/it/v0.0.18/docs/getting-started/). Fonte del contratto di installazione: [archivi delle versioni](https://github.com/fengyanweb/ku/blob/v0.0.18-r1/docs/history.md).
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/it/v0.0.18/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+Prerequisiti e misure di memoria di `ku supervise` sono nel [supporto](/it/v0.0.18/docs/support/). La CLI macOS esegue programmi, ma non supporta questo isolamento nativamente.

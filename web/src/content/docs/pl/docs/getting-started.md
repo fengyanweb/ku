@@ -1,12 +1,19 @@
 ---
 title: 'Pierwsze kroki'
 description: 'Napisz Hello Ku, sprawdź kod źródłowy i poznaj różnicę między interpretacją a kompilacją.'
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-20'
-sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
+sources:
+  [
+    'examples/hello.ku',
+    'README.md',
+    'docs/syntax.md',
+    'docs/v0.0.18.md',
+    'docs/v0.0.18-r1.md',
+  ]
 ---
 
-Dokumentacja opisuje zamrożony zakres eksperymentalnego wydania wstępnego v0.0.18. Faktyczna publikacja i pliki do pobrania są zapisane w GitHub Releases. Ta strona używa podstawowej składni i poleceń CLI dostępnych już w v0.0.17. Najpierw [zainstaluj Ku](/pl/docs/install/) i sprawdź, czy działa `ku --version`.
+Najpierw [zainstaluj Ku](/pl/docs/install/) i sprawdź, czy działa `ku --version`.
 
 ## Pierwszy program
 
@@ -81,4 +88,4 @@ ku run
 
 Punkt wejścia pakietu konfiguruje się w `ku.mod`. `ku create --list` wyświetla dostępne szablony. Polecenia `ku test` i `ku fmt` obecnie nie istnieją.
 
-Przejdź do [przewodnika po języku](/pl/docs/guide/language/), [rozwiązywania problemów](/pl/docs/guide/errors/) i [obsługi zapleczy](/pl/docs/support/). Pokazane wyniki są oczekiwanymi przykładami i nie zastępują sprawdzenia instalacji na własnej platformie.
+Przejdź do [przewodnika po języku](/pl/docs/guide/language/), [rozwiązywania problemów](/pl/docs/guide/errors/) i [obsługi zapleczy](/pl/docs/support/).

@@ -1,33 +1,34 @@
 ---
 title: 项目与贡献
 description: Ku 项目状态、公开源码、许可边界与提交问题的方式。
-kuVersion: '0.0.19 / experimental prerelease'
+kuVersion: '0.0.19'
 verifiedAt: '2026-10-28'
 sources:
   [
     'README.md',
     'Cargo.toml',
+    'LICENSE',
     'editors/vscode-ku/package.json',
     'docs/v0.0.19.md',
     'docs/syntax.md',
-    'LICENSE',
-    'NOTICE',
   ]
 ---
 
-项目名称为 **Ku 编程语言 / Ku programming language**，CLI 名称为 `ku`。Ku 是仍在开发中的小型编程语言与解释器，已发布版本及平台资产以发行页面为准。
+项目名称为 **Ku 编程语言 / Ku programming language**，CLI 名称为 `ku`。Ku 是具有显式所有权与 Result 错误处理的编程语言与工具链，提供解释运行、可执行 runner 和已支持程序的原生 C 编译路径。当前版本为 Ku 0.0.19。
+
+<span id="license"></span>
 
 ## 源码与许可
 
-[查看 GitHub 源码](https://github.com/fengyanweb/ku)与[发行页面](https://github.com/fengyanweb/ku/releases)。Ku 使用 [Apache License 2.0](https://github.com/fengyanweb/ku/blob/main/LICENSE)。请阅读仓库 [NOTICE](https://github.com/fengyanweb/ku/blob/main/NOTICE)，并以所用发行版或源码副本中附带的许可文本为准。
+Ku 与 VS Code 插件采用 **Apache-2.0** 许可证。可查看[源码](https://github.com/fengyanweb/ku)、[0.0.19 发行包](https://github.com/fengyanweb/ku/releases/tag/v0.0.19)和[许可证全文](https://github.com/fengyanweb/ku/blob/v0.0.19/LICENSE)。
 
-第三方组件保留各自的版权与许可条款，其通知和许可材料与 Ku 自身许可分别适用；再分发时应保留对应组件要求的材料。
+第三方组件仍遵循各自许可证；发行包内保留了相应许可证与声明。
 
 ## 提交问题
 
 通过[仓库 Issues](https://github.com/fengyanweb/ku/issues)提交可复现问题。报告尽量包含：
 
-邮件反馈：[kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+邮件反馈: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
 
 - Ku 版本、Git commit（使用开发源码时）和目标系统 / 架构。
 - 完整命令、后端、最小 `.ku` 源码。
@@ -38,10 +39,10 @@ sources:
 
 ## 贡献前先读
 
-[语法合同](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md)与[语义合同](https://github.com/fengyanweb/ku/blob/main/docs/semantics.md)规定语言行为。CI、实现和规范需一起核对，不能把工作日志目标当成已实现功能。
+[语法参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)与[语言语义](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)规定语言行为。选择修改目标时，请区分已发布行为与开发分支。
 
-修改应尽量小，说明复现、原因、影响和验证范围。网站内容与对应源码一起审查，接受贡献的具体流程仍由维护方决定，本站不另行虚构贡献协议。
+修改应尽量小，说明复现、原因、影响和验证范围。源码、文档与示例应使用同一版本；维护者审核后再合并贡献。
 
-当前官网是静态站点，正文、导航和代码无需业务后端。站内搜索在浏览器加载 Pagefind 索引；不提供线上 Ku 代码执行服务。
+本站暂不提供在线 Ku 解释器。
 
 继续阅读[快速开始](/zh-cn/docs/getting-started/)、[支持范围](/zh-cn/docs/support/)与[发布记录](/zh-cn/releases/)。

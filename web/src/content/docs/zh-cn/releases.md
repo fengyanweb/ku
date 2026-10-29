@@ -2,8 +2,8 @@
 title: '版本与发布记录'
 description: '版本与发布记录'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-21'
-sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.19.md']
+verifiedAt: '2026-10-23'
+sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
 ## 0.0.19
@@ -14,21 +14,17 @@ Ku 0.0.19 是供受控环境试用的实验预发行版，CLI 与 VS Code 插件
 
 实际公开状态、附件与校验信息以 Release 页面为准。升级后应重新构建 native 程序；本版安装包目标仍为 macOS ARM64、Linux x64 和 Windows x64。
 
-## 0.0.18 修订版 1（历史）
+## 0.0.18
 
-历史修订版保留 0.0.18 版本号，发布标识为 `v0.0.18-r1`。新增调用链、大浮点源码字面量、`time.date(Time)` 和插件修复；[初版 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.18) 保留供追溯。
+Ku 0.0.18 为实验版本，包含受限 native Task、计时器与后台 I/O、HTTP/1.1 连接复用、JSON 编解码，以及通过 `ku supervise` 显式管理完整程序的资源限制。
 
-该版为实验预发行版，包含有限 Task/等待与关闭修复、HTTP 连接复用与缓冲限制、JSON 大浮点往返修复，以及显式 `ku supervise` 受控 worker。
+本版已包含 native C 浮点常量与大浮点构建、链式调用接收者重复求值、`time.date(Time)` 的 Result 检查，以及 VS Code 插件版本读取和补全修复。升级后请重新编译受影响的 native 程序；即使扩展版本号相同，旧的 `ku-language-0.0.18.vsix` 也需要重新安装。
 
-[下载与校验](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [固定文档](/zh-cn/v0.0.18/) · [已知限制](/zh-cn/docs/support/)
+[安装 Ku](/zh-cn/v0.0.18/docs/install/) · [下载 0.0.18](https://github.com/fengyanweb/ku/releases/tag/v0.0.18-r1) · [支持平台与已知问题](/zh-cn/v0.0.18/docs/support/)
 
-**HTTP 已知问题：历史出现过 504，本轮短测未复现，根因未确认，正式 30 分钟验收尚未通过。** 完整 M:N、通用网络调度和数据库完整平台矩阵尚未完成。
+## v0.0.17
 
-## 0.0.17
-
-同步只读借用、自举 Parser 的花括号 while 与跨平台工具修复。
-
-[下载与发布说明](https://github.com/fengyanweb/ku/releases/tag/v0.0.17) · [固定文档](/zh-cn/v0.0.17/)
+同步只读借用、自举 Parser 的花括号 while 与跨平台工具修复。对应[发布记录](https://github.com/fengyanweb/ku/releases/tag/v0.0.17)，旧 API 与当前版本可能不同。
 
 ## 早期开发记录
 

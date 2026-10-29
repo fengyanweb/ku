@@ -1,8 +1,8 @@
 ---
 title: 语言指南
 description: 学习 Ku 的变量、函数、控制流、所有权、模块与可恢复错误。
-kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+kuVersion: '0.0.19'
+verifiedAt: '2026-10-23'
 sources:
   [
     'docs/syntax.md',
@@ -10,14 +10,12 @@ sources:
     'examples/function.ku',
     'examples/control_flow.ku',
     'examples/result.ku',
-    'src/cli.rs',
-    'src/ir/task_lower.rs',
   ]
 sidebar:
   order: 0
 ---
 
-本页介绍核心写法，详细规则见仓库[语法合同](https://github.com/fengyanweb/ku/blob/main/docs/syntax.md)和[语义合同](https://github.com/fengyanweb/ku/blob/main/docs/semantics.md)为准。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
+从变量、函数和错误处理开始，再了解资源的归属。详细规则见[语法参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)和[语言语义](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)。下列为教学片段，后端差异见[支持矩阵](/zh-cn/docs/support/)。
 
 ## 变量与类型
 
@@ -59,9 +57,11 @@ if (total == 10) {
 
 `for i in 5` 遍历 `0` 到 `4`。`if` 与 `while` 条件必须是 `bool`；多语句 body 使用花括号。分支表达式使用 `match`，没有 `switch`。
 
+<span id="ownership"></span>
+
 ## 所有权与只读借用
 
-`int`、`float`、`bool`、`null` 是 Copy 值。字符串、数组、对象、结构体、enum、Result 与函数值按 Owned 处理，赋值和普通传参默认 move；需要保留独立值时显式 `.clone()`。Task 不可 clone。
+`int`、`float`、`bool`、`null` 是 Copy 值。字符串、数组、对象、结构体、enum、Result 与函数值按 Owned 处理，赋值和普通传参默认 move；需要保留独立值时显式 `.clone()`。Task 和 move-only native 句柄不可 clone。Owned 值在拥有者作用域退出时确定性 drop；复制不是自动发生的。
 
 ```ku
 original = "Ku"
@@ -70,15 +70,25 @@ println(original)
 println(copy)
 ```
 
-同步函数可以声明只读借用参数：
+Ku 的所有权语义不依赖全局追踪式垃圾回收（tracing GC）。部分共享内部结构仍使用引用计数，例如 native 闭包环境；这不表示零运行时开销、零停顿或不会发生实现缺陷。
+
+同步函数可以声明只读借用参数，完整示例：
 
 ```ku
 fn length(&text: str): int {
     return text.len()
 }
+
+fn main() {
+    text = "Ku"
+    println(length(text))
+    println(text)
+}
 ```
 
-调用仍写 `length(value)`，不在实参前加 `&`。借用不能修改来源、移出其 owned 内容或逃逸调用作用域；async borrowed 参数等组合尚不支持。只读借用不是任意函数纯度保证。
+预期输出为 `2` 和 `Ku`。
+
+调用仍写 `length(value)`，不在实参前加 `&`。借用不能修改来源、移出其 owned 内容或逃逸调用作用域；async borrowed 参数等组合尚不支持。普通 Owned 参数仍可能移动实参，即使函数体只读；是否保留所有权由参数声明决定。只读借用不代表函数没有 I/O 或内部状态变化。
 
 ## 结构体、对象与模块
 
@@ -95,6 +105,8 @@ println(user.name)
 动态对象使用 `{ name: "Ku" }`。普通对象索引缺键会失败；`value["name"]?` 以 Result 处理缺键，成功值为 `KuValue`，需要具体类型时用 `.as_str()?` 或 `.as_int()?`。缺键不会自动变成 `null`。
 
 标准库使用点分路径，例如 `import json from "std.json"`；本地模块可写 `import math from "./math"`。用户顶层导出名以 ASCII 大写字母开头，小写名字保留在文件内部。
+
+<span id="errors"></span>
 
 ## 可恢复错误
 
@@ -120,12 +132,4 @@ Error 包含 `domain`、`code`、`message`。`panic`、Task 取消和超时不�
 
 ## 并发的当前边界
 
-普通开发者通过 `async fn` 获得一次性 Task 句柄，再 `await`；没有 `task.spawn`、`Task.new` 或 `thread.spawn` 业务入口。解释器和 native Task 子集的覆盖不同，不应从一种后端的示例推导另一种后端完整支持。参见[平台与后端支持](/zh-cn/docs/support/)。
-
-## 选择执行合同
-
-源码语言与后端覆盖相关，但不是同一件事。`ku check` 检查程序，`ku run` 执行解释器，默认 `ku build` 打包解释器路径，`ku build --backend c` 只降低其支持的子集。检查器接受的库调用仍可能被 native 降低拒绝。
-
-`T!` 表示 Result 值，`async fn` 产生 Task。`?` 传播 Result，`await` 消费 Task，二者不能互换。native HTTP 中的 PG 查询等操作有明确限定的挂起路径，必须按模块说明使用。
-
-从[标准库索引](/zh-cn/docs/stdlib/)查参数、返回值与错误，再核对[后端和资源边界](/zh-cn/docs/support/)选择部署命令。async 语法不代表通用线程启动或自动重试 API。
+普通开发者通过 `async fn` 获得一次性 Task 句柄，再 `await`；没有 `task.spawn`、`Task.new` 或 `thread.spawn` 业务入口。解释器和 native Task 子集的覆盖不同，不应从一种后端的示例推导另一种后端完整支持。参见 [Task 与异步调用](/zh-cn/docs/guide/concurrency/)和[平台与后端支持](/zh-cn/docs/support/)。
