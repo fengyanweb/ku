@@ -710,6 +710,7 @@ fn generate_c_source_with_frames_attempt(
     // array typedefs (a `KuArray_KuStruct_X` only needs the struct as a pointer),
     // then the struct bodies (which can embed a `KuArray_*` by value), then the
     // ownership helpers (forward-declared so struct-clone↔array-clone can recurse).
+    emit_object_type_header(&mut out, program, task_net || task_json)?;
     emit_struct_forward_decls(&mut out, program);
     // Arrays store their element behind a pointer, so a declared (not yet
     // complete) Result/closure tag is enough for `[T!]` and `[fn(...): T]`.
@@ -1586,6 +1587,7 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         for field in &layout.fields {
             match &field.ty {
                 IrType::Int | IrType::Float | IrType::Bool | IrType::Str => {}
+                IrType::Named(name) if is_runtime_object_name(name) => {}
                 // Array fields (`[int]`, `[Person]`, `[[int]]`): the array typedef is
                 // emitted before the struct layout and the array helpers are forward-
                 // declared, so embedding one by value and deep clone/drop both work.
@@ -1650,7 +1652,7 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
             // fields are ordered by `emit_layouts` across the unified struct+enum
             // graph, so skip them (their name is not in the struct `indexes`).
             if let IrType::Named(name) = &field.ty {
-                if enum_type_name(name).is_some() {
+                if enum_type_name(name).is_some() || is_runtime_object_name(name) {
                     continue;
                 }
                 let dependency = indexes[name.as_str()];
@@ -1676,6 +1678,8 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
             for field in &variant.fields {
                 match &field.ty {
                     IrType::Int | IrType::Float | IrType::Bool | IrType::Str => {}
+                    IrType::Named(name) if is_runtime_object_name(name) => {}
+                    IrType::Array(element) if is_early_array_element(element, program) => {}
                     IrType::Named(name) if enum_type_name(name).is_none() => {
                         if !indexes.contains_key(name.as_str()) {
                             return Err(unsupported(format!(
@@ -1923,22 +1927,26 @@ fn emit_struct_forward_decls(out: &mut COutput, program: &IrProgram) {
     }
 }
 
-/// An array element whose `KuArray_E` typedef is emittable *before* the struct
-/// layouts: a primitive, a user struct (its tag is forward-declared, and the array
-/// only holds a pointer to it), or a nested array of such. Closure/object/http/value
-/// elements are NOT early — their tags are declared here, but their C type bodies
-/// are completed later by `emit_late_array_typedefs`.
+fn is_runtime_object_name(name: &str) -> bool {
+    matches!(name, "__ku_value" | "__ku_object")
+}
+
+/// An array element whose ABI is available before user aggregate layouts:
+/// primitives, the already-declared dynamic object/value ABI, forward-declared
+/// user struct pointers, or nested arrays of those. Closure/http elements remain
+/// late; their full type bodies are emitted in subsequent ABI phases.
 fn is_early_array_element(element: &IrType, program: &IrProgram) -> bool {
     match element {
         IrType::Int | IrType::Float | IrType::Bool | IrType::Str => true,
         IrType::Array(inner) => is_early_array_element(inner, program),
         IrType::Named(name) => {
-            enum_type_name(name).is_none()
-                && program
-                    .layouts
-                    .structs
-                    .iter()
-                    .any(|layout| layout.name == *name)
+            is_runtime_object_name(name)
+                || (enum_type_name(name).is_none()
+                    && program
+                        .layouts
+                        .structs
+                        .iter()
+                        .any(|layout| layout.name == *name))
         }
         _ => false,
     }
@@ -3887,9 +3895,37 @@ fn emit_result_abi_phase(
     Ok(())
 }
 
+/// Complete the existing dynamic ABI before user layouts can embed KuValue by
+/// value. Only declarations move here; ownership implementations remain below.
+fn emit_object_type_header(out: &mut COutput, program: &IrProgram, force: bool) -> KuResult<()> {
+    out.check()?;
+    if !force && !program_uses_object(program) {
+        return Ok(());
+    }
+    out.push_str(
+        r#"typedef enum { KU_NULL=0, KU_INT, KU_FLOAT, KU_BOOL, KU_STR, KU_OBJECT, KU_ARRAY, KU_FUNCTION } KuValueTag;
+typedef struct KuValue KuValue;
+typedef struct KuObject KuObject;
+typedef struct KuValueArray KuValueArray;
+struct KuValue { KuValueTag tag; union { int64_t i; double f; bool b; KuString s; KuObject* o; KuValueArray* arr; struct { void* invoke; void* env; } fn; } as; };
+typedef struct { KuString key; KuValue value; bool used; } KuEntry;
+struct KuObject { size_t len; size_t cap; KuEntry* entries; };
+struct KuValueArray { size_t len; size_t cap; KuValue* data; };
+static void ku_value_drop(KuValue*);
+static KuValue ku_value_move(KuValue*);
+static KuValue ku_value_clone(KuValue);
+static void ku_object_drop(KuObject*);
+static KuObject* ku_object_move(KuObject**);
+static KuObject* ku_object_clone(KuObject*);
+
+"#,
+    );
+    Ok(())
+}
+
 /// Emit the tagged KuValue + open-addressing KuObject runtime, only when the
-/// program actually uses dynamic objects. Depends on the KuString ABI already
-/// emitted in the header.
+/// program actually uses dynamic objects. Its existing ABI is declared before
+/// user aggregate layouts; runtime behavior and function order stay unchanged.
 fn emit_object_abi(
     out: &mut COutput,
     program: &IrProgram,
@@ -3906,16 +3942,7 @@ fn emit_object_abi(
         "#define KU_NATIVE_TEST_OBJECT_OOM 0\n"
     });
     out.push_str(
-        r#"typedef enum { KU_NULL=0, KU_INT, KU_FLOAT, KU_BOOL, KU_STR, KU_OBJECT, KU_ARRAY, KU_FUNCTION } KuValueTag;
-typedef struct KuValue KuValue;
-typedef struct KuObject KuObject;
-typedef struct KuValueArray KuValueArray;
-struct KuValue { KuValueTag tag; union { int64_t i; double f; bool b; KuString s; KuObject* o; KuValueArray* arr; struct { void* invoke; void* env; } fn; } as; };
-typedef struct { KuString key; KuValue value; bool used; } KuEntry;
-struct KuObject { size_t len; size_t cap; KuEntry* entries; };
-struct KuValueArray { size_t len; size_t cap; KuValue* data; };
-
-static KuValue ku_v_null(void) { KuValue v; v.tag=KU_NULL; v.as.i=0; return v; }
+        r#"static KuValue ku_v_null(void) { KuValue v; v.tag=KU_NULL; v.as.i=0; return v; }
 static KuValue ku_v_int(int64_t i) { KuValue v; v.tag=KU_INT; v.as.i=i; return v; }
 static KuValue ku_v_float(double f) { KuValue v; v.tag=KU_FLOAT; v.as.f=f; return v; }
 static KuValue ku_v_bool(bool b) { KuValue v; v.tag=KU_BOOL; v.as.b=b; return v; }
@@ -7895,7 +7922,18 @@ fn program_uses_object(program: &IrProgram) -> bool {
     if program_uses_http(program) {
         return true;
     }
-    program.functions.iter().any(|function| {
+    program.layouts.structs.iter().any(|layout| {
+        layout
+            .fields
+            .iter()
+            .any(|field| ir_type_uses_object(&field.ty))
+    }) || program.layouts.enums.iter().any(|layout| {
+        layout
+            .variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .any(|field| ir_type_uses_object(&field.ty))
+    }) || program.functions.iter().any(|function| {
         ir_type_uses_object(&function.return_type)
             || function.params.iter().any(|p| ir_type_uses_object(&p.ty))
             || function

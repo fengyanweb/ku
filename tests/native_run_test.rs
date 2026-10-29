@@ -6440,11 +6440,31 @@ fn main(): null! {
 fn native_json_typed_envelope_keeps_dynamic_subtree_without_output_dom() {
     let fixture = HttpJsonFixture(unique_temp_dir("json-typed-envelope"));
     let dir = &fixture.0;
-    fs::write(
-        dir.join("main.ku"),
-        include_str!("../examples/json_typed.ku"),
-    )
-    .expect("write typed JSON envelope source");
+    let mut source = include_str!("../examples/json_typed.ku").to_owned();
+    source.push_str(
+        r#"
+struct DynamicLists {
+    items: [KuValue]
+    nested: [[KuValue]]
+}
+enum DynamicCarrier { One(data: KuValue), Many(items: [KuValue]) }
+fn ExerciseDynamicLayouts(): null! {
+    first = json.decode("{\"value\":1}")?
+    second = json.decode("[2,true]")?
+    rows = DynamicLists { items: [first], nested: [[second]] }
+    expected = "{\"items\":[{\"value\":1}],\"nested\":[[[2,true]]]}"
+    if (json.encode(rows)? != expected) { panic("dynamic array layout") }
+    copy = rows.clone()
+    if (json.encode(copy)? != expected) { panic("dynamic array clone") }
+    one = DynamicCarrier.One(json.decode("\"owned\"")?)
+    many = DynamicCarrier.Many([json.decode("null")?])
+    one_copy = one.clone()
+    many_copy = many.clone()
+    return ok(null)
+}
+"#,
+    );
+    fs::write(dir.join("main.ku"), source).expect("write typed JSON envelope source");
     let generated = native_emit_c(dir, "main.ku");
     let writer = generated
         .split("static bool ku_json_write_typed_struct_Envelope(")
@@ -6487,6 +6507,9 @@ static void* ku_json_typed_realloc(void* value, size_t len) {{
 int main(void) {
   /* Execute the actual Ku example before the directed allocator failures. */
   CHECK(ku_fixture_main()==0 && NO_LIVE_ALLOCATIONS());
+  KuResult_null layouts=ExerciseDynamicLayouts();
+  CHECK(layouts.ok);
+  ku_result_drop_null(&layouts);CHECK(NO_LIVE_ALLOCATIONS());
   uint8_t body[129];memset(body,'x',sizeof(body));
   KuStruct_Envelope input={0};
   input.id=ku_string_concat(ku_string_static((const uint8_t*)"owned",5),
