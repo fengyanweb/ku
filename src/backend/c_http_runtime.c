@@ -1581,9 +1581,6 @@ static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct
   }
   return response_charge;
 }
-enum { KU_HTTP_JOB_STARTED=1u,KU_HTTP_JOB_COMPLETED=2u,
-  KU_HTTP_JOB_RETIRED=4u,KU_HTTP_JOB_CONTROL=8u };
-typedef struct { uint64_t epoch; unsigned int reasons; int queued; } KuHttpJobEventSlot;
 typedef struct KuHttpQueue {
   KuHttpJob** items;
   int cap; int head; int tail; int count; int closed; int abort;
@@ -1593,12 +1590,6 @@ typedef struct KuHttpQueue {
   KuHttpWake* wake;
   int owner_work_pending; /* Only the matching event owner reads/writes this. */
   unsigned int owner_inline_remaining;
-  /* Event slots borrow fixed C storage until every worker has joined. The
-     ring owns only slot identities, never a job ref that could delay retirement. */
-  KuHttpJobEventSlot* event_slots; int* event_ring;
-  int event_cap,event_head,event_tail,event_count;
-  uint64_t event_epoch;
-  size_t event_peak,event_published,event_consumed,event_coalesced,event_stale;
 } KuHttpQueue;
 static int ku_http_queue_is_current_owner(const KuHttpQueue* queue);
 static void ku_http_queue_notify(KuHttpQueue* queue) {
@@ -1617,73 +1608,8 @@ struct KuHttpJob {
   KuStruct___ku_http_response response;
   unsigned long long handler_deadline, request_deadline;
   KuHttpFailure failure;
-  size_t event_index; uint64_t event_epoch; /* Immutable after pre-publication bind. */
   int claimed; int started; int completed; int cancelled;
 };
-static size_t ku_http_queue_events_bytes(size_t cap) {
-  return cap*(sizeof(KuHttpJobEventSlot)+sizeof(int));
-}
-static int ku_http_queue_events_init(KuHttpQueue* queue,int cap) {
-  if(queue->event_slots || cap<0 || (size_t)cap>SIZE_MAX/(sizeof(KuHttpJobEventSlot)+sizeof(int)))return 0;
-  if(!cap)return 1;
-  void* storage=calloc(1,ku_http_queue_events_bytes((size_t)cap));
-  if(!storage)return 0;
-  queue->event_slots=(KuHttpJobEventSlot*)storage;
-  queue->event_ring=(int*)(queue->event_slots+cap);queue->event_cap=cap;return 1;
-}
-static void ku_http_queue_event_publish(KuHttpQueue* queue,size_t index,uint64_t epoch,unsigned int reasons) {
-  if(!epoch || !queue->event_slots) {ku_http_queue_notify(queue);return;}
-  int notify=0;
-  ku_http_mutex_lock(&queue->lock);
-  if(index<(size_t)queue->event_cap && queue->event_slots[index].epoch==epoch) {
-    KuHttpJobEventSlot* slot=&queue->event_slots[index];slot->reasons|=reasons;
-    if(queue->event_published<SIZE_MAX)queue->event_published++;
-    if(!slot->queued) {
-      if(queue->event_count>=queue->event_cap) {fputs("http completion ring invariant failed\n",stderr);exit(1);}
-      queue->event_ring[queue->event_tail]=(int)index;
-      queue->event_tail=(queue->event_tail+1)%queue->event_cap;queue->event_count++;slot->queued=1;
-      if((size_t)queue->event_count>queue->event_peak)queue->event_peak=(size_t)queue->event_count;
-    } else if(queue->event_coalesced<SIZE_MAX)queue->event_coalesced++;
-    notify=1;
-  } else if(queue->event_stale<SIZE_MAX)queue->event_stale++;
-  ku_http_mutex_unlock(&queue->lock);
-  if(notify)ku_http_queue_notify(queue);
-}
-static void ku_http_job_publish(KuHttpJob* job,unsigned int reasons) {
-  ku_http_queue_event_publish(job->queue,job->event_index,job->event_epoch,reasons);
-}
-static int ku_http_job_bind(KuHttpJob* job,size_t index) {
-  KuHttpQueue* queue=job->queue;
-  if(!queue->event_slots)return 1; /* Portable/legacy observation path. */
-  int bound=0;ku_http_mutex_lock(&queue->lock);
-  if(index<(size_t)queue->event_cap && queue->event_epoch<UINT64_MAX
-      && !queue->event_slots[index].epoch) {
-    KuHttpJobEventSlot* slot=&queue->event_slots[index];
-    slot->epoch=++queue->event_epoch;slot->reasons=0; /* Keep old queued marker until pop. */
-    job->event_index=index;job->event_epoch=slot->epoch;bound=1;
-  }
-  ku_http_mutex_unlock(&queue->lock);return bound;
-}
-static void ku_http_job_unbind(KuHttpJob* job) {
-  KuHttpQueue* queue=job->queue;if(!job->event_epoch)return;
-  ku_http_mutex_lock(&queue->lock);
-  if(job->event_index<(size_t)queue->event_cap) {
-    KuHttpJobEventSlot* slot=&queue->event_slots[job->event_index];
-    if(slot->epoch==job->event_epoch) {slot->epoch=0;slot->reasons=0;}
-  }
-  ku_http_mutex_unlock(&queue->lock);
-}
-static int ku_http_queue_event_pop(KuHttpQueue* queue,size_t* index,uint64_t* epoch,unsigned int* reasons) {
-  int found=0;ku_http_mutex_lock(&queue->lock);
-  if(queue->event_count) {
-    *index=(size_t)queue->event_ring[queue->event_head];
-    queue->event_head=(queue->event_head+1)%queue->event_cap;queue->event_count--;
-    KuHttpJobEventSlot* slot=&queue->event_slots[*index];
-    *epoch=slot->epoch;*reasons=slot->reasons;slot->reasons=0;slot->queued=0;
-    if(queue->event_consumed<SIZE_MAX)queue->event_consumed++;found=1;
-  }
-  ku_http_mutex_unlock(&queue->lock);return found;
-}
 static int ku_http_job_projection(KuHttpJob* job,size_t bytes) {
   if (!ku_http_buffer_reserve(job->budget,bytes)) return 0;
   job->projection_charge=bytes; return 1;
@@ -1715,7 +1641,6 @@ static KuHttpJob* ku_http_job_new(KuHttpQueue* queue, KuHttpInput* input) {
 static void ku_http_job_release(KuHttpJob* job) {
   if (!job) return;
   KuHttpQueue* queue = job->queue;
-  size_t event_index=job->event_index;uint64_t event_epoch=job->event_epoch;
   if (ku_refcount_release(&job->owners, "http job")) {
     ku_http_input_drop(&job->input);
     ku_drop_struct___ku_http_response(&job->response);
@@ -1729,7 +1654,7 @@ static void ku_http_job_release(KuHttpJob* job) {
   }
   /* Release publication precedes wake, including the non-final worker owner.
      ClosedWaitingJob can now see the actual remaining owner count. */
-  ku_http_queue_event_publish(queue,event_index,event_epoch,KU_HTTP_JOB_RETIRED);
+  ku_http_queue_notify(queue);
 }
 static int ku_http_job_only_owner(KuHttpJob* job) {
   /* The calling connection already owns a reference. The only additional
@@ -1755,14 +1680,14 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
   job->handler_deadline = __ku_handler_deadline;
   job->started = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_job_publish(job,KU_HTTP_JOB_STARTED);
+  ku_http_queue_notify(job->queue);
 }
 static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   ku_http_mutex_lock(&job->lock);
   int cancelled = job->cancelled || ku_http_now_ms() >= job->request_deadline;
   if (cancelled) { job->cancelled = 1; job->completed = 1; }
   ku_http_mutex_unlock(&job->lock);
-  if (cancelled) { ku_http_input_drop(&job->input); ku_http_job_publish(job,KU_HTTP_JOB_COMPLETED); return; }
+  if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_notify(job->queue); return; }
   ku_http_failure_current=(KuHttpFailure){0};
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
   KuHttpFailure failure=ku_http_failure_current;
@@ -1777,7 +1702,7 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   job->response = response;
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_job_publish(job,KU_HTTP_JOB_COMPLETED);
+  ku_http_queue_notify(job->queue);
 }
 /* Only compiler-proven bounded work enters here, once, before any worker
  * publication. Save every synchronous execution TLS field: a local request
@@ -1828,7 +1753,7 @@ static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
     ku_http_mutex_unlock(&job->lock);
   }
   ku_http_mutex_unlock(&queue->lock);
-  if (job) ku_http_job_publish(job,KU_HTTP_JOB_CONTROL);
+  if (job) ku_http_queue_notify(queue);
   return job;
 }
 
@@ -1887,7 +1812,6 @@ static void ku_http_queue_free(KuHttpQueue* queue) {
   if (queue->count || queue->resident) { fputs("http queue freed before actual retirement\n", stderr); exit(1); }
   ku_http_sync_destroy(&queue->lock, &queue->not_empty);
   free(queue->items); queue->items = NULL;
-  free(queue->event_slots);queue->event_slots=NULL;queue->event_ring=NULL;
 }
 typedef struct { KuHttpServer* server; KuHttpQueue* queue; } KuHttpWorkerCtx;
 #if defined(_WIN32)
@@ -1998,8 +1922,7 @@ typedef struct KuHttpConnection {
   int active_position,free_next;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   struct KuHttpReactor* reactor;
-  int work_position,idle_position,parked_class;
-  unsigned long long maintenance_deadline;
+  int work_position,idle_position;
 #endif
   int phase; int poll_index; int management;
   int request_lease,request_queued,pending_index,header_started;
@@ -2166,7 +2089,7 @@ static void ku_http_connection_close(KuHttpConnection* connection) {
     connection->deadline = 0;
     return;
   }
-  if (connection->job) {ku_http_job_unbind(connection->job);ku_http_job_release(connection->job);}
+  if (connection->job) ku_http_job_release(connection->job);
   /* No queued/worker reference and no Task handle survives this boundary. */
   ku_http_request_lease_release(connection);
   ku_http_active_retire(connection);
@@ -2274,7 +2197,7 @@ static void ku_http_connection_next_request(KuHttpConnection* connection, KuHttp
   if (connection->job && !ku_http_job_only_owner(connection->job)) {
     connection->phase = KU_HTTP_IO_REUSE_WAIT; connection->deadline = 0; return;
   }
-  if (connection->job) { ku_http_job_unbind(connection->job);ku_http_job_release(connection->job); connection->job = NULL; }
+  if (connection->job) { ku_http_job_release(connection->job); connection->job = NULL; }
   ku_http_request_lease_release(connection);
   ku_drop_struct___ku_http_response(&connection->output.response);
   ku_http_buffer_refund(connection->budget, connection->output.charge); connection->output.charge = 0;
@@ -2326,13 +2249,6 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   KuHttpJob* job = ku_http_job_new(queue, &connection->input);
   if (!job) { connection->failure.reason=KU_HTTP_ERROR_ALLOCATION; ku_http_connection_status(connection, server, 500); return; }
   job->request_deadline = connection->request_deadline;
-#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-  if(queue->event_slots && (!connection->active_set
-      || !ku_http_job_bind(job,(size_t)(connection-connection->active_set->connections)))) {
-    connection->failure.reason=KU_HTTP_ERROR_QUEUE;
-    ku_http_job_release(job);ku_http_connection_status(connection,server,503);return;
-  }
-#endif
   connection->job = job;
   connection->phase = KU_HTTP_IO_JOB;
   connection->deadline = 0;
@@ -2867,7 +2783,6 @@ typedef struct KuHttpLoopOwner {
   unsigned long long transport_closes[KU_HTTP_CLOSE_REASON_COUNT];
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   size_t active_requests,peak_active_requests;
-  size_t job_events_queued,job_events_peak,job_events_published,job_events_consumed,job_events_coalesced,job_events_stale,job_observations;
   KuHttpWake* wake;
 #if defined(_WIN32)
   HANDLE thread;
@@ -3239,12 +3154,8 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     ku_http_mutex_lock(&group->lock);
     for (int i=0;i<group->created;i++) {
       KuHttpLoopOwner* owner=&group->loops[i];
-      n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu,\"job_events_queued\":%llu,\"job_events_peak\":%llu,\"job_events_published\":%llu,\"job_events_consumed\":%llu,\"job_events_coalesced\":%llu,\"job_events_stale\":%llu,\"job_observations\":%llu}",i?",":"",i,
-        owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes,
-        (unsigned long long)owner->job_events_queued,(unsigned long long)owner->job_events_peak,
-        (unsigned long long)owner->job_events_published,(unsigned long long)owner->job_events_consumed,
-        (unsigned long long)owner->job_events_coalesced,(unsigned long long)owner->job_events_stale,
-        (unsigned long long)owner->job_observations);
+      n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
+        owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes);
       if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     }
     ku_http_mutex_unlock(&group->lock);
@@ -3487,29 +3398,6 @@ static int ku_http_task_slice_interrupted(void* raw) {
 #endif
 }
 #endif
-#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-/* Snapshot only at a concrete transition/event. Worker changes publish after
- * dropping job.lock, so a concurrent STARTED/COMPLETED cannot strand this cache.
- * The original request D and cleanup grace are never renewed by observation. */
-static unsigned long long ku_http_connection_job_deadline(KuHttpConnection* connection) {
-  KuHttpJob* job=connection->job;unsigned long long nearest=UINT64_MAX;
-  if(!job)return nearest;
-  ku_http_mutex_lock(&job->lock);
-  if(connection->phase==KU_HTTP_IO_JOB)nearest=job->request_deadline;
-  if(job->started && !job->completed) {
-    unsigned long long grace=KU_HANDLER_CLEANUP_GRACE_MS?KU_HANDLER_CLEANUP_GRACE_MS:1u;
-    unsigned long long cleanup=job->handler_deadline>UINT64_MAX-grace?UINT64_MAX:job->handler_deadline+grace;
-    if(cleanup<nearest)nearest=cleanup;
-  }
-  ku_http_mutex_unlock(&job->lock);
-#if defined(__APPLE__)
-  if(connection->phase==KU_HTTP_IO_JOB && connection->peer_read_paused
-      && connection->peer_error_probe_deadline && connection->peer_error_probe_deadline<nearest)
-    nearest=connection->peer_error_probe_deadline;
-#endif
-  return nearest;
-}
-#endif
 /* Persistent owner reactor. Kernel payloads are unique 64-bit registration
  * tokens, never pointers to mutable/recycled slots or truncated generations.
  * Strict idle sockets have one READ registration and one indexed heap item;
@@ -3531,7 +3419,7 @@ typedef struct {
   short events;
 } KuHttpReadyEvent;
 typedef struct KuHttpReactor {
-  int descriptor,fault,slots,work_count,idle_count,idle_initial_count,parked_jobs,pressure_cursor,draining;
+  int descriptor,fault,slots,work_count,idle_count,idle_initial_count,draining;
   size_t capacity,hash_capacity,fd_capacity,fd_count,old_net_count,ready_count,pending_base;
   uint64_t next_token;
   KuHttpActiveSet* active;
@@ -3797,7 +3685,6 @@ static short ku_http_reactor_connection_events(const KuHttpConnection* c) {
   return 0;
 }
 static unsigned long long ku_http_reactor_connection_idle_deadline(const KuHttpConnection* c) {
-  if(c->parked_class==2)return c->maintenance_deadline;
   return c->request_deadline && c->request_deadline<c->deadline?c->request_deadline:c->deadline;
 }
 static int ku_http_reactor_heap_before(KuHttpReactor* r,int left,int right) {
@@ -3827,9 +3714,8 @@ static void ku_http_reactor_heap_fix(KuHttpReactor* r,int position) {
 static void ku_http_reactor_idle_remove(KuHttpReactor* r,KuHttpConnection* c) {
   int position=c->idle_position;if(position<0) return;
   if(position>=r->idle_count || &r->active->connections[r->idle_heap[position]]!=c) {r->fault=1;return;}
-  if(c->parked_class==2)r->parked_jobs--;
-  else if(!c->reused)r->idle_initial_count--;
-  int last=r->idle_heap[--r->idle_count];c->idle_position=-1;c->parked_class=0;
+  if(!c->reused) r->idle_initial_count--;
+  int last=r->idle_heap[--r->idle_count];c->idle_position=-1;
   if(position<r->idle_count) {
     r->idle_heap[position]=last;r->active->connections[last].idle_position=position;
     ku_http_reactor_heap_fix(r,position);
@@ -3868,18 +3754,12 @@ static void ku_http_reactor_pending_forget(KuHttpActiveSet* active,int index) {
 static void ku_http_reactor_refresh(KuHttpConnection* c) {
   KuHttpReactor* r=c->reactor;
   if(!r || !c->active_set || c->active_position<0) return;
-  int parked=ku_http_reactor_idle(c)?1:
-      c->job && (c->phase==KU_HTTP_IO_JOB || c->phase==KU_HTTP_IO_REUSE_WAIT || c->phase==KU_HTTP_IO_CLOSED_JOB)?2:0;
-  if(!r->draining && parked) {
+  if(!r->draining && ku_http_reactor_idle(c)) {
     ku_http_reactor_work_remove(r,c);
-    if(c->idle_position>=0 && c->parked_class!=parked)ku_http_reactor_idle_remove(r,c);
-    c->maintenance_deadline=parked==2?ku_http_connection_job_deadline(c):0;
     if(c->idle_position<0) {
       if(r->idle_count>=r->slots) {r->fault=1;return;}
-      c->parked_class=parked;
       c->idle_position=r->idle_count;r->idle_heap[r->idle_count++]=(int)(c-r->active->connections);
-      if(parked==2)r->parked_jobs++;
-      else if(!c->reused)r->idle_initial_count++;
+      if(!c->reused) r->idle_initial_count++;
     }
     ku_http_reactor_heap_fix(r,c->idle_position);
   } else {
@@ -3985,11 +3865,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      One receipt includes every owner array; no Task/connection consumes an
      independent copy of the service's configured byte budget. */
   size_t fixed_bytes=(size_t)slot_count*(sizeof(KuHttpConnection)+sizeof(int)+sizeof(KuHttpPollConnection))
-      +(size_t)request_limit*(sizeof(KuHttpJob*)+2u*sizeof(uint64_t)) /* New bounded job binding metadata. */
+      +(size_t)request_limit*sizeof(KuHttpJob*)
       +poll_capacity*sizeof(KuHttpPollFd)+(size_t)max_pending*sizeof(KuHttpPendingItem)+net_bytes;
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-  fixed_bytes+=ku_http_reactor_pending_storage_bytes((size_t)slot_count,net_capacity,(size_t)max_pending)
-      +ku_http_queue_events_bytes((size_t)slot_count);
+  fixed_bytes+=ku_http_reactor_pending_storage_bytes((size_t)slot_count,net_capacity,(size_t)max_pending);
 #endif
 #if defined(_WIN32)
   fixed_bytes+=(size_t)nworkers*sizeof(HANDLE);
@@ -4060,16 +3939,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
     return "handler queue initialization failed";
   }
-#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-  if(!ku_http_queue_events_init(&queue,slot_count)) {
-    ku_http_queue_free(&queue);ku_http_wake_close(&wake);ku_http_reactor_destroy(&reactor);
-    free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
-#if defined(KU_HTTP_HAS_TASK_RUNTIME)
-    (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
-#endif
-    return "completion event storage allocation failed";
-  }
-#endif
   KuHttpWorkerCtx ctx; ctx.server = server; ctx.queue = &queue;
 #if defined(_WIN32)
   HANDLE* workers = (HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE));
@@ -4099,7 +3968,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   int resource_accept_errors = 0;
   unsigned long long accept_retry_deadline = 0;
   unsigned long long health_deadline=ku_http_deadline_ms(500);
-  uint64_t next_cpu_sample_ms=0;size_t observed_jobs=0;
+  uint64_t next_cpu_sample_ms=0;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
   KuHttpTaskIoBatch task_io_batch={0};
   KuHttpTaskSliceTurn task_io_slice_turn={0,UINT64_MAX};
@@ -4115,8 +3984,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_mutex_lock(&queue.lock);
     size_t queued = (size_t)queue.count, running = queue.running, resident = queue.resident;
     size_t queued_bytes=queue.queued_bytes, peak_queued_bytes=queue.peak_queued_bytes;
-    size_t events_queued=(size_t)queue.event_count,events_peak=queue.event_peak,events_published=queue.event_published;
-    size_t events_consumed=queue.event_consumed,events_coalesced=queue.event_coalesced,events_stale=queue.event_stale;
     ku_http_mutex_unlock(&queue.lock);
     size_t occupied_connections=active.sockets+(size_t)pending.raw_count;
     int occupied_requests=active.request_active;
@@ -4132,9 +3999,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     if (cpu_sample_due) ku_http_owner_cpu_sample(owner,sampled_cpu_ns,sampled_cpu_ms,cpu_sample_valid);
     owner->queued = queued; owner->running = running; owner->resident = resident;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
-    owner->job_events_queued=events_queued;owner->job_events_peak=events_peak;owner->job_events_published=events_published;
-    owner->job_events_consumed=events_consumed;owner->job_events_coalesced=events_coalesced;owner->job_events_stale=events_stale;
-    owner->job_observations=observed_jobs;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
     owner->active_requests=(size_t)active.request_active;owner->peak_active_requests=(size_t)active.request_peak;
     owner->heartbeat = ku_http_now_ms();
@@ -4185,40 +4049,15 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     unsigned long long now = ku_http_now_ms();
     unsigned long long pending_deadline=ku_http_pending_maintain(&pending,server,now);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
-    /* Completion records hold the fixed queue/connection storage pin, not an
-     * extra job owner. Validate the immutable binding before using C's own ref.
-     * Clearing queued/reasons and a concurrent producer share queue.lock. */
-    for(unsigned int turn=0;turn<64u;turn++) {
-      size_t index=0;uint64_t epoch=0;unsigned int reasons=0;
-      if(!ku_http_queue_event_pop(&queue,&index,&epoch,&reasons))break;
-      if(!epoch || !reasons || index>=(size_t)slot_count)continue;
-      KuHttpConnection* changed=&connections[index];
-      if(changed->active_set!=&active || changed->active_position<0 || !changed->job
-          || changed->job->queue!=&queue || changed->job->event_epoch!=epoch)continue;
-      ku_http_reactor_idle_remove(&reactor,changed);ku_http_reactor_work_add(&reactor,changed);
-    }
-    ku_http_mutex_lock(&queue.lock);
-    if(queue.event_count)queue.owner_work_pending=1; /* Bounded drain owes another I/O turn. */
-    ku_http_mutex_unlock(&queue.lock);
-    /* Idle sockets and unchanged worker jobs share the indexed timer heap.
-     * A global drain moves at most 64 records to work per turn. Request D,
-     * cleanup grace and Darwin's paused-peer probe remain finite heap keys. */
+    /* Idle sockets are touched only for a due deadline, bounded admission
+     * pressure, drain or actual kernel readiness. Move candidates to the work
+     * list before its reverse pass; list/heap storage never duplicates slots. */
     reactor.draining=!listening || listen_failure;
     for(unsigned int turn=0;turn<64u && reactor.idle_count;turn++) {
-      if(!reactor.draining && ku_http_reactor_idle_deadline(&reactor)>now)break;
-      KuHttpConnection* due=&connections[reactor.idle_heap[0]];
-      ku_http_reactor_idle_remove(&reactor,due);ku_http_reactor_work_add(&reactor,due);
-    }
-    /* A job's earlier timer must not hide a reclaimable idle C under actual
-     * record pressure. This bounded cursor visits only the existing heap and
-     * never cancels a job or reduces the configured C/A/P capabilities. */
-    for(unsigned int turn=0;turn<64u && pending.raw_count && ku_http_free_slot(&active)<0
-        && reactor.idle_count>reactor.parked_jobs;turn++) {
-      if(reactor.pressure_cursor>=reactor.idle_count)reactor.pressure_cursor=0;
-      KuHttpConnection* idle=&connections[reactor.idle_heap[reactor.pressure_cursor++]];
-      if(idle->parked_class==1) {
-        ku_http_reactor_idle_remove(&reactor,idle);ku_http_reactor_work_add(&reactor,idle);
-      }
+      int connection_pressure=pending.raw_count && ku_http_free_slot(&active)<0;
+      KuHttpConnection* idle=&connections[reactor.idle_heap[0]];
+      if(!reactor.draining && !connection_pressure && ku_http_reactor_idle_deadline(&reactor)>now) break;
+      ku_http_reactor_idle_remove(&reactor,idle);ku_http_reactor_work_add(&reactor,idle);
     }
     int maintenance_count=reactor.work_count;
 #else
@@ -4242,7 +4081,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         ku_http_connection_close(connection); continue;
       }
       int before_observe_phase=connection->phase;
-      if(connection->job && observed_jobs<SIZE_MAX)observed_jobs++;
       ku_http_connection_observe_job(connection, server);
       int response_became_ready=before_observe_phase!=KU_HTTP_IO_WRITE
           && connection->phase==KU_HTTP_IO_WRITE;
@@ -4349,9 +4187,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         task_deadline==0u && active.count!=0,task_deadline==0u && active.count!=0,0};
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     task_io_eligibility.deadline=idle_deadline;
-    task_io_eligibility.has_idle=reactor.idle_count>reactor.parked_jobs;
+    task_io_eligibility.has_idle=reactor.idle_count!=0;
     if(reactor.idle_count) task_io_eligibility.all_async=0;
-    if(reactor.idle_initial_count || reactor.parked_jobs) task_io_eligibility.all_batchable=0;
+    if(reactor.idle_initial_count) task_io_eligibility.all_batchable=0;
 #endif
     unsigned long long task_io_slice_deadline=health_deadline;
     if (accept_retry_deadline>now && accept_retry_deadline<task_io_slice_deadline)
@@ -4543,8 +4381,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
             item->poll_index>=0?item->socket_value:KU_HTTP_INVALID_SOCKET,0,
             item->queue_generation,item->poll_index);
     }
-    if((reactor.idle_count && reactor.draining)
-        || (reactor.idle_count>reactor.parked_jobs && pending.raw_count && ku_http_free_slot(&active)<0))wait_ms=0;
+    if(reactor.idle_count && (reactor.draining
+        || (pending.raw_count && ku_http_free_slot(&active)<0))) wait_ms=0;
     int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);
 #else
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
@@ -4612,7 +4450,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       KuHttpConnection* connection=&connections[event->entry];
       if(connection->active_set!=&active || connection->active_position<0
           || connection->connection_generation!=event->generation || connection->socket_value!=event->fd) continue;
-      ku_http_reactor_idle_remove(&reactor,connection);ku_http_reactor_work_add(&reactor,connection);
       short events=event->events;
 #else
     for (int selected_connection=0;selected_connection<connection_poll_count;selected_connection++) {
