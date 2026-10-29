@@ -411,7 +411,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
       GOTOOLCHAIN: local
-      KU_PERFORMANCE_V2_ROOT: ${{ runner.temp }}/ku-performance-v2
       KU_PERFORMANCE_V2_BASELINE: 988f32ef496b18b935a3c276ef7933d0563691da
 
     steps:
@@ -420,6 +419,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set the performance root from the step runtime
+        shell: bash
+        run: printf 'KU_PERFORMANCE_V2_ROOT=%s\n' "$RUNNER_TEMP/ku-performance-v2" >> "$GITHUB_ENV"
 
       - name: Verify runner entry contracts without starting workloads
         run: python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py

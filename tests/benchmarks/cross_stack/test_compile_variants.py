@@ -129,6 +129,9 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
+        job_env=job.split('\n    env:\n',1)[1].split('\n    steps:',1)[0]
+        self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
+        self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
         self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2')",text)
         self.assertIn("&& '-performance-v2' || ''",text)
