@@ -137,6 +137,49 @@ def same_json(actual, expected):
         same_json(actual[key], value) for key, value in expected.items())
 
 
+def validate_layout(layout):
+    """Check compiled sizeof/offsetof evidence, never infer residency from it."""
+    if (not isinstance(layout, dict) or layout.get('schema') != 'ku-json-dense-layout-v1'
+            or layout.get('resident_memory_measurement') is not False
+            or type(layout.get('available')) is not bool or layout.get('fixed_capacity') != 2048):
+        raise ValueError('missing or invalid compiled dense layout metadata')
+    sizes = layout.get('sizeof', {})
+    for key in ('void_pointer', 'KuString', 'KuValue'):
+        if type(sizes.get(key)) is not int or sizes[key] <= 0:
+            raise ValueError('invalid compiled dense sizeof: '+key)
+    if not layout['available']:
+        if layout.get('fixed_bytes') is not None:
+            raise ValueError('unavailable dense layout has fixed bytes')
+        return layout
+    features = layout.get('features', {})
+    for key in ('FILES', 'DIRECTORY', 'NETWORK', 'PG'):
+        value = features.get('KU_TASK_BLOCKING_'+key)
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError('invalid compiled dense feature: '+key)
+    for key in ('KuTaskBlockingJobV1', 'KuTaskBlockingPoolV1', 'ring_cell'):
+        if type(sizes.get(key)) is not int or sizes[key] <= 0:
+            raise ValueError('invalid compiled dense sizeof: '+key)
+    if features['KU_TASK_BLOCKING_NETWORK']:
+        if type(sizes.get('net_config')) is not int or sizes['net_config'] <= 0:
+            raise ValueError('invalid compiled dense net config size')
+    elif sizes.get('net_config') is not None:
+        raise ValueError('disabled dense network has net config size')
+    expected = sizes['KuTaskBlockingPoolV1']+2048*(sizes['KuTaskBlockingJobV1']+sizes['ring_cell'])
+    if type(layout.get('fixed_bytes')) is not int or layout['fixed_bytes'] != expected:
+        raise ValueError('compiled dense fixed byte formula mismatch')
+    offsets = layout.get('offsetof', {})
+    required = ['generation', 'output_charge', 'ticket', 'path', 'content', 'result', 'exists_value']
+    if features['KU_TASK_BLOCKING_PG']:
+        required += ['pg_operation', 'pg_pool', 'pg_ready']
+    if features['KU_TASK_BLOCKING_NETWORK']:
+        required += ['net_config', 'net_present', 'net_deadline', 'net_requested', 'net_client',
+                     'net_write', 'net_owner', 'net_addresses']
+    for key in required:
+        if type(offsets.get(key)) is not int or not 0 <= offsets[key] < sizes['KuTaskBlockingJobV1']:
+            raise ValueError('invalid compiled dense offsetof: '+key)
+    return layout
+
+
 def validate_output(text, cases, family, repeat=0, cpu_seconds=0, context='http',
                     request_ms=REQUEST_TIMEOUT_MS, handler_ms=HANDLER_TIMEOUT_MS):
     lines = [line for line in text.splitlines() if line.startswith('{"schema":"'+SCHEMA+'"')]
@@ -274,6 +317,7 @@ def main(argv=None):
         raw = logs.run('dense-'+args.family, run_command, out, timeout=args.wall_seconds+2)
         report['measurement'] = validate_output(raw, cases, args.family, args.iterations, args.cpu_seconds,
                                                 args.context, args.request_timeout_ms, args.handler_timeout_ms)
+        report['compiled_layout'] = validate_layout(report['measurement'].get('layout'))
         report['performance_measured'] = report['measurement']['performance_measured']
         report['source_input_unchanged'] = digest(source) == identity['generated_c_sha256']
         if not report['source_input_unchanged']:

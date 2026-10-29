@@ -76,6 +76,45 @@ static int ku_json_dense_real(const char* text,double* result) {
 static void ku_json_dense_hex(KuString bytes) {
   for(size_t i=0;i<bytes.len;i++)fprintf(stdout,"%02x",(unsigned)bytes.ptr[i]);
 }
+/* Called only after the measured loop AND golden retirement. Use names shared
+ * by old A and typed-config candidates: net_config can be an array or a struct.
+ * In particular, never mention candidate-only net_tls or its typedef here. */
+static void ku_json_dense_layout(void) {
+  fputs("{\"schema\":\"ku-json-dense-layout-v1\",\"resident_memory_measurement\":false,",stdout);
+  fprintf(stdout,"\"sizeof\":{\"void_pointer\":%zu,\"KuString\":%zu,\"KuValue\":%zu",
+      sizeof(void*),sizeof(KuString),sizeof(KuValue));
+#if defined(KU_TASK_BLOCKING_FILES) && defined(KU_TASK_BLOCKING_DIRECTORY) && defined(KU_TASK_BLOCKING_NETWORK) && defined(KU_TASK_BLOCKING_PG)
+  fprintf(stdout,",\"KuTaskBlockingJobV1\":%zu,\"KuTaskBlockingPoolV1\":%zu,\"ring_cell\":%zu,\"net_config\":",
+      sizeof(KuTaskBlockingJobV1),sizeof(KuTaskBlockingPoolV1),sizeof(size_t));
+#if KU_TASK_BLOCKING_NETWORK
+  fprintf(stdout,"%zu",sizeof(((KuTaskBlockingJobV1*)0)->net_config));
+#else
+  fputs("null",stdout);
+#endif
+  fprintf(stdout,"},\"available\":true,\"features\":{\"KU_TASK_BLOCKING_FILES\":%d,\"KU_TASK_BLOCKING_DIRECTORY\":%d,\"KU_TASK_BLOCKING_NETWORK\":%d,\"KU_TASK_BLOCKING_PG\":%d},",
+      KU_TASK_BLOCKING_FILES,KU_TASK_BLOCKING_DIRECTORY,KU_TASK_BLOCKING_NETWORK,KU_TASK_BLOCKING_PG);
+  fprintf(stdout,"\"offsetof\":{\"generation\":%zu,\"output_charge\":%zu,\"ticket\":%zu,\"path\":%zu,\"content\":%zu,\"result\":%zu,\"exists_value\":%zu",
+      offsetof(KuTaskBlockingJobV1,generation),offsetof(KuTaskBlockingJobV1,output_charge),
+      offsetof(KuTaskBlockingJobV1,ticket),offsetof(KuTaskBlockingJobV1,path),
+      offsetof(KuTaskBlockingJobV1,content),offsetof(KuTaskBlockingJobV1,result),
+      offsetof(KuTaskBlockingJobV1,exists_value));
+#if KU_TASK_BLOCKING_PG
+  fprintf(stdout,",\"pg_operation\":%zu,\"pg_pool\":%zu,\"pg_ready\":%zu",
+      offsetof(KuTaskBlockingJobV1,pg_operation),offsetof(KuTaskBlockingJobV1,pg_pool),
+      offsetof(KuTaskBlockingJobV1,pg_ready));
+#endif
+#if KU_TASK_BLOCKING_NETWORK
+  fprintf(stdout,",\"net_config\":%zu,\"net_present\":%zu,\"net_deadline\":%zu,\"net_requested\":%zu,\"net_client\":%zu,\"net_write\":%zu,\"net_owner\":%zu,\"net_addresses\":%zu",
+      offsetof(KuTaskBlockingJobV1,net_config),offsetof(KuTaskBlockingJobV1,net_present),
+      offsetof(KuTaskBlockingJobV1,net_deadline),offsetof(KuTaskBlockingJobV1,net_requested),
+      offsetof(KuTaskBlockingJobV1,net_client),offsetof(KuTaskBlockingJobV1,net_write),
+      offsetof(KuTaskBlockingJobV1,net_owner),offsetof(KuTaskBlockingJobV1,net_addresses));
+#endif
+  fprintf(stdout,"},\"fixed_capacity\":2048,\"fixed_bytes\":%zu}",ku_task_blocking_fixed_bytes(2048u));
+#else
+  fputs("},\"available\":false,\"features\":{},\"offsetof\":{},\"fixed_capacity\":2048,\"fixed_bytes\":null}",stdout);
+#endif
+}
 int main(int argc,char** argv) {
   double cpu_target=0,wall_limit=0;uint64_t repeat=0,request_ms=0,handler_ms=0;
   if(argc!=8 || !ku_json_dense_real(argv[2],&cpu_target) || cpu_target<0 || cpu_target>20
@@ -145,8 +184,9 @@ int main(int argc,char** argv) {
   if(!ku_json_dense_clock(CLOCK_THREAD_CPUTIME_ID,&done_cpu)
       || !ku_json_dense_clock(CLOCK_MONOTONIC,&done_wall)
       || done_cpu<cleanup_cpu || done_wall<cleanup_wall)return 3;
-  fprintf(stdout,",\"golden_cleanup_thread_cpu_ns\":%llu,\"golden_cleanup_wall_ns\":%llu}\n",
+  fprintf(stdout,",\"golden_cleanup_thread_cpu_ns\":%llu,\"golden_cleanup_wall_ns\":%llu,\"layout\":",
       (unsigned long long)(done_cpu-cleanup_cpu),(unsigned long long)(done_wall-cleanup_wall));
+  ku_json_dense_layout();fputs("}\n",stdout);
   return status;
 cleanup:
   for(size_t i=0;i<count;i++)ku_string_drop(&golden[i]);free(golden);return status;
