@@ -50,7 +50,7 @@
       "docs/guide/language"
     ],
     [
-      "設定明確資源邊界。",
+      "按需設定資源上限。",
       "限制服務連線、執行中請求、等待佇列與緩衝區；OS 限制取決於平台和部署設定。",
       "支援範圍",
       "docs/support"
@@ -82,10 +82,10 @@
     ],
     ["認識這門語言", "從變數、函式，到資料與錯誤處理。", "docs/guide/language"],
     ["使用標準函式庫", "查找模組，瞭解 JSON 介面。", "docs/stdlib"],
-    ["瞭解目前邊界", "平台、執行路徑與已知限制。", "docs/support"]
+    ["平台與執行方式", "選擇適合程式的執行方式。", "docs/support"]
   ],
   "projectTitle": "認真構建，也坦誠記錄。",
-  "projectDescription": "Ku v{releasedVersion} 仍在開發中。Linux ARM64 候選部署已完成隔離範例預演，尚未驗證真實業務的生產使用。歡迎以實際程式參與評估並回饋問題；公開產物以 GitHub Release 為準。",
+  "projectDescription": "Ku v{releasedVersion} 已發佈，提供命令列工具、VS Code 擴充套件和標準庫。歡迎體驗、回報問題，或參與專案開發。",
   "github": "在 GitHub 查看專案",
   "license": "採用 Apache-2.0 授權條款，詳見 LICENSE 和 NOTICE。",
   "verified": "內容覈實",
@@ -99,5 +99,10 @@
   "toolsGroup": "語言與工具",
   "projectGroup": "專案",
   "libraryGroup": "標準函式庫",
-  "examplesGroup": "範例"
+  "examplesGroup": "範例",
+  "supportKu": "支持 Ku",
+  "donateDescription": "如果 Ku 對你有幫助，歡迎自願贊賞，支持專案的持續開發。感謝你的支持。",
+  "wechatInstruction": "使用微信掃一掃，或儲存圖片後在微信中識別。",
+  "wechatAlt": "Ku 專案微信贊賞碼",
+  "emailFeedback": "電子郵件回報"
 }

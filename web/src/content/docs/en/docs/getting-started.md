@@ -18,7 +18,9 @@ fn main() {
 }
 ```
 
-`fn main()` is the entry point. `println` writes one line of text. Ku does not use `let` or `let mut`.
+`fn main()` is the program entry point, and `println` writes one line of text. This program needs no return type annotation, `!`, `?`, or `return ok(null)`. The entry function itself is still required. Ku does not use `let` or `let mut`.
+
+Operations such as reading a file or parsing JSON may return a Result. Use [`T!` and `?` as explained in error handling](/en/docs/guide/errors/#result-operators) when working with those results.
 
 ## Check and run
 

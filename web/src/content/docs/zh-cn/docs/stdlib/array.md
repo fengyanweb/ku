@@ -42,18 +42,17 @@ import array from "std.array"
 ```ku
 import array from "std.array"
 
-fn main(): null! {
+fn main() {
     values = [1, 2, 3]
     extended = values.push(4)
     doubled = extended.map(x => x * 2)
     println(array.len(values))
-    println(doubled.try_get(3)?)
+    println(doubled[3])
     try {
         values.try_get(9)?
     } catch (error) {
         println(error.code)
     }
-    return ok(null)
 }
 ```
 
@@ -64,6 +63,8 @@ index_out_of_bounds
 ```
 
 `push` 后 `values` 仍有三个元素，`extended` 有四个。`mapper` 必须匹配元素类型，函数体遵循普通所有权和 Result 规则。
+
+这里已知 `doubled` 有四个元素，所以直接使用 `doubled[3]`；下标不确定且需要处理越界时，使用 `try_get(index)?`。示例中的 `?` 在 `try` 内，错误由 `catch` 处理，因此 `main` 不需要返回 `null!`。
 
 ## 后端支持
 

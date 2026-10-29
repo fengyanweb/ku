@@ -2,7 +2,7 @@
 title: 'نصب و دریافت'
 description: 'دریافت پیش‌انتشار آزمایشی Ku 0.0.19 و آشنایی با نیازمندی‌های پلتفرم و ساخت.'
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-21'
+verifiedAt: '2026-10-28'
 sources:
   [
     'Cargo.toml',
@@ -12,80 +12,74 @@ sources:
   ]
 ---
 
-> اطلاعات تازهٔ v0.0.19 در ادامه فعلاً به انگلیسی آمده است؛ بقیهٔ ترجمه حفظ می‌شود. [English](/en/docs/support/) · [简体中文](/zh-cn/docs/support/)
+**Ku 0.0.19** را برای رایانهٔ خود دانلود کنید. هر بستهٔ این پیش‌انتشار آزمایشی شامل ابزار خط فرمان، مفسر و افزونهٔ VS Code است.
 
-This page targets the **v0.0.19 experimental prerelease**. Use the actual [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) and its assets; documentation alone does not establish completed publication or production readiness.
+## ۱. دانلود Ku
 
-## انتخاب پلتفرم
+| سیستم   | معماری                | دانلود                                                                                                                          | حجم     |
+| ------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| macOS   | Apple Silicon / ARM64 | [دانلود macOS (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)     | 39.8 MB |
+| Windows | x64                   | [دانلود Windows (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz) | 44.1 MB |
+| Linux   | x64 / GNU             | [دانلود Linux (.tar.gz)](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) | 48.3 MB |
 
-Download the target archive below, its manifest and `SHA256SUMS` from the [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19). `native_ci-*` artifacts are CI examples, not CLI installers.
+## ۲. استخراج و اجرا
 
-| سیستم   | معماری                | بایگانی                                                                                                                                               |
-| ------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS   | Apple Silicon / arm64 | [`ku-v0.0.19-aarch64-apple-darwin.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-aarch64-apple-darwin.tar.gz)         |
-| Windows | x64 / MSVC            | [`ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-pc-windows-msvc.tar.gz)     |
-| Linux   | x64 / GNU             | [`ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/fengyanweb/ku/releases/download/v0.0.19/ku-v0.0.19-x86_64-unknown-linux-gnu.tar.gz) |
+**تمام بسته** را در پوشه‌ای خالی، مثلاً پوشهٔ `ku` در پوشهٔ کاربری خود، استخراج کنید. همهٔ فایل‌ها را کنار هم نگه دارید و فقط فایل اجرایی را جابه‌جا نکنید. در همان پوشه یک ترمینال باز کنید.
 
-[Download checksums: SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS)
-
-بایگانی پلتفرم‌های دیگر بررسی نشده است. پشتیبانی از کامپایل متقابل به معنای انتشار بسته برای تمام سیستم‌عامل‌ها و معماری‌ها نیست.
-
-## استخراج و بررسی
-
-1. بایگانی را با `SHA256SUMS` انتشار تطبیق دهید. فایل جداگانهٔ `.manifest.json` یکپارچگی بایگانی و فایل‌ها را توصیف می‌کند. چک‌سام‌ها برای بررسی یکپارچگی‌اند و امضای ناشر نیستند.
-2. **تمام بایگانی** را در پوشه‌ای خالی استخراج کرده و `README-INSTALL.md` را بخوانید. چیدمان نسبی `ku`، ‏`libku.rlib`، ‏`deps/` و `native-tls/` را حفظ کنید.
-3. نسخه را از همان پوشه بررسی کنید. در macOS / Linux:
+macOS / Linux:
 
 ```sh
 ./ku --version
 ```
 
-در Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 .\ku.exe --version
 ```
 
-نسخهٔ گزارش‌شده باید `0.0.19` باشد. در صورت نیاز پوشه را به `PATH` اضافه کنید و سپس `ku --version` را اجرا کنید. برای یکپارچگی با VS Code، فایل همراه `ku-language-0.0.19.vsix` را نصب کنید.
+باید `ku 0.0.19` نمایش داده شود. اکنون می‌توانید فایل‌های `.ku` را اجرا و بررسی کنید؛ این کارها به نصب Rust نیاز ندارند.
 
-## Interpreter and VS Code extension
+<details>
+<summary>اختیاری: اجرای ku از هر پوشه</summary>
 
-Each platform archive above includes the Ku CLI (`ku run` uses the interpreter) and `ku-language-0.0.19.vsix`. The extension is distributed inside those archives, without a separate VSIX download asset. This website does not provide an in-browser interpreter.
-
-After extraction, choose **… → Install from VSIX…** in the VS Code Extensions view, open `ku-language-0.0.19.vsix`, and reload the window. Alternatively, run this from the extracted directory:
-
-```sh
-code --install-extension ./ku-language-0.0.19.vsix
-```
-
-The extension also needs the Ku CLI. Add the extracted directory to `PATH`, or set `ku.executablePath` in VS Code to the full path of `ku` (`ku.exe` on Windows).
-
-## نیازمندی‌های اجرا و ساخت
-
-| عملیات                                  | نیازمندی‌های اضافی                                                                     |
-| --------------------------------------- | -------------------------------------------------------------------------------------- |
-| `ku run hello.ku` / `ku check hello.ku` | Ku CLI متناسب با پلتفرم                                                                |
-| دستور پیش‌فرض `ku build hello.ku`       | Rust **1.89.0** برای مقصد و پیونددهندهٔ سیستم؛ وابستگی‌های Rust همراه بسته را حفظ کنید |
-| `ku build --backend c hello.ku`         | کامپایلر C و پیونددهندهٔ سالم برای مقصد                                                |
-| برنامهٔ بومی پایگاه داده                | کتابخانه‌های پویای خارجیِ سازگارِ کارخواه پایگاه داده؛ در بسته نیستند                  |
-
-اجراکنندهٔ پیش‌فرض فقط کد ورودی را در خود جای می‌دهد. ماژول‌های واردشده همچنان از محل اصلی بارگذاری می‌شوند. استقرار کل گراف واردسازی محلی بدون وابستگی به کد منبع، به کامپایل C بومی نیاز دارد و همچنان تابع [محدودیت‌های پشتیبانی از مسیرهای اجرا](/fa/docs/support/) است.
-
-## آزمایش کد توسعه
-
-در نسخهٔ محلی دریافت‌شده از مخزن:
+اگر بسته را در `~/ku` استخراج کرده‌اید، این خط را به فایل راه‌اندازی پوستهٔ خود، مانند `~/.zshrc` یا `~/.bashrc`، اضافه کنید:
 
 ```sh
-cargo +1.89.0 run --locked --release -- --version
-cargo +1.89.0 run --locked --release -- run examples/hello.ku
+export PATH="$HOME/ku:$PATH"
 ```
 
-The CLI and Cargo version for this release is `0.0.19`. Record the Git commit, target and toolchain when building source; source-build success does not prove publication of a release artifact.
+در Windows، تنظیمات متغیرهای محیطی حساب کاربری را باز کنید و مسیر کامل پوشهٔ استخراج‌شده، مثلاً `%USERPROFILE%\ku`، را به متغیر کاربری `Path` اضافه کنید. ورودی‌های موجود را نگه دارید.
 
-## حذف نصب
+ترمینال تازه‌ای باز کنید و `ku --version` را اجرا کنید.
 
-برای نصب از بایگانی، پوشهٔ استخراج‌شده را حذف کنید، ورودی اضافه‌شده به `PATH` را برگردانید و افزونهٔ VS Code را حذف کنید. ابتدا کدها و تنظیماتی را که در آن پوشه ساخته‌اید نگه دارید. نصب‌کنندهٔ جداگانهٔ یک‌کلیکی، نصب از مدیر بسته یا فرمان `ku uninstall` بررسی نشده‌اند.
+</details>
 
-گام بعدی: [اجرای اولین برنامه](/fa/docs/getting-started/). منبع قرارداد نصب: [بایگانی‌های انتشار](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/history.md).
+## ۳. نصب افزونهٔ VS Code
 
-`ku supervise` has platform-specific prerequisites and memory metrics; see [support boundaries](/fa/docs/support/). The macOS CLI can run programs, but this isolation mode is not natively supported.
+در بخش افزونه‌های VS Code گزینهٔ **… → Install from VSIX…** را انتخاب کنید، فایل `ku-language-0.0.19.vsix` را از پوشهٔ استخراج‌شده باز کنید و پنجره را دوباره بارگذاری کنید.
+
+اگر Ku در `PATH` نیست، مقدار `ku.executablePath` را روی مسیر کامل `ku` یا در Windows روی `ku.exe` تنظیم کنید.
+
+<details>
+<summary>بررسی فایل دانلودشده</summary>
+
+SHA-256 بسته را با [SHA256SUMS](https://github.com/fengyanweb/ku/releases/download/v0.0.19/SHA256SUMS) مقایسه کنید. [صفحهٔ انتشار](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) برای هر بسته یک فایل `.manifest.json` شامل مجموع بررسی فایل‌ها نیز دارد. راهنمای بیشتر در فایل `README-INSTALL.md` داخل بسته است.
+
+</details>
+
+<details>
+<summary>کامپایل برنامه‌های Ku خودتان</summary>
+
+`ku run` و `ku check` فقط به CLI همان سیستم نیاز دارند. `ku build` پیش‌فرض علاوه بر آن به Rust **1.89.0** و پیونددهندهٔ سیستم نیاز دارد. `ku build --backend c` به کامپایلر C و پیونددهندهٔ مقصد نیاز دارد. برنامه‌های بومی پایگاه داده نیز به کتابخانه‌های کلاینت سازگار نیاز دارند که در بسته نیستند.
+
+</details>
+
+<details>
+<summary>حذف نصب</summary>
+
+ابتدا فایل‌های منبع و تنظیماتی را که خودتان ساخته‌اید نگه دارید، سپس پوشهٔ استخراج‌شده، ورودی اضافه‌شده به `PATH` و افزونهٔ VS Code را حذف کنید.
+
+</details>
+
+[گام بعد: اجرای اولین برنامه](/fa/docs/getting-started/)

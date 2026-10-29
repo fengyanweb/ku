@@ -115,5 +115,10 @@
   "toolsGroup": "Limbaj și instrumente",
   "projectGroup": "Proiect",
   "libraryGroup": "Biblioteca standard",
-  "examplesGroup": "Exemple"
+  "examplesGroup": "Exemple",
+  "supportKu": "Susține Ku",
+  "donateDescription": "Dacă Ku îți este util, poți susține dezvoltarea sa printr-o donație voluntară. Îți mulțumim.",
+  "wechatInstruction": "Scanează cu WeChat sau salvează imaginea și deschide-o în WeChat.",
+  "wechatAlt": "Cod de donație WeChat pentru Ku",
+  "emailFeedback": "Feedback prin e-mail"
 }

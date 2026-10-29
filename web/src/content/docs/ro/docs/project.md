@@ -27,6 +27,8 @@ Ku și extensia VS Code sunt oferite sub Apache License 2.0. Consultați [LICENS
 
 Folosește [Issues](https://github.com/fengyanweb/ku/issues) ale depozitului pentru rapoarte reproductibile. Include:
 
+Feedback prin e-mail: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Versiunea Ku, commitul Git pentru surse de dezvoltare și sistemul / arhitectura țintă.
 - Comanda completă, backendul și sursa minimă `.ku`.
 - Diagnosticul complet sau Error structurat, ieșirea așteptată și cea efectivă.

@@ -14,6 +14,7 @@
     "check": "astro check",
     "build": "astro build",
     "build:production": "node scripts/require-production.mjs && astro build",
+    "package": "node scripts/package-site.mjs",
     "preview": "node scripts/preview.mjs"
   },
   "dependencies": {

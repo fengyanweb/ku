@@ -50,7 +50,7 @@
       "docs/guide/language"
     ],
     [
-      "设置明确资源边界。",
+      "按需设置资源上限。",
       "为服务连接、活跃请求、等待队列和缓冲区设置上限；OS 限制取决于平台和部署配置。",
       "支持范围",
       "docs/support"
@@ -65,7 +65,7 @@
   ],
   "performanceLimits": "单轮观察不等于容量或长期验收。宿主实际换页与长尾延迟仍在，PG 连接池 reset 语义存在差异。本轮测量的是 cgroup 内存，不是 RSS，不提供 RSS 比较。",
   "practiceTitle": ["熟悉的数据，", "明确的错误处理。"],
-  "practiceDescription": "导入模块，构造数据，再编码为 JSON。用 ? 传播错误，让失败路径成为代码的一部分。",
+  "practiceDescription": "导入模块，构造数据，再编码为 JSON。示例中的 ? 将编码错误交给 main 的调用方处理。",
   "jsonReference": "阅读 JSON 参考",
   "exampleNote": "同步示例。适用版本与后端差异见接口参考。",
   "copy": "复制代码",
@@ -86,10 +86,10 @@
       "查找 HTTP、JSON、文件、时间、数据库等官方模块。",
       "docs/stdlib"
     ],
-    ["了解当前边界", "平台、执行路径与已知限制。", "docs/support"]
+    ["平台与执行方式", "选择适合程序的运行方式。", "docs/support"]
   ],
   "projectTitle": "认真构建，也坦诚记录。",
-  "projectDescription": "Ku v{releasedVersion} 仍处于开发阶段。Linux ARM64 候选部署已完成隔离样例预演，尚未验证真实业务生产使用。欢迎用实际程序参与评估并反馈问题；公开产物以 GitHub Release 为准。",
+  "projectDescription": "Ku v{releasedVersion} 已发布，提供命令行工具、VS Code 插件和标准库。欢迎体验、反馈问题，或参与项目开发。",
   "github": "在 GitHub 查看项目",
   "license": "采用 Apache-2.0 许可证，详见 LICENSE 和 NOTICE。",
   "verified": "内容核实",
@@ -103,5 +103,10 @@
   "toolsGroup": "语言与工具",
   "projectGroup": "项目",
   "libraryGroup": "标准库",
-  "examplesGroup": "示例"
+  "examplesGroup": "示例",
+  "supportKu": "支持 Ku",
+  "donateDescription": "如果 Ku 对你有帮助，欢迎自愿赞赏，支持项目的持续开发。感谢你的支持。",
+  "wechatInstruction": "使用微信扫一扫，或保存图片后在微信中识别。",
+  "wechatAlt": "Ku 项目微信赞赏码",
+  "emailFeedback": "邮件反馈"
 }

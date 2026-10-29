@@ -107,5 +107,10 @@
   "toolsGroup": "Linguagem e ferramentas",
   "projectGroup": "Projeto",
   "libraryGroup": "Biblioteca padrão",
-  "examplesGroup": "Exemplos"
+  "examplesGroup": "Exemplos",
+  "supportKu": "Apoie o Ku",
+  "donateDescription": "Se o Ku é útil para você, considere apoiar seu desenvolvimento com uma doação voluntária. Obrigado.",
+  "wechatInstruction": "Escaneie com o WeChat ou salve a imagem e abra-a no WeChat.",
+  "wechatAlt": "Código de doação do WeChat para o Ku",
+  "emailFeedback": "Feedback por e-mail"
 }

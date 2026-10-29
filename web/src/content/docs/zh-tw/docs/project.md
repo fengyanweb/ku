@@ -27,6 +27,8 @@ Ku 與 VS Code 擴充功能採用 Apache License 2.0，詳見 [LICENSE](https://
 
 通過[倉庫 Issues](https://github.com/fengyanweb/ku/issues)提交可復現問題。報告盡量包含：
 
+電子郵件回報：[kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku 版本、Git commit（使用開發原始碼時）和目標系統 / 架構。
 - 完整命令、後端、最小 `.ku` 原始碼。
 - 完整診斷或結構化 Error、預期與實際輸出。

@@ -27,6 +27,8 @@ Ku ve VS Code uzantısı Apache License 2.0 ile sunulur. [LICENSE](https://githu
 
 Yeniden üretilebilir raporlar için deponun [Issues](https://github.com/fengyanweb/ku/issues) bölümünü kullanın. Şunları ekleyin:
 
+E-posta ile geri bildirim: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Ku sürümü, geliştirme kaynakları için Git commiti ve hedef sistem / mimari.
 - Tam komut, arka uç ve en küçük `.ku` kaynak örneği.
 - Tam tanı veya yapılandırılmış Error, beklenen ve gerçek çıktı.

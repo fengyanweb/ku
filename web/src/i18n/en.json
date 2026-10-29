@@ -50,7 +50,7 @@
       "docs/guide/language"
     ],
     [
-      "Set resource boundaries.",
+      "Set resource limits as needed.",
       "Bound service connections, active requests, waiting queues and buffers. OS limits depend on the platform and deployment.",
       "Support matrix",
       "docs/support"
@@ -65,7 +65,7 @@
   ],
   "performanceLimits": "A single round is not capacity or long-term acceptance. Host paging and long-tail latency remain. PG pool-reset semantics differ. This round measured cgroup memory, not RSS; no RSS comparison is made.",
   "practiceTitle": ["Familiar data.", "Explicit errors."],
-  "practiceDescription": "Import a module, build a value, and encode it as JSON. The ? operator propagates errors instead of hiding them.",
+  "practiceDescription": "Import a module, create data and encode it as JSON. Here, ? passes an encoding error to the caller of main.",
   "jsonReference": "Read the JSON reference",
   "exampleNote": "Synchronous example. Backend and version details are documented in the reference.",
   "copy": "Copy code",
@@ -91,13 +91,13 @@
       "docs/stdlib"
     ],
     [
-      "Know the boundaries",
-      "Platforms, backends and current limits.",
+      "Platforms and execution",
+      "Choose how to run your program.",
       "docs/support"
     ]
   ],
   "projectTitle": "A work in progress. A story to follow.",
-  "projectDescription": "Ku v{releasedVersion} remains in development. A Linux ARM64 deployment candidate has been rehearsed with an isolated sample; real-business production use has not been validated. Evaluate it with your own programs and share feedback. Published artifacts are listed in GitHub Releases.",
+  "projectDescription": "Ku v{releasedVersion} is available with a CLI, VS Code extension and standard library. Try it, report issues or contribute to its development.",
   "github": "Explore on GitHub",
   "license": "Licensed under Apache-2.0. See LICENSE and NOTICE.",
   "verified": "Verified",
@@ -111,5 +111,10 @@
   "toolsGroup": "Language & tools",
   "projectGroup": "Project",
   "libraryGroup": "Standard library",
-  "examplesGroup": "Examples"
+  "examplesGroup": "Examples",
+  "supportKu": "Support Ku",
+  "donateDescription": "If Ku helps you, you can support its continued development with a voluntary donation. Thank you.",
+  "wechatInstruction": "Scan with WeChat, or save the image and open it in WeChat.",
+  "wechatAlt": "WeChat donation code for Ku",
+  "emailFeedback": "Email feedback"
 }

@@ -115,5 +115,10 @@
   "toolsGroup": "Dil ve araçlar",
   "projectGroup": "Proje",
   "libraryGroup": "Standart kütüphane",
-  "examplesGroup": "Örnekler"
+  "examplesGroup": "Örnekler",
+  "supportKu": "Ku’yu destekleyin",
+  "donateDescription": "Ku işinize yarıyorsa gönüllü bir bağışla geliştirilmesini destekleyebilirsiniz. Teşekkürler.",
+  "wechatInstruction": "WeChat ile tarayın veya görseli kaydedip WeChat’te açın.",
+  "wechatAlt": "Ku için WeChat bağış kodu",
+  "emailFeedback": "E-posta ile geri bildirim"
 }

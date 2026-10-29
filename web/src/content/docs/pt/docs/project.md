@@ -27,6 +27,8 @@ Ku e a extensão VS Code usam a Apache License 2.0. Consulte [LICENSE](https://g
 
 Use os [Issues](https://github.com/fengyanweb/ku/issues) do repositório para relatos reproduzíveis. Inclua:
 
+Feedback por e-mail: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
+
 - Versão do Ku, commit Git para fontes de desenvolvimento e sistema / arquitetura de destino.
 - Comando completo, backend e código-fonte `.ku` mínimo.
 - Diagnóstico completo ou Error estruturado, saída esperada e saída real.

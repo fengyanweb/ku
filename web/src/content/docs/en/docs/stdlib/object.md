@@ -31,7 +31,7 @@ import object from "std.object"
 Save as `objects.ku`, then run `ku run objects.ku` or `ku build --backend c -o objects objects.ku`.
 
 ```ku
-fn main(): null! {
+fn main() {
     user = { name: "Ku" }
     println(user.get_or("name", "unknown"))
     println(user.get_or("age", 99))
@@ -41,7 +41,6 @@ fn main(): null! {
     } catch (error) {
         println(error.code)
     }
-    return ok(null)
 }
 ```
 

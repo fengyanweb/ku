@@ -7,10 +7,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const kuGrammar = JSON.parse(
   readFileSync(
-    new URL(
-      '../editors/vscode-ku/syntaxes/ku.tmLanguage.json',
-      import.meta.url,
-    ),
+    new URL('./src/data/ku.tmLanguage.json', import.meta.url),
     'utf8',
   ),
 );
@@ -20,6 +17,19 @@ const readJson = (path) =>
   JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
 const languages = readJson('./src/i18n/languages.json');
 const versioning = readJson('./src/data/versions.json');
+const packageMetadata = readJson('./package.json');
+const lockMetadata = readJson('./package-lock.json');
+if (
+  versioning.current !== versioning.released ||
+  versioning.current !== packageMetadata.version ||
+  versioning.current !== lockMetadata.version ||
+  versioning.current !== lockMetadata.packages?.['']?.version ||
+  ('languageVersion' in versioning &&
+    versioning.current !== versioning.languageVersion)
+)
+  throw new Error(
+    'Website package, lockfile and current release versions must agree.',
+  );
 const translations = Object.fromEntries(
   Object.keys(languages).map((locale) => [
     locale,
