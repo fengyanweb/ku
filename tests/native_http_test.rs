@@ -2000,6 +2000,56 @@ fn main(): null! {
 "#;
 
 #[test]
+fn native_http_status_lines_preserve_longest_unknown_and_invalid_statuses() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"import "std.http"
+fn main(): null! {
+    app=http.server()
+    app.get("/longest",fn(){return http.text(431,"longest")})
+    app.get("/unknown",fn(){return http.text(599,"unknown")})
+    app.get("/low",fn(){return http.text(99,"invalid-status")})
+    app.get("/high",fn(){return http.text(600,"invalid-status")})
+    app.get("/ok",fn(){return http.text("ready")})
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_finite_native_server("status-lines", source, &address, 5) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (path, expected, body) in [
+        (
+            "/longest",
+            "HTTP/1.1 431 Request Header Fields Too Large",
+            Some("longest"),
+        ),
+        ("/unknown", "HTTP/1.1 599 Unknown", Some("unknown")),
+        ("/low", "HTTP/1.1 500 Internal Server Error", None),
+        ("/high", "HTTP/1.1 500 Internal Server Error", None),
+        ("/ok", "HTTP/1.1 200 OK", Some("ready")),
+    ] {
+        let response = http_response(
+            &address,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, expected);
+        assert_eq!(response.lines().next(), Some(expected));
+        if let Some(body) = body {
+            assert!(response.ends_with(&format!("\r\n\r\n{body}")), "{response}");
+        } else {
+            assert!(!response.contains("invalid-status"), "{response}");
+        }
+    }
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
 fn native_http_error_statuses_match_interpreter() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
@@ -3695,6 +3745,10 @@ fn native_http_gather_write_preserves_partial_vectors_errors_and_turn_budgets() 
         "typedef struct { const char* bytes; size_t length; } KuHttpPart;",
         "\nenum {\n  KU_HTTP_IO_FREE",
     );
+    let status_text = region(
+        "static const char* ku_http_status_text(",
+        "static KuString ku_http_string_copy(",
+    );
     let write = region(
         "static void ku_http_connection_write_limited(",
         "static void ku_http_connection_observe_job(",
@@ -3844,6 +3898,16 @@ static void fixture_pressure(KuHttpConnection* connection) {
     let checks = r#"
 int main(void) {
   KuHttpConnection connection; KuHttpServer server={0};
+  /* Every supported status and the default Unknown reason must fit the real
+     production layout, including CRLF and the snprintf terminator. */
+  for(int status=100;status<=599;status++) {
+    int length=snprintf(connection.output.first,sizeof(connection.output.first),
+        "HTTP/1.1 %d %s\r\n",status,ku_http_status_text(status));
+    CHECK(length>0 && (size_t)length<sizeof(connection.output.first));
+    CHECK(connection.output.first[length]=='\0');
+    if(status==431)CHECK(length==46);
+    if(status==599)CHECK(!strcmp(connection.output.first,"HTTP/1.1 599 Unknown\r\n"));
+  }
   static const unsigned char fixture_prefix_bytes[9]={'H',0,'I','a','b','c','d','e','f'};
   /* The first-write opportunity is one syscall and16KiB, not an unbounded
      flush. The original readiness cursor/deadline must resume it exactly. */
@@ -3956,7 +4020,7 @@ int main(void) {
     let path = directory.path().join("gather.c");
     fs::write(
         &path,
-        format!("{header}{output}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
+        format!("{header}{status_text}{output}{phases}{edges}{write}{pressure_edges}{pressure}{pressure_end}{checks}"),
     )
     .unwrap();
     let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "gather")

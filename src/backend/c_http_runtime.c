@@ -1719,7 +1719,9 @@ typedef struct { const char* bytes; size_t length; } KuHttpPart;
 typedef struct {
   KuStruct___ku_http_response response;
   size_t charge;
-  char first[256]; char last[128];
+  /* Status is normalized to 100..599 before formatting. The longest private
+     reason is 31 bytes, so the complete status line including NUL needs 47. */
+  char first[64]; char last[128];
   KuHttpPart parts[9];
   int count; int part;
   size_t offset;
