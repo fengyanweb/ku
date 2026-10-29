@@ -67,8 +67,8 @@ type corpus struct {
 	hash    string
 }
 type config struct {
-	responseLiteral, pathOverride string
-	responseLiteralSet, pathOverrideSet bool
+	responseLiteral, pathOverride                                           string
+	responseLiteralSet, pathOverrideSet                                     bool
 	address, workload, protocolPath, corporaDir, corpusPath, output, events string
 	duration, timeout, idle                                                 time.Duration
 	rate                                                                    float64
@@ -1116,6 +1116,7 @@ func inputAt(c config, j job) (int, int) {
 	}
 	return e.Work[j.index%uint64(len(e.Work))], e.Seeds[(j.index/uint64(len(e.Work)))%uint64(len(e.Seeds))]
 }
+
 // The override is deliberately a separate diagnostic contract. Empty response
 // literals are valid only when explicitly selected; defaults remain unchanged.
 func validateConstantDiagnostic(c config) error {
@@ -1438,11 +1439,11 @@ func run(c config) (map[string]any, error) {
 		out["normal_score_eligible"] = false
 		out["diagnostic_scope"] = "constant HTTP H4 qualification only; excludes generic/real-business main tables"
 		clocks["constant_http_diagnostic"] = map[string]any{
-			"path_override":          c.pathOverride,
-			"response_literal_bytes": len(c.responseLiteral),
+			"path_override":           c.pathOverride,
+			"response_literal_bytes":  len(c.responseLiteral),
 			"response_literal_sha256": hex.EncodeToString(literalHash[:]),
-			"oracle":                 "HTTP200 plus exact complete fixed body; no dynamic RID body echo",
-			"request_identity":       "original unique RID query and request headers retained",
+			"oracle":                  "HTTP200 plus exact complete fixed body; no dynamic RID body echo",
+			"request_identity":        "original unique RID query and request headers retained",
 		}
 	}
 	out["descriptor_preparation"] = descriptors.report(l.origin, anchor)

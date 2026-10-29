@@ -62,6 +62,14 @@ class AssessmentQualityTest(unittest.TestCase):
             'correct_scheduled_to_complete': {'count': 1000, 'p99_ms': 1}},
             'service_cost': {'before': {'memory_events': {}}, 'after': {'memory_events': {}}}}
 
+    def test_constant_diagnostic_never_qualifies_as_dynamic_business_work(self):
+        for flags in ({'diagnostic_only': True}, {'normal_score_eligible': False}):
+            result = dict(self.report(), **flags)
+            self.assertEqual(qualification(result, 'ok')['reasons'],
+                             ['diagnostic_contract_excluded_from_main_table'])
+            self.assertFalse(qualification(result, 'ok')['eligible_for_formal_candidate'])
+        self.assertTrue(qualification(self.report(), 'ok')['eligible_for_formal_candidate'])
+
     def test_accounting_is_not_arrival_quality_and_lateness_is_not_its_own_cause(self):
         r = self.report()
         r['ledger']['scheduled_to_attempt']['p99_ms'] = 338

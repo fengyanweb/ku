@@ -1100,6 +1100,8 @@ def qualification(result, workload):
     """Small-tail samples stay explicit, never silently treated as p99 evidence."""
     ledger = result['ledger']
     reasons = []
+    if result.get('diagnostic_only') is True or result.get('normal_score_eligible') is False:
+        reasons.append('diagnostic_contract_excluded_from_main_table')
     clock=measurement_clock(result.get('configuration',{}))
     if not clock['available']:
         reasons.append(clock['reason'])
