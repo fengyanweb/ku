@@ -5691,33 +5691,48 @@ static KuString ku_json_buffer_take_string(KuJsonBuffer* buffer) {
   return value;
 }
 
-/* Raw JSON string scans need a validated byte width, not a decoded scalar.
-   The E0/ED/F0/F4 bounds also reject overlongs, surrogates and >U+10FFFF. */
-static size_t ku_json_utf8_width(
+static bool ku_json_utf8_scalar(
     const uint8_t* current,
-    const uint8_t* end) {
-  if (!current || current >= end) return 0;
+    const uint8_t* end,
+    size_t* width,
+    uint32_t* scalar) {
+  if (!current || current >= end) return false;
   uint8_t first = current[0];
-  if (first < 0x80) return 1;
+  if (first < 0x80) {
+    *width = 1;
+    *scalar = first;
+    return true;
+  }
   size_t remaining = (size_t)(end - current);
   if (first >= 0xC2 && first <= 0xDF) {
-    if (remaining < 2 || (current[1] & 0xC0) != 0x80) return 0;
-    return 2;
+    if (remaining < 2 || (current[1] & 0xC0) != 0x80) return false;
+    *width = 2;
+    *scalar = ((uint32_t)(first & 0x1F) << 6) | (uint32_t)(current[1] & 0x3F);
+    return true;
   }
   if (first >= 0xE0 && first <= 0xEF) {
-    if (remaining < 3 || (current[1] & 0xC0) != 0x80 || (current[2] & 0xC0) != 0x80) return 0;
-    if (first == 0xE0 && current[1] < 0xA0) return 0;
-    if (first == 0xED && current[1] >= 0xA0) return 0;
-    return 3;
+    if (remaining < 3 || (current[1] & 0xC0) != 0x80 || (current[2] & 0xC0) != 0x80) return false;
+    if (first == 0xE0 && current[1] < 0xA0) return false;
+    if (first == 0xED && current[1] >= 0xA0) return false;
+    *width = 3;
+    *scalar = ((uint32_t)(first & 0x0F) << 12)
+        | ((uint32_t)(current[1] & 0x3F) << 6)
+        | (uint32_t)(current[2] & 0x3F);
+    return true;
   }
   if (first >= 0xF0 && first <= 0xF4) {
     if (remaining < 4 || (current[1] & 0xC0) != 0x80
-        || (current[2] & 0xC0) != 0x80 || (current[3] & 0xC0) != 0x80) return 0;
-    if (first == 0xF0 && current[1] < 0x90) return 0;
-    if (first == 0xF4 && current[1] > 0x8F) return 0;
-    return 4;
+        || (current[2] & 0xC0) != 0x80 || (current[3] & 0xC0) != 0x80) return false;
+    if (first == 0xF0 && current[1] < 0x90) return false;
+    if (first == 0xF4 && current[1] > 0x8F) return false;
+    *width = 4;
+    *scalar = ((uint32_t)(first & 0x07) << 18)
+        | ((uint32_t)(current[1] & 0x3F) << 12)
+        | ((uint32_t)(current[2] & 0x3F) << 6)
+        | (uint32_t)(current[3] & 0x3F);
+    return *scalar <= 0x10FFFF;
   }
-  return 0;
+  return false;
 }
 
 static size_t ku_json_encode_utf8(uint32_t scalar, uint8_t bytes[4]) {
@@ -5876,8 +5891,9 @@ static bool ku_json_parse_string(
         parser->current++;
         continue;
       }
-      size_t width = ku_json_utf8_width(parser->current, end);
-      if (!width) {
+      size_t width = 0;
+      uint32_t scalar = 0;
+      if (!ku_json_utf8_scalar(parser->current, end, &width, &scalar)) {
         /* An allocation failure in the earlier valid prefix must still win
            over this later syntax error, whose byte position stays unchanged. */
         if (parser->current != start && !ku_json_buffer_append(&buffer, start,
@@ -6240,8 +6256,9 @@ static bool ku_json_write_string(
     if (byte >= 0x20 && byte != '"' && byte != '\\') {
       if (byte < 0x80) current++;
       else {
-        size_t width = ku_json_utf8_width(current, end);
-        if (!width) {
+        size_t width = 0;
+        uint32_t scalar = 0;
+        if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
           return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
         }
         current += width;
