@@ -3811,10 +3811,12 @@ int main(void) {
     )
     .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        output.stdout,
-        b"http-route-snapshot-owned-validation-budget-ok\n"
-    );
+    let marker = if cfg!(windows) {
+        b"http-route-snapshot-owned-validation-budget-ok\r\n".as_slice()
+    } else {
+        b"http-route-snapshot-owned-validation-budget-ok\n".as_slice()
+    };
+    assert_eq!(output.stdout, marker);
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
