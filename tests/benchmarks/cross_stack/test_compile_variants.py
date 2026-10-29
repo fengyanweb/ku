@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 import types
@@ -15,7 +17,8 @@ import profile_training
 from compile_variants import profile_input, native_flags
 from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
-from build_linux import expand_ku_server
+from build_linux import (expand_ku_server, file_identity, native_emission_source,
+                         normal_compiler_receipt, normal_compiler_recorder)
 
 
 class KuCompilerCommandTests(unittest.TestCase):
@@ -27,6 +30,89 @@ class KuCompilerCommandTests(unittest.TestCase):
         for argument in ['a"b', 'a\nb', 'a\rb']:
             with self.assertRaisesRegex(ValueError, 'KU_CC'):
                 compile_variants.ku_cc_command(['clang-18', argument])
+
+
+class NormalCompilerReceiptTests(unittest.TestCase):
+    """Exercise real wrapper execution with inert files, never a C compiler."""
+
+    def fixture(self, root):
+        work = root / 'source with spaces'
+        work.mkdir()
+        source = work / 'generated server.c'
+        source.write_text('/* fixture only: no C compilation */\n')
+        staged = root / '.ku-link-library-fixture' / 'libpq.so'
+        staged.parent.mkdir()
+        staged.write_bytes(b'fixture libpq identity')
+        final = root / 'bin with spaces' / 'ku-server'
+        temporary = final.parent / '.ku-link-temp-fixture' / final.name
+        temporary.parent.mkdir(parents=True)
+        observed = root / 'executed-argv.json'
+        compiler = root / 'compiler with spaces'
+        compiler.write_text('#!' + sys.executable + '\n'
+            'import json,sys\n'
+            'open(' + repr(str(observed)) + ',"w").write(json.dumps(sys.argv))\n'
+            'print(' + repr('native c ok: ' + str(source)) + ')\n'
+            'print(' + repr('build ok: ' + str(final)) + ')\n')
+        compiler.chmod(0o700)
+        arguments = [str(source), '-std=c11', '-o', str(temporary), '-O2', '-pthread', str(staged)]
+        return work, source, staged, final, temporary, observed, compiler, arguments
+
+    def test_atomic_output_staged_library_and_stdout_survive_transparent_exec(self):
+        with tempfile.TemporaryDirectory(prefix='ku receipts ') as directory:
+            root = Path(directory)
+            work, source, staged, final, temporary, observed, compiler, arguments = self.fixture(root)
+            with normal_compiler_recorder(root / 'receipts', compiler, work, staged) as recorder:
+                command = recorder['command']
+                self.assertIn('"' + command[2] + '"', recorder['ku_cc'])
+                run = subprocess.run([*command, *arguments], cwd=work, text=True,
+                                     capture_output=True, timeout=10)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stderr, '')
+                self.assertEqual(native_emission_source(run.stdout, final, work), source.resolve())
+                with self.assertRaisesRegex(RuntimeError, 'emission output'):
+                    native_emission_source('recorder noise\n' + run.stdout, final, work)
+                receipt_path = Path(recorder['receipt'])
+                receipt = json.loads(receipt_path.read_text())
+                self.assertEqual(json.loads(observed.read_text()), [str(compiler), *arguments])
+                self.assertEqual(receipt['argv'], [str(compiler), *arguments])
+                self.assertEqual(receipt['cwd'], str(work.resolve()))
+                self.assertEqual(receipt['output'], str(temporary.resolve()))
+                self.assertNotEqual(receipt['output'], str(final))
+                self.assertEqual(receipt['flags'], ['-std=c11', '-O2', '-pthread'])
+                self.assertNotIn('-lm', receipt['flags'])
+                self.assertEqual(receipt['library_inputs'][0]['sha256'], file_identity(staged)['sha256'])
+                self.assertEqual(receipt['compiler'], file_identity(compiler))
+                self.assertNotIn('env', receipt)
+                # CLI deletes its private library after linking; its identity
+                # must already be durable rather than read back after return.
+                staged.unlink()
+                self.assertEqual(json.loads(receipt_path.read_text()), receipt)
+            self.assertFalse(Path(command[2]).exists())
+            self.assertFalse(Path(command[3]).exists())
+            self.assertTrue(receipt_path.is_file())
+
+    def test_unknown_inputs_and_nonexact_o2_fail_before_exec_and_cleanup_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _, staged, _, _, _, compiler, arguments = self.fixture(root)
+            extra = root / 'unselected.so'
+            extra.write_bytes(b'different library')
+            obj = root / 'extra.o'
+            obj.write_bytes(b'object file')
+            config = dict(compiler=file_identity(compiler), work=str(work),
+                          library=file_identity(staged), helper_sha256='fixture')
+            for changed in [arguments + ['-O3'], arguments + ['-O2'],
+                            [x for x in arguments if x != '-O2'],
+                            arguments + [str(extra)], arguments + [str(obj)],
+                            arguments + [str(staged)], arguments + ['@options']]:
+                with self.subTest(arguments=changed), self.assertRaises(RuntimeError):
+                    normal_compiler_receipt(config, changed, work)
+            with self.assertRaisesRegex(ValueError, 'interrupted fixture'):
+                with normal_compiler_recorder(root / 'failed', compiler, work, staged) as recorder:
+                    command = recorder['command']
+                    raise ValueError('interrupted fixture')
+            self.assertFalse(Path(command[2]).exists())
+            self.assertFalse(Path(command[3]).exists())
 
 
 class HostedWorkflowContracts(unittest.TestCase):

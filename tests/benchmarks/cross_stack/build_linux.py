@@ -7,6 +7,7 @@ ROOT/build, not the source tree. This prepares measured programs, not a Release.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -16,9 +17,12 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
+
+from compile_variants import ku_cc_command
 
 CANDIDATE = "8210e5200c466d9041807d04a68c1844ba9cbd6f"
 
@@ -39,6 +43,117 @@ def write_json(path, value):
         json.dump(value, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
     os.replace(temporary, path)
+
+
+def file_identity(path):
+    path = Path(path).absolute()
+    real = path.resolve(strict=True)
+    if not real.is_file():
+        raise RuntimeError("compiler input is not a regular file: " + str(path))
+    return dict(path=str(path), real_path=str(real), size=real.stat().st_size,
+                sha256=digest(real))
+
+
+def normal_compiler_receipt(config, arguments, cwd):
+    """Inspect the real CLI invocation before its staged library disappears.
+
+    This is deliberately limited to the frozen native ARM64 benchmark: no
+    override flags, response files, additional object files or libraries.
+    The CLI owns -o staging/installation; it need not equal the final output.
+    """
+    compiler = file_identity(config["compiler"]["path"])
+    if compiler != config["compiler"]:
+        raise RuntimeError("recorded native compiler identity changed")
+    row = dict(schema="ku-normal-compiler-invocation-v1", compiler=compiler,
+               argv=[compiler["path"], *arguments], cwd=str(Path(cwd).resolve()),
+               helper_sha256=config["helper_sha256"])
+    if arguments in (["-dumpmachine"], ["--version"]):
+        return dict(row, kind="probe")
+    sources, libraries, flags, output = [], [], [], None
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-o":
+            index += 1
+            if output is not None or index == len(arguments):
+                raise RuntimeError("expected one actual native compiler -o")
+            output = str((Path(cwd) / arguments[index]).resolve())
+        elif argument in ("-std=c11", "-O2", "-pthread", "-lm"):
+            if argument in flags:
+                raise RuntimeError("duplicate normal native compiler flag: " + argument)
+            flags.append(argument)
+        elif argument.startswith("-"):
+            raise RuntimeError("unknown normal native compiler flag/input: " + argument)
+        else:
+            if not (argument.endswith(".c") or re.search(r"\.so(?:\.[0-9.]+)?$", argument)):
+                raise RuntimeError("unknown native compiler input: " + argument)
+            item = file_identity(Path(cwd) / argument)
+            if argument.endswith(".c"):
+                if Path(config["work"]).resolve() not in Path(item["real_path"]).parents:
+                    raise RuntimeError("native compiler source escaped the private build directory")
+                sources.append(item)
+            elif re.search(r"\.so(?:\.[0-9.]+)?$", argument):
+                expected = config["library"]
+                if expected is None or item["sha256"] != expected["sha256"]:
+                    raise RuntimeError("unknown native library input: " + argument)
+                libraries.append(dict(item, role="libpq", selected_input=expected))
+        index += 1
+    if (len(sources) != 1 or output is None or "-std=c11" not in flags or "-O2" not in flags
+            or len(libraries) != (1 if config["library"] else 0)):
+        raise RuntimeError("native compiler invocation is not the exact normal O2 contract")
+    return dict(row, kind="compile", source=sources[0], output=output,
+                flags=flags, library_inputs=libraries)
+
+
+def exec_recorded_compiler(config_path, arguments):
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if digest(__file__) != config["helper_sha256"]:
+        raise RuntimeError("compiler receipt helper changed during the build")
+    row = normal_compiler_receipt(config, arguments, Path.cwd())
+    receipt = Path(config["receipt"])
+    if row["kind"] == "probe":
+        receipt = receipt.with_name("probe-" + arguments[0].lstrip("-") + ".json")
+    # Explicit compiler selection has no fallback: a second compile is an
+    # unexpected invocation, not permission to overwrite its first evidence.
+    with receipt.open("x", encoding="utf-8") as stream:
+        json.dump(row, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    os.execv(config["compiler"]["path"], row["argv"])
+
+
+@contextmanager
+def normal_compiler_recorder(directory, compiler, work, library=None):
+    """Rebuild a disposable KU_CC recorder; keep only its receipt and recipe."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    helper = Path(__file__).resolve()
+    config = dict(compiler=file_identity(compiler), work=str(Path(work).resolve()),
+                  library=file_identity(library) if library is not None else None,
+                  helper_sha256=digest(helper), receipt=str(directory / "compiler.json"))
+    with tempfile.TemporaryDirectory(prefix="ku-cc-", dir=directory.parent) as temporary:
+        wrapper, settings = Path(temporary) / "record.py", Path(temporary) / "config.json"
+        wrapper.write_text("import sys\nsys.dont_write_bytecode = True\n"
+                           + "sys.path.insert(0, " + repr(str(helper.parent)) + ")\n"
+                           + "from build_linux import exec_recorded_compiler\n"
+                           + "exec_recorded_compiler(sys.argv[1], sys.argv[2:])\n", encoding="utf-8")
+        write_json(settings, config)
+        command = [sys.executable, "-B", str(wrapper), str(settings)]
+        yield dict(command=command, ku_cc=ku_cc_command(command),
+                   receipt=config["receipt"], recipe=dict(
+                       function="build_linux.normal_compiler_recorder", helper=str(helper),
+                       helper_sha256=config["helper_sha256"], wrapper_sha256=digest(wrapper),
+                       compiler=config["compiler"], library=config["library"]))
+
+
+def native_emission_source(emission, destination, work):
+    # The recorder is silent: ordinary CLI stdout remains exactly two lines.
+    lines = emission.splitlines()
+    if len(lines) != 2 or not lines[0].startswith("native c ok: ") or lines[1] != "build ok: " + str(destination):
+        raise RuntimeError("unexpected Ku C emission output; refusing to reuse generated source")
+    generated = Path(lines[0].removeprefix("native c ok: "))
+    if generated.is_symlink() or Path(work).resolve() not in generated.resolve(strict=True).parents:
+        raise RuntimeError("generated C escaped the private build directory")
+    return generated.resolve(strict=True)
 
 
 def identities(root):
@@ -240,6 +355,20 @@ class Builder:
                                 "--jobs", "2", "--target-dir", target])
         ku = target / "release/ku"
         self.version("ku", [ku, "--version"], "ku " + self.package_version)
+        self.ku_native(ku)
+
+    def ku_native(self, ku):
+        """Use an identified existing CLI for the ordinary native Release path.
+
+        Modes expand this Builder's own immutable source, not another version's
+        benchmark program. Reusing the CLI does not claim it was rebuilt here.
+        """
+        ku = Path(ku).resolve(strict=True)
+        self.version("ku", [ku, "--version"], "ku " + self.package_version)
+        compiler = shutil.which("clang-18", path=self.environment["PATH"])
+        if compiler is None:
+            raise RuntimeError("normal native compiler clang-18 is missing")
+        self.version("cc", [compiler, "--version"], "18.")
         libpq = Path("/usr/lib/aarch64-linux-gnu/libpq.so").resolve(strict=True)
         with libpq.open("rb") as stream:
             magic = stream.read(4)
@@ -259,17 +388,18 @@ class Builder:
         outputs = {}
         for name, path in (("server", expanded), ("batch", batch)):
             destination = self.bin / ("ku-" + name)
-            emission = self.command("ku-native-" + name, [ku, "build", "--backend", "c", "--profile", "release",
-                                                       "--emit-c", "-o", destination, path], cwd=work,
-                                    environment={"KU_PG_LIB": str(private)})
+            with normal_compiler_recorder(self.logs / ("native-compiler-" + name), compiler, work,
+                                          private / "libpq.so" if name == "server" else None) as recorder:
+                emission = self.command("ku-native-" + name, [ku, "build", "--backend", "c", "--profile", "release",
+                                                           "--emit-c", "-o", destination, path], cwd=work,
+                                        environment={"KU_PG_LIB": str(private), "KU_CC": recorder["ku_cc"]})
             # Measure the ordinary CLI's Release output. ARM64 Linux linking
             # is now supported; a historical refusal is not a successful build.
-            lines = emission.splitlines()
-            if len(lines) != 2 or not lines[0].startswith("native c ok: ") or lines[1] != "build ok: " + str(destination):
-                raise RuntimeError("unexpected Ku C emission output; refusing to reuse generated source")
-            generated_source = Path(lines[0].removeprefix("native c ok: ")).resolve(strict=True)
-            if work.resolve() not in generated_source.parents or generated_source.is_symlink():
-                raise RuntimeError("generated C escaped the private build directory")
+            generated_source = native_emission_source(emission, destination, work)
+            invocation = json.loads(Path(recorder["receipt"]).read_text(encoding="utf-8"))
+            if (invocation["kind"] != "compile" or invocation["source"]["real_path"] != str(generated_source)
+                    or invocation["source"]["sha256"] != digest(generated_source)):
+                raise RuntimeError("actual compiler input does not match the CLI's retained generated C")
             elf_header = self.command("ku-elf-header-" + name, ["readelf", "-h", destination], timeout=30)
             if "AArch64" not in elf_header or "ELF64" not in elf_header:
                 raise RuntimeError("native benchmark output is not actual ELF64 AArch64")
@@ -277,6 +407,10 @@ class Builder:
             outputs[name] = dict(source=str(path), source_sha256=digest(path),
                                  generated_c=str(generated_source), generated_c_sha256=digest(generated_source),
                                  binary=str(destination), binary_sha256=digest(destination),
+                                 compiler_invocation=invocation,
+                                 compiler_receipt=recorder["receipt"],
+                                 compiler_receipt_sha256=digest(recorder["receipt"]),
+                                 compiler_recorder=recorder["recipe"],
                                  elf_header=elf_header, dynamic_dependencies=dynamic,
                                  linking="ordinary Ku CLI native Release build on ARM64 Linux; no separate official archive in this release")
         generated = {str(p.relative_to(work)): digest(p) for p in work.rglob("*.c")}
@@ -299,7 +433,8 @@ class Builder:
                                                                   native=outputs, generated_c=generated,
                                                                   libpq_source=str(libpq), libpq_sha256=digest(libpq),
                                                                   libpq_private_sha256=digest(private / "libpq.so"),
-                                                                  cc="clang-18", native_flags="C11 -O2 -pthread -lm; server links installed libpq.so",
+                                                                  cc=file_identity(compiler),
+                                                                  native_flags={name: item["compiler_invocation"]["flags"] for name, item in outputs.items()},
                                                                   official_release_target=False))
         self.built.add("ku")
 
