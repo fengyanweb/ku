@@ -1,0 +1,21 @@
+// Native C only. Build: ku build --native examples/pg_typed_demo.ku
+// Read a private libpq connection string from db.conn; never commit credentials.
+import pg from "std.pg"
+import "std.fs"
+
+fn main(): null! {
+    client = pg.client({conninfo: fs.read("db.conn")?, max_connections: 2})?
+    row = client.query_one_typed(
+        "SELECT $1::int4 AS id, $2::bool AS enabled, $3::text AS label, $4::text AS optional_label",
+        [17, true, "中文🙂 ' \\", null],
+        ["int4", "bool", "text", "text?"],
+        ["int4", "bool", "text", "text?"]
+    )?
+    if (row.rows() != 1 || row.cols() != 4) { panic("typed row shape") }
+    if (row.value_int(0, 0)? != 17 || !row.value_bool(0, 1)?) { panic("typed scalar") }
+    if (!row.is_null(0, 3)?) { panic("typed NULL") }
+    client.close()
+    // The row and this owned string remain valid after connection cleanup.
+    println(row.value(0, 2)?)
+    return ok(null)
+}
