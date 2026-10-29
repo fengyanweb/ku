@@ -5383,6 +5383,109 @@ fn main(): null! {
 }
 
 #[test]
+fn native_json_raw_utf8_boundaries_reject_invalid_bytes_and_release_buffers() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-raw-utf8-boundaries"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import json from "std.json"
+fn main(): null! {
+    println(json.encode(json.decode("\"\"")?)?)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write JSON UTF-8 fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    // Inject byte arrays after code generation: neither the Rust source parser
+    // nor fs.read may reject malformed UTF-8 before the native JSON routines.
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-raw-utf8-boundaries",
+        r#"
+static int json_utf8_valid_case(const uint8_t* bytes,size_t len,const char* escaped) {
+  uint8_t input[8]={'a'},expected[16]={'"','a'};
+  memcpy(input+1,bytes,len);input[len+1]='z';
+  size_t encoded_len=escaped?strlen(escaped):len;
+  memcpy(expected+2,escaped?(const uint8_t*)escaped:bytes,encoded_len);
+  expected[encoded_len+2]='z';expected[encoded_len+3]='"';
+  KuValue value=ku_v_str(ku_string_static(input,len+2));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(encoded.ok && encoded.value.len==encoded_len+4);
+  CHECK(!memcmp(encoded.value.ptr,expected,encoded_len+4));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len+2 && !memcmp(input+1,bytes,len));
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(expected,encoded_len+4));
+  CHECK(decoded.ok && decoded.value.tag==KU_STR && decoded.value.as.s.len==len+2);
+  CHECK(!memcmp(decoded.value.as.s.ptr,input,len+2));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);ku_value_drop(&value);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+static int json_utf8_invalid_case(const uint8_t* bytes,size_t len) {
+  uint8_t input[8]={'a'},text[10]={'"','a'};
+  memcpy(input+1,bytes,len);memcpy(text+2,bytes,len);
+  KuValue value=ku_v_str(ku_string_static(input,len+1));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(!encoded.ok && ku_string_equal(encoded.error.domain,ku_string_static((const uint8_t*)"json",4)));
+  CHECK(ku_string_equal(encoded.error.code,ku_string_static((const uint8_t*)"stringify_error",15)));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len+1 && !memcmp(input+1,bytes,len));
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);ku_value_drop(&value);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  // With no closing quote, truncated sequences end at the actual input bound.
+  // Check the error text so an unrelated "unterminated string" cannot pass.
+  for(size_t closing=0;closing<2;closing++) {
+    text[len+2]='"';
+    KuResult_kuvalue decoded=ku_json_parse(ku_string_static(text,len+2+closing));
+    static const char message[]="invalid utf-8 in json string";
+    CHECK(!decoded.ok && ku_string_equal(decoded.error.domain,ku_string_static((const uint8_t*)"json",4)));
+    CHECK(ku_string_equal(decoded.error.code,ku_string_static((const uint8_t*)"parse_error",11)));
+    CHECK(decoded.error.message.len>=sizeof(message)-1 && !memcmp(decoded.error.message.ptr,message,sizeof(message)-1));
+    ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+    CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  return 0;
+}
+int main(void) {
+  static const struct {uint8_t bytes[4];size_t len;const char* escaped;} valid[]={
+    {{0x00},1,"\\u0000"},{{0x20},1,NULL},{{0x22},1,"\\\""},{{0x5c},1,"\\\\"},{{0x7f},1,NULL},
+    {{0xc2,0x80},2,NULL},{{0xdf,0xbf},2,NULL},
+    {{0xe0,0xa0,0x80},3,NULL},{{0xe0,0xbf,0xbf},3,NULL},
+    {{0xe1,0x80,0x80},3,NULL},{{0xec,0xbf,0xbf},3,NULL},
+    {{0xed,0x80,0x80},3,NULL},{{0xed,0x9f,0xbf},3,NULL},
+    {{0xee,0x80,0x80},3,NULL},{{0xef,0xbf,0xbf},3,NULL},
+    {{0xf0,0x90,0x80,0x80},4,NULL},{{0xf0,0xbf,0xbf,0xbf},4,NULL},
+    {{0xf1,0x80,0x80,0x80},4,NULL},{{0xf3,0xbf,0xbf,0xbf},4,NULL},
+    {{0xf4,0x80,0x80,0x80},4,NULL},{{0xf4,0x8f,0xbf,0xbf},4,NULL}
+  };
+  static const struct {uint8_t bytes[4];size_t len;} invalid[]={
+    {{0x80},1},{{0xbf},1},{{0xc0,0x80},2},{{0xc1,0xbf},2},
+    {{0xe0,0x80,0x80},3},{{0xe0,0x9f,0xbf},3},
+    {{0xed,0xa0,0x80},3},{{0xed,0xbf,0xbf},3},
+    {{0xf0,0x80,0x80,0x80},4},{{0xf0,0x8f,0xbf,0xbf},4},
+    {{0xf4,0x90,0x80,0x80},4},{{0xf4,0xbf,0xbf,0xbf},4},
+    {{0xf5,0x80,0x80,0x80},4},{{0xf8,0x80,0x80,0x80},4},{{0xfe},1},{{0xff},1}
+  };
+  for(size_t i=0;i<sizeof(valid)/sizeof(valid[0]);i++) {
+    CHECK(!json_utf8_valid_case(valid[i].bytes,valid[i].len,valid[i].escaped));
+    for(size_t length=1;length<valid[i].len;length++)
+      CHECK(!json_utf8_invalid_case(valid[i].bytes,length));
+    for(size_t position=1;position<valid[i].len;position++) {
+      uint8_t broken[4];memcpy(broken,valid[i].bytes,valid[i].len);
+      broken[position]=0x7f;CHECK(!json_utf8_invalid_case(broken,valid[i].len));
+      broken[position]=0xc0;CHECK(!json_utf8_invalid_case(broken,valid[i].len));
+    }
+  }
+  for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
+    CHECK(!json_utf8_invalid_case(invalid[i].bytes,invalid[i].len));
+  return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn native_json_accepts_raw_del_and_c1_but_rejects_c0() {
     let dir = unique_temp_dir("json-raw-controls");
     fs::write(dir.join("legal.json"), [b'"', 0x7f, 0xc2, 0x85, b'"'])
