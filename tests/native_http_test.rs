@@ -3610,6 +3610,9 @@ fn ProofLong(): HttpResponse { i=0 while (i<1000) { i=i+1 } return http.text(str
 fn ProofBodyQuery(req: HttpRequest): HttpResponse { return http.text(req.body + req.query.q) }
 fn ProofComplete(req: HttpRequest): HttpResponse { return http.text(req.headers.host + req.params.id + req.method + req.path + req.body + req.query.q) }
 fn ProofWhole(req: HttpRequest): HttpResponse { return ProofComplete(req) }
+async fn ProofAsyncQuery(req: HttpRequest): HttpResponse! { return ok(http.text(req.query.q)) }
+async fn ProofAsyncBody(req: HttpRequest): HttpResponse! { return ok(http.text(req.method + req.body)) }
+async fn ProofAsyncWhole(req: HttpRequest): HttpResponse! { return await ProofAsyncBody(req) }
 fn main(): null! {
     app = http.server()
     app.get("/", fn() { return http.text("ok") })
@@ -3619,6 +3622,9 @@ fn main(): null! {
     app.get("/proof-long",ProofLong)
     app.post("/body/{id}",ProofBodyQuery)
     app.post("/whole/{id}",ProofWhole)
+    app.post("/async-query/{id}",ProofAsyncQuery)
+    app.post("/async-body/{id}",ProofAsyncBody)
+    app.post("/async-whole/{id}",ProofAsyncWhole)
     app.listen("127.0.0.1:0")?
     return ok(null)
 }
@@ -3659,6 +3665,28 @@ static void* fixture_token_allocate(size_t bytes) {{
     generated.push_str(r#"
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"route snapshot %d: %s\n",__LINE__,#x); return 91; } } while(0)
 #define STR(x) ku_string_static((const uint8_t*)(x),strlen(x))
+static unsigned int fixture_async_fields;
+static const char* fixture_async_path;
+static int fixture_async_seen,fixture_async_valid;
+static int fixture_async_string(KuString value,const char* expected) {
+  return value.len==strlen(expected) && (!value.len || (value.ptr && !memcmp(value.ptr,expected,value.len)));
+}
+static uint32_t fixture_async_start(void* runtime,size_t owner,void* environment,uint64_t deadline,
+    KuStruct___ku_http_request* request,void** output) {
+  (void)runtime;(void)owner;(void)environment;
+  fixture_async_seen++;fixture_async_valid=deadline!=0;
+  unsigned int fields=fixture_async_fields;
+  fixture_async_valid&=fields&1u ? request->headers!=NULL : request->headers==NULL;
+  fixture_async_valid&=fields&2u ? request->params!=NULL : request->params==NULL;
+  fixture_async_valid&=fields&4u ? request->query!=NULL : request->query==NULL;
+  fixture_async_valid&=fields&8u ? fixture_async_string(request->method,"POST") : !request->method.ptr;
+  fixture_async_valid&=fields&16u ? fixture_async_string(request->path,fixture_async_path) : !request->path.ptr;
+  fixture_async_valid&=fields&32u ? fixture_async_string(request->body,"hey") : !request->body.ptr;
+  if(fields&1u) {KuValue* value=ku_object_get(request->headers,STR("host"));fixture_async_valid&=value && value->tag==KU_STR && fixture_async_string(value->as.s,"local");}
+  if(fields&2u) {KuValue* value=ku_object_get(request->params,STR("id"));fixture_async_valid&=value && value->tag==KU_STR && fixture_async_string(value->as.s,"a");}
+  if(fields&4u) {KuValue* value=ku_object_get(request->query,STR("q"));fixture_async_valid&=value && value->tag==KU_STR && fixture_async_string(value->as.s,"z");}
+  *output=NULL;return 0;
+}
 int main(void) {
   KuHttpServer* server=ku_http_server_new();server->max_body_bytes=4;
   ku_http_server_add_route(server,STR("GET"),STR("/v/{id}"),(void*)(uintptr_t)1,NULL,0,0);
@@ -3789,6 +3817,44 @@ int main(void) {
     CHECK(ku_http_parse_complete_header(server,invalid_projected,strlen(invalid_projected),&part)==400);
     ku_http_input_drop(&part);CHECK(!budget.current);
   }
+  /* Real async factory metadata comes from its Task body, not the empty
+     signature thunk. Observe only materialization here; the separate socket
+     regression executes these fields across actual Task suspension/cleanup. */
+  void* async_invokes[]={(void*)ProofAsyncQuery__thunk,(void*)ProofAsyncBody__thunk,(void*)ProofAsyncWhole__thunk};
+  const unsigned int async_masks[]={4u,40u,63u};
+  const char* async_routes[]={"/async-query/{id}","/async-body/{id}","/async-whole/{id}"};
+  const char* async_paths[]={"/async-query/a","/async-body/a","/async-whole/a"};
+  KuHttpLoopGroup async_group={0};CHECK(ku_http_mutex_init(&async_group.lock));async_group.server=server;
+  KuHttpLoopOwner async_owner={0};async_owner.group=&async_group;ku_http_current_loop=&async_owner;
+  size_t async_calls[3],async_bytes[3];
+  for(size_t mode=0;mode<3;mode++) {
+    void* factory=ku_http_async_factory(async_invokes[mode]);CHECK(factory);
+    CHECK(ku_http_handler_request_fields(factory)==async_masks[mode]);
+    ku_http_server_add_route(server,STR("POST"),STR(async_routes[mode]),async_invokes[mode],NULL,1,1);
+    KuHttpConnection connection={0};connection.input.budget=&budget;connection.budget=&budget;
+    char block[256];int size=snprintf(block,sizeof(block),"POST %s?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n",async_paths[mode]);
+    size_t live_before=ku_perf_live_bytes,calls_before=ku_perf_calls,bytes_before=ku_perf_total_bytes;
+    CHECK(size>0 && (size_t)size<sizeof(block));
+    CHECK(!ku_http_parse_complete_header(server,block,(size_t)size,&connection.input));
+    CHECK(connection.input.route->returns_result==2 && connection.input.route->fields_mask==async_masks[mode]);
+    CHECK(!!connection.input.headers==!!(async_masks[mode]&1u));
+    memcpy(connection.input.body,"hey",3);
+    size_t projected=ku_http_projection_bytes(&connection.input,1,2);
+    size_t saved_limit=budget.limit;budget.limit=budget.current+projected-1u;
+    CHECK(!ku_http_buffer_reserve(&budget,projected));budget.limit=saved_limit;
+    connection.input.route->invoke=(void*)fixture_async_start;
+    fixture_async_fields=async_masks[mode];fixture_async_path=async_paths[mode];fixture_async_seen=0;
+    CHECK(ku_http_async_submit(&connection,server)==1);
+    CHECK(fixture_async_seen==1 && fixture_async_valid && connection.phase==KU_HTTP_IO_ASYNC);
+    CHECK(!budget.current && !connection.input.route && !connection.async_task);
+    CHECK(ku_perf_live_bytes==live_before);
+    async_calls[mode]=ku_perf_calls-calls_before;async_bytes[mode]=ku_perf_total_bytes-bytes_before;
+  }
+  CHECK(async_calls[0]<async_calls[2] && async_bytes[0]<async_bytes[2]);
+  CHECK(async_calls[1]<async_calls[2] && async_bytes[1]<async_bytes[2]);
+  printf("async-projection query_calls=%zu query_bytes=%zu body_calls=%zu body_bytes=%zu whole_calls=%zu whole_bytes=%zu\n",
+      async_calls[0],async_bytes[0],async_calls[1],async_bytes[1],async_calls[2],async_bytes[2]);
+  ku_http_current_loop=NULL;ku_http_mutex_destroy(&async_group.lock);
   __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
   __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
   ku_http_queue_free(&local_queue);ku_http_wake_close(&local_wake);ku_http_net_cleanup();
@@ -3816,7 +3882,8 @@ int main(void) {
     } else {
         b"http-route-snapshot-owned-validation-budget-ok\n".as_slice()
     };
-    assert_eq!(output.stdout, marker);
+    assert!(output.stdout.ends_with(marker), "{output:?}");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
@@ -6274,6 +6341,18 @@ async fn fields(req: HttpRequest): HttpResponse! {
     key="host"
     return ok(http.text(req.params.id + ":" + req.query["q"] + ":" + req.headers[key]))
 }
+async fn payload(req: HttpRequest): HttpResponse! {
+    time.sleep(2)?
+    return ok(http.text(req.method + ":" + req.body))
+}
+async fn forwarded(req: HttpRequest): HttpResponse! {
+    return await fields(req)
+}
+async fn aliased(req: HttpRequest): HttpResponse! {
+    alias=req
+    time.sleep(2)?
+    return ok(http.text(alias.method + ":" + alias.body))
+}
 async fn slow(): HttpResponse! { time.sleep(2000)? return ok(http.text("late")) }
 async fn disk(): HttpResponse! {
     fs.write("async-owner.txt","disk 中文")?
@@ -6287,6 +6366,9 @@ fn main(): null! {
     app.get("/hello", route)
     app.get("/echo", echo)
     app.get("/fields/{id}", fields)
+    app.get("/forwarded/{id}", forwarded)
+    app.post("/payload", payload)
+    app.post("/aliased", aliased)
     app.get("/slow", slow)
     app.get("/disk", disk)
     app.get("/sync", fn() { return http.text("sync") })
@@ -6314,6 +6396,7 @@ fn main(): null! {
         ("/hello", "Ku 世界"),
         ("/echo", "/echo"),
         ("/fields/one?q=value", "one:value:localhost"),
+        ("/forwarded/one?q=value", "one:value:localhost"),
         ("/disk", "disk 中文"),
         ("/sync", "sync"),
     ] {
@@ -6324,6 +6407,16 @@ fn main(): null! {
         );
         assert_status(&response, "HTTP/1.1 200 OK");
         assert!(response.ends_with(body), "{response}");
+    }
+    for path in ["/payload", "/aliased"] {
+        let body = "body 中文😀";
+        let response = http_response(
+            &address,
+            &format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()),
+            Duration::from_secs(3),
+        );
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert!(response.ends_with(&format!("POST:{body}")), "{response}");
     }
     let response = http_response(
         &address,

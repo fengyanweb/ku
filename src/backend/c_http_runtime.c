@@ -1137,8 +1137,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   KuHttpHandler* selected=NULL;
   int route_status=ku_http_select_route(server,input->method,hdr+target_start,path_len,
       &selected,param_values,param_lengths,&param_count);
-  unsigned int fields_mask=selected && selected->returns_result!=2
-      ?ku_http_handler_request_fields(selected->invoke):63u;
+  unsigned int fields_mask=selected?ku_http_handler_request_fields(selected->invoke):63u;
   int public_headers=!server->root || (selected && selected->arity==1 && (fields_mask&1u));
   size_t header_capacity=public_headers?ku_http_map_capacity(header_fields):0;
   size_t control_bytes=control_length<=128u?control_length:0;
@@ -1214,9 +1213,9 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   return 0;
 }
 typedef struct KuHttpJob KuHttpJob;
-/* A native consumer without a parser token keeps the complete public ABI. Task
-   factories likewise retain all fields; only a compiler-proven sync thunk can
-   carry a reduced mask. Validation and framed body ownership are independent. */
+/* A native consumer without a parser token keeps the complete public ABI.
+   Only a compiler-proven synchronous thunk or Task factory carries a reduced
+   mask. Validation and framed body ownership remain independent. */
 static unsigned int ku_http_input_fields(const KuHttpInput* input) {
   return input->route?input->route->fields_mask:63u;
 }
@@ -3000,15 +2999,18 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
     for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
     projection_charge=ku_http_projection_bytes(input,route->nparams,parameter_names);
     if (!ku_http_buffer_reserve(connection->budget,projection_charge)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection,server,503); return 1; }
-    req.params = ku_object_new(ku_http_map_capacity(route->nparams));
-    for (size_t i=0; i<route->nparams; i++)
-      ku_object_set(req.params,ku_http_string_copy(route->param_names[i],strlen(route->param_names[i])),
-        ku_v_str(ku_http_string_copy(param_values[i],param_value_lens[i])));
-    req.method = ku_http_string_copy(method,strlen(method));
-    req.path = ku_http_string_copy(target,path_len);
-    req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
-    req.query = ku_http_parse_query(target,path_len);
-    req.headers = input->headers; input->headers = NULL;
+    unsigned int fields=ku_http_input_fields(input);
+    if(fields&2u) {
+      req.params = ku_object_new(ku_http_map_capacity(route->nparams));
+      for (size_t i=0; i<route->nparams; i++)
+        ku_object_set(req.params,ku_http_string_copy(route->param_names[i],strlen(route->param_names[i])),
+          ku_v_str(ku_http_string_copy(param_values[i],param_value_lens[i])));
+    }
+    if(fields&8u)req.method = ku_http_string_copy(method,strlen(method));
+    if(fields&16u)req.path = ku_http_string_copy(target,path_len);
+    if(fields&32u)req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
+    if(fields&4u)req.query = ku_http_parse_query(target,path_len);
+    if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
   }
   KuHttpLoopOwner* owner = ku_http_current_loop;
   /* One original handler deadline is carried through every PG wait/reset.
