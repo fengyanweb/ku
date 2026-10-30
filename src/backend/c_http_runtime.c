@@ -2381,12 +2381,6 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
   if (!ku_http_request_prepare(connection,server)) return;
-  /* Empty C-only sockets do not allocate input backing or consume A. */
-  if (!connection->header) {
-    if (!ku_http_buffer_reserve(connection->budget,1024u)) {connection->failure.reason=KU_HTTP_ERROR_PROJECTION;ku_http_connection_status(connection,server,503);return;}
-    connection->capacity=1024u;connection->header=(char*)malloc(connection->capacity);
-    if (!connection->header) {connection->failure.reason=KU_HTTP_ERROR_ALLOCATION;ku_http_connection_status(connection,server,500);return;}
-  }
   char incoming[KU_HTTP_READ_CHUNK];
   int received;
   if (connection->carry_length) {
@@ -2415,7 +2409,10 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   if ((size_t)received > SIZE_MAX - scan_from) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
   size_t needed = scan_from + (size_t)received;
   if (needed > connection->capacity) {
-    size_t capacity = connection->capacity;
+    /* First reserve only after receiving bytes, when the required backing is
+     * known. A complete larger packet must not allocate an unused 1KiB buffer
+     * and immediately grow it. Partial headers keep the same doubling policy. */
+    size_t capacity = connection->capacity ? connection->capacity : 1024u;
     while (capacity < needed) {
       if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
       capacity *= 2;
@@ -2889,10 +2886,10 @@ static int ku_http_parse_ipv4(const char* text, unsigned long* network_order) {
  * accept turn belongs to one single-threaded owner until it publishes success;
  * reads, writes, parser state and completion never move between loops. */
 typedef struct KuHttpLoopGroup KuHttpLoopGroup;
-  size_t handler_workers;
 typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, request_limit, pending, workers, ready, exited, drained;
+  size_t handler_workers;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
   KuHttpConnection* connection_base; uint64_t connection_generation;
   uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
@@ -4112,10 +4109,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
     int cpu_sample_valid=cpu_sample_due && ku_http_thread_cpu_ns(&sampled_cpu_ns);
     if (cpu_sample_due) next_cpu_sample_ms=sampled_cpu_ms>UINT64_MAX-10u ? UINT64_MAX : sampled_cpu_ms+10u;
-    owner->handler_workers=(size_t)ctx.spawned;
     ku_http_mutex_lock(&group->lock);
     if (cpu_sample_due) ku_http_owner_cpu_sample(owner,sampled_cpu_ns,sampled_cpu_ms,cpu_sample_valid);
     owner->queued = queued; owner->running = running; owner->resident = resident;
+    owner->handler_workers=(size_t)ctx.spawned;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
     owner->active_requests=(size_t)active.request_active;owner->peak_active_requests=(size_t)active.request_peak;
@@ -4842,15 +4839,15 @@ static KuHttpSocket ku_http_management_open(const char* text) {
   return listener;
 failed:
   ku_http_socket_close(listener); return KU_HTTP_INVALID_SOCKET;
+}
+static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
+  ku_http_validate_server(server);
   const char* worker_policy=getenv("KU_HTTP_WORKER_POLICY");
   if(worker_policy && strcmp(worker_policy,"elastic") && strcmp(worker_policy,"fixed")) {
     ku_string_drop(&address);
     return ku_http_listen_err(server,"KU_HTTP_WORKER_POLICY must be elastic or fixed");
   }
   server->elastic_workers=!worker_policy || !strcmp(worker_policy,"elastic");
-}
-static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
-  ku_http_validate_server(server);
   if (address.len == 0 || memchr(address.ptr, 0, address.len) != NULL) {
     ku_string_drop(&address);
     return ku_http_listen_err(server, "invalid listen address");
