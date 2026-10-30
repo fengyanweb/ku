@@ -130,8 +130,16 @@ class HostedCycleTests(unittest.TestCase):
 
 
     def test_run_dispatches_capacity_only_once_after_fixed_windows_and_always_cleans_db(self):
-        for tail_only,fail_final,stability_only in [(False,False,False),(False,True,False),(True,False,False),(True,False,True)]:
-            with self.subTest(tail_only=tail_only,fail_final=fail_final,stability_only=stability_only),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+        cases=[(False,False,False,'pass',None),(False,True,False,'pass',None),
+               (True,False,False,'pass',None),(True,False,True,'pass',None),
+               (False,False,False,'fail',None),(False,False,False,'unknown',None),
+               (True,False,True,'unknown',None)]
+        cases += [(False,False,False,'pass',issue) for issue in
+                  [('execution_complete',False),('arrival_schedule_quality','fail'),
+                   ('environment_quality','unknown'),('measurement_invalid',True)]]
+        for tail_only,fail_final,stability_only,quality,final_issue in cases:
+            with self.subTest(tail_only=tail_only,fail_final=fail_final,stability_only=stability_only,
+                             quality=quality,final_issue=final_issue),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
                 root=Path(d);frozen=root/'frozen-plan.json';h.save(frozen,self.plan());original_hash=h.sha(frozen)
                 manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
                 h.save(manifest,{'db_url':'fixture','db_cgroup':'/unused','database':{}})
@@ -145,13 +153,21 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
                 patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
                 patches.enter_context(patch.object(h.db,'Database',return_value=owned))
-                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'unknown'}))
+                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':quality}))
                 def measured(plan_path,output,phase,**unused):
                     config=h.load(plan_path);label=Path(output).name;calls.append((label,phase))
                     if label in ('control','final'):
                         self.assertEqual(phase,'all');self.assertNotIn('capacity',config);self.assertNotIn('stability',config)
+                        if label=='control':self.assertEqual(config['stop_after_consecutive_unusable_windows'],2)
                         if label=='final' and fail_final:raise ValueError('fixed-window failure retained')
-                        return {'execution_complete':True,'goal_status':'unknown','rows':[{'functional_valid':True,'accounting_valid':True}]}
+                        row=dict(status='observed',functional_valid=True,accounting_valid=True,
+                            arrival_schedule_quality='pass',environment_quality='unknown' if label=='control' else 'pass',
+                            measurement_invalid=False,natural_reclamation=True)
+                        result={'execution_complete':True,'goal_status':'not_met' if label=='final' else 'unknown','rows':[row]}
+                        if label=='final' and final_issue:
+                            key,value=final_issue
+                            (result if key=='execution_complete' else row)[key]=value
+                        return result
                     if label.startswith('capacity-'):
                         kind=label.removeprefix('capacity-');self.assertEqual(phase,'capacity')
                         self.assertEqual(config['capacity']['workloads'],[kind])
@@ -165,10 +181,22 @@ class HostedCycleTests(unittest.TestCase):
                 if fail_final:
                     with self.assertRaisesRegex(ValueError,'fixed-window failure'):h.run(args,state)
                     self.assertEqual(calls,[('control','all'),('final','all')])
+                elif quality!='pass' or final_issue:
+                    result=h.run(args,state,tail_only=tail_only,stability_only=stability_only)
+                    self.assertFalse(result['execution_complete']);self.assertEqual(result['goal_status'],'blocked')
+                    self.assertEqual(calls,[('control','all')]+([('final','all')] if quality=='pass' else []))
+                    self.assertNotIn('capacity',state['steps']);self.assertNotIn('stability',state['steps'])
+                    self.assertFalse((root/'results/stability').exists())
+                    if final_issue:
+                        self.assertEqual(set(result['axes']),{'control','final'})
+                        self.assertEqual(set(state['deferred']),{'capacity','stability'})
+                    else:
+                        self.assertNotIn('final',state['steps']);self.assertFalse((root/'final-plan.json').exists())
                 else:
                     result=h.run(args,state,tail_only=tail_only,stability_only=stability_only);self.assertTrue(result['execution_complete'])
                     expected=[('control','all')]+([] if tail_only else [('final','all')])+([] if stability_only else [('capacity-json_object','capacity'),('capacity-db','capacity')])+[('stability','stability')]
                     self.assertEqual(calls,expected)
+                    if not tail_only:self.assertEqual(state['steps']['final']['result']['goal_status'],'not_met')
                     if tail_only:
                         self.assertFalse(result['fixed_matrix_executed']);self.assertFalse(result['cross_host_pooling'])
                         self.assertEqual(result['goal_status'],'unknown');self.assertNotIn('final',state['steps'])
@@ -178,6 +206,20 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(cleaned,['stop']);self.assertIs(fc.Harness,old_harness)
                 self.assertEqual(h.sha(frozen),original_hash)
                 self.assertIn('capacity',h.load(frozen));self.assertIn('stability',h.load(frozen))
+
+    def test_incomplete_run_returns_nonzero_without_treating_goal_failure_as_incomplete(self):
+        for complete in (False,True):
+            with self.subTest(complete=complete),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);source=root/'source';tools=root/'tools'
+                source.mkdir();tools.mkdir()
+                patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(h.signal,'signal'));patches.enter_context(patch.object(h.signal,'alarm'))
+                patches.enter_context(patch.object(h,'run',return_value={'execution_complete':complete,'goal_status':'not_met'}))
+                patches.enter_context(patch('builtins.print'))
+                code=h.main(['--phase','run','--root',str(root/'output'),'--source',str(source),
+                             '--tools',str(tools),'--candidate','1'*40])
+                self.assertEqual(code,0 if complete else 2)
 
 
     def test_compiler_phase_has_48_short_balanced_comparisons_no_formal_or_capacity(self):

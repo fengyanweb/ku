@@ -2784,6 +2784,7 @@ typedef struct KuHttpLoopOwner {
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   size_t active_requests,peak_active_requests;
   KuHttpWake* wake;
+  int task_work_pending; /* Only this event owner reads/writes Task self-work. */
 #if defined(_WIN32)
   HANDLE thread;
 #else
@@ -2933,10 +2934,18 @@ static void ku_http_group_notify(KuHttpLoopGroup* group) {
 
 
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
+static int ku_http_task_take_owner_work(KuHttpLoopOwner* owner) {
+  int pending=owner->task_work_pending;owner->task_work_pending=0;return pending;
+}
 static void ku_http_task_event_wake(void* context, size_t owner) {
   KuHttpLoopGroup* group = (KuHttpLoopGroup*)context;
   ku_http_mutex_lock(&group->lock);
-  if (owner < (size_t)group->created && group->loops[owner].wake) ku_http_wake_notify(group->loops[owner].wake);
+  if (owner < (size_t)group->created && group->loops[owner].wake) {
+    KuHttpLoopOwner* target=&group->loops[owner];
+    if(ku_http_current_loop==target && ku_http_current_loop->group==group
+        && ku_http_current_loop->index==(int)owner) target->task_work_pending=1;
+    else ku_http_wake_notify(target->wake);
+  }
   int notify_coordinator=group->draining || group->tasks_closing;
   ku_http_mutex_unlock(&group->lock);
   if (notify_coordinator) ku_http_wake_notify(&group->wake);
@@ -4288,6 +4297,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      * after maintenance and FIFO admission, so no pending work is put to sleep.
      * Cross-thread publications still use the original wake protocol. */
     int owner_work=ku_http_queue_take_owner_work(&queue);
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    owner_work|=owner->task_work_pending;
+#endif
     int wait_ms = -1;
     if (nearest != ~0ULL) {
       now = ku_http_now_ms();
@@ -4383,6 +4395,17 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     }
     if(reactor.idle_count && (reactor.draining
         || (pending.raw_count && ku_http_free_slot(&active)<0))) wait_ms=0;
+#endif
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+    /* Registrations may publish Task work after the earlier eligibility pass.
+     * Only this thread can set this flag; once taken, no self-publication can
+     * interleave before the OS call. Other threads retain the real wake FD.
+     * This turn cannot certify an idle socket or start a computation slice. */
+    if(ku_http_task_take_owner_work(owner)) {
+      wait_ms=0;task_io_structural_urgent=1;task_io_probe_can_bootstrap=0;
+    }
+#endif
+#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);
 #else
     int selected = ku_http_poll(poll_items, (size_t)poll_count, wait_ms);
