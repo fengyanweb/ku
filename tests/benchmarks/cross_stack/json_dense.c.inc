@@ -19,6 +19,9 @@ static int ku_json_dense_clone(const uint8_t* bytes,size_t length,KuString* out)
 }
 static int ku_json_dense_call(const KuJsonDenseCase* input,int http_context,
     uint64_t request_ms,uint64_t handler_ms,int headers,KuString* output) {
+#if KU_JSON_DENSE_PHASE_LEDGER
+  unsigned phase_outer=ku_dense_change_phase(KU_DENSE_REQUEST);
+#endif
   KuStruct___ku_http_request request={0};KuString rid={0},key={0};
   *output=(KuString){0};
   /* The real request deadline begins at socket admission/first request bytes.
@@ -48,6 +51,9 @@ static int ku_json_dense_call(const KuJsonDenseCase* input,int http_context,
    * normal/error returns. The local copy is no longer an owner after this call. */
   KuResult_struct___ku_http_response result=encode(request);
   request=(KuStruct___ku_http_request){0};
+#if KU_JSON_DENSE_PHASE_LEDGER
+  ku_dense_change_phase(KU_DENSE_VALIDATE);
+#endif
   KuSyncExitSignal signal={0};
   int expired=__ku_sync_finish_request(&signal);
   static const char content_type[]="text/plain; charset=utf-8";
@@ -58,9 +64,16 @@ static int ku_json_dense_call(const KuJsonDenseCase* input,int http_context,
       && (!headers || (result.value.content_type.len==sizeof(content_type)-1u
           && !memcmp(result.value.content_type.ptr,content_type,sizeof(content_type)-1u)));
   if(valid)*output=ku_string_move(&result.value.body);
-  ku_result_drop_struct___ku_http_response(&result);return valid;
+  ku_result_drop_struct___ku_http_response(&result);
+#if KU_JSON_DENSE_PHASE_LEDGER
+  ku_dense_change_phase(phase_outer);
+#endif
+  return valid;
 prepare_failed:
   ku_string_drop(&key);ku_string_drop(&rid);ku_drop_struct___ku_http_request(&request);
+#if KU_JSON_DENSE_PHASE_LEDGER
+  ku_dense_change_phase(phase_outer);
+#endif
   __ku_sync_reset();return 0;
 }
 static int ku_json_dense_unsigned(const char* text,uint64_t* result) {
@@ -171,6 +184,9 @@ int main(int argc,char** argv) {
       fprintf(stderr,"dense preflight failed at case %zu\n",selected[i]);status=4;goto cleanup;
     }
   }
+#if KU_JSON_DENSE_PHASE_LEDGER
+  ku_dense_reset_phases();
+#endif
   if(!ku_json_dense_clock(CLOCK_THREAD_CPUTIME_ID,&begin_cpu)
       || !ku_json_dense_clock(CLOCK_MONOTONIC,&begin_wall)) {status=3;goto cleanup;}
   end_cpu=begin_cpu;end_wall=begin_wall;
@@ -181,9 +197,18 @@ int main(int argc,char** argv) {
       if(!ku_json_dense_call(&ku_json_dense_cases[selected[at]],http_context,request_ms,handler_ms,0,&response)) {
         fprintf(stderr,"dense execution failed at iteration %llu\n",(unsigned long long)correct);status=4;goto cleanup;
       }
+#if KU_JSON_DENSE_PHASE_LEDGER
+      ku_dense_change_phase(KU_DENSE_VALIDATE);
+#endif
       int same=response.len==golden[at].len
           && (!response.len || !memcmp(response.ptr,golden[at].ptr,response.len));
+#if KU_JSON_DENSE_PHASE_LEDGER
+      ku_dense_change_phase(KU_DENSE_DROP);
+#endif
       ku_string_drop(&response);
+#if KU_JSON_DENSE_PHASE_LEDGER
+      ku_dense_change_phase(KU_DENSE_OFF);
+#endif
       if(!same) {fprintf(stderr,"dense output changed at iteration %llu\n",(unsigned long long)correct);status=4;goto cleanup;}
       correct++;
     }
@@ -215,7 +240,11 @@ int main(int argc,char** argv) {
       || done_cpu<cleanup_cpu || done_wall<cleanup_wall)return 3;
   fprintf(stdout,",\"golden_cleanup_thread_cpu_ns\":%llu,\"golden_cleanup_wall_ns\":%llu,\"layout\":",
       (unsigned long long)(done_cpu-cleanup_cpu),(unsigned long long)(done_wall-cleanup_wall));
-  ku_json_dense_layout();fputs("}\n",stdout);
+  ku_json_dense_layout();
+#if KU_JSON_DENSE_PHASE_LEDGER
+  ku_dense_write_phases();
+#endif
+  fputs("}\n",stdout);
   return status;
 cleanup:
   for(size_t i=0;i<count;i++)ku_string_drop(&golden[i]);free(golden);return status;

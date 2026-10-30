@@ -12,8 +12,8 @@ import database as db
 from linux_harness import ExternalDomain, GIB
 
 ARCHIVE_LIMIT = 384<<20
-BASELINE = '988f32ef496b18b935a3c276ef7933d0563691da'
-FOLLOWUP_PREPATCH = 'bf98a25d58edee602961d7980025fb392961f40b'
+BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
+FOLLOWUP_PREPATCH = BASELINE
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -139,17 +139,72 @@ def diagnostic_plan(versions):
               'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
 
 
-def followup_plan(versions):
+def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH):
     plan=diagnostic_plan(versions)
-    plan.update(schema='ku-hosted-followup-screen-v1',prepatch=FOLLOWUP_PREPATCH,
+    plan.update(schema='ku-hosted-followup-screen-v1',prepatch=prepatch,
         paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],
         environment_controls=dict(name='A',workload='json_object',rate=500,warmup_seconds=5,score_seconds=10,count=3),
         maximum_windows=33,formal_baseline_executed=False,
         latency_slo_ms={'ok':100,'json_object':100,'db':250},
         scope='Three prepatch environment controls, then3 paired normal A/B/R turns per business and at most1 B-ledger D. '
-              'A is frozen bf98a25, not historical formal A0=988f32e. Normal CLI C11O2/helpers/text/async/int only. '
+              'A is the explicitly frozen prepatch, not historical formal A0=988f32e. Normal CLI C11O2/helpers/text/async/int only. '
               'No formal/capacity/stability score; candidate adoption requires valid measured normal A/B benefit, not counters.')
+    variants=sorted(n for n in versions if re.fullmatch(r'C[1-7]',n))
+    fixed=['BF'] if 'BF' in versions else []
+    plan['candidate_versions']=['B',*variants,*fixed]
+    if variants or fixed:
+        names=['A','B',*variants,*fixed,'reference']
+        plan['paired_orders']=[names,names[1:]+names[:1],names[2:]+names[:2]]
+        plan['maximum_windows']=3+len(plan['cases'])*(3*len(names)+1)
+        plan['scope']+=' Additional C1..C7 are preregistered normal commit ablations, not selected post hoc. BF is the identical B binary with explicit fixed workers.'
+    if 'C1' in versions and 'C2' in versions:
+        names=['A','C1','C2','B','reference']
+        plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
+            paired_orders=[names,names[2:]+names[:2],names[4:]+names[:4]],ledger=False))
+        plan['latency_slo_ms']['json_escape']=100
+    plan['cases'].append(dict(workload='cpu',rate=80,reference='R',contract='compute-guard',
+        paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],ledger=False))
+    plan['latency_slo_ms']['cpu']=1000
+    if fixed:
+        plan['worker_growth']=dict(names=['B','BF'],orders=[['B','BF'],['BF','B'],['B','BF']],
+            cold=dict(rate=500,seconds=3),burst=dict(rate=8000,seconds=5),warmup_seconds=0,
+            workload='json_object',maximum_p99_ms=100,diagnostic_only=True,normal_score_eligible=False)
+    if 'HC' in versions:
+        plan['transport_control']=dict(name='HC',workload='json_object',rate=500,warmup_seconds=3,score_seconds=15,
+            diagnostic_only=True,normal_score_eligible=False,
+            scope='Same1048bytebody/1071byteresponseandworkerpath;omitsTransform;notJSON-onlytimeorranking')
+    plan['maximum_windows']=3+sum(len(diagnostic_turns(plan,c,True)) for c in plan['cases'])
+    if fixed:plan['maximum_windows']+=12
+    if 'HC' in versions:plan['maximum_windows']+=1
     return plan
+
+
+def diagnostic_turns(plan,case,followup):
+    if not followup:
+        return [(turn,case['reference'] if turn.startswith('reference') else 'D' if turn=='ledger-sample' else 'B')
+                for turn in plan['order']]
+    turns=[(f'group-{i+1}-{name}',case['reference'] if name=='reference' else name)
+        for i,order in enumerate(case.get('paired_orders',plan['paired_orders'])) for name in order]
+    if case.get('ledger',True):turns.append(('ledger-sample','D'))
+    return turns
+
+
+def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup):
+    normal=len(rows)==expected and not stopped
+    qualified=not followup or all(r.get('diagnostic_only') or
+        (r.get('functional_valid') is True and r.get('accounting_valid') is True
+         and r.get('all_correct') is True and r.get('natural_reclamation') is True
+         and r.get('arrival_schedule_quality')=='pass' and r.get('environment_quality')=='pass'
+         and not r.get('measurement_invalid') and not r.get('observed_environment_faults')) for r in rows)
+    layers=not followup or plan.get('json_layer_diagnosis',{}).get('execution_complete') is True
+    control_ok=not followup or (isinstance(control,dict) and control.get('functional_valid') is True
+        and control.get('accounting_valid') is True and control.get('all_correct') is True
+        and control.get('natural_reclamation') is True and control.get('arrival_schedule_quality')=='pass'
+        and not control.get('measurement_invalid') and not control.get('observed_environment_faults'))
+    growth_ok=not plan.get('worker_growth') or len(growth)==12 and all(r.get('valid') for r in growth)
+    return dict(normal_windows_complete=normal,normal_windows_qualified=qualified,json_layers_complete=layers,
+        transport_control_complete=control_ok,worker_growth_complete=growth_ok,
+        execution_complete=normal and qualified and layers and control_ok and growth_ok)
 
 
 def build_ledger(a):
@@ -192,6 +247,47 @@ def build_ledger(a):
                    [('normal C',Path(normal['generated_c'])),('ledger C',ledger),('roles C',source)]})
 
 
+def build_json_layers(a):
+    """Actual generated Transform and same-volume transport control; never rankings."""
+    import json_dense as jd
+    records=[]
+    try:
+        for name in ('A','B'):
+            m=load(a.root/name/'manifest.json');build=m['stacks']['ku']['build']
+            normal=build['native']['server'];invocation=normal['compiler_invocation']
+            compiler=invocation['compiler'];libraries=invocation['library_inputs']
+            if sha(compiler['path'])!=compiler['sha256']:raise ValueError('JSON diagnostic compiler changed')
+            for item in libraries:
+                if sha(item['selected_input']['real_path'])!=item['selected_input']['sha256']:
+                    raise ValueError('JSON diagnostic library changed')
+            common=['--generated-c',normal['generated_c'],'--source-commit',m['candidate_base'],
+                '--cli-sha256',sha(build['cli']),'--cc',compiler['path']]
+            for item in libraries:common+=['--link',item['selected_input']['real_path']]
+            for mode,extra in [('plain',[]),('clocks',['--phase-clocks']),('allocations',['--phase-ledger'])]:
+                output=a.root/'json-layers'/name/mode
+                jd.main([*common,'--output',str(output),*extra,'--family','http-object',
+                    '--iterations','4096' if mode=='allocations' else '32768','--wall-seconds','30',
+                    '--runner-prefix','taskset -c 0'])
+                reports=sorted(output.glob('result-*.json'))
+                if len(reports)!=1 or not load(reports[0]).get('passed'):raise ValueError('JSON diagnostic did not validate')
+                records.append(dict(name=name,mode=mode,result=str(reports[0]),sha256=sha(reports[0])))
+            if name=='B':
+                output=a.root/'json-layers'/'http-control'
+                jd.main([*common,'--output',str(output),'--http-control'])
+                control=load(output/'emission.json');binary=output/'http-control';source=output/'http-control.c'
+                m=copy.deepcopy(m);m.update(diagnostic_only=True,normal_score_eligible=False,
+                    diagnostic_role='same-wire-volume-sync-worker-control-without-Transform')
+                m['stacks']['ku']['command']=[str(binary)]
+                build=m['stacks']['ku']['build'];build['native']['server']=dict(normal,
+                    generated_c=str(source),generated_c_sha256=sha(source),binary=str(binary),binary_sha256=sha(binary),
+                    diagnostic_receipt=str(output/'emission.json'))
+                build['diagnostic']=control;save(a.root/'HC/manifest.json',m)
+        return dict(execution_complete=True,records=records,transport_control='HC',diagnostic_only=True,goal_status='unknown')
+    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
+        # A derived diagnostic failure cannot turn a normal product window into a pass or stop unrelated measurements.
+        return dict(execution_complete=False,records=records,error=repr(error),diagnostic_only=True,goal_status='blocked')
+
+
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
@@ -208,21 +304,31 @@ def build(a,state):
         d=a.root/name;snapshot(a.source,commit,d/'src');(d/'tools').symlink_to(a.tools,target_is_directory=True)
         b=Builder(d,d/'src',uid=uid,gid=gid,candidate=commit,**(mode or {}))
         try:
-            if name in ('A0','A','B'):b.ku()
+            if name in ('A0','A','B') or re.fullmatch(r'C[1-7]',name):b.ku()
             elif name=='R':b.rust();b.go_build(client=True)
             else:b.ku_native(Path(load(a.root/'B/manifest.json')['stacks']['ku']['build']['cli']))
             return b.finish()
         except BaseException as e:b.finish(failed=repr(e));raise
     build_set=getattr(a,'build_set','full');diagnostic=build_set in ('diagnostic','followup-screen')
-    builds=([('A',FOLLOWUP_PREPATCH,None)] if build_set=='followup-screen' else [])+[
+    prepatch=getattr(a,'prepatch',FOLLOWUP_PREPATCH)
+    variants=getattr(a,'screen_variants',[])
+    builds=([('A',prepatch,None),*[(f'C{i+1}',commit,None) for i,commit in enumerate(variants)]] if build_set=='followup-screen' else [])+[
         ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
-    for name in ((['A'] if build_set=='followup-screen' else [])+['B','R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']):
-        d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else name)/'manifest.json')
+    b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
+    fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
+    names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
+        +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
+    for name in names:
+        d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else 'B' if name=='BF' else name)/'manifest.json')
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
+        if not is_r and 'KU_HTTP_WORKER_POLICY' in Path(m['stacks']['ku']['build']['native']['server']['generated_c']).read_text():
+            m['declared_worker_policy']='fixed' if name=='BF' else 'elastic'
+            m['service_env']={**m['service_env'],'KU_HTTP_WORKER_POLICY':m['declared_worker_policy']}
+        elif not is_r:m['declared_worker_policy']='legacy-fixed'
         if is_r:m['stacks'][stack]['env'].update(BENCH_REQUEST_TIMEOUT_MS='30000',BENCH_LISTEN_BACKLOG='4096',
             BENCH_PG_MODE='reset-equivalent' if name in ('RS','RPS') else 'normal',
             BENCH_PG_API='typed-text-key' if name in ('RP','RPS') else 'normal',BENCH_JSON_MODE='typed' if name=='RJ' else 'generic')
@@ -232,12 +338,21 @@ def build(a,state):
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
     if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
-    plan=followup_plan(versions) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    layers=None
+    if build_set=='followup-screen':
+        layers=step(state,a.root,'build-json-layers',lambda:build_json_layers(a))
+        if layers.get('execution_complete') is True:
+            m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
+                source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
+                diagnostic_only=True,normal_score_eligible=False)
+    plan=followup_plan(versions,prepatch) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
     if build_set=='followup-screen':
-        if identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
-            raise ValueError('paired normal Ku business inputs differ')
+        for name in plan['candidate_versions']:
+            if identities['A']['files']['expanded source']['sha256']!=identities[name]['files']['expanded source']['sha256']:
+                raise ValueError('paired normal Ku business inputs differ: '+name)
         if bl.benchmark_stack_sources(a.root/'A/src/tests/benchmarks/cross_stack/rust')!=load(a.root/'R/manifest.json')['stacks']['rust']['build']['source_files_sha256']:
             raise ValueError('reference business source differs from frozen prepatch')
     dependencies={};abi={}
@@ -250,7 +365,7 @@ def build(a,state):
             if key not in dependencies:dest.parent.mkdir(exist_ok=True);shutil.copyfile(path,dest)
             dependencies[key]={'system_path':str(path),'copy':str(dest),'bytes':path.stat().st_size}
     save(a.root/'dependency-identities.json',dependencies);save(a.root/'target-abi.json',abi)
-    return {'execution_complete':True,'goal_status':'unknown','plan_sha256':sha(a.root/'frozen-plan.json'),
+    return {'execution_complete':True,'goal_status':'unknown','plan_sha256':sha(a.root/'frozen-plan.json'),'json_layer_diagnosis':layers,
             'direct_scope':'BD separate app/ELF identity only; not mixed with helpers主表'}
 
 
@@ -416,6 +531,27 @@ def diagnostic_memory(service, output):
                 parts=value.split()
                 if len(parts)==2 and parts[1]=='kB':current[metrics[key]]=int(parts[0])*1024
     if current is not None and not truncated:mappings.append(current)
+    stack_threads=[];stack_ranges=set()
+    try:tasks=sorted((Path('/proc')/str(service.process.pid)/'task').iterdir(),key=lambda p:int(p.name))
+    except OSError:tasks=[]
+    for task in tasks[:128]:
+        item={'tid':int(task.name)}
+        try:
+            with task.joinpath('syscall').open('rb') as stream:raw_syscall=stream.read(4097)
+            if len(raw_syscall)>4096:raise ValueError('syscall snapshot exceeded4096B bound')
+            syscall=raw_syscall.decode(errors='replace').split()
+            if len(syscall)<3 or syscall[0]=='running':raise ValueError('thread running or syscall SP unavailable')
+            sp=int(syscall[-2],0)
+            matches=[m for m in mappings if int(m['start'],16)<=sp<int(m['end'],16)]
+            if len(matches)!=1:raise ValueError('SP has no unique retained VMA')
+            m=matches[0];stack_ranges.add((m['start'],m['end']))
+            item.update(stack_pointer=hex(sp),start=m['start'],end=m['end'],
+                rss_bytes=m.get('rss_bytes'),pss_bytes=m.get('pss_bytes'),anonymous_bytes=m.get('anonymous_bytes'),
+                attribution='SP-containing VMA; stack/TLS/TCB may share this mapping and are not split')
+        except (OSError,ValueError) as error:item['unknown']=str(error)
+        stack_threads.append(item)
+    for m in mappings:
+        if (m['start'],m['end']) in stack_ranges:m['category']='thread_stack_or_TLS'
     groups={}
     for item in mappings:
         group=groups.setdefault(item['category'],dict(mapping_count=0,**{v:0 for v in metrics.values()}))
@@ -423,6 +559,7 @@ def diagnostic_memory(service, output):
         for metric in metrics.values():group[metric]+=item.get(metric,0)
     return dict(raw_path=str(output),raw_sha256=sha(output),bytes=len(raw),limit_bytes=limit,
         complete=not truncated,truncated=truncated,categories=groups,mappings=mappings,
+        thread_stack_VMA_evidence=stack_threads,thread_stack_VMA_unique=len(stack_ranges),
         scope='Endpoint mapping RSS/PSS/Anonymous/PrivateDirty/Swap are separate, overlapping views. '
               'Do not add them together, or add cgroup kernel and its kernel_stack/page-table/slab subfields. '
               'Anonymous VMAs can contain allocator mmap, pthread stacks and zero-fill BSS tails; smaps labels alone '
@@ -524,11 +661,11 @@ def window_quality(row):
     return invalid,signature
 
 
-def screen_pairs(rows,case,slo):
+def screen_pairs(rows,case,slo,numerator='B',denominator='A'):
     pairs=[];good=[]
     for group in range(1,4):
         selected={r['name']:r for r in rows if r['turn'].startswith('group-%d-'%group)}
-        a,b,ref=(selected.get(n) for n in ('A','B',case['reference']))
+        a,b,ref=(selected.get(n) for n in (denominator,numerator,case['reference']))
         if not all((a,b,ref)):continue
         valid=all(r.get('functional_valid') is True and r.get('accounting_valid') is True and r.get('all_correct') is True
             and r.get('natural_reclamation') is True and r.get('arrival_schedule_quality')=='pass'
@@ -544,7 +681,7 @@ def screen_pairs(rows,case,slo):
         pairs.append(pair)
         if valid and pair['cpu_B_over_A'] is not None:good.append((b['full_cpu_us'],a['full_cpu_us']))
     ci=fc.paired_interval([p[0] for p in good],[p[1] for p in good],minimum=3)
-    return dict(pairs=pairs,valid_pair_count=len(good),cpu_paired_bootstrap95=ci,
+    return dict(numerator_name=numerator,denominator_name=denominator,ratio_keys_B_A_alias_for_declared_names=True,pairs=pairs,valid_pair_count=len(good),cpu_paired_bootstrap95=ci,
         all_three_cpu_directions_lower=len(good)>=3 and all(x<y for x,y in good),
         cpu_upper95_below_one=ci.get('status')=='estimated' and ci['upper95']<1,
         confidence_note='Only3 short paired windows; percentile bootstrap is descriptive and stationarity is unproven. '
@@ -675,9 +812,7 @@ def diagnostic(a,state,followup=False):
                 save(directory/'summary.json',result);return result
         for case in plan['cases']:
             failures=0;previous_failure=None;case_rows=[]
-            turns=([(f'group-{i+1}-{name}',case['reference'] if name=='reference' else name)
-                for i,order in enumerate(plan['paired_orders']) for name in order]+[('ledger-sample','D')]) if followup else [
-                (turn,case['reference'] if turn.startswith('reference') else 'D' if turn=='ledger-sample' else 'B') for turn in plan['order']]
+            turns=diagnostic_turns(plan,case,followup)
             for turn,name in turns:
                 output=directory/case['workload']/turn
                 try:row=fc.window(plan,name,case['workload'],case['rate'],plan['warmup_seconds'],
@@ -726,17 +861,58 @@ def diagnostic(a,state,followup=False):
             controls=[r.get('full_cpu_us') for r in case_rows if r['name']=='B']
             save(directory/case['workload']/'comparison.json',dict(rows=case_rows,
                 paired_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
+                candidate_screens={n:screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],n)
+                    for n in plan.get('candidate_versions',['B']) if any(r['name']==n for r in case_rows)} if followup else {},
+                worker_policy_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],'B','BF')
+                    if followup and 'BF' in plan['versions'] else None,
                 normal_control_cpu_max_min=max(controls)/min(controls) if len(controls)>=2 and
                     all(type(x) in (int,float) and x>0 for x in controls) else None,
                 no_formal_performance_claim=True,diagnostic_cost_not_pooled=True,
                 interpretation='Before/after drift and sampling perturbation require review. D and normal differ in '
                     'instrumentation/layout; these windows do not isolate perf overhead from ledger/roles overhead.'))
-        expected_rows=30 if followup else 15
-        result=dict(execution_complete=len(rows)==expected_rows and not stopped,rows=rows,stopped=stopped,
-            goal_status='unknown',formal_qualified=False,candidate_accepted=False,
+        growth_rows=[];control_row=None
+        if followup and plan.get('worker_growth') and not stopped:
+            config=plan['worker_growth']
+            for mode in ('cold','burst'):
+                for group,order in enumerate(config['orders'],1):
+                    for name in order:
+                        out=directory/'worker-growth'/mode/f'group-{group}-{name}'
+                        try:
+                            row=fc.window(plan,name,config['workload'],config[mode]['rate'],0,config[mode]['seconds'],out,
+                                job={'phase':'diagnostic','contract':'worker-growth-'+mode})
+                        except Exception as error:
+                            row=load(out/'window.json') if (out/'window.json').is_file() else {}
+                            row['error']=repr(error)
+                        invalid,_=window_quality(row)
+                        p99=row.get('latency',{}).get('p99_ms')
+                        row.update(name=name,group=group,mode=mode,diagnostic_only=True,normal_score_eligible=False,
+                            valid=not invalid and row.get('all_correct') is True and row.get('natural_reclamation') is True
+                                and type(p99)in(int,float) and p99<=config['maximum_p99_ms'])
+                        growth_rows.append(row);save(out/'window.json',row)
+                        if not row['valid']:break
+                    if growth_rows and not growth_rows[-1]['valid']:break
+                if growth_rows and not growth_rows[-1]['valid']:break
+        if followup and plan.get('transport_control') and not stopped:
+            c=plan['transport_control'];out=directory/'transport-control'
+            try:
+                control_row=fc.window(plan,c['name'],c['workload'],c['rate'],c['warmup_seconds'],c['score_seconds'],out,
+                    job={'phase':'diagnostic','contract':'same-volume-control-not-Transform'})
+            except Exception as error:
+                control_row=load(out/'window.json') if (out/'window.json').is_file() else {}
+                control_row['error']=repr(error)
+            window_quality(control_row)
+            control_row.update(diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+                candidate_accepted=False,scope=c['scope'])
+            save(out/'window.json',control_row)
+        expected_rows=sum(len(diagnostic_turns(plan,c,followup)) for c in plan['cases'])
+        axes=diagnostic_axes(plan,rows,expected_rows,stopped,control_row,growth_rows,followup)
+        result=dict(**axes,axes=axes,rows=rows,stopped=stopped,
+            goal_status='unknown' if axes['execution_complete'] else 'blocked',formal_qualified=False,candidate_accepted=False,
             scope=plan['scope'],additional_anomaly_windows=0,environment_controls=control_rows,
             environment_qualification=environment,perf_capability=capability,
-            scope_window_count=len(rows)+len(control_rows))
+            scope_window_count=len(rows)+len(control_rows)+(control_row is not None)+len(growth_rows),transport_control=control_row,
+            worker_growth=growth_rows,
+            json_layer_diagnosis=plan.get('json_layer_diagnosis'))
         save(directory/'summary.json',result);return result
     finally:
         fc.Harness=original
@@ -942,17 +1118,23 @@ def main(argv=None):
     p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','followup-screen','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
+    p.add_argument('--prepatch',default=FOLLOWUP_PREPATCH)
+    p.add_argument('--screen-variants',default='',help='Up to seven explicit full commits, comma separated; normal preregistered short ablations only')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
-    if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate]) or a.baseline!=BASELINE:p.error('frozen full commit identities required')
+    a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
+    if len(a.screen_variants)>7 or len(set(a.screen_variants))!=len(a.screen_variants):p.error('at most seven distinct screen variants')
+    if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate,a.prepatch,*a.screen_variants]) or a.baseline!=BASELINE:p.error('frozen full commit identities required')
+    if a.build_set!='followup-screen' and a.screen_variants:p.error('screen variants require followup-screen build-set')
+    if a.prepatch in a.screen_variants or a.candidate in a.screen_variants:p.error('screen variants must differ from prepatch and final candidate')
     if a.phase!='archive' and (platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64')):p.error('actual Linux ARM64 required')
     if a.phase=='diagnostic' and a.build_set!='diagnostic':p.error('diagnostic phase requires --build-set diagnostic')
     if a.phase=='followup-screen' and a.build_set!='followup-screen':p.error('screen phase requires --build-set followup-screen')
-    if a.build_set=='followup-screen' and a.candidate==FOLLOWUP_PREPATCH:p.error('screen candidate must differ from frozen prepatch')
+    if a.build_set=='followup-screen' and a.candidate==a.prepatch:p.error('screen candidate must differ from frozen prepatch')
     if a.phase in ('run','tail','lifecycle','compiler') and a.build_set!='full':p.error('formal phases require full build-set')
     a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=a.build_set,
-        prepatch=FOLLOWUP_PREPATCH if a.build_set=='followup-screen' else None)
+        prepatch=a.prepatch if a.build_set=='followup-screen' else None,screen_variants=a.screen_variants)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
     if a.phase=='archive':result=archive(a,state)
@@ -961,7 +1143,7 @@ def main(argv=None):
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm(130*60-30)
         if a.phase=='diagnostic':signal.alarm(20*60-30)
-        if a.phase=='followup-screen':signal.alarm(25*60-30)
+        if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
             'followup-screen':lambda a,s:diagnostic(a,s,followup=True)}[a.phase]

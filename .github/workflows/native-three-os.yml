@@ -10,6 +10,14 @@ on:
         type: choice
         default: full
         options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+      prepatch:
+        description: 'Full prepatch commit for followup-screen only; blank uses the current frozen 9567271 baseline'
+        type: string
+        default: ''
+      screen_variants:
+        description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -234,6 +242,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_run_test \
+            native_object_insertion_reuses_probe_and_relocates_after_rehash -- --exact --nocapture --test-threads=1
           cargo test --release --locked \
             --test native_http_test \
             --test native_task_source_test \
@@ -417,8 +428,10 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
       GOTOOLCHAIN: local
-      KU_PERFORMANCE_V2_BASELINE: 988f32ef496b18b935a3c276ef7933d0563691da
+      KU_PERFORMANCE_V2_BASELINE: 956727188a058119fdb3790959063f1496ccb4cc
       KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
+      KU_PERFORMANCE_V2_PREPATCH: ${{ inputs.prepatch || '956727188a058119fdb3790959063f1496ccb4cc' }}
+      KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
 
     steps:
       - name: Check out the exact candidate and baseline history
@@ -493,7 +506,8 @@ jobs:
           python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
             --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
             --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA" \
+            --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
 
       - name: Run the one serial cgroup cycle and preserve each goal status
         timeout-minutes: 130
@@ -522,7 +536,8 @@ jobs:
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
           done
 
       - name: Always archive the allowlisted evidence and goal_status

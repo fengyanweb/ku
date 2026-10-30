@@ -19,6 +19,8 @@ mod native_allocation_harness;
 #[allow(dead_code)]
 #[path = "support/native_pg_harness.rs"]
 mod native_c_harness;
+#[path = "support/native_task_ledger.rs"]
+mod native_task_ledger;
 use native_c_harness::bounded_process;
 
 use std::env;
@@ -3638,9 +3640,55 @@ fn main(): null! {
     generated = generated.replacen(
         "typedef struct KuString {",
         &format!(
-            "{}\ntypedef struct KuString {{",
+            "{}\n{}\ntypedef struct KuString {{",
+            native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
             native_allocation_harness::ALLOCATION_HOOK
         ),
+        1,
+    );
+    let receive_anchor = "static void ku_http_connection_read_header(";
+    assert_eq!(generated.matches(receive_anchor).count(), 1);
+    let receive_hooks = r#"
+static const char* fixture_header_bytes;
+static size_t fixture_header_length,fixture_header_recv_calls,fixture_header_grow_calls;
+static size_t fixture_header_grow_bytes,fixture_header_reserved_at_grow;
+static int fixture_header_recv_mode,fixture_header_fail_grow,fixture_header_old_null;
+static KuHttpBufferBudget* fixture_header_budget;
+static int fixture_header_receive(KuHttpSocket socket_value,char* bytes,size_t capacity) {
+  (void)socket_value;fixture_header_recv_calls++;
+  if(fixture_header_recv_mode==1)return 0;
+  if(fixture_header_recv_mode==2 || fixture_header_recv_mode==3) {
+#if defined(_WIN32)
+    WSASetLastError(fixture_header_recv_mode==2?WSAEWOULDBLOCK:WSAEINTR);
+#else
+    errno=fixture_header_recv_mode==2?EAGAIN:EINTR;
+#endif
+    return -1;
+  }
+  size_t amount=fixture_header_length<capacity?fixture_header_length:capacity;
+  memcpy(bytes,fixture_header_bytes,amount);return (int)amount;
+}
+static void* fixture_header_grow(void* previous,size_t bytes) {
+  fixture_header_grow_calls++;fixture_header_grow_bytes=bytes;
+  fixture_header_old_null=previous==NULL;
+  fixture_header_reserved_at_grow=fixture_header_budget->current;
+  if(fixture_header_fail_grow) {fixture_header_fail_grow=0;return NULL;}
+  return ku_perf_realloc(previous,bytes);
+}
+"#;
+    generated = generated.replacen(
+        receive_anchor,
+        &format!("{receive_hooks}\n{receive_anchor}"),
+        1,
+    );
+    let receive_edge = "} else received = ku_http_socket_recv(connection->socket_value, incoming, sizeof(incoming));";
+    assert_eq!(generated.matches(receive_edge).count(), 1);
+    generated = generated.replacen(receive_edge,"} else received = fixture_header_receive(connection->socket_value,incoming,sizeof(incoming));",1);
+    let grow_edge = "char* grown = (char*)realloc(connection->header, capacity);";
+    assert_eq!(generated.matches(grow_edge).count(), 1);
+    generated = generated.replacen(
+        grow_edge,
+        "char* grown = (char*)fixture_header_grow(connection->header,capacity);",
         1,
     );
     let anchor = "static int ku_http_parse_complete_header(";
@@ -3665,9 +3713,135 @@ static void* fixture_token_allocate(size_t bytes) {{
     generated.push_str(r#"
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"route snapshot %d: %s\n",__LINE__,#x); return 91; } } while(0)
 #define STR(x) ku_string_static((const uint8_t*)(x),strlen(x))
+
+static void fixture_header_fresh(KuHttpConnection* connection,KuHttpBufferBudget* budget) {
+  memset(connection,0,sizeof(*connection));connection->socket_value=KU_HTTP_INVALID_SOCKET;
+  connection->budget=budget;connection->phase=KU_HTTP_IO_HEADER;
+  connection->deadline=ku_http_deadline_ms(3000u);connection->request_deadline=connection->deadline;
+  fixture_header_budget=budget;fixture_header_recv_calls=fixture_header_grow_calls=0;
+  fixture_header_grow_bytes=fixture_header_reserved_at_grow=0;
+  fixture_header_recv_mode=fixture_header_fail_grow=fixture_header_old_null=0;
+}
+static int fixture_header_first_backing(KuHttpServer* server,KuHttpBufferBudget* budget,KuHttpQueue* queue) {
+  char bytes[1325];memset(bytes,'a',sizeof(bytes));
+  static const char prefix[]="GET / HTTP/1.1\r\nX-Fill: ";
+  memcpy(bytes,prefix,sizeof(prefix)-1u);
+  size_t baseline=ku_perf_live_bytes;KuHttpConnection connection={0};budget->limit=1048576u;
+  fixture_header_fresh(&connection,budget);fixture_header_bytes=bytes;fixture_header_length=sizeof(bytes);
+  ku_http_connection_read_header(&connection,server,queue,0);
+  CHECK(connection.phase==KU_HTTP_IO_HEADER && connection.buffered==sizeof(bytes));
+  CHECK(fixture_header_grow_calls==1 && fixture_header_old_null && fixture_header_grow_bytes==2048u);
+  CHECK(fixture_header_reserved_at_grow==2048u && budget->current==2048u);
+  CHECK(!memcmp(connection.header,bytes,sizeof(bytes)));
+  ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
+  for(int mode=1;mode<=3;mode++) {
+    fixture_header_fresh(&connection,budget);fixture_header_recv_mode=mode;
+    ku_http_connection_read_header(&connection,server,queue,0);
+    CHECK(fixture_header_recv_calls==1 && !fixture_header_grow_calls && !connection.header && !connection.capacity);
+    if(mode==1)CHECK(connection.output.response.status==400);
+    else CHECK(connection.phase==KU_HTTP_IO_HEADER);
+    ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
+  }
+  fixture_header_fresh(&connection,budget);connection.reused=1;fixture_header_recv_mode=1;
+  ku_http_connection_read_header(&connection,server,queue,0);
+  CHECK(connection.phase==KU_HTTP_IO_FREE && !fixture_header_grow_calls && !budget->current);
+  fixture_header_fresh(&connection,budget);fixture_header_bytes=bytes;fixture_header_length=1;
+  ku_http_connection_read_header(&connection,server,queue,0);
+  CHECK(connection.buffered==1 && connection.capacity==1024u && budget->current==1024u);
+  fixture_header_bytes=bytes+1;fixture_header_length=sizeof(bytes)-1u;
+  ku_http_connection_read_header(&connection,server,queue,0);
+  CHECK(connection.buffered==sizeof(bytes) && connection.capacity==2048u && fixture_header_grow_calls==2);
+  CHECK(!fixture_header_old_null && fixture_header_reserved_at_grow==3072u && budget->current==2048u);
+  CHECK(!memcmp(connection.header,bytes,sizeof(bytes)));
+  ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
+  for(int failure=0;failure<4;failure++) {
+    fixture_header_fresh(&connection,budget);fixture_header_bytes=bytes;fixture_header_length=sizeof(bytes);
+    if(failure>=2) {
+      fixture_header_length=1;ku_http_connection_read_header(&connection,server,queue,0);
+      CHECK(connection.capacity==1024u && budget->current==1024u);
+      fixture_header_bytes=bytes+1;fixture_header_length=sizeof(bytes)-1u;
+    }
+    if(failure%2==0)fixture_header_fail_grow=1;
+    else budget->limit=failure>=2?3071u:2047u;
+    ku_http_connection_read_header(&connection,server,queue,0);
+    CHECK(connection.output.response.status==(failure%2==0?500:503));
+    CHECK(!connection.header && !connection.capacity && !budget->current);
+    if(failure==2)CHECK(fixture_header_reserved_at_grow==3072u);
+    ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
+    budget->limit=1048576u;
+  }
+  fixture_header_fresh(&connection,budget);fixture_header_recv_mode=2;
+  connection.carry=(char*)malloc(sizeof(bytes));CHECK(connection.carry);
+  memcpy(connection.carry,bytes,sizeof(bytes));connection.carry_length=sizeof(bytes);
+  CHECK(ku_http_buffer_reserve(budget,sizeof(bytes)));
+  ku_http_connection_read_header(&connection,server,queue,0);
+  CHECK(!fixture_header_recv_calls && !connection.carry && !connection.carry_length);
+  CHECK(connection.buffered==sizeof(bytes) && fixture_header_grow_calls==1 && fixture_header_old_null);
+  CHECK(fixture_header_reserved_at_grow==2048u && budget->current==2048u);
+  CHECK(!memcmp(connection.header,bytes,sizeof(bytes)));
+  ku_http_connection_close(&connection);CHECK(!budget->current && ku_perf_live_bytes==baseline);
+  puts("header-first-backing=1call/2048B split-peak=3072B oom/carry/EOF/EAGAIN/EINTR-clean");return 0;
+}
 static unsigned int fixture_async_fields;
 static const char* fixture_async_path;
 static int fixture_async_seen,fixture_async_valid;
+typedef struct {
+  KuHttpQueue* queue;KuHttpJob* retire;
+  KuTestEvent go;unsigned int event;unsigned long long deadline;
+} FixtureQueuePublication;
+static int fixture_queue_publication(void* raw) {
+  FixtureQueuePublication* publication=(FixtureQueuePublication*)raw;
+  CHECK(ku_test_event_wait(&publication->go,2000));
+  if(publication->retire)ku_http_job_release(publication->retire);
+  else ku_http_queue_publish(publication->queue,publication->event,publication->deadline);
+  return 0;
+}
+static void fixture_queue_scan(KuHttpQueue* queue) {
+  ku_http_mutex_lock(&queue->lock);ku_http_queue_observation_begin_locked(queue);
+  ku_http_mutex_unlock(&queue->lock);
+}
+static int fixture_queue_wait_protocol(KuHttpWake* wake) {
+  KuHttpQueue queue={0};CHECK(ku_http_queue_init(&queue,4,wake));
+  KuHttpPollFd item={0};item.fd=wake->read_socket;item.events=KU_HTTP_POLL_READ;
+  for(int after_arm=0;after_arm<2;after_arm++) {
+    fixture_queue_scan(&queue);
+    FixtureQueuePublication publication={.queue=&queue,.event=KU_HTTP_QUEUE_COMPLETE};
+    CHECK(ku_test_event_init(&publication.go));KuTestThread thread={0};
+    CHECK(ku_test_thread_start(&thread,fixture_queue_publication,&publication));
+    if(after_arm)CHECK(!ku_http_queue_arm_wait(&queue,~0ULL));
+    CHECK(ku_test_event_set(&publication.go));CHECK(ku_test_thread_join(&thread,2000));CHECK(!thread.outcome);
+    CHECK(ku_test_event_destroy(&publication.go));item.revents=0;
+    if(after_arm) {
+      /* Publication after registration, before the actual OS wait, leaves a
+       * real readable channel. Its state is visible even if poll starts late. */
+      CHECK(ku_http_poll(&item,1,2000)==1 && (item.revents&KU_HTTP_POLL_READ));
+      ku_http_wake_drain(wake);
+    } else {
+      /* An unarmed publication remains pending and forces a real re-scan;
+       * it cannot be forgotten by arming immediately before sleeping. */
+      CHECK(ku_http_queue_arm_wait(&queue,~0ULL));CHECK(!ku_http_poll(&item,1,0));
+    }
+  }
+  fixture_queue_scan(&queue);CHECK(!ku_http_queue_arm_wait(&queue,1000u));
+  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_CLAIM,0);item.revents=0;
+  CHECK(!ku_http_poll(&item,1,0)); /* Claim does not release an A lease. */
+  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_BEGIN,2000u);item.revents=0;
+  CHECK(!ku_http_poll(&item,1,0)); /* Existing wait already precedes this start deadline. */
+  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_BEGIN,999u);item.revents=0;
+  CHECK(ku_http_poll(&item,1,2000)==1);ku_http_wake_drain(wake);
+  KuHttpInput input={0};KuHttpJob* job=ku_http_job_new(&queue,&input);CHECK(job);
+  ku_refcount_retain(&job->owners,"fixture worker");CHECK(!ku_http_job_only_owner(job));
+  fixture_queue_scan(&queue);CHECK(!ku_http_queue_arm_wait(&queue,~0ULL));
+  FixtureQueuePublication retirement={.queue=&queue,.retire=job};
+  CHECK(ku_test_event_init(&retirement.go));KuTestThread worker={0};
+  CHECK(ku_test_thread_start(&worker,fixture_queue_publication,&retirement));
+  CHECK(ku_test_event_set(&retirement.go));CHECK(ku_test_thread_join(&worker,2000));CHECK(!worker.outcome);
+  CHECK(ku_test_event_destroy(&retirement.go));item.revents=0;
+  CHECK(ku_http_poll(&item,1,2000)==1 && ku_http_job_only_owner(job));
+  ku_http_wake_drain(wake);ku_http_job_release(job);
+  CHECK(!ku_http_queue_resident(&queue));fixture_queue_scan(&queue);
+  ku_http_queue_free(&queue);return 0;
+}
 static int fixture_async_string(KuString value,const char* expected) {
   return value.len==strlen(expected) && (!value.len || (value.ptr && !memcmp(value.ptr,expected,value.len)));
 }
@@ -3686,6 +3860,28 @@ static uint32_t fixture_async_start(void* runtime,size_t owner,void* environment
   if(fields&2u) {KuValue* value=ku_object_get(request->params,STR("id"));fixture_async_valid&=value && value->tag==KU_STR && fixture_async_string(value->as.s,"a");}
   if(fields&4u) {KuValue* value=ku_object_get(request->query,STR("q"));fixture_async_valid&=value && value->tag==KU_STR && fixture_async_string(value->as.s,"z");}
   *output=NULL;return 0;
+}
+static void fixture_async_runtime_wake(void* context,size_t owner) {(void)context;(void)owner;}
+static int fixture_async_request(KuHttpConnection* connection,KuHttpServer* server,
+    KuHttpBufferBudget* budget,const char* path) {
+  fixture_header_fresh(connection,budget);connection->input.budget=budget;
+  char block[256];int size=snprintf(block,sizeof(block),
+      "POST %s?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n",path);
+  CHECK(size>0 && (size_t)size<sizeof(block));
+  CHECK(!ku_http_parse_complete_header(server,block,(size_t)size,&connection->input));
+  CHECK(connection->input.route && connection->input.body && connection->input.body_len==3u);
+  memcpy(connection->input.body,"hey",3);return 0;
+}
+static int fixture_async_cancel(KuHttpTaskRuntime* runtime,KuHttpConnection* connection) {
+  uint64_t deadline=ku_task_driver_now_ms()+2000u,next=UINT64_MAX;
+  for(size_t turn=0;turn<32u && connection->async_task;turn++) {
+    KuStruct___ku_http_response response={0};size_t charge=0;
+    uint32_t status=ku_http_task_poll(runtime,&connection->async_task,1,deadline,&response,&charge);
+    CHECK(status<=KU_TASK_DRIVER_PENDING && !charge && !response.body.ptr);
+    ku_drop_struct___ku_http_response(&response);
+    if(connection->async_task)CHECK(ku_http_task_pump(runtime,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(!connection->async_task);ku_http_connection_close(connection);return 0;
 }
 int main(void) {
   KuHttpServer* server=ku_http_server_new();server->max_body_bytes=4;
@@ -3752,6 +3948,7 @@ int main(void) {
   CHECK(ku_http_poll(&item,1,0)==1 && (item.revents&KU_HTTP_POLL_READ));
   CHECK(ku_http_queue_take_owner_work(&queue)==1);
   ku_http_wake_drain(&wake);item.revents=0;CHECK(ku_http_poll(&item,1,0)==0);
+  CHECK(!fixture_queue_wait_protocol(&wake));
   ku_http_wake_close(&wake);
   CHECK(ku_http_handler_is_short((void*)ProofText__thunk));
   CHECK(ku_http_handler_is_short((void*)ProofNumber__thunk));
@@ -3854,9 +4051,71 @@ int main(void) {
   CHECK(async_calls[1]<async_calls[2] && async_bytes[1]<async_bytes[2]);
   printf("async-projection query_calls=%zu query_bytes=%zu body_calls=%zu body_bytes=%zu whole_calls=%zu whole_bytes=%zu\n",
       async_calls[0],async_bytes[0],async_calls[1],async_bytes[1],async_calls[2],async_bytes[2]);
+  /* The actual HTTP admission failure must not invoke a factory or retain
+     parser/header/body owners. Checking reserve alone would miss this branch. */
+  for(size_t mode=0;mode<3u;mode++) {
+    KuHttpConnection rejected={0};size_t live_before=ku_perf_live_bytes;
+    CHECK(!fixture_async_request(&rejected,server,&budget,async_paths[mode]));
+    CHECK(rejected.input.route->fields_mask==async_masks[mode]);
+    CHECK(!!rejected.input.headers==!!(async_masks[mode]&1u));
+    rejected.input.route->invoke=(void*)fixture_async_start;fixture_async_seen=0;
+    size_t charge=ku_http_projection_bytes(&rejected.input,1u,2u),saved_limit=budget.limit;
+    CHECK(charge && budget.current);budget.limit=budget.current+charge-1u;
+    CHECK(ku_http_async_submit(&rejected,server)==1 && !fixture_async_seen);
+    CHECK(rejected.phase==KU_HTTP_IO_WRITE && rejected.output.response.status==503);
+    CHECK(rejected.failure.reason==KU_HTTP_ERROR_PROJECTION && !rejected.async_task);
+    CHECK(!rejected.input.route && !rejected.input.headers && !rejected.input.body && !budget.current);
+    budget.limit=saved_limit;ku_http_connection_close(&rejected);
+    CHECK(!budget.current && ku_perf_live_bytes==live_before);
+  }
+  /* Fill the real bridge's one handle with a request owning all six fields.
+     A second full request is built, reaches the generated factory and is
+     rejected. Its HTTP/Task receipts must return to the occupied baseline;
+     releasing the original owner must then return both ledgers to idle. */
+  size_t runtime_live_before=ku_perf_live_bytes;
+  uint64_t runtime_deadline=ku_task_driver_now_ms()+2000u;
+  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)ku_http_task_runtime_new(
+      1u,1u,8u*1024u*1024u,NULL,fixture_async_runtime_wake,runtime_deadline);
+  CHECK(runtime && runtime->capacity==1u && runtime->free_handle_count==1u);
+  async_group.tasks=runtime;
+  uint64_t idle_task[9]={0};ku_http_task_driver_budget(runtime,idle_task);
+  size_t idle_live=ku_perf_live_bytes;
+  for(size_t cycle=0;cycle<2u;cycle++) {
+    KuHttpConnection held={0};CHECK(!fixture_async_request(&held,server,&budget,async_paths[2]));
+    CHECK(held.input.route->fields_mask==63u && held.input.headers && held.input.body);
+    CHECK(ku_http_async_submit(&held,server)==1 && held.phase==KU_HTTP_IO_ASYNC && held.async_task);
+    CHECK(!held.input.route && !budget.current && runtime->active_handles==1u && !runtime->free_handle_count);
+    uint64_t occupied_task[9]={0};ku_http_task_driver_budget(runtime,occupied_task);
+    CHECK(occupied_task[1]==1u && occupied_task[4]>idle_task[4]);
+    size_t occupied_live=ku_perf_live_bytes;
+    KuHttpConnection rejected={0};CHECK(!fixture_async_request(&rejected,server,&budget,async_paths[2]));
+    CHECK(rejected.input.route->fields_mask==63u && rejected.input.headers && rejected.input.body);
+    CHECK(rejected.input.route->invoke==ku_http_async_factory(async_invokes[2]));
+    CHECK(ku_http_async_submit(&rejected,server)==1 && rejected.output.response.status==503);
+    CHECK(rejected.failure.reason==KU_HTTP_ERROR_TASK_LIMIT && rejected.failure.driver_status==KU_TASK_DRIVER_LIMIT);
+    CHECK(!rejected.async_task && !rejected.input.route && !rejected.input.headers && !rejected.input.body && !budget.current);
+    uint64_t after_rejection[9]={0};ku_http_task_driver_budget(runtime,after_rejection);
+    CHECK(after_rejection[1]==occupied_task[1] && after_rejection[3]==occupied_task[3]
+        && after_rejection[4]==occupied_task[4] && runtime->active_handles==1u && !runtime->free_handle_count);
+    ku_http_connection_close(&rejected);CHECK(!budget.current && ku_perf_live_bytes==occupied_live);
+    CHECK(!fixture_async_cancel(runtime,&held));
+    uint64_t reclaimed_task[9]={0};ku_http_task_driver_budget(runtime,reclaimed_task);
+    CHECK(!reclaimed_task[1] && reclaimed_task[3]==idle_task[3] && reclaimed_task[4]==idle_task[4]);
+    CHECK(!runtime->active_handles && runtime->free_handle_count==1u && !budget.current && ku_perf_live_bytes==idle_live);
+  }
+  runtime_deadline=ku_task_driver_now_ms()+2000u;
+  CHECK(ku_http_task_runtime_close(runtime,runtime_deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<8u && runtime->driver.workers_exited!=runtime->driver.workers_created;turn++) {
+    uint64_t next=UINT64_MAX;CHECK(ku_http_task_pump(runtime,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  }
+  CHECK(runtime->driver.workers_exited==runtime->driver.workers_created);
+  CHECK(ku_http_task_runtime_free(runtime,runtime_deadline)==KU_TASK_DRIVER_OK);
+  async_group.tasks=NULL;CHECK(ku_perf_live_bytes==runtime_live_before && !budget.current);
+  puts("async-submit-budget-503-and-real-factory-limit-ledgers-reclaimed");
   ku_http_current_loop=NULL;ku_http_mutex_destroy(&async_group.lock);
   __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
   __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
+  CHECK(!fixture_header_first_backing(server,&budget,&local_queue));
   ku_http_queue_free(&local_queue);ku_http_wake_close(&local_wake);ku_http_net_cleanup();
   ku_http_mutex_destroy(&budget.lock);ku_http_server_free(server);
   CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
@@ -8762,4 +9021,388 @@ fn main(): null! {
         .wait_for_natural_exit(Duration::from_secs(5))
         .success());
     assert!(!watchdog.timed_out());
+}
+
+#[test]
+fn native_http_utf8_word_scan_matches_unicode_and_input_boundaries() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c");
+    let start = runtime.find("static int ku_http_utf8_valid(").unwrap();
+    let end = start + runtime[start..].find("\n/* RFC 9112").unwrap();
+    let directory = native_c_harness::TempDir::new("http-utf8-word");
+    let cases_path = directory.path().join("unicode-cases.bin");
+    let mut cases = std::io::BufWriter::new(fs::File::create(&cases_path).unwrap());
+    let mut count = 0usize;
+    let mut add = |bytes: &[u8]| {
+        assert!(bytes.len() <= 128);
+        cases
+            .write_all(&(bytes.len() as u16).to_le_bytes())
+            .unwrap();
+        cases
+            .write_all(&[u8::from(std::str::from_utf8(bytes).is_ok())])
+            .unwrap();
+        cases.write_all(bytes).unwrap();
+        count += 1;
+    };
+    add(&[]);
+    for first in 0..=u8::MAX {
+        add(&[first]);
+        for second in 0..=u8::MAX {
+            add(&[first, second]);
+        }
+    }
+    for text in ["中文", "🙂", "\0", "é", "\u{10ffff}", "a\\\"\n"] {
+        for prefix in 0..32 {
+            let mut bytes = vec![b'A'; prefix];
+            bytes.extend_from_slice(text.as_bytes());
+            for suffix in 0..16 {
+                let mut padded = bytes.clone();
+                padded.resize(padded.len() + suffix, b'B');
+                add(&padded);
+            }
+        }
+    }
+    let mut seed = 0x8675_3091u32;
+    for sample in 0..128_000 {
+        let mut bytes = [0u8; 128];
+        for byte in &mut bytes[..sample % 129] {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *byte = seed as u8;
+        }
+        add(&bytes[..sample % 129]);
+    }
+    cases.flush().unwrap();
+    drop(cases);
+    let mut source = String::from(
+        "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n",
+    );
+    source.push_str(&runtime[start..end]);
+    source.push_str(
+        r#"
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+int main(int argc,char** argv) {
+  if(argc!=3 || !ku_http_utf8_valid(NULL,0) || ku_http_utf8_valid(NULL,1))return 91;
+  FILE* input=fopen(argv[1],"rb");if(!input)return 92;
+  size_t count=0;
+  for(;;) {
+    int low=fgetc(input);if(low==EOF)break;
+    int high=fgetc(input),expected=fgetc(input);uint8_t bytes[128];
+    if(high==EOF || expected==EOF)return 93;
+    size_t length=(unsigned)low+((unsigned)high<<8);
+    if(length>sizeof(bytes) || fread(bytes,1,length,input)!=length)return 94;
+    if(ku_http_utf8_valid(bytes,length)!=expected) {
+      fprintf(stderr,"unicode mismatch at case %zu length %zu\n",count,length);return 95;
+    }
+    if(++count>300000u)return 96;
+  }
+  if(ferror(input) || fclose(input) || count!=(size_t)strtoull(argv[2],NULL,10))return 97;
+  size_t page=0;uint8_t* region=NULL;
+#if defined(_WIN32)
+  SYSTEM_INFO info;GetSystemInfo(&info);page=info.dwPageSize;
+  region=(uint8_t*)VirtualAlloc(NULL,page*2,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+  if(!region)return 98;DWORD old=0;
+  if(!VirtualProtect(region+page,page,PAGE_NOACCESS,&old))return 99;
+#else
+  long size=sysconf(_SC_PAGESIZE);if(size<128)return 98;page=(size_t)size;
+  region=(uint8_t*)mmap(NULL,page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(region==MAP_FAILED || mprotect(region+page,page,PROT_NONE))return 99;
+#endif
+  for(size_t length=0;length<=64;length++) {
+    uint8_t* tail=region+page-length;memset(tail,'A',length);
+    if(!ku_http_utf8_valid(tail,length))return 100;
+    if(length) {tail[length-1]=0xc2;if(ku_http_utf8_valid(tail,length))return 101;}
+    if(length>=4) {
+      static const uint8_t emoji[]={0xf0,0x9f,0x99,0x82};
+      memcpy(tail+length-4,emoji,sizeof(emoji));
+      if(!ku_http_utf8_valid(tail,length))return 102;
+    }
+  }
+#if defined(_WIN32)
+  if(!VirtualFree(region,0,MEM_RELEASE))return 103;
+#else
+  if(munmap(region,page*2))return 103;
+#endif
+  puts("http-utf8-differential-and-guard-page-ok");return 0;
+}
+"#,
+    );
+    let path = directory.path().join("unicode.c");
+    fs::write(&path, source).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "unicode")
+    else {
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable)
+            .arg(cases_path)
+            .arg(count.to_string()),
+        Duration::from_secs(20),
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"http-utf8-differential-and-guard-page-ok\n");
+}
+
+#[test]
+fn native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-elastic-workers");
+    let generated = native_c_harness::emit_c(
+        directory.path(),
+        r#"
+import "std.http"
+fn Work(): HttpResponse { return http.text("worked") }
+fn WorkerTransport(): HttpResponse { i=0 while (i<1000) { i=i+1 } return http.text("worked") }
+fn main(): null! {
+    app=http.server()
+    app.get("/",Work)
+    app.post("/worker",WorkerTransport)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#,
+    );
+    let instrumentation = format!(
+        "{}\n{}\n{}\n{}\nstatic void fixture_worker_gate(void);\nstatic int fixture_worker_spawn_failed(void);\nstatic void* fixture_worker_handles(size_t,size_t);\nstatic void* fixture_zero_calloc(size_t,size_t);\n",
+        native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
+        native_task_ledger::LEDGER_LOCK,
+        native_allocation_harness::ALLOCATION_HOOK,
+        native_task_ledger::LOCKED_ALLOCATIONS,
+    );
+    let mut generated = generated
+        .replacen("int main(void) {", "static int fixture_original_main(void) {", 1)
+        .replacen("typedef struct KuString {", &format!("{instrumentation}typedef struct KuString {{"), 1)
+        .replacen("    ku_http_job_run(context->server, job);", "    fixture_worker_gate();\n    ku_http_job_run(context->server, job);", 1)
+        .replacen("static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {", "static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {\n  if(fixture_worker_spawn_failed())return 0;", 1)
+        .replace("(HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE))", "(HANDLE*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(HANDLE))")
+        .replace("(pthread_t*)malloc((size_t)nworkers * sizeof(pthread_t))", "(pthread_t*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(pthread_t))")
+        .replace("calloc((size_t)slot_count,", "fixture_zero_calloc((size_t)slot_count,");
+    generated.push_str(r#"
+static KuTestEvent fixture_all_running,fixture_release_workers;
+static size_t fixture_started;
+static int fixture_fail_next_spawn;
+static size_t fixture_zero_allocations;
+static void* fixture_worker_handles(size_t count,size_t bytes) {
+  if(!count) {fixture_zero_allocations++;return NULL;}
+  return malloc(bytes);
+}
+static void* fixture_zero_calloc(size_t count,size_t bytes) {
+  if(!count) {fixture_zero_allocations++;return NULL;}
+  return calloc(count,bytes);
+}
+static int fixture_worker_spawn_failed(void) {
+  int fail=fixture_fail_next_spawn;fixture_fail_next_spawn=0;return fail;
+}
+static void fixture_worker_gate(void) {
+  fixture_alloc_lock();size_t started=++fixture_started;fixture_alloc_unlock();
+  if(started==16u)CHECK(ku_test_event_set(&fixture_all_running));
+  CHECK(ku_test_event_wait(&fixture_release_workers,2000u));
+}
+static KuHttpJob* fixture_elastic_job(KuHttpServer* server,KuHttpQueue* queue,KuHttpBufferBudget* budget) {
+  const char* header="GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+  KuHttpInput input={0};input.budget=budget;
+  CHECK(!ku_http_parse_complete_header(server,header,strlen(header),&input));
+  KuHttpJob* job=ku_http_job_new(queue,&input);CHECK(job);
+  job->request_deadline=ku_http_deadline_ms(5000u);return job;
+}
+static void fixture_transport_pair(KuHttpSocket* accepted,KuHttpSocket* peer) {
+  KuHttpSocket listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);CHECK(listener!=KU_HTTP_INVALID_SOCKET);
+  struct sockaddr_in address={0};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+  CHECK(!bind(listener,(struct sockaddr*)&address,sizeof(address)) && !listen(listener,1));
+#if defined(_WIN32)
+  int length=(int)sizeof(address);
+#else
+  socklen_t length=(socklen_t)sizeof(address);
+#endif
+  CHECK(!getsockname(listener,(struct sockaddr*)&address,&length));
+  *peer=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);CHECK(*peer!=KU_HTTP_INVALID_SOCKET);
+  CHECK(!connect(*peer,(struct sockaddr*)&address,sizeof(address)));
+  *accepted=accept(listener,NULL,NULL);CHECK(*accepted!=KU_HTTP_INVALID_SOCKET);
+  ku_http_socket_close(listener);
+  CHECK(ku_http_socket_nonblocking(*accepted) && ku_http_socket_nonblocking(*peer));
+  CHECK(!ku_http_socket_suppress_sigpipe(*accepted));
+}
+static void fixture_elastic_transport(KuHttpServer* server) {
+  KuHttpBufferBudget budget={0};budget.limit=1048576;CHECK(ku_http_mutex_init(&budget.lock));
+  server->buffer_budget=&budget;
+  KuHttpLoopGroup group={0};group.server=server;group.count=group.created=1;CHECK(ku_http_mutex_init(&group.lock));
+  KuHttpWake wake={0};CHECK(ku_http_wake_init(&wake));
+  KuHttpQueue queue={0};CHECK(ku_http_queue_init(&queue,4,&wake));
+  KuHttpWorkerThread handles[1];
+  KuHttpWorkerCtx context={.server=server,.queue=&queue,.threads=handles,.capacity=1,.elastic=1};queue.workers=&context;
+  KuHttpLoopOwner* owner=&group.loops[0];owner->group=&group;owner->wake=&wake;owner->slots=1;
+  KuHttpLoopOwner* previous=ku_http_current_loop;ku_http_current_loop=owner;
+  CHECK(!ku_http_handler_is_short((void*)WorkerTransport__thunk));
+  for(int mode=0;mode<3;mode++) {
+    /* Mode0 is real worker-creation failure. Mode1 zero-worker and mode2
+     * closed-queue admission retain the old EOF-without-response behavior. */
+    KuHttpSocket accepted,peer;fixture_transport_pair(&accepted,&peer);
+    KuHttpConnection connection={0};int indices[1];
+    KuHttpActiveSet active={.connections=&connection,.indices=indices,.capacity=1,.free_head=-1,.request_limit=1};
+    owner->connection_base=&connection;ku_http_atomic_store(&ku_http_active_conns,1);
+    ku_http_connection_start(&connection,&active,accepted,server);
+    CHECK(ku_http_request_lease_take(&connection));
+    const char* request="POST /worker?q=1 HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\nX-Request-Id: spawn-failure\r\n\r\nabc";
+    CHECK(ku_http_socket_send(peer,request,strlen(request))==(int)strlen(request));
+    if(!mode)fixture_fail_next_spawn=1;
+    if(mode==2) {ku_http_mutex_lock(&queue.lock);queue.closed=1;ku_http_mutex_unlock(&queue.lock);}
+    for(int turn=0;turn<8 && (connection.phase==KU_HTTP_IO_HEADER || connection.phase==KU_HTTP_IO_BODY);turn++) {
+      KuHttpPollFd ready={0};ready.fd=accepted;ready.events=KU_HTTP_POLL_READ;
+      CHECK(ku_http_poll(&ready,1,2000)>0);
+      if(connection.phase==KU_HTTP_IO_HEADER)ku_http_connection_read_header(&connection,server,&queue,mode==1?0:1);
+      else ku_http_connection_read_body(&connection,server,&queue,mode==1?0:1);
+    }
+    if(!mode) {
+      CHECK(connection.phase==KU_HTTP_IO_WRITE && connection.output.response.status==503);
+      CHECK(connection.failure.reason==KU_HTTP_ERROR_WORKER_START && connection.failure.stage==1);
+      CHECK(connection.request_id_length==13 && !memcmp(connection.request_id,"spawn-failure",13));
+      CHECK(!connection.job && !connection.input.route && !queue.resident && !queue.count && !queue.queued_bytes);
+      CHECK(active.request_active==1 && !context.spawned && !budget.current);
+      for(int turn=0;turn<8 && connection.phase==KU_HTTP_IO_WRITE;turn++) {
+        KuHttpPollFd ready={0};ready.fd=accepted;ready.events=KU_HTTP_POLL_WRITE;CHECK(ku_http_poll(&ready,1,2000)>0);
+        ku_http_connection_write(&connection,server);
+      }
+    }
+    CHECK(connection.phase==KU_HTTP_IO_FREE && connection.socket_value==KU_HTTP_INVALID_SOCKET);
+    CHECK(!connection.job && !active.count && !active.sockets && !active.request_active && !budget.current);
+    char wire[512];size_t used=0;
+    for(int turn=0;turn<8;turn++) {
+      KuHttpPollFd ready={0};ready.fd=peer;ready.events=KU_HTTP_POLL_READ;CHECK(ku_http_poll(&ready,1,2000)>0);
+      int received=ku_http_socket_recv(peer,wire+used,sizeof(wire)-used-1u);CHECK(received>=0);
+      if(!received)break;
+      used+=(size_t)received;CHECK(used<sizeof(wire)-1u);
+    }
+    wire[used]=0;
+    if(!mode)CHECK(used && !strncmp(wire,"HTTP/1.1 503 Service Unavailable\r\n",34)
+        && strstr(wire,"connection: close\r\n") && strstr(wire,"\r\n\r\nService Unavailable"));
+    else CHECK(!used);
+    ku_http_socket_close(peer);
+    CHECK(group.error_counts[KU_HTTP_ERROR_WORKER_START]==1 && owner->rejected==1 && !owner->admitted);
+    CHECK(owner->transport_closes[KU_HTTP_CLOSE_QUEUE_NOT_ADMITTED]==(unsigned long long)mode);
+  }
+  CHECK(!context.spawned && !queue.resident && !queue.count && !queue.queued_bytes && !budget.current);
+  ku_http_current_loop=previous;ku_http_queue_free(&queue);ku_http_wake_close(&wake);
+  ku_http_mutex_destroy(&group.lock);ku_http_mutex_destroy(&budget.lock);server->buffer_budget=NULL;
+}
+int main(void) {
+  CHECK(!ku_http_net_init());
+  KuHttpServer* server=ku_http_server_new();
+  ku_http_server_add_route(server,ku_string_static((const uint8_t*)"GET",3u),
+      ku_string_static((const uint8_t*)"/",1u),(void*)Work__thunk,NULL,0,0);
+  ku_http_server_add_route(server,ku_string_static((const uint8_t*)"POST",4u),
+      ku_string_static((const uint8_t*)"/worker",7u),(void*)WorkerTransport__thunk,NULL,0,0);
+  /* Zero physical slots/workers are legal for a non-accepting owner. Force
+   * every affected zero-size reserve to return NULL, as libc may legally do. */
+  for(int fixed=0;fixed<2;fixed++) {
+    KuHttpLoopGroup group={0};group.server=server;group.listener=KU_HTTP_INVALID_SOCKET;
+    group.count=group.created=1;group.started=group.draining=1;
+    CHECK(ku_http_mutex_init(&group.lock));CHECK(ku_http_wake_init(&group.wake));
+    group.loops[0].group=&group;group.loops[0].pending=4;group.loops[0].request_limit=4;
+    server->elastic_workers=!fixed;
+    CHECK(!ku_http_loop_run(&group.loops[0]));
+    CHECK(!group.loops[0].handler_workers && !group.failure);
+    ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);
+  }
+  CHECK(fixture_zero_allocations>=8u);
+  fixture_elastic_transport(server);
+  for(int fixed=0;fixed<2;fixed++) {
+    fixture_started=0;fixture_fail_next_spawn=0;
+    CHECK(ku_test_event_init(&fixture_all_running));CHECK(ku_test_event_init(&fixture_release_workers));
+    KuHttpBufferBudget budget={0};budget.limit=4u*1024u*1024u;CHECK(ku_http_mutex_init(&budget.lock));
+    KuHttpQueue queues[2]={{0}};KuHttpWake wakes[2]={{0}};
+    KuHttpWorkerThread handles[2][8];KuHttpWorkerCtx contexts[2]={{0}};
+    KuHttpJob* jobs[2][9]={{0}};
+    for(size_t owner=0;owner<2;owner++) {
+      CHECK(ku_http_wake_init(&wakes[owner]));CHECK(ku_http_queue_init(&queues[owner],16,&wakes[owner]));
+      contexts[owner]=(KuHttpWorkerCtx){.server=server,.queue=&queues[owner],.threads=handles[owner],.capacity=8,.elastic=!fixed};
+      queues[owner].workers=&contexts[owner];CHECK(!contexts[owner].spawned);
+      if(fixed)for(int index=0;index<8;index++)CHECK(ku_http_worker_spawn(&contexts[owner]));
+      CHECK(contexts[owner].spawned==(fixed?8:0));
+    }
+    if(!fixed) {
+      KuHttpJob* zero=fixture_elastic_job(server,&queues[0],&budget);
+      contexts[0].capacity=0;contexts[0].threads=NULL;
+      CHECK(!ku_http_queue_push(&queues[0],zero));
+      CHECK(ku_http_job_only_owner(zero) && !queues[0].count && !queues[0].queued_bytes);
+      ku_http_job_release(zero);CHECK(!budget.current && !ku_http_queue_resident(&queues[0]));
+      contexts[0].capacity=8;contexts[0].threads=handles[0];
+      KuHttpJob* rejected=fixture_elastic_job(server,&queues[0],&budget);fixture_fail_next_spawn=1;
+      CHECK(!ku_http_queue_push(&queues[0],rejected));
+      CHECK(ku_http_job_only_owner(rejected) && !queues[0].count && !queues[0].queued_bytes && !contexts[0].spawned);
+      ku_http_job_release(rejected);CHECK(!budget.current && !ku_http_queue_resident(&queues[0]));
+    }
+    for(size_t index=0;index<9;index++)for(size_t owner=0;owner<2;owner++) {
+      jobs[owner][index]=fixture_elastic_job(server,&queues[owner],&budget);
+      CHECK(ku_http_queue_push(&queues[owner],jobs[owner][index]));
+      CHECK(contexts[owner].spawned<=8);
+    }
+    CHECK(ku_test_event_wait(&fixture_all_running,2000u));
+    for(size_t owner=0;owner<2;owner++) {
+      CHECK(contexts[owner].spawned==8);ku_http_mutex_lock(&queues[owner].lock);
+      CHECK(queues[owner].running==8 && queues[owner].count==1);
+      ku_http_mutex_unlock(&queues[owner].lock);
+      ku_http_queue_cancel_job(jobs[owner][0]); /* Running: real worker owner must survive. */
+      CHECK(!ku_http_job_only_owner(jobs[owner][0]));
+    }
+    ku_http_queue_cancel_job(jobs[0][8]); /* Queued cancellation removes the real node and payload. */
+    CHECK(ku_http_job_only_owner(jobs[0][8]) && jobs[0][8]->completed && jobs[0][8]->cancelled);
+    ku_http_queue_close(&queues[0],1);ku_http_queue_close(&queues[1],1);
+    CHECK(ku_test_event_set(&fixture_release_workers));
+    for(size_t owner=0;owner<2;owner++) {
+#if defined(_WIN32)
+      CHECK(WaitForMultipleObjects(8u,handles[owner],TRUE,2000u)==WAIT_OBJECT_0);
+      for(int index=0;index<8;index++)CHECK(CloseHandle(handles[owner][index]));
+#else
+      alarm(3);for(int index=0;index<8;index++)CHECK(!pthread_join(handles[owner][index],NULL));alarm(0);
+#endif
+      for(size_t index=0;index<9;index++) {
+        KuHttpJob* job=jobs[owner][index];CHECK(job->completed && ku_http_job_only_owner(job));
+        if(!index || (!owner && index==8))CHECK(job->cancelled && !job->started);
+        else CHECK(!job->cancelled && job->started && job->response.status==200
+            && job->response.body.len==6 && !memcmp(job->response.body.ptr,"worked",6));
+        ku_http_job_release(job);
+      }
+      CHECK(!queues[owner].count && !queues[owner].running && !queues[owner].resident && !queues[owner].queued_bytes);
+      ku_http_queue_free(&queues[owner]);ku_http_wake_close(&wakes[owner]);
+    }
+    CHECK(!budget.current);ku_http_mutex_destroy(&budget.lock);
+    CHECK(ku_test_event_destroy(&fixture_all_running));CHECK(ku_test_event_destroy(&fixture_release_workers));
+  }
+  ku_http_server_free(server);ku_http_net_cleanup();
+  FixtureLedger ledger=fixture_ledger();CHECK(!ledger.allocations && !ledger.bytes && !ledger.overflow);
+  puts("http-elastic-workers-full-capacity-and-retirement-ok");return 0;
+}
+"#);
+    let path = directory.path().join("elastic.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "elastic")
+    else {
+        return;
+    };
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"http-elastic-workers-full-capacity-and-retirement-ok\n"
+    );
 }

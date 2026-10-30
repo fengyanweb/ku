@@ -4794,6 +4794,7 @@ static void* ku_http_loop_thread(void* argument) {
   int final_cpu_valid=ku_http_thread_cpu_ns(&final_cpu_ns);
   ku_http_mutex_lock(&owner->group->lock);
   ku_http_owner_cpu_sample(owner,final_cpu_ns,final_cpu_ms,final_cpu_valid);
+  owner->handler_workers = 0;
   owner->ready = 0; owner->exited = 1;
   ku_http_mutex_unlock(&owner->group->lock);
   ku_http_group_notify(owner->group);

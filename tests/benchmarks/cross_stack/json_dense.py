@@ -97,7 +97,247 @@ def case_identity(rows):
     return hashlib.sha256(encoded(rows)).hexdigest()
 
 
-def emit(generated, cases, template):
+
+
+def generated_function_span(source, signature):
+    """Locate one complete C body, ignoring braces in literals/comments."""
+    if source.count(signature) != 1:
+        raise ValueError('expected one generated function: '+signature)
+    start=source.index(signature);i=start+len(signature)-1;depth=0
+    while i<len(source):
+        if source.startswith('//',i):
+            end=source.find('\n',i+2)
+            if end<0:break
+            i=end+1;continue
+        if source.startswith('/*',i):
+            end=source.find('*/',i+2)
+            if end<0:break
+            i=end+2;continue
+        char=source[i]
+        if char in ('"', "'"):
+            quote=char;i+=1
+            while i<len(source):
+                if source[i]=='\\':i+=2;continue
+                if source[i]==quote:i+=1;break
+                i+=1
+            continue
+        if char=='{':depth+=1
+        elif char=='}':
+            depth-=1
+            if depth==0:return start,i+1
+        i+=1
+    raise ValueError('cannot locate complete generated function')
+
+def instrument_phases(source, allocation_ledger=True):
+    """Diagnostic-only exclusive phase clocks + the existing allocation hook.
+
+    This wraps the actual generated Transform, never a reimplemented JSON loop.
+    Thread-CPU reads and header allocation hooks perturb this binary; its CPU
+    is not eligible for HTTP scoring or a precise ordinary-product percentage.
+    """
+    hook_source = (HERE.parent.parent/'support/native_allocation_harness.rs').read_text()
+    match = re.search(r'pub const ALLOCATION_HOOK: &str = r#"(.*?)"#;', hook_source, re.S)
+    if not match:
+        raise ValueError('existing native allocation hook unavailable')
+    hook = match.group(1)
+    prefix = r"""
+/* Single-thread dense diagnosis. No server/event-loop is started. */
+enum { KU_DENSE_OFF, KU_DENSE_REQUEST, KU_DENSE_OBJECT, KU_DENSE_DECODE,
+       KU_DENSE_ENCODE, KU_DENSE_DROP, KU_DENSE_VALIDATE, KU_DENSE_PHASES };
+typedef struct {
+  uint64_t cpu_ns, segments, allocations, requested_bytes, reallocations;
+  uint64_t explicit_copy_calls, explicit_copy_bytes, frees, live_at_last_exit;
+} KuDensePhase;
+static KuDensePhase ku_dense_phases[KU_DENSE_PHASES];
+static unsigned ku_dense_phase;
+static uint64_t ku_dense_phase_started,ku_dense_phase_reads;
+static uint64_t ku_dense_calibration_ns,ku_dense_calibration_reads;
+static size_t ku_dense_live_baseline;
+static uint64_t ku_dense_phase_clock(void) {
+  struct timespec t={0};
+  if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t) || t.tv_sec<0 || t.tv_nsec<0
+      || t.tv_nsec>=1000000000L || (uint64_t)t.tv_sec>UINT64_MAX/1000000000u) {
+    fputs("dense phase clock failed\n",stderr);exit(3);
+  }
+  return (uint64_t)t.tv_sec*UINT64_C(1000000000)+(uint64_t)t.tv_nsec;
+}
+static unsigned ku_dense_change_phase(unsigned next);
+"""
+    # Count each concrete request made by the shared hook, including realloc;
+    # requested bytes include old/new capacity overlap, not unique live bytes.
+    hook = hook.replace('  ku_perf_calls++;',
+        '  ku_perf_calls++;\n  ku_dense_phases[ku_dense_phase].allocations++;\n'
+        '  ku_dense_phases[ku_dense_phase].requested_bytes += size;')
+    hook = hook.replace('  KuPerfAllocation* replacement =',
+        '  ku_dense_phases[ku_dense_phase].reallocations++;\n  KuPerfAllocation* replacement =')
+    hook = hook.replace('  ku_perf_live_allocations--;',
+        '  ku_dense_phases[ku_dense_phase].frees++;\n  ku_perf_live_allocations--;')
+    helpers = r"""
+static unsigned ku_dense_change_phase(unsigned next) {
+  uint64_t now=ku_dense_phase_clock();ku_dense_phase_reads++;
+  unsigned old=ku_dense_phase;
+  if(old) {
+    if(now<ku_dense_phase_started) {fputs("dense phase clock reversed\n",stderr);exit(3);}
+    ku_dense_phases[old].cpu_ns+=now-ku_dense_phase_started;
+    ku_dense_phases[old].live_at_last_exit=ku_perf_live_bytes;
+  }
+  ku_dense_phase=next;ku_dense_phase_started=now;
+  if(next)ku_dense_phases[next].segments++;
+  return old;
+}
+static void* ku_dense_memcpy(void* d,const void* s,size_t n) {
+  ku_dense_phases[ku_dense_phase].explicit_copy_calls++;
+  ku_dense_phases[ku_dense_phase].explicit_copy_bytes+=n;
+  return memcpy(d,s,n);
+}
+static void* ku_dense_memmove(void* d,const void* s,size_t n) {
+  ku_dense_phases[ku_dense_phase].explicit_copy_calls++;
+  ku_dense_phases[ku_dense_phase].explicit_copy_bytes+=n;
+  return memmove(d,s,n);
+}
+#define memcpy ku_dense_memcpy
+#define memmove ku_dense_memmove
+static void ku_dense_reset_phases(void) {
+  ku_dense_change_phase(KU_DENSE_OFF);
+  memset(ku_dense_phases,0,sizeof(ku_dense_phases));ku_dense_phase_reads=0;
+  ku_dense_live_baseline=ku_perf_live_bytes;ku_perf_peak_bytes=ku_perf_live_bytes;
+  uint64_t begin=ku_dense_phase_clock(),last=begin;
+  /* Report calibration, do not silently subtract it. Allocator/copy-hook
+   * perturbation and compiler layout cannot be removed by clock subtraction. */
+  for(size_t i=0;i<20000;i++)last=ku_dense_phase_clock();
+  ku_dense_calibration_ns=last-begin;ku_dense_calibration_reads=20000;
+}
+static void ku_dense_write_phases(void) {
+  static const char* names[]={"off","request_projection","object_and_control",
+      "decode","encode","drop","validation"};
+  fputs(",\"phase_ledger\":{\"diagnostic_only\":true,\"normal_score_eligible\":false,\"exclusive\":true,\"rows\":[",stdout);
+  for(size_t i=1;i<KU_DENSE_PHASES;i++) {
+    KuDensePhase* p=&ku_dense_phases[i];if(i>1)fputc(',',stdout);
+    fprintf(stdout,"{\"phase\":\"%s\",\"gross_thread_cpu_ns\":%llu,\"segments\":%llu,\"allocation_requests\":%llu,\"requested_bytes\":%llu,\"reallocations\":%llu,\"explicit_copy_calls\":%llu,\"explicit_copy_bytes\":%llu,\"frees\":%llu,\"live_bytes_at_last_exit\":%llu}",names[i],
+      (unsigned long long)p->cpu_ns,(unsigned long long)p->segments,
+      (unsigned long long)p->allocations,(unsigned long long)p->requested_bytes,
+      (unsigned long long)p->reallocations,(unsigned long long)p->explicit_copy_calls,
+      (unsigned long long)p->explicit_copy_bytes,(unsigned long long)p->frees,
+      (unsigned long long)p->live_at_last_exit);
+  }
+  fprintf(stdout,"],\"phase_clock_reads\":%llu,\"clock_calibration_ns\":%llu,\"clock_calibration_reads\":%llu,\"live_baseline_bytes\":%zu,\"peak_live_bytes\":%zu,\"live_after_cleanup_bytes\":%zu,\"allocator_retained_bytes\":null,\"allocator_retained_status\":\"unknown; hook live bytes are not allocator retained pages or RSS\",\"copy_scope\":\"explicit runtime memcpy/memmove calls only; allocator realloc moves and compiler scalar copies not counted\"}",
+      (unsigned long long)ku_dense_phase_reads,(unsigned long long)ku_dense_calibration_ns,
+      (unsigned long long)ku_dense_calibration_reads,ku_dense_live_baseline,
+      ku_perf_peak_bytes,ku_perf_live_bytes);
+}
+"""
+    helpers = helpers.replace(r'\"exclusive\":true',
+        r'\"exclusive\":true,\"allocation_hook_enabled\":'+str(allocation_ledger).lower())
+    if not allocation_ledger:
+        # Clock-only uses ordinary allocation/copy calls. Unknown allocation
+        # values are omitted, never reported as measured zero.
+        needle = "    KuDensePhase* p=&ku_dense_phases[i];if(i>1)fputc(',',stdout);"
+        replacement = needle+r"""
+    fprintf(stdout,"{\"phase\":\"%s\",\"gross_thread_cpu_ns\":%llu,\"segments\":%llu}",
+        names[i],(unsigned long long)p->cpu_ns,(unsigned long long)p->segments);continue;
+"""
+        helpers = helpers.replace(needle,replacement)
+        tail_start=helpers.index(r'  fprintf(stdout,"],\"phase_clock_reads')
+        tail_end=helpers.index('ku_perf_peak_bytes,ku_perf_live_bytes);',tail_start)+len('ku_perf_peak_bytes,ku_perf_live_bytes);')
+        clock_tail=r"""  fprintf(stdout,"],\"phase_clock_reads\":%llu,\"clock_calibration_ns\":%llu,\"clock_calibration_reads\":%llu,\"live_baseline_bytes\":null,\"peak_live_bytes\":null,\"live_after_cleanup_bytes\":null,\"allocator_retained_bytes\":null,\"allocator_retained_status\":\"unknown; allocation hook disabled for clock-only diagnosis\"}",
+      (unsigned long long)ku_dense_phase_reads,(unsigned long long)ku_dense_calibration_ns,
+      (unsigned long long)ku_dense_calibration_reads);"""
+        helpers=helpers[:tail_start]+clock_tail+helpers[tail_end:]
+        helpers += '\n#undef malloc\n#undef calloc\n#undef realloc\n#undef free\n#undef memcpy\n#undef memmove\n'
+    declaration = 'typedef struct KuString {'
+    if source.count(declaration) != 1:
+        raise ValueError('cannot locate generated allocation boundary')
+    source = source.replace(declaration, prefix+hook+helpers+declaration, 1)
+    signature = 'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {'
+    start,end=generated_function_span(source,signature)
+    body = source[start:end]
+    if body.count('ku_json_parse(') != 1 or body.count('ku_json_stringify(') != 1:
+        raise ValueError('Transform decode/encode boundaries changed')
+    wrappers = r"""
+static KuResult_kuvalue ku_dense_decode(KuString text) {
+  unsigned old=ku_dense_change_phase(KU_DENSE_DECODE);
+  KuResult_kuvalue result=ku_json_parse(text);ku_dense_change_phase(old);return result;
+}
+static KuResult_str ku_dense_encode(KuValue value) {
+  unsigned old=ku_dense_change_phase(KU_DENSE_ENCODE);
+  KuResult_str result=ku_json_stringify(value);ku_dense_change_phase(old);return result;
+}
+static void ku_dense_request_drop(KuStruct___ku_http_request* value) {
+  unsigned old=ku_dense_change_phase(KU_DENSE_DROP);
+  ku_drop_struct___ku_http_request(value);ku_dense_change_phase(old);
+}
+static void ku_dense_object_drop(KuObject* value) {
+  if(!value) { ku_object_drop(value);return; }
+  unsigned old=ku_dense_change_phase(KU_DENSE_DROP);
+  ku_object_drop(value);ku_dense_change_phase(old);
+}
+"""
+    body = body.replace(signature, signature+'\n  unsigned ku_dense_outer=ku_dense_change_phase(KU_DENSE_OBJECT);', 1)
+    body = body.replace('ku_json_parse(', 'ku_dense_decode(').replace('ku_json_stringify(', 'ku_dense_encode(')
+    body = body.replace('ku_drop_struct___ku_http_request(', 'ku_dense_request_drop(')
+    # Only top-level generated cleanup is wrapped: nested drops stay in decode/
+    # encode/object, so phase CPU is exclusive rather than overlapping inclusive.
+    body = body.replace('ku_object_drop(', 'ku_dense_object_drop(')
+    body, returns = re.subn(r'(?m)^(  )(return [^\n]+)', r'\1ku_dense_change_phase(ku_dense_outer);\n\1\2', body)
+    if returns < 2:
+        raise ValueError('generated Transform return coverage changed')
+    return source[:start]+wrappers+body+source[end:]
+
+
+def make_http_control_source(source, cases):
+    """Same HTTP body/output sizes and sync worker, without Transform business.
+
+    Deliberately a frozen-corpus diagnostic control, NOT a product fast path or
+    a correct general JSON handler. The real dynamic16-digit RID is copied into
+    each newly allocated response. No cached result enters a scored manifest.
+    """
+    signature = 'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {'
+    if source.count(signature) != 1:
+        raise ValueError('expected one actual synchronous JSON handler')
+    start,end=generated_function_span(source,signature)
+    case = next(row for row in cases if row['family'] == 'http-object')
+    expected = copy.deepcopy(case['expected']);expected['id'] = '0'*16
+    body = encoded(expected)
+    needle = b'"id":"'+b'0'*16+b'"'
+    if body.count(needle) != 1:
+        raise ValueError('control RID slot is not unique')
+    offset = body.index(needle)+len(b'"id":"')
+    code = signature+r"""
+  if (++__ku_call_depth > KU_MAX_CALL_DEPTH) { fputs("maximum call depth exceeded\n",stderr);exit(1); }
+  static const uint8_t template_body[]={BODY};
+  KuString body={0},rid=ku_http_map_get(req.query,ku_string_static((const uint8_t*)"rid",3));
+  KuResult_struct___ku_http_response result={0};
+  int valid=rid.len==16u;
+  for(size_t i=0;valid && i<rid.len;i++)if(rid.ptr[i]<'0' || rid.ptr[i]>'9')valid=0;
+  if(!valid) {
+    result.error=ku_error_make(ku_string_static((const uint8_t*)"diagnostic",10),
+        ku_string_static((const uint8_t*)"control_input",13),
+        ku_string_static((const uint8_t*)"control requires numeric16 RID",30));
+  } else if(!(body.ptr=(uint8_t*)malloc(sizeof(template_body)))) {
+    result.error=ku_object_out_of_memory_error();
+  } else {
+    body.len=body.capacity=sizeof(template_body);body.storage=KU_STRING_OWNED;
+    memcpy(body.ptr,template_body,sizeof(template_body));
+    memcpy(body.ptr+OFFSET,rid.ptr,16u);
+    result.ok=true;result.value.status=200;
+    result.value.content_type=ku_string_static((const uint8_t*)"text/plain; charset=utf-8",25);
+    result.value.body=ku_string_move(&body);
+  }
+  ku_string_drop(&body);ku_string_drop(&rid);ku_drop_struct___ku_http_request(&req);
+  __ku_call_depth--;return result;
+}
+"""
+    code = code.replace('BODY', ','.join(str(x) for x in body)).replace('OFFSET', str(offset))
+    result = source[:start]+code+source[end:]
+    return result, dict(schema='ku-json-http-control-v1',diagnostic_only=True,normal_score_eligible=False,
+        input_body_bytes=len(case['input'].encode()),output_body_bytes=len(body),rid_bytes=16,rid_offset=offset,
+        input_body_sha256=hashlib.sha256(case['input'].encode()).hexdigest(),
+        output_template_sha256=hashlib.sha256(body).hexdigest(),thread_model='original synchronous HTTP worker',
+        preserved='ordinary transport/routing/UTF8/projection/job/deadline/budget/response write/drop;dynamicRID and response allocation',
+        omitted='JSON decode/object Transform/encode;frozen corpus result template;not general JSON semantics',
+        scope='diagnostic attribution only;not HTTP/Rust formal ranking or a product optimization')
+
+def emit(generated, cases, template, phase_ledger=False, allocation_ledger=True):
     source = generated.read_text(encoding='utf-8')
     signature = 'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {'
     if source.count(signature) != 1 or len(re.findall(r'^int main\(void\) \{', source, re.M)) != 1:
@@ -107,9 +347,12 @@ def emit(generated, cases, template):
                    'ku_http_deadline_ms', 'ku_http_now_ms', '__ku_sync_reset', '__ku_sync_finish_request'):
         if symbol not in source:
             raise ValueError('generated runtime missing '+symbol)
+    if phase_ledger:
+        source = instrument_phases(source, allocation_ledger)
     source = re.sub(r'^int main\(void\) \{', 'static int ku_json_dense_original_main(void) {',
                     source, count=1, flags=re.M)
     arrays = ['\n/* Permanent diagnostic wrapper: original handler/runtime above unchanged. */',
+              '#define KU_JSON_DENSE_PHASE_LEDGER '+str(int(phase_ledger)),
               '#define KU_JSON_DENSE_HAS_COLD_INPUTS '+str(int('typedef struct KuTaskBlockingInputsV1 {' in source)),
               '#define KU_JSON_DENSE_HAS_FREE_INDEX '+str(int('uint32_t* free_indices;' in source)),
               'typedef struct { const char* family; const uint8_t* body; size_t body_length; '
@@ -195,7 +438,7 @@ def validate_layout(layout):
 
 
 def validate_output(text, cases, family, repeat=0, cpu_seconds=0, context='http',
-                    request_ms=REQUEST_TIMEOUT_MS, handler_ms=HANDLER_TIMEOUT_MS):
+                    request_ms=REQUEST_TIMEOUT_MS, handler_ms=HANDLER_TIMEOUT_MS, phase_mode=None):
     lines = [line for line in text.splitlines() if line.startswith('{"schema":"'+SCHEMA+'"')]
     if len(lines) != 1:
         raise ValueError('expected exactly one bounded dense result')
@@ -233,6 +476,38 @@ def validate_output(text, cases, family, repeat=0, cpu_seconds=0, context='http'
         raise ValueError('dense CPU budget incomplete')
     if not repeat and not cpu_seconds and (correct or value['stop_reason'] != 'validation_only'):
         raise ValueError('unexpected timed work in validation-only mode')
+    ledger=value.get('phase_ledger')
+    if phase_mode is not None:
+        if (phase_mode not in ('allocation','clocks') or not isinstance(ledger,dict)
+                or ledger.get('diagnostic_only') is not True or ledger.get('normal_score_eligible') is not False
+                or ledger.get('exclusive') is not True
+                or ledger.get('allocation_hook_enabled') is not (phase_mode=='allocation')):
+            raise ValueError('missing or mismatched diagnostic phase ledger')
+        rows=ledger.get('rows',[])
+        if (len(rows)!=6 or {r.get('phase') for r in rows} !=
+                {'request_projection','object_and_control','decode','encode','drop','validation'}):
+            raise ValueError('incomplete diagnostic phase coverage')
+        for row in rows:
+            for key in ('gross_thread_cpu_ns','segments'):
+                if type(row.get(key)) is not int or row[key]<0:
+                    raise ValueError('invalid diagnostic phase counter')
+            if row['phase'] in ('decode','encode') and row['segments']!=correct:
+                raise ValueError('phase Transform denominator mismatch')
+        if sum(r['gross_thread_cpu_ns'] for r in rows)>value['thread_cpu_ns']:
+            raise ValueError('exclusive phase CPU exceeds whole loop CPU')
+        if (type(ledger.get('phase_clock_reads')) is not int or ledger['phase_clock_reads']<0
+                or ledger.get('clock_calibration_reads')!=20000
+                or type(ledger.get('clock_calibration_ns')) is not int or ledger['clock_calibration_ns']<0):
+            raise ValueError('invalid phase clock calibration')
+        if phase_mode=='allocation' and ledger.get('live_after_cleanup_bytes')!=0:
+            raise ValueError('dense allocation hook did not return to zero after cleanup')
+        if phase_mode=='clocks' and any(ledger.get(k) is not None for k in
+                ('live_baseline_bytes','peak_live_bytes','live_after_cleanup_bytes')):
+            raise ValueError('clock-only mode must not invent live allocation measurements')
+        ledger['clock_read_calibration_ns_per_read']=ledger['clock_calibration_ns']/20000
+        ledger['interpretation']='exclusive instrumented CPU only; calibration not silently subtracted; hook/layout/clock perturbation not ordinary service cost'
+    elif ledger is not None:
+        raise ValueError('instrumented output cannot be accepted as plain dense output')
     value['semantic_preflight_correct'] = len(seen)
     value['ns_per_correct'] = value['thread_cpu_ns']/correct if correct else None
     value['performance_measured'] = bool(repeat or cpu_seconds)
@@ -255,6 +530,9 @@ def main(argv=None):
     parser.add_argument('--cc', default='clang-18', help='one compiler executable, no shell flags')
     parser.add_argument('--link', type=Path, action='append', default=[], help='exact shared/import library file, e.g.libpq.so')
     parser.add_argument('--debug-symbols', action='store_true')
+    parser.add_argument('--phase-ledger', action='store_true', help='diagnostic-only exclusive phase clocks/allocation hook; never HTTP scoring')
+    parser.add_argument('--phase-clocks', action='store_true', help='phase threadCPU clocks only; allocation/copy probes disabled')
+    parser.add_argument('--http-control', action='store_true', help='emit/build same-size sync HTTP control without JSON business; never starts service or enters formal scores')
     parser.add_argument('--emit-only', action='store_true', help='do not compile or execute')
     parser.add_argument('--binary', type=Path, help='externally compiled wrapper; same emitted C identity required')
     mode = parser.add_mutually_exclusive_group()
@@ -277,12 +555,32 @@ def main(argv=None):
             or not 1 <= args.wall_seconds <= 180
             or not 1 <= args.request_timeout_ms <= 300000 or not 1 <= args.handler_timeout_ms <= 300000):
         parser.error('bounded CPU/repeat/wall/deadline arguments required')
+    if args.phase_ledger and args.phase_clocks:
+        parser.error('choose phase clocks or allocation ledger, not both')
+    if args.http_control and (args.phase_ledger or args.phase_clocks or args.binary or args.cpu_seconds or args.iterations):
+        parser.error('--http-control is an independent build-only diagnostic')
     if args.emit_only and args.binary:
         parser.error('--emit-only and --binary are separate operations')
     source = args.generated_c.resolve(strict=True)
     template = HERE/'json_dense.c.inc';cases = make_cases()
-    wrapper = emit(source, cases, template)
-    identity = {'schema': SCHEMA, 'source_commit': args.source_commit, 'cli_sha256': args.cli_sha256,
+    if args.http_control:
+        original_hash=digest(source)
+        wrapper, control = make_http_control_source(source.read_text(encoding='utf-8'), cases)
+        out = args.output.resolve();out.mkdir(parents=True,exist_ok=False)
+        path=out/'http-control.c';path.write_text(wrapper,encoding='utf-8')
+        libraries=[str(path.resolve(strict=True)) for path in args.link]
+        command=[args.cc,str(path),'-std=c11','-O2','-pthread','-lm',*libraries,'-o',str(out/'http-control')]
+        control.update(source_commit=args.source_commit,cli_sha256=args.cli_sha256,
+            generated_c_sha256=original_hash,control_c_sha256=digest(path),expected_compile_command=command,
+            source_input_unchanged=digest(source)==original_hash)
+        if not args.emit_only:
+            logs=Commands(out/'logs');logs.run('compile',command,out,timeout=180)
+            control.update(binary_sha256=digest(out/'http-control'),commands=logs.rows)
+        save(out/'emission.json',control)
+        print(json.dumps({'emission':str(out/'emission.json'),'diagnostic_only':True,'normal_score_eligible':False}))
+        return
+    wrapper = emit(source, cases, template, args.phase_ledger or args.phase_clocks, not args.phase_clocks)
+    identity = {'phase_clocks': args.phase_clocks, 'phase_ledger': args.phase_ledger, 'schema': SCHEMA, 'source_commit': args.source_commit, 'cli_sha256': args.cli_sha256,
                 'generated_c_sha256': digest(source), 'template_sha256': digest(template),
                 'cases_sha256': case_identity(cases), 'wrapper_sha256': hashlib.sha256(wrapper.encode()).hexdigest(),
                 'protocol_sha256': digest(HERE/'protocol.json'),
@@ -330,7 +628,8 @@ def main(argv=None):
                        str(args.request_timeout_ms), str(args.handler_timeout_ms)]
         raw = logs.run('dense-'+args.family, run_command, out, timeout=args.wall_seconds+2)
         report['measurement'] = validate_output(raw, cases, args.family, args.iterations, args.cpu_seconds,
-                                                args.context, args.request_timeout_ms, args.handler_timeout_ms)
+                                                args.context, args.request_timeout_ms, args.handler_timeout_ms,
+                                                'allocation' if args.phase_ledger else 'clocks' if args.phase_clocks else None)
         report['compiled_layout'] = validate_layout(report['measurement'].get('layout'))
         report['performance_measured'] = report['measurement']['performance_measured']
         report['source_input_unchanged'] = digest(source) == identity['generated_c_sha256']

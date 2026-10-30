@@ -2906,6 +2906,11 @@ fn native_object_insertion_reuses_probe_and_relocates_after_rehash() {
             1,
         );
     let checks = r#"
+static int fixture_owned(KuString value,KuString* out) {
+  uint8_t* bytes=(uint8_t*)malloc(value.len?value.len:1u);if(!bytes)return 0;
+  if(value.len)memcpy(bytes,value.ptr,value.len);
+  *out=(KuString){bytes,value.len,value.len?value.len:1u,KU_STRING_OWNED};return 1;
+}
 static void fixture_fault(const char* site) {
 #if defined(_WIN32)
   _putenv_s("KU_NATIVE_TEST_OBJECT_OOM_SITE",site);
@@ -2930,8 +2935,8 @@ int main(void) {
   for(size_t i=0;i<32;i++) {
     KuString key={0},payload={0};
     KuString borrowed=ku_string_static((const uint8_t*)keys[i],strlen(keys[i]));
-    CHECK(ku_object_string_try_clone(borrowed,&key));
-    CHECK(ku_object_string_try_clone(ku_string_static((const uint8_t*)"payload",7),&payload));
+    CHECK(fixture_owned(borrowed,&key));
+    CHECK(fixture_owned(ku_string_static((const uint8_t*)"payload",7),&payload));
     KuValue value=ku_v_str(ku_string_move(&payload));
     size_t old_cap=object->cap,old_len=object->len;
     if(i==5) {
@@ -2959,7 +2964,7 @@ int main(void) {
   }
   CHECK(object->cap>=64 && object->len==32);
   /* An existing key replaces exactly once without insertion/rehash. */
-  KuString duplicate={0};CHECK(ku_object_string_try_clone(ku_string_static((const uint8_t*)keys[7],strlen(keys[7])),&duplicate));
+  KuString duplicate={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)keys[7],strlen(keys[7])),&duplicate));
   KuValue replacement=ku_v_int(73);size_t cap=object->cap,hash_before=ku_slot_hash_calls;
   CHECK(ku_object_try_set_owned(object,&duplicate,&replacement));
   CHECK(ku_slot_hash_calls==hash_before+1u && object->cap==cap && object->len==32);
@@ -2973,6 +2978,17 @@ int main(void) {
   CHECK(ku_slot_hash_calls==hash_before+1u && copied.tag==KU_NULL);
   CHECK(borrowed.len==12u && !memcmp(borrowed.ptr,"borrowed-new",12));
   CHECK(ku_object_get(object,borrowed)->as.i==91);
+  KuString held={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)"held",4),&held));
+  KuValue failed=ku_v_str(ku_string_move(&held));const uint8_t* held_ptr=failed.as.s.ptr;
+  KuString new_key={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)"clone-failure",13),&new_key));
+  size_t length=object->len,live=ku_perf_live_allocations,bytes=ku_perf_live_bytes;
+  fixture_fault("string_clone");
+  CHECK(!ku_object_try_set_copy_key(object,new_key,&failed));
+  CHECK(failed.tag==KU_STR && failed.as.s.ptr==held_ptr && object->len==length);
+  CHECK(ku_perf_live_allocations==live && ku_perf_live_bytes==bytes);
+  CHECK(new_key.len==13u && !memcmp(new_key.ptr,"clone-failure",13));
+  fixture_fault("");CHECK(ku_object_try_set_copy_key(object,new_key,&failed));
+  CHECK(failed.tag==KU_NULL && object->len==length+1u);ku_string_drop(&new_key);
   ku_object_drop(object);CHECK(NO_LIVE_ALLOCATIONS());
   puts("object-probe-slot-ok");return 0;
 }

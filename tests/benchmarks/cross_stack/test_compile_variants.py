@@ -402,6 +402,71 @@ class JsonDenseEntryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'ordinary generated'):
                 json_dense.emit(source, [], Path(__file__).with_name('json_dense.c.inc'))
 
+    def test_explicit_phase_ledger_and_http_control_remain_diagnostic_only(self):
+        source = ('typedef struct KuString { /* ordinary ABI */ } KuString;\n'
+                  'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {\n'
+                  '  KuResult_kuvalue decoded=ku_json_parse(req.body);\n'
+                  '  KuResult_str encoded=ku_json_stringify(decoded.value);\n'
+                  '  ku_object_drop(NULL);\n'
+                  '  ku_drop_struct___ku_http_request(&req);\n'
+                  '  return result;\n'
+                  '__ku_sync_epilogue:;\n'
+                  '  return fallback;\n}\n'
+                  'int main(void) { return original_startup(); }\n')
+        phases = json_dense.instrument_phases(source)
+        self.assertIn('normal_score_eligible', phases)
+        self.assertIn('ku_dense_decode(req.body)', phases)
+        self.assertIn('ku_dense_encode(decoded.value)', phases)
+        self.assertIn('ku_dense_object_drop(NULL)', phases)
+        self.assertIn('ku_dense_request_drop(&req)', phases)
+        self.assertEqual(phases.count('ku_dense_change_phase(ku_dense_outer);'), 2)
+        self.assertIn('allocator_retained_bytes', phases)
+        self.assertIn('ku_perf_allocate', phases)  # Existing shared allocation hook.
+        # Generated insertion guards close at column zero too; a textual
+        # first "\n}\n" would truncate the Transform before its encode call.
+        nested = source.replace('  KuResult_str encoded=',
+            '  if (condition) {\n    text="} /* not a closing brace */";\n}\n  KuResult_str encoded=')
+        self.assertIn('ku_dense_encode(decoded.value)', json_dense.instrument_phases(nested))
+        with self.assertRaisesRegex(ValueError, 'boundaries changed'):
+            json_dense.instrument_phases(source.replace('ku_json_parse(', 'different('))
+        control, identity = json_dense.make_http_control_source(source, json_dense.make_cases())
+        self.assertTrue(identity['diagnostic_only'])
+        self.assertFalse(identity['normal_score_eligible'])
+        self.assertEqual(identity['input_body_bytes'], 1048)
+        self.assertEqual(identity['output_body_bytes'], 1071)
+        self.assertEqual(identity['rid_bytes'], 16)
+        self.assertIn('memcpy(body.ptr+', control)
+        self.assertIn('rid.ptr,16u)', control)
+        self.assertIn('body.storage=KU_STRING_OWNED', control)
+        self.assertIn('malloc(sizeof(template_body))', control)
+        self.assertNotIn('ku_json_parse(req.body)', control)
+        self.assertIn('int main(void) { return original_startup(); }', control)
+
+    def test_phase_output_cannot_silently_become_plain_performance(self):
+        rows = json_dense.make_cases()
+        value = self.result(rows)
+        phases = ['request_projection', 'object_and_control', 'decode', 'encode', 'drop', 'validation']
+        value['phase_ledger'] = {'diagnostic_only': True, 'normal_score_eligible': False,
+            'exclusive': True, 'allocation_hook_enabled': True,
+            'rows': [{'phase': p, 'gross_thread_cpu_ns': 0, 'segments': 0} for p in phases],
+            'phase_clock_reads': 0, 'clock_calibration_reads': 20000,
+            'clock_calibration_ns': 1000000, 'live_after_cleanup_bytes': 0}
+        parse = lambda x, **kw: json_dense.validate_output(
+            json.dumps(x, separators=(',', ':')), rows, 'ascii', **kw)
+        self.assertTrue(parse(value, phase_mode='allocation')['phase_ledger']['diagnostic_only'])
+        with self.assertRaisesRegex(ValueError, 'plain dense'):
+            parse(value)
+        malformed = copy.deepcopy(value)
+        malformed['phase_ledger']['rows'][2]['segments'] = 1
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            parse(malformed, phase_mode='allocation')
+        malformed = copy.deepcopy(value)
+        malformed['phase_ledger']['live_after_cleanup_bytes'] = 1
+        with self.assertRaisesRegex(ValueError, 'return to zero'):
+            parse(malformed, phase_mode='allocation')
+        with self.assertRaisesRegex(ValueError, 'mismatched'):
+            parse(value, phase_mode='clocks')
+
 
 class ProfileReceiptTests(unittest.TestCase):
     def variant_fixture(self, root):

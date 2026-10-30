@@ -13,6 +13,71 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_screen_freezes_each_candidate_without_mixing_direct_or_diagnostic(self):
+        names=['A','B','R','RS','D',*[f'C{i}' for i in range(1,7)]]
+        versions={n:{'source_commit':str(i)*40,'root':'/unused/'+n} for i,n in enumerate(names)}
+        plan=h.followup_plan(versions,'f'*40)
+        self.assertEqual(plan['prepatch'],'f'*40)
+        self.assertEqual(plan['candidate_versions'],['B','C1','C2','C3','C4','C5','C6'])
+        self.assertEqual(plan['maximum_windows'],111)
+        for order in plan['paired_orders']:
+            self.assertEqual(set(order),{'A','B','C1','C2','C3','C4','C5','C6','reference'})
+            self.assertEqual(len(order),len(set(order)))
+            self.assertNotIn('D',order)
+        self.assertNotIn('capacity',plan)
+        self.assertNotIn('stability',plan)
+        self.assertFalse(plan['formal_qualified'])
+        for case in plan['cases']:
+            self.assertIn(case['workload'],plan['latency_slo_ms'])
+            self.assertIn(case['reference'],versions)
+        for name in plan['paired_orders'][0]:
+            self.assertEqual(len({order.index(name) for order in plan['paired_orders']}),3)
+        versions['C7']={'root':'/unused/C7','source_commit':'7'*40}
+        versions['BF']={'root':'/unused/BF','source_commit':'b'*40}
+        versions['HC']={'root':'/unused/HC','diagnostic_only':True}
+        full=h.followup_plan(versions,'f'*40)
+        self.assertEqual(full['maximum_windows'],142)
+        self.assertIn('BF',full['candidate_versions'])
+        self.assertNotIn('HC',full['candidate_versions'])
+        self.assertTrue(full['transport_control']['diagnostic_only'])
+        self.assertFalse(full['transport_control']['normal_score_eligible'])
+
+    def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
+        rows=[]
+        for group in range(1,4):
+            for name,cpu,p99 in [('A',10,1),('B',30,4),('C1',8,2),('R',9,1)]:
+                rows.append(dict(turn=f'group-{group}-{name}',name=name,full_cpu_us=cpu,
+                    latency={'p99_ms':p99},memory={'steady_median_bytes':100},comparison_contract='same',
+                    functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
+                    arrival_schedule_quality='pass',environment_quality='pass',observed_environment_faults=[]))
+        result=h.screen_pairs(rows,{'reference':'R'},20,'C1')
+        self.assertEqual(result['numerator_name'],'C1')
+        self.assertEqual(result['valid_pair_count'],3)
+        self.assertEqual([p['p99_B_ms'] for p in result['pairs']],[2]*3)
+        self.assertAlmostEqual(result['cpu_paired_bootstrap95']['estimate'],.8)
+        self.assertFalse(result['adopted'])
+        self.assertFalse(result['formal_qualified'])
+
+    def test_followup_keeps_valid_normal_rows_but_requires_json_and_control_axes(self):
+        good=dict(functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
+            arrival_schedule_quality='pass',environment_quality='pass',observed_environment_faults=[])
+        plan={'json_layer_diagnosis':{'execution_complete':True}}
+        result=h.diagnostic_axes(plan,[good],1,[],good,[],True)
+        self.assertTrue(result['execution_complete'])
+        plan['json_layer_diagnosis']['execution_complete']=False
+        result=h.diagnostic_axes(plan,[good],1,[],good,[],True)
+        self.assertTrue(result['normal_windows_complete'])
+        self.assertTrue(result['normal_windows_qualified'])
+        self.assertFalse(result['json_layers_complete'])
+        self.assertFalse(result['execution_complete'])
+        plan['json_layer_diagnosis']['execution_complete']=True
+        bad=dict(good,all_correct=False)
+        result=h.diagnostic_axes(plan,[good],1,[],bad,[],True)
+        self.assertFalse(result['transport_control_complete'])
+        self.assertFalse(result['execution_complete'])
+        bad=dict(good,arrival_schedule_quality='fail')
+        self.assertFalse(h.diagnostic_axes(plan,[bad],1,[],good,[],True)['normal_windows_qualified'])
+
     def plan(self):
         return h.frozen_plan({n:{'root':'/unused/'+n,'stack':'rust' if n.startswith('R') else 'ku'}
             for n in ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']})

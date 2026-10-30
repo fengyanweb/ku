@@ -141,6 +141,7 @@ FLOW_COUNTERS = (
     'pg_interest_after_read_write', 'pg_interest_after_other',
     'pg_completion', 'pg_completion_broadcast', 'pg_connect_broadcast',
     'blocking_worker_wake_no_work', 'blocking_signal_queued_zero', 'blocking_signal_queued_positive',
+    'blocking_actual_broadcast', 'blocking_signal_skipped',
     'pg_phase_before_unknown', 'pg_phase_after_unknown',
 ) + tuple(f'pg_phase_{side}_{phase}' for side in ('before', 'after') for phase in range(1, 11))
 
@@ -425,21 +426,29 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
     replace('owner-pending-take', '  int pending=queue->owner_work_pending;queue->owner_work_pending=0;return pending;',
             '  int pending=queue->owner_work_pending;queue->owner_work_pending=0;\n'
             '  if(pending)ku_flow_count(KUF_HTTP_OWNER_PENDING_TAKE);return pending;')
-    replace('queue-pop', '  if (job) ku_http_queue_notify(queue);\n  return job;',
-            '  if (job) ' + tagged('ku_http_queue_notify(queue);', 'QUEUE_POP', 'HTTP_QUEUE_POP') + '\n  return job;')
+    gated_queue='static void ku_http_queue_publish_locked(' in text
+    pop_call='ku_http_queue_publish_locked(queue,KU_HTTP_QUEUE_CLAIM,0);' if gated_queue else 'ku_http_queue_notify(queue);'
+    begin_call='ku_http_queue_publish(job->queue,KU_HTTP_QUEUE_BEGIN,job->handler_deadline);' if gated_queue else 'ku_http_queue_notify(job->queue);'
+    complete_call='ku_http_queue_publish(job->queue,KU_HTTP_QUEUE_COMPLETE,0);' if gated_queue else 'ku_http_queue_notify(job->queue);'
+    release_call='ku_http_queue_publish(queue,KU_HTTP_QUEUE_RETIRE,0);' if gated_queue else 'ku_http_queue_notify(queue);'
+    if gated_queue:
+        replace('queue-pop','  if (job) '+pop_call,'  if (job) '+tagged(pop_call,'QUEUE_POP','HTTP_QUEUE_POP'))
+    else:
+        replace('queue-pop', '  if (job) '+pop_call+'\n  return job;',
+                '  if (job) ' + tagged(pop_call, 'QUEUE_POP', 'HTTP_QUEUE_POP') + '\n  return job;')
     replace('queue-push-condition-signal', '    ku_http_condition_signal(&queue->not_empty);',
             '    ku_flow_count(KUF_HTTP_QUEUE_PUSH_SIGNAL);ku_http_condition_signal(&queue->not_empty);')
     replace('queue-pop-condition-wait', '  while (queue->count == 0 && !queue->closed) ku_http_condition_wait(&queue->not_empty, &queue->lock);',
             '  while (queue->count == 0 && !queue->closed) {ku_flow_count(KUF_HTTP_QUEUE_WAIT);ku_http_condition_wait(&queue->not_empty, &queue->lock);}')
-    replace('job-begin', '  job->started = 1;\n  ku_http_mutex_unlock(&job->lock);\n  ku_http_queue_notify(job->queue);',
+    replace('job-begin', '  job->started = 1;\n  ku_http_mutex_unlock(&job->lock);\n  '+begin_call,
             '  job->started = 1;\n  ku_http_mutex_unlock(&job->lock);\n  '
-            + tagged('ku_http_queue_notify(job->queue);', 'JOB_BEGIN', 'HTTP_JOB_BEGIN'))
-    replace('job-cancelled', '  if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_notify(job->queue); return; }',
+            + tagged(begin_call, 'JOB_BEGIN', 'HTTP_JOB_BEGIN'))
+    replace('job-cancelled', '  if (cancelled) { ku_http_input_drop(&job->input); '+complete_call+' return; }',
             '  if (cancelled) { ku_http_input_drop(&job->input); '
-            + tagged('ku_http_queue_notify(job->queue);', 'JOB_CANCELLED', 'HTTP_JOB_CANCELLED') + ' return; }')
-    replace('job-complete', '  job->completed = 1;\n  ku_http_mutex_unlock(&job->lock);\n  ku_http_queue_notify(job->queue);',
+            + tagged(complete_call, 'JOB_CANCELLED', 'HTTP_JOB_CANCELLED') + ' return; }')
+    replace('job-complete', '  job->completed = 1;\n  ku_http_mutex_unlock(&job->lock);\n  '+complete_call,
             '  job->completed = 1;\n  ku_http_mutex_unlock(&job->lock);\n  '
-            + tagged('ku_http_queue_notify(job->queue);', 'JOB_COMPLETE', 'HTTP_JOB_COMPLETE'))
+            + tagged(complete_call, 'JOB_COMPLETE', 'HTTP_JOB_COMPLETE'))
     replace('job-release-result', '  if (ku_refcount_release(&job->owners, "http job")) {',
             '  int ku_flow_final=ku_refcount_release(&job->owners, "http job");\n'
             '  int ku_flow_worker=ku_flow_is_worker();\n'
@@ -447,11 +456,11 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
             '  ku_flow_count(ku_flow_final?KUF_HTTP_RELEASE_FINAL:KUF_HTTP_RELEASE_NONFINAL);\n'
             '  if (ku_flow_final) {')
     replace('job-release-notify', '  /* Release publication precedes wake, including the non-final worker owner.\n'
-            '     ClosedWaitingJob can now see the actual remaining owner count. */\n  ku_http_queue_notify(queue);',
+            '     ClosedWaitingJob can now see the actual remaining owner count. */\n  '+release_call,
             '  /* Original release has completed; only the cached queue is used. */\n'
             '  unsigned int ku_flow_saved=ku_flow_source_push(ku_flow_final?KUF_SRC_FINAL_RELEASE:\n'
             '      ku_flow_worker?KUF_SRC_WORKER_RELEASE:KUF_SRC_OTHER_RELEASE);\n'
-            '  ku_http_queue_notify(queue);ku_flow_source_restore(ku_flow_saved);')
+            '  '+release_call+'ku_flow_source_restore(ku_flow_saved);')
     replace('wake-notify-entry', 'static void ku_http_wake_notify(KuHttpWake* wake) {\n',
             'static void ku_http_wake_notify(KuHttpWake* wake) {\n'
             '  ku_flow_count(KUF_WAKE_NOTIFY);ku_flow_source_count(KUF_SM_WAKE_NOTIFY);\n')
@@ -539,13 +548,20 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
 
     blocking = 'static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {' in text
     if blocking:
+        gated_signal='  if (!pool->queued && !pool->closing && !pool->state_waiters) return;' in text
         replace('blocking-signal-queue-state', 'static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n',
                 'static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n'
-                '  ku_flow_count(pool->queued?KUF_BLOCKING_SIGNAL_QUEUED_POSITIVE:KUF_BLOCKING_SIGNAL_QUEUED_ZERO);\n')
-        replace('blocking-worker-wake-no-work', '      if (ku_task_blocking_wait(pool,UINT64_MAX)<0) {\n'
+                '  ku_flow_count(pool->queued?KUF_BLOCKING_SIGNAL_QUEUED_POSITIVE:KUF_BLOCKING_SIGNAL_QUEUED_ZERO);\n'
+                +('' if gated_signal else '  ku_flow_count(KUF_BLOCKING_ACTUAL_BROADCAST);\n'))
+        if gated_signal:
+            replace('blocking-signal-actual','  if (!pool->queued && !pool->closing && !pool->state_waiters) return;',
+                '  if (!pool->queued && !pool->closing && !pool->state_waiters) {ku_flow_count(KUF_BLOCKING_SIGNAL_SKIPPED);return;}\n'
+                '  ku_flow_count(KUF_BLOCKING_ACTUAL_BROADCAST);')
+        worker_wait='ku_task_blocking_wait_inner' if 'static int ku_task_blocking_wait_inner(' in text else 'ku_task_blocking_wait'
+        replace('blocking-worker-wake-no-work', '      if ('+worker_wait+'(pool,UINT64_MAX)<0) {\n'
                 '        pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_set_closing_locked(pool,1u); break;\n      }\n'
                 '    }\n    if (!pool->queued && pool->closing) break;',
-                '      if (ku_task_blocking_wait(pool,UINT64_MAX)<0) {\n'
+                '      if ('+worker_wait+'(pool,UINT64_MAX)<0) {\n'
                 '        pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_set_closing_locked(pool,1u); break;\n      }\n'
                 '      if(!pool->queued && !pool->closing)ku_flow_count(KUF_BLOCKING_WORKER_WAKE_NO_WORK);\n'
                 '    }\n    if (!pool->queued && pool->closing) break;')
