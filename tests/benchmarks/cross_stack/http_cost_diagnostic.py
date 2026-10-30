@@ -493,10 +493,31 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
     replace('task-event-source', 'static void ku_http_task_event_wake(void* context, size_t owner) {\n',
             'static void ku_http_task_event_wake(void* context, size_t owner) {\n'
             '  unsigned int ku_flow_saved=ku_flow_source_push(ku_flow_task_source(context,(unsigned long long)owner));\n')
-    replace('task-owner-target', '  if (owner < (size_t)group->created && group->loops[owner].wake) ku_http_wake_notify(group->loops[owner].wake);',
-            '  if (owner < (size_t)group->created && group->loops[owner].wake) {\n'
-            '    ku_flow_count(KUF_TASK_TARGET_OWNER);ku_http_wake_notify(group->loops[owner].wake);\n'
-            '  } else ku_flow_count(KUF_TASK_TARGET_OWNER_ABSENT);')
+    owner_targets = (
+        ('cross_thread_wake',
+         '  if (owner < (size_t)group->created && group->loops[owner].wake) ku_http_wake_notify(group->loops[owner].wake);',
+         '  if (owner < (size_t)group->created && group->loops[owner].wake) {\n'
+         '    ku_flow_count(KUF_TASK_TARGET_OWNER);ku_http_wake_notify(group->loops[owner].wake);\n'
+         '  } else ku_flow_count(KUF_TASK_TARGET_OWNER_ABSENT);'),
+        ('owner_local_pending',
+         '  if (owner < (size_t)group->created && group->loops[owner].wake) {\n'
+         '    KuHttpLoopOwner* target=&group->loops[owner];\n'
+         '    if(ku_http_current_loop==target && ku_http_current_loop->group==group\n'
+         '        && ku_http_current_loop->index==(int)owner) target->task_work_pending=1;\n'
+         '    else ku_http_wake_notify(target->wake);\n  }',
+         '  if (owner < (size_t)group->created && group->loops[owner].wake) {\n'
+         '    ku_flow_count(KUF_TASK_TARGET_OWNER);\n'
+         '    KuHttpLoopOwner* target=&group->loops[owner];\n'
+         '    if(ku_http_current_loop==target && ku_http_current_loop->group==group\n'
+         '        && ku_http_current_loop->index==(int)owner) target->task_work_pending=1;\n'
+         '    else ku_http_wake_notify(target->wake);\n  } else ku_flow_count(KUF_TASK_TARGET_OWNER_ABSENT);'),
+    )
+    if sum(text.count(old) for _, old, _ in owner_targets) != 1:
+        raise ValueError('task-owner-target: expected exactly one supported legacy/owner-local target anchor')
+    task_owner_notify_mode, old_target, new_target = next(
+        (mode, old, new) for mode, old, new in owner_targets if old in text)
+    replace('task-owner-target', old_target, new_target)
+    anchors[-1]['source_variant'] = task_owner_notify_mode
     replace('task-coordinator-target', '  if (notify_coordinator) ku_http_wake_notify(&group->wake);\n}',
             '  if (notify_coordinator) {ku_flow_count(KUF_TASK_TARGET_COORDINATOR);ku_http_wake_notify(&group->wake);}\n'
             '  ku_flow_source_restore(ku_flow_saved);\n}')
@@ -578,6 +599,7 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
         'source_commit': source_commit, 'normal_generated_c': str(source),
         'normal_generated_c_bytes': len(original), 'normal_generated_c_sha256': hashlib.sha256(original).hexdigest(),
         'ledger_c_sha256': hashlib.sha256(output).hexdigest(), 'pg_present': pg, 'blocking_present': blocking,
+        'task_owner_notify_mode': task_owner_notify_mode,
         'slot_capacity': 256, 'counter_count': len(FLOW_COUNTER_NAMES),
         'counter_names': FLOW_COUNTER_NAMES, 'anchors': anchors,
         'required_next_step': 'existing prepare_source with marker-gated ledger_role_footer; then --wrap=pthread_create',
