@@ -108,6 +108,22 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(retained['passed'],issue is None)
                 if issue in ('driver_exception','interrupt'):self.assertIn('error',retained)
 
+    def test_json_attachment_programming_error_is_incomplete_without_swallowing_interrupt(self):
+        import json_dense
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);compiler=root/'compiler';compiler.write_bytes(b'compiler fixture')
+            cli=root/'cli';cli.write_bytes(b'CLI fixture')
+            normal={'generated_c':str(root/'normal.c'),'compiler_invocation':{
+                'compiler':{'path':str(compiler),'sha256':h.sha(compiler)},'library_inputs':[]}}
+            manifest={'candidate_base':'a'*40,'stacks':{'ku':{'build':{
+                'cli':str(cli),'native':{'server':normal}}}}}
+            for name in ('A','B'):h.save(root/name/'manifest.json',manifest)
+            with patch.object(json_dense,'main',side_effect=TypeError('missing environment')):
+                result=h.build_json_layers(types.SimpleNamespace(root=root))
+            self.assertFalse(result['execution_complete']);self.assertIn('TypeError',result['error'])
+            with patch.object(json_dense,'main',side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):h.build_json_layers(types.SimpleNamespace(root=root))
+
     def plan(self):
         return h.frozen_plan({n:{'root':'/unused/'+n,'stack':'rust' if n.startswith('R') else 'ku'}
             for n in ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']})
@@ -169,8 +185,9 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(gate.call_count,1);self.assertEqual(result['execution_complete'],gate_passed)
                 controls=plan['environment_controls']['count'] if followup else 0
                 expected=plan['maximum_windows'] if followup else sum(len(h.diagnostic_turns(plan,c,False)) for c in plan['cases'])
-                self.assertEqual(window.call_count,expected if gate_passed else controls)
-                self.assertEqual(result['scope_window_count'],expected if gate_passed else controls)
+                # Supplementary gate failure must preserve already valid normal windows.
+                self.assertEqual(window.call_count,expected)
+                self.assertEqual(result['scope_window_count'],expected)
                 self.assertEqual(cleanup,['database']);self.assertEqual(result['admission']['passed'],gate_passed)
                 if not gate_passed:self.assertEqual(result['goal_status'],'blocked')
 

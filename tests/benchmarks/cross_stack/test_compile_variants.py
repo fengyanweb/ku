@@ -442,6 +442,27 @@ class JsonDenseEntryTests(unittest.TestCase):
         self.assertNotIn('ku_json_parse(req.body)', control)
         self.assertIn('int main(void) { return original_startup(); }', control)
 
+    def test_http_control_cli_supplies_clean_environment_to_compiler(self):
+        source=('KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {\n'
+                '  KuResult_kuvalue decoded=ku_json_parse(req.body);\n'
+                '  KuResult_str encoded=ku_json_stringify(decoded.value);\n'
+                '  return result;\n__ku_sync_epilogue:;\n  return fallback;\n}\n'
+                'int main(void) { return original_startup(); }\n')
+        calls=[]
+        def compile_only(commands,label,argv,cwd,**kwargs):
+            calls.append((label,argv,dict(commands.environment)))
+            Path(argv[-1]).write_bytes(b'explicit fake compiler output; no executable started')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generated=root/'normal.c';generated.write_text(source)
+            with patch.object(json_dense.Commands,'run',new=compile_only),patch.dict(os.environ,{'CFLAGS':'-O3','LLVM_PROFILE_FILE':'unexpected'}),patch('builtins.print'):
+                json_dense.main(['--generated-c',str(generated),'--output',str(root/'control'),
+                    '--source-commit','a'*40,'--cli-sha256','b'*64,'--http-control'])
+            self.assertEqual(len(calls),1)
+            self.assertIn('-O2',calls[0][1]);self.assertNotIn('CFLAGS',calls[0][2])
+            self.assertNotIn('LLVM_PROFILE_FILE',calls[0][2])
+            receipt=json.loads((root/'control/emission.json').read_text())
+            self.assertTrue(receipt['diagnostic_only']);self.assertFalse(receipt['normal_score_eligible'])
+
     def test_phase_output_cannot_silently_become_plain_performance(self):
         rows = json_dense.make_cases()
         value = self.result(rows)

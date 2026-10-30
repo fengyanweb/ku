@@ -19,6 +19,19 @@ on:
         type: string
         default: ''
 
+      reuse_build_run:
+        description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
+        type: string
+        default: ''
+      reuse_build_sha256:
+        description: 'Exact prior evidence tar SHA256; required with reuse_build_run'
+        type: string
+        default: ''
+      reuse_product_commit:
+        description: 'Original product commit inside reused binaries; separate from current measurement tools'
+        type: string
+        default: ''
+
 permissions:
   contents: read
 
@@ -424,6 +437,7 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
+      actions: read
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
@@ -432,6 +446,9 @@ jobs:
       KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
       KU_PERFORMANCE_V2_PREPATCH: ${{ inputs.prepatch || '956727188a058119fdb3790959063f1496ccb4cc' }}
       KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
+      KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
+      KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
+      KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
 
     steps:
       - name: Check out the exact candidate and baseline history
@@ -492,6 +509,15 @@ jobs:
           test "$(stat -c %g "$KU_PERFORMANCE_V2_ROOT")" = "$(id -g)"
           go version
 
+      - name: Download the exact optional prior build archive
+        if: inputs.reuse_build_run != ''
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-performance-v2-evidence
+          path: ${{ runner.temp }}/ku-reused-build
+          run-id: ${{ inputs.reuse_build_run }}
+          github-token: ${{ github.token }}
+
       - name: Build frozen sources and plans as the benchmark user
         timeout-minutes: 35
         shell: bash
@@ -503,11 +529,25 @@ jobs:
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = followup-screen ]; then
             performance_build_set=followup-screen
           fi
-          python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
-            --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
-            --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA" \
-            --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+          if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
+            test "$performance_build_set" = followup-screen
+            python3 -B tests/benchmarks/cross_stack/reuse_build.py \
+              --archive "$RUNNER_TEMP/ku-reused-build/ku-performance-v2-evidence.tar.gz" \
+              --archive-sha256 "$KU_PERFORMANCE_V2_REUSE_SHA256" \
+              --source-run "$KU_PERFORMANCE_V2_REUSE_RUN" \
+              --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+              --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+          else
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
+            python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
+              --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+              --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+          fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
         timeout-minutes: 130
@@ -536,7 +576,7 @@ jobs:
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA" \
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
               --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
           done
 
@@ -549,7 +589,7 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive \
             --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
             --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE"
           sudo -n chown "$(id -u):$(id -g)" \
             "$KU_PERFORMANCE_V2_ROOT/ku-performance-v2-evidence.tar.gz" "$KU_PERFORMANCE_V2_ROOT/archive.json"
 

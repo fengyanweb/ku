@@ -289,8 +289,9 @@ def build_json_layers(a):
                     diagnostic_receipt=str(output/'emission.json'))
                 build['diagnostic']=control;save(a.root/'HC/manifest.json',m)
         return dict(execution_complete=True,records=records,transport_control='HC',diagnostic_only=True,goal_status='unknown')
-    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
-        # A derived diagnostic failure cannot turn a normal product window into a pass or stop unrelated measurements.
+    except Exception as error:
+        # Keep ordinary measurements independent of derived tool failures,
+        # including programming errors. Interrupt/termination still propagates.
         return dict(execution_complete=False,records=records,error=repr(error),diagnostic_only=True,goal_status='blocked')
 
 
@@ -323,6 +324,12 @@ def build(a,state):
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
+    return complete_build(a,state,build_set,prepatch,variants)
+
+
+def complete_build(a,state,build_set,prepatch,variants):
+    """Freeze/verify prepared normal builds; shared by fresh and byte-verified reuse."""
+    diagnostic=build_set in ('diagnostic','followup-screen')
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
@@ -822,13 +829,6 @@ def diagnostic(a,state,followup=False):
                     admission={'passed':False,'execution_complete':False,'reason':'environment controls blocked; admission not started'},
                     goal_status='blocked',formal_qualified=False,candidate_accepted=False,scope_window_count=len(control_rows))
                 save(directory/'summary.json',result);return result
-        admission=required_admission(plan,a.root,state,boot,directory/'admission')
-        if admission.get('passed') is not True:
-            result=dict(execution_complete=False,goal_status='blocked',formal_qualified=False,candidate_accepted=False,
-                rows=[],stopped=[{'reason':'actual admission/recovery gate did not pass; retained without retry'}],
-                axes={'admission_complete':False},admission=admission,environment_controls=control_rows,
-                environment_qualification=environment,perf_capability=capability,scope_window_count=len(control_rows))
-            save(directory/'summary.json',result);return result
         for case in plan['cases']:
             failures=0;previous_failure=None;case_rows=[]
             turns=diagnostic_turns(plan,case,followup)
@@ -923,6 +923,8 @@ def diagnostic(a,state,followup=False):
             control_row.update(diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
                 candidate_accepted=False,scope=c['scope'])
             save(out/'window.json',control_row)
+        admission=(required_admission(plan,a.root,state,boot,directory/'admission') if not stopped else
+            dict(passed=False,execution_complete=False,reason='normal functional/environment stop; supplementary gate not started'))
         expected_rows=sum(len(diagnostic_turns(plan,c,followup)) for c in plan['cases'])
         axes=diagnostic_axes(plan,rows,expected_rows,stopped,control_row,growth_rows,followup,admission)
         result=dict(**axes,axes=axes,rows=rows,stopped=stopped,

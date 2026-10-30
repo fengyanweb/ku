@@ -574,7 +574,9 @@ def main(argv=None):
             generated_c_sha256=original_hash,control_c_sha256=digest(path),expected_compile_command=command,
             source_input_unchanged=digest(source)==original_hash)
         if not args.emit_only:
-            logs=Commands(out/'logs');logs.run('compile',command,out,timeout=180)
+            environment=dict(os.environ)
+            for key in ('CFLAGS','CXXFLAGS','LDFLAGS','LLVM_PROFILE_FILE'):environment.pop(key,None)
+            logs=Commands(out/'logs',environment);logs.run('compile',command,out,timeout=180)
             control.update(binary_sha256=digest(out/'http-control'),commands=logs.rows)
         save(out/'emission.json',control)
         print(json.dumps({'emission':str(out/'emission.json'),'diagnostic_only':True,'normal_score_eligible':False}))
