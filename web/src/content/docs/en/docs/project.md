@@ -34,13 +34,13 @@ Email feedback: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
 - Full command, backend, and minimal `.ku` source.
 - Complete diagnostic or structured Error, expected output, and actual output.
 - Rust / C toolchain versions for build issues, and whether local imports are involved.
-- Archive filename/checksum and actual CLI path. For a new fix candidate, include `ku doctor --json`; the original public 0.0.19 may lack doctor. See [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
+- Archive filename/checksum and actual CLI path.
 
 Do not submit tokens, passwords, real connection strings, or logs containing sensitive business data. Performance reports should include environment, workload, measurement method, and raw results. One successful sample does not establish production throughput.
 
 ## Before contributing
 
-The [syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) and [language semantics](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) define language behavior. Distinguish published behavior from development branch changes when choosing a contribution.
+The [syntax reference](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md) and [language semantics](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md) define language behavior. Check the target version’s API before contributing.
 
 Keep changes focused and explain reproduction, cause, scope, and validation. Code, documentation and examples should target the same version. Maintainers review proposed changes before merging.
 

@@ -76,11 +76,9 @@ ku check hello.ku
 
 ## Runner 构建与 E0514
 
-`ku build hello.ku` 默认构建 Debug / Runner。Rust 的 E0514 表示编译依赖与当前编译器身份不兼容；`Cargo.toml` 中的 `rust-version` 是源码最低支持版本，不会替用户选择某一工具链。原公开 0.0.19 包的运行时由 Rust 1.89.0 编译，系统安装了更新 Rust 并不会改变随包库。
+`ku build hello.ku` 默认使用 Debug / Runner。E0514 表示 Rust 编译器与运行时库不兼容；0.0.19 的随包库使用 Rust 1.89.0，升级系统 Rust 不会重编这份库。保留安装包中的 `ku.exe`、`libku.rlib` 和整个 `deps` 目录，避免混用不同版本。
 
-**先区分发行包与修复候选。** 当前下载页的原公开包尚未包含下面的 `doctor` 和精确工具链选择修复。单靠清理 Cargo 缓存、改用 `--emit-c` 或换成 C 后端，都不能证明默认 Runner 构建已修好。请在问题报告中提供实际安装资产名与校验信息；不要混用不同包的 `ku.exe`、`libku.rlib` 和 `deps`。
-
-Windows 可先采集这些不含项目源码的路径/版本信息：
+Windows 的 MSVC Runner 还需要 Visual Studio Build Tools 的 C++ 工具和 Windows SDK。检查实际使用的程序与工具链：
 
 ```powershell
 Get-Command ku -All
@@ -91,29 +89,7 @@ rustup show active-toolchain
 rustup toolchain list
 ```
 
-如果没有安装 Rust/Rustup，对应命令找不到是有用的诊断信息，不影响 `ku check` 或 `ku .\hello.ku` 本身。报错中的库目录不单独证明开发机路径被硬编码；先确认实际运行的 `ku.exe`，以及是否仍在使用旧的 PATH 条目。分享时可隐藏个人用户名和目录。
-
-### 修复候选的诊断与恢复
-
-仅在新候选包中使用：
-
-```powershell
-ku doctor --backend runner
-ku doctor --json
-```
-
-候选显示实际 CLI、安装根、manifest、精确库来源、需要的 Rust 身份及预计使用的编译器。只读诊断不会自动下载工具链。保留 `ku-runtime.json`、`ku-runtime-deps.json`、`libku.rlib` 和整个 `deps` 目录；文件缺失、损坏或混包时会拒绝构建，不从另一个安装目录借库。
-
-匹配工具链未安装且 Rustup 已可用时，明确请求：
-
-```powershell
-ku doctor --install-runner-toolchain
-ku build .\hello.ku
-```
-
-安装命令只安装本包要求的精确工具链，不更改系统 Rust 默认版本或项目配置。安装失败时不继续假装就绪。显式的 `KU_RUNNER_RUSTC` 必须是编译器绝对路径；其身份不匹配时应纠正该配置，而不是期待候选静默忽略它。编译器 ready 仍不代替系统链接器的检查。
-
-C 后端问题单独使用候选 `ku doctor --backend c` 排查。它不需要 Runner 的 Rust 库，但需要支持的 C 工具链，以及程序所用数据库等原生库。更多简写和参数范围见[命令行参考](/zh-cn/docs/tools/cli/)；正式修复包发布前不要将候选行为当成原公开包能力。
+反馈问题时附安装包名、校验值、完整命令和错误输出。`ku check` 与解释运行不需要 Rust；C 原生编译的工具要求见[安装说明](/zh-cn/docs/install/)。
 
 ## 读取诊断
 

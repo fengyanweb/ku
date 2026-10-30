@@ -3,18 +3,10 @@ title: '命令行工具'
 description: 'Ku 常用命令、完整简写、参数作用域与 Runner 构建依赖。'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-29'
-sources:
-  [
-    'src/cli.rs',
-    'src/cli_contract.rs',
-    'docs/cli-runtime-bundle.md',
-    'docs/package.md',
-  ]
+sources: ['src/cli.rs', 'docs/package.md']
 ---
 
 先用 `ku -v` 查看版本，`ku --help` 查看当前安装的总帮助。
-
-> **修复候选**：新增的 `doctor` 与统一子命令帮助尚未发布，原公开 0.0.19 下载包不包含这两项能力。
 
 ## 日常命令
 
@@ -48,7 +40,7 @@ ku ./hello.ku
 
 ## 完整形式与简写
 
-以下来自命令合同表；别名只在相应命令的参数位置生效。
+别名只在相应命令的参数位置生效。
 
 | 功能              | 完整形式                          | 简写或等价形式                              |
 | ----------------- | --------------------------------- | ------------------------------------------- |
@@ -105,45 +97,6 @@ ku build --native ./hello.ku -o ./hello
 ```
 
 第一条只生成 C 文件；第二条通过兼容分支编译和链接 C 程序。`--native` 必须位于 `build` 后的兼容解析位置，不能移到任意选项位置并当作无条件别名。
-
-<a id="candidate-diagnostics"></a>
-
-## 修复候选：帮助与环境诊断
-
-以下只适用于本分支新构建的候选包，旧公开包可能拒绝这些入口：
-
-```sh
-ku help build
-ku build --help
-ku run --help
-ku check --help
-ku create --help
-ku init --help
-ku doctor --help
-```
-
-候选中的公开子命令帮助不运行程序、不创建目录或触发构建，退出码为 0；未知命令/选项返回非 0。`supervise`、`service` 继续提供各自帮助。`ku check --json` 输出的 JSON Lines 与普通帮助不同，不要混用机器可读诊断与帮助文本。
-
-```sh
-ku doctor
-ku doctor --json
-ku doctor --backend runner
-ku doctor --backend c
-```
-
-这些诊断默认只读。默认诊断区分基础安装和可选构建后端；没有 C 编译器不等于 Ku 不能解释运行。指定后端时按该后端检查，不满足返回非 0。`--json` 的标准输出仅含诊断 JSON。
-
-候选 Runner 从实际 CLI 所在安装包的 `ku-runtime.json` 与 `ku-runtime-deps.json` 精确定位并校验库，不按文件修改时间挑选。当前修复发行工具链为 1.89.0；这与源码的最低支持版本是两个概念。系统默认 1.96/1.99 不会自动成为该包的 Runner 编译器。候选会选择完整身份匹配的已安装编译器，不修改全局默认、项目 toolchain 文件或目录 override。
-
-若明确选择独立编译器，可用 `KU_RUNNER_RUSTC` 指定其**绝对路径**；此配置优先，不匹配就报错，不静默换回别的编译器。诊断读取不自动下载工具链。确需安装匹配工具链时，用户显式运行：
-
-```sh
-ku doctor --install-runner-toolchain
-```
-
-它只安装该已校验包需要的工具链，不更改全局默认。没有 Rustup、网络不可用或安装失败时会给出诊断，不把后端标成可用。候选完整行为与发行状态见[Runner 构建排查](/zh-cn/docs/guide/errors/#runner-build)。
-
-当前没有 `ku fmt`、`ku test` 或 `ku doc` 命令；VS Code 格式化属于插件功能。其他后端与平台支持见[支持矩阵](/zh-cn/docs/support/)。
 
 ## 受控执行
 

@@ -71,19 +71,17 @@ Compare the archive’s SHA-256 with [SHA256SUMS](https://github.com/fengyanweb/
 <details>
 <summary>Compiling your own Ku programs</summary>
 
-`ku run`, `ku check` and `ku ./hello.ku` need the platform CLI only. The original public package includes a Runner runtime compiled by Rust **1.89.0**; default `ku build` additionally needs matching Rust and a system linker. Upgrading system Rust does not rebuild that runtime. Selecting another version may produce E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
+`ku run`, `ku check` and `ku ./hello.ku` need the platform CLI only. The package includes a Runner runtime compiled by Rust **1.89.0**; default `ku build` additionally needs matching Rust and a system linker. Upgrading system Rust does not rebuild that runtime. Selecting another version may produce E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
 
-The Windows MSVC Runner also requires the Visual Studio Build Tools C++ tools and Windows SDK. `ku doctor --install-runner-toolchain` installs Rust only, not these system components.
+The Windows MSVC Runner also requires the Visual Studio Build Tools C++ tools and Windows SDK.
 
 `ku build --backend c --release hello.ku -o hello` is a separate C-native path requiring a target C compiler and linker. Use `hello.exe` on Windows. Native database programs also need matching database client libraries, which are not bundled.
 
 </details>
 
-## Updates and fix-candidate status
+## Updates
 
 Extract an **entire new bundle** into a separate empty directory, verify it and run `ku -v` before switching `PATH`. Do not overlay a new CLI onto old runtime libraries. Keep the old directory for rollback and confirm the executable path in use. On Windows, close the relevant Ku processes before changing directories if files are in use.
-
-The development branch is fixing Runner compiler selection and adding `ku doctor`. **These changes are not included in the original public 0.0.19 downloads above.** A candidate bundle verifies CLI/runtime/dependencies using `ku-runtime.json` and `ku-runtime-deps.json`, then selects an installed Rust compiler with matching complete identity. Only explicit `ku doctor --install-runner-toolchain` requests installation; it does not change the global default. See [candidate diagnostics](/en/docs/tools/cli/#candidate-diagnostics).
 
 <details>
 <summary>Uninstall</summary>

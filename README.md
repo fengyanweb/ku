@@ -6,8 +6,6 @@ Ku 是一门开发中的编程语言，提供解释执行、静态检查、nativ
 
 0.0.19 汇集多事件循环 HTTP、有限 native Task、异步 PostgreSQL 适配、服务恢复和已验证的运行时修复。它仍是实验版本：受控环境预演不代表已经完成真实生产灰度，个别负载的长尾延迟仍是已知问题。请先阅读 [版本说明](docs/v0.0.19.md) 和 [已知限制](docs/v0.0.19-known-issues.md)。
 
-本分支正在准备 **CLI / Runner 构建修复候选**，尚未发布，原 `v0.0.19` 标签与安装资产保留。新的环境诊断、统一帮助和精确工具链选择不应被当作旧下载包已有能力，详见[候选说明](docs/cli-runtime-bundle.md)。
-
 ## 安装与第一个程序
 
 从 [GitHub Releases](https://github.com/fengyanweb/ku/releases) 选择与系统和架构一致的安装包，核对随包 `SHA256SUMS`，解压后将包含 `ku`（Windows 为 `ku.exe`）的目录加入 `PATH`。保留包内伴随库和元数据，不要只复制一个可执行文件。
@@ -50,17 +48,15 @@ ku build --backend c --release examples/hello.ku -o hello
 | TCP/TLS 协议范围与验证身份 | [协议地基状态](docs/protocol-foundation.md) |
 | 编辑器插件 | [VS Code 扩展](editors/vscode-ku/README.md) |
 | 最新七语言固定负载对比 | [中文](docs/performance-v0.0.19.md) / [English](docs/performance-v0.0.19.en.md) |
-| 0.0.19 交付范围 | [中文](docs/v0.0.19.md) / [English](docs/v0.0.19.en.md) |
+| 0.0.19 版本说明 | [中文](docs/v0.0.19.md) / [English](docs/v0.0.19.en.md) |
 
 常用命令为 `ku check`、`ku run`、`ku build`、`ku ir`、`ku package`、`ku service` 和 `ku supervise`。[CLI 参考](web/src/content/docs/zh-cn/docs/tools/cli.md)列出已有简写：`ku -v` 是版本，`ku build -v FILE` 是构建详细日志；单文件可写 `ku ./hello.ku`，但不接受程序参数或依赖选项。模板可写 `ku create my-api -t http` / `ku init -t cli`，输出可用 `-o`。
 
 默认 `ku build hello.ku` 是 Debug / Runner，需要匹配随包运行时的 Rust 和系统链接器。它不同于 `ku build --backend c --release hello.ku -o hello`，也不同于源码分发命令 `ku package pack`。`--emit-c` 不会把默认 Runner 变成 C-only；历史 `--native` 不带 `-o` 时只生成 C。Windows 输出名使用 `.exe`。
 
-修复候选支持 `ku help build`、`ku build --help` 等统一帮助及 `ku doctor --backend runner`。只读诊断不会自动安装；显式 `ku doctor --install-runner-toolchain` 才请求安装本包所需的精确工具链，不改变全局默认。原公开包可能不支持这些新入口，见[Windows / E0514 排查](docs/cli-runtime-bundle.md#windows-诊断与修复候选)。
-
 ## 从源码构建
 
-源码最低支持 Rust 1.89；本次修复发行工具链仍为经过验证的 **1.89.0**，统一配置在 [release-toolchain.json](scripts/release-toolchain.json)。最低支持版本不等于用户全局工具链锁。native C 输出另需受支持的 C 编译器和所用原生库。
+源码最低支持 Rust 1.89，发行工具链为 **1.89.0**，配置见 [release-toolchain.json](scripts/release-toolchain.json)。native C 输出另需受支持的 C 编译器和所用原生库。
 
 ```sh
 cargo +1.89.0 build --locked --release
@@ -68,12 +64,12 @@ cargo +1.89.0 build --locked --release
 ./target/release/ku ./examples/hello.ku
 ```
 
-Windows 使用 `target\release\ku.exe`。项目已有回归测试与 CI 夹具是源码的一部分；临时探针和重复构建包不应提交。
+Windows 使用 `target\release\ku.exe`。
 
 ## 版本历史
 
 - [0.0.19](docs/v0.0.19.md)：当前版本。
-- [0.0.18](docs/v0.0.18.md) 与 [历史修订](docs/v0.0.18-r1.md)：保留原交付身份。
+- [0.0.18](docs/v0.0.18.md) 与 [历史修订](docs/v0.0.18-r1.md)。
 - [0.0.17](docs/v0.0.17.md)、[0.0.16](docs/v0.0.16.md)：早期版本。
 
-历史性能数据只对应其原提交、输入、平台和限制，不表示所有工作负载都优于其他语言。当前官网代码的版本与已经部署的网站版本可能不同。
+历史性能数据只对应其原提交、输入、平台和限制，不表示所有工作负载都优于其他语言。

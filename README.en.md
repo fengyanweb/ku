@@ -6,8 +6,6 @@ Ku is an experimental programming language with an interpreter, static checking,
 
 This version brings together multi-loop native HTTP, supported native Task paths, asynchronous PostgreSQL integration, service recovery, and verified runtime fixes. Controlled deployment rehearsals do not establish production readiness. Long-tail latency remains a known issue under some loads. Read the [release notes](docs/v0.0.19.en.md) and [known limitations](docs/v0.0.19-known-issues.en.md).
 
-This branch prepares a **CLI / Runner build fix candidate**, not a published release. The original `v0.0.19` tag and assets remain unchanged. New diagnostics, unified help and exact-toolchain selection are not claimed for the old public package; see [candidate notes](docs/cli-runtime-bundle.en.md).
-
 ## Install and run
 
 Choose the matching OS and architecture from [GitHub Releases](https://github.com/fengyanweb/ku/releases), verify the supplied `SHA256SUMS`, extract the archive, and add its directory to `PATH`. Keep the accompanying libraries and metadata with `ku` (`ku.exe` on Windows).
@@ -49,11 +47,9 @@ Common commands include `check`, `run`, `build`, `ir`, `package`, `service` and 
 
 Default `ku build hello.ku` is Debug / Runner, requiring Rust matching the bundled runtime and a system linker. It differs from `ku build --backend c --release hello.ku -o hello` and source-distribution command `ku package pack`. `--emit-c` does not change Runner to C-only; historical `--native` without `-o` emits C only. Use an `.exe` output name on Windows.
 
-The fix candidate supports unified `ku help build` / `ku build --help` and `ku doctor --backend runner`. Read-only diagnosis never installs automatically. Explicit `ku doctor --install-runner-toolchain` requests only the bundle’s exact toolchain without changing the global default. These new entries may be absent in the original public package; see [Windows / E0514 diagnosis](docs/cli-runtime-bundle.en.md#windows-diagnosis-and-the-fix-candidate).
-
 ## Build from source
 
-The source MSRV is Rust 1.89. This fix retains the verified release toolchain **1.89.0**, centralized in [release-toolchain.json](scripts/release-toolchain.json). MSRV is not a lock on a user’s global toolchain. Native C output also needs a supported C compiler and the program’s native libraries.
+The source MSRV is Rust 1.89 and the release toolchain is **1.89.0**; see [release-toolchain.json](scripts/release-toolchain.json). Native C output also needs a supported C compiler and the program’s native libraries.
 
 ```sh
 cargo +1.89.0 build --locked --release
@@ -61,8 +57,8 @@ cargo +1.89.0 build --locked --release
 ./target/release/ku ./examples/hello.ku
 ```
 
-On Windows, use `target\release\ku.exe`. Existing regression tests and CI fixtures are maintained source; disposable probes and duplicate build artifacts should not be committed.
+On Windows, use `target\release\ku.exe`.
 
 ## History
 
-[0.0.18](docs/v0.0.18.md), its [historical revision](docs/v0.0.18-r1.md), [0.0.17](docs/v0.0.17.md), and [0.0.16](docs/v0.0.16.md) remain available with their original release identities. Historical performance results apply only to their recorded commit, workload, platform, and limits. Updated website source does not imply an online deployment.
+[0.0.18](docs/v0.0.18.md), its [historical revision](docs/v0.0.18-r1.md), [0.0.17](docs/v0.0.17.md), and [0.0.16](docs/v0.0.16.md) remain available with their original release identities. Historical performance results apply only to their recorded commit, workload, platform, and limits.

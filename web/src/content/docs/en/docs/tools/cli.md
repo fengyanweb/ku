@@ -3,18 +3,10 @@ title: 'Command-line tools'
 description: 'Ku commands, complete shorthand reference, option scope and Runner requirements.'
 kuVersion: '0.0.19'
 verifiedAt: '2026-10-29'
-sources:
-  [
-    'src/cli.rs',
-    'src/cli_contract.rs',
-    'docs/cli-runtime-bundle.en.md',
-    'docs/package.md',
-  ]
+sources: ['src/cli.rs', 'docs/package.md']
 ---
 
 Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help.
-
-> **Fix candidate:** `doctor` and unified subcommand help are not yet released; the original public 0.0.19 download does not include them.
 
 ## Everyday commands
 
@@ -48,7 +40,7 @@ ku ./hello.ku
 
 ## Full forms and shorthands
 
-These entries correspond to the command contract. Aliases apply only in the relevant command's option positions.
+Aliases apply only in the relevant command's option positions.
 
 | Function               | Full form                         | Shorthand or equivalent                     |
 | ---------------------- | --------------------------------- | ------------------------------------------- |
@@ -105,45 +97,6 @@ ku build --native ./hello.ku -o ./hello
 ```
 
 The first emits C only. The second selects the compatibility branch that compiles and links a C program. `--native` must occupy its compatibility position immediately after `build`; it is not an unconditional alias accepted anywhere.
-
-<a id="candidate-diagnostics"></a>
-
-## Fix candidate: help and environment diagnostics
-
-These entries require the newly built candidate package; the original public package may reject them:
-
-```sh
-ku help build
-ku build --help
-ku run --help
-ku check --help
-ku create --help
-ku init --help
-ku doctor --help
-```
-
-Candidate help for public subcommands exits 0 without executing programs, creating projects or starting builds. Unknown commands/options fail. `supervise` and `service` retain their dedicated help. `ku check --json` emits JSON Lines rather than ordinary help; keep machine-readable diagnostics separate from help text.
-
-```sh
-ku doctor
-ku doctor --json
-ku doctor --backend runner
-ku doctor --backend c
-```
-
-These diagnostics are read-only by default. Default checks distinguish a basic installation from optional build backends: missing C tools do not mean interpretation is unavailable. An explicitly requested backend returns nonzero when its requirements fail. `--json` writes diagnostic JSON only to stdout.
-
-Candidate Runner resolves and verifies exact library paths through `ku-runtime.json` and `ku-runtime-deps.json` belonging to the actual CLI installation, without selecting by modification time. This fix retains release toolchain 1.89.0, separately from the source MSRV. A system default of 1.96/1.99 does not become this bundle's Runner compiler automatically. The candidate chooses an installed compiler with matching complete identity, without changing global defaults, project toolchain files or directory overrides.
-
-For an explicit standalone compiler, set `KU_RUNNER_RUSTC` to its **absolute path**. This takes priority and fails on mismatch rather than silently choosing another compiler. Read-only diagnosis does not download toolchains. Explicitly request installation when needed:
-
-```sh
-ku doctor --install-runner-toolchain
-```
-
-It installs only the validated package's required toolchain without changing the global default. Missing Rustup, network or installation failures are reported; they do not mark the backend ready. See [Runner troubleshooting](/en/docs/guide/errors/#runner-build) for candidate policy and release status.
-
-There are no `ku fmt`, `ku test` or `ku doc` commands; VS Code formatting belongs to the extension. See [backend/platform support](/en/docs/support/) for other capabilities.
 
 ## Controlled execution
 

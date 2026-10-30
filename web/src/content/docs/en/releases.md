@@ -6,10 +6,6 @@ verifiedAt: '2026-10-29'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
-## CLI fix candidate in development
-
-An independent candidate fixes Runner compiler/dependency identity and adds `ku doctor` plus unified subcommand help. Existing shorthands are documented in the [CLI reference](/en/docs/tools/cli/). **It is not published; 0.0.19 downloads below remain the original assets.** The fix does not overwrite old tags or automatically adopt the performance candidate. See [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
-
 ## 0.0.19
 
 Ku 0.0.19 is an experimental prerelease for controlled evaluation, with matching CLI and VS Code extension versions. It collects the implemented native Task, HTTP, PostgreSQL and service-management work, keeps the previous JSON default, and uses Apache-2.0. Complete M:N, general I/O coverage and the full database platform matrix remain incomplete. Historical HTTP 504s and cancellation-related latency tails remain documented; this release does not claim completed long-term or production acceptance.

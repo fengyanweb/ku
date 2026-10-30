@@ -21,7 +21,7 @@ sources:
 
 ## 选择平台与执行路径
 
-按[安装说明](/zh-cn/docs/install/)和实际[发行资产](https://github.com/fengyanweb/ku/releases)选择系统与架构对应的 CLI。源码构建、CI 作业或隔离安装预演不等于已发布相应平台的下载包。Linux ARM64 RC 预演只覆盖样例服务及其依赖；真实应用、生产 SLO 与灰度验收需要单独完成。
+按[安装说明](/zh-cn/docs/install/)选择与系统和架构对应的 CLI。预编译安装包支持 macOS ARM64、Linux x64 和 Windows x64；Linux ARM64 需要从源码构建。
 
 | 能力                       | 解释器 `ku run` / 默认 runner             | Native C                         | Native Task 路径                                                 |
 | -------------------------- | ----------------------------------------- | -------------------------------- | ---------------------------------------------------------------- |
@@ -85,7 +85,7 @@ Ku 仍在开发中，不承诺完整自举检查器/IR/后端、通用 Task 网�
 
 ## 已知问题
 
-原公开 0.0.19 的默认 Runner 构建可能选到与随包运行时不同的 Rust，产生 E0514。CLI/安装包修复候选正在增加精确身份校验、工具链选择和 `ku doctor`，尚未包含在原下载包。见[构建排查](/zh-cn/docs/guide/errors/#runner-build)；C 后端成功不代替默认 Runner 原命令验证。
+默认 Runner 构建使用与随包运行时不匹配的 Rust 时会报 E0514。所需 Rust、链接器及 Windows SDK 见[安装说明](/zh-cn/docs/install/)，排查步骤见[构建错误](/zh-cn/docs/guide/errors/#runner-build)。
 
 截至 2026-10-28，0.0.19 的三平台发布检查与安装包验证已通过。以下延迟问题仍保留：
 

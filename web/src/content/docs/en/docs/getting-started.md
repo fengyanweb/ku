@@ -60,7 +60,7 @@ The installation page lists the required build tools. For the default backend:
 ku build hello.ku
 ```
 
-The default is Debug / Runner, packaging interpreter execution and requiring Rust matching the bundled runtime plus a system linker. The original public 0.0.19 package can select a different Rust version and fail with E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build). Interpretation needs no Rust. Native C is a separate path requiring a C compiler:
+The default is Debug / Runner, packaging interpreter execution and requiring Rust matching the bundled runtime plus a system linker. Rust incompatible with the bundled runtime can cause E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build). Interpretation needs no Rust. Native C is a separate path requiring a C compiler:
 
 ```sh
 ku build --backend c --release hello.ku -o hello

@@ -6,10 +6,6 @@ verifiedAt: '2026-10-29'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
 
-## 开发中的 CLI 修复候选
-
-正在准备独立的 Runner 工具链/依赖身份修复、新增 `ku doctor` 与统一子命令帮助；已有简写补充见[CLI 参考](/zh-cn/docs/tools/cli/)。**尚未发布，下面的 0.0.19 下载仍是原发行资产。** 该修复不覆盖旧标签、不自动采用性能开发候选；具体错误及候选处理见[Runner 排查](/zh-cn/docs/guide/errors/#runner-build)。
-
 ## 0.0.19
 
 Ku 0.0.19 是供受控环境试用的实验预发行版，CLI 与 VS Code 插件版本一致。它汇集已实现的 native Task、HTTP、PostgreSQL 和服务管理工作，保留旧 JSON 默认实现，采用 Apache-2.0。完整 M:N、通用 I/O 覆盖和数据库完整平台矩阵尚未完成；历史 HTTP 504 与取消场景长尾仍按已知问题记录，不宣称长期或生产验收已通过。

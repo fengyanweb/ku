@@ -60,7 +60,7 @@ println(count)
 ku build hello.ku
 ```
 
-默认是 Debug / Runner 后端，生成解释器打包型可执行文件；它需要匹配随包库的 Rust 和系统链接器。原公开 0.0.19 包存在选择到不同 Rust 版本后报 E0514 的问题，见[Runner 构建排查](/zh-cn/docs/guide/errors/#runner-build)。解释运行无需 Rust。native C 是独立路径，需要单独的 C 编译器：
+默认是 Debug / Runner 后端，生成解释器打包型可执行文件；它需要匹配随包库的 Rust 和系统链接器。Rust 与随包运行时不匹配时会报 E0514，见[Runner 构建排查](/zh-cn/docs/guide/errors/#runner-build)。解释运行无需 Rust。native C 是独立路径，需要单独的 C 编译器：
 
 ```sh
 ku build --backend c --release hello.ku -o hello
