@@ -8,6 +8,7 @@ import gzip
 import tempfile
 import types
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 from task_cpu_window import generation_gate, driver_lifecycle_cpu
@@ -278,6 +279,18 @@ class ClockAndRecoveryTest(unittest.TestCase):
         value = arrival_cpu(samples, 'service', 500_000_000, 1_500_000_000)
         self.assertTrue(value['available'])
         self.assertAlmostEqual(value['cpu_seconds'], .001)
+
+
+    def test_rejected_probe_is_counted_but_only_a_new_correct_plan_recovers(self):
+        origin = 100_000_000_000
+        rows = iter([event('busy', 1_000_000_000, 1_100_000_000, 'rejected_503'),
+                     event('next', 2_000_000_000, 2_100_000_000),
+                     event('later', 6_000_000_000, 6_100_000_000)])
+        view = recovery_probe_views(rows, origin, {'withdrawal': origin})['withdrawal']
+        self.assertEqual(view['probe_phases']['within5s_after_withdrawal'], {'rejected_503': 1, 'correct': 1})
+        self.assertEqual(view['first_complete_new_probe']['rid'], 'next')
+        self.assertTrue(view['observation_covers_full5s'])
+        self.assertTrue(view['recovered'])
 
 
 class MeasurementRulesTest(unittest.TestCase):
@@ -1155,6 +1168,99 @@ class FocusLifecycleRecoveryTests(unittest.TestCase):
         result = focus_cycle.window_lifecycle_cost(score, physical, True, termination, {})
         self.assertEqual(result, expected)
         self.assertNotIn('correct_response_denominator', result)
+
+
+class ResourceSamplerTests(unittest.TestCase):
+    @contextmanager
+    def environment(self):
+        original = Path.read_text
+        def proc_text(path, *args, **kwargs):
+            if str(path) == '/proc/stat':
+                return 'cpu 1 2 3 4 5 6 7 8 9 10\n'
+            if str(path) == '/proc/loadavg':
+                return '0.00 0.00 0.00 1/1 1\n'
+            return original(path, *args, **kwargs)
+        with mock.patch.object(linux_harness.Path, 'read_text', new=proc_text), \
+             mock.patch.object(linux_harness, 'guest_memory', new=lambda: {'free': 10}), \
+             mock.patch.object(linux_harness.resource, 'getrusage', new=lambda *args: types.SimpleNamespace(ru_utime=1, ru_stime=2, ru_maxrss=3)), \
+             mock.patch.object(linux_harness.time, 'time_ns', new=lambda: 1000), \
+             mock.patch.object(linux_harness.time, 'monotonic_ns', new=lambda: 2000):
+            yield
+
+    def domain(self):
+        class DomainFake:
+            sequence = 0
+            def snapshot(self):
+                self.sequence += 1
+                return {'label': 'service', 'sequence': self.sequence, 'payload': 'x'*8192}
+        return DomainFake()
+
+    def test_streaming_keeps_all_bounded_rows_without_retaining_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment():
+            root = Path(directory)
+            regular = linux_harness.Sampler([self.domain()], root/'regular.json', maximum=4)
+            streamed = linux_harness.Sampler([self.domain()], root/'resources.json', maximum=4, retain_samples=False)
+            for sampler in (regular, streamed):
+                for _ in range(7):
+                    sampler.sample()
+                sampler.stop()
+            self.assertEqual(streamed.samples, [])
+            self.assertEqual(len(regular.samples), 4)
+            self.assertTrue(streamed.overflow)
+            regular_output = json.loads((root/'regular.json').read_text())
+            streamed_output = json.loads((root/'resources.json').read_text())
+            self.assertEqual(streamed_output['samples'], regular_output['samples'])
+            self.assertEqual(streamed_output['sample_count'], 4)
+            self.assertEqual(streamed_output['retained_in_memory'], 0)
+            self.assertIsNone(streamed.error)
+            rows = streamed.stream_path.read_text().splitlines()
+            self.assertEqual([json.loads(line) for line in rows], regular.samples)
+            self.assertEqual(streamed.stop(), [])
+            self.assertEqual(streamed.stream_path.read_text().splitlines(), rows)
+
+    def test_interrupted_stream_is_retained_and_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment():
+            path = Path(directory)/'resources.json'
+            sampler = linux_harness.Sampler([self.domain()], path, retain_samples=False)
+            sampler.sample()
+            before = sampler.stream_path.read_bytes()
+            self.assertFalse(path.exists())
+            with self.assertRaises(FileExistsError):
+                linux_harness.Sampler([self.domain()], path, retain_samples=False)
+            self.assertEqual(sampler.stream_path.read_bytes(), before)
+            sampler.stop()
+            self.assertEqual(len(json.loads(path.read_text())['samples']), 2)
+        with self.assertRaisesRegex(ValueError, 'output path'):
+            linux_harness.Sampler([], retain_samples=False)
+
+    def test_truncated_stream_is_not_published_as_complete_resources(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment():
+            path = Path(directory)/'resources.json'
+            sampler = linux_harness.Sampler([self.domain()], path, retain_samples=False)
+            sampler.sample()
+            with sampler.stream_path.open('a') as raw:
+                raw.write('{interrupted')
+            with self.assertRaisesRegex(RuntimeError, 'raw stream retained'):
+                sampler.stop()
+            self.assertFalse(path.exists())
+            self.assertIn(b'{interrupted', sampler.stream_path.read_bytes())
+            self.assertIsNotNone(sampler.error)
+
+    def test_join_timeout_never_reports_a_complete_stream(self):
+        class ThreadFake:
+            def join(self, timeout):
+                self.timeout = timeout
+            def is_alive(self):
+                return True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'resources.json'
+            sampler = linux_harness.Sampler([], path, retain_samples=False)
+            sampler.thread = ThreadFake()
+            with self.assertRaisesRegex(RuntimeError, 'bounded join'):
+                sampler.stop()
+            self.assertEqual(sampler.thread.timeout, 3)
+            self.assertFalse(path.exists())
+            self.assertTrue(sampler.stream_path.exists())
 
 
 class DriverOwnedCleanupTests(unittest.TestCase):

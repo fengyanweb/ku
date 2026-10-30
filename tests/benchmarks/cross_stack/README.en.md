@@ -254,3 +254,61 @@ analyses. Website edits and packaging require separate scope; they do not replac
 runtime evidence.
 
 The Rust reference accepts explicit `BENCH_REQUEST_TIMEOUT_MS` (1–300000; unchanged default 45000) to match Ku `KU_HTTP_REQUEST_TIMEOUT_MS`. It covers Legacy admission/execution; cooperative/bounded CPU modes retain their existing 3000ms absolute deadline. Freeze the actual values in the plan; increasing a deadline cannot count as an optimization.
+
+## Rejections and observer memory
+
+Ku `/db` maps only `pg/pool_busy` to a 503 admission rejection, retaining the
+`database_error:pool_busy` body. Other failures remain HTTP500. Existing PG
+`database.pg_client_pool_rejections` counting is unchanged. No global runtime response rewriting,
+SQL replay, queue expansion or deadline extension is introduced. The shared
+driver counts503/429 as `rejected_503`/`rejected_429` and retains their bounded
+body in CSV `detail`; rejections are not correct responses or goodput. Bind the
+new source/binary/driver identities to future results. The 27 historical warmup
+HTTP500 responses remain HTTP500; do not relabel old capacity results.
+
+`loops[].timeout_responses` keeps its original contract:
+`ku_http_connection_response` calls `ku_http_count_response` when constructing
+408/504 output, before complete socket writing. Header/body receive failures
+can also construct 408; a Task deadline generating 504 is only one source.
+Deadline expiration, response construction and complete transmission are distinct.
+This field does not count the first or last, and is not an execution-stall count.
+There is no exposed per-status complete-transmission counter. The 132 historical
+construction events lack per-request association; neither execution timeout nor
+planned RST explains all of them from this evidence.
+
+After H3's withdrawal, current native HTTP has no independent experimental
+`completion_event_queue`. Sync jobs publish `KuHttpJob.completed`, observed by
+`ku_http_connection_observe_job`. Tasks wake their owner through
+`ku_http_task_event_wake` and are observed through `ku_http_async_observe`.
+`KuHttpQueue` is an inbound work queue and `KuHttpWake` a coalesced notification
+channel; neither is that completion queue. For this reviewed code it is
+**not applicable**, not an observed zero. Generic collection for unknown binaries
+keeps `not_exposed`/`unclassified_raw_fields` rather than inferring zero.
+
+The 30-minute V top-level resource observer samples every 5 seconds. It previously
+retained snapshots in Python until completion, bounded by `seconds//5+128`;
+this is not a confirmed infinite leak. Request CSV and recovery aggregation
+already stream input; the observer does not hold all request objects. V now uses
+`Sampler(..., retain_samples=False)`: append each snapshot to
+`resources.samples.jsonl`, retain no snapshot history in memory, then assemble
+compatible `resources.json.samples[]` one row at a time. The original sample
+limit remains; overflow, sampling errors, bounded-join failures or incomplete
+rows remain failures. Interrupted raw streams survive and cannot be silently
+overwritten. Ordinary short scoring windows keep their original snapshot
+statistics; sampling intervals, deadlines and service settings are unchanged.
+
+This reduces measurement-coordinator snapshot retention, not Ku service RSS,
+and does not uniquely explain all historical coordinator RSS growth. No old
+80-window, full-capacity or 30-minute V measurements were rerun for this observer
+change; historical results retain their original identities.
+
+Run lightweight regressions from this directory. The existing CLI only executes
+the actual fixture catch body, without contacting a database:
+
+```sh
+KU_BENCHMARK_CLI=/path/to/existing/ku python3 -B -m unittest test_linux_harness test_pg_variants
+go -C client test -run TestReusedConnectionFailuresNeverReplay -count=1
+```
+
+Without `KU_BENCHMARK_CLI`, the real-Ku semantic test explicitly skips; do not
+report that skip as a pass.

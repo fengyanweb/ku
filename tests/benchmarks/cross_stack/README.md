@@ -238,3 +238,48 @@ CPU 保留在原报告，不能相加。结束后等待原 quiet 指标、正常
 
 Synthetic regression: `python3 -B -m unittest test_linux_harness.FocusStabilityTests` from this directory.
 These tests use reports and owned threads only; they do not start a service, database, or30-minute run.
+
+## 拒绝分类与观察器内存
+
+Ku `/db` 的 `pg/pool_busy` 是有界等待队列的准入拒绝，夹具返回503并保留
+`database_error:pool_busy` 正文；其他错误继续500。PG原有`database.pg_client_pool_rejections`计数保留，
+不在运行时全局改写应用响应、不重试SQL、不放大队列或期限。共享驱动对503/429
+分别计为`rejected_503`/`rejected_429`，并在CSV的有界`detail`保留拒绝正文；
+拒绝不计入正确响应或goodput。新的状态码/驱动必须绑定新的源码和二进制身份，
+历史容量热身中的27个500仍然是500，不能据此改写旧成绩。
+
+`loops[].timeout_responses`保留原语义：`ku_http_connection_response`在构造408/504
+输出时调用`ku_http_count_response`，早于socket完整写回。header/body接收错误也
+可能构造408；Task期限触发的504只是其中一条来源。因此必须区分期限触发、
+构造超时响应和完整发送响应；这个计数不能直接给出前后两项，也不能解释为
+执行停顿数。当前没有按状态码公开“完整写回”计数。历史132次构造记录没有
+逐请求关联，既不能认定全是执行超时，也不能认定全是预定RST。
+
+当前撤回H3后的native HTTP没有该实验的独立`completion_event_queue`：
+同步job在`KuHttpJob.completed`发布，owner在`ku_http_connection_observe_job`观察；
+Task通过`ku_http_task_event_wake`唤醒owner，再由`ku_http_async_observe`读取原状态。
+`KuHttpQueue`是入站工作队列，`KuHttpWake`是合并唤醒通道，不能把它们称为该完成队列。
+对当前代码，该独立队列为**不适用**，不是已测得0。通用采集器对未知二进制仍保留
+`not_exposed`/`unclassified_raw_fields`，不从缺字段推导归零。
+
+30分钟V的顶层资源观察器每5秒采样，原实现把快照留在Python内存直到结束；
+它有`seconds//5+128`上限，不是已确认的无限泄漏。请求CSV与恢复统计本来就是
+流式处理，不能把观察器增长说成保存了全部请求对象。V现在使用
+`Sampler(..., retain_samples=False)`：逐条写`resources.samples.jsonl`、内存不保留
+历史快照，结束时逐条组装兼容的`resources.json.samples[]`，不一次加载整个数组。
+样本总数仍受原上限约束；超限、采样错误、停止超时或不完整行均保留失败信息，
+不能成为合格窗口。中断明细保留，存在旧stream时拒绝覆盖。普通短计分窗继续使用
+原有内存快照统计，未改采样间隔、期限或服务参数。
+
+这减少的是测量协调器的快照保留成本，不是Ku服务RSS收益，也未证明历史协调器
+RSS增长全部由此造成。新观察器没有重跑旧80窗、全部容量或30分钟V；历史结果仍按
+原身份解释。
+
+轻量回归在本目录运行，现有CLI只用于执行夹具的实际catch片段，不连数据库：
+
+```sh
+KU_BENCHMARK_CLI=/path/to/existing/ku python3 -B -m unittest test_linux_harness test_pg_variants
+go -C client test -run TestReusedConnectionFailuresNeverReplay -count=1
+```
+
+未设置`KU_BENCHMARK_CLI`时，实际Ku语义用例明确skip；不能把它写成通过。

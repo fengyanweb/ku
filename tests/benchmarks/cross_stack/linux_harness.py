@@ -495,26 +495,45 @@ class ExternalDomain:
     snapshot = Domain.snapshot
 
 class Sampler:
-    def __init__(self, domains, output=None, interval=1.0, maximum=2048):
+    def __init__(self, domains, output=None, interval=1.0, maximum=2048, *, retain_samples=True):
         self.domains, self.output = list(domains), Path(output) if output else None
         self.interval, self.maximum = interval, maximum
         self.samples, self.overflow, self.error = [], False, None
+        self.retain_samples, self.sample_count, self.stopped = retain_samples, 0, False
+        self.stream_path = None
+        if not retain_samples:
+            if self.output is None:
+                raise ValueError('streamed resource sampling requires an output path')
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.stream_path = self.output.with_name(self.output.stem+'.samples.jsonl')
+            # Preserve an interrupted stream; never silently overwrite evidence.
+            with self.stream_path.open('x'):
+                pass
         self.done = threading.Event()
         self.thread = None
     def sample(self):
-        if len(self.samples) >= self.maximum:
+        if self.sample_count >= self.maximum:
             self.overflow = True
             return
         try:
             usage=resource.getrusage(resource.RUSAGE_SELF)
             cpu_ticks=Path('/proc/stat').read_text().splitlines()[0].split()[1:]
-            self.samples.append({'wall_time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
-                                 'observer':{'pid':os.getpid(),'cpu_user_seconds':usage.ru_utime,'cpu_system_seconds':usage.ru_stime,
-                                             'lifetime_peak_rss_bytes':usage.ru_maxrss*1024,'scope':'root coordinator, outside all service domains'},
-                                 'guest_memory':guest_memory(),
-                                 'guest_cpu_ticks':dict(zip(('user','nice','system','idle','iowait','irq','softirq','steal','guest','guest_nice'),map(int,cpu_ticks))),
-                                 'guest_loadavg':Path('/proc/loadavg').read_text().strip(),
-                                 'domains': [d.snapshot() for d in self.domains]})
+            value = {'wall_time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
+                     'observer':{'pid':os.getpid(),'cpu_user_seconds':usage.ru_utime,'cpu_system_seconds':usage.ru_stime,
+                                 'lifetime_peak_rss_bytes':usage.ru_maxrss*1024,'scope':'root coordinator, outside all service domains'},
+                     'guest_memory':guest_memory(),
+                     'guest_cpu_ticks':dict(zip(('user','nice','system','idle','iowait','irq','softirq','steal','guest','guest_nice'),map(int,cpu_ticks))),
+                     'guest_loadavg':Path('/proc/loadavg').read_text().strip(),
+                     'domains': [d.snapshot() for d in self.domains]}
+            if self.retain_samples:
+                self.samples.append(value)
+            else:
+                # One fresh snapshot at a time. The existing count limit also
+                # bounds on-disk rows; no request objects or resource history are
+                # retained by the long-lived stability coordinator.
+                with self.stream_path.open('a') as stream:
+                    stream.write(json.dumps(value, ensure_ascii=False, allow_nan=False)+'\n')
+            self.sample_count += 1
         except Exception as error:
             self.error = repr(error)
     def start(self):
@@ -526,13 +545,45 @@ class Sampler:
         self.thread.start()
         return self
     def stop(self):
+        if self.stopped:
+            return self.samples
         self.done.set()
         if self.thread:
             self.thread.join(timeout=3)
+            if self.thread.is_alive():
+                self.error = 'resource sampler did not stop within bounded join'
+                raise RuntimeError(self.error)
         self.sample()
         if self.output:
-            write_json(self.output, {'samples': self.samples, 'overflow': self.overflow,
-                                     'error': self.error, 'interval_seconds': self.interval})
+            metadata = {'overflow': self.overflow, 'error': self.error,
+                        'interval_seconds': self.interval}
+            if self.retain_samples:
+                write_json(self.output, dict(metadata, samples=self.samples))
+            else:
+                # Keep resources.json's existing samples[] schema for offline
+                # consumers, without materializing that array in coordinator RAM.
+                metadata.update(sample_count=self.sample_count, retained_in_memory=0,
+                                stream_path=str(self.stream_path))
+                temporary = self.output.with_name(self.output.name+'.writing')
+                try:
+                    count = 0
+                    with temporary.open('w') as destination, self.stream_path.open() as source:
+                        destination.write('{"samples":[')
+                        for line in source:
+                            if not line.endswith('\n') or not isinstance(json.loads(line), dict):
+                                raise ValueError('incomplete resource stream row; raw stream retained')
+                            if count:
+                                destination.write(',')
+                            destination.write(line.rstrip('\n'))
+                            count += 1
+                        if count != self.sample_count:
+                            raise ValueError('resource stream sample count mismatch')
+                        destination.write('],'+json.dumps(metadata, ensure_ascii=False)[1:]+'\n')
+                    os.replace(temporary, self.output)
+                except Exception as error:
+                    self.error = repr(error)
+                    raise RuntimeError('resource stream finalization failed; raw stream retained') from error
+        self.stopped = True
         return self.samples
 
 JAVA_SHUTDOWN_PREFIX = b'BENCH_SHUTDOWN '

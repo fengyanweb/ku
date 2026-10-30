@@ -562,7 +562,7 @@ func TestSharedPoolLIFOBoundAndClose(t *testing.T) {
 }
 
 func TestReusedConnectionFailuresNeverReplay(t *testing.T) {
-	for _, scenario := range []string{"io", "protocol", "body", "timeout", "close", "rejected"} {
+	for _, scenario := range []string{"io", "protocol", "body", "timeout", "close", "rejected", "rate_limited"} {
 		t.Run(scenario, func(t *testing.T) {
 			c := testConfig(t)
 			c.idle, c.timeout = 500*time.Millisecond, 150*time.Millisecond
@@ -590,9 +590,13 @@ func TestReusedConnectionFailuresNeverReplay(t *testing.T) {
 						return
 					case "close":
 						w.Header().Set("Connection", "close")
-					case "rejected":
-						w.WriteHeader(http.StatusServiceUnavailable)
-						_, _ = io.WriteString(w, "busy")
+					case "rejected", "rate_limited":
+						status := http.StatusServiceUnavailable
+						if scenario == "rate_limited" {
+							status = http.StatusTooManyRequests
+						}
+						w.WriteHeader(status)
+						_, _ = io.WriteString(w, "database_error:pool_busy")
 						return
 					}
 				}
@@ -612,13 +616,16 @@ func TestReusedConnectionFailuresNeverReplay(t *testing.T) {
 				t.Fatal(r)
 			}
 			r := request(1, "2")
-			expected := map[string]string{"io": "connection_error", "protocol": "protocol_error", "body": "body_error", "timeout": "timeout", "close": "correct", "rejected": "rejected_503"}[scenario]
+			expected := map[string]string{"io": "connection_error", "protocol": "protocol_error", "body": "body_error", "timeout": "timeout", "close": "correct", "rejected": "rejected_503", "rate_limited": "rejected_429"}[scenario]
 			if r.category != expected || arrivals.Load() != 2 || l.dials != 1 || r.sent.IsZero() {
 				t.Fatalf("failed reused request was replayed or misclassified: %+v arrivals=%d dials=%d", r, arrivals.Load(), l.dials)
 			}
 			live := uint64(0)
-			if scenario == "rejected" {
+			if scenario == "rejected" || scenario == "rate_limited" {
 				live = 1
+				if r.detail != "database_error:pool_busy" {
+					t.Fatalf("bounded rejection lost its error category: %+v", r)
+				}
 			}
 			if l.live != live || uint64(len(pool.idle)) != live {
 				t.Fatalf("bad connection was retained: live=%d idle=%d", l.live, len(pool.idle))

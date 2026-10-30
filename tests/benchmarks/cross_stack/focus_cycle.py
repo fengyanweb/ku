@@ -829,7 +829,8 @@ def stability_window(plan, output, config, binding, unchanged):
             'metrics': initial_metrics, 'metrics_coverage': stability_metrics_coverage(initial_metrics),
             'coordinator': stability_coordinator()}
         sampler = Sampler([service.domain, parent, h.db_domain], output/'resources.json',
-                          interval=5, maximum=config['seconds']//5+128).start()
+                          interval=5, maximum=config['seconds']//5+128,
+                          retain_samples=False).start()
         row['score_started'] = True
         for index in range(config['seconds']//config['segment_seconds']):
             unchanged()

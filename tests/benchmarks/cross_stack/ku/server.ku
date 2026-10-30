@@ -116,7 +116,12 @@ fn main(): null! {
             score = result.value_int(0, 2)?
             body = json.encode({id: key, label: label, score: score, rid: req.query.rid})?
             status = 200
-        } catch (error) { body = "database_error:" + error.code.clone() }
+        } catch (error) {
+            body = "database_error:" + error.code.clone()
+            // A full bounded PG wait queue rejects admission; other failures
+            // keep their original HTTP500 response and are not retried.
+            if (error.domain == "pg" && error.code == "pool_busy") { status = 503 }
+        }
         return ok(http.text(status, body))
     }
     app.get("/db", database)

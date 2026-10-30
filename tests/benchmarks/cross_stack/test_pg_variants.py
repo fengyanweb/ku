@@ -1,5 +1,7 @@
 """Identity/mode guards for PG comparisons; no VM or database is started."""
 import json
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -102,6 +104,40 @@ class KuPGExecutionVariantTest(unittest.TestCase):
         for text in (candidate, sync_int, legacy):
             self.assertIn('SELECT id,label,score FROM cross_stack_items WHERE id=$1', text)
             self.assertIn('max_connections: 16, max_waiters: 128', text)
+
+    @unittest.skipUnless(os.environ.get("KU_BENCHMARK_CLI"), "set KU_BENCHMARK_CLI to an existing Ku CLI for semantic fixture regression")
+    def test_pg_overload_catch_preserves_other_errors_and_next_request(self):
+        # Execute the actual fixture catch body, not a Python copy of its policy.
+        # The isolated program never imports PG, opens a socket or retries SQL.
+        start = self.source.index('        } catch (error) {')
+        end = self.source.index('        return ok(http.text(status, body))', start)
+        catch = self.source[start + len('        } '):end]
+        program = '''fn main() {
+    for failure in [{domain: "pg", code: "pool_busy", message: "synthetic"},
+                     {domain: "pg", code: "query_error", message: "synthetic"},
+                     {domain: "app", code: "pool_busy", message: "synthetic"},
+                     {domain: "", code: "", message: "synthetic"}] {
+        body = "database_error"
+        status = 500
+        try {
+            if (failure.code != "") { fail failure }
+            body = "ok:next-plan"
+            status = 200
+        } ''' + catch + '''
+        println(status)
+        println(body)
+    }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="ku-pg-overload-") as directory:
+            source = Path(directory) / "contract.ku"
+            source.write_text(program)
+            result = subprocess.run([os.environ["KU_BENCHMARK_CLI"], str(source)],
+                                    cwd=directory, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["503", "database_error:pool_busy",
+                "500", "database_error:query_error", "500", "database_error:pool_busy",
+                "200", "ok:next-plan"])
 
     def test_composes_with_direct_and_json_response_and_rejects_unknown(self):
         combined = expand_ku_server(self.source, 12345, "direct", "response", "int", "async")

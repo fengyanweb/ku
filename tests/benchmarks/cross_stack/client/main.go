@@ -1017,8 +1017,10 @@ func (w *worker) request(j job, began time.Time) (r result) {
 		}
 	case 503:
 		r.category = "rejected_503"
+		r.detail = truncate(string(payload))
 	case 429:
 		r.category = "rejected_429"
+		r.detail = truncate(string(payload))
 	default:
 		r.category = "other_http"
 		r.detail = truncate(string(payload))
