@@ -2889,10 +2889,10 @@ static int ku_http_parse_ipv4(const char* text, unsigned long* network_order) {
  * accept turn belongs to one single-threaded owner until it publishes success;
  * reads, writes, parser state and completion never move between loops. */
 typedef struct KuHttpLoopGroup KuHttpLoopGroup;
-  size_t handler_workers;
 typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, request_limit, pending, workers, ready, exited, drained;
+  size_t handler_workers;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
   KuHttpConnection* connection_base; uint64_t connection_generation;
   uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
@@ -4112,10 +4112,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     int cpu_sample_due=sampled_cpu_ms>=next_cpu_sample_ms;
     int cpu_sample_valid=cpu_sample_due && ku_http_thread_cpu_ns(&sampled_cpu_ns);
     if (cpu_sample_due) next_cpu_sample_ms=sampled_cpu_ms>UINT64_MAX-10u ? UINT64_MAX : sampled_cpu_ms+10u;
-    owner->handler_workers=(size_t)ctx.spawned;
     ku_http_mutex_lock(&group->lock);
     if (cpu_sample_due) ku_http_owner_cpu_sample(owner,sampled_cpu_ns,sampled_cpu_ms,cpu_sample_valid);
     owner->queued = queued; owner->running = running; owner->resident = resident;
+    owner->handler_workers=(size_t)ctx.spawned;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
     owner->active_requests=(size_t)active.request_active;owner->peak_active_requests=(size_t)active.request_peak;
@@ -4842,15 +4842,15 @@ static KuHttpSocket ku_http_management_open(const char* text) {
   return listener;
 failed:
   ku_http_socket_close(listener); return KU_HTTP_INVALID_SOCKET;
+}
+static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
+  ku_http_validate_server(server);
   const char* worker_policy=getenv("KU_HTTP_WORKER_POLICY");
   if(worker_policy && strcmp(worker_policy,"elastic") && strcmp(worker_policy,"fixed")) {
     ku_string_drop(&address);
     return ku_http_listen_err(server,"KU_HTTP_WORKER_POLICY must be elastic or fixed");
   }
   server->elastic_workers=!worker_policy || !strcmp(worker_policy,"elastic");
-}
-static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
-  ku_http_validate_server(server);
   if (address.len == 0 || memchr(address.ptr, 0, address.len) != NULL) {
     ku_string_drop(&address);
     return ku_http_listen_err(server, "invalid listen address");
