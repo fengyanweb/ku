@@ -86,6 +86,23 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.assertFalse(backup_dir.exists())
         self.assertFalse(backup_cargo.exists())
 
+    def test_reported_artifact_uses_cli_cwd_quotes_and_actual_ownership(self):
+        project = self.root / 'project with spaces'
+        project.mkdir()
+        artifact = project / 'output.ll'
+        artifact.write_bytes(b'; real IR fixture\n')
+        for printed in ('output.ll', '"output.ll"', str(artifact), json.dumps(str(artifact))):
+            with self.subTest(printed=printed):
+                path = self.consumer.reported_artifact('llvm ir ok: ' + printed + '\n', 'llvm ir ok: ', project, self.root)
+                self.assertTrue(os.path.samefile(path, artifact))
+        with tempfile.TemporaryDirectory(prefix='ku-unowned-ir-') as other:
+            outside = Path(other) / 'outside.ll'
+            outside.write_bytes(b'; outside')
+            with self.assertRaisesRegex(RuntimeError, 'reported=.*cwd=.*root='):
+                self.consumer.reported_artifact('llvm ir ok: ' + str(outside), 'llvm ir ok: ', project, self.root)
+        with self.assertRaisesRegex(RuntimeError, 'expected one bounded artifact'):
+            self.consumer.reported_artifact('not an artifact', 'llvm ir ok: ', project, self.root)
+
     def test_report_is_utf8_even_under_cp1252_text_default(self):
         value = {'path': '搬迁 中文 空格', 'failure': '库版本错误 😀'}
         with mock.patch('io.text_encoding', return_value='cp1252'):

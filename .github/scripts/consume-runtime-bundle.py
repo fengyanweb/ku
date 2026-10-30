@@ -112,6 +112,64 @@ def relocate_checkout_entry(source, destination):
     shutil.move(str(source), str(destination))
 
 
+def reported_artifact(text, prefix, cwd, owned_root):
+    """Resolve CLI paths in its cwd and check actual directory identities.
+
+    Windows normal and extended-length spellings can name the same file but
+    have different lexical anchors. samefile() handles that without weakening
+    the check to a textual prefix. Quoted display paths are handled explicitly.
+    """
+    matches = [line[len(prefix):].strip() for line in text.splitlines() if line.startswith(prefix)]
+    if len(matches) != 1 or not matches[0] or len(matches[0]) > 4096:
+        raise RuntimeError('expected one bounded artifact path; prefix=' + repr(prefix) + '; stdout=' + repr(text[:1000]))
+    reported = matches[0]
+    candidates = [reported]
+    if len(reported) > 1 and reported[0] == reported[-1] and reported[0] in ('"', "'"):
+        candidates.append(reported[1:-1])
+        if reported[0] == '"':
+            try:
+                decoded = json.loads(reported)
+                if isinstance(decoded, str) and decoded not in candidates:
+                    candidates.append(decoded)
+            except ValueError:
+                pass
+    diagnostics = []
+    for spelling in candidates:
+        path = Path(spelling)
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_file():
+                raise ValueError('reported artifact is not a regular file')
+            parent = resolved.parent
+            for _ in range(128):
+                if os.path.samefile(parent, owned_root):
+                    return resolved
+                next_parent = parent.parent
+                if next_parent == parent:
+                    break
+                parent = next_parent
+            diagnostics.append('outside owned root; resolved=' + repr(str(resolved))[:500] + '; parent=' + repr(str(resolved.parent))[:500])
+        except (OSError, RuntimeError, ValueError) as error:
+            diagnostics.append(type(error).__name__ + ': ' + str(error)[:500])
+    raise RuntimeError('IR artifact path unresolved/unowned: reported=' + repr(reported)[:600] +
+        '; cwd=' + repr(str(cwd))[:500] + '; root=' + repr(str(owned_root))[:500] + '; attempts=' + repr(diagnostics)[:1500])
+
+
+def project_contract_fixture(project, source):
+    """Use the public template layout; ku.mod deliberately rejects root='.'."""
+    mod = project / 'ku.mod'
+    source_root = project / 'src'
+    if mod.exists() or source_root.exists():
+        raise ValueError('project contract would replace existing owned fixture data')
+    source_root.mkdir()
+    entry = source_root / 'main.ku'
+    entry.write_bytes(source.read_bytes())
+    mod.write_text('name = "hello"\nversion = "0.1.0"\nroot = "src"\nmain = "main.ku"\ncache = ".ku/cache"\nout = ".ku/build"\n', encoding='utf-8')
+    return mod, entry
+
+
 def run(args, report):
     repo = args.repo.resolve()
     archive = args.archive.resolve()
@@ -311,10 +369,9 @@ def run(args, report):
             ir_hash = None
             for flag in ('--emit-ll', '--emit-llvm'):
                 result = build_run('contract-' + flag, [flag], project / ('contract-emit' + suffix), entry=llvm_source.name, wanted='')
-                ir = next((line.removeprefix('llvm ir ok: ').strip() for line in output(result).splitlines() if line.startswith('llvm ir ok: ')), None)
-                if not ir or not Path(ir).resolve().is_relative_to(root) or not Path(ir).is_file():
-                    raise RuntimeError('emit LLVM flag did not create owned text IR')
-                current = EXPORT.file_hash(Path(ir))
+                ir = reported_artifact(output(result), 'llvm ir ok: ', project, root)
+                report['cases'][-1]['ir_sha256'] = EXPORT.file_hash(ir)
+                current = EXPORT.file_hash(ir)
                 if ir_hash is not None and ir_hash != current:
                     raise RuntimeError('emit LLVM aliases produced different IR')
                 ir_hash = current
@@ -324,10 +381,10 @@ def run(args, report):
                 result = invoke([ku, 'build', '--backend', backend, '-o', destination, llvm_source.name], project, env)
                 record('contract-text-only-backend-' + backend, result, 'nonzero-after-text-IR')
                 text = output(result) + result.stderr.decode(errors='replace')
-                ir = next((line.removeprefix('llvm ir ok: ').strip() for line in output(result).splitlines() if line.startswith('llvm ir ok: ')), None)
-                if result.returncode == 0 or 'LLVM backend does not link executables yet' not in text or destination.exists() or not ir:
-                    raise RuntimeError('LLVM backend contract changed: ' + backend)
-                current = EXPORT.file_hash(Path(ir))
+                if result.returncode == 0 or 'LLVM backend does not link executables yet' not in text or destination.exists():
+                    raise RuntimeError('LLVM backend contract changed: ' + backend + '; stdout=' + repr(output(result)[:1500]))
+                ir = reported_artifact(output(result), 'llvm ir ok: ', project, root)
+                current = EXPORT.file_hash(ir)
                 if backend_ir_hash is not None and backend_ir_hash != current:
                     raise RuntimeError('LLVM backend aliases generated different IR')
                 backend_ir_hash = current
@@ -342,10 +399,7 @@ def run(args, report):
             c_source.unlink()
             # Valid project context, not a directory-name guess. All commands
             # run from this same owned directory and restore its prior state.
-            mod = project / 'ku.mod'
-            if mod.exists():
-                raise RuntimeError('contract fixture already has a project manifest')
-            mod.write_text('name = "hello"\nversion = "0.1.0"\nroot = "."\nmain = "hello.ku"\ncache = ".ku/cache"\nout = ".ku/build"\n', encoding='utf-8')
+            mod, project_entry = project_contract_fixture(project, source)
             try:
                 success('contract-project-run-omitted', ['run'], expected)
                 success('contract-project-check-omitted', ['check'])
@@ -363,6 +417,8 @@ def run(args, report):
                 success('contract-package-pack-omitted', ['package', 'pack'])
             finally:
                 mod.unlink()
+                project_entry.unlink()
+                project_entry.parent.rmdir()
             report['cli_contract']['status'] = 'passed'
 
         # Mechanism reproduction on known archive bytes, not a claim about
