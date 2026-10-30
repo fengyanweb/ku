@@ -8,6 +8,16 @@ on:
         required: false
         default: ''
         type: string
+      windows_only:
+        description: 'Run only the Windows consumer when other immutable SDK consumers already passed'
+        required: false
+        default: false
+        type: boolean
+      readonly_only:
+        description: 'Windows-only RX ACL supplement on a prior verified SDK; skips ordinary cases'
+        required: false
+        default: false
+        type: boolean
   push:
     paths:
       - 'src/cli.rs'
@@ -35,7 +45,7 @@ concurrency:
 
 jobs:
   publisher:
-    if: github.event_name != 'workflow_dispatch' || inputs.installer_run == ''
+    if: (github.event_name != 'workflow_dispatch' || inputs.installer_run == '') && !inputs.readonly_only
     name: Publisher ${{ matrix.target }}
     timeout-minutes: 35
     runs-on: ${{ matrix.os }}
@@ -112,7 +122,7 @@ jobs:
           retention-days: 7
 
   consumer:
-    if: ${{ always() && (needs.publisher.result == 'success' || (needs.publisher.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.installer_run != '')) }}
+    if: ${{ always() && (needs.publisher.result == 'success' || (needs.publisher.result == 'skipped' && github.event_name == 'workflow_dispatch' && (inputs.installer_run != '' || inputs.readonly_only))) }}
     permissions:
       contents: read
       actions: read
@@ -123,16 +133,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
+        include: >-
+          ${{ fromJSON(inputs.windows_only && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -145,8 +147,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INSTALLER_RUN: ${{ inputs.installer_run || github.run_id }}
           INSTALLER_TARGET: ${{ matrix.target }}
+          READONLY_ONLY: ${{ inputs.readonly_only }}
+          WINDOWS_ONLY: ${{ inputs.windows_only }}
+          REUSED_INSTALLER: ${{ inputs.installer_run }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:READONLY_ONLY -ceq 'true' -and ($env:WINDOWS_ONLY -cne 'true' -or [string]::IsNullOrWhiteSpace($env:REUSED_INSTALLER))) { throw 'readonly_only requires windows_only and a prior installer_run' }
           if ($env:INSTALLER_RUN -cnotmatch '^[1-9][0-9]{0,19}$') { throw 'installer_run must be a positive workflow run ID' }
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
           $source = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:INSTALLER_RUN" -Headers $headers -TimeoutSec 30
@@ -173,11 +179,15 @@ jobs:
           rustc -vV
       - name: Consume the downloaded archive outside checkout and build directory
         shell: pwsh
+        env:
+          READONLY_ONLY: ${{ inputs.readonly_only }}
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/downloaded-installer" -Filter '*.tar.gz')
           if ($archive.Count -ne 1) { throw 'Expected exactly one actual installer' }
-          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain 1.96.0 --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
+          $extra = @()
+          if ($env:READONLY_ONLY -ceq 'true') { $extra += '--readonly-only' }
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain 1.96.0 --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT @extra
           if ($LASTEXITCODE) { throw 'Downloaded installer consumer failed' }
       - name: Preserve concise success or failure evidence
         if: always()

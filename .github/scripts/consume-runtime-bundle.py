@@ -36,6 +36,81 @@ EXPORT = load("consume_export", "export-release.py")
 OWNER = load("consume_owner", "verify-native-three-os.py")
 OWNER.MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 
+# Fixed script, structured UTF-8 JSON input; paths are never interpolated into
+# executable PowerShell text. Only a verified, owned SDK tree is affected.
+WINDOWS_READONLY_ACL = r'''
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$inputData = [IO.File]::ReadAllText($env:KU_READONLY_ACL_INPUT, [Text.Encoding]::UTF8) | ConvertFrom-Json
+$root = [string]$inputData.root
+$backup = [string]$inputData.backup
+$access = [Security.AccessControl.AccessControlSections]::Access
+$sidType = [Security.Principal.SecurityIdentifier]
+function Rule-Fingerprint($acl) {
+    $keys = @($acl.GetAccessRules($true, $true, $sidType) | ForEach-Object {
+        "$($_.IdentityReference.Value)|$([int64]$_.FileSystemRights)|$($_.AccessControlType)|$($_.InheritanceFlags)|$($_.PropagationFlags)|$($_.IsInherited)"
+    } | Sort-Object)
+    return ConvertTo-Json -InputObject $keys -Compress
+}
+function Samples {
+    $result = @()
+    foreach ($relative in @('.', 'ku.exe', 'deps', 'ku-runtime.json')) {
+        $path = if ($relative -eq '.') { $root } else { Join-Path $root $relative }
+        $acl = Get-Acl -LiteralPath $path
+        $rules = @($acl.GetAccessRules($true, $true, $sidType))
+        $result += [ordered]@{ relative=$relative; protected=$acl.AreAccessRulesProtected; rules_truncated=($rules.Count -gt 16); rules=@($rules | Select-Object -First 16 | ForEach-Object {
+            [ordered]@{sid=$_.IdentityReference.Value; mask=[int64]$_.FileSystemRights; rights=[string]$_.FileSystemRights; type=[string]$_.AccessControlType; inheritance=[string]$_.InheritanceFlags; propagation=[string]$_.PropagationFlags; inherited=$_.IsInherited}
+        }) }
+    }
+    return $result
+}
+if ($inputData.mode -eq 'apply') {
+    if (Test-Path -LiteralPath $backup) { throw 'ACL backup unexpectedly exists' }
+    $items = @((Get-Item -LiteralPath $root -Force)) + @(Get-ChildItem -LiteralPath $root -Force -Recurse)
+    if ($items.Count -gt 2048) { throw 'SDK ACL entry bound exceeded' }
+    $rows = @($items | ForEach-Object {
+        if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'SDK ACL fixture contains a link' }
+        $acl = Get-Acl -LiteralPath $_.FullName
+        [ordered]@{ relative=[IO.Path]::GetRelativePath($root, $_.FullName); directory=$_.PSIsContainer; sddl=$acl.GetSecurityDescriptorSddlForm($access); protected=$acl.AreAccessRulesProtected; fingerprint=(Rule-Fingerprint $acl) }
+    })
+    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $rows -Depth 6 -Compress))
+    if ($bytes.Length -gt 4MB) { throw 'SDK ACL backup bound exceeded' }
+    [IO.File]::WriteAllBytes($backup + '.writing', $bytes)
+    [IO.File]::Move($backup + '.writing', $backup)
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    # Protect children before their parents. There are no deny ACEs and no
+    # inherited administrator FullControl left to make the write probe pass.
+    foreach ($row in @($rows | Sort-Object { $_.relative.Length } -Descending)) {
+        $path = if ($row.relative -eq '.') { $root } else { Join-Path $root $row.relative }
+        $acl = if ($row.directory) { [Security.AccessControl.DirectorySecurity]::new() } else { [Security.AccessControl.FileSecurity]::new() }
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($current, [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.AccessControlType]::Allow))
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+        Set-Acl -LiteralPath $path -AclObject $acl
+    }
+    [ordered]@{mode='protected-allow-RX'; entry_count=$rows.Count; samples=@(Samples)} | ConvertTo-Json -Depth 8 -Compress
+} elseif ($inputData.mode -eq 'restore') {
+    $rows = @([IO.File]::ReadAllText($backup, [Text.Encoding]::UTF8) | ConvertFrom-Json)
+    if ($rows.Count -gt 2048) { throw 'SDK ACL restore entry bound exceeded' }
+    foreach ($row in @($rows | Sort-Object { $_.relative.Length })) {
+        $path = if ($row.relative -eq '.') { $root } else { Join-Path $root $row.relative }
+        $acl = Get-Acl -LiteralPath $path
+        $acl.SetSecurityDescriptorSddlForm([string]$row.sddl, $access)
+        Set-Acl -LiteralPath $path -AclObject $acl
+    }
+    $mismatches = @($rows | Where-Object {
+        $path = if ($_.relative -eq '.') { $root } else { Join-Path $root $_.relative }
+        $acl = Get-Acl -LiteralPath $path
+        $acl.AreAccessRulesProtected -ne $_.protected -or (Rule-Fingerprint $acl) -cne $_.fingerprint
+    } | Select-Object -First 8 | ForEach-Object { $_.relative })
+    [ordered]@{restored=($mismatches.Count -eq 0); mismatch_paths=$mismatches; entry_count=$rows.Count; verification='original ACE tuples and inheritance-protection state'} | ConvertTo-Json -Depth 4 -Compress
+    if ($mismatches.Count) { exit 1 }
+} elseif ($inputData.mode -eq 'inspect') {
+    [ordered]@{samples=@(Samples)} | ConvertTo-Json -Depth 8 -Compress
+} else { throw 'Unknown ACL fixture action' }
+'''
+
 
 def write_report(path, value):
     """Serialize UTF-8 before opening anything; replace only a complete file.
@@ -168,6 +243,166 @@ def project_contract_fixture(project, source):
     entry.write_bytes(source.read_bytes())
     mod.write_text('name = "hello"\nversion = "0.1.0"\nroot = "src"\nmain = "main.ku"\ncache = ".ku/cache"\nout = ".ku/build"\n', encoding='utf-8')
     return mod, entry
+
+
+def windows_readonly_installation(install, project, root, env, report, report_path, version):
+    """One controlled RX fixture with original-DACL recovery and real probes."""
+    ku = install / 'ku.exe'
+    backup = root / 'windows-readonly-dacl.json'
+    input_path = root / 'windows-readonly-input.json'
+    acl_env = dict(env, KU_READONLY_ACL_INPUT=str(input_path))
+    detail = report.setdefault('windows_readonly_acl', {})
+    created_probes = []
+
+    def save():
+        write_report(report_path, report)
+
+    def command(name, argv, wanted=None):
+        try:
+            result = invoke(argv, project, env)
+        except OSError as error:
+            report['cases'].append(dict(name=name, start_error=type(error).__name__, winerror=getattr(error, 'winerror', None)))
+            save()
+            raise
+        report['cases'].append(dict(name=name, exit_code=result.returncode, expected_exit='zero',
+            stdout_sha256=hashlib.sha256(result.stdout).hexdigest(), stderr_excerpt=result.stderr.decode('utf-8', errors='replace')[-1500:]))
+        save()
+        if result.returncode or wanted is not None and output(result) != wanted:
+            raise RuntimeError(name + ': ' + output(result)[-1500:] + result.stderr.decode('utf-8', errors='replace')[-1500:])
+        return result
+
+    def acl_action(mode):
+        write_report(input_path, dict(mode=mode, root=str(install), backup=str(backup)))
+        result = invoke(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_READONLY_ACL], root, acl_env, seconds=60)
+        if result.returncode:
+            raise RuntimeError('ACL ' + mode + ' failed: ' + output(result)[-2000:] + result.stderr.decode('utf-8', errors='replace')[-2000:])
+        return json.loads(output(result))
+
+    command('readonly-control-version-before-ACL', [ku, '-v'], 'ku ' + version + '\n')
+    try:
+        detail['applied'] = acl_action('apply')
+        save()
+        failures = []
+        try:
+            with ku.open('rb') as source:
+                detail['MZ_read_passed'] = source.read(2) == b'MZ'
+            if not detail['MZ_read_passed']:
+                failures.append('executable MZ read incorrect')
+        except OSError as error:
+            detail['MZ_read_error'] = str(error)[:500]
+            failures.append('executable read denied')
+        try:
+            command('readonly-version-under-RX-ACL', [ku, '-v'], 'ku ' + version + '\n')
+            detail['execute_passed'] = True
+        except (OSError, RuntimeError) as error:
+            detail['execute_error'] = str(error)[:1000]
+            failures.append('version execution failed')
+        detail['write_probes'] = []
+        for relative, existing in (('.readonly-write-probe', False), ('deps/.readonly-write-probe', False), ('ku-runtime.json', True)):
+            path = install / relative
+            probe = dict(relative=relative, expected='PermissionError', existing=existing)
+            try:
+                with path.open('r+b' if existing else 'xb') as stream:
+                    if not existing:
+                        created_probes.append(path)
+                        stream.write(b'must be denied')
+                probe['denied'] = False
+                failures.append('write unexpectedly allowed: ' + relative)
+            except PermissionError as error:
+                probe.update(denied=True, winerror=getattr(error, 'winerror', None))
+            except OSError as error:
+                probe.update(denied=False, other_error=str(error)[:500])
+                failures.append('write probe had wrong error: ' + relative)
+            detail['write_probes'].append(probe)
+        save()
+        if failures:
+            raise RuntimeError('read-only ACL preflight failed: ' + '; '.join(failures))
+        built = project / 'readonly-result.exe'
+        command('read-only-install', [ku, 'build', 'hello.ku', '-o', built])
+        command('read-only-install-result', [built], 'Hello Ku\n')
+        built.unlink()
+        detail['build_and_run_passed'] = True
+    except BaseException as error:
+        detail['failure'] = type(error).__name__ + ': ' + str(error)[-2000:]
+        try:
+            detail['failure_acl_samples'] = acl_action('inspect')
+        except BaseException as inspection:
+            detail['inspection_error'] = str(inspection)[-1000:]
+        save()
+        raise
+    finally:
+        if backup.exists():
+            try:
+                detail['restoration'] = acl_action('restore')
+            except BaseException as error:
+                detail['restoration_error'] = str(error)[-2000:]
+                save()
+                raise
+        for path in created_probes:
+            path.unlink(missing_ok=True)
+        save()
+
+
+def run_readonly_only(args, report):
+    """Supplement the already-tested immutable Windows SDK, not all cases."""
+    if os.name != 'nt':
+        raise ValueError('--readonly-only is a Windows supplemental gate')
+    repo = args.repo.resolve()
+    metadata = json.loads(args.manifest.read_text(encoding='utf-8'))
+    if metadata['target'] != 'x86_64-pc-windows-msvc' or EXPORT.file_hash(args.archive) != metadata['sha256'] or args.archive.stat().st_size != metadata['size']:
+        raise ValueError('readonly SDK archive identity mismatch')
+    if args.expected_sdk_commit and args.expected_sdk_commit != metadata['commit']:
+        raise ValueError('readonly SDK source differs from selected publisher')
+    env = dict(os.environ, RUSTUP_AUTO_INSTALL='0')
+    env.pop('KU_RUNNER_RUSTC', None)
+    env.pop('RUSTUP_TOOLCHAIN', None)
+    verifier = checked(['git', 'rev-parse', 'HEAD'], repo, env).strip()
+    report.update(schema='ku-runtime-consumer-v1', status='running', cases=[], source_commit=metadata['commit'],
+        sdk_source_commit=metadata['commit'], verification_code_commit=verifier, archive_sha256=metadata['sha256'],
+        installer_run_id=args.installer_run, verification_run_id=os.environ.get('GITHUB_RUN_ID'),
+        scope='Windows readonly supplement only; prior ordinary cases and other platforms are separate runs')
+    with tempfile.TemporaryDirectory(prefix='ku-readonly-sdk-') as temporary:
+        root = Path(temporary).resolve()
+        install = root / '中文 只读 SDK'
+        install.mkdir()
+        EXPORT.verify_archive(args.archive.resolve(), metadata['files'], install)
+        manifest = EXPORT.RUNTIME_BUNDLE.verify(install, metadata['version'], metadata['commit'], metadata['target'])
+        report.update(target=metadata['target'], publisher=manifest['rustc'], bundle_id=manifest['bundle_id'])
+        project = root / 'project'
+        project.mkdir()
+        (project / 'hello.ku').write_bytes(EXPORT.canonical_example((repo / 'examples/hello.ku').read_bytes()))
+        rustup = management_invocation('rustup')
+        if not rustup:
+            raise ValueError('readonly CI setup requires rustup')
+        before = checked([rustup, 'default'], project, env)
+        report['global_default_before'] = before
+        ku = install / 'ku.exe'
+        # Setup is explicit and outside the RX probe. No toolchain is cloned.
+        ready = invoke([ku, 'doctor', '--backend', 'runner', '--json'], project, env)
+        report['setup_toolchain_install_performed'] = ready.returncode != 0
+        if ready.returncode:
+            prepared = invoke([ku, 'doctor', '--install-runner-toolchain'], project, env, seconds=660)
+            if prepared.returncode:
+                raise RuntimeError('explicit readonly toolchain setup failed: ' + prepared.stderr.decode('utf-8', errors='replace')[-2000:])
+            ready = invoke([ku, 'doctor', '--backend', 'runner', '--json'], project, env)
+        if ready.returncode:
+            raise RuntimeError('readonly runner setup not ready: ' + ready.stderr.decode('utf-8', errors='replace')[-2000:])
+        report['setup_doctor'] = json.loads(output(ready))
+        doctor = report['setup_doctor']
+        selected = doctor['selected_compiler']
+        system = doctor['system_rustc']['identity']
+        if (selected['link_probe_passed'] is not True
+                or any(selected['identity'][key] != manifest['rustc'][key] for key in ('release', 'commit_hash', 'commit_date', 'host'))
+                or doctor['required_rustc'] != manifest['rustc']):
+            raise RuntimeError('readonly setup did not verify the exact SDK compiler/required identity')
+        if system['release'] != args.consumer_toolchain or system['release'] == manifest['rustc']['release']:
+            raise RuntimeError('readonly supplement requires the declared unlike system compiler')
+        report['consumer'] = system
+        windows_readonly_installation(install, project, root, env, report, args.output, metadata['version'])
+        if checked([rustup, 'default'], project, env) != before:
+            raise RuntimeError('readonly setup changed the global Rust default')
+        report.update(global_default_unchanged=True, toolchain_clone=False)
+    report.update(status='passed', owned_temp_removed=True)
 
 
 def run(args, report):
@@ -614,21 +849,7 @@ def run(args, report):
         remove_executable(native)
         # Enforce read-only installation, not only a no-write assertion.
         if os.name == "nt":
-            sid = checked(["whoami", "/user", "/fo", "csv", "/nh"], root, base_env).strip().split(",")[-1].strip('"')
-            checked(["icacls", install, "/deny", sid + ":(OI)(CI)(W)"], root, base_env)
-            try:
-                probe = install / '.readonly-write-probe'
-                try:
-                    probe.write_bytes(b'must not be writable')
-                except PermissionError:
-                    pass
-                else:
-                    probe.unlink()
-                    raise RuntimeError('Windows installation was not actually read-only')
-                success("read-only-install", ["build", "hello.ku", "-o", "readonly-result"])
-                execute_and_remove("read-only-install-result", project / "readonly-result")
-            finally:
-                checked(["icacls", install, "/remove:d", sid, "/T", "/C"], root, base_env)
+            windows_readonly_installation(install, project, root, env, report, args.output, metadata['version'])
         else:
             paths = [install, *install.rglob("*")]
             modes = [(p, stat.S_IMODE(p.stat().st_mode)) for p in paths]
@@ -663,6 +884,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--consumer-toolchain", default="1.96.0")
     parser.add_argument("--hide-checkout", action="store_true")
+    parser.add_argument("--readonly-only", action="store_true")
     parser.add_argument("--installer-run")
     parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
@@ -670,7 +892,7 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "running"}
     try:
-        run(args, report)
+        (run_readonly_only if args.readonly_only else run)(args, report)
     except BaseException as error:
         report.update(status="failed", failure=type(error).__name__ + ": " + str(error)[-6000:])
         raise
