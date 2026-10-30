@@ -2,7 +2,7 @@
 title: 项目与贡献
 description: Ku 项目状态、公开源码、许可边界与提交问题的方式。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'README.md',
@@ -34,6 +34,7 @@ Ku 与 VS Code 插件采用 **Apache-2.0** 许可证。可查看[源码](https:/
 - 完整命令、后端、最小 `.ku` 源码。
 - 完整诊断或结构化 Error、预期与实际输出。
 - 涉及构建时的 Rust / C 工具链版本，以及是否存在本地 import。
+- 安装包文件名与校验值、实际 CLI 路径；使用新修复候选时附 `ku doctor --json` 诊断。原公开 0.0.19 包可能不支持 doctor，参见[构建排查](/zh-cn/docs/guide/errors/#runner-build)。
 
 请勿提交 token、密码、真实连接字符串或含敏感业务数据的日志。性能问题应同时记录环境、负载、测量方法和原始结果；一次样例成功不能代表生产吞吐。
 

@@ -2,7 +2,7 @@
 title: 安装与下载
 description: 下载 Ku 0.0.19 实验预发行包，了解平台、构建工具与安装验证。
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'Cargo.toml',
@@ -29,13 +29,13 @@ sources:
 macOS / Linux：
 
 ```sh
-./ku --version
+./ku -v
 ```
 
 Windows PowerShell：
 
 ```powershell
-.\ku.exe --version
+.\ku.exe -v
 ```
 
 显示 `ku 0.0.19` 即可。现在就能运行和检查 `.ku` 文件，这两项操作不需要安装 Rust。
@@ -51,7 +51,7 @@ export PATH="$HOME/ku:$PATH"
 
 Windows 打开“编辑账户的环境变量”，编辑用户 `Path`，新增解压文件夹的完整路径，例如 `%USERPROFILE%\ku`。保留原有条目。
 
-重新打开终端，运行 `ku --version` 确认。
+重新打开终端，运行 `ku -v` 确认。
 
 </details>
 
@@ -71,9 +71,17 @@ Windows 打开“编辑账户的环境变量”，编辑用户 `Path`，新增�
 <details>
 <summary>编译自己的 Ku 程序</summary>
 
-`ku run` 和 `ku check` 只需对应平台的 CLI。默认 `ku build` 另需 Rust **1.89.0** 和系统链接器；`ku build --backend c` 另需目标 C 编译器和链接器。native 数据库程序还需安装匹配的数据库客户端库，这些库不包含在平台包内。
+`ku run`、`ku check` 和 `ku ./hello.ku` 只需对应平台的 CLI。原公开包的默认 `ku build` 使用 Rust **1.89.0** 编译的随包运行时，另需匹配的 Rust 和系统链接器；它不会因为系统 Rust 升级而自动重编。选到其他版本时可能报 E0514，见[构建排查](/zh-cn/docs/guide/errors/#runner-build)。
+
+`ku build --backend c --release hello.ku -o hello` 是独立的 C 原生构建，需要目标 C 编译器和链接器。Windows 输出使用 `hello.exe`。native 数据库程序还需匹配的数据库客户端库，这些库不包含在平台包内。
 
 </details>
+
+## 更新与修复候选
+
+更新时将**完整新包**解压到独立空目录，核对校验信息并执行 `ku -v` 后再切换 `PATH`；不要把新 CLI 覆盖到旧库目录。保留原目录可供回退，确认自己使用的是预期路径；Windows 文件被占用时先退出对应 Ku 进程，再切换目录。
+
+当前开发分支正在修复 Runner 工具链选择，并新增 `ku doctor`。**这些改动尚未包含在上方原公开 0.0.19 包中，不能对旧包直接假设命令可用。** 新候选包通过 `ku-runtime.json` 和 `ku-runtime-deps.json` 校验 CLI、运行时及依赖，自动选取完整身份匹配的已安装 Rust；明确请求 `ku doctor --install-runner-toolchain` 才会安装所需工具链，不修改全局默认。候选诊断及用法见[命令行参考](/zh-cn/docs/tools/cli/#candidate-diagnostics)。
 
 <details>
 <summary>卸载</summary>

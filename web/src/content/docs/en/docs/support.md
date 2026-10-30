@@ -2,7 +2,7 @@
 title: Platform and backend support
 description: Distinguish Ku release platforms, interpreter, runner, native C, Task subset, and LLVM support.
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/syntax.md',
@@ -84,6 +84,8 @@ Database clients are native-only. A real-server check applies to its driver, pla
 Ku remains under development. Complete self-hosted checking/IR/backend, generic Task network scheduling and a complete database/platform matrix are not promised. Rust supplies the bootstrap toolchain. Version 0.0.x does not guarantee source or generated C/FFI ABI compatibility.
 
 ## Known issues
+
+The original public 0.0.19 Runner build can select Rust incompatible with its bundled runtime and fail with E0514. A CLI/bundle fix candidate adds exact identity checks, toolchain selection and `ku doctor`; these are not yet in the original downloads. See [Runner troubleshooting](/en/docs/guide/errors/#runner-build). A successful C build does not validate the default Runner command.
 
 As of 2026-10-28, the three-platform release gates and package verification for 0.0.19 have passed. These latency issues remain:
 

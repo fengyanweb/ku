@@ -2,9 +2,13 @@
 title: '版本与发布记录'
 description: '版本与发布记录'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-23'
+verifiedAt: '2026-10-29'
 sources: ['docs/history.md', 'docs/v0.0.17.md', 'docs/v0.0.18.md']
 ---
+
+## 开发中的 CLI 修复候选
+
+正在准备独立的 Runner 工具链/依赖身份修复、新增 `ku doctor` 与统一子命令帮助；已有简写补充见[CLI 参考](/zh-cn/docs/tools/cli/)。**尚未发布，下面的 0.0.19 下载仍是原发行资产。** 该修复不覆盖旧标签、不自动采用性能开发候选；具体错误及候选处理见[Runner 排查](/zh-cn/docs/guide/errors/#runner-build)。
 
 ## 0.0.19
 

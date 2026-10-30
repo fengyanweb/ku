@@ -2,7 +2,7 @@
 title: Errors and troubleshooting
 description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/diagnostics.md',
@@ -65,12 +65,55 @@ Removing only `: null!` while keeping the outer `?` in this example is invalid. 
 ## Identify the Ku executable
 
 ```sh
-ku --version
+ku -v
 ku -h
 ku check hello.ku
 ```
 
 If `ku` is not found, invoke the executable from its extracted directory. Use `ku.exe` on Windows. If the default build is missing Rust or linking libraries, check the [installation requirements](/en/docs/install/) and retain the complete archive layout, rather than copying only the CLI.
+
+<a id="runner-build"></a>
+
+## Runner builds and E0514
+
+`ku build hello.ku` defaults to Debug / Runner. Rust E0514 means a compiled dependency and the selected compiler have incompatible identities. Cargo's `rust-version` states a source minimum; it does not select the user's toolchain. The original public 0.0.19 runtime was built using Rust 1.89.0. Installing a newer system Rust does not rebuild that bundled library.
+
+**Distinguish the published archive from the fix candidate.** The original downloads do not yet contain the `doctor` and exact-toolchain-selection changes below. Clearing Cargo caches, adding `--emit-c`, or switching to the C backend does not establish a fix for default Runner builds. Include the actual archive name and checksums in an issue; never combine `ku.exe`, `libku.rlib` and `deps` from different bundles.
+
+On Windows, collect executable and toolchain identity without sharing project source:
+
+```powershell
+Get-Command ku -All
+where.exe ku
+ku -v
+rustc -vV
+rustup show active-toolchain
+rustup toolchain list
+```
+
+If Rust/Rustup is absent, the missing commands are useful diagnostic evidence; this does not prevent `ku check` or `ku .\hello.ku`. A library directory in an error does not alone prove a hardcoded developer path. Identify the actual `ku.exe` and stale PATH entries first. Redact personal usernames/directories before sharing.
+
+### Candidate diagnosis and recovery
+
+Use these with a newly built candidate bundle only:
+
+```powershell
+ku doctor --backend runner
+ku doctor --json
+```
+
+The candidate reports its actual CLI, installation root, manifest, exact library locations, required Rust identity and expected selected compiler. Read-only diagnosis never downloads a toolchain. Keep `ku-runtime.json`, `ku-runtime-deps.json`, `libku.rlib` and the whole `deps` directory together. Missing, corrupted or mixed files fail the build rather than borrowing another installation's libraries.
+
+When the matching toolchain is absent and Rustup is available, explicitly request:
+
+```powershell
+ku doctor --install-runner-toolchain
+ku build .\hello.ku
+```
+
+Installation requests only the bundle's exact toolchain, without changing system defaults or project configuration. A failed installation does not mark Runner ready. Explicit `KU_RUNNER_RUSTC` must name an absolute compiler path; correct a mismatched override rather than expecting silent fallback. A ready compiler still does not replace system-linker checks.
+
+C-backend failures use candidate `ku doctor --backend c` separately. C builds do not consume Runner's Rust libraries, but need a supported C toolchain and native libraries such as database clients. See the [CLI reference](/en/docs/tools/cli/) for shorthands and option scope. Candidate behavior is not claimed for the original public package before a fix is released.
 
 ## Read diagnostics
 

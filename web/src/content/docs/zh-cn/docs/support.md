@@ -2,7 +2,7 @@
 title: 平台与后端支持
 description: 区分 Ku 已发布平台、解释器、默认 runner、native C、Task 子集与 LLVM 的能力。
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/syntax.md',
@@ -84,6 +84,8 @@ Windows 省略 `--cgroup-root`。数值使用十进制字节或毫秒。`--` 后
 Ku 仍在开发中，不承诺完整自举检查器/IR/后端、通用 Task 网络调度或完整数据库平台矩阵。Rust 仍提供 bootstrap 工具链。0.0.x 不保证源码或生成 C/FFI ABI 兼容。
 
 ## 已知问题
+
+原公开 0.0.19 的默认 Runner 构建可能选到与随包运行时不同的 Rust，产生 E0514。CLI/安装包修复候选正在增加精确身份校验、工具链选择和 `ku doctor`，尚未包含在原下载包。见[构建排查](/zh-cn/docs/guide/errors/#runner-build)；C 后端成功不代替默认 Runner 原命令验证。
 
 截至 2026-10-28，0.0.19 的三平台发布检查与安装包验证已通过。以下延迟问题仍保留：
 

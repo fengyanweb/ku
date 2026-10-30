@@ -46,6 +46,7 @@ class ReleaseExportTests(unittest.TestCase):
                      f"native-tls/v1/{self.target}/lib/libku_native_tls.a"):
             self.put(self.bundle / name, f"fixture:{name}\n".encode())
         (self.bundle / "ku").chmod(0o755)
+        self.make_runtime_manifest()
         self.package = self.root / "cache" / "sample-1.2.3"
         self.put(self.package / "Cargo.toml", b"fixture manifest\n")
         self.put(self.package / "LICENSE-MIT", b"original license bytes\r\nCopyright sample\r\n")
@@ -69,6 +70,12 @@ class ReleaseExportTests(unittest.TestCase):
         self.sysroot = self.root / "rust"
         self.put(self.sysroot / "share/doc/rust/licenses/MIT.txt", b"original Rust license\n")
         self.put(self.sysroot / "share/doc/rust/COPYRIGHT-library.html", b"<html>original Rust attribution</html>")
+
+    def make_runtime_manifest(self):
+        for name in ('ku-runtime.json', 'ku-runtime-deps.json'):
+            (self.bundle / name).unlink(missing_ok=True)
+        text = 'release: 1.89.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + self.target + '\n'
+        EXPORT.RUNTIME_BUNDLE.create(self.bundle, '0.0.17', 'a'*40, self.target, text, '1.89.0')
 
     @staticmethod
     def put(path: Path, data: bytes):
@@ -98,6 +105,51 @@ class ReleaseExportTests(unittest.TestCase):
             with mock.patch.object(EXPORT, "plain", side_effect=target_mode):
                 return EXPORT.export_release(**arguments)
         return EXPORT.export_release(**arguments)
+
+    def test_runtime_manifest_rejects_missing_mixed_corrupt_and_escaping_inputs(self):
+        runtime = self.bundle / 'ku-runtime.json'
+        original = runtime.read_bytes()
+        runtime.unlink()
+        with self.assertRaises(EXPORT.ExportError):
+            self.run_export()
+        runtime.write_bytes(original)
+        dependency = self.bundle / 'deps/libsample-0123456789abcdef.rlib'
+        saved = dependency.read_bytes()
+        dependency.write_bytes(b'from another compilation')
+        with self.assertRaisesRegex(EXPORT.ExportError, 'runtime bundle'):
+            self.run_export()
+        dependency.write_bytes(saved)
+        manifest = json.loads(original)
+        manifest['runtime_rlib'] = '../libku.rlib'
+        runtime.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(EXPORT.ExportError, 'runtime bundle'):
+            self.run_export()
+        runtime.write_bytes(original)
+        self.assertEqual(EXPORT.RUNTIME_BUNDLE.verify(self.bundle)['source_commit'], 'a'*40)
+
+    def test_runtime_identity_uses_actual_compiler_and_ignores_unlisted_mtime(self):
+        before = EXPORT.RUNTIME_BUNDLE.verify(self.bundle)
+        extra = self.bundle / 'deps/libku-ffffffffffffffff.rlib'
+        extra.write_bytes(b'unrelated newer library')
+        os.utime(extra, (time.time()+3600, time.time()+3600))
+        self.assertEqual(EXPORT.RUNTIME_BUNDLE.verify(self.bundle), before)
+        # Selection is bounded to the manifest, but publisher exports must not
+        # include an unlisted dependency even when its filename looks valid.
+        with self.assertRaisesRegex(EXPORT.ExportError, 'closure'):
+            self.run_export()
+        extra.unlink()
+        bad_compiler = 'release: 1.96.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + self.target + '\n'
+        with self.assertRaisesRegex(ValueError, 'actual compiler'):
+            EXPORT.RUNTIME_BUNDLE.rust_identity(bad_compiler, '1.89.0', self.target)
+
+    def test_runtime_manifest_duplicate_keys_and_relative_paths_rejected(self):
+        path = self.bundle / 'ku-runtime.json'
+        path.write_text('{"schema":"ku-runtime-bundle-v1","schema":"other"}')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            EXPORT.RUNTIME_BUNDLE.verify(self.bundle)
+        for name in ('../outside', '/absolute', 'C:/outside', 'deps/../libku.rlib', 'deps\\outside', 'deps//file'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                EXPORT.RUNTIME_BUNDLE.relative_file(self.bundle, name)
 
     def test_roundtrip_hashes_original_licenses_and_file_set(self):
         result = self.run_export()
@@ -382,6 +434,7 @@ class ReleaseExportTests(unittest.TestCase):
         (current / "lib/libku_native_tls.a").rename(current / "lib/ku_native_tls.lib")
         self.put(self.bundle / "ku.pdb", b"debug symbols")
         self.put(self.bundle / "deps/sample_derive-0123456789abcdef.dll", b"Cargo emitted Windows procedural macro")
+        self.make_runtime_manifest()
         result = self.run_export()
         self.assertIn(self.target, result["manifest_path"])
 
@@ -401,6 +454,7 @@ class ReleaseExportTests(unittest.TestCase):
                                 "deps/libsample.so.1", "deps/libsample.rlib", "deps/libsample-ABCDEF0123456789.rlib"):
                     self.assertFalse(EXPORT.dependency_name(invalid, target))
         self.put(self.bundle / positive[self.target], b"Cargo emitted Linux procedural macro")
+        self.make_runtime_manifest()
         self.run_export()
 
     def test_wrong_platform_or_arbitrary_dynamic_library_is_not_exported(self):

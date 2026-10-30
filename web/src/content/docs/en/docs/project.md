@@ -2,7 +2,7 @@
 title: Project and contribution
 description: Ku project status, public source, licensing boundaries, and reproducible issue reports.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'README.md',
@@ -34,6 +34,7 @@ Email feedback: [kagura.gc@qq.com](mailto:kagura.gc@qq.com)
 - Full command, backend, and minimal `.ku` source.
 - Complete diagnostic or structured Error, expected output, and actual output.
 - Rust / C toolchain versions for build issues, and whether local imports are involved.
+- Archive filename/checksum and actual CLI path. For a new fix candidate, include `ku doctor --json`; the original public 0.0.19 may lack doctor. See [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
 
 Do not submit tokens, passwords, real connection strings, or logs containing sensitive business data. Performance reports should include environment, workload, measurement method, and raw results. One successful sample does not establish production throughput.
 
