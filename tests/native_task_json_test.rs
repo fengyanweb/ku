@@ -16,6 +16,9 @@ use native_task_ledger::{LEDGER_LOCK, LOCKED_ALLOCATIONS};
 use std::{fs, process::Command};
 
 fn replace_once(source: String, needle: &str, replacement: &str) -> String {
+    // Every entry point may embed a checkout-CRLF C file. Normalize here, not
+    // only in generated(), because raw-IR probes also emit C directly.
+    let source = source.replace("\r\n", "\n");
     assert_eq!(
         source.matches(needle).count(),
         1,
@@ -341,7 +344,12 @@ async fn main():null! { return ok(null) }
             _ => None,
         })
         .expect("real decode destination");
-    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    // Exercise the checkout-dependent embedded-C newline shape on every host,
+    // including Unix. Probe placement must survive CRLF without changing C.
+    let generated = c::generate_native_task_c_source(&native, &Default::default())
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
     let allocations=LOCKED_ALLOCATIONS
         .replace("static void* fixture_malloc(size_t size) { fixture_alloc_lock();", "static void* fixture_malloc(size_t size) { fixture_json_allocation_boundary(); fixture_alloc_lock();")
         .replace("static void* fixture_calloc(size_t count,size_t size) { fixture_alloc_lock();", "static void* fixture_calloc(size_t count,size_t size) { fixture_json_allocation_boundary(); fixture_alloc_lock();")
