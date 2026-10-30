@@ -615,7 +615,10 @@ def run(args, report):
         # Enforce read-only installation, not only a no-write assertion.
         if os.name == "nt":
             sid = checked(["whoami", "/user", "/fo", "csv", "/nh"], root, base_env).strip().split(",")[-1].strip('"')
-            checked(["icacls", install, "/deny", sid + ":(OI)(CI)(W)"], root, base_env)
+            # icacls requires '*' before numeric SIDs; otherwise it resolves
+            # the SID text as an account name and fails before the probe.
+            principal = "*" + sid
+            checked(["icacls", install, "/deny", principal + ":(OI)(CI)(W)"], root, base_env)
             try:
                 probe = install / '.readonly-write-probe'
                 try:
@@ -628,7 +631,7 @@ def run(args, report):
                 success("read-only-install", ["build", "hello.ku", "-o", "readonly-result"])
                 execute_and_remove("read-only-install-result", project / "readonly-result")
             finally:
-                checked(["icacls", install, "/remove:d", sid, "/T", "/C"], root, base_env)
+                checked(["icacls", install, "/remove:d", principal, "/T", "/C"], root, base_env)
         else:
             paths = [install, *install.rglob("*")]
             modes = [(p, stat.S_IMODE(p.stat().st_mode)) for p in paths]

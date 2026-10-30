@@ -8,6 +8,11 @@ on:
         required: false
         default: ''
         type: string
+      windows_only:
+        description: 'Run only the Windows consumer when other immutable SDK consumers already passed'
+        required: false
+        default: false
+        type: boolean
   push:
     paths:
       - 'src/cli.rs'
@@ -123,16 +128,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-            python: python
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            python: python3
-          - os: macos-15
-            target: aarch64-apple-darwin
-            python: python3
+        include: >-
+          ${{ fromJSON(inputs.windows_only && '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"}]' || '[{"os":"windows-2025","target":"x86_64-pc-windows-msvc","python":"python"},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","python":"python3"},{"os":"macos-15","target":"aarch64-apple-darwin","python":"python3"}]') }}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
