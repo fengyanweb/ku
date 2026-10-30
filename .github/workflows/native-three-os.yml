@@ -6,16 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler'
+        description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic]
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -237,6 +237,7 @@ jobs:
           cargo test --release --locked \
             --test native_http_test \
             --test native_task_source_test \
+            --test native_task_expression_ir_test \
             --test native_task_control_test \
             --test native_task_driver_test \
             --test native_task_frame_c_test \
@@ -274,6 +275,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --release --locked --test native_task_source_test native_task_scalar_ \
+            -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_task_source_test native_task_string_equality_ \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test native_http_async_ \
             -- --nocapture --test-threads=1
@@ -401,7 +404,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic')
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -412,6 +415,7 @@ jobs:
       RUST_BACKTRACE: "1"
       GOTOOLCHAIN: local
       KU_PERFORMANCE_V2_BASELINE: 988f32ef496b18b935a3c276ef7933d0563691da
+      KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
 
     steps:
       - name: Check out the exact candidate and baseline history
@@ -477,7 +481,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build \
+          performance_build_set=full
+          if [ "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic ]; then
+            performance_build_set=diagnostic
+          fi
+          python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
             --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
             --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
             --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
@@ -491,15 +499,19 @@ jobs:
           set -euo pipefail
           # Dispatch these scopes serially; the distinct groups avoid cancelling an existing run.
           performance_phases=(run)
+          performance_build_set=full
           if [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-builds ]; then
             performance_phases=(compiler)
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-finish ]; then
             performance_phases=(tail compiler)
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-validation ]; then
             performance_phases=(lifecycle compiler)
+          elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic ]; then
+            performance_phases=(diagnostic)
+            performance_build_set=diagnostic
           fi
           for performance_phase in "${performance_phases[@]}"; do
-            sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" \
+            sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
               --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
@@ -530,7 +542,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
