@@ -388,8 +388,8 @@ def full_archive(a,state):
                 try:data=encoded(redact(json.loads(raw),a.root))
                 except (ValueError,UnicodeError):data=encoded({'invalid_json_not_exported':True,'raw_sha256':original,'reason':'unparseable receipt may contain private values'})
             elif path.suffix in ('.log','.md','.py'):data=redact(raw.decode(errors='replace'),a.root).encode()
-            name=path.relative_to(a.root).as_posix();info=tarfile.TarInfo(name);info.size=len(data);info.mode=0o644;info.mtime=0
-            tar.addfile(info,io.BytesIO(data));entries.append(dict(path=name,original_sha256=original,archived_sha256=hashlib.sha256(data).hexdigest(),bytes=len(data)))
+            name=path.relative_to(a.root).as_posix();info=tarfile.TarInfo(name);info.size=len(data);info.mode=path.stat().st_mode&0o777;info.mtime=0
+            tar.addfile(info,io.BytesIO(data));entries.append(dict(path=name,original_sha256=original,archived_sha256=hashlib.sha256(data).hexdigest(),bytes=len(data),mode=info.mode))
             if destination.stat().st_size>limit:raise ValueError('archive exceeds frozen384MiB; no evidence silently discarded')
         raw=encoded({'files':entries,'path_root':'${EVIDENCE_ROOT}','raw_and_redacted_hashes_distinct':True})
         info=tarfile.TarInfo('portable-file-map.json');info.size=len(raw);tar.addfile(info,io.BytesIO(raw))
