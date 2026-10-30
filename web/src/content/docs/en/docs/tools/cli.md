@@ -32,7 +32,7 @@ ku ./hello.ku
 | `ku build main.ku`                              | Build using Debug / Runner defaults                               |
 | `ku build --backend c --release main.ku -o app` | Compile and link a native C program                               |
 | `ku ir main.ku`                                 | Print optimized Ku IR                                             |
-| `ku llvm main.ku`                               | Emit experimental LLVM text IR, not an executable                 |
+| `ku llvm empty.ku`                              | Emit experimental LLVM text IR, not an executable                 |
 | `ku template list`                              | List basic, cli, http, json, fs and lib templates                 |
 | `ku package resolve --locked`                   | Resolve using the project lock                                    |
 | `ku package pack`                               | Create a source/dependency distribution, not a program executable |
@@ -80,12 +80,12 @@ Prefix special filenames with a relative path, such as `ku ./-hello.ku`, or `ku 
 | `ku build hello.ku`                              | Default Debug / Runner: a Rust wrapper packages interpreter execution; requires Rust matching the bundled runtime and a system linker |
 | `ku build --backend c --release hello.ku -o app` | A native C executable; requires a supported C compiler/linker and native libraries used by the program                                |
 | `ku build --emit-c hello.ku`                     | Still Runner by default, with additional C output; neither a C-only build nor a workaround for mismatched Runner toolchains           |
-| `ku build --backend llvm hello.ku`               | Currently LLVM text IR, without a complete executable-linking path                                                                    |
+| `ku build --backend llvm empty.ku`               | Currently LLVM text IR, without a complete executable-linking path                                                                    |
 | `ku package pack`                                | A source distribution, distinct from the program artifacts above                                                                      |
 
 `check`, `run` and implicit execution need no Rust/C compiler. Runner embeds the entry file only; local imports still need their original module sources at runtime. Native C expands the import graph into a program independent of Ku source. Default output is under `.ku/build/<profile>/`; use the actual path printed by the CLI. Give Windows executables an `.exe` suffix.
 
-The LLVM backend writes text IR and then returns nonzero because executable linking is not supported; this is not a successful executable build.
+The LLVM examples use `empty.ku` containing `fn main() {}`. This prototype supports a subset of syntax and built-ins; `--backend llvm` writes text IR and returns nonzero because executable linking is not supported.
 
 ### Historical `--native`
 

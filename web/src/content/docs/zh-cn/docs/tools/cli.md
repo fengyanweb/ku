@@ -32,7 +32,7 @@ ku ./hello.ku
 | `ku build main.ku`                              | 默认 Debug / Runner 构建                  |
 | `ku build --backend c --release main.ku -o app` | 编译并链接 native C 程序                  |
 | `ku ir main.ku`                                 | 查看优化后的 Ku IR                        |
-| `ku llvm main.ku`                               | 输出实验性 LLVM 文本 IR，不生成可执行文件 |
+| `ku llvm empty.ku`                              | 输出实验性 LLVM 文本 IR，不生成可执行文件 |
 | `ku template list`                              | 列出 basic、cli、http、json、fs、lib 模板 |
 | `ku package resolve --locked`                   | 按项目 lock 固定依赖                      |
 | `ku package pack`                               | 创建源码与依赖分发包，不是可执行程序      |
@@ -80,12 +80,12 @@ ku ./hello.ku
 | `ku build hello.ku`                              | 默认 Debug / Runner：生成 Rust wrapper，打包解释执行路径；需要与随包运行时匹配的 Rust 及系统链接器 |
 | `ku build --backend c --release hello.ku -o app` | native C 可执行程序；需要受支持的 C 编译器、链接器及程序使用的原生库                               |
 | `ku build --emit-c hello.ku`                     | 默认仍走 Runner，额外输出 C；不是 C-only 构建，也不能绕过 Runner 工具链不匹配                      |
-| `ku build --backend llvm hello.ku`               | 当前为 LLVM 文本 IR，不是完整可执行链接路径                                                        |
+| `ku build --backend llvm empty.ku`               | 当前为 LLVM 文本 IR，不是完整可执行链接路径                                                        |
 | `ku package pack`                                | 源码分发包，与上面两种程序产物不同                                                                 |
 
 `check`、`run` 与隐式运行不要求 Rust/C 编译器。Runner 只嵌入入口文件；含本地导入的程序运行时仍需原模块源码。native C 构建展开导入图，产物不依赖原 Ku 源码。默认输出在 `.ku/build/<profile>/`，请使用 CLI 报出的实际路径；Windows 输出名使用 `.exe`。
 
-LLVM 后端写出文本 IR 后会以非零状态报告尚不支持可执行链接；不能把它当成已成功构建的程序。
+LLVM 示例中的 `empty.ku` 内容为 `fn main() {}`。该原型只支持部分语法和内建调用；`--backend llvm` 写出文本 IR 后返回非零，因为尚不支持可执行链接。
 
 ### 历史 `--native`
 
