@@ -32,6 +32,12 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "build-native-tls-pack.ps1 requires PowerShell 7 or newer for bounded process-tree cleanup"
 }
 
+$kuTlsReleaseConfiguration = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'release-toolchain.json') -Raw -Encoding utf8 | ConvertFrom-Json
+if ($kuTlsReleaseConfiguration.schema -cne 'ku-release-toolchain-v1' -or $kuTlsReleaseConfiguration.toolchain -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Invalid release toolchain configuration' }
+$kuTlsReleaseToolchain = [string]$kuTlsReleaseConfiguration.toolchain
+# Changing the publisher requires revalidating the native archive/link contract.
+if ($kuTlsReleaseToolchain -cne '1.89.0') { throw 'The validated native TLS ABI requires an explicit migration before changing the publisher toolchain' }
+
 $kuTlsPathComparison = if ($IsWindows) {
     [System.StringComparison]::OrdinalIgnoreCase
 }
@@ -44,7 +50,7 @@ $kuTlsContracts = @{
         Flavor = "gnu"
         ObjectFormat = "elf-x86_64"
         Archive = "libku_native_tls.a"
-        LinkContract = "rust-1.89.0-linux-gnu-v1"
+        LinkContract = "rust-$($kuTlsReleaseToolchain)-linux-gnu-v1"
         Crt = "system-dynamic"
         NativeStaticLibs = "-lc -lm -lrt -lpthread -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"
     }
@@ -52,7 +58,7 @@ $kuTlsContracts = @{
         Flavor = "msvc"
         ObjectFormat = "coff-x86_64"
         Archive = "ku_native_tls.lib"
-        LinkContract = "rust-1.89.0-windows-msvc-v1"
+        LinkContract = "rust-$($kuTlsReleaseToolchain)-windows-msvc-v1"
         Crt = "msvc-dynamic"
         NativeStaticLibs = "bcrypt.lib advapi32.lib kernel32.lib ntdll.lib userenv.lib ws2_32.lib dbghelp.lib /defaultlib:msvcrt"
     }
@@ -60,7 +66,7 @@ $kuTlsContracts = @{
         Flavor = "gnu"
         ObjectFormat = "coff-x86_64"
         Archive = "libku_native_tls.a"
-        LinkContract = "rust-1.89.0-windows-gnu-v1"
+        LinkContract = "rust-$($kuTlsReleaseToolchain)-windows-gnu-v1"
         Crt = "mingw-dynamic"
         NativeStaticLibs = "-lbcrypt -ladvapi32 -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp"
     }
@@ -68,7 +74,7 @@ $kuTlsContracts = @{
         Flavor = "apple"
         ObjectFormat = "macho-arm64"
         Archive = "libku_native_tls.a"
-        LinkContract = "rust-1.89.0-darwin-v1"
+        LinkContract = "rust-$($kuTlsReleaseToolchain)-darwin-v1"
         Crt = "system-dynamic"
         NativeStaticLibs = "-lc -lm -liconv -lSystem -lc -lm"
     }
@@ -1399,20 +1405,20 @@ try {
 
     $kuTlsRustc = Invoke-KuTlsBoundedProcess `
         "rustc" `
-        @("+1.89.0", "--version") `
+        @("+$kuTlsReleaseToolchain", "--version") `
         $kuTlsRepositoryRoot `
         $kuTlsBuildRoot `
         "rustc-version" `
         $kuTlsToolProbeTimeoutMs
     if ($kuTlsRustc.ExitCode -ne 0 -or
-        $kuTlsRustc.Output -notmatch '^rustc 1\.89\.0 \(') {
+        $kuTlsRustc.Output -notmatch ('^rustc ' + [regex]::Escape($kuTlsReleaseToolchain) + ' \(')) {
         throw "native TLS packs require the exact Rust 1.89.0 toolchain"
     }
 
     $kuTlsCargo = Invoke-KuTlsBoundedProcess `
         "cargo" `
         @(
-            "+1.89.0",
+            "+$kuTlsReleaseToolchain",
             "rustc",
             "--locked",
             "--release",
@@ -1508,7 +1514,7 @@ fn main() {
     $kuTlsValidatorBinary = Join-Path $kuTlsBuildRoot $(if ($IsWindows) { "validate_tls_archive.exe" } else { "validate_tls_archive" })
     $kuTlsValidatorBuild = Invoke-KuTlsBoundedProcess `
         "rustc" `
-        @("+1.89.0", "--edition=2021", "-C", "panic=abort", "-o", $kuTlsValidatorBinary, $kuTlsValidatorSource) `
+        @("+$kuTlsReleaseToolchain", "--edition=2021", "-C", "panic=abort", "-o", $kuTlsValidatorBinary, $kuTlsValidatorSource) `
         $kuTlsBuildRoot `
         $kuTlsBuildRoot `
         "archive-validator-build" `

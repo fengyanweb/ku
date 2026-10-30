@@ -1,0 +1,189 @@
+name: CLI runtime bundle consumer
+
+on:
+  workflow_dispatch:
+    inputs:
+      installer_run:
+        description: 'Optional prior run with successful same-target Publisher installers; empty builds new SDKs'
+        required: false
+        default: ''
+        type: string
+  push:
+    paths:
+      - 'src/cli.rs'
+      - 'src/cli_contract.rs'
+      - 'src/runner_bundle.rs'
+      - 'build.rs'
+      - 'build_support/**'
+      - 'src/lib.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/cli_v002_test.rs'
+      - 'scripts/release-toolchain.json'
+      - 'scripts/package-release.ps1'
+      - 'scripts/build-native-tls-pack.ps1'
+      - '.github/scripts/*runtime-bundle.py'
+      - '.github/scripts/export-release.py'
+      - '.github/workflows/cli-runtime-bundle.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-runtime-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publisher:
+    if: github.event_name != 'workflow_dispatch' || inputs.installer_run == ''
+    name: Publisher ${{ matrix.target }}
+    timeout-minutes: 35
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      CARGO_INCREMENTAL: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Read the single publisher toolchain configuration
+        shell: pwsh
+        run: |
+          $toolchain = (Get-Content scripts/release-toolchain.json -Raw | ConvertFrom-Json).toolchain
+          rustup toolchain install $toolchain --profile minimal --component rustfmt --component clippy --no-self-update
+          if ($LASTEXITCODE) { throw 'Publisher toolchain installation failed' }
+          "KU_RELEASE_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Check the changed CLI and manifest contracts
+        shell: pwsh
+        run: |
+          cargo +$env:KU_RELEASE_TOOLCHAIN fmt --all -- --check
+          if ($LASTEXITCODE) { throw 'Rust formatting failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN clippy --locked --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE) { throw 'Workspace check/clippy failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN build --locked --lib --bin ku
+          if ($LASTEXITCODE) { throw 'Matching source CLI/library build failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --test cli_v002_test -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Real CLI integration failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib cli_contract -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'CLI contract tests failed' }
+          cargo +$env:KU_RELEASE_TOOLCHAIN test --locked --lib runner_bundle -- --test-threads=1
+          if ($LASTEXITCODE) { throw 'Runner manifest tests failed' }
+          & ${{ matrix.python }} -B .github/scripts/test-export-release.py
+          if ($LASTEXITCODE) { throw 'Exporter contract tests failed' }
+          & ${{ matrix.python }} -B .github/scripts/test-prepare-release.py
+          if ($LASTEXITCODE) { throw 'Final release contract tests failed' }
+      - name: Build the real isolated same-batch installer tree
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -NonInteractive -File scripts/package-release.ps1
+      - name: Export and consume the final source-free archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content editors/vscode-ku/package.json -Raw | ConvertFrom-Json).version
+          $metadataPath = Join-Path $env:RUNNER_TEMP 'bundle-cargo-metadata.json'
+          $metadata = & cargo +$env:KU_RELEASE_TOOLCHAIN metadata --locked --format-version 1 --filter-platform '${{ matrix.target }}'
+          if ($LASTEXITCODE) { throw 'Metadata failed' }
+          $metadata | Out-File -FilePath $metadataPath -Encoding utf8
+          $sysroot = & rustc +$env:KU_RELEASE_TOOLCHAIN --print sysroot
+          if ($LASTEXITCODE) { throw 'Publisher sysroot missing' }
+          & ${{ matrix.python }} -B .github/scripts/export-release.py --bundle "release/${{ matrix.target }}" --output "$env:RUNNER_TEMP/cli-bundle-assets" --repo . --version $version --target '${{ matrix.target }}' --commit $env:GITHUB_SHA --metadata $metadataPath --rust-sysroot $sysroot.Trim()
+          if ($LASTEXITCODE) { throw 'Actual archive validation failed' }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-runtime-installer-${{ matrix.target }}
+          path: ${{ runner.temp }}/cli-bundle-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  consumer:
+    if: ${{ always() && (needs.publisher.result == 'success' || (needs.publisher.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.installer_run != '')) }}
+    permissions:
+      contents: read
+      actions: read
+    name: Consumer Rust 1.96 ${{ matrix.target }}
+    needs: [publisher]
+    timeout-minutes: 25
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Verify the selected same-target publisher succeeded
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALLER_RUN: ${{ inputs.installer_run || github.run_id }}
+          INSTALLER_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:INSTALLER_RUN -cnotmatch '^[1-9][0-9]{0,19}$') { throw 'installer_run must be a positive workflow run ID' }
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $source = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:INSTALLER_RUN" -Headers $headers -TimeoutSec 30
+          $jobs = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:INSTALLER_RUN/jobs?per_page=100" -Headers $headers -TimeoutSec 30
+          if ($jobs.total_count -gt 100) { throw 'Installer source run exceeds the bounded job query' }
+          $matching = @($jobs.jobs | Where-Object { $_.name -ceq "Publisher $env:INSTALLER_TARGET" -and $_.conclusion -ceq 'success' })
+          if ($matching.Count -ne 1) { throw 'Selected SDK has no unique successful same-target Publisher job' }
+          if ($source.head_sha -cnotmatch '^[0-9a-f]{40}$') { throw 'Installer source commit is invalid' }
+          "SDK_SOURCE_COMMIT=$($source.head_sha)" >> $env:GITHUB_ENV
+          "INSTALLER_RUN_ID=$env:INSTALLER_RUN" >> $env:GITHUB_ENV
+          Write-Host "Consume immutable SDK from run $env:INSTALLER_RUN / commit $($source.head_sha); current verification code remains $env:GITHUB_SHA"
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: cli-runtime-installer-${{ matrix.target }}
+          path: ${{ runner.temp }}/downloaded-installer
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.installer_run || github.run_id }}
+      - name: Make the independent consumer default Rust 1.96
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE) { throw 'Consumer toolchain unavailable' }
+          rustup default 1.96.0
+          rustc -vV
+      - name: Consume the downloaded archive outside checkout and build directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/downloaded-installer" -Filter '*.tar.gz')
+          if ($archive.Count -ne 1) { throw 'Expected exactly one actual installer' }
+          & ${{ matrix.python }} -B .github/scripts/consume-runtime-bundle.py --archive $archive[0].FullName --manifest ($archive[0].FullName + '.manifest.json') --repo . --output "$env:RUNNER_TEMP/cli-consumer-evidence.json" --consumer-toolchain 1.96.0 --hide-checkout --installer-run $env:INSTALLER_RUN_ID --expected-sdk-commit $env:SDK_SOURCE_COMMIT
+          if ($LASTEXITCODE) { throw 'Downloaded installer consumer failed' }
+      - name: Preserve concise success or failure evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-runtime-consumer-${{ matrix.target }}
+          path: ${{ runner.temp }}/cli-consumer-evidence.json
+          if-no-files-found: warn
+          retention-days: 7

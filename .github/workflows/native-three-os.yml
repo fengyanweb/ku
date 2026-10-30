@@ -1161,12 +1161,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install the pinned Rust toolchain
-        shell: bash
+      - name: Install the configured publisher toolchain
+        shell: pwsh
         run: |
-          rustup set profile minimal
-          rustup toolchain install 1.89.0 --no-self-update
-          rustup default 1.89.0
+          $toolchain = (Get-Content scripts/release-toolchain.json -Raw | ConvertFrom-Json).toolchain
+          rustup toolchain install $toolchain --profile minimal --no-self-update
+          if ($LASTEXITCODE) { throw 'Publisher toolchain installation failed' }
+          "KU_RELEASE_TOOLCHAIN=$toolchain" >> $env:GITHUB_ENV
 
       - name: Install the release packaging Node runtime
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -1207,10 +1208,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $metadataPath = Join-Path $env:RUNNER_TEMP 'ku-release-cargo-metadata.json'
-          $metadata = & cargo metadata --locked --format-version 1 --filter-platform $env:RELEASE_TARGET
+          $metadata = & cargo +$env:KU_RELEASE_TOOLCHAIN metadata --locked --format-version 1 --filter-platform $env:RELEASE_TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Cannot collect locked Cargo dependency metadata' }
           $metadata | Out-File -FilePath $metadataPath -Encoding utf8
-          $sysroot = & rustc +1.89.0 --print sysroot
+          $sysroot = & rustc +$env:KU_RELEASE_TOOLCHAIN --print sysroot
           if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the pinned Rust license materials' }
           & ${{ matrix.python }} -B .github/scripts/export-release.py `
             --bundle (Join-Path $env:GITHUB_WORKSPACE "release/$env:RELEASE_TARGET") `
