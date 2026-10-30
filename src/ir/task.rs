@@ -1366,7 +1366,7 @@ fn validate_shape(
                                 && destination == &IrType::Int
                         }
                         TaskBinaryOp::Equal | TaskBinaryOp::NotEqual => {
-                            matches!(left_type, IrType::Int | IrType::Bool)
+                            matches!(left_type, IrType::Int | IrType::Bool | IrType::Str)
                                 && left_type == right_type
                                 && destination == &IrType::Bool
                         }
@@ -1381,7 +1381,7 @@ fn validate_shape(
                     };
                     if dst == left || dst == right || destination_borrowed || !valid_types {
                         return Err(invalid(
-                            "Binary requires distinct destination and matching int or bool Value types",
+                            "Binary requires distinct destination and matching int, bool or str Value types",
                         ));
                     }
                 }

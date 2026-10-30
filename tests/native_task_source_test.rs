@@ -30,6 +30,313 @@ fn native(source: &str) -> String {
     c::generate_native_task_c_source(&tasks, &Default::default()).expect("native Task C generation")
 }
 
+#[test]
+fn native_task_string_equality_reads_owners_and_preserves_effectful_operands() {
+    use ku::ir::task::TaskOp;
+
+    // Ku literals accept embedded NUL bytes, rather than a backslash-zero escape.
+    let source = r#"
+async fn Simple(value: str): bool! {
+    equal = value == "中文😀\0尾"
+    different = value != "中文😀\0尾x"
+    same = value == value
+    println(value)
+    return ok(equal && different && same)
+}
+async fn Edges(): bool! {
+    if (!("" == "") || "" != "") { fail "empty equality" }
+    if ("ab" == "abc" || "a\0b" == "a\0c" || "a\0b" == "a") { fail "length or NUL equality" }
+    return ok("a\0b" != "a\0c" && "中文😀" == "中文😀")
+}
+async fn Emit(label: str, value: str): str! {
+    println(label)
+    return ok(value)
+}
+async fn Order(value: str): bool! {
+    compared = value == (await Emit("rhs", value))?
+    return ok(compared)
+}
+async fn Temporary(): bool! {
+    return ok((await Emit("left", "once"))? != (await Emit("right", "different"))?)
+}
+async fn Bad(): str! { fail "expected RHS" }
+async fn Catch(value: str): bool! {
+    try { compared = value == (await Bad())? return ok(compared) }
+    catch(err) {
+        if (!(err.domain == "ku" && err.code == "fail") || err.message != "expected RHS") {
+            fail "catch projection equality"
+        }
+    }
+    return ok(value == "中文😀\0尾")
+}
+async fn main(): null! {
+    for index in 8 {
+        value = "中文" + "😀\0尾"
+        if (!(await Simple(value.clone()))?) { fail "ordinary comparison" }
+        if (!(await Edges())?) { fail "edge comparison" }
+        if (!(await Order(value.clone()))?) { fail "RHS moved its original LHS" }
+        if (!(await Temporary())?) { fail "temporary comparison" }
+        if (!(await Catch(value.clone()))?) { fail "RHS failure cleanup" }
+        if (value != "中文😀\0尾") { fail "comparison consumed original" }
+    }
+    return ok(null)
+}
+"#
+    .replace("\\0", "\0");
+    ku::cli::run_source("task-string-equality.ku", &source)
+        .expect("the same comparison oracles pass in the interpreter");
+    let lowered = task_lower::lower_program(&checked(&source)).unwrap();
+    let clones = |name: &str| {
+        lowered
+            .tasks
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap()
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|operation| matches!(operation, TaskOp::StringClone { .. }))
+            .count()
+    };
+    assert_eq!(clones("Simple"), 0, "read-only RHS needs no owner snapshot");
+    assert_eq!(clones("Order"), 1, "RHS can move the named LHS");
+    assert_eq!(clones("Temporary"), 0, "temporary owners already persist");
+    let generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    assert!(generated.contains("= ku_string_equal("));
+    assert!(generated.contains("= !ku_string_equal("));
+    let anchor = "typedef struct KuString {";
+    assert_eq!(generated.matches(anchor).count(), 1);
+    let generated = generated.replacen(anchor, &format!("{ALLOCATION_HOOK}\n{anchor}"), 1);
+    let generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+        1,
+    ) + r#"
+int main(void) {
+  int result=fixture_original_main();
+  if(result) return result;
+  if(!ku_perf_calls || ku_perf_live_allocations || ku_perf_live_bytes || ku_perf_overflow) {
+    fprintf(stderr,"string comparison allocations: %zu %zu overflow=%d\n",ku_perf_live_allocations,ku_perf_live_bytes,ku_perf_overflow);
+    return 2;
+  }
+  return 0;
+}
+"#;
+    let directory = TempDir::new("native-task-string-equality");
+    let path = directory.path().join("comparison.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "comparison") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute native Task string comparisons"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "中文😀\0尾\nrhs\nleft\nright\n".repeat(8)
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_string_equality_snapshot_cleans_up_cancel_and_allocation_failures() {
+    use ku::ir::task::TaskOp;
+
+    let lowered = task_lower::lower_program(&checked(
+        r#"
+async fn Compare(value: str): bool! { return ok(value == (await Wait())?) }
+async fn Wait(): str! { while(true) {} return ok("never") }
+async fn main(): null! { return ok(null) }
+"#,
+    ))
+    .unwrap();
+    let (snapshot, original) = lowered.tasks.functions[0]
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .find_map(|operation| match operation {
+            TaskOp::StringClone { dst, src } => Some((dst.0, src.0)),
+            _ => None,
+        })
+        .expect("an effectful RHS needs the existing bounded string snapshot");
+    let generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    let allocation_hook = ALLOCATION_HOOK.replacen(
+        "  ku_perf_calls++;",
+        "  ku_perf_calls++;\n  if(fixture_fail_allocation) { fixture_fail_allocation=0; return NULL; }",
+        1,
+    );
+    let generated = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("static int fixture_fail_allocation;\n{allocation_hook}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "static uint64_t ku_task_driver_now_ms(void) {",
+            "static uint64_t ku_task_driver_now_ms(void) { return 1000u; }\nstatic uint64_t fixture_original_now(void) {",
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int fixture_original_main(void) {",
+            1,
+        );
+    let fixture = r#"
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"string snapshot line %d: %s\n",__LINE__,#c); return 1; } } while(0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int mode) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
+  uint64_t next=UINT64_MAX,deadline=3000u; KuTaskValueV1 task={0};
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,2u,ring,2u,fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+4096u,
+    1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuString value=ku_string_alloc(3u); memcpy(value.ptr,"A\0B",3u);
+  CHECK(ku_task_0_start_value(&driver,&value,&task)==KU_TASK_DRIVER_OK);
+  CHECK(!value.ptr && !value.len);
+  KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+  if(mode==2) driver.byte_limit=driver.fixed_bytes+driver.reserved_bytes;
+  if(mode==3) fixture_fail_allocation=1;
+  for(size_t turn=0;turn<128u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++) {
+    CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    if(mode<2 && driver.resident==2u) break;
+  }
+  if(mode<2) {
+    CHECK(driver.resident==2u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING);
+    CHECK((instance->frame.header.initialized & (UINT64_C(1)<<@SNAPSHOT@))!=0u);
+    CHECK(instance->frame.s_@SNAPSHOT@.storage==KU_STRING_OWNED);
+    CHECK(instance->frame.s_@SNAPSHOT@.ptr!=instance->frame.s_@ORIGINAL@.ptr);
+    CHECK(instance->frame.s_@SNAPSHOT@.len==3u && !memcmp(instance->frame.s_@SNAPSHOT@.ptr,"A\0B",3u));
+    uint32_t reason=mode ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
+    CHECK(ku_task_driver_request_cancel(&task.ticket,&task.owner.lease,reason,deadline)==KU_TASK_CONTROL_OK);
+    for(size_t turn=0;turn<512u && ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+      CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+    CHECK(ku_task_control_status(&task.owner.lease)==reason);
+  } else {
+    CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_FAILED);
+    CHECK(driver.peak_resident==1u && !fixture_fail_allocation);
+    KuTaskAdapterOutcomeV1 outcome={0}; CHECK(ku_task_value_take(&task,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==2u && !outcome.value.boolean.ok && outcome.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+    const char* code=mode==2 ? "memory_limit" : "out_of_memory";
+    CHECK(ku_string_equal(outcome.value.boolean.error.domain,ku_string_static((const uint8_t*)"task",4u)));
+    CHECK(ku_string_equal(outcome.value.boolean.error.code,ku_string_static((const uint8_t*)code,strlen(code))));
+    ku_task_outcome_drop(&outcome);
+  }
+  CHECK(ku_task_value_drop(&task,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<512u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.running && !driver.queued && !driver.timers && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK && ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  for(size_t round=0;round<8u;round++)
+    for(int mode=0;mode<4;mode++) CHECK(!fixture_case(mode));
+  puts("task-string-snapshot-cleanup-ok"); return 0;
+}
+"#
+    .replace("@SNAPSHOT@", &snapshot.to_string())
+    .replace("@ORIGINAL@", &original.to_string());
+    let directory = TempDir::new("native-task-string-snapshot");
+    let path = directory.path().join("snapshot.c");
+    fs::write(&path, generated + &fixture).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "snapshot") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute native Task string snapshot cleanup"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-string-snapshot-cleanup-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn native_task_string_equality_keeps_pg_fixture_rejection_mapping_exact() {
+    let fixture = include_str!("benchmarks/cross_stack/ku/server.ku");
+    assert!(fixture
+        .contains("if (error.domain == \"pg\" && error.code == \"pool_busy\") { status = 503 }"));
+    // The default helpers/text/async/int expansion changes only the peer port.
+    // Emit the actual complete service through the normal import/check/lower
+    // chain; generation performs no listen or database operation.
+    let benchmark = TempDir::new("native-task-pg-fixture-emission");
+    let input = benchmark.path().join("server.ku");
+    fs::write(&input, fixture.replace("__PEER_PORT__", "19191")).unwrap();
+    ku::cli::run_cli(vec![
+        "ku".into(),
+        "build".into(),
+        "--native".into(),
+        input.to_string_lossy().into_owned(),
+    ])
+    .expect("the complete benchmark keeps its original direct error comparisons");
+    let emitted = fs::read_to_string(input.with_extension("c")).unwrap();
+    assert!(emitted.contains("= ku_string_equal("));
+    let source = r#"
+async fn Classify(domain: str, code: str): int! {
+    status = 500
+    if (domain == "pg" && code == "pool_busy") { status = 503 }
+    return ok(status)
+}
+async fn main(): null! {
+    println((await Classify("pg", "pool_busy"))?)
+    println((await Classify("pg", "query_failed"))?)
+    println((await Classify("other", "pool_busy"))?)
+    println((await Classify("other", "query_failed"))?)
+    return ok(null)
+}
+"#;
+    // The complete original benchmark is separately emitted. These four
+    // branch cases require neither a database connection nor SQL retries.
+    ku::cli::run_source("task-pg-error-classification.ku", source).unwrap();
+    let generated = native(source);
+    let directory = TempDir::new("native-task-pg-error-classification");
+    let path = directory.path().join("classification.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "classification") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute native Task error classification"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "503\n500\n500\n500\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 // Instrument actual typed states in every emitted representation, including
 // bounded loop blocks. The separate outlined false-header label is a real
 // header entry even for zero trips; an entry/check label is not a state.

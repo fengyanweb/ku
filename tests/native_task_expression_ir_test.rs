@@ -100,6 +100,8 @@ fn binary(op: TaskBinaryOp, left: IrType, right: IrType, output: IrType) -> Task
                     read(0),
                     read(1),
                     read(2),
+                    TaskOp::DropIfInit { slot: SlotId(0) },
+                    TaskOp::DropIfInit { slot: SlotId(1) },
                     null_result(3),
                 ],
                 done(3),
@@ -135,7 +137,9 @@ fn binary_types_match(op: TaskBinaryOp, left: &IrType, right: &IrType, output: &
             left == &IrType::Int && right == &IrType::Int && output == &IrType::Int
         }
         TaskBinaryOp::Equal | TaskBinaryOp::NotEqual => {
-            matches!(left, IrType::Int | IrType::Bool) && left == right && output == &IrType::Bool
+            matches!(left, IrType::Int | IrType::Bool | IrType::Str)
+                && left == right
+                && output == &IrType::Bool
         }
         TaskBinaryOp::Less
         | TaskBinaryOp::LessEqual
@@ -182,6 +186,35 @@ fn native_task_expression_ir_binary_exact_type_matrix() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn native_task_expression_ir_string_equality_reads_owned_and_local_borrowed_views() {
+    for op in [TaskBinaryOp::Equal, TaskBinaryOp::NotEqual] {
+        let owned = binary(op, IrType::Str, IrType::Str, IrType::Bool);
+        accepted(&owned); // Both input Reads still precede their owner cleanup.
+        let mut local_views = owned.clone();
+        local_views.functions[0].parameters.clear();
+        local_views.functions[0].states[0]
+            .operations
+            .retain(|operation| !matches!(operation, TaskOp::DropIfInit { .. }));
+        for index in 0..2 {
+            local_views.functions[0].slots[index].ty = TaskSlotType::Value {
+                ty: IrType::Str,
+                borrowed: true,
+            };
+            local_views.functions[0].states[0].operations.insert(
+                index,
+                TaskOp::Init {
+                    dst: SlotId(index),
+                    value: TaskConstant::Str("中文😀\0尾".into()),
+                },
+            );
+        }
+        accepted(&local_views); // A local view does not cross any Task boundary.
+        local_views.functions[0].parameters.push(SlotId(0));
+        rejected(&local_views, "borrowed parameter cannot enter a task frame");
     }
 }
 

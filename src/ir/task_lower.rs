@@ -895,6 +895,16 @@ impl<'a> FunctionLowerer<'a> {
                     );
                 }
                 let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                if equality && self.function.slots[source.0].ty == value_slot(IrType::Str) {
+                    return self.string_equality_expression(
+                        source,
+                        !matches!(&left.kind, ExprKind::Variable(_)),
+                        *op,
+                        right,
+                        expression.span,
+                        depth,
+                    );
+                }
                 let input_type = match &self.function.slots[source.0].ty {
                     TaskSlotType::Value {
                         ty: IrType::Int,
@@ -906,7 +916,7 @@ impl<'a> FunctionLowerer<'a> {
                     } if equality => IrType::Bool,
                     _ => {
                         return Err(unsupported(
-                            "binary operands other than int or same-type bool equality",
+                            "binary operands other than int or same-type bool/str equality",
                             left.span,
                         ))
                     }
@@ -1113,6 +1123,58 @@ impl<'a> FunctionLowerer<'a> {
                 expression.span,
             )),
         }
+    }
+
+    // A comparison only reads its operands. Keep ordinary string owners alive;
+    // snapshot a named LHS only when RHS effects can move or replace it. The
+    // existing bounded read-only expression check also covers literal RHSs.
+    #[inline(never)]
+    fn string_equality_expression(
+        &mut self,
+        source: SlotId,
+        temporary_left: bool,
+        op: BinaryOp,
+        right: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let snapshot = !temporary_left && !self.pure_array_index(right)?;
+        let left = if snapshot {
+            let left = self.slot(value_slot(IrType::Str))?;
+            self.emit(TaskOp::StringClone {
+                dst: left,
+                src: source,
+            })?;
+            left
+        } else {
+            source
+        };
+        let temporary_right = !matches!(&right.kind, ExprKind::Variable(_));
+        let right = self.expression(right, depth + 1)?;
+        if self.function.slots[right.0].ty != value_slot(IrType::Str) {
+            return Err(unsupported(
+                "mixed binary operand types in a Task frame",
+                span,
+            ));
+        }
+        let destination = self.slot(value_slot(IrType::Bool))?;
+        self.emit(TaskOp::Binary {
+            dst: destination,
+            op: match op {
+                BinaryOp::Equal => TaskBinaryOp::Equal,
+                BinaryOp::NotEqual => TaskBinaryOp::NotEqual,
+                _ => unreachable!("only string equality reaches this lowering"),
+            },
+            left,
+            right,
+        })?;
+        if temporary_left || snapshot {
+            self.emit(TaskOp::Drop { slot: left })?;
+        }
+        if temporary_right {
+            self.emit(TaskOp::Drop { slot: right })?;
+        }
+        Ok(destination)
     }
 
     // String owners and allocation temporaries stay outside ordinary recursive

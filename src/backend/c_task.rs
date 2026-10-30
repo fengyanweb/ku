@@ -3179,6 +3179,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                         ),
                         state,
                     )?;
+                } else if self.slot_type(*left)? == &IrType::Str {
+                    let negate = match op {
+                        TaskBinaryOp::Equal => "",
+                        TaskBinaryOp::NotEqual => "!",
+                        _ => return Err(unsupported("non-equality Task string comparison")),
+                    };
+                    if self.slot_type(*right)? != &IrType::Str {
+                        return Err(unsupported("mixed Task string comparison"));
+                    }
+                    out.push_str(&format!(
+                        "  {} = {negate}ku_string_equal({}, {});\n",
+                        self.place(*dst),
+                        self.place(*left),
+                        self.place(*right)
+                    ));
+                    self.set_init(out, *dst, true);
                 } else {
                     let operator = match op {
                         TaskBinaryOp::Equal => "==",
