@@ -303,6 +303,13 @@ def run(a,state,tail_only=False,stability_only=False):
         if not path.exists():save(path,config)
         output=a.root/'results'/label
         return step(state,a.root,label,lambda:fc.execute(path,output,phase,resume=(output/'identity.json').exists()),resume=True)
+    def blocked(reason,axes):
+        pending=['final','capacity','stability'] if 'final' not in axes and not tail_only else ['capacity','stability']
+        if stability_only:pending=['stability']
+        state['deferred']={label:reason for label in pending}
+        return dict(execution_complete=False,goal_status='blocked',candidate_accepted=False,
+            environment_quality=environment['quality'],fixed_matrix_executed='final' in axes,
+            axes=axes,reason=reason,scope='Retained original windows; downstream measurements not started or retried.')
     try:
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
@@ -310,11 +317,21 @@ def run(a,state,tail_only=False,stability_only=False):
         fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None)
         control=copy.deepcopy(fixed);control.update(targets=[],schedule=[dict(phase='control',workload='json_object',rate=500,
             orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
-        control.pop('stop_after_consecutive_unusable_windows',None)
+        control['stop_after_consecutive_unusable_windows']=2
         summary=execute('control',control,'all');environment=environment_record(summary,a.root/'environment-qualification.json')
+        if environment['quality']!='pass':
+            return blocked('environment control quality is '+environment['quality'],{'control':summary})
+        if summary.get('execution_complete') is not True:
+            return blocked('environment control execution incomplete',{'control':summary})
         final=None if tail_only else execute('final',fixed,'all')
         checked=summary if tail_only else final
-        function_ok=bool(checked.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in checked['rows'])
+        function_ok=(checked.get('execution_complete') is True and bool(checked.get('rows')) and all(
+            r.get('status')=='observed' and r.get('functional_valid') is True and r.get('accounting_valid') is True
+            and r.get('arrival_schedule_quality')=='pass' and (tail_only or r.get('environment_quality')=='pass')
+            and r.get('measurement_invalid') is False and r.get('natural_reclamation') is True for r in checked['rows']))
+        if not function_ok:
+            return blocked('fixed/control measurement incomplete, invalid or function/accounting/cleanup failed',
+                {'control':summary,**({'final':final} if final is not None else {})})
         if function_ok:
             def capacities():
                 results=[]
@@ -327,7 +344,6 @@ def run(a,state,tail_only=False,stability_only=False):
             if not stability_only:step(state,a.root,'capacity',capacities,resume=True)
             if not state['steps'].get('stability'):
                 execute('stability',plan,'stability') # once-only; no resume/replacement of continuous evidence
-        else:state['deferred']={'capacity':'confirmed function/accounting failure','stability':'same candidate; not retried'}
         if tail_only:
             capacity=state['steps'].get('capacity',{}).get('result',{})
             continuous=state['steps'].get('stability',{}).get('result',{})
@@ -951,6 +967,6 @@ def main(argv=None):
             'followup-screen':lambda a,s:diagnostic(a,s,followup=True)}[a.phase]
         result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','lifecycle','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle','diagnostic','followup-screen') and result.get('execution_complete') is not True else 0
+    print(json.dumps(result));return 2 if a.phase in ('run','tail','lifecycle','diagnostic','followup-screen') and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
