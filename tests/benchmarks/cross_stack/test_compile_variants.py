@@ -124,8 +124,8 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, performance-v2, performance-v2-builds]",text)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds')",job)
+        self.assertIn("task-main-path, performance-v2, performance-v2-builds, performance-v2-finish]",text)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish')",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
@@ -133,7 +133,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds')",text)
+        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
@@ -148,8 +148,11 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build',build)
         self.assertNotIn('sudo',build)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase"',run)
-        self.assertIn('performance_phase=run',run)
-        self.assertIn('if [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-builds ]; then\n            performance_phase=compiler',run)
+        self.assertIn('performance_phases=(run)',run)
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-builds ]; then\n            performance_phases=(compiler)',run)
+        self.assertIn('elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-finish ]; then\n            performance_phases=(tail compiler)',run)
+        self.assertIn('for performance_phase in "${performance_phases[@]}"; do',run)
+        self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
         self.assertIn('timeout-minutes: 130',run)
