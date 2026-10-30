@@ -62,28 +62,122 @@ class HostedCycleTests(unittest.TestCase):
         good=dict(functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
             arrival_schedule_quality='pass',environment_quality='pass',observed_environment_faults=[])
         plan={'json_layer_diagnosis':{'execution_complete':True}}
-        result=h.diagnostic_axes(plan,[good],1,[],good,[],True)
+        admission={'passed':True,'execution_complete':True}
+        result=h.diagnostic_axes(plan,[good],1,[],good,[],True,admission)
         self.assertTrue(result['execution_complete'])
         plan['json_layer_diagnosis']['execution_complete']=False
-        result=h.diagnostic_axes(plan,[good],1,[],good,[],True)
+        result=h.diagnostic_axes(plan,[good],1,[],good,[],True,admission)
         self.assertTrue(result['normal_windows_complete'])
         self.assertTrue(result['normal_windows_qualified'])
         self.assertFalse(result['json_layers_complete'])
         self.assertFalse(result['execution_complete'])
         plan['json_layer_diagnosis']['execution_complete']=True
         bad=dict(good,all_correct=False)
-        result=h.diagnostic_axes(plan,[good],1,[],bad,[],True)
+        result=h.diagnostic_axes(plan,[good],1,[],bad,[],True,admission)
         self.assertFalse(result['transport_control_complete'])
         self.assertFalse(result['execution_complete'])
         bad=dict(good,arrival_schedule_quality='fail')
-        self.assertFalse(h.diagnostic_axes(plan,[bad],1,[],good,[],True)['normal_windows_qualified'])
+        self.assertFalse(h.diagnostic_axes(plan,[bad],1,[],good,[],True,admission)['normal_windows_qualified'])
+        missing=h.diagnostic_axes(plan,[good],1,[],good,[],True)
+        self.assertTrue(missing['normal_windows_complete']);self.assertFalse(missing['admission_complete'])
+        self.assertFalse(missing['execution_complete'])
+
+    def test_admission_gate_requires_actual_gate_identity_and_natural_retirement(self):
+        from unittest.mock import Mock
+        for issue in (None,'gate','forced','identity','driver_exception','interrupt'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);plan={'versions':{'B':{'root':str(root),'stack':'ku'}},'resources':h.RESOURCES}
+                binding={'source_commit':'a'*40}
+                identities=[binding,{'source_commit':'b'*40} if issue=='identity' else binding]
+                patches.enter_context(patch.object(fc,'version_identity',side_effect=identities))
+                service=Mock();service.stop.return_value={'natural':issue!='forced'}
+                harness=Mock();harness.start.return_value=service;harness.close.return_value=[]
+                harness.admission_pressure.return_value={'passed':issue!='gate'}
+                if issue in ('driver_exception','interrupt'):
+                    harness.admission_pressure.side_effect=KeyboardInterrupt() if issue=='interrupt' else RuntimeError('retained driver failure')
+                patches.enter_context(patch.object(fc,'Harness',return_value=harness))
+                patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda stack,r:r.get('natural') is True))
+                if issue=='interrupt':
+                    with self.assertRaises(KeyboardInterrupt):h.admission_window(plan,root/'gate')
+                else:
+                    result=h.admission_window(plan,root/'gate')
+                    self.assertEqual(result['passed'],issue is None)
+                    self.assertFalse(result['normal_score_eligible'])
+                service.stop.assert_called_once();harness.close.assert_called_once()
+                retained=h.load(root/'gate/admission-window.json')
+                self.assertEqual(retained['passed'],issue is None)
+                if issue in ('driver_exception','interrupt'):self.assertIn('error',retained)
 
     def plan(self):
         return h.frozen_plan({n:{'root':'/unused/'+n,'stack':'rust' if n.startswith('R') else 'ku'}
             for n in ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']})
 
+    def test_admission_reuse_requires_same_boot_build_and_resources_and_never_retries_failure(self):
+        from unittest.mock import Mock
+        binding={'source_commit':'a'*40,'files':{'ELF':{'sha256':'b'*64}}}
+        for issue in (None,'boot','binding','resources','failed','interrupted'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);plan=self.plan();state={'steps':{}}
+                gate=Mock(return_value={'passed':issue!='failed','execution_complete':True,'binding':binding})
+                with patch.object(h,'admission_window',gate),patch.object(fc,'version_identity',return_value=binding):
+                    first=h.required_admission(plan,root,state,'boot',root/'admission')
+                    self.assertEqual(gate.call_count,1)
+                    if issue=='boot':boot='other-boot'
+                    else:boot='boot'
+                    if issue=='binding':state['steps']['admission']['result']['binding']={'source_commit':'c'*40}
+                    if issue=='resources':state['steps']['admission']['result']['resources']={'service_cores':1}
+                    if issue=='interrupted':state['steps']['admission']={'state':'failed','error':'KeyboardInterrupt'}
+                    second=h.required_admission(plan,root,state,boot,root/'admission')
+                    self.assertEqual(gate.call_count,1)
+                    self.assertEqual(second['passed'],issue is None)
+                    if issue is None:self.assertTrue(second['reused_same_host_build'])
+                    else:self.assertEqual(second['goal_status'],'blocked');self.assertTrue(second['no_retry'])
+
+    def test_diagnostic_and_screen_admission_are_required_but_not_timed_windows(self):
+        from unittest.mock import Mock
+        for followup,gate_passed in ((False,True),(False,False),(True,True),(True,False)):
+            with self.subTest(followup=followup,gate_passed=gate_passed),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+                root=Path(directory)
+                versions={name:{'root':str(root/name),'source_commit':'a'*40} for name in ['A','B','R','RS','D','HC']}
+                plan=h.followup_plan(versions) if followup else h.diagnostic_plan(versions)
+                plan['json_layer_diagnosis']={'execution_complete':True}
+                h.save(root/'frozen-plan.json',plan)
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'private-fixture','db_cgroup':'/unused','database':{}})
+                h.save(dbstate,{'limits':{'cpuset.cpus':'3'}})
+                cleanup=[];fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:cleanup.append('database') or {'stopped':True})
+                state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}}
+                gate=Mock(return_value={'passed':gate_passed,'execution_complete':True,'binding':{'source_commit':'a'*40}})
+                good=dict(status='observed',functional_valid=True,accounting_valid=True,all_correct=True,
+                    natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',
+                    measurement_invalid=False,observed_environment_faults=[],full_cpu_us=10,latency={'p99_ms':1},
+                    memory={'steady_median_bytes':100},comparison_contract='same')
+                window=Mock(side_effect=lambda *args,**kwargs:dict(good))
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
+                patches.enter_context(patch.object(h,'sha',return_value='boot'))
+                patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(h,'diagnostic_command',return_value={}))
+                patches.enter_context(patch.object(h,'perf_capability',return_value={'available':False}))
+                patches.enter_context(patch.object(h.shutil,'which',return_value=None))
+                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'pass'}))
+                patches.enter_context(patch.object(h,'admission_window',gate))
+                patches.enter_context(patch.object(h,'window_quality',return_value=(False,None)))
+                patches.enter_context(patch.object(fc,'window',window))
+                result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools'),state,followup=followup)
+                self.assertEqual(gate.call_count,1);self.assertEqual(result['execution_complete'],gate_passed)
+                controls=plan['environment_controls']['count'] if followup else 0
+                expected=plan['maximum_windows'] if followup else sum(len(h.diagnostic_turns(plan,c,False)) for c in plan['cases'])
+                self.assertEqual(window.call_count,expected if gate_passed else controls)
+                self.assertEqual(result['scope_window_count'],expected if gate_passed else controls)
+                self.assertEqual(cleanup,['database']);self.assertEqual(result['admission']['passed'],gate_passed)
+                if not gate_passed:self.assertEqual(result['goal_status'],'blocked')
+
     def test_five_registered_groups_and_pg_sharing_are_actual_windows(self):
         plan=self.plan();jobs=fc.jobs_for(plan,'final');self.assertEqual(len(jobs),80)
+        self.assertEqual(len(plan['targets']),16)
+        self.assertTrue(plan['admission']['required']);self.assertFalse(plan['admission']['counts_as_timed_window'])
         self.assertEqual({t['metric'] for t in plan['targets']},{'full_cpu_us','memory.steady_median_bytes'})
         pg=[x for x in jobs if x['contract']=='pg-shared']
         for group in range(1,6):self.assertEqual(sorted(x['name'] for x in pg if x['group']==group),['A0','B','R','RS'])
@@ -170,12 +264,14 @@ class HostedCycleTests(unittest.TestCase):
             for w in ['json_object','db'] for n in ['B','R']]}
         stable={'execution_complete':True,'formal_qualified':True,'rows':[{'natural_reclamation':True,
             'segments':[{'streams':{'mixed':{'assessment':{'functional_valid':True,'accounting_valid':True}}}}]}]}
-        result=h.acceptance_result(final,cap,stable,'met')
+        admission={'passed':True,'execution_complete':True}
+        result=h.acceptance_result(final,cap,stable,'met',admission)
         self.assertTrue(result['functional_acceptance']);self.assertEqual(result['goal_status'],'unknown')
-        result=h.acceptance_result(final,cap,{},'met')
+        result=h.acceptance_result(final,cap,{},'met',admission)
         self.assertFalse(result['functional_acceptance']);self.assertFalse(result['execution_complete'])
         cap['capacity'][0]['functional_valid']=False
-        self.assertEqual(h.acceptance_result(final,cap,stable,'met')['goal_status'],'not_met')
+        self.assertEqual(h.acceptance_result(final,cap,stable,'met',admission)['goal_status'],'not_met')
+        self.assertEqual(h.acceptance_result(final,cap,stable,'met')['goal_status'],'blocked')
 
     def test_coarse_search_cannot_exceed_six_points_before_refinement(self):
         cap=self.plan()['capacity']
@@ -201,7 +297,7 @@ class HostedCycleTests(unittest.TestCase):
                (True,False,True,'unknown',None)]
         cases += [(False,False,False,'pass',issue) for issue in
                   [('execution_complete',False),('arrival_schedule_quality','fail'),
-                   ('environment_quality','unknown'),('measurement_invalid',True)]]
+                   ('environment_quality','unknown'),('measurement_invalid',True),('admission',False)]]
         for tail_only,fail_final,stability_only,quality,final_issue in cases:
             with self.subTest(tail_only=tail_only,fail_final=fail_final,stability_only=stability_only,
                              quality=quality,final_issue=final_issue),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
@@ -219,6 +315,9 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
                 patches.enter_context(patch.object(h.db,'Database',return_value=owned))
                 patches.enter_context(patch.object(h,'environment_record',return_value={'quality':quality}))
+                gate_issue=final_issue==('admission',False)
+                patches.enter_context(patch.object(h,'admission_window',return_value={'passed':not gate_issue,'execution_complete':True,
+                    'goal_status':'met','binding':{'source_commit':'a'*40}}))
                 def measured(plan_path,output,phase,**unused):
                     config=h.load(plan_path);label=Path(output).name;calls.append((label,phase))
                     if label in ('control','final'):
@@ -249,12 +348,12 @@ class HostedCycleTests(unittest.TestCase):
                 elif quality!='pass' or final_issue:
                     result=h.run(args,state,tail_only=tail_only,stability_only=stability_only)
                     self.assertFalse(result['execution_complete']);self.assertEqual(result['goal_status'],'blocked')
-                    self.assertEqual(calls,[('control','all')]+([('final','all')] if quality=='pass' else []))
+                    self.assertEqual(calls,[('control','all')]+([('final','all')] if quality=='pass' and not gate_issue else []))
                     self.assertNotIn('capacity',state['steps']);self.assertNotIn('stability',state['steps'])
                     self.assertFalse((root/'results/stability').exists())
                     if final_issue:
-                        self.assertEqual(set(result['axes']),{'control','final'})
-                        self.assertEqual(set(state['deferred']),{'capacity','stability'})
+                        self.assertEqual(set(result['axes']),{'control','admission'} if gate_issue else {'control','admission','final'})
+                        self.assertEqual(set(state['deferred']),{'final','capacity','stability'} if gate_issue else {'capacity','stability'})
                     else:
                         self.assertNotIn('final',state['steps']);self.assertFalse((root/'final-plan.json').exists())
                 else:
@@ -267,7 +366,7 @@ class HostedCycleTests(unittest.TestCase):
                         self.assertEqual(result['goal_status'],'unknown');self.assertNotIn('final',state['steps'])
                         self.assertFalse((root/'final-plan.json').exists())
                         self.assertEqual(result['capacity_executed'],not stability_only)
-                        self.assertEqual(set(result['axes']),{'control','stability'} if stability_only else {'control','capacity','stability'})
+                        self.assertEqual(set(result['axes']),{'control','admission','stability'} if stability_only else {'control','admission','capacity','stability'})
                 self.assertEqual(cleaned,['stop']);self.assertIs(fc.Harness,old_harness)
                 self.assertEqual(h.sha(frozen),original_hash)
                 self.assertIn('capacity',h.load(frozen));self.assertIn('stability',h.load(frozen))

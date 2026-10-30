@@ -20,6 +20,11 @@ RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
 SERVICE_ENV = {'KU_EVENT_LOOPS': '{cores}', 'KU_BLOCKING_THREADS': '17',
                'KU_THREAD_BUDGET': '64', 'KU_TASK_MAX_BYTES': '67108864',
                'KU_HTTP_REQUEST_TIMEOUT_MS': '30000'}
+ADMISSION = dict(required=True,name='B',connections=1184,planned_cancel=16,explicit_503=32,
+    limits={'max_connections':4096,'max_active_requests':1024,'max_pending_requests':128},
+    recovery_maximum_seconds=5,recovery_origin='before final body-byte release; owned-socket withdrawal if release never starts',
+    normal_score_eligible=False,counts_as_timed_window=False,
+    scope='Finite actual admission/recovery, separate from fixed CPU, capacity and diagnostic windows')
 
 
 def load(p): return json.loads(Path(p).read_text())
@@ -50,7 +55,7 @@ def frozen_plan(versions):
                 metric='full_cpu_us',minimum_pairs=5,display_contract='pg-strict' if contract=='pg-shared' else 'typed-pg-strict'))
             targets.append(dict(targets[-1],metric='memory.steady_median_bytes',maximum_ratio=1))
     return dict(versions=versions,resources=RESOURCES,quality_policy=POLICY,rates={'json_object':500,'db':200,'ok':2000,'cpu':80},
-        schedule=schedule,targets=targets,resume={'maximum_replacements':0},bootstrap_resamples=20000,
+        schedule=schedule,targets=targets,admission=copy.deepcopy(ADMISSION),resume={'maximum_replacements':0},bootstrap_resamples=20000,
         stop_after_consecutive_unusable_windows=2,control_cpu_max_min=1.10,
         pg_shared_scope='one Ku window serves default/strict only within the SAME preregistered entry/group; R normal/reset separate',
         historical_ablation_scope='AJ/AR/AP/AM/B0 local history excluded; no old-machine score imported',
@@ -125,7 +130,7 @@ def diagnostic_command(argv, output, timeout=30, limit=32<<20):
 def diagnostic_plan(versions):
     """A single short identification experiment, never the formal matrix."""
     return dict(schema='ku-hosted-followup-diagnostic-v1', versions=versions,
-        resources=RESOURCES, quality_policy=POLICY,
+        resources=RESOURCES, quality_policy=POLICY,admission=copy.deepcopy(ADMISSION),
         cases=[dict(workload=w, rate=r, reference=ref, contract=contract)
                for w,r,ref,contract in [('ok',2000,'R','text'),
                    ('json_object',500,'R','dom'),('db',200,'RS','pg-strict')]],
@@ -189,7 +194,7 @@ def diagnostic_turns(plan,case,followup):
     return turns
 
 
-def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup):
+def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup,admission=None):
     normal=len(rows)==expected and not stopped
     qualified=not followup or all(r.get('diagnostic_only') or
         (r.get('functional_valid') is True and r.get('accounting_valid') is True
@@ -202,9 +207,10 @@ def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup):
         and control.get('natural_reclamation') is True and control.get('arrival_schedule_quality')=='pass'
         and not control.get('measurement_invalid') and not control.get('observed_environment_faults'))
     growth_ok=not plan.get('worker_growth') or len(growth)==12 and all(r.get('valid') for r in growth)
+    admission_ok=isinstance(admission,dict) and admission.get('passed') is True and admission.get('execution_complete') is True
     return dict(normal_windows_complete=normal,normal_windows_qualified=qualified,json_layers_complete=layers,
-        transport_control_complete=control_ok,worker_growth_complete=growth_ok,
-        execution_complete=normal and qualified and layers and control_ok and growth_ok)
+        transport_control_complete=control_ok,worker_growth_complete=growth_ok,admission_complete=admission_ok,
+        execution_complete=normal and qualified and layers and control_ok and growth_ok and admission_ok)
 
 
 def build_ledger(a):
@@ -421,6 +427,7 @@ def run(a,state,tail_only=False,stability_only=False):
     def blocked(reason,axes):
         pending=['final','capacity','stability'] if 'final' not in axes and not tail_only else ['capacity','stability']
         if stability_only:pending=['stability']
+        if 'admission' not in axes:pending.insert(0,'admission')
         state['deferred']={label:reason for label in pending}
         return dict(execution_complete=False,goal_status='blocked',candidate_accepted=False,
             environment_quality=environment['quality'],fixed_matrix_executed='final' in axes,
@@ -429,7 +436,7 @@ def run(a,state,tail_only=False,stability_only=False):
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
         fc.Harness=HostedHarness
-        fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None)
+        fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None);fixed.pop('admission',None)
         control=copy.deepcopy(fixed);control.update(targets=[],schedule=[dict(phase='control',workload='json_object',rate=500,
             orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
         control['stop_after_consecutive_unusable_windows']=2
@@ -438,6 +445,9 @@ def run(a,state,tail_only=False,stability_only=False):
             return blocked('environment control quality is '+environment['quality'],{'control':summary})
         if summary.get('execution_complete') is not True:
             return blocked('environment control execution incomplete',{'control':summary})
+        admission=required_admission(plan,a.root,state,boot,a.root/'results/admission')
+        if admission.get('passed') is not True:
+            return blocked('actual admission/recovery gate did not pass; retained without retry',{'control':summary,'admission':admission})
         final=None if tail_only else execute('final',fixed,'all')
         checked=summary if tail_only else final
         function_ok=(checked.get('execution_complete') is True and bool(checked.get('rows')) and all(
@@ -446,7 +456,7 @@ def run(a,state,tail_only=False,stability_only=False):
             and r.get('measurement_invalid') is False and r.get('natural_reclamation') is True for r in checked['rows']))
         if not function_ok:
             return blocked('fixed/control measurement incomplete, invalid or function/accounting/cleanup failed',
-                {'control':summary,**({'final':final} if final is not None else {})})
+                {'control':summary,'admission':admission,**({'final':final} if final is not None else {})})
         if function_ok:
             def capacities():
                 results=[]
@@ -462,8 +472,8 @@ def run(a,state,tail_only=False,stability_only=False):
         if tail_only:
             capacity=state['steps'].get('capacity',{}).get('result',{})
             continuous=state['steps'].get('stability',{}).get('result',{})
-            required=[summary,continuous] if stability_only else [summary,capacity,continuous]
-            axes={'control':summary,'stability':continuous}
+            required=[summary,admission,continuous] if stability_only else [summary,admission,capacity,continuous]
+            axes={'control':summary,'admission':admission,'stability':continuous}
             if not stability_only:axes['capacity']=capacity
             return {'execution_complete':all(x.get('execution_complete') is True for x in required),
                 'goal_status':'unknown','fixed_matrix_executed':False,'cross_host_pooling':False,
@@ -478,8 +488,9 @@ def run(a,state,tail_only=False,stability_only=False):
         save(a.root/'results/core-advantage.json',{'goals':core,'goal_status':core_status,'selection':'predeclared dom/strictPG only; no score postselection'})
         goal='not_met' if 'not_met' in (core_status,final.get('goal_status')) else 'met' if core_status==final.get('goal_status')=='met' else 'unknown'
         acceptance=acceptance_result(final,state['steps'].get('capacity',{}).get('result',{}),
-            state['steps'].get('stability',{}).get('result',{}),goal)
+            state['steps'].get('stability',{}).get('result',{}),goal,admission)
         return dict(acceptance,core_advantage_goal_status=core_status,
+            admission=admission,
             formal_qualified=final.get('formal_qualified',False),environment_quality=environment['quality'],candidate_accepted=False,
             stability_status=state['steps'].get('stability',{}).get('state','not_executed'))
     finally:
@@ -808,8 +819,16 @@ def diagnostic(a,state,followup=False):
             if environment['quality']=='fail':
                 result=dict(execution_complete=False,rows=[],stopped=[{'reason':'prepatch environment qualification failed; no business scores started'}],
                     environment_controls=control_rows,environment_qualification=environment,perf_capability=capability,
+                    admission={'passed':False,'execution_complete':False,'reason':'environment controls blocked; admission not started'},
                     goal_status='blocked',formal_qualified=False,candidate_accepted=False,scope_window_count=len(control_rows))
                 save(directory/'summary.json',result);return result
+        admission=required_admission(plan,a.root,state,boot,directory/'admission')
+        if admission.get('passed') is not True:
+            result=dict(execution_complete=False,goal_status='blocked',formal_qualified=False,candidate_accepted=False,
+                rows=[],stopped=[{'reason':'actual admission/recovery gate did not pass; retained without retry'}],
+                axes={'admission_complete':False},admission=admission,environment_controls=control_rows,
+                environment_qualification=environment,perf_capability=capability,scope_window_count=len(control_rows))
+            save(directory/'summary.json',result);return result
         for case in plan['cases']:
             failures=0;previous_failure=None;case_rows=[]
             turns=diagnostic_turns(plan,case,followup)
@@ -905,8 +924,9 @@ def diagnostic(a,state,followup=False):
                 candidate_accepted=False,scope=c['scope'])
             save(out/'window.json',control_row)
         expected_rows=sum(len(diagnostic_turns(plan,c,followup)) for c in plan['cases'])
-        axes=diagnostic_axes(plan,rows,expected_rows,stopped,control_row,growth_rows,followup)
+        axes=diagnostic_axes(plan,rows,expected_rows,stopped,control_row,growth_rows,followup,admission)
         result=dict(**axes,axes=axes,rows=rows,stopped=stopped,
+            admission=admission,
             goal_status='unknown' if axes['execution_complete'] else 'blocked',formal_qualified=False,candidate_accepted=False,
             scope=plan['scope'],additional_anomaly_windows=0,environment_controls=control_rows,
             environment_qualification=environment,perf_capability=capability,
@@ -918,6 +938,72 @@ def diagnostic(a,state,followup=False):
         fc.Harness=original
         state['database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
         diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-after.log')
+
+
+def required_admission(plan, root, state, boot, output):
+    """One bounded gate; reuse only success bound to this boot and exact B build.
+
+    Retained failure/interruption is blocked evidence, never an implicit retry.
+    This step deliberately contributes no fixed/diagnostic timed windows.
+    """
+    old=state.setdefault('steps',{}).get('admission')
+    if old:
+        receipt=copy.deepcopy(old.get('result')) if isinstance(old.get('result'),dict) else {}
+        try:
+            matching=(receipt.get('boot_sha256')==boot and receipt.get('binding')==fc.version_identity(plan,'B')
+                and receipt.get('resources')==plan['resources'] and receipt.get('contract')==plan.get('admission',ADMISSION))
+        except Exception:matching=False
+        if old.get('state')=='completed' and matching and receipt.get('passed') is True and receipt.get('execution_complete') is True:
+            return dict(receipt,reused_same_host_build=True)
+        return dict(receipt,passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
+            reason='retained admission is failed, incomplete, or not bound to the current boot/build/resources; no implicit rerun')
+    def execute():
+        receipt=admission_window(plan,output)
+        receipt.update(boot_sha256=boot,resources=copy.deepcopy(plan['resources']),contract=copy.deepcopy(plan.get('admission',ADMISSION)))
+        save(Path(output)/'admission-window.json',receipt)
+        return receipt
+    try:
+        return step(state,root,'admission',execute)
+    except Exception as error:
+        # step retains the failed attempt. Do not turn a driver/setup failure
+        # into a retry or let downstream successful cleanup erase this axis.
+        return dict(passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
+            error=repr(error),reason='admission attempt failed; retained without retry',evidence=str(Path(output)/'admission-window.json'))
+
+
+def admission_window(plan, output):
+    """Finite real C/A/P gate, separate from throughput and normal CPU scores."""
+    output=Path(output);spec=plan['versions']['B'];binding=fc.version_identity(plan,'B')
+    harness=fc.Harness(Path(spec['root']),output);service=None;interrupted=None
+    row=dict(schema='ku-hosted-admission-v1',passed=False,execution_complete=False,
+        binding=binding,source_commit=binding['source_commit'],normal_score_eligible=False,
+        scope='Finite actual admission/recovery; no maximum RPS or Rust comparison')
+    try:
+        service=harness.start(spec.get('stack','ku'),cores=plan['resources']['service_cores'],
+            memory=plan['resources']['service_memory_bytes'],output=output/'service',extra_env=spec.get('env',{}))
+        row['gate']=harness.admission_pressure(service,output/'admission')
+        row['execution_complete']=True
+        row['identity_unchanged']=fc.version_identity(plan,'B')==binding
+    except BaseException as error:
+        row['error']=repr(error)
+        if isinstance(error,(KeyboardInterrupt,SystemExit)):raise
+    finally:
+        if service is not None:
+            try:row['termination']=service.stop()
+            except BaseException as error:
+                row['termination_error']=repr(error)
+                if isinstance(error,(KeyboardInterrupt,SystemExit)):interrupted=error
+        try:row['cleanup']=harness.close()
+        except BaseException as error:
+            row['cleanup_error']=repr(error)
+            if isinstance(error,(KeyboardInterrupt,SystemExit)):interrupted=error
+        row['natural_reclamation']=service is not None and fc.service_termination_succeeded('ku',row.get('termination',{}))
+        row['passed']=bool(row.get('gate',{}).get('passed') is True and row.get('identity_unchanged') is True
+            and row['natural_reclamation'] and 'cleanup_error' not in row and 'error' not in row)
+        row['goal_status']='met' if row['passed'] else 'blocked'
+        save(output/'admission-window.json',row)
+        if interrupted is not None:raise interrupted
+    return row
 
 
 def compiler_plan(versions):
@@ -1019,7 +1105,7 @@ def compiler(a,state):
         state['compiler_database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
 
 
-def acceptance_result(final, capacity, stability, comparison_goal):
+def acceptance_result(final, capacity, stability, comparison_goal, admission=None):
     """Capacity/recovery and continuous evidence are independent required axes."""
     rows=capacity.get('capacity',[]);scenes=[]
     for workload in ['json_object','db']:
@@ -1035,13 +1121,15 @@ def acceptance_result(final, capacity, stability, comparison_goal):
     stable_function=bool(stable_rows) and all(r.get('natural_reclamation') is True and bool(r.get('segments')) and all(
         stream['assessment'].get('functional_valid') is True and stream['assessment'].get('accounting_valid') is True
         for segment in r['segments'] for stream in segment['streams'].values()) for r in stable_rows)
-    functional=bool(final.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in final['rows']) and cap_function and stable_function
+    admission_ok=isinstance(admission,dict) and admission.get('passed') is True and admission.get('execution_complete') is True
+    functional=bool(final.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in final['rows']) and cap_function and stable_function and admission_ok
     cap_status='not_met' if any(x['goal_status']=='not_met' for x in scenes) else 'met' if all(x['goal_status']=='met' for x in scenes) else 'unknown'
     statuses=[comparison_goal,cap_status,'met' if stability.get('formal_qualified') is True else 'unknown']
     known_failure=any(r.get('functional_valid') is False or r.get('accounting_valid') is False for r in final.get('rows',[])+rows)
     goal='not_met' if known_failure or 'not_met' in statuses else 'met' if all(x=='met' for x in statuses) and functional else 'unknown'
-    return {'execution_complete':final.get('execution_complete') is True and capacity.get('execution_complete') is True and stability.get('execution_complete') is True,
-        'goal_status':goal,'functional_acceptance':functional,'functional_axes':{'capacity_recovery':cap_function,'continuous':stable_function},
+    if not admission_ok:goal='blocked'
+    return {'execution_complete':final.get('execution_complete') is True and capacity.get('execution_complete') is True and stability.get('execution_complete') is True and admission_ok,
+        'goal_status':goal,'functional_acceptance':functional,'functional_axes':{'capacity_recovery':cap_function,'continuous':stable_function,'actual_admission':admission_ok},
         'capacity_goals':scenes,'stability_qualified':stability.get('formal_qualified') is True,
         'scope':'completed!=qualified!=goal met; censored capacity remains unknown; candidate adoption separate'}
 

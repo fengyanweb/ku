@@ -12,6 +12,7 @@ import csv
 import gzip
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -1031,6 +1032,209 @@ class Harness:
             result, self.manifest.get('quality_policy'),
             self.manifest.get('environment_qualification'))
         write_json(report, result)
+        return result
+    def admission_pressure(self, service, output):
+        """Finite JSON admission gate; independent from CPU/throughput scoring.
+
+        Keep the raw driver report unchanged, including exit-2 failure evidence.
+        Only the owned driver domain is terminated here; callers own Service.stop.
+        """
+        output = Path(output)
+        output.mkdir(parents=True, exist_ok=True)
+        names = ('admission.json', 'admission-driver.json', 'client.log', 'resources.json',
+                 'environment.json', 'runtime-before.json', 'runtime-after.json', 'driver-cleanup.json')
+        if any((output / name).exists() for name in names):
+            raise RuntimeError('admission evidence already exists; use a fresh output directory')
+        address = getattr(service, 'control_address', None) or getattr(service, 'management_address', None)
+        token = getattr(service, 'control_token', None)
+        if service.stack != 'ku' or not address or not isinstance(token, str) or not token:
+            raise ValueError('admission gate requires a Ku service with its authenticated management ingress')
+        for endpoint in (service.address, address):
+            try:
+                host, port = endpoint.rsplit(':', 1)
+                if not ipaddress.ip_address(host.strip('[]')).is_loopback or not 0 < int(port) < 65536:
+                    raise ValueError()
+            except (ValueError, AttributeError):
+                raise ValueError('admission gate only accepts numeric loopback host:port') from None
+        expected_limits = {'max_connections': 4096, 'max_active_requests': 1024, 'max_pending_requests': 128}
+        if service.startup.get('configured_admission_limits') != expected_limits:
+            raise ValueError('admission gate requires unchanged C=4096 A=1024 P=128')
+        driver_cores = self.manifest.get('driver_cores', 3)
+        if type(driver_cores) is not int or driver_cores < 1:
+            raise ValueError('driver_cores must be a positive integer')
+        os.chown(output, self.uid, self.gid)
+        spec = self.manifest['client']
+        command = [template(x, {'root': self.root}) for x in spec['command']]
+        command += ['--admission-pressure', '--address', service.address,
+                    '--admission-admin-address', address, '--workload', 'json_object',
+                    '--protocol', str(self.protocol), '--output', str(output / 'admission-driver.json')]
+        env = os.environ.copy()
+        env.update({k: str(v) for k, v in spec.get('env', {}).items()})
+        env.setdefault('GOMAXPROCS', str(driver_cores))
+        env['KU_SERVICE_CONTROL_TOKEN'] = token
+        identity = {'kind': 'finite_json_admission_boundary', 'service': service.startup['identity'],
+                    'protocol_sha256': self.identity['protocol_sha256'],
+                    'manifest_sha256': self.identity['manifest_sha256'], 'harness_revision': 1}
+        driver_errors, observer_errors, cleanup_errors = [], [], []
+        interrupted = None
+        def error_text(error):
+            return repr(error).replace(token, '<redacted>')
+        def observe(action, label):
+            nonlocal interrupted
+            try:
+                return action()
+            except BaseException as error:
+                value = {'observation_error': error_text(error)}
+                observer_errors.append(label + ': ' + value['observation_error'])
+                if not isinstance(error, Exception) and interrupted is None:
+                    interrupted = error
+                return value
+        process = sampler = None
+        # Retain ownership even if writing a cgroup setting raises in __init__.
+        domain = Domain.__new__(Domain)
+        before = after = driver_after = runtime_before = runtime_after = None
+        code = None
+        samples = []
+        cleanup = {'launched': False, 'process_reaped': False, 'cgroup_removed': False}
+        environment = {'schema': 'ku-admission-environment-v1', 'measurement_identity': identity,
+                       'command': command, 'expected_limits': expected_limits,
+                       'driver_cores': driver_cores, 'driver_cpuset': self.manifest.get('driver_cpuset', '4-6'),
+                       'driver_memory_bytes': GIB, 'driver_execution_deadline_seconds': 20,
+                       'GOMAXPROCS': env['GOMAXPROCS'], 'token_transport': 'environment_only',
+                       'scope': 'finite admission observation, not a throughput ranking or a new formal environment qualification',
+                       'environment_qualification': self.manifest.get('environment_qualification'),
+                       'database_retry': False}
+        try:
+            Domain.__init__(domain, self, 'driver', driver_cores, GIB, self.manifest.get('driver_cpuset', '4-6'))
+            environment['driver_domain'] = {'path': str(domain.path), 'settings': domain.settings}
+            write_json(output / 'environment.json', environment)
+            before = observe(service.domain.snapshot, 'service_before')
+            runtime_before = observe(service.metrics, 'runtime_before')
+            write_json(output / 'runtime-before.json', runtime_before)
+            domains = [service.domain, domain] + ([self.db_domain] if self.db_domain else [])
+            sampler = Sampler(domains, output / 'resources.json', interval=.25, maximum=160)
+            sampler.start()
+            process = self.launch(command, Path(spec.get('cwd', self.root)), env, domain, output / 'client.log')
+            code = process.wait(timeout=20)
+            if code != 0:
+                driver_errors.append(f'driver exit={code}')
+        except BaseException as error:
+            driver_errors.append(error_text(error))
+            if not isinstance(error, Exception):
+                interrupted = error
+        finally:
+            # No setup/launch/wait/sampling exception bypasses owned cleanup.
+            if hasattr(domain, 'path'):
+                driver_after = observe(domain.snapshot, 'driver_before_cleanup')
+                try:
+                    domain.kill()
+                except BaseException as error:
+                    cleanup_errors.append('kill: ' + error_text(error))
+                    if not isinstance(error, Exception) and interrupted is None:
+                        interrupted = error
+                if process is not None:
+                    try:
+                        process.wait(timeout=3)
+                    except BaseException as error:
+                        cleanup_errors.append('reap: ' + error_text(error))
+                        if not isinstance(error, Exception) and interrupted is None:
+                            interrupted = error
+                cleanup_after = observe(domain.snapshot, 'driver_after_cleanup')
+                if sampler is not None:
+                    try:
+                        # Retain the final cgroup counters before its removal.
+                        samples = sampler.stop()
+                    except BaseException as error:
+                        observer_errors.append('sampler_stop: ' + error_text(error))
+                        if not isinstance(error, Exception) and interrupted is None:
+                            interrupted = error
+                try:
+                    removed = domain.remove()
+                except BaseException as error:
+                    removed = False
+                    cleanup_errors.append('remove: ' + error_text(error))
+                    if not isinstance(error, Exception) and interrupted is None:
+                        interrupted = error
+                process_reaped = process is not None and observe(lambda: process.poll() is not None, 'driver_reaped') is True
+                cleanup.update(launched=process is not None,
+                    exit_code=process.returncode if process is not None else None,
+                    process_reaped=process_reaped,
+                    before=driver_after, after=cleanup_after, cgroup_removed=removed,
+                    cleanup_error='; '.join(cleanup_errors) or None,
+                    scope='owned driver cleanup, never evidence that business admission or recovery passed')
+            try:
+                write_json(output / 'driver-cleanup.json', cleanup)
+            except BaseException as error:
+                observer_errors.append('cleanup_receipt: ' + error_text(error))
+                if not isinstance(error, Exception) and interrupted is None:
+                    interrupted = error
+            after = observe(service.domain.snapshot, 'service_after')
+            runtime_after = observe(service.metrics, 'runtime_after')
+            try:
+                write_json(output / 'runtime-after.json', runtime_after)
+                if not (output / 'environment.json').exists():
+                    write_json(output / 'environment.json', environment)
+            except BaseException as error:
+                observer_errors.append('observation_receipt: ' + error_text(error))
+                if not isinstance(error, Exception) and interrupted is None:
+                    interrupted = error
+        report = output / 'admission-driver.json'
+        driver = None
+        try:
+            if report.stat().st_size > 16 * MIB:
+                raise ValueError('driver JSON exceeds16MiB bound')
+            driver = read_json(report)
+            if not isinstance(driver, dict) or driver.get('schema') != 'ku-admission-pressure-v1':
+                raise ValueError('unexpected admission driver schema')
+        except Exception as error:
+            driver_errors.append('driver_report: ' + error_text(error))
+            driver = {}
+        expected_counts = {'explicit_503': 32, 'planned_cancel': 16, 'correct_200': 1136}
+        counts = driver.get('counts', {})
+        terminal_counts = (isinstance(counts, dict) and set(counts) == set(expected_counts)
+                           and all(type(counts[k]) is int and counts[k] == value for k, value in expected_counts.items()))
+        probes = driver.get('recovery_probe', [])
+        recovery = {'passed': driver.get('resources_recovered') is True
+                    and driver.get('normal_flow_recovered_within_5s') is True
+                    and isinstance(probes, list) and len(probes) == 8
+                    and all(isinstance(row, dict) and row.get('category') == 'correct_200'
+                            and row.get('status') == 200 and row.get('body_bytes') == 1071 for row in probes),
+                    'resources_recovered': driver.get('resources_recovered'),
+                    'normal_flow_recovered_within_5s': driver.get('normal_flow_recovered_within_5s'),
+                    'elapsed_ns': driver.get('recovery_elapsed_ns'), 'probe_count': len(probes) if isinstance(probes, list) else None}
+        if driver.get('passed') is not True or driver.get('formal_throughput_score') is not False:
+            driver_errors.append('driver did not report a successful independent admission gate')
+        if driver.get('expected_limits') != expected_limits or not terminal_counts:
+            driver_errors.append('actual limits or terminal counts differ from the finite admission contract')
+        if not recovery['passed']:
+            driver_errors.append('driver recovery gate did not pass')
+        sampler_error = getattr(sampler, 'error', None)
+        sampler_overflow = getattr(sampler, 'overflow', None)
+        if sampler_error or sampler_overflow or sampler is None:
+            observer_errors.append('resource sampler missing, failed or overflowed')
+        quiet = quiet_metrics('ku', runtime_after, require_database_metrics=False)
+        if isinstance(runtime_after, dict):
+            quiet = quiet and all(row.get('active_requests') == 0 for row in runtime_after.get('loops', []))
+        service_exited = observe(lambda: service.process.poll() is not None, 'service_exit') is not False
+        cleanup_ok = (cleanup.get('process_reaped') is True and cleanup.get('cgroup_removed') is True
+                      and cleanup.get('after', {}).get('process_count') == 0 and not cleanup_errors)
+        passed = (code == 0 and not driver_errors and not observer_errors and cleanup_ok
+                  and quiet and not service_exited and interrupted is None)
+        result = {'schema': 'ku-admission-harness-v1', 'passed': passed,
+                  'formal_throughput_score': False, 'measurement_identity': identity,
+                  'driver_error': '; '.join(driver_errors) or None,
+                  'observer_error': '; '.join(observer_errors) or None,
+                  'driver_exit_code': code, 'driver_passed': driver.get('passed'),
+                  'driver_failure': driver.get('failure'), 'counts': counts, 'recovery': recovery,
+                  'runtime_quiet_after': quiet, 'service_exited': service_exited,
+                  'driver_cleanup_ok': cleanup_ok, 'driver_cleanup': cleanup,
+                  'resource_receipts': {'service_before': before, 'service_after': after,
+                      'driver_before_cleanup': driver_after, 'sample_count': len(samples),
+                      'sampler_error': sampler_error, 'sampler_overflow': sampler_overflow},
+                  'artifacts': {name: str(output / name) for name in names if name != 'admission.json'}}
+        write_json(output / 'admission.json', result)
+        if interrupted is not None:
+            raise interrupted
         return result
     def close(self):
         results = []
