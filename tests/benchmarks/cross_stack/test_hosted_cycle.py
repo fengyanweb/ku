@@ -130,8 +130,8 @@ class HostedCycleTests(unittest.TestCase):
 
 
     def test_run_dispatches_capacity_only_once_after_fixed_windows_and_always_cleans_db(self):
-        for tail_only,fail_final in [(False,False),(False,True),(True,False)]:
-            with self.subTest(tail_only=tail_only,fail_final=fail_final),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+        for tail_only,fail_final,stability_only in [(False,False,False),(False,True,False),(True,False,False),(True,False,True)]:
+            with self.subTest(tail_only=tail_only,fail_final=fail_final,stability_only=stability_only),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
                 root=Path(d);frozen=root/'frozen-plan.json';h.save(frozen,self.plan());original_hash=h.sha(frozen)
                 manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
                 h.save(manifest,{'db_url':'fixture','db_cgroup':'/unused','database':{}})
@@ -166,14 +166,15 @@ class HostedCycleTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError,'fixed-window failure'):h.run(args,state)
                     self.assertEqual(calls,[('control','all'),('final','all')])
                 else:
-                    result=h.run(args,state,tail_only=tail_only);self.assertTrue(result['execution_complete'])
-                    expected=[('control','all')]+([] if tail_only else [('final','all')])+[('capacity-json_object','capacity'),('capacity-db','capacity'),('stability','stability')]
+                    result=h.run(args,state,tail_only=tail_only,stability_only=stability_only);self.assertTrue(result['execution_complete'])
+                    expected=[('control','all')]+([] if tail_only else [('final','all')])+([] if stability_only else [('capacity-json_object','capacity'),('capacity-db','capacity')])+[('stability','stability')]
                     self.assertEqual(calls,expected)
                     if tail_only:
                         self.assertFalse(result['fixed_matrix_executed']);self.assertFalse(result['cross_host_pooling'])
                         self.assertEqual(result['goal_status'],'unknown');self.assertNotIn('final',state['steps'])
                         self.assertFalse((root/'final-plan.json').exists())
-                        self.assertEqual(set(result['axes']),{'control','capacity','stability'})
+                        self.assertEqual(result['capacity_executed'],not stability_only)
+                        self.assertEqual(set(result['axes']),{'control','stability'} if stability_only else {'control','capacity','stability'})
                 self.assertEqual(cleaned,['stop']);self.assertIs(fc.Harness,old_harness)
                 self.assertEqual(h.sha(frozen),original_hash)
                 self.assertIn('capacity',h.load(frozen));self.assertIn('stability',h.load(frozen))

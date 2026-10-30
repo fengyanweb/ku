@@ -6,16 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'full runs gates; performance-v2 runs core; performance-v2-builds runs compiler; performance-v2-finish runs tail then compiler'
+        description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation]
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -401,7 +401,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation')
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -495,6 +495,8 @@ jobs:
             performance_phases=(compiler)
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-finish ]; then
             performance_phases=(tail compiler)
+          elif [ "$KU_PERFORMANCE_V2_SCOPE" = performance-v2-validation ]; then
+            performance_phases=(lifecycle compiler)
           fi
           for performance_phase in "${performance_phases[@]}"; do
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" \
@@ -528,7 +530,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

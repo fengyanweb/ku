@@ -176,7 +176,8 @@ def environment_record(summary, destination):
     save(destination,record);return record
 
 
-def run(a,state,tail_only=False):
+def run(a,state,tail_only=False,stability_only=False):
+    if stability_only and not tail_only:raise ValueError('stability-only requires tail scope')
     if os.geteuid()!=0:raise ValueError('run requires root cgroup control')
     boot=hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()
     if state.setdefault('run_boot_sha256',boot)!=boot:raise ValueError('resume across hosts/boots forbidden; new root required')
@@ -217,16 +218,19 @@ def run(a,state,tail_only=False):
                     results.append(execute('capacity-'+kind,config,'capacity'))
                 return {'capacity':[r for result in results for r in result['capacity']],
                     'execution_complete':all(r.get('execution_complete') is True for r in results),'goal_status':'unknown'}
-            step(state,a.root,'capacity',capacities,resume=True)
+            if not stability_only:step(state,a.root,'capacity',capacities,resume=True)
             if not state['steps'].get('stability'):
                 execute('stability',plan,'stability') # once-only; no resume/replacement of continuous evidence
         else:state['deferred']={'capacity':'confirmed function/accounting failure','stability':'same candidate; not retried'}
         if tail_only:
             capacity=state['steps'].get('capacity',{}).get('result',{})
             continuous=state['steps'].get('stability',{}).get('result',{})
-            return {'execution_complete':all(x.get('execution_complete') is True for x in [summary,capacity,continuous]),
+            required=[summary,continuous] if stability_only else [summary,capacity,continuous]
+            axes={'control':summary,'stability':continuous}
+            if not stability_only:axes['capacity']=capacity
+            return {'execution_complete':all(x.get('execution_complete') is True for x in required),
                 'goal_status':'unknown','fixed_matrix_executed':False,'cross_host_pooling':False,
-                'axes':{'control':summary,'capacity':capacity,'stability':continuous},
+                'capacity_executed':not stability_only,'axes':axes,
                 'environment_quality':environment['quality'],'candidate_accepted':False,
                 'scope':'tail on this instance only; no fixed-matrix rows imported, fabricated or pooled across hosts'}
         core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='full_cpu_us' else 1) for t in plan['targets']
@@ -434,7 +438,7 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','tail','compiler','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -448,10 +452,11 @@ def main(argv=None):
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
-        if a.phase in ('run','tail','compiler'):signal.alarm(130*60-30)
-        operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),'compiler':compiler}[a.phase]
-        result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','compiler'))
+        if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm(130*60-30)
+        operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
+            'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler}[a.phase]
+        result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','lifecycle','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 2 if a.phase=='tail' and result.get('execution_complete') is not True else 0
+    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle') and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
