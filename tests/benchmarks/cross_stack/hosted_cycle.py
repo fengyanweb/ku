@@ -176,7 +176,7 @@ def environment_record(summary, destination):
     save(destination,record);return record
 
 
-def run(a,state):
+def run(a,state,tail_only=False):
     if os.geteuid()!=0:raise ValueError('run requires root cgroup control')
     boot=hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()
     if state.setdefault('run_boot_sha256',boot)!=boot:raise ValueError('resume across hosts/boots forbidden; new root required')
@@ -205,8 +205,9 @@ def run(a,state):
             orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
         control.pop('stop_after_consecutive_unusable_windows',None)
         summary=execute('control',control,'all');environment=environment_record(summary,a.root/'environment-qualification.json')
-        final=execute('final',fixed,'all')
-        function_ok=bool(final.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in final['rows'])
+        final=None if tail_only else execute('final',fixed,'all')
+        checked=summary if tail_only else final
+        function_ok=bool(checked.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in checked['rows'])
         if function_ok:
             def capacities():
                 results=[]
@@ -220,6 +221,14 @@ def run(a,state):
             if not state['steps'].get('stability'):
                 execute('stability',plan,'stability') # once-only; no resume/replacement of continuous evidence
         else:state['deferred']={'capacity':'confirmed function/accounting failure','stability':'same candidate; not retried'}
+        if tail_only:
+            capacity=state['steps'].get('capacity',{}).get('result',{})
+            continuous=state['steps'].get('stability',{}).get('result',{})
+            return {'execution_complete':all(x.get('execution_complete') is True for x in [summary,capacity,continuous]),
+                'goal_status':'unknown','fixed_matrix_executed':False,'cross_host_pooling':False,
+                'axes':{'control':summary,'capacity':capacity,'stability':continuous},
+                'environment_quality':environment['quality'],'candidate_accepted':False,
+                'scope':'tail on this instance only; no fixed-matrix rows imported, fabricated or pooled across hosts'}
         core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='full_cpu_us' else 1) for t in plan['targets']
             if t['numerator']=='B' and ((t['contract']=='dom' and t['denominator']=='R') or (t['contract']=='pg-shared' and t['denominator']=='RS'))]
         core_plan=dict(plan,targets=core_targets);core=fc.compare_goals(core_plan,final.get('rows',[]))
@@ -425,7 +434,7 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','compiler','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','tail','compiler','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -439,9 +448,10 @@ def main(argv=None):
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
-        if a.phase in ('run','compiler'):signal.alarm(130*60-30)
-        result=step(state,a.root,a.phase,lambda:(build if a.phase=='build' else compiler if a.phase=='compiler' else run)(a,state),resume=a.phase in ('run','compiler'))
+        if a.phase in ('run','tail','compiler'):signal.alarm(130*60-30)
+        operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),'compiler':compiler}[a.phase]
+        result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 0
+    print(json.dumps(result));return 2 if a.phase=='tail' and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
