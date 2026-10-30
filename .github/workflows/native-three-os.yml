@@ -257,7 +257,7 @@ jobs:
           set -euo pipefail
           cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
           cargo test --release --locked --test native_run_test \
-            native_object_insertion_reuses_probe_and_relocates_after_rehash -- --exact --nocapture --test-threads=1
+            native_object_insertion_preserves_collisions_ownership_and_oom -- --exact --nocapture --test-threads=1
           cargo test --release --locked \
             --test native_http_test \
             --test native_task_source_test \
