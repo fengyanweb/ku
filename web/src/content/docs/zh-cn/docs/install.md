@@ -73,6 +73,8 @@ Windows 打开“编辑账户的环境变量”，编辑用户 `Path`，新增�
 
 `ku run`、`ku check` 和 `ku ./hello.ku` 只需对应平台的 CLI。原公开包的默认 `ku build` 使用 Rust **1.89.0** 编译的随包运行时，另需匹配的 Rust 和系统链接器；它不会因为系统 Rust 升级而自动重编。选到其他版本时可能报 E0514，见[构建排查](/zh-cn/docs/guide/errors/#runner-build)。
 
+Windows 的 MSVC Runner 还需要 Visual Studio Build Tools 的 C++ 工具与 Windows SDK；`ku doctor --install-runner-toolchain` 只安装 Rust，不会安装这些系统组件。
+
 `ku build --backend c --release hello.ku -o hello` 是独立的 C 原生构建，需要目标 C 编译器和链接器。Windows 输出使用 `hello.exe`。native 数据库程序还需匹配的数据库客户端库，这些库不包含在平台包内。
 
 </details>

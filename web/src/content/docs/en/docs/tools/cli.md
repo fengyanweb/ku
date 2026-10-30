@@ -14,7 +14,7 @@ sources:
 
 Use `ku -v` to print the version and `ku --help` for the installed CLI's top-level help.
 
-> **Fix-candidate status:** the existing shorthands below apply to 0.0.19. The separately marked `doctor` and unified subcommand-help sections describe this development branch's fix candidate, not the original public 0.0.19 package. Download links still identify the original published assets.
+> **Fix candidate:** `doctor` and unified subcommand help are not yet released; the original public 0.0.19 download does not include them.
 
 ## Everyday commands
 
@@ -93,6 +93,8 @@ Prefix special filenames with a relative path, such as `ku ./-hello.ku`, or `ku 
 
 `check`, `run` and implicit execution need no Rust/C compiler. Runner embeds the entry file only; local imports still need their original module sources at runtime. Native C expands the import graph into a program independent of Ku source. Default output is under `.ku/build/<profile>/`; use the actual path printed by the CLI. Give Windows executables an `.exe` suffix.
 
+The LLVM backend writes text IR and then returns nonzero because executable linking is not supported; this is not a successful executable build.
+
 ### Historical `--native`
 
 Existing calls are preserved. Prefer explicit `--backend c` in new commands:
@@ -167,5 +169,3 @@ These values are the supervisor's defaults made explicit. Numeric durations are 
 The control listener exposes `GET /status`, `GET /metrics` and `POST /stop` with `X-Ku-Control-Token` authentication. It manages health, admission/drain and bounded restart of one service instance; it is not a request proxy or database retry mechanism. Managed-program stdout/stderr go to the null device in this mode; use its control metrics rather than assuming application logs are retained.
 
 Without memory options this ordinary mode does not enforce an OS memory ceiling. Explicit memory mode requires **both** `--worker-memory-bytes` and `--total-memory-bytes`; Linux additionally needs a delegated `--cgroup-root`. Read [platform limits](/en/docs/support/) first. Native macOS rejects this hard-limit mode while allowing ordinary supervision. Metrics distinguish current state and failures; successful health does not prove a business SLO or stable production backend.
-
-The LLVM backend writes text IR and then returns nonzero because executable linking is not supported; this is not a successful executable build.

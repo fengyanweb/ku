@@ -37,6 +37,28 @@ OWNER = load("consume_owner", "verify-native-three-os.py")
 OWNER.MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 
 
+def write_report(path, value):
+    """Serialize UTF-8 before opening anything; replace only a complete file.
+
+    A serialization/encoding/write failure leaves the last valid report intact.
+    The temporary file is owned, in the same directory, and always cleaned.
+    """
+    contents = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", prefix="." + path.name + ".", suffix=".writing", dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(contents)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 @contextmanager
 def environment(values):
     original = dict(os.environ)
@@ -56,7 +78,7 @@ def output(result):
 def invoke(command, cwd, env, seconds=300):
     OWNER.COMMAND_TIMEOUT_SECONDS = seconds
     with environment(env):
-        return OWNER.run_bounded([str(p) for p in command], cwd, "Runner archive consumer")
+        return OWNER.run_bounded([str(p) for p in command], cwd, "Runner archive consumer", check=False)
 
 
 def checked(command, cwd, env):
@@ -88,8 +110,15 @@ def run(args, report):
     rustup = str(Path(rustup).resolve())
     base_env = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
     before_default = checked([rustup, "default"], repo, base_env)
+    verifier_commit = checked(['git', 'rev-parse', 'HEAD'], repo, base_env).strip()
+    if len(verifier_commit) != 40 or any(c not in '0123456789abcdef' for c in verifier_commit):
+        raise ValueError('verification source commit is not a full Git SHA')
+    if args.expected_sdk_commit is not None and metadata['commit'] != args.expected_sdk_commit:
+        raise ValueError('archive source identity differs from the selected installer run')
     target = metadata["target"]
     report.update(schema="ku-runtime-consumer-v1", source_commit=metadata["commit"],
+                  sdk_source_commit=metadata["commit"], verification_code_commit=verifier_commit,
+                  installer_run_id=args.installer_run, verification_run_id=os.environ.get("GITHUB_RUN_ID"),
                   target=target, archive_sha256=metadata["sha256"], cases=[], status="running")
     with tempfile.TemporaryDirectory(prefix="ku-runner-consumer-") as temporary:
         root = Path(temporary).resolve()
@@ -130,7 +159,7 @@ def run(args, report):
         def record(name, result, expected_exit="zero"):
             report["cases"].append(dict(name=name, exit_code=result.returncode, expected_exit=expected_exit,
                 stdout_sha256=hashlib.sha256(result.stdout).hexdigest(), stderr_sha256=hashlib.sha256(result.stderr).hexdigest()))
-            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+            write_report(args.output, report)
 
         def success(name, arguments, wanted=None, selected_env=None, working=None):
             result = invoke([ku, *arguments], working or project, selected_env or env)
@@ -288,7 +317,7 @@ def run(args, report):
             mod = project / 'ku.mod'
             if mod.exists():
                 raise RuntimeError('contract fixture already has a project manifest')
-            mod.write_text('name = "hello"\nversion = "0.1.0"\nroot = "."\nmain = "hello.ku"\ncache = ".ku/cache"\nout = ".ku/build"\n')
+            mod.write_text('name = "hello"\nversion = "0.1.0"\nroot = "."\nmain = "hello.ku"\ncache = ".ku/cache"\nout = ".ku/build"\n', encoding='utf-8')
             try:
                 success('contract-project-run-omitted', ['run'], expected)
                 success('contract-project-check-omitted', ['check'])
@@ -312,7 +341,7 @@ def run(args, report):
         # the user's original unidentified E:\ package. Unlike rustc directly
         # reading this package must reject its incompatible crate metadata.
         mismatch_source = root / 'compiler_mismatch.rs'
-        mismatch_source.write_text('extern crate ku; fn main() { println!("{}", ku::cli::help_text()); }\n')
+        mismatch_source.write_text('extern crate ku; fn main() { println!("{}", ku::cli::help_text()); }\n', encoding="utf-8")
         mismatch = invoke([consumer_path, '--edition=2021', '--crate-name', 'ku_consumer_mismatch',
                            mismatch_source, '--extern', 'ku=' + str(install / 'libku.rlib'),
                            '-L', 'dependency=' + str(install / 'deps'), '-o', root / 'must-not-build'], project, base_env)
@@ -393,7 +422,7 @@ def run(args, report):
 
         # Add a genuinely incompatible libku with newer mtime, not a text mock.
         fake_source = root / "fake.rs"
-        fake_source.write_text("pub fn wrong_library() {}\n")
+        fake_source.write_text("pub fn wrong_library() {}\n", encoding="utf-8")
         wrong = install / "deps/libku-0000000000000000.rlib"
         result = invoke([consumer_path, "--crate-type", "rlib", "--crate-name", "ku", fake_source, "-o", wrong], project, base_env)
         if result.returncode:
@@ -412,7 +441,7 @@ def run(args, report):
             failure("missing-manifest-no-development-fallback")
         finally:
             (root / "missing-manifest").rename(runtime_path)
-        dependencies = json.loads(deps_path.read_text())
+        dependencies = json.loads(deps_path.read_text(encoding="utf-8"))
         dependency = install / dependencies["files"][-1]["path"]
         with changed(dependency, b"not the matching same-build dependency"):
             failure("mixed-or-corrupt-dependency")
@@ -429,7 +458,7 @@ def run(args, report):
         mixed["runtime_target"] = "x86_64-pc-windows-gnu" if os.name == "nt" else "x86_64-pc-windows-msvc"
         with changed(runtime_path, json.dumps(mixed).encode()):
             failure("target-ABI-mismatch")
-        escaped = json.loads(deps_path.read_text())
+        escaped = json.loads(deps_path.read_text(encoding="utf-8"))
         escaped["files"][0]["path"] = "../outside.rlib"
         escaped_bytes = json.dumps(escaped).encode()
         mixed = json.loads(original_manifest)
@@ -463,7 +492,7 @@ def run(args, report):
         # Common immutable env for both processes; no per-thread env mutation.
         OWNER.COMMAND_TIMEOUT_SECONDS = 300
         with environment(env), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer") for i in range(2)]
+            futures = [pool.submit(OWNER.run_bounded, [str(ku), "build", "hello.ku", "-o", str(project / ("parallel-" + str(i)))], project, "parallel Runner consumer", check=False) for i in range(2)]
             for i, future in enumerate(futures):
                 result = future.result()
                 record("parallel-build-" + str(i), result)
@@ -550,6 +579,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--consumer-toolchain", default="1.96.0")
     parser.add_argument("--hide-checkout", action="store_true")
+    parser.add_argument("--installer-run")
+    parser.add_argument("--expected-sdk-commit")
     args = parser.parse_args()
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -560,7 +591,7 @@ def main():
         report.update(status="failed", failure=type(error).__name__ + ": " + str(error)[-6000:])
         raise
     finally:
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        write_report(args.output, report)
 
 
 if __name__ == "__main__":

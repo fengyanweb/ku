@@ -29,6 +29,49 @@ EXPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPORT)
 
 
+class RuntimeConsumerReportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('ku_runtime_consumer_report', Path(__file__).with_name('consume-runtime-bundle.py'))
+        assert spec and spec.loader
+        cls.consumer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.consumer)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='ku-consumer-report-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.path = self.root / '中文 report.json'
+        self.original = b'{"status":"last valid report"}\n'
+        self.path.write_bytes(self.original)
+
+    def test_report_is_utf8_even_under_cp1252_text_default(self):
+        value = {'path': '搬迁 中文 空格', 'failure': '库版本错误 😀'}
+        with mock.patch('io.text_encoding', return_value='cp1252'):
+            self.consumer.write_report(self.path, value)
+        self.assertEqual(json.loads(self.path.read_bytes().decode('utf-8')), value)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_serialization_or_encoding_failure_preserves_original(self):
+        for value, error in (({'not_json': object()}, TypeError), ({'invalid_unicode': '\ud800'}, UnicodeEncodeError), ({'not_finite': float('nan')}, ValueError)):
+            with self.subTest(error=error.__name__), self.assertRaises(error):
+                self.consumer.write_report(self.path, value)
+            self.assertEqual(self.path.read_bytes(), self.original)
+            self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_replace_failure_cleans_private_file_and_preserves_original(self):
+        with mock.patch.object(self.consumer.os, 'replace', side_effect=PermissionError('replace denied')), self.assertRaises(PermissionError):
+            self.consumer.write_report(self.path, {'status': 'next complete report'})
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_write_failure_cleans_private_file_and_preserves_original(self):
+        with mock.patch.object(self.consumer.os, 'fsync', side_effect=OSError('disk write failed')), self.assertRaises(OSError):
+            self.consumer.write_report(self.path, {'status': 'next complete report'})
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+
 class ReleaseExportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ku-export-test-")

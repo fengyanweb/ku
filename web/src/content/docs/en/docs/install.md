@@ -73,6 +73,8 @@ Compare the archive’s SHA-256 with [SHA256SUMS](https://github.com/fengyanweb/
 
 `ku run`, `ku check` and `ku ./hello.ku` need the platform CLI only. The original public package includes a Runner runtime compiled by Rust **1.89.0**; default `ku build` additionally needs matching Rust and a system linker. Upgrading system Rust does not rebuild that runtime. Selecting another version may produce E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
 
+The Windows MSVC Runner also requires the Visual Studio Build Tools C++ tools and Windows SDK. `ku doctor --install-runner-toolchain` installs Rust only, not these system components.
+
 `ku build --backend c --release hello.ku -o hello` is a separate C-native path requiring a target C compiler and linker. Use `hello.exe` on Windows. Native database programs also need matching database client libraries, which are not bundled.
 
 </details>
