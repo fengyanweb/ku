@@ -1281,7 +1281,8 @@ fn native_http_routing_matches_interpreter() {
     assert!(generated.contains("ku_http_socket_nonblocking(cli)"));
     assert!(generated.contains("send(socket_value, data, chunk, MSG_NOSIGNAL)"));
     assert!(generated.contains("setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE"));
-    assert!(generated.contains("pthread_create(&worker, &attributes, ku_http_worker, &ctx)"));
+    assert!(generated.contains("pthread_create(&worker,&attributes,ku_http_worker,context)"));
+    assert!(generated.contains("context->threads[context->spawned++]=worker;"));
     assert!(generated.contains("pthread_join(workers[w], NULL)"));
     assert!(generated.contains("#define KU_HTTP_ACCEPT_PEER_BACKOFF_CAP_MS 8"));
     assert!(generated.contains("#define KU_HTTP_ACCEPT_RESOURCE_RETRY_CAP 8"));
@@ -9151,7 +9152,10 @@ int main(int argc,char** argv) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"http-utf8-differential-and-guard-page-ok\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-utf8-differential-and-guard-page-ok\n"
+    );
 }
 
 #[test]
@@ -9402,7 +9406,7 @@ int main(void) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        output.stdout,
-        b"http-elastic-workers-full-capacity-and-retirement-ok\n"
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "http-elastic-workers-full-capacity-and-retirement-ok\n"
     );
 }

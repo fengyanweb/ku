@@ -2897,6 +2897,7 @@ typedef struct KuHttpLoopOwner {
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   size_t active_requests,peak_active_requests;
   KuHttpWake* wake;
+  KuHttpQueue* handler_queue; /* Lifetime protected by group->lock. */
   int task_work_pending; /* Only this event owner reads/writes Task self-work. */
 #if defined(_WIN32)
   HANDLE thread;
@@ -2930,6 +2931,19 @@ static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint
     return;
   }
   owner->cpu_ns=cpu_ns; owner->cpu_sample_ms=sampled_ms;
+}
+/* Management may run while an owner sleeps through a pure worker CLAIM.
+ * Hold group->lock for the queue's published lifetime, then take queue->lock.
+ * Workers never acquire group->lock while holding queue->lock. Reading live
+ * counters here preserves observation without waking HTTP for telemetry. */
+static void ku_http_owner_queue_sample_locked(KuHttpLoopOwner* owner) {
+  KuHttpQueue* queue=owner->handler_queue;
+  if(!queue)return;
+  ku_http_mutex_lock(&queue->lock);
+  owner->queued=(size_t)queue->count;owner->running=queue->running;
+  owner->resident=queue->resident;owner->queued_bytes=queue->queued_bytes;
+  owner->peak_queued_bytes=queue->peak_queued_bytes;
+  ku_http_mutex_unlock(&queue->lock);
 }
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
@@ -3262,6 +3276,7 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     used = (size_t)n;
     for (int i=0; i<group->created; i++) {
       KuHttpLoopOwner* owner = &group->loops[i];
+      ku_http_owner_queue_sample_locked(owner);
       uint64_t sampled_now=ku_http_now_ms();
       uint64_t sample_age=sampled_now>=owner->cpu_sample_ms ? sampled_now-owner->cpu_sample_ms : 0;
       n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"active_requests\":%llu,\"peak_active_requests\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu,\"handler_workers\":%llu,\"max_handler_workers\":%d}",
@@ -3279,6 +3294,7 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     ku_http_mutex_lock(&group->lock);
     for (int i=0;i<group->created;i++) {
       KuHttpLoopOwner* owner=&group->loops[i];
+      ku_http_owner_queue_sample_locked(owner);
       n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
         owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes);
       if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
@@ -4088,7 +4104,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
   const char* listen_failure = worker_start_failed ? "handler thread startup failed" : NULL;
   ku_http_mutex_lock(&group->lock);
-  owner->wake = &wake; owner->ready = !listen_failure;
+  owner->wake = &wake; owner->handler_queue=&queue; owner->ready = !listen_failure;
   if (listen_failure) group->failure = listen_failure;
   ku_http_mutex_unlock(&group->lock);
   ku_http_wake_notify(&group->wake);
@@ -4731,8 +4747,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
   }
   free(workers);
+  ku_http_mutex_lock(&group->lock);
+  owner->handler_queue=NULL;owner->wake=NULL;
+  ku_http_mutex_unlock(&group->lock);
   ku_http_queue_free(&queue);
-  ku_http_mutex_lock(&group->lock); owner->wake = NULL; ku_http_mutex_unlock(&group->lock);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   ku_http_reactor_delete(&reactor,(size_t)slot_count);
 #endif
