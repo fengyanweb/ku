@@ -4319,42 +4319,13 @@ static bool ku_object_try_rehash(KuObject* object) {
   return true;
 }
 
-/* Both setters have already proved this key absent and found an empty slot.
- * Only table growth invalidates that slot. No ownership changes before all
- * fallible work succeeds; callers retain both payloads on false. */
-static bool ku_object_try_insert_empty_owned(
-    KuObject* object, KuString* key, KuValue* value, uint64_t hash, size_t index) {
-  if (index >= object->cap || object->entries[index].used)
-    ku_object_internal_fail("invalid object insertion slot");
-  size_t threshold = object->cap - object->cap / 4;
-  if (object->len == SIZE_MAX) return false;
-  if (object->len + 1 >= threshold) {
-    if (!ku_object_try_rehash(object)) return false;
-    /* Rehash changed the table, so only the saved hash remains valid. The
-     * common no-growth insertion keeps its already-probed empty slot. */
-    size_t mask = object->cap - 1;
-    index = (size_t)hash & mask;
-    for (size_t probes = 0; probes < object->cap; probes++) {
-      if (!object->entries[index].used) break;
-      index = (index + 1) & mask;
-    }
-  }
-  if (object->entries[index].used) ku_object_internal_fail("object hash table probe exhausted");
-  object->entries[index].key = ku_string_move(key);
-  object->entries[index].value = ku_value_move(value);
-  object->entries[index].used = true;
-  object->len++;
-  return true;
-}
-
 /* On failure both key and value remain owned by the caller. */
 static bool ku_object_try_set_owned(
     KuObject* object, KuString* key, KuValue* value) {
   ku_object_require_valid(object);
   if (!key || !value) ku_object_internal_fail("invalid object insertion value");
-  uint64_t hash = ku_obj_hash(*key);
   size_t mask = object->cap - 1;
-  size_t index = (size_t)hash & mask;
+  size_t index = (size_t)ku_obj_hash(*key) & mask;
   for (size_t probes = 0; probes < object->cap; probes++) {
     if (!object->entries[index].used) break;
     if (ku_string_equal(object->entries[index].key, *key)) {
@@ -4365,7 +4336,14 @@ static bool ku_object_try_set_owned(
     }
     index = (index + 1) & mask;
   }
-  return ku_object_try_insert_empty_owned(object, key, value, hash, index);
+  size_t threshold = object->cap - object->cap / 4;
+  if (object->len == SIZE_MAX) return false;
+  if (object->len + 1 >= threshold && !ku_object_try_rehash(object)) return false;
+  KuString moved_key = ku_string_move(key);
+  KuValue moved_value = ku_value_move(value);
+  ku_object_insert_raw(object->entries, object->cap, moved_key, moved_value);
+  object->len++;
+  return true;
 }
 
 /* The key is borrowed. Replacing an existing entry neither allocates nor
@@ -4375,9 +4353,8 @@ static bool ku_object_try_set_copy_key(
     KuObject* object, KuString key, KuValue* value) {
   ku_object_require_valid(object);
   if (!value) ku_object_internal_fail("invalid object insertion value");
-  uint64_t hash = ku_obj_hash(key);
   size_t mask = object->cap - 1;
-  size_t index = (size_t)hash & mask;
+  size_t index = (size_t)ku_obj_hash(key) & mask;
   for (size_t probes = 0; probes < object->cap; probes++) {
     if (!object->entries[index].used) break;
     if (ku_string_equal(object->entries[index].key, key)) {
@@ -4389,7 +4366,7 @@ static bool ku_object_try_set_copy_key(
   }
   KuString owned_key = (KuString){0};
   if (!ku_object_string_try_clone(key, &owned_key)) return false;
-  if (ku_object_try_insert_empty_owned(object, &owned_key, value, hash, index)) return true;
+  if (ku_object_try_set_owned(object, &owned_key, value)) return true;
   ku_string_drop(&owned_key);
   return false;
 }
