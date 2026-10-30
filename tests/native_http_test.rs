@@ -5878,6 +5878,188 @@ int main(void) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("http-wake-coalescing-ok"));
 }
 
+#[cfg(unix)]
+#[test]
+fn native_http_task_self_wake_keeps_late_work_and_cross_thread_retirement() {
+    let runtime = include_str!("../src/backend/c_http_runtime.c").replace("\r\n", "\n");
+    let wake_start = runtime
+        .find("typedef struct {\n  KuHttpSocket read_socket;")
+        .unwrap();
+    let wake_end = runtime[wake_start..]
+        .find("/* Payload/request-map quota")
+        .unwrap()
+        + wake_start;
+    let wake = runtime[wake_start..wake_end].replacen(
+        "static void ku_http_wake_notify(KuHttpWake* wake) {",
+        "static void ku_http_wake_notify(KuHttpWake* wake) {\n  fixture_before_notify(wake);",
+        1,
+    );
+    let task_start = runtime
+        .find("static int ku_http_task_take_owner_work(")
+        .unwrap();
+    let task_end = runtime[task_start..].find("\n#endif").unwrap() + task_start;
+    let task = &runtime[task_start..task_end];
+    let late_start = runtime
+        .find("    if(ku_http_task_take_owner_work(owner)) {")
+        .unwrap();
+    let late_end = runtime[late_start..].find("\n    }").unwrap() + late_start + 6;
+    let late = &runtime[late_start..late_end];
+    assert!(runtime.contains("owner_work|=owner->task_work_pending;"));
+    assert!(late_start > runtime.find("reactor.old_net_count=net_count;").unwrap());
+    assert!(late_end < runtime.find("int selected=ku_http_reactor_wait(").unwrap());
+    let header = r#"
+#define _GNU_SOURCE
+#define _DARWIN_C_SOURCE
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+typedef int KuHttpSocket;
+typedef _Atomic size_t KuAtomicRefcount;
+#define KU_HTTP_INVALID_SOCKET (-1)
+#define KU_THREAD_LOCAL _Thread_local
+#include <time.h>
+#define CHECK(c) do { if(!(c)) { fprintf(stderr,"task wake line %d: %s\n",__LINE__,#c); exit(97); } } while(0)
+static int ku_http_socket_last_error(void) { return errno; }
+static int ku_http_socket_would_block(int e) { return e==EAGAIN || e==EWOULDBLOCK; }
+static int ku_http_socket_error_interrupted(int e) { return e==EINTR; }
+static void ku_http_socket_close(KuHttpSocket s) { if(s>=0) close(s); }
+static int ku_http_socket_nonblocking(KuHttpSocket s) { int f=fcntl(s,F_GETFL,0); return f>=0 && !fcntl(s,F_SETFL,f|O_NONBLOCK); }
+static int ready(KuHttpSocket s,int timeout) { struct pollfd f={s,POLLIN,0}; return poll(&f,1,timeout)>0 && (f.revents&POLLIN); }
+static void fixture_before_notify(void*);
+"#;
+    let model = r#"
+/* Field-only group model; the exact production callback/late-wait block below
+ * runs against real mutexes, native wake pipes and independently created TLS. */
+typedef pthread_mutex_t KuHttpMutex;
+typedef struct KuHttpLoopGroup KuHttpLoopGroup;
+typedef struct KuHttpLoopOwner {
+  KuHttpLoopGroup* group; int index; KuHttpWake* wake; int task_work_pending;
+} KuHttpLoopOwner;
+struct KuHttpLoopGroup {
+  KuHttpMutex lock; int created,draining,tasks_closing;
+  KuHttpWake wake; KuHttpLoopOwner loops[2];
+};
+static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
+static void ku_http_mutex_lock(KuHttpMutex* m) { CHECK(!pthread_mutex_lock(m)); }
+static void ku_http_mutex_unlock(KuHttpMutex* m) { CHECK(!pthread_mutex_unlock(m)); }
+static KuHttpWake* fixture_gated_wake;
+static KuTestEvent fixture_notify_entered,fixture_notify_release;
+static void fixture_before_notify(void* raw) {
+  if(raw==fixture_gated_wake) {
+    CHECK(ku_test_event_set(&fixture_notify_entered));
+    CHECK(ku_test_event_wait(&fixture_notify_release,2000u));
+  }
+}
+"#;
+    let checks = r#"
+typedef struct { KuHttpLoopGroup* group; size_t target; } FixturePublication;
+static int fixture_worker_publish(void* raw) {
+  FixturePublication* p=(FixturePublication*)raw;
+  CHECK(!ku_http_current_loop);
+  ku_http_task_event_wake(p->group,p->target);
+  return 0;
+}
+static void fixture_late_wait(KuHttpLoopOwner* owner,int* wait,int* urgent,int* bootstrap) {
+  int wait_ms=*wait,task_io_structural_urgent=*urgent,task_io_probe_can_bootstrap=*bootstrap;
+@LATE@
+  *wait=wait_ms;*urgent=task_io_structural_urgent;*bootstrap=task_io_probe_can_bootstrap;
+}
+int main(void) {
+  KuHttpLoopGroup group={0},other={0}; KuHttpWake wakes[2];
+  CHECK(!pthread_mutex_init(&group.lock,NULL));CHECK(ku_http_wake_init(&group.wake));
+  CHECK(ku_test_event_init(&fixture_notify_entered));CHECK(ku_test_event_init(&fixture_notify_release));
+  group.created=2;
+  for(int i=0;i<2;i++) {
+    CHECK(ku_http_wake_init(&wakes[i]));group.loops[i].group=&group;
+    group.loops[i].index=i;group.loops[i].wake=&wakes[i];
+  }
+  ku_http_current_loop=&group.loops[0];
+  for(int i=0;i<16;i++)ku_http_task_event_wake(&group,0u);
+  CHECK(group.loops[0].task_work_pending && !ready(wakes[0].read_socket,0));
+  int wait=-1,urgent=0,bootstrap=1;
+  fixture_late_wait(&group.loops[0],&wait,&urgent,&bootstrap);
+  CHECK(wait==0 && urgent && !bootstrap && !group.loops[0].task_work_pending);
+  wait=123;urgent=0;bootstrap=1;
+  fixture_late_wait(&group.loops[0],&wait,&urgent,&bootstrap);
+  CHECK(wait==123 && !urgent && bootstrap); /* No permanent zero-time poll. */
+  CHECK(!group.loops[0].task_work_pending); /* Earlier eligibility saw no work. */
+  ku_http_task_event_wake(&group,0u); /* A late same-thread publication. */
+  wait=-1;urgent=0;bootstrap=1;fixture_late_wait(&group.loops[0],&wait,&urgent,&bootstrap);
+  CHECK(wait==0 && urgent && !bootstrap && !ready(wakes[0].read_socket,0));
+  ku_http_task_event_wake(&group,1u);
+  CHECK(!group.loops[1].task_work_pending && ready(wakes[1].read_socket,2000));
+  ku_http_wake_drain(&wakes[1]);
+  KuHttpLoopOwner impostor=group.loops[0];ku_http_current_loop=&impostor;
+  ku_http_task_event_wake(&group,0u);CHECK(ready(wakes[0].read_socket,2000));ku_http_wake_drain(&wakes[0]);
+  ku_http_current_loop=&group.loops[0];group.loops[0].group=&other;
+  ku_http_task_event_wake(&group,0u);CHECK(ready(wakes[0].read_socket,2000));ku_http_wake_drain(&wakes[0]);
+  group.loops[0].group=&group;group.loops[0].index=1;
+  ku_http_task_event_wake(&group,0u);CHECK(ready(wakes[0].read_socket,2000));ku_http_wake_drain(&wakes[0]);
+  group.loops[0].index=0;ku_http_task_event_wake(&group,SIZE_MAX);
+  CHECK(!group.loops[0].task_work_pending && !ready(group.wake.read_socket,0));
+  FixturePublication publication={&group,0u};KuTestThread worker;
+  CHECK(ku_test_thread_start(&worker,fixture_worker_publish,&publication));CHECK(ku_test_thread_join(&worker,2000u));
+  CHECK(!group.loops[0].task_work_pending && ready(wakes[0].read_socket,2000));ku_http_wake_drain(&wakes[0]);
+  group.draining=1;ku_http_task_event_wake(&group,0u);
+  CHECK(group.loops[0].task_work_pending && ready(group.wake.read_socket,2000));ku_http_wake_drain(&group.wake);
+  CHECK(!ready(wakes[0].read_socket,0));ku_http_task_take_owner_work(&group.loops[0]);group.draining=0;
+  group.tasks_closing=1;ku_http_task_event_wake(&group,0u);
+  CHECK(ready(group.wake.read_socket,2000));ku_http_wake_drain(&group.wake);group.tasks_closing=0;
+  ku_http_task_take_owner_work(&group.loops[0]);
+  fixture_gated_wake=&wakes[1];publication.target=1u;
+  CHECK(ku_test_thread_start(&worker,fixture_worker_publish,&publication));
+  CHECK(ku_test_event_wait(&fixture_notify_entered,2000u));
+  CHECK(pthread_mutex_trylock(&group.lock)==EBUSY); /* Teardown cannot free the wake yet. */
+  CHECK(ku_test_event_set(&fixture_notify_release));CHECK(ku_test_thread_join(&worker,2000u));fixture_gated_wake=NULL;
+  CHECK(ready(wakes[1].read_socket,2000));ku_http_wake_drain(&wakes[1]);
+  ku_http_mutex_lock(&group.lock);group.loops[1].wake=NULL;group.tasks_closing=1;ku_http_mutex_unlock(&group.lock);
+  ku_http_wake_close(&wakes[1]);ku_http_current_loop=&group.loops[1];
+  ku_http_task_event_wake(&group,1u); /* A late final retirement after owner teardown. */
+  CHECK(!group.loops[1].task_work_pending && ready(group.wake.read_socket,2000));ku_http_wake_drain(&group.wake);
+  ku_http_current_loop=NULL;CHECK(ku_test_thread_start(&worker,fixture_worker_publish,&publication));
+  CHECK(ku_test_thread_join(&worker,2000u));CHECK(ready(group.wake.read_socket,2000));
+  ku_http_wake_close(&wakes[0]);ku_http_wake_close(&group.wake);
+  CHECK(!pthread_mutex_destroy(&group.lock));CHECK(ku_test_event_destroy(&fixture_notify_entered));CHECK(ku_test_event_destroy(&fixture_notify_release));
+  puts("http-task-self-wake-owner-retirement-ok");return 0;
+}
+"#
+    .replace("@LATE@", late);
+    let directory = native_c_harness::TempDir::new("http-task-self-wake");
+    let path = directory.path().join("owner_wake.c");
+    fs::write(
+        &path,
+        format!(
+            "{header}{wake}{}{model}{task}{checks}",
+            native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS
+        ),
+    )
+    .unwrap();
+    let executable = native_c_harness::compile_harness(directory.path(), &path, "owner_wake")
+        .expect("owner Task wake regression requires the native C compiler");
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"http-task-self-wake-owner-retirement-ok\n");
+    assert!(output.stderr.is_empty());
+}
+
 #[test]
 fn native_http_live_task_readiness_preserves_completion_cancel_and_owned_lease() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
