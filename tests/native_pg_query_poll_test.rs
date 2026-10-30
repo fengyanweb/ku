@@ -698,6 +698,42 @@ fn native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_p
     );
 }
 
+#[test]
+fn native_pg_async_input_owner_prepays_aligned_storage_and_releases_failures() {
+    let directory = TempDir::new("async-pg-input-owner");
+    let harness = query_stub_harness(&directory)
+        .replacen(
+            "int main(void) {",
+            "static int ku_legacy_query_tests(void) {",
+            1,
+        )
+        .replacen(
+            "static void* ku_test_pg_malloc(size_t size) {",
+            "static void* input_real_malloc(size_t size) {",
+            1,
+        )
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_pump_tests(void) {")
+        + ASYNC_INPUT_OWNER_SUITE;
+    let source = directory.path().join("async-pg-input-owner.c");
+    fs::write(&source, harness).expect("write PG input owner harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "async-pg-input-owner")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("PG input owner harness exceeded bounds");
+    assert!(
+        output.status.success(),
+        "PG input owner harness failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg async input owner closed loop\n"
+    );
+}
+
 fn run_async_acquire_waiter_handoff(kind: u8) {
     let name = match kind {
         0 => "async-query-acquire-handoff-expired",
@@ -1862,6 +1898,7 @@ static size_t fail_malloc_size = 0;
 static int injected_allocation_failures = 0;
 static int fail_runtime_allocation_after = 0, single_row_calls = 0, read_ahead_calls = 0;
 static int track_runtime_allocations = 0, live_runtime_allocations = 0;
+static size_t runtime_allocation_calls = 0;
 static int expire_oom_after_shutdown = 0;
 #define KU_PG_TEST_ALLOCATION_RECORDS 16
 static struct { void* pointer; size_t size; } runtime_allocations[KU_PG_TEST_ALLOCATION_RECORDS];
@@ -1885,6 +1922,7 @@ static void record_runtime_allocation(void* pointer, size_t size) {
   bad_calls++;
 }
 static void* ku_test_pg_malloc(size_t size) {
+  runtime_allocation_calls++;
   if (fail_runtime_allocation_after > 0 && --fail_runtime_allocation_after == 0) { injected_allocation_failures++; return 0; }
   if (fail_malloc_size && size == fail_malloc_size) { fail_malloc_size = 0; injected_allocation_failures++; return 0; }
   void* pointer = malloc(size); record_runtime_allocation(pointer, size); return pointer;
@@ -3190,6 +3228,116 @@ int main(void) {
 }
 "#;
 
+const ASYNC_INPUT_OWNER_SUITE: &str = r#"
+static size_t input_limit=SIZE_MAX;
+static AsyncBudget* input_allocation_budget;
+static unsigned long long input_expire_on_allocation;
+static size_t input_allocation_calls;
+static int input_reserve(void* raw,size_t bytes) {
+  AsyncBudget* budget=(AsyncBudget*)raw;
+  if(budget->bytes>input_limit || bytes>input_limit-budget->bytes)return 0;
+  return async_reserve(raw,bytes);
+}
+static void* ku_test_pg_malloc(size_t bytes) {
+  if(input_allocation_budget) {
+    /* All operation/input allocations must follow their actual reservation. */
+    if(input_allocation_budget->bytes<bytes)abort();
+    input_allocation_calls++;
+  }
+  void* pointer=input_real_malloc(bytes);
+  if(pointer && input_expire_on_allocation) {
+    clock_ms=input_expire_on_allocation;input_expire_on_allocation=0;
+  }
+  return pointer;
+}
+static KuPgAsyncOp* input_create(KuPgClient* pool,AsyncBudget* budget,KuString sql,
+    KuArray_str params,int typed,const KuValue* leaves,KuArray_str types,KuError* error) {
+  input_allocation_budget=budget;input_allocation_calls=0;
+  KuPgAsyncBudget host={budget,input_reserve,async_refund};
+  KuPgAsyncOp* operation=typed
+      ?ku_pg_async_create_one_typed(pool,sql,leaves,params.len,types,(KuArray_str){0},clock_ms+100u,host,async_wake,budget,error)
+      :ku_pg_async_create(pool,sql,params,clock_ms+100u,host,async_wake,budget,error);
+  input_allocation_budget=NULL;return operation;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;track_runtime_allocations=1;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* pool=opened.value;
+  KuString strings[]={text("one"),text(""),text("中文")};
+  KuString schemas[]={text("int4"),text("text?"),text("text")};
+  KuValue leaves[]={ku_v_int(123),ku_v_null(),ku_v_str(strings[2])};
+  /* Empty SQL and zero parameters retain their previous validation contract.
+   * All combinations still copy, rather than borrow the caller's storage. */
+  for(int typed=0;typed<2;typed++)for(size_t count=0;count<=3u;count++)for(int empty=0;empty<2;empty++) {
+    AsyncBudget budget={0};KuError error={0};size_t base=runtime_bytes;int base_live=live_runtime_allocations;
+    KuString sql=text(empty?"":"SELECT $1");KuArray_str params={count,strings,count};
+    KuPgAsyncOp* operation=input_create(pool,&budget,sql,params,typed,leaves,(KuArray_str){count,schemas,count},&error);
+    CHECK(operation && !error.code.ptr && input_allocation_calls==1u);
+    CHECK(runtime_bytes-base==operation->input_charge && budget.bytes==operation->input_charge
+        && live_runtime_allocations==base_live+1);
+    uintptr_t first=(uintptr_t)operation,end=first+operation->input_charge;
+    CHECK((uintptr_t)operation->sql>=first+sizeof(*operation)
+        && (uintptr_t)operation->sql+sql.len<end && !operation->sql[sql.len]
+        && !memcmp(operation->sql,sql.ptr,sql.len));
+    CHECK(operation->sql!=(const char*)sql.ptr && operation->count==(int)count);
+    if(operation->values_bytes)CHECK((uintptr_t)(typed?(void*)operation->typed:(void*)operation->values)>=first+sizeof(*operation)
+        && (uintptr_t)(typed?(void*)operation->typed:(void*)operation->values)+operation->values_bytes<=end);
+    if(typed)CHECK((uintptr_t)operation->typed%_Alignof(KuPgTypedQuery)==0u);
+    else if(count)CHECK((uintptr_t)operation->values%_Alignof(const char*)==0u);
+    if(operation->param_bytes)CHECK((uintptr_t)operation->params>=first+sizeof(*operation)
+        && (uintptr_t)operation->params+operation->param_bytes<=end);
+    else CHECK(!operation->params);
+    if(!typed)for(size_t i=0;i<count;i++)CHECK(operation->values[i]!=(const char*)strings[i].ptr
+        && !memcmp(operation->values[i],strings[i].ptr,strings[i].len) && !operation->values[i][strings[i].len]);
+    if(typed && count>1u)CHECK(!operation->values[1]);
+    size_t charge=operation->input_charge;
+    CHECK(ku_pg_async_step(operation,0u,clock_ms,1));async_drop_output(operation,&budget,0);
+    CHECK(!budget.bytes && runtime_bytes==base && live_runtime_allocations==base_live);
+
+    input_limit=charge-1u;fail_runtime_allocation_after=1;
+    operation=input_create(pool,&budget,sql,params,typed,leaves,(KuArray_str){count,schemas,count},&error);
+    CHECK(!operation && !budget.bytes && !input_allocation_calls && fail_runtime_allocation_after==1);
+    CHECK(ku_string_equal(error.code,text("resource_limit")));ku_error_drop(&error);
+    input_limit=charge;int failures=injected_allocation_failures;
+    operation=input_create(pool,&budget,sql,params,typed,leaves,(KuArray_str){count,schemas,count},&error);
+    CHECK(!operation && !budget.bytes && input_allocation_calls==1u
+        && injected_allocation_failures==failures+1 && !fail_runtime_allocation_after);
+    CHECK(ku_string_equal(error.code,text("out_of_memory")));ku_error_drop(&error);
+    CHECK(runtime_bytes==base && live_runtime_allocations==base_live);
+    operation=input_create(pool,&budget,sql,params,typed,leaves,(KuArray_str){count,schemas,count},&error);
+    CHECK(operation && budget.bytes==charge);CHECK(ku_pg_async_step(operation,0u,clock_ms,1));
+    async_drop_output(operation,&budget,0);input_limit=SIZE_MAX;
+    CHECK(!ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes);
+  }
+  /* Reject representational overflow before any caller charge or allocation. */
+  size_t offset=17,charge=19;
+  CHECK(!ku_pg_async_input_layout(SIZE_MAX,0,0,0,&offset,&charge) && offset==17 && charge==19);
+  CHECK(!ku_pg_async_input_layout(1,SIZE_MAX,0,1,&offset,&charge));
+  CHECK(!ku_pg_async_input_layout(1,0,SIZE_MAX,0,&offset,&charge));
+  AsyncBudget budget={0};KuError error={0};size_t base=runtime_bytes;int before_sends=user_sends;
+  input_expire_on_allocation=clock_ms+100u;
+  KuPgAsyncOp* operation=input_create(pool,&budget,text("SELECT 3"),(KuArray_str){0},0,NULL,(KuArray_str){0},&error);
+  CHECK(!operation && !input_expire_on_allocation && input_allocation_calls==1u && !budget.bytes);
+  CHECK(ku_string_equal(error.code,text("query_timeout")) && user_sends==before_sends);ku_error_drop(&error);
+  CHECK(runtime_bytes==base && !ku_database_budget_snapshot().pending_operations);
+  /* A detached result outlives the whole input block. */
+  operation=input_create(pool,&budget,text("SELECT 3"),(KuArray_str){0},0,NULL,(KuArray_str){0},&error);
+  CHECK(operation && async_finish(operation,0) && operation->output.ok);
+  KuResult_pg_result result=ku_pg_async_take(operation);size_t result_bytes=0;
+  CHECK(result.ok && ku_pg_result_owned_bytes(result.value,&result_bytes));
+  ku_pg_async_dispose(operation,1);CHECK(budget.bytes==result_bytes && result.value->rows==1u);
+  CHECK(ku_pg_cell_in_bounds(result.value,0,0));ku_drop_pg_result(&result.value);async_refund(&budget,result_bytes);
+  CHECK(!budget.bytes && runtime_bytes==base);
+  CHECK(ku_pg_client_capture_retain(pool));ku_pg_client_close_owned(pool);CHECK(pool->closing);
+  operation=input_create(pool,&budget,text("SELECT 3"),(KuArray_str){0},0,NULL,(KuArray_str){0},&error);
+  CHECK(!operation && !budget.bytes && input_allocation_calls==1u && ku_string_equal(error.code,text("client_closed")));
+  ku_error_drop(&error);ku_pg_client_capture_release(pool);
+  CHECK(!live_connections && !live_results && !runtime_bytes && !live_runtime_allocations
+      && !ku_database_budget_snapshot().pending_operations && !ku_database_budget_snapshot().pending_bytes && !bad_calls);
+  track_runtime_allocations=0;puts("pg async input owner closed loop");return 0;
+}
+"#;
+
 const ASYNC_ACQUIRE_HANDOFF_SUITE: &str = r#"
 #define KU_TEST_HANDOFF_CANCEL (KU_TEST_HANDOFF_KIND==1)
 #define KU_TEST_HANDOFF_SUCCESS (KU_TEST_HANDOFF_KIND==2)
@@ -3765,7 +3913,15 @@ int main(void) {
       (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error)
       && fail_runtime_allocation_after==1 && user_sends==before_sends && !budget.bytes);
   fail_runtime_allocation_after=0;ku_error_drop(&error);
-  for(int failure=1;failure<=4;failure++) {
+  /* Count the constructor's real allocation attempts, rather than freeze its
+   * former four-block representation into an error-handling contract. */
+  KuValue probe[1]={ku_v_int(1)};size_t calls_before=runtime_allocation_calls;
+  op=ku_pg_async_create_one_typed(pool,text("SELECT $1::int4"),probe,1u,(KuArray_str){1u,&int4},(KuArray_str){1u,&int4},clock_ms+2000u,
+      (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error);
+  size_t input_calls=runtime_allocation_calls-calls_before;
+  CHECK(op && input_calls && input_calls<=16u && user_sends==before_sends);
+  CHECK(ku_pg_async_step(op,0u,clock_ms,1));async_drop_output(op,&budget,0);
+  for(size_t failure=1;failure<=input_calls;failure++) {
     KuValue values[1]={ku_v_int(1)};error=(KuError){0};fail_runtime_allocation_after=failure;
     CHECK(!ku_pg_async_create_one_typed(pool,text("SELECT $1::int4"),values,1u,(KuArray_str){1u,&int4},(KuArray_str){1u,&int4},clock_ms+2000u,
         (KuPgAsyncBudget){&budget,async_reserve,async_refund},async_wake,&budget,&error)

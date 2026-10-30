@@ -256,6 +256,21 @@ static void ku_pg_async_failure(KuPgAsyncOp* op) {
   ku_pg_async_finish(op,op->sent ? completed ? ku_pg_execution_completed_without_result_error()
       : ku_pg_execution_unknown_error() : ku_pg_query_connection_error(),1);
 }
+/* One uniquely owned input block. Metadata follows the header at its target
+ * ABI alignment; SQL/parameter bytes need no additional alignment. Requested
+ * bytes, including padding, are prepaid before malloc. Result rows keep their
+ * independent allocation/ownership and never borrow this tail. */
+static int ku_pg_async_input_layout(size_t sql_bytes,size_t values_bytes,size_t storage_bytes,
+    int typed,size_t* values_offset,size_t* charge) {
+  size_t alignment=typed?_Alignof(KuPgTypedQuery):_Alignof(const char*);
+  size_t offset=sizeof(KuPgAsyncOp);
+  size_t padding=(alignment-offset%alignment)%alignment;
+  if(padding>SIZE_MAX-offset)return 0;
+  offset+=padding;
+  if(values_bytes>SIZE_MAX-offset || sql_bytes>SIZE_MAX-offset-values_bytes
+      || storage_bytes>SIZE_MAX-offset-values_bytes-sql_bytes)return 0;
+  *values_offset=offset;*charge=offset+values_bytes+sql_bytes+storage_bytes;return 1;
+}
 static KuPgAsyncOp* ku_pg_async_create_inputs(KuPgClient* p,KuString sql,KuArray_str params,
     const KuValue* typed_params,size_t typed_count,KuArray_str param_types,KuArray_str result_types,int typed,
     unsigned long long absolute_deadline,KuPgAsyncBudget budget,
@@ -281,24 +296,27 @@ static KuPgAsyncOp* ku_pg_async_create_inputs(KuPgClient* p,KuString sql,KuArray
   size_t terminators=typed?(count?1u:0u):count;
   if(sql.len>SIZE_MAX-1u || param_bytes>SIZE_MAX-terminators) {*error=ku_pg_async_limit_error();return NULL;}
   size_t sql_bytes=sql.len+1u,storage_bytes=param_bytes+terminators;
-  if (sql_bytes>SIZE_MAX-sizeof(KuPgAsyncOp) || values_bytes>SIZE_MAX-sizeof(KuPgAsyncOp)-sql_bytes
-      || storage_bytes>SIZE_MAX-sizeof(KuPgAsyncOp)-sql_bytes-values_bytes) { *error=ku_pg_async_limit_error();return NULL; }
-  size_t charge=sizeof(KuPgAsyncOp)+sql_bytes+values_bytes+storage_bytes,operation_charge=0;
+  size_t values_offset=0,charge=0,operation_charge=0;
+  if(!ku_pg_async_input_layout(sql_bytes,values_bytes,storage_bytes,typed,&values_offset,&charge)) {
+    *error=ku_pg_async_limit_error();return NULL;
+  }
   size_t pending=typed ? sql.len+values_bytes+storage_bytes:sql.len+param_bytes+count*sizeof(KuString);
   if (!ku_database_operation_begin(pending,&operation_charge)) {
     *error=ku_pg_async_limit_error();return NULL;
   }
   if (!budget.reserve(budget.context,charge)) {ku_database_operation_end(operation_charge);*error=ku_pg_async_limit_error();return NULL;}
-  KuPgAsyncOp* op=(KuPgAsyncOp*)calloc(1,sizeof(*op));
-  char* copied_sql=(char*)malloc(sql_bytes);
-  void* values_storage=values_bytes?malloc(values_bytes):NULL;
-  const char** values=(const char**)values_storage;
-  KuPgTypedQuery* typed_query=typed?(KuPgTypedQuery*)values_storage:NULL;
-  char* storage=storage_bytes ? (char*)malloc(storage_bytes):NULL;
-  if (!op || !copied_sql || (values_bytes && !values_storage) || (storage_bytes && !storage)) {
-    free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);
+  KuPgAsyncOp* op=(KuPgAsyncOp*)malloc(charge);
+  if (!op) {
+    budget.refund(budget.context,charge);
     ku_database_operation_end(operation_charge);*error=ku_pg_out_of_memory_error();return NULL;
   }
+  memset(op,0,sizeof(*op));
+  uint8_t* tail=(uint8_t*)op+values_offset;
+  void* values_storage=values_bytes?(void*)tail:NULL;
+  const char** values=(const char**)values_storage;
+  KuPgTypedQuery* typed_query=typed?(KuPgTypedQuery*)values_storage:NULL;
+  char* copied_sql=(char*)tail+values_bytes;
+  char* storage=storage_bytes?copied_sql+sql_bytes:NULL;
   int copied=ku_pg_copy_until(copied_sql,sql.ptr,sql.len,deadline);copied_sql[sql.len]=0;
   if(typed && copied) {
     copied=ku_pg_typed_bind(typed_query,typed_params,count,param_types,result_types,storage,deadline);
@@ -307,7 +325,7 @@ static KuPgAsyncOp* ku_pg_async_create_inputs(KuPgClient* p,KuString sql,KuArray
     char* cursor=storage;
     for(size_t i=0;i<count && copied;i++) {values[i]=cursor;copied=ku_pg_copy_until(cursor,params.data[i].ptr,params.data[i].len,deadline);cursor[params.data[i].len]=0;cursor+=params.data[i].len+1u;}
   }
-  if(!copied) {free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);*error=ku_pg_query_timeout_error();return NULL;}
+  if(!copied) {free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);*error=ku_pg_query_timeout_error();return NULL;}
   op->pool=p;op->budget=budget;op->typed=typed_query;op->sql=copied_sql;op->values=values;op->params=storage;
   op->sql_bytes=sql_bytes;op->values_bytes=values_bytes;op->param_bytes=storage_bytes;
   op->input_charge=charge;op->operation_charge=operation_charge;op->count=(int)count;
@@ -321,7 +339,7 @@ static KuPgAsyncOp* ku_pg_async_create_inputs(KuPgClient* p,KuString sql,KuArray
   if (deadline<op->acquire_deadline) op->acquire_deadline=deadline;
   op->waiter.wake=wake;op->waiter.context=context;
   ku_pg_mutex_lock(&p->lock);
-  if(p->closing) {ku_pg_mutex_unlock(&p->lock);free(op);free(copied_sql);free(values_storage);free(storage);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
+  if(p->closing) {ku_pg_mutex_unlock(&p->lock);free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
     *error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);return NULL;}
   p->async_operations++;ku_pg_mutex_unlock(&p->lock);return op;
 }
@@ -761,7 +779,7 @@ static void ku_pg_async_dispose(KuPgAsyncOp* op,int transfer_result) {
   else if(op->output.ok)ku_pg_async_drop_table(op,&op->output.value);
   else ku_error_drop(&op->output.error);
   ku_pg_async_drop_query(op);
-  free(op->sql);free(op->typed?(void*)op->typed:(void*)op->values);free(op->params);
+  /* SQL, metadata and parameter storage are interior pointers of this owner. */
   size_t charge=op->input_charge,operation_charge=op->operation_charge;
   free(op);budget.refund(budget.context,charge);ku_database_operation_end(operation_charge);
   ku_pg_mutex_lock(&p->lock);p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p);ku_pg_mutex_unlock(&p->lock);
