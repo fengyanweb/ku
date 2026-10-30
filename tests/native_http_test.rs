@@ -9100,6 +9100,24 @@ fn native_http_utf8_word_scan_matches_unicode_and_input_boundaries() {
             }
         }
     }
+    // Exercise repeated non-ASCII iterations as well as transitions into and
+    // out of the ASCII word scan. Random invalid input usually returns before
+    // reaching these long, otherwise valid prefixes.
+    for text in ["é", "中文", "🙂", "\u{10ffff}"] {
+        for prefix in 0..16 {
+            for repeats in 1..=12 {
+                let mut bytes = vec![b'A'; prefix];
+                bytes.extend_from_slice(text.repeat(repeats).as_bytes());
+                for suffix in 0..16 {
+                    let mut padded = bytes.clone();
+                    padded.resize(padded.len() + suffix, b'B');
+                    add(&padded);
+                    padded.push(0xc2);
+                    add(&padded);
+                }
+            }
+        }
+    }
     let mut seed = 0x8675_3091u32;
     for sample in 0..128_000 {
         let mut bytes = [0u8; 128];

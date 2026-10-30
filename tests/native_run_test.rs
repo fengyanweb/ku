@@ -2898,8 +2898,10 @@ fn native_object_insertion_preserves_collisions_ownership_and_oom() {
     let dir = unique_temp_dir("object-probe-slot");
     fs::write(dir.join("main.ku"), "fn main() { item = { keep: 1 } }\n")
         .expect("write object insertion source");
-    let generated = native_emit_c(&dir, "main.ku")
-        .replace("#define KU_NATIVE_TEST_OBJECT_OOM 0", "#define KU_NATIVE_TEST_OBJECT_OOM 1");
+    let generated = native_emit_c(&dir, "main.ku").replace(
+        "#define KU_NATIVE_TEST_OBJECT_OOM 0",
+        "#define KU_NATIVE_TEST_OBJECT_OOM 1",
+    );
     let checks = r#"
 static int fixture_owned(KuString value,KuString* out) {
   uint8_t* bytes=(uint8_t*)malloc(value.len?value.len:1u);if(!bytes)return 0;

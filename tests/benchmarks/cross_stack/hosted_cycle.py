@@ -167,6 +167,12 @@ def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH):
         plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
             paired_orders=[names,names[2:]+names[:2],names[4:]+names[:4]],ledger=False))
         plan['latency_slo_ms']['json_escape']=100
+    else:
+        # Every new combination must check the Unicode path, even after old
+        # ablations are withdrawn. Reuse the normal A/B/reference order.
+        plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
+            paired_orders=copy.deepcopy(plan['paired_orders']),ledger=False))
+        plan['latency_slo_ms']['json_escape']=100
     plan['cases'].append(dict(workload='cpu',rate=80,reference='R',contract='compute-guard',
         paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],ledger=False))
     plan['latency_slo_ms']['cpu']=1000

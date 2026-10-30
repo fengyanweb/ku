@@ -42,6 +42,15 @@ class HostedCycleTests(unittest.TestCase):
         self.assertTrue(full['transport_control']['diagnostic_only'])
         self.assertFalse(full['transport_control']['normal_score_eligible'])
 
+    def test_combination_without_old_ablations_still_checks_unicode(self):
+        versions={n:{'source_commit':'b'*40,'root':'/unused/'+n} for n in ['A','B','BF','R','RS','D','HC']}
+        plan=h.followup_plan(versions,'f'*40)
+        case=next(c for c in plan['cases'] if c['workload']=='json_escape')
+        self.assertEqual(case['paired_orders'],plan['paired_orders'])
+        self.assertNotIn('C1',str(case))
+        self.assertEqual(len(h.diagnostic_turns(plan,case,True)),12)
+        self.assertEqual(plan['maximum_windows'],76)
+
     def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
         rows=[]
         for group in range(1,4):

@@ -520,13 +520,15 @@ static int ku_http_utf8_valid(const uint8_t* data, size_t len) {
   if (len != 0 && !data) return 0;
   size_t i = 0;
   while (i < len) {
-    while (len - i >= sizeof(uint64_t)) {
-      uint64_t word;
-      memcpy(&word, data + i, sizeof(word));
-      if (word & UINT64_C(0x8080808080808080)) break;
-      i += sizeof(word);
+    if (data[i] <= 0x7f) {
+      while (len - i >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, data + i, sizeof(word));
+        if (word & UINT64_C(0x8080808080808080)) break;
+        i += sizeof(word);
+      }
+      if (i == len) break;
     }
-    if (i == len) break;
     uint8_t c = data[i];
     if (c <= 0x7f) { i++; continue; }
     if (c >= 0xc2 && c <= 0xdf) {
