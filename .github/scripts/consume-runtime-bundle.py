@@ -98,16 +98,29 @@ def changed(path, contents):
         path.write_bytes(before)
 
 
+def management_invocation(name):
+    """Preserve Rustup's argv[0] alias; rustup-init is a different mode.
+
+    abspath removes cwd dependence without resolving a management symlink.
+    """
+    found = shutil.which(name)
+    return os.path.abspath(found) if found else None
+
+
+def relocate_checkout_entry(source, destination):
+    """CI-owned source/target entries may be on a different Windows volume."""
+    shutil.move(str(source), str(destination))
+
+
 def run(args, report):
     repo = args.repo.resolve()
     archive = args.archive.resolve()
     metadata = json.loads(args.manifest.read_text(encoding="utf-8"))
     if EXPORT.file_hash(archive) != metadata["sha256"] or archive.stat().st_size != metadata["size"]:
         raise ValueError("downloaded archive SHA/size mismatch")
-    rustup = shutil.which("rustup")
+    rustup = management_invocation("rustup")
     if not rustup:
         raise ValueError("consumer gate requires rustup; the separate no-Rust case isolates it")
-    rustup = str(Path(rustup).resolve())
     base_env = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
     before_default = checked([rustup, "default"], repo, base_env)
     verifier_commit = checked(['git', 'rev-parse', 'HEAD'], repo, base_env).strip()
@@ -186,25 +199,25 @@ def run(args, report):
             if path.is_file():
                 path.unlink()
 
-        def execute_and_remove(name, destination):
+        def execute_and_remove(name, destination, wanted=None):
             executable = Path(destination)
             if os.name == 'nt' and executable.suffix.lower() != '.exe':
                 executable = executable.with_suffix('.exe')
             executed = invoke([executable], project, env)
             record(name, executed)
-            if executed.returncode or output(executed) != expected:
+            if executed.returncode or output(executed) != (expected if wanted is None else wanted):
                 raise RuntimeError(name + ' produced incorrect executable output')
             report['cases'][-1]['binary_sha256'] = EXPORT.file_hash(executable)
             remove_executable(executable)
 
-        def build_run(name, arguments, destination, verbose_profile=None):
-            result = success(name, ['build', *arguments, '-o', destination, 'hello.ku'])
+        def build_run(name, arguments, destination, verbose_profile=None, entry="hello.ku", wanted=None):
+            result = success(name, ['build', *arguments, '-o', destination, entry])
             if verbose_profile is not None:
                 text = output(result)
                 if 'build profile: ' + verbose_profile not in text or 'rustc command:' not in text:
                     raise RuntimeError(name + ' did not use expected Runner profile/verbose scope')
                 report['cases'][-1]['observed_build_profile'] = verbose_profile
-            execute_and_remove(name + '-result', destination)
+            execute_and_remove(name + '-result', destination, wanted)
             return result
 
         def exercise_cli_contracts():
@@ -281,9 +294,23 @@ def run(args, report):
                 build_run('contract-build-verbose-' + flag, [flag], project / ('contract-verbose' + suffix), 'debug')
             for backend in ('runner', 'interp', 'interpreter', 'c', 'native-c'):
                 build_run('contract-backend-' + backend, ['--backend', backend], project / ('contract-backend' + suffix))
+            # LLVM is an explicitly limited text prototype. The ordinary
+            # Hello Runner cases above remain unchanged; this empty-main IR
+            # fixture is supported and its Runner executable emits no stdout.
+            llvm_source = project / 'llvm-empty.ku'
+            llvm_source.write_text('fn main() {}\n', encoding='utf-8')
+            report['cli_contract']['llvm_fixture'] = dict(source_sha256=hashlib.sha256(llvm_source.read_bytes()).hexdigest(),
+                expected_stdout='', scope='supported empty main;not the ordinary Hello fixture')
+            limited_output = project / ('contract-hello-llvm-unsupported' + suffix)
+            limited = invoke([ku, 'build', '--emit-ll', '-o', limited_output, 'hello.ku'], project, env)
+            record('contract-hello-llvm-existing-limitation', limited, 'nonzero-println-requires-Result')
+            limited_text = output(limited) + limited.stderr.decode('utf-8', errors='replace')
+            if limited.returncode == 0 or "LLVM intrinsic 'println' requires a Result type" not in limited_text or limited_output.exists():
+                raise RuntimeError('the documented Hello LLVM prototype limitation changed: ' + limited_text[-2048:])
+            report['cli_contract']['hello_llvm_limitation'] = limited_text[-2048:]
             ir_hash = None
             for flag in ('--emit-ll', '--emit-llvm'):
-                result = build_run('contract-' + flag, [flag], project / ('contract-emit' + suffix))
+                result = build_run('contract-' + flag, [flag], project / ('contract-emit' + suffix), entry=llvm_source.name, wanted='')
                 ir = next((line.removeprefix('llvm ir ok: ').strip() for line in output(result).splitlines() if line.startswith('llvm ir ok: ')), None)
                 if not ir or not Path(ir).resolve().is_relative_to(root) or not Path(ir).is_file():
                     raise RuntimeError('emit LLVM flag did not create owned text IR')
@@ -294,7 +321,7 @@ def run(args, report):
             backend_ir_hash = None
             for backend in ('llvm', 'll'):
                 destination = project / ('contract-llvm-no-executable' + suffix)
-                result = invoke([ku, 'build', '--backend', backend, '-o', destination, 'hello.ku'], project, env)
+                result = invoke([ku, 'build', '--backend', backend, '-o', destination, llvm_source.name], project, env)
                 record('contract-text-only-backend-' + backend, result, 'nonzero-after-text-IR')
                 text = output(result) + result.stderr.decode(errors='replace')
                 ir = next((line.removeprefix('llvm ir ok: ').strip() for line in output(result).splitlines() if line.startswith('llvm ir ok: ')), None)
@@ -304,6 +331,7 @@ def run(args, report):
                 if backend_ir_hash is not None and backend_ir_hash != current:
                     raise RuntimeError('LLVM backend aliases generated different IR')
                 backend_ir_hash = current
+            llvm_source.unlink()
             # Legacy --native only emits C when directly after build and no -o.
             c_source = source.with_suffix('.c')
             result = success('contract-native-legacy-C-only', ['build', '--native', 'hello.ku'])
@@ -509,13 +537,13 @@ def run(args, report):
                     old = repo / name
                     if old.exists():
                         destination = root / ("retired-checkout-" + name)
-                        old.rename(destination)
+                        relocate_checkout_entry(old, destination)
                         retired.append((old, destination))
                 success("source-and-target-unavailable", ["build", "hello.ku", "-o", "without-source"])
                 execute_and_remove("source-and-target-unavailable-result", project / "without-source")
             finally:
                 for old, destination in reversed(retired):
-                    destination.rename(old)
+                    relocate_checkout_entry(destination, old)
         else:
             report["cases"].append({"name": "source-and-target-unavailable", "status": "not_requested_local;CI flag required"})
         exercise_cli_contracts()

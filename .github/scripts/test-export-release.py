@@ -45,6 +45,47 @@ class RuntimeConsumerReportTests(unittest.TestCase):
         self.original = b'{"status":"last valid report"}\n'
         self.path.write_bytes(self.original)
 
+    def test_rustup_management_symlink_keeps_invoked_name(self):
+        target = self.root / 'rustup-init'
+        alias = self.root / 'rustup'
+        target.write_text('import pathlib,sys\nname=pathlib.Path(sys.argv[0]).name\nprint(name)\nsys.exit(0 if name == "rustup" else 23)\n', encoding='utf-8')
+        try:
+            alias.symlink_to(target)
+        except OSError as error:
+            self.skipTest('platform cannot create file symlink: ' + str(error))
+        with mock.patch.object(self.consumer.shutil, 'which', return_value=str(alias)):
+            invoked = self.consumer.management_invocation('rustup')
+        self.assertEqual(invoked, os.path.abspath(alias))
+        self.assertNotEqual(invoked, str(alias.resolve()))
+        result = subprocess.run([sys.executable, invoked], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b'rustup')
+
+    def test_owned_checkout_move_and_restore_handles_cross_volume(self):
+        import errno
+        source_dir = self.root / 'src'
+        source_dir.mkdir()
+        source_file = source_dir / '中文.rs'
+        source_file.write_bytes(b'original source bytes\n')
+        cargo = self.root / 'Cargo.toml'
+        cargo.write_bytes(b'[package]\n')
+        backup_dir = self.root / 'retired-src'
+        backup_cargo = self.root / 'retired-Cargo.toml'
+        # Real copy/unlink fallback is exercised, not only an asserted helper
+        # call. Path.rename would fail on the same EXDEV condition.
+        with mock.patch.object(self.consumer.os, 'rename', side_effect=OSError(errno.EXDEV, 'cross-device move')):
+            self.consumer.relocate_checkout_entry(source_dir, backup_dir)
+            self.consumer.relocate_checkout_entry(cargo, backup_cargo)
+            self.assertFalse(source_dir.exists())
+            self.assertFalse(cargo.exists())
+            self.assertEqual((backup_dir / source_file.name).read_bytes(), b'original source bytes\n')
+            self.consumer.relocate_checkout_entry(backup_dir, source_dir)
+            self.consumer.relocate_checkout_entry(backup_cargo, cargo)
+        self.assertEqual(source_file.read_bytes(), b'original source bytes\n')
+        self.assertEqual(cargo.read_bytes(), b'[package]\n')
+        self.assertFalse(backup_dir.exists())
+        self.assertFalse(backup_cargo.exists())
+
     def test_report_is_utf8_even_under_cp1252_text_default(self):
         value = {'path': '搬迁 中文 空格', 'failure': '库版本错误 😀'}
         with mock.patch('io.text_encoding', return_value='cp1252'):
