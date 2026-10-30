@@ -5,7 +5,7 @@ No product patch, remote dispatch, SDK matrix, installation or release operation
 from __future__ import annotations
 import argparse, copy, gzip, hashlib, io, json, os
 from pathlib import Path
-import platform, pwd, re, shutil, signal, subprocess, sys, tarfile, time
+import platform, pwd, re, shutil, signal, subprocess, sys, tarfile, threading, time
 import build_linux as bl
 import focus_cycle as fc
 import database as db
@@ -96,6 +96,88 @@ def normalize_manifest(m, protocol, client):
     return m
 
 
+def diagnostic_command(argv, output, timeout=30, limit=32<<20):
+    """Finite observer/tool invocation; failure is evidence, never a fake sample."""
+    output=Path(output);output.parent.mkdir(parents=True,exist_ok=True)
+    record=dict(command=list(map(str,argv)),stdout=str(output),stderr=str(output.with_suffix(output.suffix+'.log')))
+    process=None;began=time.monotonic()
+    try:
+        with output.open('xb') as out,Path(record['stderr']).open('xb') as err:
+            process=subprocess.Popen(record['command'],stdout=out,stderr=err,
+                stdin=subprocess.DEVNULL,start_new_session=True)
+            while process.poll() is None:
+                if time.monotonic()-began>timeout or out.tell()+err.tell()>limit:
+                    raise RuntimeError('diagnostic tool time/output bound exceeded')
+                time.sleep(.05)
+            record['exit_code']=process.returncode
+            if out.tell()+err.tell()>limit:raise RuntimeError('diagnostic tool output bound exceeded before exit')
+    except OSError as error:record['error']=repr(error)
+    except RuntimeError as error:record['error']=str(error)
+    finally:
+        if process is not None and process.poll() is None:
+            os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5)
+        record.update(seconds=time.monotonic()-began,complete=process is not None and
+            process.returncode==0 and 'error' not in record)
+    save(output.with_suffix(output.suffix+'.json'),record);return record
+
+
+def diagnostic_plan(versions):
+    """A single short identification experiment, never the formal matrix."""
+    return dict(schema='ku-hosted-followup-diagnostic-v1', versions=versions,
+        resources=RESOURCES, quality_policy=POLICY,
+        cases=[dict(workload=w, rate=r, reference=ref, contract=contract)
+               for w,r,ref,contract in [('ok',2000,'R','text'),
+                   ('json_object',500,'R','dom'),('db',200,'RS','pg-strict')]],
+        order=['reference-before','normal-before','ledger-sample','normal-after','reference-after'],
+        warmup_seconds=3, score_seconds=15, perf_frequency=499,
+        stop_after_consecutive_environment_failures=2, maximum_additional_anomaly_windows=0,
+        no_replacement=True, formal_qualified=False, candidate_accepted=False,
+        scope='Current normal Release helpers/text/async/int versus Rust; ledger+roles only in D. '
+              'No A0, typed/direct alternatives, compiler variants, capacity or 30-minute acceptance. '
+              'D CPU is diagnostic only; inclusive samples overlap and cannot be added. '
+              'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
+
+
+def build_ledger(a):
+    import http_cost_diagnostic as hcd
+    m=copy.deepcopy(load(a.root/'B/manifest.json'));build=m['stacks']['ku']['build']
+    normal=build['native']['server'];directory=a.root/'D/build';directory.mkdir(parents=True)
+    ledger=directory/'ledger.c';source=directory/'roles.c';binary=directory/'bin/ku-server'
+    binary.parent.mkdir()
+    receipt=hcd.prepare_ledger_source(Path(normal['generated_c']),ledger,source_commit=a.candidate)
+    save(directory/'ledger-identity.json',receipt)
+    roles=hcd.prepare_source(ledger,source,source_commit=a.candidate)
+    save(directory/'roles-identity.json',roles)
+    invocation=normal['compiler_invocation'];compiler=Path(invocation['compiler']['path'])
+    if sha(compiler)!=invocation['compiler']['sha256']:raise ValueError('normal compiler identity changed')
+    libraries=[x['selected_input']['real_path'] for x in invocation['library_inputs']]
+    for item in invocation['library_inputs']:
+        if sha(item['selected_input']['real_path'])!=item['selected_input']['sha256']:
+            raise ValueError('normal compiler library identity changed')
+    argv=[str(compiler),str(source),*invocation['flags'],*libraries,'-g',
+          '-Wl,--wrap=pthread_create','-o',str(binary)]
+    completed=diagnostic_command(argv,directory/'compiler.log',timeout=120)
+    record=dict(command=argv,tool_result=completed,compiler=invocation['compiler'],
+        normal_c=bl.file_identity(normal['generated_c']),ledger_c=bl.file_identity(ledger),
+        roles_c=bl.file_identity(source),source_commit=a.candidate,diagnostic_only=True,
+        normal_score_eligible=False,normal_flags=invocation['flags'],additional_flags=['-g','-Wl,--wrap=pthread_create'])
+    save(directory/'compiler.json',record)
+    if not completed['complete']:raise RuntimeError('ledger compile failed; see D/build/compiler.log')
+    for label,command in [('assembly',['llvm-objdump-18','--disassemble','--source','--line-numbers','--demangle',str(binary)]),
+                          ('symbols',['nm','-n','-S','--defined-only',str(binary)]),
+                          ('elf',['readelf','-h','-S','-n',str(binary)])]:
+        diagnostic_command(command,directory/(label+'.log'),timeout=60,limit=64<<20)
+    m['stacks']['ku']['command']=[str(binary)]
+    build['native']['server']=dict(normal,generated_c=str(source),generated_c_sha256=sha(source),
+        binary=str(binary),binary_sha256=sha(binary),diagnostic_receipt=str(directory/'compiler.json'))
+    build['native_flags']['server']=[*invocation['flags'],'-g','-Wl,--wrap=pthread_create']
+    build['diagnostic']=record;m.update(diagnostic_only=True,normal_score_eligible=False)
+    save(a.root/'D/manifest.json',m)
+    return dict(root=str(a.root/'D'),stack='ku',source_commit=a.candidate,binary_sha256=sha(binary),
+        artifacts={name:dict(path=str(path),sha256=sha(path)) for name,path in
+                   [('normal C',Path(normal['generated_c'])),('ledger C',ledger),('roles C',source)]})
+
+
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
@@ -117,11 +199,13 @@ def build(a,state):
             else:b.ku_native(Path(load(a.root/'B/manifest.json')['stacks']['ku']['build']['cli']))
             return b.finish()
         except BaseException as e:b.finish(failed=repr(e));raise
-    for name,commit,mode in [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
-        ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]:
+    diagnostic=getattr(a,'build_set','full')=='diagnostic'
+    builds=[('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
+        ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
+    for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
-    for name in ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']:
+    for name in (['B','R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']):
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else name)/'manifest.json')
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
         if is_r:m['stacks'][stack]['env'].update(BENCH_REQUEST_TIMEOUT_MS='30000',BENCH_LISTEN_BACKLOG='4096',
@@ -132,7 +216,8 @@ def build(a,state):
         versions[name]=dict(root=str(d),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary))
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
-    plan=frozen_plan(versions);save(a.root/'frozen-plan.json',plan)
+    if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
+    plan=diagnostic_plan(versions) if diagnostic else frozen_plan(versions);save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
     dependencies={};abi={}
     for binary in sorted({f['path'] for v in identities.values() for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
@@ -248,6 +333,265 @@ def run(a,state,tail_only=False,stability_only=False):
     finally:
         fc.Harness=original
         state['database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
+
+
+def diagnostic_context(service):
+    """Instantaneous bounded Linux evidence; a wait stack is not a CPU sample."""
+    def read(path):
+        try:
+            with Path(path).open('rb') as stream:return stream.read(65536).decode(errors='replace')
+        except OSError as error:return {'unavailable':repr(error)}
+    proc=Path('/proc')/str(service.process.pid)
+    try:tasks=sorted(proc.joinpath('task').iterdir(),key=lambda p:int(p.name))
+    except OSError:tasks=[]
+    return dict(monotonic_ns=time.monotonic_ns(),wall_time_ns=time.time_ns(),
+        vmstat=read('/proc/vmstat'),meminfo=read('/proc/meminfo'),host_cpu=read('/proc/stat'),
+        service_status=read(proc/'status'),smaps_rollup=read(proc/'smaps_rollup'),
+        task_count=len(tasks),task_limit=128,
+        waits=[dict(tid=int(task.name),stack=read(task/'stack'),wchan=read(task/'wchan'),
+                    syscall=read(task/'syscall'),schedstat=read(task/'schedstat')) for task in tasks[:128]],
+        scope='Live snapshots only. Host swap deltas do not identify service swap ownership; '
+              'major/minor faults are not proof of swap. Wait snapshots do not measure wait duration.')
+
+
+def diagnostic_memory(service, output):
+    """Endpoint-only mapping evidence; never add overlapping accounting axes."""
+    output=Path(output);output.parent.mkdir(parents=True,exist_ok=True);limit=4<<20
+    with (Path('/proc')/str(service.process.pid)/'smaps').open('rb') as stream:raw=stream.read(limit+1)
+    truncated=len(raw)>limit;raw=raw[:limit];output.write_bytes(raw)
+    try:executable=os.readlink(Path('/proc')/str(service.process.pid)/'exe')
+    except OSError:executable=None
+    metrics={'Rss':'rss_bytes','Pss':'pss_bytes','Anonymous':'anonymous_bytes',
+             'Private_Dirty':'private_dirty_bytes','Swap':'swap_bytes'}
+    mappings=[];current=None
+    for line in raw.decode(errors='replace').splitlines():
+        match=re.match(r'^([0-9a-f]+)-([0-9a-f]+)\s+(\S+)\s+([0-9a-f]+)\s+\S+\s+\d+\s*(.*)$',line)
+        if match:
+            if current is not None:mappings.append(current)
+            start,end,permissions,offset,name=match.groups()
+            category=('named_heap' if name=='[heap]' else 'named_stack' if name.startswith('[stack') else
+                'executable_file' if name and name==executable else 'shared_library_file' if name.startswith('/') and '.so' in name else
+                'other_file' if name.startswith('/') else 'special_named' if name.startswith('[') else 'anonymous_mapping')
+            current=dict(start=start,end=end,permissions=permissions,file_offset=offset,name=name,category=category)
+        elif current is not None and ':' in line:
+            key,value=line.split(':',1)
+            if key in metrics:
+                parts=value.split()
+                if len(parts)==2 and parts[1]=='kB':current[metrics[key]]=int(parts[0])*1024
+    if current is not None and not truncated:mappings.append(current)
+    groups={}
+    for item in mappings:
+        group=groups.setdefault(item['category'],dict(mapping_count=0,**{v:0 for v in metrics.values()}))
+        group['mapping_count']+=1
+        for metric in metrics.values():group[metric]+=item.get(metric,0)
+    return dict(raw_path=str(output),raw_sha256=sha(output),bytes=len(raw),limit_bytes=limit,
+        complete=not truncated,truncated=truncated,categories=groups,mappings=mappings,
+        scope='Endpoint mapping RSS/PSS/Anonymous/PrivateDirty/Swap are separate, overlapping views. '
+              'Do not add them together, or add cgroup kernel and its kernel_stack/page-table/slab subfields. '
+              'Anonymous VMAs can contain allocator mmap, pthread stacks and zero-fill BSS tails; smaps labels alone '
+              'cannot distinguish them. Named heap excludes mmap allocations; virtual reserved size is not resident memory. '
+              'D TLS counter bank and dump buffer are instrumentation BSS, not normal product memory.')
+
+
+def diagnostic_symbols(service, output):
+    """Preserve mapped ELFs before Service.stop removes its executable copy."""
+    output=Path(output);symfs=output/'symfs';symfs.mkdir()
+    with (Path('/proc')/str(service.process.pid)/'maps').open('rb') as stream:raw=stream.read((1<<20)+1)
+    truncated=len(raw)>1<<20;raw=raw[:1<<20]
+    (output/'maps.log').write_bytes(raw);files=[];issues=[];total=0;seen=set()
+    if truncated:issues.append({'reason':'1MiB maps read bound; snapshot incomplete'})
+    for line in raw.decode(errors='replace').splitlines():
+        columns=line.split(None,5)
+        if len(columns)!=6 or not columns[5].startswith('/'):continue
+        name=columns[5]
+        if name in seen:continue
+        seen.add(name);source=Path(name)
+        if '..' in source.parts or name.endswith(' (deleted)'):
+            issues.append(dict(path=name,reason='not a current canonical mapped file'));continue
+        try:
+            with source.open('rb') as stream:magic=stream.read(4)
+            if magic!=b'\x7fELF':continue
+            size=source.stat().st_size
+            if len(files)>=64 or total+size>128<<20:
+                issues.append(dict(path=name,reason='64ELF/128MiB symbol snapshot bound'));continue
+            destination=symfs/name.lstrip('/');destination.parent.mkdir(parents=True,exist_ok=True)
+            try:os.link(source,destination)
+            except OSError:shutil.copyfile(source,destination)
+            expected=sha(source)
+            if sha(destination)!=expected:raise ValueError('symbol ELF snapshot SHA mismatch')
+            files.append(dict(mapped_path=name,copy=str(destination),bytes=size,sha256=expected));total+=size
+        except (OSError,ValueError) as error:issues.append(dict(path=name,reason=repr(error)))
+    record=dict(symfs=str(symfs),files=files,issues=issues,bytes=total,complete=not issues,
+        scope='Exact mapped ELF snapshots for --symfs, including the later-deleted runtime executable. '
+              'Kernel/vDSO symbols and unreadable mappings remain unknown; no implicit build-id cache assumption.')
+    save(output/'symbol-identities.json',record);return record
+
+
+def diagnostic_observe(call):
+    try:return call()
+    except Exception as error:return {'observer_error':repr(error),'complete':False}
+
+
+def diagnostic(a,state):
+    import http_cost_diagnostic as hcd
+    if os.geteuid()!=0:raise ValueError('diagnostic requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan.get('schema')!='ku-hosted-followup-diagnostic-v1':raise ValueError('diagnostic build-set required')
+    boot=sha('/proc/sys/kernel/random/boot_id')
+    if state.setdefault('diagnostic_boot_sha256',boot)!=boot:raise ValueError('cross-host diagnostic resume forbidden')
+    directory=a.root/'diagnostic';directory.mkdir(exist_ok=False)
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None
+    state['execution_environment']=dict(kernel=platform.release(),machine=platform.machine(),
+        cpu_count=os.cpu_count(),coordinator_affinity=sorted(os.sched_getaffinity(0)),
+        parent_cgroup_limits={n:(Path('/sys/fs/cgroup')/n).read_text().strip() for n in
+            ['cpu.max','memory.max','memory.swap.max'] if (Path('/sys/fs/cgroup')/n).exists()},
+        kernel_observation_controls={n:Path('/proc/sys/kernel',n).read_text().strip() for n in
+            ['perf_event_paranoid','kptr_restrict','sched_schedstats'] if Path('/proc/sys/kernel',n).exists()})
+    diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-before.log')
+    perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
+    if perf:diagnostic_command([perf,'version'],directory/'perf-version.log')
+    rows=[];stopped=[]
+    class DiagnosticHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+        def client(self,service,workload,rate,duration,output,**kwargs):
+            if Path(output).name!='score':
+                return super().client(service,workload,rate,duration,output,**kwargs)
+            output=Path(output);output.mkdir(parents=True,exist_ok=True);stop=threading.Event()
+            if self.root!=a.root/'D':
+                def endpoint(name):
+                    return dict(context=diagnostic_observe(lambda:diagnostic_context(service)),
+                        threads=diagnostic_observe(lambda:hcd.snapshot(service.process.pid,service.domain.path)),
+                        memory=diagnostic_observe(lambda:diagnostic_memory(service,output/(name+'-smaps.log'))))
+                before=endpoint('before')
+                try:return super().client(service,workload,rate,duration,output,**kwargs)
+                finally:save(output/'control-endpoints.json',dict(before=before,
+                    after=endpoint('after'),
+                    no_perf_or_product_instrumentation=True,
+                    scope='Two external endpoint snapshots, outside timed driver; existing1Hz resource sampler remains.'))
+            record={'diagnostic_only':True,'normal_score_eligible':False,'thread':{},'contexts':[]}
+            record['memory_before']=diagnostic_observe(lambda:diagnostic_memory(service,output/'before-smaps.log'))
+            def threads():
+                try:record['thread']=hcd.collect_thread_window(service.process.pid,min(duration+8,120),
+                    cgroup=service.domain.path,stop_event=stop,max_samples=512,max_thread_records=50000)
+                except Exception as error:record['thread']={'error':repr(error)}
+            def context():
+                while len(record['contexts'])<32:
+                    record['contexts'].append(diagnostic_observe(lambda:diagnostic_context(service)))
+                    raw=output/'perf.data'
+                    if ((raw.is_file() and raw.stat().st_size>96<<20) or
+                            ((output/'perf-record.log').is_file() and (output/'perf-record.log').stat().st_size>1<<20)):
+                        record['perf_bounded_stop']='96MiB raw or1MiB log limit; partial evidence retained'
+                        if process is not None and process.poll() is None:
+                            try:os.killpg(process.pid,signal.SIGINT)
+                            except ProcessLookupError:pass
+                        break
+                    if stop.wait(1):break
+            probes=[threading.Thread(target=threads,daemon=True),threading.Thread(target=context,daemon=True)]
+            process=None;log=None
+            try:
+                for probe in probes:
+                    try:probe.start()
+                    except RuntimeError as error:record.setdefault('observer_start_errors',[]).append(repr(error))
+                record['symbol_snapshot']=diagnostic_observe(lambda:diagnostic_symbols(service,output))
+                if perf:
+                    command=[perf,'record','--clockid','mono','-e','cpu-clock','-F',str(plan['perf_frequency']),
+                        '--call-graph','dwarf,8192','--inherit','--switch-events','-p',str(service.process.pid),
+                        '-o',str(output/'perf.data'),'--','sleep',str(duration+6)]
+                    record['perf_command']=command;log=(output/'perf-record.log').open('xb')
+                    try:process=subprocess.Popen(command,stdout=log,stderr=log,start_new_session=True)
+                    except OSError as error:record['perf_error']=repr(error)
+                else:record['perf_error']='perf unavailable; CPU attribution unknown'
+                return super().client(service,workload,rate,duration,output,**kwargs)
+            finally:
+                stop.set()
+                for probe in probes:
+                    if probe.ident is not None:probe.join(timeout=5)
+                record['observer_threads_stopped']=all(not probe.is_alive() for probe in probes)
+                if process is not None:
+                    if process.poll() is None:
+                        try:os.killpg(process.pid,signal.SIGINT)
+                        except ProcessLookupError:pass
+                    try:process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:os.killpg(process.pid,signal.SIGKILL)
+                        except ProcessLookupError:pass
+                        process.wait(timeout=5)
+                        record['perf_forced_cleanup']=True
+                    record['perf_exit_code']=process.returncode
+                if log:log.close()
+                record['memory_after']=diagnostic_observe(lambda:diagnostic_memory(service,output/'after-smaps.log'))
+                save(output/'diagnostic-observations.json',record)
+    try:
+        fixture.start();private=load(a.root/'fixture/manifest.json')
+        private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
+        fc.Harness=DiagnosticHarness
+        for case in plan['cases']:
+            failures=0;previous_failure=None;case_rows=[]
+            for turn in plan['order']:
+                name=case['reference'] if turn.startswith('reference') else 'D' if turn=='ledger-sample' else 'B'
+                output=directory/case['workload']/turn
+                try:row=fc.window(plan,name,case['workload'],case['rate'],plan['warmup_seconds'],
+                    plan['score_seconds'],output,job={'phase':'explore','contract':case['contract']})
+                except Exception as error:
+                    row=load(output/'window.json') if (output/'window.json').is_file() else {'error':repr(error)}
+                row.update(turn=turn,workload=case['workload'],name=name,diagnostic_only=name=='D',
+                    normal_score_eligible=name!='D',formal_qualified=False,candidate_accepted=False)
+                if name=='D':
+                    log=output/'service/service.log';ledgers=[]
+                    if log.is_file():
+                        with log.open('rb') as stream:text=stream.read((8<<20)+1)
+                        if len(text)>8<<20:ledgers.append({'unavailable':'service log exceeds8MiB read bound; original retained'})
+                        for line in text.decode(errors='replace').splitlines() if len(text)<=8<<20 else []:
+                            if line.startswith('KU_FLOW_DIAG '):
+                                try:
+                                    value=json.loads(line[len('KU_FLOW_DIAG '):])
+                                    if not isinstance(value,dict):raise ValueError('expected object')
+                                    ledgers.append(value)
+                                except ValueError:ledgers.append({'unparseable':line[:1024]})
+                    save(output/'flow-ledger.json',dict(records=ledgers,record_count=len(ledgers),
+                        scope='Whole service lifetime including readiness and warmup; no score-only normalization.',
+                        complete_record_count=sum(x.get('complete') is True for x in ledgers)))
+                    raw=output/'score/perf.data'
+                    if perf and raw.is_file() and raw.stat().st_size:
+                        symfs=output/'score/symfs';symbols=['--symfs',str(symfs)] if symfs.is_dir() else []
+                        diagnostic_command([perf,'report','-i',str(raw),*symbols,'--stdio','--no-children',
+                            '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=60)
+                        diagnostic_command([perf,'script','-i',str(raw),*symbols,'--ns','--show-switch-events',
+                            '--show-lost-events','--show-task-events','-F','+pid,+tid,+cpu,+ip,+symoff,+srcline,+misc'],
+                            output/'score/perf-stacks.log',timeout=60,limit=64<<20)
+                    row['flow_ledger_path']=str(output/'flow-ledger.json')
+                    row['flow_ledger_available']=len(ledgers)==1 and 'unparseable' not in ledgers[0] and 'unavailable' not in ledgers[0]
+                    row['flow_ledger_complete']=row['flow_ledger_available'] and ledgers[0].get('complete') is True
+                    row['thread_and_perf_observation_path']=str(output/'score/diagnostic-observations.json')
+                case_rows.append(row);rows.append(row);save(directory/'results.json',dict(rows=rows,stopped=stopped))
+                invalid=(row.get('measurement_invalid') is True or row.get('arrival_schedule_quality')!='pass'
+                         or row.get('environment_quality')=='fail')
+                signature=[row.get(k) for k in ('measurement_invalid','arrival_schedule_quality','environment_quality')]
+                failures=failures+1 if invalid and signature==previous_failure else 1 if invalid else 0
+                previous_failure=signature if invalid else None
+                if row.get('functional_valid') is False or row.get('accounting_valid') is False or failures>=2:
+                    stopped.append(dict(workload=case['workload'],after=turn,
+                        reason='confirmed functional/accounting failure' if row.get('functional_valid') is False or
+                            row.get('accounting_valid') is False else 'two consecutive unusable measurement windows; same quality signature; cause not inferred',
+                        quality_signature=signature,
+                        no_retry=True));break
+            controls=[r.get('full_cpu_us') for r in case_rows if r['turn'] in ('normal-before','normal-after')]
+            save(directory/case['workload']/'comparison.json',dict(rows=case_rows,
+                normal_control_cpu_max_min=max(controls)/min(controls) if len(controls)==2 and
+                    all(type(x) in (int,float) and x>0 for x in controls) else None,
+                no_formal_performance_claim=True,diagnostic_cost_not_pooled=True,
+                interpretation='Before/after drift and sampling perturbation require review. D and normal differ in '
+                    'instrumentation/layout; these windows do not isolate perf overhead from ledger/roles overhead.'))
+        result=dict(execution_complete=len(rows)==15 and not stopped,rows=rows,stopped=stopped,
+            goal_status='unknown',formal_qualified=False,candidate_accepted=False,
+            scope=plan['scope'],additional_anomaly_windows=0)
+        save(directory/'summary.json',result);return result
+    finally:
+        fc.Harness=original
+        state['database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
+        diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-after.log')
 
 
 def compiler_plan(versions):
@@ -391,7 +735,8 @@ def evidence_file(path, root):
     if any(x in parts for x in ['tools','cli-cache','rust-cargo','ku-cargo','target','data','socket','.git','__pycache__']):
         return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:] in (('rust-cargo','release','ku-cross-stack-rust'),('target','release','ku-cross-stack-rust'))
     return path.name not in ('ku-performance-v2-evidence.tar.gz','archive.json') and not path.name.endswith('.writing') and (
-        path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or (path.suffix=='.profraw' and 'http-profiles' in parts) or 'bin' in parts or path.name=='libpq.so')
+        path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or (path.suffix=='.profraw' and 'http-profiles' in parts) or
+        (parts[0]=='diagnostic' and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
 
 
 def full_archive(a,state):
@@ -414,7 +759,9 @@ def full_archive(a,state):
     if destination.stat().st_size>limit:raise ValueError('archive footer exceeded frozen limit')
     result=dict(complete=True,path=str(destination),sha256=sha(destination),bytes=destination.stat().st_size,file_count=len(entries),
         goal_status=state.get('steps',{}).get('run',{}).get('result',{}).get('goal_status','unknown'),
-        caches_included=False,private_uris_redacted=True,source_scope='normal generated C/Ku inputs plus benchmark source; product Git commits in frozen plan')
+        caches_included=False,private_uris_redacted=True,
+        redaction_scope='Structured JSON and text logs only; raw perf/ELF bytes remain exact and may retain ephemeral private-fixture values.',
+        source_scope='normal generated C/Ku inputs plus benchmark source; product Git commits in frozen plan')
     save(a.root/'archive.json',result)
     for path in [destination,a.root/'archive.json']:os.chown(path,state.get('uid',os.getuid()),state.get('gid',os.getgid()));path.chmod(0o644)
     return result
@@ -442,14 +789,17 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
+    p.add_argument('--build-set',choices=['full','diagnostic'],default='full')
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate]) or a.baseline!=BASELINE:p.error('frozen full commit identities required')
     if a.phase!='archive' and (platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64')):p.error('actual Linux ARM64 required')
-    a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__))
+    if a.phase=='diagnostic' and a.build_set!='diagnostic':p.error('diagnostic phase requires --build-set diagnostic')
+    if a.phase in ('run','tail','lifecycle','compiler') and a.build_set!='full':p.error('formal phases require full build-set')
+    a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=a.build_set)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
     if a.phase=='archive':result=archive(a,state)
@@ -457,10 +807,11 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm(130*60-30)
+        if a.phase=='diagnostic':signal.alarm(20*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
-            'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler}[a.phase]
+            'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic}[a.phase]
         result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','lifecycle','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle') and result.get('execution_complete') is not True else 0
+    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle','diagnostic') and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
