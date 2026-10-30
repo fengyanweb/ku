@@ -200,11 +200,12 @@ def run(a,state):
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
         fc.Harness=HostedHarness
-        control=copy.deepcopy(plan);control.update(targets=[],schedule=[dict(phase='control',workload='json_object',rate=500,
+        fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None)
+        control=copy.deepcopy(fixed);control.update(targets=[],schedule=[dict(phase='control',workload='json_object',rate=500,
             orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
         control.pop('stop_after_consecutive_unusable_windows',None)
         summary=execute('control',control,'all');environment=environment_record(summary,a.root/'environment-qualification.json')
-        final=execute('final',plan,'all')
+        final=execute('final',fixed,'all')
         function_ok=bool(final.get('rows')) and all(r.get('functional_valid') is True and r.get('accounting_valid') is True for r in final['rows'])
         if function_ok:
             def capacities():

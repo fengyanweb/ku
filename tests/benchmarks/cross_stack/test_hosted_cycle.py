@@ -129,6 +129,50 @@ class HostedCycleTests(unittest.TestCase):
             with tarfile.open(result['path']) as tar:self.assertIn('archive-failure.json',tar.getnames())
 
 
+    def test_run_dispatches_capacity_only_once_after_fixed_windows_and_always_cleans_db(self):
+        for fail_final in [False,True]:
+            with self.subTest(fail_final=fail_final),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);frozen=root/'frozen-plan.json';h.save(frozen,self.plan());original_hash=h.sha(frozen)
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'fixture','db_cgroup':'/unused','database':{}})
+                h.save(dbstate,{'limits':{'cpuset.cpus':'3'}})
+                cleaned=[];owned=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:cleaned.append('stop') or {'stopped':True})
+                state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}}
+                read_bytes,read_text=Path.read_bytes,Path.read_text;old_harness=fc.Harness;calls=[]
+                patches.enter_context(patch.object(Path,'read_bytes',lambda p:b'fixture-boot' if str(p)=='/proc/sys/kernel/random/boot_id' else read_bytes(p)))
+                patches.enter_context(patch.object(Path,'read_text',lambda p,*a,**k:'MemTotal: 16777216 kB' if str(p)=='/proc/meminfo' else read_text(p,*a,**k)))
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
+                patches.enter_context(patch.object(h.db,'Database',return_value=owned))
+                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'unknown'}))
+                def measured(plan_path,output,phase,**unused):
+                    config=h.load(plan_path);label=Path(output).name;calls.append((label,phase))
+                    if label in ('control','final'):
+                        self.assertEqual(phase,'all');self.assertNotIn('capacity',config);self.assertNotIn('stability',config)
+                        if label=='final' and fail_final:raise ValueError('fixed-window failure retained')
+                        return {'execution_complete':True,'goal_status':'unknown','rows':[{'functional_valid':True,'accounting_valid':True}]}
+                    if label.startswith('capacity-'):
+                        kind=label.removeprefix('capacity-');self.assertEqual(phase,'capacity')
+                        self.assertEqual(config['capacity']['workloads'],[kind])
+                        return {'execution_complete':True,'capacity':[dict(name=n,workload=kind,functional_valid=True,
+                            accounting_valid=True,all_recovery_passed=True,qualified_lower_rate=100,upper_rate=None,boundary_observed=False) for n in ['B','R']]}
+                    self.assertEqual((label,phase),('stability','stability'))
+                    return {'execution_complete':True,'formal_qualified':False,'rows':[{'natural_reclamation':True,
+                        'segments':[{'streams':{'mixed':{'assessment':{'functional_valid':True,'accounting_valid':True}}}}]}]}
+                patches.enter_context(patch.object(fc,'execute',side_effect=measured))
+                args=types.SimpleNamespace(root=root)
+                if fail_final:
+                    with self.assertRaisesRegex(ValueError,'fixed-window failure'):h.run(args,state)
+                    self.assertEqual(calls,[('control','all'),('final','all')])
+                else:
+                    result=h.run(args,state);self.assertTrue(result['execution_complete'])
+                    self.assertEqual(calls,[('control','all'),('final','all'),('capacity-json_object','capacity'),('capacity-db','capacity'),('stability','stability')])
+                self.assertEqual(cleaned,['stop']);self.assertIs(fc.Harness,old_harness)
+                self.assertEqual(h.sha(frozen),original_hash)
+                self.assertIn('capacity',h.load(frozen));self.assertIn('stability',h.load(frozen))
+
+
     def test_compiler_phase_has_48_short_balanced_comparisons_no_formal_or_capacity(self):
         versions=self.plan()['versions']
         for n in ['KO3','KThin','KPGO','RThin','RPGO']:versions[n]={'root':'/unused/'+n}
