@@ -308,12 +308,18 @@ class HostedCycleTests(unittest.TestCase):
             protocol=root/'B/src/tests/benchmarks/cross_stack/protocol.json'
             protocol.write_bytes(b'{ "schema": 1 }\n')
             h.save(root/'private.json',{'db_url':'postgres://private-fixture','public':'retained'})
+            driver=root/'fresh-driver/bin/cross-stack-client';driver.parent.mkdir(parents=True)
+            driver.write_bytes(b'raw driver fixture')
+            driver_source=root/'fresh-driver/source/main.go';driver_source.parent.mkdir(parents=True)
+            driver_source.write_bytes(b'package main\n')
             result=h.full_archive(types.SimpleNamespace(root=root),{'steps':{}})
             self.assertTrue(result['complete'])
             with tarfile.open(result['path']) as archive:
                 self.assertEqual(archive.extractfile(corpus.relative_to(root).as_posix()).read(),raw)
                 self.assertEqual(archive.extractfile(protocol.relative_to(root).as_posix()).read(),protocol.read_bytes())
                 self.assertEqual(json.load(archive.extractfile('private.json')),{'public':'retained'})
+                self.assertEqual(archive.extractfile('fresh-driver/bin/cross-stack-client').read(),driver.read_bytes())
+                self.assertEqual(archive.extractfile('fresh-driver/source/main.go').read(),driver_source.read_bytes())
                 mapping={row['path']:row for row in json.load(archive.extractfile('portable-file-map.json'))['files']}
                 row=mapping[corpus.relative_to(root).as_posix()]
                 self.assertEqual(row['original_sha256'],row['archived_sha256'])

@@ -191,13 +191,17 @@ def new_driver(a):
     go=a.tools/'go/bin/go';logs=Commands(out/'commands',environment)
     version=logs.run('version',[go,'version'],directory,timeout=30)
     if not re.fullmatch(r'go version go1\.27\.2 linux/arm64',version):raise ValueError('fixed Go ARM64 toolchain required')
-    binary=out/'cross-stack-client'
+    (out/'bin').mkdir()
+    binary=out/'bin/cross-stack-client'
     logs.run('build',[go,'build','-trimpath','-mod=readonly','-o',binary,'.'],directory,timeout=180)
     logs.run('contracts',[go,'test','./...'],directory,timeout=180)
     driver_input_preflight(directory,a.root/'R/src/tests/benchmarks/cross_stack/protocol.json',go,logs)
     if sources()!=source_hashes:raise ValueError('driver sources changed during preparation')
+    for relative,digest in source_hashes.items():
+        target=out/'source'/relative;target.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(directory/relative,target);checked(target,digest)
     client=dict(command=[str(binary)],cwd=str(a.root),env={'GOMAXPROCS':'1'},sha256=h.sha(binary),
-        source_sha256=h.sha(directory/'main.go'),source_files_sha256=source_hashes,
+        source_sha256=h.sha(directory/'main.go'),source_files_sha256=source_hashes,source_root=str(out/'source'),
         tool_checkout_commit=subprocess.check_output(['git','-C',str(a.source),'rev-parse','HEAD'],text=True,timeout=10).strip())
     h.save(out/'identity.json',dict(client=client,commands=logs.rows,scope='new common driver for all reused services; no old results imported'))
     m=h.load(a.root/'R/manifest.json');m['client']=client;h.save(a.root/'R/manifest.json',m)
