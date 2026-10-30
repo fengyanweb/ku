@@ -897,6 +897,50 @@ class FocusCycleTests(unittest.TestCase):
 class FocusStabilityTests(unittest.TestCase):
     """Only synthetic reports/threads; these never create cgroups or services."""
 
+    def test_each_stability_consumer_gets_its_own_frozen_protocol_and_real_corpora(self):
+        source=Path(__file__).with_name('protocol.json').resolve(); original=source.read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            mixed=types.SimpleNamespace(protocol=source,output=Path(directory)/'mixed',
+                identity={'protocol_sha256':focus_cycle.digest(source),'manifest_sha256':'f'*64})
+            initial=copy.deepcopy(mixed.identity)
+            receipt=focus_cycle.stability_client_protocol(mixed,'mixed')
+            self.assertEqual(mixed.protocol,source);self.assertEqual(mixed.identity,initial)
+            self.assertEqual(receipt['sha256'],focus_cycle.digest(source))
+            task=types.SimpleNamespace(protocol=source,output=Path(directory)/'task-mix',identity=initial.copy())
+            receipt=focus_cycle.stability_client_protocol(task,'task_mix')
+            derived=json.loads(task.protocol.read_text());base=json.loads(original)
+            self.assertEqual(derived['endpoints']['cpu']['work_units'],[512])
+            self.assertEqual(derived['endpoints']['cpu']['seed_lengths'],[3,11])
+            self.assertEqual(derived['SLO']['task_mix_short_p99_ms'],20)
+            self.assertEqual(task.identity['protocol_sha256'],focus_cycle.digest(task.protocol))
+            self.assertEqual(task.identity['manifest_sha256'],initial['manifest_sha256'])
+            self.assertEqual(receipt['source_sha256'],focus_cycle.digest(source))
+            for name,item in derived['corpora'].items():
+                corpus=(task.protocol.parent/item['path']).resolve()
+                self.assertEqual(corpus,(source.parent/base['corpora'][name]['path']).resolve())
+                self.assertEqual(focus_cycle.digest(corpus),item['sha256'])
+                self.assertEqual(json.loads(corpus.read_bytes())['counter'],item['counter'])
+                self.assertEqual(receipt['corpora'][name]['source_path'],str(corpus))
+                self.assertEqual(receipt['corpora'][name]['sha256'],item['sha256'])
+            self.assertEqual(derived['endpoints']['mixed'],base['endpoints']['mixed'])
+            self.assertEqual(source.read_bytes(),original)
+
+    def test_task_mix_refuses_changed_corpus_or_route_before_writing_protocol(self):
+        source=Path(__file__).with_name('protocol.json').resolve()
+        for change in ('sha','envelope','route'):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);protocol=json.loads(source.read_text())
+                for item in protocol['corpora'].values():item['path']=str((source.parent/item['path']).resolve())
+                if change=='sha':protocol['corpora']['object']['sha256']='0'*64
+                elif change=='route':protocol['endpoints']['cpu']['method']='POST'
+                else:
+                    corpus=root/'bad.json';corpus.write_text('{"counter":7,"wrong":null}')
+                    protocol['corpora']['object'].update(path=str(corpus),sha256=focus_cycle.digest(corpus))
+                original=root/'source.json';original.write_text(json.dumps(protocol))
+                client=types.SimpleNamespace(protocol=original,output=root/'derived',identity={})
+                with self.assertRaises(ValueError):focus_cycle.stability_client_protocol(client,'task_mix')
+                self.assertFalse((client.output/'task-mix-protocol.json').exists())
+
     def plan(self):
         plan = FocusCycleTests().plan()
         plan['stability'] = {'name': 'B', 'frozen_final': True, 'seconds': 1800,

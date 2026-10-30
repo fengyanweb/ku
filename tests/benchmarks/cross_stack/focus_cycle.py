@@ -734,6 +734,42 @@ def stability_parent_cleanup(parent):
             'scope': 'only the random private driver parent and its owned children'}
 
 
+def stability_client_protocol(client, kind):
+    """Freeze Task mix inputs without altering the ordinary mixed protocol."""
+    source = Path(client.protocol).resolve(strict=True)
+    receipt = {'source_path': str(source), 'source_sha256': digest(source),
+               'path': str(source), 'sha256': digest(source)}
+    if kind == 'mixed':
+        return receipt
+    if kind != 'task_mix':
+        raise ValueError('unknown stability stream protocol: '+kind)
+    protocol = json.loads(source.read_text())
+    if any(protocol['endpoints'][key].get('method') != 'GET' for key in ('ok', 'cpu')):
+        raise ValueError('Task mix requires original GET ok/cpu routes')
+    destination = Path(client.output).resolve()/'task-mix-protocol.json'
+    corpora = {}
+    for name, item in protocol['corpora'].items():
+        path = (source.parent/item['path']).resolve(strict=True)
+        raw = path.read_bytes()
+        if len(raw)>65536 or hashlib.sha256(raw).hexdigest() != item['sha256']:
+            raise ValueError('Task mix source corpus bound/SHA mismatch: '+name)
+        value = json.loads(raw, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x)))
+        if (not isinstance(value, dict) or set(value) != {'counter', 'data'}
+                or type(value['counter']) is not int or value['counter'] != item['counter']):
+            raise ValueError('Task mix source corpus envelope mismatch: '+name)
+        item['path'] = os.path.relpath(path, destination.parent)
+        corpora[name] = {'source_path': str(path), 'relative_path': item['path'],
+                        'sha256': item['sha256'], 'bytes': len(raw)}
+    protocol['endpoints']['cpu'].update(work_units=[512], seed_lengths=[3, 11])
+    protocol.setdefault('SLO', {})['task_mix_short_p99_ms'] = 20
+    write_json(destination, protocol)
+    receipt.update(path=str(destination), sha256=digest(destination), corpora=corpora,
+                   contract={'work_units': [512], 'seed_lengths': [3, 11], 'short_slo_ms': 20})
+    client.protocol = destination
+    client.identity = dict(client.identity, protocol_sha256=receipt['sha256'])
+    return receipt
+
+
 def stability_window(plan, output, config, binding, unchanged):
     """One service, simultaneous streams, finite segments and one CPU denominator."""
     name = config['name']
@@ -775,6 +811,7 @@ def stability_window(plan, output, config, binding, unchanged):
                 client.manifest['client']['command'] += ['--cpu-rate', str(config['cpu_rate']),
                     '--cpu-cancel-every', '10', '--cpu-cancel-delay-us', '250']
             receipt = {'source_manifest_sha256': client.identity['manifest_sha256'],
+                'protocol': stability_client_protocol(client, kind),
                 'effective_client': client.manifest['client'], 'parent': str(parent.path),
                 'child_limits': {'cpu.max': '100000 100000', 'memory.max': GIB, 'cpuset': '2'},
                 'scope': 'derived client-only in-memory configuration; original frozen manifest unchanged'}
