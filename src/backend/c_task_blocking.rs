@@ -184,6 +184,7 @@ struct KuTaskBlockingPoolV1 {
 #endif
   size_t capacity, worker_target, workers_created, workers_exited, workers_joined;
   size_t head, queued, running, resident, peak_resident, peak_queued, peak_running;
+  size_t state_waiters;
   uint64_t accepted, rejected, rejected_queue, finished;
   void* retirement_context;
   void (*retirement_notify)(void*);
@@ -365,13 +366,19 @@ invalid:
 }
 #endif
 static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {
+  /* All publishers and wait registrations hold pool->mutex. Idle execution
+   * workers need only QUEUED or closing; NET_WAIT/DONE publication already
+   * wakes its Task owner through the driver. Finite state/finish observers
+   * retain the shared condition and register before atomically releasing the
+   * mutex in wait, so neither completion nor shutdown can be lost. */
+  if (!pool->queued && !pool->closing && !pool->state_waiters) return;
 #if defined(_WIN32)
   WakeAllConditionVariable(&pool->condition);
 #else
   if (pthread_cond_broadcast(&pool->condition)) pool->fault=KU_TASK_DRIVER_INTERNAL;
 #endif
 }
-static int ku_task_blocking_wait(KuTaskBlockingPoolV1* pool, uint64_t deadline) {
+static int ku_task_blocking_wait_inner(KuTaskBlockingPoolV1* pool, uint64_t deadline) {
 #if defined(_WIN32)
   DWORD delay=INFINITE;
   if (deadline!=UINT64_MAX) {
@@ -404,6 +411,15 @@ static int ku_task_blocking_wait(KuTaskBlockingPoolV1* pool, uint64_t deadline) 
 #endif
   return status==0 ? 0 : status==ETIMEDOUT ? 1 : -1;
 #endif
+}
+static int ku_task_blocking_wait(KuTaskBlockingPoolV1* pool, uint64_t deadline) {
+  /* State observers may wait for physical job retirement with either finite
+   * or infinite deadlines. Only execution workers use wait_inner directly. */
+  if (pool->state_waiters==SIZE_MAX) { pool->fault=KU_TASK_DRIVER_INTERNAL; return -1; }
+  pool->state_waiters++;
+  int status=ku_task_blocking_wait_inner(pool,deadline);
+  pool->state_waiters--;
+  return status;
 }
 typedef union KuTaskBlockingAllocationV1 {
   struct { size_t bytes; } allocation;
@@ -593,7 +609,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
   if (ku_task_blocking_lock(pool)) return;
   for (;;) {
     while (!pool->queued && !pool->closing) {
-      if (ku_task_blocking_wait(pool,UINT64_MAX)<0) {
+      if (ku_task_blocking_wait_inner(pool,UINT64_MAX)<0) {
         pool->fault=KU_TASK_DRIVER_INTERNAL; ku_task_blocking_set_closing_locked(pool,1u); break;
       }
     }

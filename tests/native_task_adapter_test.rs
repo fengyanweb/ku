@@ -1668,6 +1668,11 @@ async fn main(): null! { return ok(null) }
             1,
         )
         .replacen(
+            "  if (!pool->queued && !pool->closing && !pool->state_waiters) return;",
+            "  if (!pool->queued && !pool->closing && !pool->state_waiters) return;\n  fixture_pool_actual_signal();",
+            1,
+        )
+        .replacen(
             "KuTaskBlockingAllocationV1* allocation=(KuTaskBlockingAllocationV1*)malloc(total);",
             "KuTaskBlockingAllocationV1* allocation=(KuTaskBlockingAllocationV1*)fixture_blocking_malloc(total);",
             1,
@@ -1748,6 +1753,10 @@ static void* fixture_output_malloc(size_t bytes) {
   return pointer;
 }
 static int fixture_fail_pool_signal;
+static size_t fixture_pool_actual_signals;
+static void fixture_pool_actual_signal(void) {
+  fixture_alloc_lock(); fixture_pool_actual_signals++; fixture_alloc_unlock();
+}
 static int fixture_pool_signal_failure(void) {
   fixture_alloc_lock(); int fail=fixture_fail_pool_signal; fixture_fail_pool_signal=0;
   fixture_alloc_unlock(); return fail;
@@ -2417,8 +2426,32 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
     CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   }
 }
+static void blocking_notification_predicates(void) {
+  KuTaskBlockingPoolV1 pool={0};
+#if defined(_WIN32)
+  InitializeSRWLock(&pool.mutex); InitializeConditionVariable(&pool.condition);
+#else
+  CHECK(!pthread_mutex_init(&pool.mutex,NULL));
+  CHECK(!pthread_cond_init(&pool.condition,NULL));
+#endif
+  CHECK(!ku_task_blocking_lock(&pool));
+  size_t before=fixture_pool_actual_signals;
+  for(size_t i=0;i<32u;i++)ku_task_blocking_signal(&pool);
+  CHECK(fixture_pool_actual_signals==before); /* DONE/NET_WAIT without a reader. */
+  pool.queued=1u;ku_task_blocking_signal(&pool);
+  CHECK(fixture_pool_actual_signals==before+1u);
+  pool.queued=0;pool.state_waiters=1u;ku_task_blocking_signal(&pool);
+  CHECK(fixture_pool_actual_signals==before+2u); /* Registered physical-retirement observer. */
+  pool.state_waiters=0;pool.closing=1u;ku_task_blocking_signal(&pool);
+  CHECK(fixture_pool_actual_signals==before+3u); /* Idle worker exit/finish always wakes. */
+  ku_task_blocking_unlock(&pool);
+#if !defined(_WIN32)
+  CHECK(!pthread_cond_destroy(&pool.condition));CHECK(!pthread_mutex_destroy(&pool.mutex));
+#endif
+}
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
+  blocking_notification_predicates();
   blocking_capacity_storage_is_bounded_and_freed();
   blocking_queue_and_generation(); blocking_queued_cancel_retires_before_occupied_worker_is_released();
   blocking_late_retirement_keeps_original_deadline();
