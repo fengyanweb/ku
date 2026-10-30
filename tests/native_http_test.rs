@@ -224,6 +224,24 @@ fn spawn_native_server_settings(
     max_requests: Option<usize>,
     settings: &[(&str, &str)],
 ) -> Option<NativeHttpServer> {
+    spawn_native_server_settings_with_observation(
+        name,
+        source,
+        address,
+        observed.then_some(RUN_TIMEOUT),
+        max_requests,
+        settings,
+    )
+}
+
+fn spawn_native_server_settings_with_observation(
+    name: &str,
+    source: &str,
+    address: &str,
+    observed_timeout: Option<Duration>,
+    max_requests: Option<usize>,
+    settings: &[(&str, &str)],
+) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
     fs::write(dir.join(entry), source.replace("__ADDRESS__", address)).expect("write ku source");
@@ -437,11 +455,11 @@ fn spawn_native_server_settings(
     } else {
         dir.join(&out)
     };
-    if observed {
+    if let Some(timeout) = observed_timeout {
         let mut command = Command::new(&exe);
         command.current_dir(&dir);
         command.envs(settings.iter().copied());
-        let service = match spawn_bounded_service(command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS) {
+        let service = match spawn_bounded_service(command, timeout, RUN_OUTPUT_LIMITS) {
             Ok(service) => service,
             Err(error) => {
                 fs::remove_dir_all(&dir).ok();
@@ -3136,49 +3154,84 @@ fn main(): null! {
 fn native_handler_timeout_bounds_infinite_finally_and_releases_worker() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
-    let Some(mut server) =
-        spawn_native_server("infinite-finally", INFINITE_FINALLY_SOURCE, &address)
-    else {
+    let Some(mut server) = spawn_native_server_settings_with_observation(
+        "infinite-finally",
+        INFINITE_FINALLY_SOURCE,
+        &address,
+        Some(Duration::from_secs(10)),
+        None,
+        &[],
+    ) else {
         return;
     };
+    let observed_at = Instant::now();
+    let mut stages = Vec::new();
+    let exercise = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stages.push(("startup /ok sent", observed_at.elapsed()));
+        let ready = http_response(
+            &address,
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(5),
+        );
+        stages.push(("startup response received", observed_at.elapsed()));
+        assert_status(&ready, "HTTP/1.1 200 OK");
 
-    let ready = http_response(
-        &address,
-        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        Duration::from_secs(5),
-    );
-    assert_status(&ready, "HTTP/1.1 200 OK");
+        // The checked service owns the process and drains bounded stdout/stderr.
+        // Its original 10s outer bound now also covers startup. A child that
+        // exits after sending 504 cannot be mistaken for a successful stop.
+        let started = Instant::now();
+        let mut stuck = connect_with_retry(&address, Duration::from_secs(2));
+        stuck
+            .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write infinite-finally request");
+        stages.push(("/stuck sent", observed_at.elapsed()));
+        let stuck_response = read_http_stream(stuck, Duration::from_secs(12));
+        stages.push(("/stuck response received", observed_at.elapsed()));
+        assert_status(&stuck_response, "HTTP/1.1 504 Gateway Timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "infinite finally cleanup was not bounded promptly: {:?}",
+            started.elapsed()
+        );
 
-    // The watchdog owns the external server process. Its deadline is longer
-    // than the runtime's expected cleanup bound but shorter than the socket
-    // read timeout, so a regression is force-killed instead of hanging cargo.
-    let watchdog = server.arm_kill_watchdog(Duration::from_secs(10));
-    let started = Instant::now();
-    let mut stuck = connect_with_retry(&address, Duration::from_secs(2));
-    stuck
-        .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write infinite-finally request");
-    let stuck_response = read_http_stream(stuck, Duration::from_secs(12));
+        // With max_active_requests=1, success proves the first handler released
+        // its permit and did not leave the worker stuck in its finally loop.
+        stages.push(("recovery /ok sent", observed_at.elapsed()));
+        let recovered = http_response(
+            &address,
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(3),
+        );
+        stages.push(("recovery response received", observed_at.elapsed()));
+        assert_status(&recovered, "HTTP/1.1 200 OK");
+    }));
+    // Always check the child receipt, including when a request assertion
+    // panics. Retain the original failure after reporting the exit status and
+    // bounded diagnostics instead of replacing it with a cleanup success.
+    let stopped = server
+        .service
+        .take()
+        .expect("observed infinite-finally service")
+        .finish_checked();
+    if let Err(original) = exercise {
+        eprintln!("infinite-finally request stages: {stages:?}");
+        match stopped {
+            Ok(receipt) => eprintln!(
+                "infinite-finally checked stop after request failure: {}",
+                receipt.output.status
+            ),
+            Err(error) => eprintln!("infinite-finally child failure receipt: {error}"),
+        }
+        std::panic::resume_unwind(original);
+    }
+    let receipt = stopped.unwrap_or_else(|error| {
+        panic!("infinite-finally checked service failed; stages={stages:?}: {error}")
+    });
+    assert!(receipt.output.stderr.is_empty());
     assert!(
-        !watchdog.timed_out(),
-        "native server was killed by the 10s test watchdog; timed-out finally did not terminate"
+        !receipt.output.status.success(),
+        "forced stop is not natural success"
     );
-    assert_status(&stuck_response, "HTTP/1.1 504 Gateway Timeout");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "infinite finally cleanup was not bounded promptly: {:?}",
-        started.elapsed()
-    );
-
-    // With max_active_requests=1, success proves the first handler released its
-    // permit and did not leave the sole worker stuck in its finally loop.
-    let recovered = http_response(
-        &address,
-        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        Duration::from_secs(3),
-    );
-    assert_status(&recovered, "HTTP/1.1 200 OK");
-    assert!(!watchdog.timed_out(), "test watchdog fired after recovery");
 }
 
 // Stage 8e item-二: an HTTP program must compile and link regardless of how it
