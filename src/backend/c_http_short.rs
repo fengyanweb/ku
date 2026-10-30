@@ -732,6 +732,17 @@ mod tests {
             let tasks = crate::ir::task_lower::lower_service_handlers(&ast).unwrap();
             task_request_fields(tasks.functions.iter().find(|f| f.name == "Ready").unwrap())
         }
+        for (expression, expected) in [
+            ("req.headers.host", 1),
+            ("req.params.id", 2),
+            ("req.query.rid", 4),
+            ("req.method", 8),
+            ("req.path", 16),
+            ("req.body", 32),
+        ] {
+            let source = format!("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! {{ return ok(http.text({expression})) }} fn main() {{}}");
+            assert_eq!(mask(&source), Some(expected), "field {expression}");
+        }
         assert_eq!(mask("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! { return ok(http.text(req.query.rid)) } fn main() {}"),Some(4));
         assert_eq!(mask("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! { return ok(http.text(req.headers.host + req.params.id + req.method + req.path + req.body)) } fn main() {}"),Some(59));
         assert_eq!(mask("import \"std.http\" async fn Ready(): HttpResponse! { return ok(http.text(\"ok\")) } fn main() {}"),Some(0));

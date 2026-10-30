@@ -2894,6 +2894,94 @@ fn native_object_missing_key_and_get_or() {
 }
 
 #[test]
+fn native_object_insertion_reuses_probe_and_relocates_after_rehash() {
+    let dir = unique_temp_dir("object-probe-slot");
+    fs::write(dir.join("main.ku"), "fn main() { item = { keep: 1 } }\n")
+        .expect("write object insertion source");
+    let generated = native_emit_c(&dir, "main.ku")
+        .replace("#define KU_NATIVE_TEST_OBJECT_OOM 0", "#define KU_NATIVE_TEST_OBJECT_OOM 1")
+        .replacen(
+            "static uint64_t ku_obj_hash(KuString key) {",
+            "static size_t ku_slot_hash_calls;\nstatic uint64_t ku_obj_hash(KuString key) {\n  ku_slot_hash_calls++;",
+            1,
+        );
+    let checks = r#"
+static void fixture_fault(const char* site) {
+#if defined(_WIN32)
+  _putenv_s("KU_NATIVE_TEST_OBJECT_OOM_SITE",site);
+  _putenv_s("KU_NATIVE_TEST_OBJECT_OOM_ORDINAL","1");
+#else
+  setenv("KU_NATIVE_TEST_OBJECT_OOM_SITE",site,1);
+  setenv("KU_NATIVE_TEST_OBJECT_OOM_ORDINAL","1",1);
+#endif
+}
+int main(void) {
+  KuObject* object=NULL;CHECK(ku_object_try_new(0,&object));
+  char keys[32][24];size_t found=0;
+  /* Force wraparound collision chains in the initial table. Later table
+   * growth must re-evaluate bucket positions, not reuse a stale empty index. */
+  for(size_t candidate=0;candidate<65536 && found<32;candidate++) {
+    char text[24];int length=snprintf(text,sizeof(text),"collision-%zu",candidate);
+    CHECK(length>0 && (size_t)length<sizeof(text));
+    KuString key=ku_string_static((const uint8_t*)text,(size_t)length);
+    if((ku_obj_hash(key)&7u)==7u)memcpy(keys[found++],text,(size_t)length+1u);
+  }
+  CHECK(found==32);
+  for(size_t i=0;i<32;i++) {
+    KuString key={0},payload={0};
+    KuString borrowed=ku_string_static((const uint8_t*)keys[i],strlen(keys[i]));
+    CHECK(ku_object_string_try_clone(borrowed,&key));
+    CHECK(ku_object_string_try_clone(ku_string_static((const uint8_t*)"payload",7),&payload));
+    KuValue value=ku_v_str(ku_string_move(&payload));
+    size_t old_cap=object->cap,old_len=object->len;
+    if(i==5) {
+      size_t live=ku_perf_live_allocations,bytes=ku_perf_live_bytes;
+      const uint8_t* original_key=key.ptr;const uint8_t* original_value=value.as.s.ptr;
+      fixture_fault("object_rehash");
+      CHECK(!ku_object_try_set_owned(object,&key,&value));
+      CHECK(key.ptr==original_key && value.tag==KU_STR && value.as.s.ptr==original_value);
+      CHECK(object->cap==old_cap && object->len==old_len);
+      CHECK(ku_perf_live_allocations==live && ku_perf_live_bytes==bytes);
+      CHECK(ku_object_get(object,borrowed)==NULL);
+      fixture_fault("");
+    }
+    size_t hash_before=ku_slot_hash_calls;
+    CHECK(ku_object_try_set_owned(object,&key,&value));
+    size_t hash_delta=ku_slot_hash_calls-hash_before;
+    CHECK(hash_delta==1u+(object->cap!=old_cap?old_len:0u));
+    CHECK(!key.ptr && !key.len && value.tag==KU_NULL);
+    CHECK(object->len==old_len+1u);
+    for(size_t prior=0;prior<=i;prior++) {
+      KuValue* loaded=ku_object_get(object,ku_string_static((const uint8_t*)keys[prior],strlen(keys[prior])));
+      CHECK(loaded && loaded->tag==KU_STR && loaded->as.s.len==7u);
+      CHECK(!memcmp(loaded->as.s.ptr,"payload",7));
+    }
+  }
+  CHECK(object->cap>=64 && object->len==32);
+  /* An existing key replaces exactly once without insertion/rehash. */
+  KuString duplicate={0};CHECK(ku_object_string_try_clone(ku_string_static((const uint8_t*)keys[7],strlen(keys[7])),&duplicate));
+  KuValue replacement=ku_v_int(73);size_t cap=object->cap,hash_before=ku_slot_hash_calls;
+  CHECK(ku_object_try_set_owned(object,&duplicate,&replacement));
+  CHECK(ku_slot_hash_calls==hash_before+1u && object->cap==cap && object->len==32);
+  CHECK(!duplicate.ptr && replacement.tag==KU_NULL);
+  CHECK(ku_object_get(object,ku_string_static((const uint8_t*)keys[7],strlen(keys[7])))->as.i==73);
+  /* Copy-key insertion uses the same proven empty slot but retains the
+   * caller's borrowed key. It cannot consume or free that key on success. */
+  KuString borrowed=ku_string_static((const uint8_t*)"borrowed-new",12);
+  KuValue copied=ku_v_int(91);hash_before=ku_slot_hash_calls;
+  CHECK(ku_object_try_set_copy_key(object,borrowed,&copied));
+  CHECK(ku_slot_hash_calls==hash_before+1u && copied.tag==KU_NULL);
+  CHECK(borrowed.len==12u && !memcmp(borrowed.ptr,"borrowed-new",12));
+  CHECK(ku_object_get(object,borrowed)->as.i==91);
+  ku_object_drop(object);CHECK(NO_LIVE_ALLOCATIONS());
+  puts("object-probe-slot-ok");return 0;
+}
+"#;
+    run_array_capacity_c_harness(&dir, &generated, "object-probe-slot", checks);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_dynamic_object_store_bracket_and_dot_are_owned_and_readable() {
     let dir = unique_temp_dir("object-store");
     fs::write(
