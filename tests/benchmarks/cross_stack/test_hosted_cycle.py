@@ -236,6 +236,7 @@ class HostedCycleTests(unittest.TestCase):
                     report=h.load(root/'compiler/comparisons.json')
                     self.assertTrue(all(c['metric']=='full_cpu_us' for c in report['comparisons']))
                     self.assertTrue(all(c['interval']['estimate']==1 for c in report['comparisons']))
+                    self.assertTrue(all(c['observational_quality_passed'] is False for c in report['comparisons']))
                 self.assertIs(fc.Harness,old_fc);self.assertIs(pt.Harness,old_pt)
                 self.assertEqual(state['compiler_database_cleanup'],{'stopped':True})
 

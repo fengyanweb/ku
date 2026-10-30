@@ -334,7 +334,11 @@ def compiler(a,state):
                 complete=[g for g in groups if left in g and right in g]
                 comparisons.append({'workload':workload,'numerator':left,'denominator':right,'contract':contract,
                     'metric':'full_cpu_us','interval':fc.paired_interval([fc.metric(g[left],'full_cpu_us') for g in complete],[fc.metric(g[right],'full_cpu_us') for g in complete],minimum=3),
-                    'observational_quality_passed':len(complete)==3 and all(r.get('status')=='observed' and r.get('arrival_schedule_quality')==r.get('environment_quality')=='pass' for g in complete for r in [g[left],g[right]]),
+                    'observational_quality_passed':len(complete)==3 and all(r.get('status')=='observed'
+                        and r.get('functional_valid') is True and r.get('accounting_valid') is True
+                        and r.get('natural_reclamation') is True and r.get('measurement_invalid') is not True
+                        and r.get('arrival_schedule_quality')==r.get('environment_quality')=='pass'
+                        for g in complete for r in [g[left],g[right]]),
                     'goal_status':'unknown','formal_qualified':False,'default_changed':False})
         save(directory/'comparisons.json',{'comparisons':comparisons,'HTTP_train_and_heldout':validation,'goal_status':'unknown'})
         return dict(execution_complete=result['execution_complete'],goal_status='unknown',comparisons=str(directory/'comparisons.json'),
