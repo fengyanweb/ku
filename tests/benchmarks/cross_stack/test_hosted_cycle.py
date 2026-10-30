@@ -298,6 +298,26 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual({x['denominator'] for x in strict},{'RS'})
         self.assertEqual({x['maximum_ratio'] for x in strict if x['metric']=='full_cpu_us'},{.90})
 
+    def test_archive_preserves_frozen_input_bytes_and_keeps_receipt_redaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            corpus=root/'B/src/tests/benchmarks/cross_stack/corpora/object.json'
+            corpus.parent.mkdir(parents=True)
+            raw=b'{ "counter":7, "data": {"token":"synthetic fixture"} }\n'
+            corpus.write_bytes(raw)
+            protocol=root/'B/src/tests/benchmarks/cross_stack/protocol.json'
+            protocol.write_bytes(b'{ "schema": 1 }\n')
+            h.save(root/'private.json',{'db_url':'postgres://private-fixture','public':'retained'})
+            result=h.full_archive(types.SimpleNamespace(root=root),{'steps':{}})
+            self.assertTrue(result['complete'])
+            with tarfile.open(result['path']) as archive:
+                self.assertEqual(archive.extractfile(corpus.relative_to(root).as_posix()).read(),raw)
+                self.assertEqual(archive.extractfile(protocol.relative_to(root).as_posix()).read(),protocol.read_bytes())
+                self.assertEqual(json.load(archive.extractfile('private.json')),{'public':'retained'})
+                mapping={row['path']:row for row in json.load(archive.extractfile('portable-file-map.json'))['files']}
+                row=mapping[corpus.relative_to(root).as_posix()]
+                self.assertEqual(row['original_sha256'],row['archived_sha256'])
+
     def test_oversize_archive_returns_explicit_failure_not_silent_truncation(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);path=root/'normal.c';path.write_bytes(bytes(range(256))*100)

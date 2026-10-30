@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse, copy, hashlib, json, os
 from pathlib import Path, PurePosixPath
-import platform, re, signal, subprocess, tarfile
+import platform, re, shutil, signal, subprocess, tarfile, tempfile
 import hosted_cycle as h
 from compile_variants import Commands, clean_environment
 
@@ -68,6 +68,50 @@ def extract_builds(archive, root, expected_sha256, names):
         h.save(root/'reuse-portable-file-map.json',index)
         h.save(root/'reuse-original-state.json',old)
         return mapping
+
+
+def restore_json_inputs(source, root, commits, mapping):
+    """Recover immutable input bytes, never normalize a corpus or its contract."""
+    prefix='tests/benchmarks/cross_stack/'
+    records=[]
+    for name,commit in commits.items():
+        start=name+'/src/'+prefix
+        for path,entry in sorted(mapping.items()):
+            if not path.startswith(start) or not path.endswith('.json'):continue
+            target=root/path;checked(target,entry['archived_sha256'])
+            if entry['archived_sha256']!=entry['original_sha256']:
+                git_path=path[len(name+'/src/'):]
+                raw=subprocess.check_output(['git','-C',str(source),'show',commit+':'+git_path],timeout=10)
+                if len(raw)>MAX_FILE or hashlib.sha256(raw).hexdigest()!=entry['original_sha256']:
+                    raise ValueError('immutable JSON input differs from original build: '+path)
+                target.write_bytes(raw)
+            checked(target,entry['original_sha256'])
+            records.append(dict(path=path,source_commit=commit,archived_sha256=entry['archived_sha256'],
+                original_sha256=entry['original_sha256'],recovered_sha256=h.sha(target),
+                archived_bytes=entry['bytes'],recovered_bytes=target.stat().st_size))
+    h.save(root/'reuse-json-input-recovery.json',dict(files=records,
+        scope='source JSON only; git-committed bytes restored without changing protocol expectations or compiled artifacts'))
+
+
+def validate_protocol_inputs(root, name, mapping):
+    base=root/name/'src/tests/benchmarks/cross_stack';path=base/'protocol.json'
+    checked(path,mapping[path.relative_to(root).as_posix()]['original_sha256'])
+    protocol=h.load(path)
+    if protocol.get('schema')!=1 or not {'object','array','escape'}<=protocol.get('corpora',{}).keys():
+        raise ValueError('frozen corpus protocol is incomplete')
+    records={}
+    for key,spec in protocol['corpora'].items():
+        relative=PurePosixPath(spec['path'])
+        if relative.is_absolute() or '..' in relative.parts or '\\' in spec['path']:
+            raise ValueError('corpus path is outside frozen inputs')
+        corpus=base/relative;checked(corpus,spec['sha256'])
+        if type(spec.get('bytes')) is not int or corpus.stat().st_size!=spec['bytes']:
+            raise ValueError('frozen corpus byte count differs: '+key)
+        value=h.load(corpus)
+        if set(value)!={'counter','data'} or value['counter']!=spec['counter']:
+            raise ValueError('frozen corpus envelope differs: '+key)
+        records[key]=dict(bytes=spec['bytes'],sha256=spec['sha256'])
+    return dict(protocol_sha256=h.sha(path),corpora=records)
 
 
 def require_elf(path):
@@ -150,6 +194,7 @@ def new_driver(a):
     binary=out/'cross-stack-client'
     logs.run('build',[go,'build','-trimpath','-mod=readonly','-o',binary,'.'],directory,timeout=180)
     logs.run('contracts',[go,'test','./...'],directory,timeout=180)
+    driver_input_preflight(directory,a.root/'R/src/tests/benchmarks/cross_stack/protocol.json',go,logs)
     if sources()!=source_hashes:raise ValueError('driver sources changed during preparation')
     client=dict(command=[str(binary)],cwd=str(a.root),env={'GOMAXPROCS':'1'},sha256=h.sha(binary),
         source_sha256=h.sha(directory/'main.go'),source_files_sha256=source_hashes,
@@ -158,11 +203,41 @@ def new_driver(a):
     m=h.load(a.root/'R/manifest.json');m['client']=client;h.save(a.root/'R/manifest.json',m)
 
 
+def driver_input_preflight(directory, protocol, go, logs):
+    """Run the real Go loader offline against the recovered input directory."""
+    test='''package main
+import ("encoding/json";"os";"testing")
+func TestReusedProtocolInputBytes(t *testing.T) {
+ c:=config{protocolPath:os.Getenv("KU_REUSED_PROTOCOL"),workload:"json_object"}
+ if err:=load(&c);err!=nil {t.Fatal(err)}
+ if c.protocolHash!=os.Getenv("KU_REUSED_PROTOCOL_SHA256") {t.Fatal("protocol SHA differs")}
+ raw,err:=os.ReadFile(c.protocolPath);if err!=nil {t.Fatal(err)}
+ var p struct {Corpora map[string]struct {Bytes int}}
+ if err=json.Unmarshal(raw,&p);err!=nil {t.Fatal(err)}
+ for _,name:=range []string{"object","array","escape"} {
+  if len(c.corpora[name].bytes)!=p.Corpora[name].Bytes {t.Fatalf("corpus bytes differ: %s",name)}
+ }
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='offline-inputs-') as temp:
+        target=Path(temp)
+        for file in directory.rglob('*'):
+            if file.is_file() and (file.suffix=='.go' or file.name in ('go.mod','go.sum')):
+                destination=target/file.relative_to(directory);destination.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copyfile(file,destination)
+        (target/'reused_inputs_test.go').write_text(test)
+        logs.run('recovered-inputs',[go,'test','-run','^TestReusedProtocolInputBytes$','-count=1','.'],target,
+            env={'KU_REUSED_PROTOCOL':str(protocol),'KU_REUSED_PROTOCOL_SHA256':h.sha(protocol)},timeout=180)
+
+
 def prepare(a):
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
     expected={'A':a.prepatch,**{f'C{i+1}':c for i,c in enumerate(a.screen_variants)},'B':a.candidate,'R':a.candidate}
     mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected)
+    restore_json_inputs(a.source,a.root,expected,mapping)
+    input_checks={name:validate_protocol_inputs(a.root,name,mapping) for name in expected}
+    h.save(a.root/'reuse-input-preflight.json',dict(versions=input_checks,network_requests=0))
     for name,commit in expected.items():
         verify_manifest(a.root,name,commit,mapping)
         (a.root/name/'tools').symlink_to(a.tools,target_is_directory=True)

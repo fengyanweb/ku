@@ -465,6 +465,7 @@ jobs:
         run: |
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_reuse_build.py
 
       - name: Install only the fixed Rust compiler and LLVM profile tools
         shell: bash

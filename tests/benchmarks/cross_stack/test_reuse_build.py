@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
 import unittest
 import reuse_build as r
 
@@ -27,6 +28,42 @@ def archive(path, changes=None, old_run=False):
 
 
 class ReuseBuildTests(unittest.TestCase):
+    def test_reformatted_source_json_is_recovered_from_exact_commit_without_redefining_corpus(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);source=root/'repository';source.mkdir()
+            subprocess.run(['git','init','-q',str(source)],check=True)
+            prefix=Path('tests/benchmarks/cross_stack');directory=source/prefix
+            (directory/'corpora').mkdir(parents=True)
+            original={}
+            spec={}
+            for name in ('object','array','escape'):
+                raw='{"counter":7,"data":{"text":"中文🙂"}}\n'.encode('utf-8')
+                relative='corpora/'+name+'.json';original[relative]=raw
+                spec[name]={'path':relative,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'counter':7}
+            original['protocol.json']=(json.dumps({'schema':1,'corpora':spec},indent=2)+'\n').encode()
+            for relative,raw in original.items():(directory/relative).write_bytes(raw)
+            subprocess.run(['git','-C',str(source),'add','.'],check=True)
+            subprocess.run(['git','-C',str(source),'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','immutable inputs'],check=True)
+            commit=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
+            destination=root/'fresh';mapping={}
+            for name in ('A','B'):
+                for relative,raw in original.items():
+                    path=name+'/src/'+prefix.as_posix()+'/'+relative
+                    exported=(json.dumps(json.loads(raw),sort_keys=True,separators=(',',':'))+'\n').encode()
+                    self.assertNotEqual(exported,raw)
+                    target=destination/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(exported)
+                    mapping[path]={'original_sha256':hashlib.sha256(raw).hexdigest(),'archived_sha256':hashlib.sha256(exported).hexdigest(),'bytes':len(exported)}
+                artifact=destination/name/'build/server.c';artifact.parent.mkdir(parents=True);artifact.write_bytes(b'untouched C')
+            r.restore_json_inputs(source,destination,{'A':commit,'B':commit},mapping)
+            for name in ('A','B'):
+                result=r.validate_protocol_inputs(destination,name,mapping)
+                self.assertEqual(result['corpora']['object']['sha256'],spec['object']['sha256'])
+                for relative,raw in original.items():self.assertEqual((destination/name/'src'/prefix/relative).read_bytes(),raw)
+                self.assertEqual((destination/name/'build/server.c').read_bytes(),b'untouched C')
+            corpus=destination/'A/src'/prefix/'corpora/object.json'
+            corpus.write_bytes(corpus.read_bytes()+b' ')
+            with self.assertRaises(ValueError):r.validate_protocol_inputs(destination,'A',mapping)
+
     def test_checksum_or_unsafe_member_cannot_write_destination(self):
         for kind in ('checksum','traversal','absolute','link','duplicate'):
             with self.subTest(kind=kind),tempfile.TemporaryDirectory() as d:

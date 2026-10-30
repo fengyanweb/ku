@@ -1155,6 +1155,14 @@ def evidence_file(path, root):
         (parts[0]=='diagnostic' and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
 
 
+def immutable_benchmark_json(path,root):
+    parts=path.relative_to(root).parts
+    if len(parts)<6 or parts[1:5]!=('src','tests','benchmarks','cross_stack'):return False
+    relative=parts[5:]
+    return relative in [('protocol.json',),('task_mix_protocol.json',),
+        ('corpora','object.json'),('corpora','array.json'),('corpora','escape.json')]
+
+
 def full_archive(a,state):
     destination=a.root/'ku-performance-v2-evidence.tar.gz'
     if destination.exists():raise ValueError('archive already exists; never overwrite retained evidence')
@@ -1163,7 +1171,7 @@ def full_archive(a,state):
         for path in sorted(a.root.rglob('*')):
             if not path.is_file() or path.is_symlink() or not evidence_file(path,a.root):continue
             raw=path.read_bytes();original=hashlib.sha256(raw).hexdigest();data=raw
-            if path.suffix=='.json':
+            if path.suffix=='.json' and not immutable_benchmark_json(path,a.root):
                 try:data=encoded(redact(json.loads(raw),a.root))
                 except (ValueError,UnicodeError):data=encoded({'invalid_json_not_exported':True,'raw_sha256':original,'reason':'unparseable receipt may contain private values'})
             elif path.suffix in ('.log','.md','.py'):data=redact(raw.decode(errors='replace'),a.root).encode()
@@ -1176,7 +1184,7 @@ def full_archive(a,state):
     result=dict(complete=True,path=str(destination),sha256=sha(destination),bytes=destination.stat().st_size,file_count=len(entries),
         goal_status=state.get('steps',{}).get('run',{}).get('result',{}).get('goal_status','unknown'),
         caches_included=False,private_uris_redacted=True,
-        redaction_scope='Structured JSON and text logs only; raw perf/ELF bytes remain exact and may retain ephemeral private-fixture values.',
+        redaction_scope='Receipts/text are redacted; frozen synthetic protocol/corpora JSON and raw perf/ELF remain byte-exact. Raw binaries may retain ephemeral private-fixture values.',
         source_scope='normal generated C/Ku inputs plus benchmark source; product Git commits in frozen plan')
     save(a.root/'archive.json',result)
     for path in [destination,a.root/'archive.json']:os.chown(path,state.get('uid',os.getuid()),state.get('gid',os.getgid()));path.chmod(0o644)
