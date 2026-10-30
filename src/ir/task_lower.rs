@@ -1571,9 +1571,6 @@ impl<'a> FunctionLowerer<'a> {
             }
             return Ok(dst);
         }
-        if matches!(name, "get" | "take" | "as_int" | "as_str") {
-            return self.json_method_expression(object, name, args, span, depth);
-        }
         if let ExprKind::Variable(variable) = &object.kind {
             if let Some(source) = self.local(variable) {
                 if matches!(&self.function.slots[source.0].ty, TaskSlotType::Value {ty,borrowed:false} if task::local_pg_type(ty))
@@ -1668,10 +1665,19 @@ impl<'a> FunctionLowerer<'a> {
             }
             return Ok(result);
         }
-        if matches!(&object.kind, ExprKind::Variable(name) if self.local(name).is_some_and(|slot| matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value {ty, ..} if (task::local_net_type(ty) || task::local_bytes_type(ty)) && !matches!(ty, IrType::Result(_)))))
+        // Shared value methods dispatch on their materialized receiver type,
+        // never on the method name alone. JSON accessors must not intercept
+        // bytes.get(). A selected receiver is evaluated exactly once;
+        // no fallback below may evaluate it again after this branch begins.
+        if matches!(&object.kind, ExprKind::Variable(name) if self.local(name).is_some_and(|slot| matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value {ty, ..} if (task::local_net_type(ty) || task::local_bytes_type(ty) || task::json_value_type(ty)) && !matches!(ty, IrType::Result(_)))))
+            || matches!(name, "get" | "take" | "as_int" | "as_str")
         {
             let source = self.expression(object, depth + 1)?;
             let ty = &self.function.slots[source.0].ty;
+            if matches!(ty, TaskSlotType::Value {ty, borrowed: false} if task::json_value_type(ty))
+            {
+                return self.json_method_expression(source, name, args, span, depth);
+            }
             if matches!(ty, TaskSlotType::Value {ty, ..} if task::local_net_type(ty) && !matches!(ty, IrType::Result(_)))
             {
                 return self.blocking_net_method(source, name, args, span, depth);
@@ -1700,14 +1706,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 return Ok(result);
             }
-            // The ordinary receiver helpers below evaluate their own source.
-            // A nontrivial receiver must not be evaluated twice.
-            if !matches!(&object.kind, ExprKind::Variable(_)) {
-                return Err(unsupported(
-                    "this nontrivial method receiver in a Task",
-                    span,
-                ));
-            }
+            return Err(unsupported("this typed method receiver in a Task", span));
         }
         if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
             && matches!(
@@ -2003,6 +2002,23 @@ impl<'a> FunctionLowerer<'a> {
         depth: usize,
     ) -> KuResult<SlotId> {
         let source = self.expression(object, depth + 1)?;
+        self.json_read_materialized(
+            source,
+            !matches!(&object.kind, ExprKind::Variable(_)),
+            key,
+            span,
+            depth,
+        )
+    }
+
+    fn json_read_materialized(
+        &mut self,
+        source: SlotId,
+        temporary: bool,
+        key: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
         if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::json_value_type(ty))
         {
             return Err(unsupported("JSON index requires an owned JSON value", span));
@@ -2023,7 +2039,7 @@ impl<'a> FunctionLowerer<'a> {
         if !matches!(&key.kind, ExprKind::Variable(_)) {
             self.emit(TaskOp::Drop { slot: key_slot })?;
         }
-        if !matches!(&object.kind, ExprKind::Variable(_)) {
+        if temporary {
             self.emit(TaskOp::Drop { slot: source })?;
         }
         Ok(dst)
@@ -2031,23 +2047,16 @@ impl<'a> FunctionLowerer<'a> {
 
     fn json_method_expression(
         &mut self,
-        object: &Expr,
+        source: SlotId,
         name: &str,
         args: &[Expr],
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
-        if name == "get" {
-            let [key] = args else {
-                return Err(unsupported("JSON get argument count", span));
-            };
-            return self.json_read_expression(object, key, span, depth);
-        }
         let expected = usize::from(name == "take");
         if args.len() != expected {
             return Err(unsupported("JSON method argument count", span));
         }
-        let source = self.expression(object, depth + 1)?;
         if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::json_value_type(ty))
         {
             return Err(unsupported(

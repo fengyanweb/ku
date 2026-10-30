@@ -7,6 +7,9 @@ import tarfile
 import tempfile
 import subprocess
 import unittest
+import types
+from contextlib import ExitStack
+from unittest.mock import patch
 import reuse_build as r
 
 
@@ -28,6 +31,38 @@ def archive(path, changes=None, old_run=False):
 
 
 class ReuseBuildTests(unittest.TestCase):
+    def test_reuse_selection_and_state_identity_match_the_explicit_hosted_flag(self):
+        for selected in (None,False,True):
+            with self.subTest(selected=selected),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);fresh=root/'fresh';tools=root/'tools';tools.mkdir()
+                args=types.SimpleNamespace(root=fresh,source=root/'source',tools=tools,archive=root/'inert.tgz',
+                    archive_sha256='1'*64,source_run='123',baseline=r.h.BASELINE,
+                    candidate='b'*40,prepatch='f'*40,screen_variants=[])
+                if selected is not None:args.task_json_screen=selected
+                def extract(archive,root,digest,expected):
+                    for name in expected:(root/name).mkdir(parents=True)
+                    # Even capable normal cached builds must not implicitly
+                    # change the requested experiment to a Task JSON screen.
+                    ir=root/'B/src/src/ir/task.rs';ir.parent.mkdir(parents=True)
+                    ir.write_text('enum TaskOp {\n    JsonDecode {\n}\n')
+                    return {}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+                patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+                extract_mock=patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+                patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs',return_value={}))
+                verify=patches.enter_context(patch.object(r,'verify_manifest'))
+                patches.enter_context(patch.object(r,'new_driver'))
+                patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
+                self.assertTrue(r.prepare(args)['execution_complete'])
+                expected={'A','B','R',*(['BT'] if selected else [])}
+                self.assertEqual(set(extract_mock.call_args.args[3]),expected)
+                self.assertEqual({call.args[1] for call in verify.call_args_list},expected)
+                state=r.h.load(fresh/'hosted-state.json')
+                self.assertEqual(state['identity'],r.h.hosted_identity(args,'followup-screen'))
+                self.assertIs(state['identity']['task_json_screen'],selected is True)
+
     def test_reformatted_source_json_is_recovered_from_exact_commit_without_redefining_corpus(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);source=root/'repository';source.mkdir()
@@ -95,6 +130,9 @@ class ReuseBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'build-only'):
                 r.extract_builds(old,root/'old-measurement',digest,{'A'})
             self.assertFalse((root/'old-measurement').exists())
+            with self.assertRaisesRegex(ValueError,'build was not completed'):
+                r.extract_builds(tar,root/'missing-task-build',r.h.sha(tar),{'A','BT'})
+            self.assertFalse((root/'missing-task-build').exists())
 
     def test_corrupt_or_wrong_architecture_normal_artifact_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:

@@ -54,8 +54,9 @@ class HostedCycleTests(unittest.TestCase):
     def test_task_json_is_separate_from_worker_goals_and_does_not_repeat_pg_or_ablations(self):
         names=['A','B','BT','BF','R','RS','D','HC','C1','C2']
         versions={n:{'source_commit':'b'*40,'root':'/unused/'+n} for n in names}
-        plan=h.followup_plan(versions,'f'*40)
+        plan=h.followup_plan(versions,'f'*40,task_json_screen=True)
         self.assertEqual(plan['candidate_versions'],['B','BT'])
+        self.assertTrue(plan['task_json_screen'])
         self.assertEqual([c['workload'] for c in plan['cases']],['json_object','json_escape','cpu'])
         for case in plan['cases'][:2]:
             for order in case.get('paired_orders',plan['paired_orders']):
@@ -69,6 +70,12 @@ class HostedCycleTests(unittest.TestCase):
         self.assertIn('BT admission is not verified',plan['task_json_comparison']['admission_scope'])
         self.assertEqual(plan['worker_growth']['names'],['B','BF'])
         self.assertNotIn('targets',plan)
+        ordinary=h.followup_plan(versions,'f'*40)
+        self.assertFalse(ordinary['task_json_screen'])
+        self.assertNotIn('BT',ordinary['candidate_versions'])
+        self.assertIn('db',[c['workload'] for c in ordinary['cases']])
+        with self.assertRaisesRegex(ValueError,'identified BT build'):
+            h.followup_plan({n:v for n,v in versions.items() if n!='BT'},'f'*40,task_json_screen=True)
 
     def test_task_json_screen_uses_current_worker_denominator_and_all_quality_checks(self):
         rows=[]
@@ -102,8 +109,8 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_build_derives_task_json_only_from_the_frozen_product_snapshot(self):
         from unittest.mock import Mock
-        for supported in (False,True):
-            with self.subTest(supported=supported),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+        for supported,requested in ((False,None),(True,None),(False,False),(True,False),(False,True),(True,True)):
+            with self.subTest(supported=supported,requested=requested),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory);tools=root/'tools';tools.mkdir()
                 source=root/'checkout';source.mkdir()
                 # Deliberately disagree with the frozen B snapshot.
@@ -131,11 +138,66 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h,'complete_build',complete))
                 args=types.SimpleNamespace(root=root,source=source,tools=tools,baseline='f'*40,
                     candidate='b'*40,prepatch='f'*40,build_set='followup-screen',screen_variants=[])
-                self.assertTrue(h.build(args,{'steps':{}})['execution_complete'])
+                if requested is not None:args.task_json_screen=requested
+                if requested and not supported:
+                    with self.assertRaisesRegex(ValueError,'frozen B product'):
+                        h.build(args,{'steps':{}})
+                    complete.assert_not_called()
+                else:
+                    self.assertTrue(h.build(args,{'steps':{}})['execution_complete'])
+                    complete.assert_called_once()
                 native=[c for c in calls if c[0]=='native']
-                self.assertEqual(native,[('native','BT',root/'B/build/ku','task')] if supported else [])
+                self.assertEqual(native,[('native','BT',root/'B/build/ku','task')] if requested and supported else [])
                 self.assertEqual([c[:2] for c in calls[:4]],[('ku','A'),('ku','B'),('rust','R'),('client','R')])
-                complete.assert_called_once()
+
+    def test_task_json_selection_is_part_of_identity_and_cannot_select_other_phases(self):
+        import io
+        from contextlib import redirect_stderr,redirect_stdout
+        args=types.SimpleNamespace(baseline=h.BASELINE,candidate='b'*40,prepatch='f'*40,screen_variants=[])
+        absent=h.hosted_identity(args,'followup-screen')
+        self.assertIs(absent['task_json_screen'],False)
+        args.task_json_screen=False
+        self.assertEqual(absent,h.hosted_identity(args,'followup-screen'))
+        args.task_json_screen=True
+        self.assertNotEqual(absent,h.hosted_identity(args,'followup-screen'))
+        self.assertIs(h.hosted_identity(args,'followup-screen')['task_json_screen'],True)
+        for build_set in ('full','diagnostic'):
+            error=io.StringIO()
+            with self.subTest(build_set=build_set),redirect_stderr(error),self.assertRaises(SystemExit) as exit:
+                h.main(['--phase','build','--root','/unused-root','--source','/unused-source',
+                    '--tools','/unused-tools','--candidate','b'*40,'--build-set',build_set,'--task-json-screen'])
+            self.assertEqual(exit.exception.code,2)
+            self.assertIn('--task-json-screen requires followup-screen',error.getvalue())
+        with tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+            root=Path(directory);source=root/'source';source.mkdir();tools=root/'tools';tools.mkdir()
+            output=root/'output';error=io.StringIO()
+            patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+            patches.enter_context(patch.object(h.signal,'signal'));patches.enter_context(patch.object(h.signal,'alarm'))
+            build=patches.enter_context(patch.object(h,'build',return_value={'execution_complete':True}))
+            argv=['--phase','build','--root',str(output),'--source',str(source),'--tools',str(tools),
+                '--candidate','b'*40,'--prepatch','f'*40,'--build-set','followup-screen']
+            with redirect_stdout(io.StringIO()):self.assertEqual(h.main(argv),0)
+            with redirect_stderr(error),self.assertRaises(SystemExit) as exit:
+                h.main([*argv,'--task-json-screen'])
+            self.assertEqual(exit.exception.code,2);self.assertIn('identity changed',error.getvalue())
+            build.assert_called_once()
+            self.assertIs(h.load(output/'hosted-state.json')['identity']['task_json_screen'],False)
+
+    def test_task_json_workflow_switch_is_explicit_and_identical_for_build_reuse_and_run(self):
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        entry=workflow.split('\n      task_json_screen:\n',1)[1].split('\n      reuse_build_run:',1)[0]
+        self.assertIn('type: boolean',entry);self.assertIn('default: false',entry)
+        job=workflow.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
+        self.assertIn("KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}",job)
+        build=job.split('- name: Build frozen',1)[1].split('- name: Run the one',1)[0]
+        run=job.split('- name: Run the one',1)[1].split('- name: Always archive',1)[0]
+        for phase,count in ((build,2),(run,1)):
+            self.assertIn('performance_task_json_args=()',phase)
+            self.assertIn('if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then',phase)
+            self.assertIn('test "$performance_build_set" = followup-screen',phase)
+            self.assertIn('performance_task_json_args+=(--task-json-screen)',phase)
+            self.assertEqual(phase.count('"${performance_task_json_args[@]}"'),count)
 
     def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
         rows=[]
@@ -251,7 +313,7 @@ class HostedCycleTests(unittest.TestCase):
                 root=Path(directory)
                 versions={name:{'root':str(root/name),'source_commit':'a'*40}
                     for name in ['A','B','R','RS','D','HC',*(['BT'] if task else [])]}
-                plan=h.followup_plan(versions) if followup else h.diagnostic_plan(versions)
+                plan=h.followup_plan(versions,task_json_screen=task) if followup else h.diagnostic_plan(versions)
                 plan['json_layer_diagnosis']={'execution_complete':True}
                 h.save(root/'frozen-plan.json',plan)
                 manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
