@@ -1600,56 +1600,13 @@ typedef struct KuHttpQueue {
   KuHttpWake* wake;
   int owner_work_pending; /* Only the matching event owner reads/writes this. */
   unsigned int owner_inline_remaining;
-  unsigned int published_events, wait_events;
-  unsigned long long begin_deadline, wait_until;
   KuHttpWorkerCtx* workers;
 } KuHttpQueue;
 static int ku_http_queue_prepare_worker(KuHttpQueue*);
-enum { KU_HTTP_QUEUE_CLAIM=1u, KU_HTTP_QUEUE_BEGIN=2u,
-       KU_HTTP_QUEUE_COMPLETE=4u, KU_HTTP_QUEUE_RETIRE=8u };
 static int ku_http_queue_is_current_owner(const KuHttpQueue* queue);
 static void ku_http_queue_notify(KuHttpQueue* queue) {
   if(ku_http_queue_is_current_owner(queue)) queue->owner_work_pending=1;
   else ku_http_wake_notify(queue->wake);
-}
-/* Publication and wait registration share queue->lock. CLAIM only changes
- * telemetry: popping a job never releases its A lease or physical resident
- * slot. BEGIN matters if it can tighten the owner's existing timer. COMPLETE
- * and physical RETIRE remain distinct conditions; neither substitutes for the
- * other, and the final worker reference is still required for reuse/drain. */
-static void ku_http_queue_publish_locked(KuHttpQueue* queue,unsigned int event,
-    unsigned long long deadline) {
-  queue->published_events|=event;
-  if(event==KU_HTTP_QUEUE_BEGIN && deadline<queue->begin_deadline)
-    queue->begin_deadline=deadline;
-  if((queue->wait_events&event)
-      && (event!=KU_HTTP_QUEUE_BEGIN || deadline<queue->wait_until)) {
-    queue->wait_events=0;
-    ku_http_queue_notify(queue);
-  }
-}
-static void ku_http_queue_publish(KuHttpQueue* queue,unsigned int event,
-    unsigned long long deadline) {
-  if(ku_http_queue_is_current_owner(queue)) {queue->owner_work_pending=1;return;}
-  ku_http_mutex_lock(&queue->lock);
-  ku_http_queue_publish_locked(queue,event,deadline);
-  ku_http_mutex_unlock(&queue->lock);
-}
-/* Reset before the owner scans job/retirement state, not before sleeping.
- * A publication during that scan remains recorded. Registration rechecks it
- * under the publisher's lock, so a later producer either sees the armed wait
- * and writes the wake channel, or makes this owner take a nonblocking turn. */
-static void ku_http_queue_observation_begin_locked(KuHttpQueue* queue) {
-  queue->wait_events=0;queue->published_events=0;queue->begin_deadline=~0ULL;
-}
-static int ku_http_queue_arm_wait(KuHttpQueue* queue,unsigned long long deadline) {
-  ku_http_mutex_lock(&queue->lock);
-  int published=(queue->published_events&(KU_HTTP_QUEUE_COMPLETE|KU_HTTP_QUEUE_RETIRE))!=0
-      || ((queue->published_events&KU_HTTP_QUEUE_BEGIN) && queue->begin_deadline<deadline);
-  queue->wait_until=deadline;
-  queue->wait_events=published ? 0u
-      : KU_HTTP_QUEUE_BEGIN|KU_HTTP_QUEUE_COMPLETE|KU_HTTP_QUEUE_RETIRE;
-  ku_http_mutex_unlock(&queue->lock);return published;
 }
 static int ku_http_queue_take_owner_work(KuHttpQueue* queue) {
   int pending=queue->owner_work_pending;queue->owner_work_pending=0;return pending;
@@ -1671,7 +1628,6 @@ static int ku_http_job_projection(KuHttpJob* job,size_t bytes) {
 }
 static int ku_http_queue_init(KuHttpQueue* queue, int cap, KuHttpWake* wake) {
   memset(queue, 0, sizeof(*queue));
-  queue->begin_deadline=~0ULL;
   queue->cap = cap;
   queue->wake = wake;
   queue->items = (KuHttpJob**)calloc((size_t)cap, sizeof(KuHttpJob*));
@@ -1710,7 +1666,7 @@ static void ku_http_job_release(KuHttpJob* job) {
   }
   /* Release publication precedes wake, including the non-final worker owner.
      ClosedWaitingJob can now see the actual remaining owner count. */
-  ku_http_queue_publish(queue,KU_HTTP_QUEUE_RETIRE,0);
+  ku_http_queue_notify(queue);
 }
 static int ku_http_job_only_owner(KuHttpJob* job) {
   /* The calling connection already owns a reference. The only additional
@@ -1736,14 +1692,14 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
   job->handler_deadline = __ku_handler_deadline;
   job->started = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_queue_publish(job->queue,KU_HTTP_QUEUE_BEGIN,job->handler_deadline);
+  ku_http_queue_notify(job->queue);
 }
 static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   ku_http_mutex_lock(&job->lock);
   int cancelled = job->cancelled || ku_http_now_ms() >= job->request_deadline;
   if (cancelled) { job->cancelled = 1; job->completed = 1; }
   ku_http_mutex_unlock(&job->lock);
-  if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_publish(job->queue,KU_HTTP_QUEUE_COMPLETE,0); return; }
+  if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_notify(job->queue); return; }
   ku_http_failure_current=(KuHttpFailure){0};
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
   KuHttpFailure failure=ku_http_failure_current;
@@ -1758,7 +1714,7 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   job->response = response;
   job->completed = 1;
   ku_http_mutex_unlock(&job->lock);
-  ku_http_queue_publish(job->queue,KU_HTTP_QUEUE_COMPLETE,0);
+  ku_http_queue_notify(job->queue);
 }
 /* Only compiler-proven bounded work enters here, once, before any worker
  * publication. Save every synchronous execution TLS field: a local request
@@ -1811,8 +1767,8 @@ static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
     job->claimed = 1; queue->running++;
     ku_http_mutex_unlock(&job->lock);
   }
-  if (job) ku_http_queue_publish_locked(queue,KU_HTTP_QUEUE_CLAIM,0);
   ku_http_mutex_unlock(&queue->lock);
+  if (job) ku_http_queue_notify(queue);
   return job;
 }
 
@@ -2932,7 +2888,7 @@ static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint
   }
   owner->cpu_ns=cpu_ns; owner->cpu_sample_ms=sampled_ms;
 }
-/* Management may run while an owner sleeps through a pure worker CLAIM.
+/* Management samples independently of the event owner's cached telemetry.
  * Hold group->lock for the queue's published lifetime, then take queue->lock.
  * Workers never acquire group->lock while holding queue->lock. Reading live
  * counters here preserves observation without waking HTTP for telemetry. */
@@ -4111,7 +4067,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   for (;;) {
     queue.owner_inline_remaining=32u;
     ku_http_mutex_lock(&queue.lock);
-    ku_http_queue_observation_begin_locked(&queue);
     size_t queued = (size_t)queue.count, running = queue.running, resident = queue.resident;
     size_t queued_bytes=queue.queued_bytes, peak_queued_bytes=queue.peak_queued_bytes;
     ku_http_mutex_unlock(&queue.lock);
@@ -4357,15 +4312,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
       if (connection->phase == KU_HTTP_IO_JOB && connection->job && connection->job->request_deadline < nearest)
         nearest = connection->job->request_deadline;
-      if(connection->job) {
-        ku_http_mutex_lock(&connection->job->lock);
-        if(connection->job->started && !connection->job->completed) {
-          unsigned long long deadline=connection->job->handler_deadline;
-          deadline=KU_HANDLER_CLEANUP_GRACE_MS>~0ULL-deadline ? ~0ULL : deadline+KU_HANDLER_CLEANUP_GRACE_MS;
-          if(deadline<nearest)nearest=deadline;
-        }
-        ku_http_mutex_unlock(&connection->job->lock);
-      }
       if (connection->async_task && !connection->async_cancelled && connection->async_deadline < nearest)
         nearest = connection->async_deadline;
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
@@ -4536,12 +4482,6 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       wait_ms=0;task_io_structural_urgent=1;task_io_probe_can_bootstrap=0;
     }
 #endif
-    if(ku_http_queue_arm_wait(&queue,wait_ms==0?0:nearest)) {
-      wait_ms=0;
-#if defined(KU_HTTP_HAS_TASK_RUNTIME)
-      task_io_structural_urgent=1;task_io_probe_can_bootstrap=0;
-#endif
-    }
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);
 #else

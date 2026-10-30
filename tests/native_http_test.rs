@@ -3694,8 +3694,7 @@ fn main(): null! {
     generated = generated.replacen(
         "typedef struct KuString {",
         &format!(
-            "{}\n{}\ntypedef struct KuString {{",
-            native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
+            "{}\ntypedef struct KuString {{",
             native_allocation_harness::ALLOCATION_HOOK
         ),
         1,
@@ -3839,63 +3838,6 @@ static int fixture_header_first_backing(KuHttpServer* server,KuHttpBufferBudget*
 static unsigned int fixture_async_fields;
 static const char* fixture_async_path;
 static int fixture_async_seen,fixture_async_valid;
-typedef struct {
-  KuHttpQueue* queue;KuHttpJob* retire;
-  KuTestEvent go;unsigned int event;unsigned long long deadline;
-} FixtureQueuePublication;
-static int fixture_queue_publication(void* raw) {
-  FixtureQueuePublication* publication=(FixtureQueuePublication*)raw;
-  CHECK(ku_test_event_wait(&publication->go,2000));
-  if(publication->retire)ku_http_job_release(publication->retire);
-  else ku_http_queue_publish(publication->queue,publication->event,publication->deadline);
-  return 0;
-}
-static void fixture_queue_scan(KuHttpQueue* queue) {
-  ku_http_mutex_lock(&queue->lock);ku_http_queue_observation_begin_locked(queue);
-  ku_http_mutex_unlock(&queue->lock);
-}
-static int fixture_queue_wait_protocol(KuHttpWake* wake) {
-  KuHttpQueue queue={0};CHECK(ku_http_queue_init(&queue,4,wake));
-  KuHttpPollFd item={0};item.fd=wake->read_socket;item.events=KU_HTTP_POLL_READ;
-  for(int after_arm=0;after_arm<2;after_arm++) {
-    fixture_queue_scan(&queue);
-    FixtureQueuePublication publication={.queue=&queue,.event=KU_HTTP_QUEUE_COMPLETE};
-    CHECK(ku_test_event_init(&publication.go));KuTestThread thread={0};
-    CHECK(ku_test_thread_start(&thread,fixture_queue_publication,&publication));
-    if(after_arm)CHECK(!ku_http_queue_arm_wait(&queue,~0ULL));
-    CHECK(ku_test_event_set(&publication.go));CHECK(ku_test_thread_join(&thread,2000));CHECK(!thread.outcome);
-    CHECK(ku_test_event_destroy(&publication.go));item.revents=0;
-    if(after_arm) {
-      /* Publication after registration, before the actual OS wait, leaves a
-       * real readable channel. Its state is visible even if poll starts late. */
-      CHECK(ku_http_poll(&item,1,2000)==1 && (item.revents&KU_HTTP_POLL_READ));
-      ku_http_wake_drain(wake);
-    } else {
-      /* An unarmed publication remains pending and forces a real re-scan;
-       * it cannot be forgotten by arming immediately before sleeping. */
-      CHECK(ku_http_queue_arm_wait(&queue,~0ULL));CHECK(!ku_http_poll(&item,1,0));
-    }
-  }
-  fixture_queue_scan(&queue);CHECK(!ku_http_queue_arm_wait(&queue,1000u));
-  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_CLAIM,0);item.revents=0;
-  CHECK(!ku_http_poll(&item,1,0)); /* Claim does not release an A lease. */
-  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_BEGIN,2000u);item.revents=0;
-  CHECK(!ku_http_poll(&item,1,0)); /* Existing wait already precedes this start deadline. */
-  ku_http_queue_publish(&queue,KU_HTTP_QUEUE_BEGIN,999u);item.revents=0;
-  CHECK(ku_http_poll(&item,1,2000)==1);ku_http_wake_drain(wake);
-  KuHttpInput input={0};KuHttpJob* job=ku_http_job_new(&queue,&input);CHECK(job);
-  ku_refcount_retain(&job->owners,"fixture worker");CHECK(!ku_http_job_only_owner(job));
-  fixture_queue_scan(&queue);CHECK(!ku_http_queue_arm_wait(&queue,~0ULL));
-  FixtureQueuePublication retirement={.queue=&queue,.retire=job};
-  CHECK(ku_test_event_init(&retirement.go));KuTestThread worker={0};
-  CHECK(ku_test_thread_start(&worker,fixture_queue_publication,&retirement));
-  CHECK(ku_test_event_set(&retirement.go));CHECK(ku_test_thread_join(&worker,2000));CHECK(!worker.outcome);
-  CHECK(ku_test_event_destroy(&retirement.go));item.revents=0;
-  CHECK(ku_http_poll(&item,1,2000)==1 && ku_http_job_only_owner(job));
-  ku_http_wake_drain(wake);ku_http_job_release(job);
-  CHECK(!ku_http_queue_resident(&queue));fixture_queue_scan(&queue);
-  ku_http_queue_free(&queue);return 0;
-}
 static int fixture_async_string(KuString value,const char* expected) {
   return value.len==strlen(expected) && (!value.len || (value.ptr && !memcmp(value.ptr,expected,value.len)));
 }
@@ -4002,7 +3944,6 @@ int main(void) {
   CHECK(ku_http_poll(&item,1,0)==1 && (item.revents&KU_HTTP_POLL_READ));
   CHECK(ku_http_queue_take_owner_work(&queue)==1);
   ku_http_wake_drain(&wake);item.revents=0;CHECK(ku_http_poll(&item,1,0)==0);
-  CHECK(!fixture_queue_wait_protocol(&wake));
   ku_http_wake_close(&wake);
   CHECK(ku_http_handler_is_short((void*)ProofText__thunk));
   CHECK(ku_http_handler_is_short((void*)ProofNumber__thunk));
