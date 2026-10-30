@@ -146,6 +146,8 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
     else:
         if any(build.get(k)!=v for k,v in [('formatting_mode','helpers'),('json_response_mode','text'),('pg_execution_mode','async'),('pg_read_mode','int')]):
             raise ValueError('reused build is not the normal helpers/text/async/int contract')
+        if build.get('json_execution_mode','worker')!=('task' if name=='BT' else 'worker'):
+            raise ValueError('reused JSON execution mode differs: '+name)
         checked(build['cli'],build['cli_sha256']);require_elf(build['cli'])
         checked(build['libpq_source'] if verify_system else root/name/'build/libpq/libpq.so',build['libpq_sha256'])
         for kind,native in build['native'].items():
@@ -238,7 +240,9 @@ def prepare(a):
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
     expected={'A':a.prepatch,**{f'C{i+1}':c for i,c in enumerate(a.screen_variants)},'B':a.candidate,'R':a.candidate}
+    if getattr(a,'task_json_screen',False):expected['BT']=a.candidate
     mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected)
+    if getattr(a,'task_json_screen',False):h.require_task_json_support(a.root)
     restore_json_inputs(a.source,a.root,expected,mapping)
     input_checks={name:validate_protocol_inputs(a.root,name,mapping) for name in expected}
     h.save(a.root/'reuse-input-preflight.json',dict(versions=input_checks,network_requests=0))
@@ -246,8 +250,7 @@ def prepare(a):
         verify_manifest(a.root,name,commit,mapping)
         (a.root/name/'tools').symlink_to(a.tools,target_is_directory=True)
     new_driver(a)
-    identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=h.sha(h.__file__),
-        build_set='followup-screen',prepatch=a.prepatch,screen_variants=a.screen_variants)
+    identity=h.hosted_identity(a,'followup-screen')
     state=dict(identity=identity,steps={},goal_status='unknown',uid=os.getuid(),gid=os.getgid(),
         reused_build=dict(archive_sha256=a.archive_sha256,source_run=a.source_run,
             product_commit=a.candidate,tool_checkout=str(a.source),normal_versions=expected,
@@ -265,6 +268,7 @@ def main(argv=None):
     parser.add_argument('--archive-sha256',required=True);parser.add_argument('--source-run',required=True)
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
+    parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     a=parser.parse_args(argv)
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []

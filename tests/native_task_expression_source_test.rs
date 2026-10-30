@@ -158,6 +158,123 @@ async fn main():null! {
 }
 
 #[test]
+fn native_task_json_bytes_and_existing_methods_dispatch_receivers_once() {
+    let source = r#"
+import json from "std.json"
+import bytes from "std.bytes"
+async fn Text(marker:int,value:str):str! { println(marker) return ok(value) }
+async fn Index(marker:int):int! { println(marker) return ok(0) }
+async fn Key(marker:int):str! { println(marker) return ok("a") }
+async fn ByteNamed():null! {
+    value=bytes.from_str((await Text(1,"AB"))?)?
+    code=value.get((await Index(2))?)?
+    println(code)
+    copied=value.clone()
+    println(value.len())
+    println(copied.len())
+    return ok(null)
+}
+async fn JsonNamed():null! {
+    value=json.decode((await Text(5,"{\"a\":\"named\"}"))?)?
+    selected=value[(await Key(6))?]?
+    println(selected.as_str()?)
+    println(json.encode(value)?)
+    return ok(null)
+}
+async fn JsonTemporary():null! {
+    selected=(json.decode((await Text(7,"{\"a\":9}"))?)?)[(await Key(8))?]?
+    println(selected.as_int()?)
+    return ok(null)
+}
+async fn JsonTake():null! {
+    selected=(json.decode((await Text(9,"{\"a\":\"taken\"}"))?)?).take((await Key(10))?)?
+    println(selected.as_str()?)
+    return ok(null)
+}
+async fn ExistingMethods():null! {
+    values=[11,12]
+    cloned=values.clone()
+    println(values.len())
+    println(cloned.try_get((await Index(11))?)?)
+    value=(await Text(12,"plain"))?
+    copied=value.clone()
+    println(value.len())
+    println(copied.byte_len())
+    return ok(null)
+}
+async fn main():null! {
+    done=(await ByteNamed())?
+    done=(await JsonNamed())?
+    done=(await JsonTemporary())?
+    done=(await JsonTake())?
+    done=(await ExistingMethods())?
+    return ok(null)
+}
+"#;
+    let mut ast = parsed(source);
+    for name in ["std:json", "std:bytes"] {
+        ast.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: name.into(),
+                span: Default::default(),
+            }),
+        );
+    }
+    Checker::new()
+        .check(&ast)
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
+    let native =
+        task_lower::lower_program(&ast).unwrap_or_else(|error| panic!("{error}\n{source}"));
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let directory = TempDir::new("task-json-typed-methods");
+    let path = directory.path().join("methods.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "methods") else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8(result.stdout).unwrap().replace('\r', "");
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "1",
+            "2",
+            "65",
+            "2",
+            "2",
+            "5",
+            "6",
+            "named",
+            r#"{"a":"named"}"#,
+            "7",
+            "8",
+            "9",
+            "9",
+            "10",
+            "taken",
+            "2",
+            "11",
+            "11",
+            "12",
+            "5",
+            "5",
+        ]
+    );
+}
+
+#[test]
 fn native_task_json_literal_allocation_refusals_are_results_and_reclaim_charge() {
     let native = lowered_json(
         r#"import json from "std.json" async fn main():null! { try {text=json.encode({a:"hello",b:1})? println(text)} catch(error){println(error.code)} return ok(null)}"#,

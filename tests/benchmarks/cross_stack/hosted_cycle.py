@@ -33,6 +33,18 @@ def save(p, v): bl.write_json(p, v)
 def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n').encode()
 
 
+def hosted_identity(a,build_set):
+    return dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
+        prepatch=a.prepatch if build_set=='followup-screen' else None,screen_variants=a.screen_variants,
+        task_json_screen=getattr(a,'task_json_screen',False))
+
+
+def require_task_json_support(root):
+    task_ir=Path(root)/'B/src/src/ir/task.rs'
+    if not task_ir.is_file() or '\n    JsonDecode {' not in task_ir.read_text():
+        raise ValueError('--task-json-screen requires a frozen B product with native Task JSON support')
+
+
 def frozen_plan(versions):
     """Seven named rows, PG Ku shared only inside the same registered group."""
     triples = [['A0','B','R'], ['B','R','A0'], ['R','A0','B'], ['A0','R','B'], ['B','A0','R']]
@@ -144,9 +156,12 @@ def diagnostic_plan(versions):
               'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
 
 
-def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH):
+def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False):
+    if task_json_screen and 'BT' not in versions:
+        raise ValueError('--task-json-screen requires the identified BT build')
     plan=diagnostic_plan(versions)
     plan.update(schema='ku-hosted-followup-screen-v1',prepatch=prepatch,
+        task_json_screen=task_json_screen,
         paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],
         environment_controls=dict(name='A',workload='json_object',rate=500,warmup_seconds=5,score_seconds=10,count=3),
         maximum_windows=33,formal_baseline_executed=False,
@@ -162,7 +177,7 @@ def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH):
         plan['paired_orders']=[names,names[1:]+names[:1],names[2:]+names[:2]]
         plan['maximum_windows']=3+len(plan['cases'])*(3*len(names)+1)
         plan['scope']+=' Additional C1..C7 are preregistered normal commit ablations, not selected post hoc. BF is the identical B binary with explicit fixed workers.'
-    if 'BT' in versions:
+    if task_json_screen:
         # This is a separately identified execution path, not a replacement
         # for the frozen worker fixture or its original sixteen goal rows.
         names=['A','B','BT','reference']
@@ -320,6 +335,8 @@ def build_json_layers(a):
 
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
+    if getattr(a,'task_json_screen',False) and getattr(a,'build_set','full')!='followup-screen':
+        raise ValueError('--task-json-screen requires followup-screen build-set')
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
     class Builder(bl.Builder):
         def command(self,label,command,**kwargs):
@@ -349,21 +366,27 @@ def build(a,state):
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     # Inspect the frozen product snapshot, never the current tools checkout.
     # Old products/build reuse keep their original plan and build identities.
-    task_ir=a.root/'B/src/src/ir/task.rs'
-    if build_set=='followup-screen' and task_ir.is_file() and '\n    JsonDecode {' in task_ir.read_text():
+    if getattr(a,'task_json_screen',False):
+        require_task_json_support(a.root)
         step(state,a.root,'build-BT',lambda:one('BT',a.candidate,{'ku_json_execution':'task'}))
     return complete_build(a,state,build_set,prepatch,variants)
 
 
 def complete_build(a,state,build_set,prepatch,variants):
     """Freeze/verify prepared normal builds; shared by fresh and byte-verified reuse."""
+    task_json_screen=getattr(a,'task_json_screen',False)
+    if task_json_screen and build_set!='followup-screen':
+        raise ValueError('--task-json-screen requires followup-screen build-set')
     diagnostic=build_set in ('diagnostic','followup-screen')
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
-    if build_set=='followup-screen' and (a.root/'BT/manifest.json').is_file():names.append('BT')
+    if task_json_screen:
+        require_task_json_support(a.root)
+        if not (a.root/'BT/manifest.json').is_file():raise ValueError('--task-json-screen requires the completed BT build')
+        names.append('BT')
     for name in names:
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else 'B' if name=='BF' else name)/'manifest.json')
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
@@ -391,7 +414,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    plan=followup_plan(versions,prepatch) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
@@ -1274,8 +1297,11 @@ def main(argv=None):
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
     p.add_argument('--prepatch',default=FOLLOWUP_PREPATCH)
     p.add_argument('--screen-variants',default='',help='Up to seven explicit full commits, comma separated; normal preregistered short ablations only')
+    p.add_argument('--task-json-screen',action='store_true',help='Explicit separate native Task JSON comparison; followup-screen only, never an implicit product-capability switch')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
-    a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
+    a=p.parse_args(argv)
+    if a.task_json_screen and a.build_set!='followup-screen':p.error('--task-json-screen requires followup-screen build-set')
+    a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
     if len(a.screen_variants)>7 or len(set(a.screen_variants))!=len(a.screen_variants):p.error('at most seven distinct screen variants')
@@ -1287,8 +1313,7 @@ def main(argv=None):
     if a.phase=='followup-screen' and a.build_set!='followup-screen':p.error('screen phase requires --build-set followup-screen')
     if a.build_set=='followup-screen' and a.candidate==a.prepatch:p.error('screen candidate must differ from frozen prepatch')
     if a.phase in ('run','tail','lifecycle','compiler') and a.build_set!='full':p.error('formal phases require full build-set')
-    a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=a.build_set,
-        prepatch=a.prepatch if a.build_set=='followup-screen' else None,screen_variants=a.screen_variants)
+    a.root.mkdir(parents=True,exist_ok=True);identity=hosted_identity(a,a.build_set)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
     if a.phase=='archive':result=archive(a,state)

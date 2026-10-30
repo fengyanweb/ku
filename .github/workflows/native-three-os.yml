@@ -18,6 +18,10 @@ on:
         description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
         type: string
         default: ''
+      task_json_screen:
+        description: 'Explicit separate native Task JSON screen (followup-screen only); false preserves the normal PG/HTTP screen'
+        type: boolean
+        default: false
 
       reuse_build_run:
         description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
@@ -454,6 +458,7 @@ jobs:
       KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
       KU_PERFORMANCE_V2_PREPATCH: ${{ inputs.prepatch || '956727188a058119fdb3790959063f1496ccb4cc' }}
       KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
+      KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
       KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
       KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
@@ -471,6 +476,9 @@ jobs:
 
       - name: Verify runner entry contracts without starting workloads
         run: |
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+          fi
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_reuse_build.py
@@ -538,6 +546,11 @@ jobs:
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = followup-screen ]; then
             performance_build_set=followup-screen
           fi
+          performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            performance_task_json_args+=(--task-json-screen)
+          fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
             test "$performance_build_set" = followup-screen
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
@@ -547,7 +560,8 @@ jobs:
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
               --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
-              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
           else
             test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
             test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
@@ -555,7 +569,8 @@ jobs:
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
               --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
-              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
@@ -581,12 +596,18 @@ jobs:
             performance_phases=(followup-screen)
             performance_build_set=followup-screen
           fi
+          performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            performance_task_json_args+=(--task-json-screen)
+          fi
           for performance_phase in "${performance_phases[@]}"; do
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
               --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
-              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS"
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
           done
 
       - name: Always archive the allowlisted evidence and goal_status
