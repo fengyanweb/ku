@@ -618,7 +618,9 @@ def run(args, report):
             # icacls requires '*' before numeric SIDs; otherwise it resolves
             # the SID text as an account name and fails before the probe.
             principal = "*" + sid
-            checked(["icacls", install, "/deny", principal + ":(OI)(CI)(W)"], root, base_env)
+            # Generic W also denies SYNCHRONIZE, which read/execute needs.
+            # Deny only mutation rights so this remains a runnable install.
+            checked(["icacls", install, "/deny", principal + ":(OI)(CI)(WD,AD,WEA,WA,DC,D)"], root, base_env)
             try:
                 probe = install / '.readonly-write-probe'
                 try:
