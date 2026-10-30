@@ -2,7 +2,7 @@
 title: Errors and troubleshooting
 description: Diagnose Ku installation, imports, ownership, JSON, and backend capability errors.
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/diagnostics.md',
@@ -65,12 +65,31 @@ Removing only `: null!` while keeping the outer `?` in this example is invalid. 
 ## Identify the Ku executable
 
 ```sh
-ku --version
+ku -v
 ku -h
 ku check hello.ku
 ```
 
 If `ku` is not found, invoke the executable from its extracted directory. Use `ku.exe` on Windows. If the default build is missing Rust or linking libraries, check the [installation requirements](/en/docs/install/) and retain the complete archive layout, rather than copying only the CLI.
+
+<a id="runner-build"></a>
+
+## Runner builds and E0514
+
+`ku build hello.ku` defaults to Debug / Runner. E0514 means Rust and the runtime library are incompatible. The 0.0.19 bundled runtime uses Rust 1.89.0; upgrading system Rust does not rebuild it. Keep `ku.exe`, `libku.rlib` and the entire `deps` directory together, without mixing versions.
+
+The Windows MSVC Runner also requires the Visual Studio Build Tools C++ tools and Windows SDK. Check the executable and toolchain in use:
+
+```powershell
+Get-Command ku -All
+where.exe ku
+ku -v
+rustc -vV
+rustup show active-toolchain
+rustup toolchain list
+```
+
+Include the archive name/checksum, full command and error output in an issue. `ku check` and interpretation do not need Rust. See [installation](/en/docs/install/) for native C build requirements.
 
 ## Read diagnostics
 

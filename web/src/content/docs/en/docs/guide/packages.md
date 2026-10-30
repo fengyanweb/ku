@@ -2,13 +2,26 @@
 title: 'Packages and modules'
 description: 'Organize source, import libraries and manage dependencies.'
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-23'
+verifiedAt: '2026-10-29'
 sources: ['docs/package.md', 'src/package.rs']
 sidebar:
   order: 3
 ---
 
 The standard library ships with Ku. Use imports for your own modules and third-party packages. There is no officially hosted public package directory; the repository provides a self-hosted registry implementation.
+
+## Create or initialize a project
+
+```sh
+ku create hello
+cd hello
+ku check
+ku run
+```
+
+The default basic template prints `Hello Ku`. Choose HTTP with `ku create my-api -t http`; `-t` equals `--template`. Initialize an existing empty directory with `ku init -t cli`; it refuses to overwrite an existing `ku.mod` or `src/main.ku`. `ku template list` and `ku create --list` list the same built-in templates: basic, cli, http, json, fs and lib.
+
+The layout below shows handwritten modules. A valid `ku.mod` selects the entry through `root` / `main`; Ku does not choose an arbitrary same-named file. See the [CLI reference](/en/docs/tools/cli/) for complete options.
 
 ## Project layout
 

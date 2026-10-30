@@ -25,6 +25,9 @@ zstd = "0.13"
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
+[build-dependencies]
+sha2 = "0.10"
+
 [target.'cfg(windows)'.dependencies]
 # 0.61 links Windows SDK import libraries directly. The older 0.52 release
 # required a Cargo-build-script-only windows.0.52.0.lib search path, which is

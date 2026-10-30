@@ -2,7 +2,7 @@
 title: Install and download
 description: Download the Ku 0.0.19 experimental prerelease and understand platform and build requirements.
 kuVersion: '0.0.19 / experimental prerelease'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'Cargo.toml',
@@ -29,13 +29,13 @@ Extract the **entire package** into an empty folder, such as `ku` in your home f
 macOS / Linux:
 
 ```sh
-./ku --version
+./ku -v
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\ku.exe --version
+.\ku.exe -v
 ```
 
 You should see `ku 0.0.19`. You can now run and check `.ku` files; installing Rust is not required for these operations.
@@ -51,7 +51,7 @@ export PATH="$HOME/ku:$PATH"
 
 On Windows, open **Edit environment variables for your account**, edit the user `Path`, and add the full path of the extracted folder, for example `%USERPROFILE%\ku`. Keep the existing entries.
 
-Open a new terminal and run `ku --version`.
+Open a new terminal and run `ku -v`.
 
 </details>
 
@@ -71,9 +71,17 @@ Compare the archive’s SHA-256 with [SHA256SUMS](https://github.com/fengyanweb/
 <details>
 <summary>Compiling your own Ku programs</summary>
 
-Running `ku run` and `ku check` needs the platform CLI. The default `ku build` additionally requires Rust **1.89.0** and a system linker. `ku build --backend c` requires a target C compiler and linker. Native database programs also need the matching database client libraries, which are not bundled.
+`ku run`, `ku check` and `ku ./hello.ku` need the platform CLI only. The package includes a Runner runtime compiled by Rust **1.89.0**; default `ku build` additionally needs matching Rust and a system linker. Upgrading system Rust does not rebuild that runtime. Selecting another version may produce E0514; see [Runner troubleshooting](/en/docs/guide/errors/#runner-build).
+
+The Windows MSVC Runner also requires the Visual Studio Build Tools C++ tools and Windows SDK.
+
+`ku build --backend c --release hello.ku -o hello` is a separate C-native path requiring a target C compiler and linker. Use `hello.exe` on Windows. Native database programs also need matching database client libraries, which are not bundled.
 
 </details>
+
+## Updates
+
+Extract an **entire new bundle** into a separate empty directory, verify it and run `ku -v` before switching `PATH`. Do not overlay a new CLI onto old runtime libraries. Keep the old directory for rollback and confirm the executable path in use. On Windows, close the relevant Ku processes before changing directories if files are in use.
 
 <details>
 <summary>Uninstall</summary>

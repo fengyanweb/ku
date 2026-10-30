@@ -2,7 +2,7 @@
 title: 错误与排查
 description: 定位 Ku 安装、导入、所有权、JSON 与后端能力错误。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'docs/diagnostics.md',
@@ -65,12 +65,31 @@ fn main(): null! {
 ## 先确认运行的是哪一个 Ku
 
 ```sh
-ku --version
+ku -v
 ku -h
 ku check hello.ku
 ```
 
 找不到 `ku` 时，直接调用解压目录的可执行文件；Windows 使用 `ku.exe`。默认 build 缺失 Rust 或链接库时，核对[安装要求](/zh-cn/docs/install/)，保留整个归档布局，不只复制 CLI 文件。
+
+<a id="runner-build"></a>
+
+## Runner 构建与 E0514
+
+`ku build hello.ku` 默认使用 Debug / Runner。E0514 表示 Rust 编译器与运行时库不兼容；0.0.19 的随包库使用 Rust 1.89.0，升级系统 Rust 不会重编这份库。保留安装包中的 `ku.exe`、`libku.rlib` 和整个 `deps` 目录，避免混用不同版本。
+
+Windows 的 MSVC Runner 还需要 Visual Studio Build Tools 的 C++ 工具和 Windows SDK。检查实际使用的程序与工具链：
+
+```powershell
+Get-Command ku -All
+where.exe ku
+ku -v
+rustc -vV
+rustup show active-toolchain
+rustup toolchain list
+```
+
+反馈问题时附安装包名、校验值、完整命令和错误输出。`ku check` 与解释运行不需要 Rust；C 原生编译的工具要求见[安装说明](/zh-cn/docs/install/)。
 
 ## 读取诊断
 

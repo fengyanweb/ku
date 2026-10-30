@@ -2,7 +2,7 @@
 title: 项目与贡献
 description: Ku 项目状态、公开源码、许可边界与提交问题的方式。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources:
   [
     'README.md',
@@ -34,12 +34,13 @@ Ku 与 VS Code 插件采用 **Apache-2.0** 许可证。可查看[源码](https:/
 - 完整命令、后端、最小 `.ku` 源码。
 - 完整诊断或结构化 Error、预期与实际输出。
 - 涉及构建时的 Rust / C 工具链版本，以及是否存在本地 import。
+- 安装包文件名与校验值、实际 CLI 路径。
 
 请勿提交 token、密码、真实连接字符串或含敏感业务数据的日志。性能问题应同时记录环境、负载、测量方法和原始结果；一次样例成功不能代表生产吞吐。
 
 ## 贡献前先读
 
-[语法参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)与[语言语义](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)规定语言行为。选择修改目标时，请区分已发布行为与开发分支。
+[语法参考](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/syntax.md)与[语言语义](https://github.com/fengyanweb/ku/blob/v0.0.19/docs/semantics.md)规定语言行为。贡献前请确认目标版本的 API。
 
 修改应尽量小，说明复现、原因、影响和验证范围。源码、文档与示例应使用同一版本；维护者审核后再合并贡献。
 

@@ -29,6 +29,107 @@ EXPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPORT)
 
 
+class RuntimeConsumerReportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('ku_runtime_consumer_report', Path(__file__).with_name('consume-runtime-bundle.py'))
+        assert spec and spec.loader
+        cls.consumer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.consumer)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='ku-consumer-report-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.path = self.root / '中文 report.json'
+        self.original = b'{"status":"last valid report"}\n'
+        self.path.write_bytes(self.original)
+
+    def test_rustup_management_symlink_keeps_invoked_name(self):
+        target = self.root / 'rustup-init'
+        alias = self.root / 'rustup'
+        target.write_text('import pathlib,sys\nname=pathlib.Path(sys.argv[0]).name\nprint(name)\nsys.exit(0 if name == "rustup" else 23)\n', encoding='utf-8')
+        try:
+            alias.symlink_to(target)
+        except OSError as error:
+            self.skipTest('platform cannot create file symlink: ' + str(error))
+        with mock.patch.object(self.consumer.shutil, 'which', return_value=str(alias)):
+            invoked = self.consumer.management_invocation('rustup')
+        self.assertEqual(invoked, os.path.abspath(alias))
+        self.assertNotEqual(invoked, str(alias.resolve()))
+        result = subprocess.run([sys.executable, invoked], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), b'rustup')
+
+    def test_owned_checkout_move_and_restore_handles_cross_volume(self):
+        import errno
+        source_dir = self.root / 'src'
+        source_dir.mkdir()
+        source_file = source_dir / '中文.rs'
+        source_file.write_bytes(b'original source bytes\n')
+        cargo = self.root / 'Cargo.toml'
+        cargo.write_bytes(b'[package]\n')
+        backup_dir = self.root / 'retired-src'
+        backup_cargo = self.root / 'retired-Cargo.toml'
+        # Real copy/unlink fallback is exercised, not only an asserted helper
+        # call. Path.rename would fail on the same EXDEV condition.
+        with mock.patch.object(self.consumer.os, 'rename', side_effect=OSError(errno.EXDEV, 'cross-device move')):
+            self.consumer.relocate_checkout_entry(source_dir, backup_dir)
+            self.consumer.relocate_checkout_entry(cargo, backup_cargo)
+            self.assertFalse(source_dir.exists())
+            self.assertFalse(cargo.exists())
+            self.assertEqual((backup_dir / source_file.name).read_bytes(), b'original source bytes\n')
+            self.consumer.relocate_checkout_entry(backup_dir, source_dir)
+            self.consumer.relocate_checkout_entry(backup_cargo, cargo)
+        self.assertEqual(source_file.read_bytes(), b'original source bytes\n')
+        self.assertEqual(cargo.read_bytes(), b'[package]\n')
+        self.assertFalse(backup_dir.exists())
+        self.assertFalse(backup_cargo.exists())
+
+    def test_reported_artifact_uses_cli_cwd_quotes_and_actual_ownership(self):
+        project = self.root / 'project with spaces'
+        project.mkdir()
+        artifact = project / 'output.ll'
+        artifact.write_bytes(b'; real IR fixture\n')
+        for printed in ('output.ll', '"output.ll"', str(artifact), json.dumps(str(artifact))):
+            with self.subTest(printed=printed):
+                path = self.consumer.reported_artifact('llvm ir ok: ' + printed + '\n', 'llvm ir ok: ', project, self.root)
+                self.assertTrue(os.path.samefile(path, artifact))
+        with tempfile.TemporaryDirectory(prefix='ku-unowned-ir-') as other:
+            outside = Path(other) / 'outside.ll'
+            outside.write_bytes(b'; outside')
+            with self.assertRaisesRegex(RuntimeError, 'reported=.*cwd=.*root='):
+                self.consumer.reported_artifact('llvm ir ok: ' + str(outside), 'llvm ir ok: ', project, self.root)
+        with self.assertRaisesRegex(RuntimeError, 'expected one bounded artifact'):
+            self.consumer.reported_artifact('not an artifact', 'llvm ir ok: ', project, self.root)
+
+    def test_report_is_utf8_even_under_cp1252_text_default(self):
+        value = {'path': '搬迁 中文 空格', 'failure': '库版本错误 😀'}
+        with mock.patch('io.text_encoding', return_value='cp1252'):
+            self.consumer.write_report(self.path, value)
+        self.assertEqual(json.loads(self.path.read_bytes().decode('utf-8')), value)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_serialization_or_encoding_failure_preserves_original(self):
+        for value, error in (({'not_json': object()}, TypeError), ({'invalid_unicode': '\ud800'}, UnicodeEncodeError), ({'not_finite': float('nan')}, ValueError)):
+            with self.subTest(error=error.__name__), self.assertRaises(error):
+                self.consumer.write_report(self.path, value)
+            self.assertEqual(self.path.read_bytes(), self.original)
+            self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_replace_failure_cleans_private_file_and_preserves_original(self):
+        with mock.patch.object(self.consumer.os, 'replace', side_effect=PermissionError('replace denied')), self.assertRaises(PermissionError):
+            self.consumer.write_report(self.path, {'status': 'next complete report'})
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+    def test_report_write_failure_cleans_private_file_and_preserves_original(self):
+        with mock.patch.object(self.consumer.os, 'fsync', side_effect=OSError('disk write failed')), self.assertRaises(OSError):
+            self.consumer.write_report(self.path, {'status': 'next complete report'})
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(list(self.root.glob('*.writing')), [])
+
+
 class ReleaseExportTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="ku-export-test-")
@@ -46,6 +147,7 @@ class ReleaseExportTests(unittest.TestCase):
                      f"native-tls/v1/{self.target}/lib/libku_native_tls.a"):
             self.put(self.bundle / name, f"fixture:{name}\n".encode())
         (self.bundle / "ku").chmod(0o755)
+        self.make_runtime_manifest()
         self.package = self.root / "cache" / "sample-1.2.3"
         self.put(self.package / "Cargo.toml", b"fixture manifest\n")
         self.put(self.package / "LICENSE-MIT", b"original license bytes\r\nCopyright sample\r\n")
@@ -69,6 +171,12 @@ class ReleaseExportTests(unittest.TestCase):
         self.sysroot = self.root / "rust"
         self.put(self.sysroot / "share/doc/rust/licenses/MIT.txt", b"original Rust license\n")
         self.put(self.sysroot / "share/doc/rust/COPYRIGHT-library.html", b"<html>original Rust attribution</html>")
+
+    def make_runtime_manifest(self):
+        for name in ('ku-runtime.json', 'ku-runtime-deps.json'):
+            (self.bundle / name).unlink(missing_ok=True)
+        text = 'release: 1.89.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + self.target + '\n'
+        EXPORT.RUNTIME_BUNDLE.create(self.bundle, '0.0.17', 'a'*40, self.target, text, '1.89.0')
 
     @staticmethod
     def put(path: Path, data: bytes):
@@ -98,6 +206,51 @@ class ReleaseExportTests(unittest.TestCase):
             with mock.patch.object(EXPORT, "plain", side_effect=target_mode):
                 return EXPORT.export_release(**arguments)
         return EXPORT.export_release(**arguments)
+
+    def test_runtime_manifest_rejects_missing_mixed_corrupt_and_escaping_inputs(self):
+        runtime = self.bundle / 'ku-runtime.json'
+        original = runtime.read_bytes()
+        runtime.unlink()
+        with self.assertRaises(EXPORT.ExportError):
+            self.run_export()
+        runtime.write_bytes(original)
+        dependency = self.bundle / 'deps/libsample-0123456789abcdef.rlib'
+        saved = dependency.read_bytes()
+        dependency.write_bytes(b'from another compilation')
+        with self.assertRaisesRegex(EXPORT.ExportError, 'runtime bundle'):
+            self.run_export()
+        dependency.write_bytes(saved)
+        manifest = json.loads(original)
+        manifest['runtime_rlib'] = '../libku.rlib'
+        runtime.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(EXPORT.ExportError, 'runtime bundle'):
+            self.run_export()
+        runtime.write_bytes(original)
+        self.assertEqual(EXPORT.RUNTIME_BUNDLE.verify(self.bundle)['source_commit'], 'a'*40)
+
+    def test_runtime_identity_uses_actual_compiler_and_ignores_unlisted_mtime(self):
+        before = EXPORT.RUNTIME_BUNDLE.verify(self.bundle)
+        extra = self.bundle / 'deps/libku-ffffffffffffffff.rlib'
+        extra.write_bytes(b'unrelated newer library')
+        os.utime(extra, (time.time()+3600, time.time()+3600))
+        self.assertEqual(EXPORT.RUNTIME_BUNDLE.verify(self.bundle), before)
+        # Selection is bounded to the manifest, but publisher exports must not
+        # include an unlisted dependency even when its filename looks valid.
+        with self.assertRaisesRegex(EXPORT.ExportError, 'closure'):
+            self.run_export()
+        extra.unlink()
+        bad_compiler = 'release: 1.96.0\ncommit-hash: ' + 'b'*40 + '\ncommit-date: 2025-08-04\nhost: ' + self.target + '\n'
+        with self.assertRaisesRegex(ValueError, 'actual compiler'):
+            EXPORT.RUNTIME_BUNDLE.rust_identity(bad_compiler, '1.89.0', self.target)
+
+    def test_runtime_manifest_duplicate_keys_and_relative_paths_rejected(self):
+        path = self.bundle / 'ku-runtime.json'
+        path.write_text('{"schema":"ku-runtime-bundle-v1","schema":"other"}')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            EXPORT.RUNTIME_BUNDLE.verify(self.bundle)
+        for name in ('../outside', '/absolute', 'C:/outside', 'deps/../libku.rlib', 'deps\\outside', 'deps//file'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                EXPORT.RUNTIME_BUNDLE.relative_file(self.bundle, name)
 
     def test_roundtrip_hashes_original_licenses_and_file_set(self):
         result = self.run_export()
@@ -382,6 +535,7 @@ class ReleaseExportTests(unittest.TestCase):
         (current / "lib/libku_native_tls.a").rename(current / "lib/ku_native_tls.lib")
         self.put(self.bundle / "ku.pdb", b"debug symbols")
         self.put(self.bundle / "deps/sample_derive-0123456789abcdef.dll", b"Cargo emitted Windows procedural macro")
+        self.make_runtime_manifest()
         result = self.run_export()
         self.assertIn(self.target, result["manifest_path"])
 
@@ -401,6 +555,7 @@ class ReleaseExportTests(unittest.TestCase):
                                 "deps/libsample.so.1", "deps/libsample.rlib", "deps/libsample-ABCDEF0123456789.rlib"):
                     self.assertFalse(EXPORT.dependency_name(invalid, target))
         self.put(self.bundle / positive[self.target], b"Cargo emitted Linux procedural macro")
+        self.make_runtime_manifest()
         self.run_export()
 
     def test_wrong_platform_or_arbitrary_dynamic_library_is_not_exported(self):

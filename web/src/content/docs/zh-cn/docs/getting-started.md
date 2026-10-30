@@ -2,11 +2,11 @@
 title: 快速开始
 description: 用 Ku 编写 Hello Ku，检查源码并了解解释运行与构建的区别。
 kuVersion: '0.0.19'
-verifiedAt: '2026-10-28'
+verifiedAt: '2026-10-29'
 sources: ['examples/hello.ku', 'README.md', 'docs/syntax.md', 'docs/v0.0.19.md']
 ---
 
-先完成[安装](/zh-cn/docs/install/)，并确认 `ku --version` 输出 `ku 0.0.19`。
+先完成[安装](/zh-cn/docs/install/)，并确认 `ku -v` 输出 `ku 0.0.19`。
 
 ## 写下第一个程序
 
@@ -28,10 +28,10 @@ fn main() {
 
 ```sh
 ku check hello.ku
-ku run hello.ku
+ku ./hello.ku
 ```
 
-`check` 检查词法、语法和基础语义，不运行程序。正常运行的预期标准输出为：
+`check` 检查词法、语法和基础语义，不运行程序。`ku ./hello.ku` 与 `ku run ./hello.ku` 等价；Windows 可写 `ku .\hello.ku`。这条简写只接受一个源路径，依赖模式使用显式 `ku run --offline ./hello.ku`。正常运行的预期标准输出为：
 
 ```text
 Hello Ku
@@ -60,10 +60,16 @@ println(count)
 ku build hello.ku
 ```
 
-默认后端生成解释器打包型可执行文件。native C 后端需要单独的 C 编译器：
+默认是 Debug / Runner 后端，生成解释器打包型可执行文件；它需要匹配随包库的 Rust 和系统链接器。Rust 与随包运行时不匹配时会报 E0514，见[Runner 构建排查](/zh-cn/docs/guide/errors/#runner-build)。解释运行无需 Rust。native C 是独立路径，需要单独的 C 编译器：
 
 ```sh
-ku build --backend c hello.ku
+ku build --backend c --release hello.ku -o hello
+```
+
+Windows PowerShell 使用 `.exe` 输出名：
+
+```powershell
+ku build --backend c --release .\hello.ku -o .\dist\hello.exe
 ```
 
 默认输出位于 `.ku/build/<profile>/`；以实际 CLI 输出路径为准。两种构建方式的覆盖范围不同，不能把 `ku check` 成功当作 native 编译成功。
@@ -75,12 +81,15 @@ ku build --backend c hello.ku
 需要包目录时，可使用内置模板：
 
 ```sh
-ku create HelloWorld --template basic
-cd HelloWorld
+ku -v
+ku create hello
+cd hello
 ku check
 ku run
 ```
 
-包通过 `ku.mod` 指定入口。`ku create --list` 查看真实模板列表；当前没有 `ku test` 或 `ku fmt` 命令。
+`ku create hello` 使用默认 basic 模板；选择其他模板可用 `ku create my-api -t http`，已有空目录可用 `ku init -t cli` 初始化。包通过 `ku.mod` 指定入口。`ku create --list` 查看真实模板列表；当前没有 `ku test` 或 `ku fmt` 命令。
 
 继续阅读[语言指南](/zh-cn/docs/guide/language/)、[错误与排查](/zh-cn/docs/guide/errors/)和[后端支持](/zh-cn/docs/support/)。
+
+更多选项、简写与 `-v` 的不同作用见[命令行参考](/zh-cn/docs/tools/cli/)。
