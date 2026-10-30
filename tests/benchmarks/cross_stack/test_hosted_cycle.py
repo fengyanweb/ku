@@ -67,12 +67,15 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(plan['maximum_windows'],3+13+12+9+12+1)
         self.assertEqual(plan['admission']['name'],'B')
         self.assertFalse(plan['task_json_comparison']['original_worker_score_eligible'])
-        self.assertIn('BT admission is not verified',plan['task_json_comparison']['admission_scope'])
+        self.assertIn('both are required',plan['task_json_comparison']['admission_scope'])
+        self.assertEqual(plan['task_json_admission'],dict(plan['admission'],name='BT'))
+        self.assertFalse(plan['task_json_admission']['counts_as_timed_window'])
         self.assertEqual(plan['worker_growth']['names'],['B','BF'])
         self.assertNotIn('targets',plan)
         ordinary=h.followup_plan(versions,'f'*40)
         self.assertFalse(ordinary['task_json_screen'])
         self.assertNotIn('BT',ordinary['candidate_versions'])
+        self.assertNotIn('task_json_admission',ordinary)
         self.assertIn('db',[c['workload'] for c in ordinary['cases']])
         with self.assertRaisesRegex(ValueError,'identified BT build'):
             h.followup_plan({n:v for n,v in versions.items() if n!='BT'},'f'*40,task_json_screen=True)
@@ -288,7 +291,7 @@ class HostedCycleTests(unittest.TestCase):
     def test_admission_reuse_requires_same_boot_build_and_resources_and_never_retries_failure(self):
         from unittest.mock import Mock
         binding={'source_commit':'a'*40,'files':{'ELF':{'sha256':'b'*64}}}
-        for issue in (None,'boot','binding','resources','failed','interrupted'):
+        for issue in (None,'boot','name','binding','resources','failed','interrupted'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);plan=self.plan();state={'steps':{}}
                 gate=Mock(return_value={'passed':issue!='failed','execution_complete':True,'binding':binding})
@@ -297,6 +300,7 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertEqual(gate.call_count,1)
                     if issue=='boot':boot='other-boot'
                     else:boot='boot'
+                    if issue=='name':state['steps']['admission']['result']['name']='BT'
                     if issue=='binding':state['steps']['admission']['result']['binding']={'source_commit':'c'*40}
                     if issue=='resources':state['steps']['admission']['result']['resources']={'service_cores':1}
                     if issue=='interrupted':state['steps']['admission']={'state':'failed','error':'KeyboardInterrupt'}
@@ -306,9 +310,60 @@ class HostedCycleTests(unittest.TestCase):
                     if issue is None:self.assertTrue(second['reused_same_host_build'])
                     else:self.assertEqual(second['goal_status'],'blocked');self.assertTrue(second['no_retry'])
 
+    def test_task_admission_has_separate_binding_and_cannot_reuse_worker_or_failed_task_receipts(self):
+        from unittest.mock import Mock
+        for issue in (None,'worker-copied','task-failed','task-ELF-changed','task-contract-changed'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);state={'steps':{}}
+                versions={name:{'root':str(root/name)} for name in ['A','B','BT','R']}
+                plan=h.followup_plan(versions,task_json_screen=True)
+                bindings={name:{'source_commit':'a'*40,'files':{'ELF':{'sha256':name}}} for name in ['B','BT']}
+                def actual_gate(plan,output,name='B'):
+                    return dict(name=name,passed=not(issue=='task-failed' and name=='BT'),
+                        execution_complete=True,binding=bindings[name])
+                gate=Mock(side_effect=actual_gate)
+                with patch.object(h,'admission_window',gate),patch.object(fc,'version_identity',side_effect=lambda p,n:bindings[n]):
+                    first=h.required_screen_admission(plan,root,state,'boot',root/'gate')
+                    self.assertEqual(gate.call_count,2)
+                    self.assertEqual(set(state['steps']),{'admission','admission-BT'})
+                    self.assertEqual(first['passed'],issue!='task-failed')
+                    self.assertEqual(first['gates']['BT']['binding'],bindings['BT'])
+                    if issue=='worker-copied':state['steps']['admission-BT']=dict(state['steps']['admission'])
+                    if issue=='task-ELF-changed':bindings['BT']=dict(bindings['BT'],files={'ELF':{'sha256':'changed'}})
+                    if issue=='task-contract-changed':plan['task_json_admission']['connections']+=1
+                    second=h.required_screen_admission(plan,root,state,'boot',root/'gate')
+                    self.assertEqual(gate.call_count,2)
+                    self.assertEqual(second['passed'],issue is None)
+                    self.assertTrue(second['gates']['B']['reused_same_host_build'])
+                    if issue is None:self.assertTrue(second['gates']['BT']['reused_same_host_build'])
+                    else:self.assertTrue(second['gates']['BT']['no_retry'])
+                    self.assertEqual(h.load(root/'gate/admission-series.json')['passed'],issue is None)
+
+    def test_task_admission_selects_actual_task_build_environment_and_identity(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+            root=Path(directory)
+            plan={'versions':{'B':{'root':str(root/'worker')},
+                'BT':{'root':str(root/'task'),'stack':'ku','env':{'EXECUTION':'task'}}},'resources':h.RESOURCES}
+            binding={'source_commit':'a'*40,'files':{'ELF':{'sha256':'task-executable'}}}
+            identity=patches.enter_context(patch.object(fc,'version_identity',return_value=binding))
+            service=Mock();service.stop.return_value={'natural':True}
+            harness=Mock();harness.start.return_value=service;harness.close.return_value=[]
+            harness.admission_pressure.return_value={'passed':True,'counts':{'correct_200':1136,'explicit_503':32,'planned_cancel':16}}
+            factory=patches.enter_context(patch.object(fc,'Harness',return_value=harness))
+            patches.enter_context(patch.object(fc,'service_termination_succeeded',return_value=True))
+            result=h.admission_window(plan,root/'gate',name='BT')
+            factory.assert_called_once_with(root/'task',root/'gate')
+            self.assertEqual([call.args[1] for call in identity.call_args_list],['BT','BT'])
+            self.assertEqual(harness.start.call_args.kwargs['extra_env'],{'EXECUTION':'task'})
+            harness.admission_pressure.assert_called_once_with(service,root/'gate/admission')
+            self.assertTrue(result['passed']);self.assertEqual(result['name'],'BT')
+            self.assertFalse(result['counts_as_timed_window']);service.stop.assert_called_once()
+            self.assertEqual(result['gate']['counts']['correct_200'],1136)
+
     def test_diagnostic_and_screen_admission_are_required_but_not_timed_windows(self):
         from unittest.mock import Mock
-        for followup,gate_passed,task in ((False,True,False),(False,False,False),(True,True,False),(True,False,False),(True,True,True)):
+        for followup,gate_passed,task in ((False,True,False),(False,False,False),(True,True,False),(True,False,False),(True,True,True),(True,False,True)):
             with self.subTest(followup=followup,gate_passed=gate_passed,task=task),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory)
                 versions={name:{'root':str(root/name),'source_commit':'a'*40}
@@ -340,7 +395,8 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h,'window_quality',return_value=(False,None)))
                 patches.enter_context(patch.object(fc,'window',window))
                 result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools'),state,followup=followup)
-                self.assertEqual(gate.call_count,1);self.assertEqual(result['execution_complete'],gate_passed)
+                self.assertEqual(gate.call_count,2 if task and gate_passed else 1)
+                self.assertEqual(result['execution_complete'],gate_passed)
                 controls=plan['environment_controls']['count'] if followup else 0
                 expected=plan['maximum_windows'] if followup else sum(len(h.diagnostic_turns(plan,c,False)) for c in plan['cases'])
                 # Supplementary gate failure must preserve already valid normal windows.
@@ -349,6 +405,13 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(cleanup,['database']);self.assertEqual(result['admission']['passed'],gate_passed)
                 if not gate_passed:self.assertEqual(result['goal_status'],'blocked')
                 if task:
+                    self.assertEqual(set(result['admission']['gates']),{'B','BT'})
+                    self.assertFalse(result['admission']['counts_as_timed_window'])
+                    if gate_passed:
+                        self.assertEqual([c.kwargs['name'] for c in gate.call_args_list],['B','BT'])
+                        self.assertEqual(gate.call_args_list[1].args[1],root/'diagnostic/admission/BT')
+                    else:
+                        self.assertTrue(result['admission']['gates']['BT']['not_started'])
                     comparison=h.load(root/'diagnostic/json_object/comparison.json')
                     self.assertEqual(comparison['task_json_screen']['denominator_name'],'B')
                     self.assertEqual(comparison['candidate_screens']['BT']['denominator_name'],'B')

@@ -188,12 +188,13 @@ def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False):
         plan['latency_slo_ms']={'json_object':100,'json_escape':100}
         plan['task_json_comparison']=dict(numerator='BT',denominator='B',reference='R',
             diagnostic_only=True,original_worker_score_eligible=False,
-            admission_scope='B synchronous worker only; BT admission is not verified by this gate',
+            admission_scope='Separate serial B worker and BT Task admission/recovery gates; both are required, neither is a timed score',
             scope='Normal O2/helpers/text native Task JSON locals versus the same-current synchronous worker; '
                   'old A/B worker comparison retained; no PG/old-ablation repetition or old-goal substitution')
+        plan['task_json_admission']=dict(copy.deepcopy(ADMISSION),name='BT')
         plan['scope']='Three frozen prepatch JSON environment controls, then separate A/B/BT/R JSON object and Unicode pairs, '
         plan['scope']+='plus the unchanged A/B/R CPU guard. BT uses normal O2/helpers/text without probes; '
-        plan['scope']+='it is excluded from original worker goals. B admission, cold/burst and HC retain their separate scope.'
+        plan['scope']+='it is excluded from original worker goals. B and BT admission/recovery are required separately; cold/burst and HC retain their separate scope.'
     elif 'C1' in versions and 'C2' in versions:
         names=['A','C1','C2','B','reference']
         plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
@@ -1002,7 +1003,7 @@ def diagnostic(a,state,followup=False):
             control_row.update(diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
                 candidate_accepted=False,scope=c['scope'])
             save(out/'window.json',control_row)
-        admission=(required_admission(plan,a.root,state,boot,directory/'admission') if not stopped else
+        admission=(required_screen_admission(plan,a.root,state,boot,directory/'admission') if not stopped else
             dict(passed=False,execution_complete=False,reason='normal functional/environment stop; supplementary gate not started'))
         expected_rows=sum(len(diagnostic_turns(plan,c,followup)) for c in plan['cases'])
         axes=diagnostic_axes(plan,rows,expected_rows,stopped,control_row,growth_rows,followup,admission)
@@ -1021,50 +1022,76 @@ def diagnostic(a,state,followup=False):
         diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-after.log')
 
 
-def required_admission(plan, root, state, boot, output):
-    """One bounded gate; reuse only success bound to this boot and exact B build.
+def required_screen_admission(plan, root, state, boot, output):
+    """Keep old B receipts unchanged; explicit Task JSON adds its own real gate."""
+    worker=required_admission(plan,root,state,boot,output)
+    if not plan.get('task_json_screen'):return worker
+    if plan.get('task_json_admission',{}).get('name')!='BT':
+        raise ValueError('Task JSON screen requires its separate BT admission contract')
+    if worker.get('passed') is True and worker.get('execution_complete') is True:
+        task=required_admission(plan,root,state,boot,Path(output)/'BT',name='BT')
+    else:
+        task=dict(name='BT',passed=False,execution_complete=False,goal_status='blocked',
+            reason='B admission did not pass; BT supplementary gate was not started',not_started=True)
+    gates={'B':worker,'BT':task}
+    complete=all(row.get('execution_complete') is True for row in gates.values())
+    passed=complete and all(row.get('passed') is True for row in gates.values())
+    result=dict(schema='ku-hosted-admission-series-v1',passed=passed,execution_complete=complete,
+        goal_status='met' if passed else 'blocked',gates=gates,
+        normal_score_eligible=False,counts_as_timed_window=False,
+        scope='Separate serial B worker and BT Task admission/recovery; no throughput score or old-goal substitution')
+    save(Path(output)/'admission-series.json',result);return result
+
+
+def required_admission(plan, root, state, boot, output, name='B'):
+    """One bounded gate; reuse only success bound to this boot/name/exact build.
 
     Retained failure/interruption is blocked evidence, never an implicit retry.
     This step deliberately contributes no fixed/diagnostic timed windows.
     """
-    old=state.setdefault('steps',{}).get('admission')
+    contract=plan.get('admission',ADMISSION) if name=='B' else plan.get('task_json_admission')
+    if not isinstance(contract,dict) or contract.get('name')!=name or name not in plan['versions']:
+        raise ValueError('missing admission contract/build for '+name)
+    key='admission' if name=='B' else 'admission-'+name
+    old=state.setdefault('steps',{}).get(key)
     if old:
         receipt=copy.deepcopy(old.get('result')) if isinstance(old.get('result'),dict) else {}
         try:
-            matching=(receipt.get('boot_sha256')==boot and receipt.get('binding')==fc.version_identity(plan,'B')
-                and receipt.get('resources')==plan['resources'] and receipt.get('contract')==plan.get('admission',ADMISSION))
+            matching=(receipt.get('name')==name and receipt.get('boot_sha256')==boot
+                and receipt.get('binding')==fc.version_identity(plan,name)
+                and receipt.get('resources')==plan['resources'] and receipt.get('contract')==contract)
         except Exception:matching=False
         if old.get('state')=='completed' and matching and receipt.get('passed') is True and receipt.get('execution_complete') is True:
             return dict(receipt,reused_same_host_build=True)
-        return dict(receipt,passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
+        return dict(receipt,name=name,passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
             reason='retained admission is failed, incomplete, or not bound to the current boot/build/resources; no implicit rerun')
     def execute():
-        receipt=admission_window(plan,output)
-        receipt.update(boot_sha256=boot,resources=copy.deepcopy(plan['resources']),contract=copy.deepcopy(plan.get('admission',ADMISSION)))
+        receipt=admission_window(plan,output,name=name)
+        receipt.update(name=name,boot_sha256=boot,resources=copy.deepcopy(plan['resources']),contract=copy.deepcopy(contract))
         save(Path(output)/'admission-window.json',receipt)
         return receipt
     try:
-        return step(state,root,'admission',execute)
+        return step(state,root,key,execute)
     except Exception as error:
         # step retains the failed attempt. Do not turn a driver/setup failure
         # into a retry or let downstream successful cleanup erase this axis.
-        return dict(passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
+        return dict(name=name,passed=False,execution_complete=False,goal_status='blocked',no_retry=True,
             error=repr(error),reason='admission attempt failed; retained without retry',evidence=str(Path(output)/'admission-window.json'))
 
 
-def admission_window(plan, output):
+def admission_window(plan, output, name='B'):
     """Finite real C/A/P gate, separate from throughput and normal CPU scores."""
-    output=Path(output);spec=plan['versions']['B'];binding=fc.version_identity(plan,'B')
+    output=Path(output);spec=plan['versions'][name];binding=fc.version_identity(plan,name)
     harness=fc.Harness(Path(spec['root']),output);service=None;interrupted=None
-    row=dict(schema='ku-hosted-admission-v1',passed=False,execution_complete=False,
-        binding=binding,source_commit=binding['source_commit'],normal_score_eligible=False,
+    row=dict(schema='ku-hosted-admission-v1',name=name,passed=False,execution_complete=False,
+        counts_as_timed_window=False,binding=binding,source_commit=binding['source_commit'],normal_score_eligible=False,
         scope='Finite actual admission/recovery; no maximum RPS or Rust comparison')
     try:
         service=harness.start(spec.get('stack','ku'),cores=plan['resources']['service_cores'],
             memory=plan['resources']['service_memory_bytes'],output=output/'service',extra_env=spec.get('env',{}))
         row['gate']=harness.admission_pressure(service,output/'admission')
         row['execution_complete']=True
-        row['identity_unchanged']=fc.version_identity(plan,'B')==binding
+        row['identity_unchanged']=fc.version_identity(plan,name)==binding
     except BaseException as error:
         row['error']=repr(error)
         if isinstance(error,(KeyboardInterrupt,SystemExit)):raise
