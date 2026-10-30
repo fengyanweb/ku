@@ -983,6 +983,9 @@ impl Checker {
                 Ok(Type::Struct(name.clone()))
             }
             TypeName::Custom(name) if self.enums.contains_key(name) => Ok(Type::Enum(name.clone())),
+            TypeName::Custom(name) if name == "KuValue" => Ok(Type::KuValue),
+            TypeName::Custom(name) if name == "HttpRequest" => Ok(http_request_type()),
+            TypeName::Custom(name) if name == "HttpResponse" => Ok(http_response_type()),
             TypeName::Custom(name) => {
                 Err(KuError::runtime(format!("undefined type '{name}'"), span))
             }
@@ -1763,6 +1766,18 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
+        self.check_expr_with_field_receiver(expr, None)
+    }
+
+    // Method dispatch and ordinary callable-field fallback share one receiver
+    // evaluation. The memo belongs only to this Call expression, never another
+    // visit, branch, statement or checker state. Field/place validation below
+    // still runs; only the already-checked receiver's nested effects are reused.
+    fn check_expr_with_field_receiver(
+        &mut self,
+        expr: &Expr,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
         self.completed_expression_provenance = None;
         let mut evaluated_provenance = None;
         self.check_depth += 1;
@@ -1813,7 +1828,8 @@ impl Checker {
                     self.check_binary(*op, &left, &right, expr.span)
                 }
                 ExprKind::Call { callee, args } => {
-                    if let Some(ty) = self.check_array_map_call(callee, args, expr.span)? {
+                    let mut checked_receiver = None;
+                    if let Some(ty) = self.check_array_map_call(callee, args, expr.span, &mut checked_receiver)? {
                         return Ok(ty);
                     }
                     if let Some(ty) = self.check_dotted_builtin_call(callee, args, expr.span)? {
@@ -1825,7 +1841,7 @@ impl Checker {
                                 .check_enum_constructor(&enum_name, &variant, args, expr.span);
                         }
                     }
-                    if let Some(ty) = self.check_std_method_call(callee, args, expr.span)? {
+                    if let Some(ty) = self.check_std_method_call(callee, args, expr.span, &mut checked_receiver)? {
                         if self.type_may_contain_function_value(&ty) {
                             if let ExprKind::Field { target, name } = &callee.kind {
                                 if name == "clone" && args.is_empty() {
@@ -1995,7 +2011,7 @@ impl Checker {
                         ))
                     } else {
                         if let Some(ty) =
-                            self.check_http_service_method_call(callee, args, expr.span)?
+                            self.check_http_service_method_call(callee, args, expr.span, &mut checked_receiver)?
                         {
                             return Ok(ty);
                         }
@@ -2005,7 +2021,7 @@ impl Checker {
                             return Ok(ty);
                         }
                         let callee_root = expr_root_name(callee).map(str::to_string);
-                        let callee_type = self.check_expr(callee)?;
+                        let callee_type = self.check_expr_with_field_receiver(callee, checked_receiver.as_ref())?;
                         let captured = self.expression_closure_provenance(callee);
                         if let Type::FunctionValue {
                             params,
@@ -2173,7 +2189,10 @@ impl Checker {
                             ));
                         }
                     }
-                    let target_type = self.check_expr(target)?;
+                    let target_type = match checked_receiver {
+                        Some(ty) => ty.clone(),
+                        None => self.check_expr(target)?,
+                    };
                     // Reading a field whose place — or an ancestor of it — was moved
                     // out is a use-after-move. Only the exact path or an ancestor
                     // blocks; a moved *descendant* does not, so resolving an
@@ -2614,16 +2633,20 @@ impl Checker {
         expected: Option<&Type>,
         mode: ParamMode,
     ) -> KuResult<Type> {
+        let ty = self.check_expr_expecting(expr, expected)?;
+        self.check_checked_arg_mode(expr, ty, mode)
+    }
+
+    fn check_checked_arg_mode(&mut self, expr: &Expr, ty: Type, mode: ParamMode) -> KuResult<Type> {
         if mode == ParamMode::View {
-            return self.check_expr_expecting(expr, expected);
+            return Ok(ty);
         }
         if let Some(root) = self.borrowed_expr_root(expr) {
-            let ty = self.check_expr(expr)?;
             if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
                 return Err(KuError::runtime(format!("cannot pass borrowed value rooted at '{root}' to owning parameter; use '.clone()' to create an owned value"), expr.span));
             }
         }
-        self.consume_expr_expecting(expr, expected)
+        self.consume_checked_expr(expr, ty)
     }
 
     fn check_binary(&self, op: BinaryOp, left: &Type, right: &Type, span: Span) -> KuResult<Type> {
@@ -2803,6 +2826,7 @@ impl Checker {
         callee: &Expr,
         args: &[Expr],
         span: Span,
+        checked_receiver: &mut Option<Type>,
     ) -> KuResult<Option<Type>> {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
@@ -2813,7 +2837,7 @@ impl Checker {
         ) {
             return Ok(None);
         }
-        let target_type = self.check_expr(target)?;
+        let target_type = self.check_method_receiver(target, checked_receiver)?;
         if (name == "run" || name == "close") && is_http_listener_type(&target_type) {
             self.reject_http_handler_control_call(target, &target_type, name, span)?;
             if !args.is_empty() {
@@ -2852,7 +2876,7 @@ impl Checker {
                 // Native listen owns and frees the server on every return path.
                 // Model that ownership transfer so a caught listen error cannot
                 // reuse a dangling server pointer.
-                self.consume_expr(target)?;
+                self.consume_checked_expr(target, target_type)?;
             }
             return Ok(Some(if name == "bind" {
                 Type::Result(Box::new(http_listener_type()))
@@ -2882,6 +2906,10 @@ impl Checker {
         } else {
             Some(self.check_expr(handler_arg)?)
         };
+        let async_handler = matches!(
+            &handler_type,
+            Some(Type::FunctionValue { is_async: true, .. })
+        );
         let handler_provenance = self.expression_closure_provenance(handler_arg);
         if handler_provenance.http_callable_body_uncertain {
             return Err(KuError::runtime(
@@ -2944,16 +2972,20 @@ impl Checker {
                     return_type,
                     body,
                     body_id,
-                    ..
+                    is_async,
                 } => {
-                    self.check_http_handler(
+                    let saved_async_depth = self.async_depth;
+                    self.async_depth = usize::from(is_async);
+                    let checked = self.check_http_handler(
                         name,
                         &params,
                         return_type.as_deref(),
                         &body,
                         body_id,
                         handler_arg.span,
-                    )?;
+                    );
+                    self.async_depth = saved_async_depth;
+                    checked?;
                 }
                 Type::Unknown => {
                     return Err(KuError::runtime(
@@ -2971,7 +3003,7 @@ impl Checker {
         }
         // Route registration mutates the named service in place. Returning the
         // service would create an untracked second owner of native's raw pointer.
-        self.freeze_http_shared_callables(&handler_provenance, span)?;
+        self.freeze_http_shared_callables(&handler_provenance, span, async_handler)?;
         Ok(Some(Type::Null))
     }
 
@@ -3203,14 +3235,22 @@ impl Checker {
         ))))
     }
 
-    fn apply_pg_client_query_signature(&mut self, args: &[Expr], span: Span) -> KuResult<Type> {
+    fn apply_pg_client_query_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
         if args.len() != 3 {
             return Err(KuError::runtime(
                 "PostgreSQL client query requires query(sql, params); pass [] when there are no parameters",
                 span,
             ));
         }
-        let client = self.check_expr(&args[0])?;
+        let client = match checked_receiver {
+            Some(ty) => ty.clone(),
+            None => self.check_expr(&args[0])?,
+        };
         let expected_client = Type::Native(metadata::PG_CLIENT.to_string());
         if client != expected_client {
             return Err(type_error(args[0].span, &expected_client, &client));
@@ -3224,6 +3264,64 @@ impl Checker {
         let expected_params = Type::Array(Box::new(Type::String));
         if params != expected_params && !empty_literal {
             return Err(type_error(args[2].span, &expected_params, &params));
+        }
+        self.reject_effectful_args_on_captured_native_receiver(
+            &args[0],
+            &client,
+            &args[1..],
+            span,
+        )?;
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::PG_RESULT.to_string(),
+        ))))
+    }
+
+    fn apply_pg_client_query_one_typed_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
+        expect_arg_count("pg_client.query_one_typed", args.len(), 5, span)?;
+        let client = match checked_receiver {
+            Some(ty) => ty.clone(),
+            None => self.check_expr(&args[0])?,
+        };
+        let expected_client = Type::Native(metadata::PG_CLIENT.to_string());
+        if client != expected_client {
+            return Err(type_error(args[0].span, &expected_client, &client));
+        }
+        let sql = self.check_expr(&args[1])?;
+        if sql != Type::String {
+            return Err(type_error(args[1].span, &Type::String, &sql));
+        }
+        // Contextual boxing belongs only to this API. Each expression is
+        // checked once, in source order; ordinary mixed arrays stay unchanged.
+        let expected_params = Type::Array(Box::new(Type::KuValue));
+        if let ExprKind::Array(elements) = &args[2].kind {
+            for element in elements {
+                let actual = self.consume_expr(element)?;
+                if !matches!(
+                    actual,
+                    Type::Int | Type::Bool | Type::Null | Type::String | Type::KuValue
+                ) {
+                    return Err(KuError::runtime("typed PostgreSQL parameters accept only int, bool, str, null or a checked KuValue", element.span));
+                }
+            }
+        } else {
+            let actual = self.check_expr(&args[2])?;
+            if actual != expected_params {
+                return Err(type_error(args[2].span, &expected_params, &actual));
+            }
+        }
+        for schema in &args[3..] {
+            let actual = self.check_expr(schema)?;
+            let expected = Type::Array(Box::new(Type::String));
+            if actual != expected
+                && !matches!(&schema.kind, ExprKind::Array(elements) if elements.is_empty())
+            {
+                return Err(type_error(schema.span, &expected, &actual));
+            }
         }
         self.reject_effectful_args_on_captured_native_receiver(
             &args[0],
@@ -3721,7 +3819,7 @@ impl Checker {
                 0 => Ok(Type::DynamicObject),
                 1 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
-                    Ok(Type::DynamicObject)
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
                 }
                 2 => {
                     expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
@@ -3883,16 +3981,38 @@ impl Checker {
         }
     }
 
+    fn check_method_receiver(
+        &mut self,
+        target: &Expr,
+        checked_receiver: &mut Option<Type>,
+    ) -> KuResult<Type> {
+        if let Some(ty) = checked_receiver {
+            return Ok(ty.clone());
+        }
+        let ty = self.check_expr(target)?;
+        *checked_receiver = Some(ty.clone());
+        Ok(ty)
+    }
+
     fn check_std_method_call(
         &mut self,
         callee: &Expr,
         args: &[Expr],
         span: Span,
+        checked_receiver: &mut Option<Type>,
     ) -> KuResult<Option<Type>> {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
         };
-        let target_type = self.check_expr(target)?;
+        let target_type = self.check_method_receiver(target, checked_receiver)?;
+        if matches!(name.as_str(), "as_int" | "as_str") && target_type != Type::KuValue {
+            return Err(KuError::runtime(
+                format!(
+                    "{name}() is reserved for KuValue conversion; bind a callable field to a variable before calling it"
+                ),
+                span,
+            ));
+        }
         if name == "clone" {
             expect_arg_count("clone", args.len(), 0, span)?;
             if is_http_service_type(&target_type) {
@@ -3996,7 +4116,12 @@ impl Checker {
             method_args.push((**target).clone());
             method_args.extend(args.iter().cloned());
             return self
-                .apply_stdlib_signature(&signature, &method_args, span)
+                .apply_stdlib_signature_with_receiver(
+                    &signature,
+                    &method_args,
+                    span,
+                    Some(&target_type),
+                )
                 .map(Some);
         }
         if let Type::Native(native) = &target_type {
@@ -4008,7 +4133,12 @@ impl Checker {
                 method_args.push((**target).clone());
                 method_args.extend(args.iter().cloned());
                 return self
-                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .apply_stdlib_signature_with_receiver(
+                        &signature,
+                        &method_args,
+                        span,
+                        Some(&target_type),
+                    )
                     .map(Some);
             }
             if native == metadata::NET_CLIENT {
@@ -4019,7 +4149,12 @@ impl Checker {
                 method_args.push((**target).clone());
                 method_args.extend(args.iter().cloned());
                 return self
-                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .apply_stdlib_signature_with_receiver(
+                        &signature,
+                        &method_args,
+                        span,
+                        Some(&target_type),
+                    )
                     .map(Some);
             }
             if native == metadata::MYSQL_CLIENT || native == metadata::MYSQL_RESULT {
@@ -4030,7 +4165,12 @@ impl Checker {
                 method_args.push((**target).clone());
                 method_args.extend(args.iter().cloned());
                 return self
-                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .apply_stdlib_signature_with_receiver(
+                        &signature,
+                        &method_args,
+                        span,
+                        Some(&target_type),
+                    )
                     .map(Some);
             }
         }
@@ -4069,15 +4209,19 @@ impl Checker {
             Type::String => "string",
             Type::Array(_) if name != "map" => "array",
             Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
-            Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
+            Type::KuValue if matches!(name.as_str(), "as_int" | "as_str" | "take") => "kuvalue",
             Type::Native(native)
-                if native == metadata::PG_CLIENT && matches!(name.as_str(), "query" | "close") =>
+                if native == metadata::PG_CLIENT
+                    && matches!(name.as_str(), "query" | "query_one_typed" | "close") =>
             {
                 "pg_client"
             }
             Type::Native(native)
                 if native == metadata::PG_RESULT
-                    && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+                    && matches!(
+                        name.as_str(),
+                        "rows" | "cols" | "value" | "value_int" | "value_bool" | "is_null"
+                    ) =>
             {
                 "pg_result"
             }
@@ -4089,8 +4233,13 @@ impl Checker {
         let mut method_args = Vec::with_capacity(args.len() + 1);
         method_args.push((**target).clone());
         method_args.extend(args.iter().cloned());
-        self.apply_stdlib_signature(&signature, &method_args, span)
-            .map(Some)
+        self.apply_stdlib_signature_with_receiver(
+            &signature,
+            &method_args,
+            span,
+            Some(&target_type),
+        )
+        .map(Some)
     }
 
     fn apply_stdlib_signature(
@@ -4099,13 +4248,27 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Type> {
+        self.apply_stdlib_signature_with_receiver(signature, args, span, None)
+    }
+
+    fn apply_stdlib_signature_with_receiver(
+        &mut self,
+        signature: &Signature,
+        args: &[Expr],
+        span: Span,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
         if !metadata::supports_borrowed_call(&signature.name) {
-            for (arg, mode) in args
+            for (index, (arg, mode)) in args
                 .iter()
                 .zip(metadata::argument_modes(&signature.name, args.len()))
+                .enumerate()
             {
                 if mode == ParamMode::View && self.borrowed_expr_root(arg).is_some() {
-                    let ty = self.check_expr(arg)?;
+                    let ty = match checked_receiver.filter(|_| index == 0) {
+                        Some(ty) => ty.clone(),
+                        None => self.check_expr(arg)?,
+                    };
                     if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
                         return Err(KuError::runtime(
                             format!(
@@ -4157,8 +4320,11 @@ impl Checker {
         if signature.name == "pg.client" {
             return self.apply_pg_client_signature(args, span);
         }
+        if signature.name == "pg_client.query_one_typed" {
+            return self.apply_pg_client_query_one_typed_signature(args, span, checked_receiver);
+        }
         if signature.name == "pg_client.query" {
-            return self.apply_pg_client_query_signature(args, span);
+            return self.apply_pg_client_query_signature(args, span, checked_receiver);
         }
         if matches!(
             signature.name.as_str(),
@@ -4172,13 +4338,19 @@ impl Checker {
             return self.apply_http_response_helper_signature(&signature.name, args, span);
         }
         if signature.name == "object.get_or" {
-            return self.apply_object_get_or_signature(args, span);
+            return self.apply_object_get_or_signature(args, span, checked_receiver);
         }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
         let actuals = args
             .iter()
             .zip(&signature.arg_modes)
-            .map(|(arg, mode)| self.check_arg_mode(arg, None, *mode))
+            .enumerate()
+            .map(
+                |(index, (arg, mode))| match checked_receiver.filter(|_| index == 0) {
+                    Some(ty) => self.check_checked_arg_mode(arg, ty.clone(), *mode),
+                    None => self.check_arg_mode(arg, None, *mode),
+                },
+            )
             .collect::<KuResult<Vec<_>>>()?;
         if let Some(receiver_type) = actuals.first() {
             self.reject_effectful_args_on_captured_native_receiver(
@@ -4333,9 +4505,17 @@ impl Checker {
         }
     }
 
-    fn apply_object_get_or_signature(&mut self, args: &[Expr], span: Span) -> KuResult<Type> {
+    fn apply_object_get_or_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        checked_receiver: Option<&Type>,
+    ) -> KuResult<Type> {
         expect_arg_count("object.get_or", args.len(), 3, span)?;
-        let object_type = self.check_expr(&args[0])?;
+        let object_type = match checked_receiver {
+            Some(ty) => ty.clone(),
+            None => self.check_expr(&args[0])?,
+        };
         let key_type = self.check_expr(&args[1])?;
         if !type_matches(&Type::String, &key_type) {
             return Err(type_error(args[1].span, &Type::String, &key_type));
@@ -4483,6 +4663,7 @@ impl Checker {
         callee: &Expr,
         args: &[Expr],
         span: Span,
+        checked_receiver: &mut Option<Type>,
     ) -> KuResult<Option<Type>> {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
@@ -4490,6 +4671,9 @@ impl Checker {
         if name != "map" {
             return Ok(None);
         }
+        let Type::Array(element) = self.check_method_receiver(target, checked_receiver)? else {
+            return Ok(None);
+        };
         if self.borrowed_expr_root(target).is_some() {
             return Err(KuError::runtime(
                 "borrowed operation is not supported: array.map; clone the array first",
@@ -4497,16 +4681,6 @@ impl Checker {
             ));
         }
         expect_arg_count("array.map", args.len(), 1, span)?;
-        let target_type = self.check_expr(target)?;
-        let Type::Array(element) = target_type else {
-            return Err(KuError::runtime(
-                format!(
-                    "type error: map expects array but got {}",
-                    type_name(&target_type)
-                ),
-                target.span,
-            ));
-        };
         if self.type_contains_native_resource(&element) {
             return Err(KuError::runtime(
                 "array.map cannot clone move-only native resource elements",
@@ -6511,7 +6685,7 @@ impl Checker {
             Type::String => "string",
             Type::Array(_) => "array",
             Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
-            Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
+            Type::KuValue if matches!(name.as_str(), "as_int" | "as_str" | "take") => "kuvalue",
             _ => return false,
         };
         Self::closure_effect_noninvoking_dotted(module, name)
@@ -6546,7 +6720,7 @@ impl Checker {
                     "len" | "is_empty" | "first" | "last" | "try_get" | "push" | "concat"
                 )
                 | ("object", "get_or")
-                | ("kuvalue", "as_int" | "as_str")
+                | ("kuvalue", "as_int" | "as_str" | "take")
                 | ("json", "parse" | "try_parse" | "stringify")
                 | (
                     "time",
@@ -7531,6 +7705,14 @@ impl Checker {
     /// closure capture boundary (E0904) on the root and that the place is still
     /// live (a double move / move-through-moved-parent is rejected).
     fn record_move(&mut self, place: &PlacePath, span: Span) -> KuResult<()> {
+        // Only the native async PG capture path freezes this move-only pool.
+        // The existing shared graph identifies the original lexical binding;
+        // an unrelated same-named local or ordinary pool call is unaffected.
+        if let Ok(binding) = self.get_allow_moved(&place.root, span) {
+            if matches!(&binding.ty, Type::Native(name) if name == metadata::PG_CLIENT) {
+                self.reject_http_shared_write(binding.binding_id, span)?;
+            }
+        }
         self.reject_readonly_capture_move(place, span)?;
         let boundary = self.closure_capture_boundaries.last().copied();
         for (index, scope) in self.scopes.iter_mut().enumerate().rev() {
@@ -7567,6 +7749,10 @@ impl Checker {
 
     fn consume_expr(&mut self, expr: &Expr) -> KuResult<Type> {
         let ty = self.check_expr(expr)?;
+        self.consume_checked_expr(expr, ty)
+    }
+
+    fn consume_checked_expr(&mut self, expr: &Expr, ty: Type) -> KuResult<Type> {
         if let Some(root) = self.borrowed_expr_root(expr) {
             if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
                 return Err(KuError::runtime(format!("cannot move out of borrowed value rooted at '{root}'; use '.clone()' to create an owned value"), expr.span));

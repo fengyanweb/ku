@@ -90,6 +90,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::ArrayLen { dst, src }
                 | TaskOp::StringLen { dst, src, .. }
                 | TaskOp::StringClone { dst, src }
+                | TaskOp::PrimitiveString { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }
@@ -135,6 +136,46 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     }
                 }
                 TaskOp::Print { value, .. } => map(value),
+                TaskOp::HttpMapGet {
+                    dst, request, key, ..
+                } => {
+                    map(dst);
+                    map(request);
+                    map(key);
+                }
+                TaskOp::PgResult {
+                    dst,
+                    source,
+                    row,
+                    col,
+                    ..
+                } => {
+                    map(dst);
+                    map(source);
+                    if let Some(row) = row {
+                        map(row);
+                    }
+                    if let Some(col) = col {
+                        map(col);
+                    }
+                }
+                TaskOp::JsonEncodeObject { dst, fields } => {
+                    map(dst);
+                    for (_, value) in fields {
+                        map(value);
+                    }
+                }
+                TaskOp::HttpResponse {
+                    dst, body, status, ..
+                } => {
+                    map(dst);
+                    if let Some(body) = body {
+                        map(body);
+                    }
+                    if let Some(status) = status {
+                        map(status);
+                    }
+                }
             }
         }
         match &mut state.terminator {
@@ -163,6 +204,23 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
             TaskTerminator::BlockingNet { inputs, dst, .. } => {
                 for input in inputs.iter_mut().flatten() {
                     map(input);
+                }
+                map(dst);
+            }
+            TaskTerminator::PgQuery {
+                client,
+                sql,
+                params,
+                typed,
+                dst,
+                ..
+            } => {
+                map(client);
+                map(sql);
+                map(params);
+                if let Some((a, b)) = typed {
+                    map(a);
+                    map(b);
                 }
                 map(dst);
             }
@@ -520,7 +578,7 @@ static uint32_t ku_task_1_try_start_impl(KuTaskDriverV1* driver,
     CHECK(!output->owner.lease.control && !output->ticket.driver && !output->ticket.slot && !output->ticket.generation);
     fixture_child=(KuTaskDriverTicketV1){0};
     fixture_charge(driver,sizeof(KuTaskInstance_0)+48u,0);
-    CHECK(fixture_ledger().allocations==4u+fixture_buffers);
+    CHECK(fixture_ledger().allocations==5u+fixture_buffers);
     CHECK(fixture_ledger().bytes==fixture_fixed+sizeof(KuTaskInstance_0)+48u);
     for (size_t i=0;i<fixture_buffers;i++) CHECK(!fixture_frees[i]);
     fixture_restores++;
@@ -575,7 +633,7 @@ static void fixture_case(unsigned mode,int error) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(2,sizeof(*slots));
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
-  fixture_fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
+  fixture_fixed=ku_task_driver_fixed_storage_bytes(2u);
   size_t limit=fixture_fixed+sizeof(KuTaskInstance_0)+48u+sizeof(KuTaskInstance_1)-(mode==FIXTURE_BYTE_LIMIT ? 1u : 0u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
@@ -766,7 +824,7 @@ static void array_idle(ArrayParameterRuntime* runtime) {
 }
 static void array_init(ArrayParameterRuntime* runtime,size_t budget) {
   memset(runtime,0,sizeof(*runtime));
-  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(runtime->slots)/sizeof(runtime->slots[0]));
   CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
       runtime->slots,1u,runtime->ring,1u,fixed+budget,1u,array_deadline())==KU_TASK_DRIVER_OK);
 }
@@ -932,7 +990,9 @@ static void array_rejected_value(unsigned mode) {
   CHECK(!input.numbers.data && !input.numbers.len && !input.numbers.capacity);
   CHECK(!input.flags.data && !input.flags.len && !input.flags.capacity);
   CHECK(!input.texts.data && !input.texts.len && !input.texts.capacity);
-  CHECK(fixture_ledger().calls==before.calls && !fixture_ledger().allocations && !fixture_ledger().bytes);
+  CHECK(fixture_ledger().calls==before.calls && fixture_ledger().allocations==1u
+      && runtime.driver.binding_keys && runtime.driver.binding_cells==2u*runtime.driver.capacity
+      && fixture_ledger().bytes==runtime.driver.binding_cells*sizeof(*runtime.driver.binding_keys));
   KuTaskDriverSnapshotV1 snapshot=array_snapshot(&runtime);
   CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
   CHECK(ku_task_value_drop(&value,array_deadline())==KU_TASK_DRIVER_OK);
@@ -1026,7 +1086,9 @@ static void array_wrapped_inline(unsigned mode) {
   CHECK(output.tag==KU_TASK_VALUE_INLINE_FAILED&&output.result_kind==7u&&output.function_id==2u
       &&output.rejection_code==(mode==0u ? KU_TASK_DRIVER_LIMIT : mode==1u ? KU_TASK_DRIVER_CLOSED : KU_TASK_ADAPTER_OUT_OF_MEMORY));
   CHECK(!output.owner.lease.control&&!output.ticket.driver);
-  CHECK(fixture_ledger().calls==before.calls&&!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  CHECK(fixture_ledger().calls==before.calls && fixture_ledger().allocations==1u
+      && runtime.driver.binding_keys && runtime.driver.binding_cells==2u*runtime.driver.capacity
+      && fixture_ledger().bytes==runtime.driver.binding_cells*sizeof(*runtime.driver.binding_keys));
   CHECK(ku_task_value_drop(&output,array_deadline())==KU_TASK_DRIVER_OK); array_finish(&runtime); array_wrapped=0u;
 }
 int main(void) {

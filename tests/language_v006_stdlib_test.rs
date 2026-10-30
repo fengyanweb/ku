@@ -1743,8 +1743,8 @@ fn std_http_config_limits_have_hard_maxima() {
         ("server", "read_header_timeout_ms", 300_001_i64, 300_000_i64),
         ("server", "max_header_bytes", 65_537, 65_536),
         ("server", "max_body_bytes", 16_777_217, 16_777_216),
-        ("server", "max_connections", 4_097, 4_096),
-        ("server", "max_active_requests", 1_025, 1_024),
+        ("server", "max_connections", 32_769, 32_768),
+        ("server", "max_active_requests", 16_385, 16_384),
         ("server", "max_pending_requests", 8_193, 8_192),
         ("client", "max_idle_connections", 1_025, 1_024),
     ] {
@@ -1756,6 +1756,10 @@ fn std_http_config_limits_have_hard_maxima() {
             err.contains(&format!("must be at most {maximum}")),
             "unexpected {constructor}.{field} error: {err}"
         );
+        let accepted = format!(
+            "import \"std.http\"\nfn main() {{ http.{constructor}({{ {field}: {maximum} }}) }}"
+        );
+        run_source("inline.ku", &accepted).expect("the declared maximum remains accepted");
     }
 
     let err = run_err(

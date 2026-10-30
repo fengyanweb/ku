@@ -65,7 +65,10 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
     let syntax = include_str!("../docs/syntax.md");
     let concurrency = include_str!("../docs/concurrency.md");
     let ir = include_str!("../docs/ir.md");
-    for document in [readme, syntax, concurrency, ir] {
+    // The short landing page links to the maintained backend contract instead
+    // of duplicating its implementation and acceptance details.
+    assert!(readme.contains("docs/concurrency.md"));
+    for document in [syntax, concurrency, ir] {
         for required in [
             "有界 worker 组",
             "async fn main(): null!",
@@ -206,7 +209,7 @@ fn protocol_status_binds_tls_evidence_to_published_commit() {
     assert!(!protocol.contains("三系统最终消费者 CI 仍待跑绿"));
     assert!(!protocol.contains("下一步先跑绿精确 target pack"));
     assert!(protocol.contains("RESP3、registry v2、官方托管与高可用不在本轮范围"));
-    assert!(readme.contains("c66828390eb3124750bca9a9c7e789dd2df70267"));
+    assert!(readme.contains("docs/protocol-foundation.md"));
     assert!(!readme.contains("三系统最终消费者 CI 仍是发布阻断项"));
 }
 

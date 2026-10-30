@@ -232,10 +232,10 @@ static int fixture_pthread_join(pthread_t handle, void** output) {
 "#;
 
 const JOIN_RETRY_MAIN: &str = r#"
-static void fixture_fixed_ledger(size_t fixed) {
-  RETRY_CHECK(ku_perf_calls == 3u && ku_perf_live_allocations == 3u);
-  RETRY_CHECK(ku_perf_live_bytes == fixed && ku_perf_peak_bytes == fixed);
-  RETRY_CHECK(ku_perf_total_bytes == fixed && !ku_perf_overflow);
+static void fixture_fixed_ledger(size_t calls,size_t allocations,size_t live,size_t total) {
+  RETRY_CHECK(ku_perf_calls == calls && ku_perf_live_allocations == allocations);
+  RETRY_CHECK(ku_perf_live_bytes == live && ku_perf_peak_bytes == total);
+  RETRY_CHECK(ku_perf_total_bytes == total && !ku_perf_overflow);
 }
 static KuTaskDriverSnapshotV1 fixture_snapshot(KuTaskDriverV1* driver, size_t fixed) {
   KuTaskDriverSnapshotV1 snapshot = {0};
@@ -252,17 +252,19 @@ static void fixture_live_storage(KuTaskDriverV1* driver, size_t fixed) {
   RETRY_CHECK(driver->sync_resources == (KU_TASK_DRIVER_SYNC_MUTEX
       | KU_TASK_DRIVER_SYNC_STATE | KU_TASK_DRIVER_SYNC_WORK));
   RETRY_CHECK(driver->shutdown_deadline == fixture_original_deadline);
-  fixture_fixed_ledger(fixed);
+  fixture_fixed_ledger(4u,4u,fixed,fixed);
 }
 int main(void) {
-  RETRY_CHECK(KU_TASK_DRIVER_ABI_VERSION == 10u);
+  RETRY_CHECK(KU_TASK_DRIVER_ABI_VERSION == 12u);
   RETRY_CHECK(KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   KuTaskDriverV1* driver = (KuTaskDriverV1*)calloc(1, sizeof(*driver));
   KuTaskDriverSlotV1* slots = (KuTaskDriverSlotV1*)calloc(2u, sizeof(*slots));
   size_t* ring = (size_t*)calloc(2u, sizeof(*ring));
   RETRY_CHECK(driver && slots && ring);
-  size_t fixed = sizeof(*driver) + 2u * (sizeof(*slots) + sizeof(*ring));
-  fixture_fixed_ledger(fixed);
+  size_t fixed = ku_task_driver_fixed_storage_bytes(2u);
+  /* Caller-owned arrays exist before the driver allocates its binding table. */
+  size_t caller_bytes=sizeof(*driver)+2u*sizeof(*slots)+2u*sizeof(*ring);
+  fixture_fixed_ledger(3u,3u,caller_bytes,caller_bytes);
   uint64_t now = ku_task_driver_now_ms();
   RETRY_CHECK(now != UINT64_MAX && now < UINT64_MAX - 1000u);
   const uint64_t deadline = now + 1000u;
@@ -352,11 +354,11 @@ int main(void) {
   fixture_live_storage(driver, fixed);
   RETRY_CHECK(ku_task_driver_destroy(driver) == KU_TASK_DRIVER_OK);
   RETRY_CHECK(driver->initialized == KU_TASK_DRIVER_STORAGE_ZERO && !driver->sync_resources);
-  fixture_fixed_ledger(fixed);
+  fixture_fixed_ledger(4u,3u,caller_bytes,fixed);
   RETRY_CHECK(ku_task_frame_zero_bytes(slots, 2u * sizeof(*slots)));
   RETRY_CHECK(ku_task_frame_zero_bytes(ring, 2u * sizeof(*ring)));
   free(ring); free(slots); free(driver);
-  RETRY_CHECK(ku_perf_calls == 3u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  RETRY_CHECK(ku_perf_calls == 4u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   /* This actual test must finish within its original finite D. It is not a
    * hard real-time guarantee for portable POSIX pthread_join's OS-return tail. */
   fixture_deadline_check();

@@ -1,0 +1,59 @@
+// Named async counterpart of http_pg_lifecycle.ku. The existing acceptance
+// driver supplies a separate private cluster, fault proxy and working directory.
+// Keep the SQL, limits, routes and response fields identical to the sync lane.
+import http from "std.http"
+import pg from "std.pg"
+import json from "std.json"
+import "std.fs"
+
+fn main(): null! {
+    conninfo = fs.read("db.conn")?
+    address = fs.read("http.addr")?
+    client = pg.client({conninfo: conninfo, max_connections: 4, max_waiters: 8,
+        connect_timeout_ms: 2000, acquire_timeout_ms: 100, query_timeout_ms: 150})?
+    async fn health(): HttpResponse! { return ok(http.text("ready")) }
+    async fn read(): HttpResponse! {
+        body = ""
+        try {
+            result = client.query("SELECT $1::text, 42::text, NULL::text", ["中文🙂 ' \\"])?
+            body = json.encode({text: result.value(0, 0)?, number: result.value(0, 1)?,
+                absent: result.is_null(0, 2)?, rows: result.rows(), cols: result.cols()})?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return ok(http.text(body))
+    }
+    async fn insert(req: HttpRequest): HttpResponse! {
+        body = ""
+        try {
+            result = client.query("INSERT INTO ku_events(id, payload) VALUES($1, $2) RETURNING payload",
+                [req.params.id.clone(), "中文🙂 payload"])?
+            body = result.value(0, 0)?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return ok(http.text(body))
+    }
+    async fn slow(): HttpResponse! {
+        body = "unexpected success"
+        try { result = client.query("SELECT pg_sleep(0.6)", [])? }
+        catch(err) { body = "error:" + err.code.clone() }
+        return ok(http.text(body))
+    }
+    async fn rows(): HttpResponse! {
+        body = ""
+        try {
+            result = client.query("SELECT i::text, repeat('x', 64) FROM generate_series(1, 10000) AS i", [])?
+            body = str(result.rows()) + ":" + result.value(9999, 0)?
+        } catch(err) { body = "error:" + err.code.clone() }
+        return ok(http.text(body))
+    }
+    app = http.service()
+    app.handler_timeout_ms = 2000
+    app.max_connections = 64
+    app.max_active_requests = 16
+    app.max_pending_requests = 32
+    app.get("/health", health)
+    app.get("/read", read)
+    app.get("/insert/{id}", insert)
+    app.get("/slow", slow)
+    app.get("/rows", rows)
+    app.listen(address)?
+    return ok(null)
+}

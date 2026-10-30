@@ -297,6 +297,7 @@ fn native_task_frame_emission_preserves_sync_output_and_fail_closed_cli_boundary
         "ku_task_driver_",
         "ku_task_control_",
         "ku_task_frame_",
+        "ku_runtime_loop_count",
     ] {
         assert!(!synchronous.contains(internal), "unexpected {internal}");
     }
@@ -807,13 +808,15 @@ static void held_unreaped(KuTaskDriverV1* driver,const KuTaskDriverSlotV1* slots
   HELD_CHECK(fixture_driver_mutex_inits==1u && !fixture_driver_mutex_drops);
   HELD_CHECK(fixture_driver_condition_inits==2u && !fixture_driver_condition_drops);
 #endif
-  HELD_CHECK(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  HELD_CHECK(ku_perf_calls==1u && ku_perf_live_allocations==1u && driver->binding_keys
+      && driver->binding_cells==2u*driver->capacity
+      && ku_perf_live_bytes==driver->binding_cells*sizeof(*driver->binding_keys) && !ku_perf_overflow);
   HELD_CHECK(ku_task_driver_unlock(driver)==0);
 }
 int main(void) {
-  HELD_CHECK(KU_TASK_DRIVER_ABI_VERSION==10u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  HELD_CHECK(KU_TASK_DRIVER_ABI_VERSION==12u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
-  size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   for (size_t i=0;i<2u;i++) HELD_CHECK(ku_test_event_init(&held_entered[i]));
   HELD_CHECK(ku_test_event_init(&held_release));
   HELD_CHECK(ku_test_event_init(&held_shutdown_waiting));
@@ -883,7 +886,7 @@ int main(void) {
   for (size_t i=0;i<2u;i++) HELD_CHECK(ku_test_event_destroy(&held_entered[i]));
   HELD_CHECK(ku_test_event_destroy(&held_release));
   HELD_CHECK(ku_test_event_destroy(&held_shutdown_waiting));
-  HELD_CHECK(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  HELD_CHECK(ku_perf_calls==1u && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
   uint64_t finished=ku_task_driver_now_ms();
   HELD_CHECK(finished!=UINT64_MAX && finished<=held_deadline);
   puts("task-driver-held-entry-ok"); return 0;
@@ -1149,12 +1152,12 @@ static int fixture_driver_init_round(KuTaskDriverV1* driver,
   return 0;
 }
 int main(void) {
-  INIT_CHECK(KU_TASK_DRIVER_ABI_VERSION == 10u);
+  INIT_CHECK(KU_TASK_DRIVER_ABI_VERSION == 12u);
   INIT_CHECK(KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   KuTaskDriverV1 driver = {0};
   KuTaskDriverSlotV1 slots[2] = {0};
   size_t ring[2] = {0};
-  size_t fixed = sizeof(driver) + sizeof(slots) + sizeof(ring);
+  size_t fixed = ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   for (unsigned attempt = 0; attempt < 16; ++attempt) {
     INIT_CHECK(!fixture_driver_init_round(&driver, slots, ring, fixed, 0, 0));
     /* Only the caller resets storage, and only after all actual native resources
@@ -1777,7 +1780,7 @@ int main(void) {
   KuTaskDriverV1 driver = {0};
   KuTaskDriverSlotV1 slots[1] = {{0}};
   size_t ring[1] = {0};
-  const size_t fixed = sizeof(driver)+sizeof(slots)+sizeof(ring);
+  const size_t fixed = ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0]));
   unsigned rounds = (unsigned)(sizeof(cases)/sizeof(cases[0])), created = 0, joined = 0;
   for (unsigned i=0;i<rounds;i++) {
     fixture_sync_round(&driver,slots,ring,fixed,cases[i].operation,cases[i].failure_bits,cases[i].created);

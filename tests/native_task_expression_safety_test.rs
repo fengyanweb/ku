@@ -272,7 +272,7 @@ static void fixture_case(unsigned mode,int error) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(2,sizeof(*slots));
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
@@ -319,7 +319,7 @@ static void fixture_case(unsigned mode,int error) {
   }
   CHECK(child_observer.control && !ku_task_driver_unlock(driver));
   FixtureLedger before=fixture_ledger();
-  CHECK(before.allocations==5u+fixture_buffers && before.bytes==fixed+instances+48u);
+  CHECK(before.allocations==6u+fixture_buffers && before.bytes==fixed+instances+48u);
   uint32_t terminal=mode==2u ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
   if (mode) {
     CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,terminal,deadline)==KU_TASK_CONTROL_OK);
@@ -341,7 +341,7 @@ static void fixture_case(unsigned mode,int error) {
   CHECK(fixture_empty_result(parent->frame.s_@VALUE_SLOT@) && fixture_empty_string(parent->frame.s_@EXTRA_SLOT@));
   CHECK(parent->drain_started && parent->drain_deadline==deadline);
   FixtureLedger clean=fixture_ledger();
-  CHECK(clean.allocations==5u && clean.bytes==fixed+instances && clean.calls==before.calls);
+  CHECK(clean.allocations==6u && clean.bytes==fixed+instances && clean.calls==before.calls);
   for (size_t i=0;i<fixture_buffers;i++) CHECK(fixture_frees[i]==1u);
   CHECK(ku_task_control_atomic_load(&parent->control.phase)==(mode ? terminal : KU_TASK_CONTROL_FAILED));
   if (!mode) CHECK(parent->exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && parent->has_cleanup_deadline && parent->cleanup_deadline==deadline);

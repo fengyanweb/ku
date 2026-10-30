@@ -195,17 +195,31 @@ fn run_repeated_pending_expression(source: &str) {
         "typedef struct KuString {",
         &format!("{instrumentation}typedef struct KuString {{"),
     );
-    let source_place = if plan.functions[0].slots.contains(&frozen_source) {
-        format!("frame->s_{}", frozen_source.0)
-    } else {
-        format!("slot_{}", frozen_source.0)
+    // Native source emission also persists Copy temporaries because its finite
+    // dispatch quantum can return before an IR liveness boundary.
+    // Scalar caches are private to one drive invocation and spill on every
+    // return. Instrument the actual assignment, then keep all parked-frame,
+    // repeated-Pending and exactly-once checks below unchanged.
+    let drive_start = generated
+        .find("static uint32_t ku_task_frame_0_drive(")
+        .unwrap();
+    let drive = generated[drive_start..].split("\nstatic ").next().unwrap();
+    let scalar_place = |slot: task::SlotId| {
+        if drive.contains(&format!(" cached_{}=", slot.0)) {
+            format!("cached_{}", slot.0)
+        } else if drive.contains(&format!(" slot_{} = ", slot.0)) {
+            format!("slot_{}", slot.0)
+        } else {
+            format!("frame->s_{}", slot.0)
+        }
     };
+    let source_place = scalar_place(frozen_source);
     let lhs_assignment = if concat {
         format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source_place},&frame->s_{});\n",lhs.0)
     } else if owned {
         format!("  frame->s_{} = ku_string_move(&{source_place});\n", lhs.0)
     } else {
-        format!("  frame->s_{} = {source_place};\n", lhs.0)
+        format!("  {} = {source_place};\n", scalar_place(lhs))
     };
     let mut generated = replace_once(
         generated,
@@ -361,7 +375,7 @@ int main(void) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(2,sizeof(*slots));
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(2u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
   size_t output_bytes=FIXTURE_CONCAT&&!FIXTURE_FAILURE ? 6u : 0u;
   uint64_t startup_now=ku_task_driver_now_ms();
@@ -392,7 +406,7 @@ int main(void) {
   CHECK(ku_task_control_lease_retain(&child_slot->driver_lease,&observer)==KU_TASK_CONTROL_OK);
   CHECK(!ku_task_driver_unlock(driver));
   fixture_wait(parent,&wait,&child);
-  FixtureLedger before=fixture_ledger(); CHECK(before.allocations==5u && before.bytes==fixed+instances);
+  FixtureLedger before=fixture_ledger(); CHECK(before.allocations==6u && before.bytes==fixed+instances);
   uint64_t polls=parked.polls;
   /* Exactly three independent notifications, each followed by the real
    * worker's condition-wait acknowledgement; no sleep or busy polling. */
@@ -586,7 +600,7 @@ async fn main(): null! { return ok(null) }
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 5u",
         "#define KU_TASK_CONTROL_ABI_VERSION 2u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 10u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 12u",
     ] {
         assert!(generated.contains(required));
     }
@@ -636,7 +650,7 @@ async fn main(): null! { return ok(null) }
         &format!("{continued}\n  fixture_if_continued(instance,descriptor->scope_id);"),
     );
     let joined = joined[0].0;
-    let joined_print = format!("  if ((frame->s_{joined}.len && fwrite(frame->s_{joined}.ptr,1,frame->s_{joined}.len,stdout)!=frame->s_{joined}.len) || fputc('\\n',stdout)==EOF || fflush(stdout)==EOF) {{");
+    let joined_print = format!("  if (ku_output_write(frame->s_{joined}.ptr,frame->s_{joined}.len) < 0 || ku_output_printf(\"\\n\")<0 || ku_output_flush()<0) {{");
     generated = replace_once(
         generated,
         &joined_print,
@@ -873,7 +887,7 @@ static void if_case(unsigned mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(3u);
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
@@ -1029,7 +1043,7 @@ static void if_case(unsigned mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
   ku_task_control_atomic_init(&if_release_ready,0); ku_task_control_atomic_init(&if_release_child,0);
   ku_task_control_atomic_init(&if_release_parent,0);
   if_case(IF_FALSE); if_case(IF_NORMAL); if_case(IF_CANCEL);

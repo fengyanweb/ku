@@ -13,6 +13,7 @@ const PRIVATE_DATABASE_HELPERS: &[&str] = &[
     "static int64_t ku_pg_rows(",
     "static int64_t ku_pg_cols(",
     "static KuResult_str ku_pg_value(",
+    "static KuResult_int ku_pg_value_int(",
     "static KuResult_bool ku_pg_is_null(",
     "static uint8_t ku_pg_client_close(",
     "static KuPgClient* ku_move_pg_client(",
@@ -58,6 +59,7 @@ fn main(): null! {
     pg_rows = pg_result.rows()
     pg_cols = pg_result.cols()
     pg_value = pg_result.value(0, 0)?
+    pg_integer = pg_result.value_int(0, 0)?
     pg_null = pg_result.is_null(0, 0)?
     postgres.close()
 

@@ -15,6 +15,7 @@ pub struct Binding {
     owner_task_id: i64,
     borrowed_parameter: bool,
     match_probe: bool,
+    function_self: bool,
 }
 
 impl Binding {
@@ -349,6 +350,29 @@ impl Env {
         mutable: bool,
         span: Span,
     ) -> KuResult<()> {
+        self.define_binding(name, value, mutable, false, span)
+    }
+
+    /// A call's injected recursive name keeps the historical global-call
+    /// precedence. Source declarations and aliases remain ordinary bindings.
+    pub(crate) fn define_function_self(
+        &mut self,
+        name: String,
+        value: Value,
+        span: Span,
+    ) -> KuResult<()> {
+        value.require_owned_root(span)?;
+        self.define_binding(name, value, false, true, span)
+    }
+
+    fn define_binding(
+        &mut self,
+        name: String,
+        value: Value,
+        mutable: bool,
+        function_self: bool,
+        span: Span,
+    ) -> KuResult<()> {
         let scope = self
             .scopes
             .last_mut()
@@ -367,6 +391,7 @@ impl Env {
                 mutable,
                 owner_task_id: crate::runtime::task::current_task_id(),
                 match_probe: false,
+                function_self,
             })),
         );
         scope.owned_bindings.insert(name);
@@ -532,6 +557,16 @@ impl Env {
             .any(|scope| scope.bindings.contains_key(name))
     }
 
+    pub(crate) fn shadows_global_function(&self, name: &str, span: Span) -> KuResult<bool> {
+        let Some(cell) = self.find_cell(name) else {
+            return Ok(false);
+        };
+        let binding = cell
+            .lock()
+            .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+        Ok(!binding.function_self)
+    }
+
     pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
         self.with_value(name, span, |value| Ok(value.clone()))
     }
@@ -656,6 +691,42 @@ impl Env {
             if !matches!(binding.value, Value::String(_)) {
                 return Err(KuError::runtime(
                     format!("internal execution expected an owned String in '{name}'"),
+                    span,
+                ));
+            }
+            return Ok(std::mem::replace(&mut binding.value, Value::Null));
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    /// Only the explicit KuValue.take receiver uses this transfer. Ordinary
+    /// reads keep their snapshot semantics; no borrowed or captured source is
+    /// detached. The caller immediately consumes this owner, including errors.
+    pub(crate) fn take_owned_json_value(&self, name: &str, span: Span) -> KuResult<Value> {
+        for scope in self.scopes.iter().rev() {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let mut binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.match_probe {
+                return Err(KuError::runtime(
+                    format!("cannot consume tentative JSON binding '{name}' in a match guard"),
+                    span,
+                ));
+            }
+            if !scope.owned_bindings.contains(name)
+                || Arc::strong_count(cell) != 1
+                || binding.borrowed_parameter
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+                || matches!(binding.value, Value::Borrowed(_))
+            {
+                return Err(KuError::runtime(
+                    format!("cannot move JSON value from captured or borrowed variable '{name}'"),
                     span,
                 ));
             }
@@ -1040,6 +1111,40 @@ impl Default for Env {
 #[cfg(test)]
 mod owned_string_tests {
     use super::*;
+
+    #[test]
+    fn explicit_json_take_transfers_storage_and_rejects_shared_or_borrowed_sources() {
+        let span = Span::default();
+        let text = String::from("kept\0payload");
+        let pointer = text.as_ptr();
+        let mut env = Env::new();
+        env.define_owned(
+            "value".into(),
+            Value::Object(HashMap::from([("data".into(), Value::String(text))])),
+            true,
+            span,
+        )
+        .unwrap();
+        let captured = env.clone();
+        assert!(captured.take_owned_json_value("value", span).is_err());
+        assert!(env.take_owned_json_value("value", span).is_err());
+        drop(captured);
+        let (view, lease) = env.borrow("value", span).unwrap();
+        assert!(env.take_owned_json_value("value", span).is_err());
+        drop(view);
+        drop(lease);
+        let Value::Object(mut fields) = env.take_owned_json_value("value", span).unwrap() else {
+            panic!("object owner")
+        };
+        let Some(Value::String(text)) = fields.remove("data") else {
+            panic!("selected string")
+        };
+        assert_eq!(text.as_ptr(), pointer);
+        assert_eq!(text, "kept\0payload");
+        assert!(env
+            .with_value("value", span, |value| Ok(matches!(value, Value::Null)))
+            .unwrap());
+    }
 
     #[test]
     fn consuming_string_read_transfers_the_buffer_and_leaves_null() {

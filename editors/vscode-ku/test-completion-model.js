@@ -35,7 +35,7 @@ assert.deepStrictEqual(model.memberCompletionLabels("string", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("string", "by"), ["byte_len"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "by"), ["byte_len"]);
-assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql"]);
+assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql", "bytes", "net", "lexer", "parser"]);
 assert.deepStrictEqual(model.memberCompletionLabels("pg"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("redis"), ["client"]);
 assert.deepStrictEqual(model.memberCompletionLabels("mysql"), ["client"]);
@@ -65,6 +65,10 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.pg",
   "std.redis",
   "std.mysql",
+  "std.bytes",
+  "std.net",
+  "std.lexer",
+  "std.parser",
 ]);
 
 assert(!model.globalCompletionLabels().includes("http.service"));

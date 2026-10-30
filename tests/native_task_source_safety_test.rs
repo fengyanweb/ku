@@ -34,6 +34,109 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 }
 
 #[test]
+fn native_task_primitive_str_allocation_limit_failure_and_transfer_reconcile() {
+    let ast = Parser::new(Lexer::new("async fn Text(value: int): str! { return ok(str(value)) } async fn main(): null! { return ok(null) }").lex().unwrap()).parse_program().unwrap();
+    Checker::new().check(&ast).unwrap();
+    let lowered = task_lower::lower_program(&ast).unwrap();
+    let mut generated = c::generate_native_task_c_source(&lowered, &Default::default()).unwrap();
+    generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{ALLOCATION_HOOK}\nstatic int fixture_format_oom;\ntypedef struct KuString {{"),
+    );
+    let begin = generated
+        .find("static uint32_t ku_task_host_concat_string(")
+        .unwrap();
+    let end = begin
+        + generated[begin..]
+            .find("static uint32_t ku_task_host_allocate_array(")
+            .unwrap();
+    let mut host = generated[begin..end].to_owned();
+    host = replace_once(
+        host,
+        "uint8_t* bytes=(uint8_t*)malloc(capacity);",
+        "uint8_t* bytes=fixture_format_oom ? NULL : (uint8_t*)malloc(capacity);",
+    );
+    generated.replace_range(begin..end, &host);
+    generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int fixture_unmodified_source_main(void) {",
+    );
+    generated.push_str(r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"primitive str line %d: %s\n",__LINE__,#c); return 1; } } while (0)
+static void fixture_wake(void* raw,size_t owner) { (void)raw; (void)owner; }
+static int fixture_case(int mode) {
+  KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[1]={0}; size_t ring[1]={0};
+  size_t fixed=ku_task_driver_fixed_storage_bytes(sizeof(slots)/sizeof(slots[0])),extra=mode==1?0u:32u;
+  uint64_t deadline=ku_task_driver_now_ms()+2000u,next=UINT64_MAX;
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,
+    slots,1u,ring,1u,fixed+sizeof(KuTaskInstance_0)+extra,1u,deadline,NULL,fixture_wake)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 value={0}; int64_t input=INT64_MIN;
+  CHECK(ku_task_0_start_value(&driver,&input,&value)==KU_TASK_DRIVER_OK);
+  size_t before=ku_perf_live_bytes; CHECK(input==INT64_MIN);
+  fixture_format_oom=mode==2;
+  for(size_t turn=0;turn<16u && ku_task_control_status(&value.owner.lease)==KU_TASK_CONTROL_PENDING;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  fixture_format_oom=0;
+  KuTaskAdapterOutcomeV1 result={0};
+  CHECK(ku_task_value_take(&value,NULL,&result)==KU_TASK_CONTROL_OK && result.result_kind==4u);
+  if(mode) {
+    CHECK(!result.value.string.ok && result.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+    KuString code=result.value.string.error.code;
+    const char* expected=mode==1?"memory_limit":"out_of_memory";
+    CHECK(code.len==strlen(expected) && !memcmp(code.ptr,expected,code.len));
+    CHECK(ku_perf_live_bytes==before);
+  } else {
+    CHECK(result.value.string.ok && result.exit_class==KU_TASK_EXIT_USER_RESULT);
+    KuString text=result.value.string.value;
+    CHECK(text.len==20u && text.capacity==20u && text.storage==KU_STRING_OWNED);
+    CHECK(!memcmp(text.ptr,"-9223372036854775808",20u));
+    CHECK(ku_perf_live_bytes==before+20u);
+  }
+  ku_task_outcome_drop(&result);
+  CHECK(ku_perf_live_bytes==before && driver.reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(ku_task_value_drop(&value,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_request_close(&driver,deadline)==KU_TASK_DRIVER_OK);
+  for(size_t turn=0;turn<16u && driver.workers_exited!=1u;turn++)
+    CHECK(ku_task_driver_pump(&driver,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(!driver.resident && !driver.reserved_bytes && !driver.fault);
+  CHECK(ku_task_driver_join(&driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  return 0;
+}
+int main(void) {
+  for(int mode=0;mode<3;mode++) CHECK(!fixture_case(mode));
+  puts("task-primitive-str-limit-oom-transfer-ok"); return 0;
+}
+"#);
+    let directory = TempDir::new("task-primitive-str-oom");
+    let path = directory.path().join("format.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "format") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a native C compiler"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "task-primitive-str-limit-oom-transfer-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_task_source_final_drain_cancel_tightens_all_receipts_and_drops_private_payload() {
     let ast = Parser::new(Lexer::new(SOURCE).lex().unwrap())
         .parse_program()
@@ -216,7 +319,7 @@ static void fixture_init(FixtureDriver* runtime) {
   runtime->slots=(KuTaskDriverSlotV1*)calloc(4,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(4,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed=sizeof(*runtime->driver)+4*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(4);
   size_t tasks=sizeof(KuTaskInstance_0)+3*sizeof(KuTaskInstance_1)+31u;
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
@@ -303,7 +406,7 @@ static void fixture_scope(int mode) {
   CHECK(count==3); CHECK(!ku_task_driver_unlock(runtime.driver));
   fixture_check_children(&runtime,children,tickets,original);
   FixtureLedger staged=fixture_ledger();
-  CHECK(staged.allocations==8u && staged.bytes==fixture_snapshot(&runtime).fixed_bytes+sizeof(KuTaskInstance_0)+3*sizeof(KuTaskInstance_1)+31u);
+  CHECK(staged.allocations==9u && staged.bytes==fixture_snapshot(&runtime).fixed_bytes+sizeof(KuTaskInstance_0)+3*sizeof(KuTaskInstance_1)+31u);
   CHECK(ku_task_control_atomic_load(&fixture_cleanup_calls)==3u);
   uint64_t deadline=original;
   uint32_t terminal=mode==2 ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
@@ -420,7 +523,7 @@ static void fixture_scope_timeout(void) {
     count++;
   }
   CHECK(count==3); CHECK(!ku_task_driver_unlock(runtime.driver));
-  FixtureLedger staged=fixture_ledger(); CHECK(staged.allocations==8u);
+  FixtureLedger staged=fixture_ledger(); CHECK(staged.allocations==9u);
   fixture_check_children(&runtime,children,tickets,deadline);
   /* Advance only the test clock. Run the real timer scan under its required
    * mutex; the generated adapter, not this fixture, selects the exit class. */
@@ -499,7 +602,7 @@ static void fixture_scope_timeout(void) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==12u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_hold,0);
   ku_task_control_atomic_init(&fixture_cleanup_calls,0);
@@ -659,13 +762,13 @@ static void fixture_observe_start(unsigned stage,const void* raw_source,
     fixture_start.buffer=argument->ptr;
     CHECK(fixture_start.parent==sizeof(KuTaskInstance_0)+31u);
     CHECK(argument->ptr && argument->len==7u && argument->capacity==31u && argument->storage==KU_STRING_OWNED);
-    CHECK(!instance && ledger.allocations==5u);
+    CHECK(!instance && ledger.allocations==6u);
     CHECK(ledger.bytes==driver->fixed_bytes+fixture_start.parent);
   } else {
     CHECK(instance && !argument->ptr);
     CHECK(instance->frame.s_0.ptr==fixture_start.buffer && instance->frame.s_0.capacity==31u);
     CHECK(instance->frame.header.initialized & UINT64_C(1));
-    CHECK(ledger.allocations==6u);
+    CHECK(ledger.allocations==7u);
     CHECK(ledger.bytes==driver->fixed_bytes+fixture_start.total);
   }
   CHECK(driver->reserved_bytes==fixture_start.total);
@@ -734,7 +837,7 @@ static void fixture_rejection(int mode) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(capacity,sizeof(*slots));
   size_t* ring=(size_t*)calloc(capacity,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+capacity*(sizeof(*slots)+sizeof(*ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
   /* Hosted admission adds only I. A is already charged to Parent, stays there
    * through construction, and moves atomically at commit. Failed source Start
    * may conservatively retain A until Parent dispose; this is not exact RSS. */
@@ -764,7 +867,7 @@ static void fixture_rejection(int mode) {
   CHECK(fixture_start.stages==(mode==1 || mode==3 ? 0u : mode==2 ? 1u : 3u));
   CHECK(fixture_charge.observations==(rejected ? 0u : 2u));
   CHECK(snapshot.reserved_bytes==sizeof(KuTaskInstance_0)+31u);
-  CHECK(ready.allocations==(rejected ? 4u : 5u));
+  CHECK(ready.allocations==(rejected ? 5u : 6u));
   CHECK(ready.bytes==fixed+sizeof(KuTaskInstance_0)+(rejected ? 0u : 31u));
   CHECK(!ku_task_driver_lock(driver)); fixture_sum_charge(driver); CHECK(!ku_task_driver_unlock(driver));
   KuTaskAdapterOutcomeV1 output={0};
@@ -784,7 +887,7 @@ static void fixture_rejection(int mode) {
   }
   CHECK(fixture_ledger().calls==ready.calls);
   ku_task_outcome_drop(&output);
-  CHECK(fixture_ledger().allocations==4u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().allocations==5u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
   CHECK(ku_task_value_drop(&parent,deadline)==KU_TASK_DRIVER_OK);
   CHECK(!parent.tag && !parent.owner.lease.control);
   CHECK(ku_task_driver_shutdown(driver,deadline)==KU_TASK_DRIVER_OK);
@@ -813,7 +916,7 @@ static void fixture_raw_external(int one_byte_short) {
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(1,sizeof(*slots));
   size_t* ring=(size_t*)calloc(1,sizeof(*ring)); CHECK(driver && slots && ring);
-  size_t fixed=sizeof(*driver)+sizeof(*slots)+sizeof(*ring);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(1u);
   size_t charge=sizeof(KuTaskInstance_1)+31u;
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
@@ -867,7 +970,7 @@ static void fixture_raw_external(int one_byte_short) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==12u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
   ku_task_control_atomic_init(&fixture_calloc_failure,0);
   ku_task_control_atomic_init(&fixture_calloc_attempts,0);
   fixture_rejection(0); fixture_rejection(1); fixture_rejection(2);

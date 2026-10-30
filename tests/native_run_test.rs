@@ -731,9 +731,10 @@ fn main(): null! {
     )
     .expect("write pending ready HTTP source");
     let generated = native_emit_c(dir, "main.ku");
-    let start = "/* Under pressure a genuinely idle persistent socket yields its slot.";
-    let end = "if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY) && now >= connection->deadline)";
+    let start = "      if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&";
+    let end = "      if ((connection->phase == KU_HTTP_IO_HEADER || connection->phase == KU_HTTP_IO_BODY || connection->phase == KU_HTTP_IO_REQUEST_WAIT) && now >= connection->deadline)";
     assert_eq!(generated.matches(start).count(), 1);
+    assert_eq!(generated.matches(end).count(), 1);
     // Execute the actual emitted promotion branch, rather than reimplementing
     // its idle predicate in the fixture. Only its surrounding loop is removed.
     let branch = generated
@@ -786,7 +787,7 @@ failed:
   *peer = *accepted = KU_HTTP_INVALID_SOCKET;
   return 0;
 }
-static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte) {
+static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte, int connection_pressure) {
   KuHttpSocket peer, accepted;
   if (!ku_http_fixture_tcp_pair(&peer, &accepted)) return 0;
   if (with_byte) {
@@ -804,37 +805,49 @@ static int ku_http_fixture_reuse_case(KuHttpBufferBudget* budget, int with_byte)
   server.buffer_budget = budget;
   server.idle_timeout_ms = 1000;
   KuHttpConnection connection = {0};
+  int active_index = -1;
+  KuHttpActiveSet active = {.connections=&connection,.indices=&active_index,
+      .capacity=1,.free_head=-1,.request_limit=1};
   ku_http_atomic_store(&ku_http_active_conns, 1);
-  ku_http_connection_start(&connection, accepted, &server);
+  ku_http_connection_start(&connection, &active, accepted, &server);
   connection.reused = 1;
   char* original_header = connection.header;
   const size_t original_capacity = connection.capacity;
   const unsigned long long original_deadline = connection.deadline;
-  int passed = connection.phase == KU_HTTP_IO_HEADER && original_header
-      && original_capacity == 1024 && budget->current == original_capacity;
-  if (passed) ku_http_fixture_promote(&connection);
+  /* A real empty C record owns its socket but has neither input backing nor
+     an A lease. Keep that lazy-allocation boundary while exercising pressure. */
+  int passed = connection.phase == KU_HTTP_IO_HEADER && !original_header
+      && !original_capacity && !budget->current && active.count == 1
+      && active.sockets == 1 && active.high_water == 1 && !active.request_active
+      && !connection.request_lease;
+  if (passed) ku_http_fixture_promote(&connection, connection_pressure);
   const int observed_phase = connection.phase;
   const int same_socket = connection.socket_value == accepted;
-  if (with_byte) {
-    char byte = 0;
+  if (with_byte || !connection_pressure) {
     passed = passed && same_socket && connection.phase == KU_HTTP_IO_HEADER
         && connection.header == original_header && connection.capacity == original_capacity
         && connection.deadline == original_deadline && !connection.buffered
-        && budget->current == original_capacity
-        && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+        && budget->current == original_capacity && active.count == 1
+        && active.sockets == 1 && !active.request_active && !connection.request_lease;
+    if (with_byte) {
+      char byte = 0;
+      passed = passed && recv(connection.socket_value, &byte, 1, MSG_PEEK) == 1 && byte == 'G';
+    }
   } else {
     passed = passed && connection.socket_value == KU_HTTP_INVALID_SOCKET
-        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current;
+        && connection.phase == KU_HTTP_IO_FREE && !connection.header && !budget->current
+        && !active.count && !active.sockets && !active.request_active;
   }
   /* Retire the actual connection owner before reporting an intentional red
      result; the failing old branch has already retired this owner itself. */
   ku_http_connection_close(&connection);
   ku_http_socket_close(peer);
-  const int retired = budget->current == 0 && ku_http_active_conns == 0;
+  const int retired = budget->current == 0 && ku_http_active_conns == 0
+      && !active.count && !active.sockets && !active.request_active;
   if (!passed || !retired) {
     fprintf(stderr,
-      "HTTP pending reuse failed after cleanup: with_byte=%d phase=%d same_socket=%d retired=%d\n",
-      with_byte, observed_phase, same_socket, retired);
+      "HTTP pending reuse failed after cleanup: with_byte=%d C_pressure=%d phase=%d same_socket=%d retired=%d\n",
+      with_byte, connection_pressure, observed_phase, same_socket, retired);
     return 0;
   }
   return 1;
@@ -844,12 +857,13 @@ int main(void) {
   KuHttpBufferBudget budget = {0};
   budget.limit = 65536;
   if (!ku_http_mutex_init(&budget.lock)) { ku_http_net_cleanup(); return 21; }
-  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1);
-  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0);
+  const int ready_passed = ku_http_fixture_reuse_case(&budget, 1, 1);
+  const int idle_passed = ku_http_fixture_reuse_case(&budget, 0, 1);
+  const int request_pressure_passed = ku_http_fixture_reuse_case(&budget, 0, 0);
   const int budget_zero = budget.current == 0;
   ku_http_mutex_destroy(&budget.lock);
   ku_http_net_cleanup();
-  if (!ready_passed || !idle_passed || !budget_zero) return 1;
+  if (!ready_passed || !idle_passed || !request_pressure_passed || !budget_zero) return 1;
   puts("http-pending-ready-reuse-ok");
   return 0;
 }
@@ -858,7 +872,7 @@ int main(void) {
     fs::write(
         &harness,
         format!(
-            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  {start}{branch}\n}}\n{checks}"
+            "#define main ku_fixture_main\n{generated}\n#undef main\nstatic void ku_http_fixture_promote(KuHttpConnection* connection, int connection_pressure) {{\n  KuHttpPending pending = {{0}};\n  pending.count = 1;\n  pending.raw_count = connection_pressure;\n  const KuHttpActiveSet active = *connection->active_set;\n  {start}{branch}\n}}\n{checks}"
         ),
     )
     .expect("write pending ready HTTP C harness");
@@ -959,6 +973,18 @@ static int ku_http_socket_recv(KuHttpSocket socket_value, char* data, size_t len
 static int ku_http_fixture_zero(void) {
   return !ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes;
 }
+static int ku_http_fixture_partial_header(KuHttpConnection* connection, const char* prefix, size_t length) {
+  if (!ku_http_buffer_reserve(connection->budget, length)) return 0;
+  connection->header = (char*)malloc(length);
+  if (!connection->header) {
+    ku_http_buffer_refund(connection->budget, length);
+    return 0;
+  }
+  connection->capacity = length;
+  memcpy(connection->header, prefix, length);
+  connection->buffered = length;
+  return 1;
+}
 static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budget, int kind, unsigned long long now) {
   KuHttpQueue queue;
   if (!ku_http_queue_init(&queue, 1, wake)) return 0;
@@ -971,23 +997,24 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   server.read_body_timeout_ms = 222;
   server.write_timeout_ms = 77;
   server.handler_timeout_ms = 100;
+  server.request_timeout_ms = 1000;
   KuHttpConnection connection = {0};
   connection.socket_value = KU_HTTP_INVALID_SOCKET;
   ku_http_fixture_now = now;
   ku_http_fixture_recv_calls = 0;
   ku_http_fixture_would_block = now < 100;
   if (kind < 2) {
-    ku_http_connection_start(&connection, KU_HTTP_INVALID_SOCKET, &server);
-    if (!connection.header) {
-      ku_http_queue_close(&queue, 0);
-      ku_http_connection_close(&connection);
-      ku_http_queue_free(&queue);
-      return 0;
-    }
+    ku_http_connection_start(&connection, NULL, KU_HTTP_INVALID_SOCKET, &server);
+    /* HEADER starts without a backing allocation; only an already partial
+       request owns bytes, as after a real positive parser read. */
     if (kind == 1) {
       static const char prefix[] = "POST /ok HTTP/1.1\r\nHost: localhost\r\n";
-      memcpy(connection.header, prefix, sizeof(prefix) - 1);
-      connection.buffered = sizeof(prefix) - 1;
+      if (!ku_http_fixture_partial_header(&connection, prefix, sizeof(prefix) - 1)) {
+        ku_http_queue_close(&queue, 0);
+        ku_http_connection_close(&connection);
+        ku_http_queue_free(&queue);
+        return 0;
+      }
       ku_http_fixture_received = "Content-Length: 1\r\n\r\nx";
     } else {
       ku_http_fixture_received = "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nx";
@@ -996,6 +1023,7 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     connection.budget = budget;
     connection.input.budget = budget;
+    connection.request_deadline = now + 1000;
     /* Match the real parser's retained body and target backing owners. */
     if (!ku_http_buffer_reserve(budget, 6)) {
       ku_http_queue_close(&queue, 0);
@@ -1047,8 +1075,9 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
   } else {
     passed = connection.phase == original_phase && connection.deadline == 100
       && ku_http_fixture_recv_calls == 1
-      && connection.header == original_header
-      && connection.capacity == original_capacity
+      && (kind == 0
+          ? connection.header != NULL && connection.capacity == 1024 && budget->current == 1024
+          : connection.header == original_header && connection.capacity == original_capacity)
       && connection.buffered == original_buffered
       && connection.input.body == original_body
       && connection.body_received == original_body_received
@@ -1242,6 +1271,9 @@ fn main(): null! {
         "int connect_expired = ku_pg_now_ms() >= deadline",
         "if (p->closing || connect_expired)",
         "static int ku_pg_client_take_dispose_locked",
+        "p->async_operations != 0 || p->capture_pins != 0",
+        "p->capture_pins--;int dispose=ku_pg_client_take_dispose_locked(p)",
+        "p->async_operations--;int dispose=ku_pg_client_take_dispose_locked(p)",
         "PostgreSQL client waiter limit reached",
         "p->waiters >= p->max_waiters",
         "timed out waiting for a PostgreSQL client connection",
@@ -1258,8 +1290,8 @@ fn main(): null! {
     }
     assert_eq!(
         c.matches("ku_pg_client_take_dispose_locked(p)").count(),
-        5,
-        "every PG close/release/acquire rollback path must use the one-finalizer arbiter"
+        7,
+        "PG close/release/acquire rollback, capture and async retirement must share the one-finalizer arbiter"
     );
     assert_eq!(
         c.matches("return ku_pg_finish_query(conn, result, deadline, broken)")
@@ -1496,6 +1528,11 @@ char* PQerrorMessage(const PGconn* value) {
 }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { if (value && value->id >= 1 && value->id <= 4) ku_test_finish_counts[value->id]++; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }
@@ -1657,6 +1694,11 @@ int PQstatus(const PGconn* value) { (void)value; ku_test_connection_touches++; r
 char* PQerrorMessage(const PGconn* value) { (void)value; return "stub error"; }
 int PQsetClientEncoding(PGconn* value, const char* encoding) { (void)value; (void)encoding; ku_test_connection_touches++; return 0; }
 const char* PQparameterStatus(const PGconn* value, const char* name) { (void)value; (void)name; ku_test_connection_touches++; return "UTF8"; }
+int PQisthreadsafe(void) { return 1; }
+int PQsslInUse(PGconn* value) { (void)value; return 0; }
+PGcancel* PQgetCancel(PGconn* value) { (void)value; return NULL; }
+int PQcancel(PGcancel* cancel, char* message, int capacity) { (void)cancel; (void)message; (void)capacity; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* value) { (void)value; }
 int PQsetnonblocking(PGconn* value, int mode) { (void)value; return mode == 1 ? 0 : -1; }
 int PQflush(PGconn* value) { (void)value; return 0; }
@@ -4944,13 +4986,57 @@ fn native_kuvalue_function_equality_does_not_consume_closure() {
 #[test]
 fn native_json_array_roundtrip() {
     let dir = unique_temp_dir("json-arr");
+    let mut integers = vec![i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+    for exponent in 0..=18 {
+        let power = 10_i64.pow(exponent);
+        integers.extend([power - 1, power, power + 1, -power + 1, -power, -power - 1]);
+    }
+    let mut state = 0x6b75_6a73_6f6e_696e_u64;
+    for _ in 0..128 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        integers.push(state as i64);
+    }
+    integers.sort_unstable();
+    integers.dedup();
+    let integer_text = format!(
+        "[{}]",
+        integers
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    fs::write(dir.join("integers.json"), integer_text).expect("write integer boundary cases");
     fs::write(
         dir.join("main.ku"),
-        "import json from \"std.json\"\n\nfn main(): null! {\n    println(json.stringify(json.parse(\"[1,2,3]\")?)?)\n    println(json.stringify(json.parse(\"[{\\\"a\\\":1},{\\\"a\\\":2}]\")?)?)\n    println(json.stringify(json.parse(\"[]\")?)?)\n    return ok(null)\n}\n",
+        r#"import {json, fs} from "std"
+
+fn main(): null! {
+    println(json.stringify(json.parse("[1,2,3]")?)?)
+    println(json.stringify(json.parse("[{\"a\":1},{\"a\":2}]")?)?)
+    println(json.stringify(json.parse("[]")?)?)
+    canonical = fs.read("integers.json")?
+    values = json.decode(canonical)?
+    if (json.encode(values)? != canonical || json.stringify(json.try_parse(json.stringify(values)?)?)? != canonical) {
+        panic("integer JSON token changed at a sign, digit or int64 boundary")
+    }
+    if (json.encode(json.decode("-0")?)? != "0") {
+        panic("integer negative zero must remain canonical zero")
+    }
+    typed = [0, -1, 9223372036854775807, -9223372036854775807 - 1]
+    if (json.encode(typed)? != "[0,-1,9223372036854775807,-9223372036854775808]") {
+        panic("typed integer array used a different JSON formatter")
+    }
+    return ok(null)
+}
+"#,
     )
     .expect("write main.ku");
 
     let Some(exe) = native_build(&dir, "main.ku", "jsonarr") else {
+        fs::remove_dir_all(&dir).ok();
         return;
     };
 
@@ -5268,6 +5354,14 @@ fn main(): null! {
     ExpectReject("\"\\uD83D\\u0041\"")?
     ExpectReject("\"\\uDE00\"")?
     ExpectReject("\"unterminated")?
+    prefix = ""
+    i = 0
+    while (i < 257) { prefix = prefix + "a"; i = i + 1 }
+    decoded = json.decode("\"" + prefix + "\\n你😀\\\"\\\\/tail\"")?
+    if (decoded.as_str()? != prefix + "\n你😀\"\\/tail") { panic("ascii run boundary") }
+    ExpectReject("\"" + prefix + "\\x\"")?
+    ExpectReject("\"" + prefix + "\n\"")?
+    ExpectReject("\"" + prefix + "")?
     return ok(null)
 }
 "#,
@@ -5286,6 +5380,411 @@ fn main(): null! {
     assert_eq!(code, Some(0));
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_json_raw_utf8_boundaries_reject_invalid_bytes_and_release_buffers() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-raw-utf8-boundaries"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import json from "std.json"
+fn main(): null! {
+    println(json.encode(json.decode("\"\"")?)?)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write JSON UTF-8 fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    // Inject byte arrays after code generation: neither the Rust source parser
+    // nor fs.read may reject malformed UTF-8 before the native JSON routines.
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-raw-utf8-boundaries",
+        r#"
+static int json_utf8_valid_case(const uint8_t* bytes,size_t len,const char* escaped) {
+  uint8_t input[8]={'a'},expected[16]={'"','a'};
+  memcpy(input+1,bytes,len);input[len+1]='z';
+  size_t encoded_len=escaped?strlen(escaped):len;
+  memcpy(expected+2,escaped?(const uint8_t*)escaped:bytes,encoded_len);
+  expected[encoded_len+2]='z';expected[encoded_len+3]='"';
+  KuValue value=ku_v_str(ku_string_static(input,len+2));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(encoded.ok && encoded.value.len==encoded_len+4);
+  CHECK(!memcmp(encoded.value.ptr,expected,encoded_len+4));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len+2 && !memcmp(input+1,bytes,len));
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(expected,encoded_len+4));
+  CHECK(decoded.ok && decoded.value.tag==KU_STR && decoded.value.as.s.len==len+2);
+  CHECK(!memcmp(decoded.value.as.s.ptr,input,len+2));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);ku_value_drop(&value);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+static int json_utf8_invalid_case(const uint8_t* bytes,size_t len) {
+  uint8_t input[8]={'a'},text[10]={'"','a'};
+  memcpy(input+1,bytes,len);memcpy(text+2,bytes,len);
+  KuValue value=ku_v_str(ku_string_static(input,len+1));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(!encoded.ok && ku_string_equal(encoded.error.domain,ku_string_static((const uint8_t*)"json",4)));
+  CHECK(ku_string_equal(encoded.error.code,ku_string_static((const uint8_t*)"stringify_error",15)));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len+1 && !memcmp(input+1,bytes,len));
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);ku_value_drop(&value);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  // With no closing quote, truncated sequences end at the actual input bound.
+  // Check the error text so an unrelated "unterminated string" cannot pass.
+  for(size_t closing=0;closing<2;closing++) {
+    text[len+2]='"';
+    KuResult_kuvalue decoded=ku_json_parse(ku_string_static(text,len+2+closing));
+    static const char message[]="invalid utf-8 in json string";
+    CHECK(!decoded.ok && ku_string_equal(decoded.error.domain,ku_string_static((const uint8_t*)"json",4)));
+    CHECK(ku_string_equal(decoded.error.code,ku_string_static((const uint8_t*)"parse_error",11)));
+    CHECK(decoded.error.message.len>=sizeof(message)-1 && !memcmp(decoded.error.message.ptr,message,sizeof(message)-1));
+    ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+    CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  return 0;
+}
+int main(void) {
+  static const struct {uint8_t bytes[4];size_t len;const char* escaped;} valid[]={
+    {{0x00},1,"\\u0000"},{{0x20},1,NULL},{{0x22},1,"\\\""},{{0x5c},1,"\\\\"},{{0x7f},1,NULL},
+    {{0xc2,0x80},2,NULL},{{0xdf,0xbf},2,NULL},
+    {{0xe0,0xa0,0x80},3,NULL},{{0xe0,0xbf,0xbf},3,NULL},
+    {{0xe1,0x80,0x80},3,NULL},{{0xec,0xbf,0xbf},3,NULL},
+    {{0xed,0x80,0x80},3,NULL},{{0xed,0x9f,0xbf},3,NULL},
+    {{0xee,0x80,0x80},3,NULL},{{0xef,0xbf,0xbf},3,NULL},
+    {{0xf0,0x90,0x80,0x80},4,NULL},{{0xf0,0xbf,0xbf,0xbf},4,NULL},
+    {{0xf1,0x80,0x80,0x80},4,NULL},{{0xf3,0xbf,0xbf,0xbf},4,NULL},
+    {{0xf4,0x80,0x80,0x80},4,NULL},{{0xf4,0x8f,0xbf,0xbf},4,NULL}
+  };
+  static const struct {uint8_t bytes[4];size_t len;} invalid[]={
+    {{0x80},1},{{0xbf},1},{{0xc0,0x80},2},{{0xc1,0xbf},2},
+    {{0xe0,0x80,0x80},3},{{0xe0,0x9f,0xbf},3},
+    {{0xed,0xa0,0x80},3},{{0xed,0xbf,0xbf},3},
+    {{0xf0,0x80,0x80,0x80},4},{{0xf0,0x8f,0xbf,0xbf},4},
+    {{0xf4,0x90,0x80,0x80},4},{{0xf4,0xbf,0xbf,0xbf},4},
+    {{0xf5,0x80,0x80,0x80},4},{{0xf8,0x80,0x80,0x80},4},{{0xfe},1},{{0xff},1}
+  };
+  for(size_t i=0;i<sizeof(valid)/sizeof(valid[0]);i++) {
+    CHECK(!json_utf8_valid_case(valid[i].bytes,valid[i].len,valid[i].escaped));
+    for(size_t length=1;length<valid[i].len;length++)
+      CHECK(!json_utf8_invalid_case(valid[i].bytes,length));
+    for(size_t position=1;position<valid[i].len;position++) {
+      uint8_t broken[4];memcpy(broken,valid[i].bytes,valid[i].len);
+      broken[position]=0x7f;CHECK(!json_utf8_invalid_case(broken,valid[i].len));
+      broken[position]=0xc0;CHECK(!json_utf8_invalid_case(broken,valid[i].len));
+    }
+  }
+  for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
+    CHECK(!json_utf8_invalid_case(invalid[i].bytes,invalid[i].len));
+  return 0;
+}
+"#,
+    );
+}
+
+#[test]
+fn native_json_word_blocks_and_short_writes_preserve_bounds_and_error_order() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-word-boundaries"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        r#"import json from "std.json"
+fn main(): null! {
+    println(json.encode("")?)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write JSON block-boundary fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    // Fail the actual reserve allocation site, including its first allocation
+    // and growth, while retaining the shared live-allocation ledger. No fixed
+    // ordinal is assumed to keep identifying the same source statement.
+    let reserve = "static bool ku_json_buffer_reserve(";
+    assert!(generated.contains(reserve));
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static int ku_json_test_fail_reserve = 0;
+static void* ku_json_test_realloc(void* p, size_t n) {{
+  if (ku_json_test_fail_reserve) return NULL;
+  return realloc(p, n);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(allocation).count(), 1);
+    let generated = generated.replacen(
+        allocation,
+        "uint8_t* data = (uint8_t*)ku_json_test_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-word-boundaries",
+        r#"
+static int json_word_error(KuError error,const char* code,const char* message) {
+  size_t n=strlen(message);
+  return ku_string_equal(error.domain,ku_string_static((const uint8_t*)"json",4))
+      && ku_string_equal(error.code,ku_string_static((const uint8_t*)code,strlen(code)))
+      && error.message.len>=n && !memcmp(error.message.ptr,message,n);
+}
+static size_t json_expected_ascii(uint8_t byte,uint8_t* out) {
+  if(byte=='"' || byte=='\\') {out[0]='\\';out[1]=byte;return 2;}
+  if(byte=='\n' || byte=='\r' || byte=='\t') {
+    out[0]='\\';out[1]=byte=='\n'?'n':byte=='\r'?'r':'t';return 2;
+  }
+  if(byte<0x20) {
+    static const char hex[]="0123456789abcdef";
+    out[0]='\\';out[1]='u';out[2]='0';out[3]='0';
+    out[4]=(uint8_t)hex[byte>>4];out[5]=(uint8_t)hex[byte&15];return 6;
+  }
+  out[0]=byte;return 1;
+}
+static int json_word_roundtrip(size_t offset,size_t prefix,size_t suffix,int inserted) {
+  size_t len=prefix+(inserted>=0)+suffix;
+  uint8_t raw[96],text[128];memset(raw,'a',len);
+  if(inserted>=0)raw[prefix]=(uint8_t)inserted;
+  // The end of the input is the allocation end: there is no readable padding.
+  uint8_t* allocation=(uint8_t*)malloc(offset+len);CHECK(allocation);
+  uint8_t* input=allocation+offset;if(len)memcpy(input,raw,len);
+  size_t at=0;text[at++]='"';
+  for(size_t i=0;i<len;i++)at+=json_expected_ascii(raw[i],text+at);
+  text[at++]='"';
+  KuValue value=ku_v_str(ku_string_static(input,len));
+  KuResult_str encoded=ku_json_stringify(value);
+  CHECK(encoded.ok && encoded.value.len==at && !memcmp(encoded.value.ptr,text,at));
+  CHECK(value.as.s.ptr==input && value.as.s.len==len && (!len || !memcmp(input,raw,len)));
+  // Parse from a separately unaligned, exact-size allocation as well.
+  uint8_t* json_allocation=(uint8_t*)malloc(offset+at);CHECK(json_allocation);
+  memcpy(json_allocation+offset,text,at);
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(json_allocation+offset,at));
+  CHECK(decoded.ok && decoded.value.tag==KU_STR && decoded.value.as.s.len==len);
+  ku_value_drop(&value);free(allocation);free(json_allocation);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  // Results must outlive both inputs and the serialized output.
+  CHECK(!len || !memcmp(decoded.value.as.s.ptr,raw,len));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+static int json_word_invalid(size_t offset,size_t prefix,size_t suffix,uint8_t byte) {
+  size_t len=prefix+suffix+1;uint8_t raw[96];memset(raw,'a',len);raw[prefix]=byte;
+  uint8_t* allocation=(uint8_t*)malloc(offset+len+2);CHECK(allocation);
+  uint8_t* text=allocation+offset;text[0]='"';memcpy(text+1,raw,len);text[len+1]='"';
+  KuResult_kuvalue decoded=ku_json_parse(ku_string_static(text,len+2));
+  CHECK(!decoded.ok && json_word_error(decoded.error,"parse_error",
+      byte<0x20?"control character in json string":"invalid utf-8 in json string"));
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);free(allocation);
+  if(byte>=0x80) {
+    // A single non-ASCII byte followed only by ASCII/EOF is always invalid UTF8.
+    allocation=(uint8_t*)malloc(offset+len);CHECK(allocation);memcpy(allocation+offset,raw,len);
+    KuValue value=ku_v_str(ku_string_static(allocation+offset,len));
+    KuResult_str encoded=ku_json_stringify(value);
+    CHECK(!encoded.ok && json_word_error(encoded.error,"stringify_error","invalid utf-8 in json string"));
+    CHECK(!memcmp(allocation+offset,raw,len));
+    ku_value_drop(&value);ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);free(allocation);
+  }
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+int main(void) {
+  static const size_t prefixes[]={0,1,6,7,8,9,15,16,17,23,24,31,32};
+  static const size_t suffixes[]={0,1,7,8};
+  for(size_t offset=0;offset<8;offset++) {
+    for(size_t len=0;len<=33;len++) {
+      CHECK(!json_word_roundtrip(offset,len,0,-1));
+      uint8_t* allocation=(uint8_t*)malloc(offset+len+1);CHECK(allocation);
+      uint8_t* text=allocation+offset;text[0]='"';memset(text+1,'a',len);
+      KuResult_kuvalue bad=ku_json_parse(ku_string_static(text,len+1));
+      CHECK(!bad.ok && json_word_error(bad.error,"parse_error","unterminated json string"));
+      ku_value_drop(&bad.value);ku_error_drop(&bad.error);free(allocation);CHECK(NO_LIVE_ALLOCATIONS());
+    }
+    for(size_t p=0;p<sizeof(prefixes)/sizeof(prefixes[0]);p++)
+      for(size_t s=0;s<sizeof(suffixes)/sizeof(suffixes[0]);s++)
+        for(unsigned byte=0;byte<256;byte++) {
+          if(byte<0x80)CHECK(!json_word_roundtrip(offset,prefixes[p],suffixes[s],(int)byte));
+          if(byte<0x20 || byte>=0x80)CHECK(!json_word_invalid(offset,prefixes[p],suffixes[s],(uint8_t)byte));
+        }
+  }
+  // The old scalar writer observes a size error on the first prefix byte over
+  // budget, before a later invalid UTF8 byte. At exactly the prefix bound, the
+  // next invalid UTF8 byte still wins. The block path must preserve both cases.
+  uint8_t* output=(uint8_t*)malloc(KU_JSON_MAX_OUTPUT_BYTES);CHECK(output);
+  for(size_t room=0;room<=24;room++)for(size_t prefix=0;prefix<=24;prefix++) {
+    uint8_t input[32];memset(input,'a',prefix);input[prefix]=0x80;
+    KuJsonBuffer buffer={output,KU_JSON_MAX_OUTPUT_BYTES-room,KU_JSON_MAX_OUTPUT_BYTES};KuError error={0};
+    CHECK(!ku_json_write_string(&buffer,ku_string_static(input,prefix+1),&error));
+    CHECK(json_word_error(error,"stringify_error",room==0 || prefix>room-1
+        ?"json.stringify output is too large":"invalid utf-8 in json string"));
+    CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
+    static const uint8_t escape_bytes[]={0,'\n','"','\\'};
+    for(size_t e=0;e<sizeof(escape_bytes);e++) {
+      input[prefix]=escape_bytes[e];input[prefix+1]=0x80;
+      size_t escape_len=escape_bytes[e]==0?6:2;
+      buffer=(KuJsonBuffer){output,KU_JSON_MAX_OUTPUT_BYTES-room,KU_JSON_MAX_OUTPUT_BYTES};error=(KuError){0};
+      CHECK(!ku_json_write_string(&buffer,ku_string_static(input,prefix+2),&error));
+      CHECK(json_word_error(error,"stringify_error",room<1+prefix+escape_len
+          ?"json.stringify output is too large":"invalid utf-8 in json string"));
+      CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
+    }
+  }
+  free(output);CHECK(NO_LIVE_ALLOCATIONS());
+  // Reserve OOM must not consume input, lose old allocation, or be overwritten
+  // by the later malformed byte. Exercise first allocation,byte,2/6 escape and
+  // ordinary-span growth without depending on allocation ordinal numbers.
+  uint8_t invalid[20]={'"'};memset(invalid+1,'a',17);invalid[18]=0x80;invalid[19]='"';
+  ku_json_test_fail_reserve=1;
+  KuResult_kuvalue parsed=ku_json_parse(ku_string_static(invalid,sizeof(invalid)));
+  CHECK(!parsed.ok && json_word_error(parsed.error,"out_of_memory","json allocation failed"));
+  ku_value_drop(&parsed.value);ku_error_drop(&parsed.error);CHECK(NO_LIVE_ALLOCATIONS());
+  KuResult_str first=ku_json_stringify(ku_v_str(ku_string_static((const uint8_t*)"",0)));
+  CHECK(!first.ok && json_word_error(first.error,"out_of_memory","json allocation failed"));
+  ku_string_drop(&first.value);ku_error_drop(&first.error);CHECK(NO_LIVE_ALLOCATIONS());
+  static const uint8_t examples[][3]={{0},{'"'},{'\n'},{'a','\n',0x80},{0}};
+  static const size_t lengths[]={1,1,1,3,0};
+  for(size_t i=0;i<5;i++) {
+    ku_json_test_fail_reserve=0;
+    size_t cap=i==3?1:64;uint8_t* previous=(uint8_t*)malloc(cap);CHECK(previous);
+    KuJsonBuffer buffer={previous,i==3?0:cap-1,cap};KuError error={0};
+    ku_json_test_fail_reserve=1;
+    CHECK(!ku_json_write_string(&buffer,ku_string_static(examples[i],lengths[i]),&error));
+    CHECK(json_word_error(error,"out_of_memory","json allocation failed"));
+    CHECK(buffer.data==previous && buffer.cap==cap);
+    CHECK(buffer.len==(i==3?1:cap));
+    ku_json_buffer_drop(&buffer);ku_error_drop(&error);CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  ku_json_test_fail_reserve=0;
+  // The local writer cursor must publish exactly the last completed write on
+  // every failed growth, including ordinary, 2-byte and 6-byte boundaries.
+  static const uint8_t cursor_input[]={'a','"','\n','b',0,'c'};
+  static const uint8_t cursor_output[]={'"','a','\\','"','\\','n','b','\\','u','0','0','0','0','c','"'};
+  static const size_t cursor_stages[]={1,1,2,2,1,6,1,1};
+  for(size_t cap=3;cap<=20;cap++)for(int fail=0;fail<=1;fail++) {
+    uint8_t* storage=(uint8_t*)malloc(cap);CHECK(storage);memcpy(storage,"pre",3);
+    KuJsonBuffer buffer={storage,3,cap};KuError error={0};
+    ku_json_test_fail_reserve=fail;
+    bool ok=ku_json_write_string(&buffer,ku_string_static(cursor_input,sizeof(cursor_input)),&error);
+    size_t committed=3;
+    for(size_t stage=0;stage<sizeof(cursor_stages)/sizeof(cursor_stages[0]);stage++) {
+      if(fail && cursor_stages[stage]>cap-committed)break;
+      committed+=cursor_stages[stage];
+    }
+    CHECK(ok==(committed==3+sizeof(cursor_output)));
+    CHECK(buffer.len==committed && !memcmp(buffer.data,"pre",3));
+    CHECK(!memcmp(buffer.data+3,cursor_output,committed-3));
+    if(!ok) {
+      CHECK(buffer.data==storage && buffer.cap==cap);
+      CHECK(json_word_error(error,"out_of_memory","json allocation failed"));
+    }
+    ku_json_buffer_drop(&buffer);ku_error_drop(&error);CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  ku_json_test_fail_reserve=0;
+  CHECK(!json_word_roundtrip(7,16,8,'\n'));return 0;
+}
+"#,
+    );
+}
+
+#[test]
+fn native_json_unescaped_strings_allocate_exact_owned_bytes_and_replay_errors() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-exact-owned"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        "import json from \"std.json\"\nfn main(): null! {\n    json.decode(\"\\\"\\\"\")?\n    return ok(null)\n}\n",
+    )
+    .expect("write exact JSON string fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    let reserve = "static bool ku_json_buffer_reserve(";
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static int ku_json_exact_fail = 0, ku_json_reserve_fail = 0;
+static size_t ku_json_exact_calls = 0, ku_json_exact_bytes = 0;
+static void* ku_json_exact_alloc(size_t len) {{
+  ku_json_exact_calls++; ku_json_exact_bytes += len;
+  return ku_json_exact_fail ? NULL : malloc(len);
+}}
+static void* ku_json_replay_realloc(void* value, size_t len) {{
+  return ku_json_reserve_fail ? NULL : realloc(value, len);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let exact = "uint8_t* owned = (uint8_t*)malloc(len);";
+    assert_eq!(generated.matches(exact).count(), 1);
+    let generated = generated.replacen(
+        exact,
+        "uint8_t* owned = (uint8_t*)ku_json_exact_alloc(len);",
+        1,
+    );
+    let reserve_allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(reserve_allocation).count(), 1);
+    let generated = generated.replacen(
+        reserve_allocation,
+        "uint8_t* data = (uint8_t*)ku_json_replay_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-exact-owned",
+        r#"
+static int json_exact_case(const uint8_t* body,size_t len) {
+  uint8_t* input=(uint8_t*)malloc(len+2);CHECK(input);
+  input[0]='"';if(len)memcpy(input+1,body,len);input[len+1]='"';
+  size_t calls=ku_json_exact_calls,bytes=ku_json_exact_bytes;
+  KuResult_kuvalue result=ku_json_parse(ku_string_static(input,len+2));
+  CHECK(result.ok && result.value.tag==KU_STR && result.value.as.s.len==len);
+  CHECK(ku_json_exact_calls-calls==(len?1:0) && ku_json_exact_bytes-bytes==len);
+  if(len) {
+    CHECK(result.value.as.s.storage==KU_STRING_OWNED && result.value.as.s.capacity==len);
+    CHECK(result.value.as.s.ptr!=input && !memcmp(result.value.as.s.ptr,body,len));
+  } else CHECK(result.value.as.s.storage==KU_STRING_STATIC && !result.value.as.s.capacity);
+  memset(input,0,len+2);free(input);
+  if(len)CHECK(!memcmp(result.value.as.s.ptr,body,len));
+  ku_value_drop(&result.value);ku_error_drop(&result.error);CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+static int json_exact_error(const uint8_t* input,size_t len,const char* code) {
+  KuResult_kuvalue result=ku_json_parse(ku_string_static(input,len));
+  CHECK(!result.ok && ku_string_equal(result.error.code,
+      ku_string_static((const uint8_t*)code,strlen(code))));
+  ku_value_drop(&result.value);ku_error_drop(&result.error);CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+int main(void) {
+  static const size_t lengths[]={0,1,7,8,15,16,31,32,63,64,65,1024};
+  uint8_t body[1024];memset(body,'x',sizeof(body));
+  for(size_t i=0;i<sizeof(lengths)/sizeof(lengths[0]);i++)CHECK(!json_exact_case(body,lengths[i]));
+  static const uint8_t unicode[]={0xe4,0xb8,0xad,0xe6,0x96,0x87,0xf0,0x9f,0x99,0x82};
+  CHECK(!json_exact_case(unicode,sizeof(unicode)));
+  ku_json_exact_fail=1;
+  CHECK(!json_exact_error((const uint8_t*)"\"valid\"",7,"out_of_memory"));
+  /* Fast-path rejection must replay valid-prefix allocations before a later
+     invalid UTF8, escape, C0 or missing quote can become the visible error. */
+  ku_json_reserve_fail=1;
+  static const uint8_t invalid_utf8[]={'"','a',0x80,'"'};
+  CHECK(!json_exact_error(invalid_utf8,sizeof(invalid_utf8),"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc\\x\"",7,"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc\n\"",6,"out_of_memory"));
+  CHECK(!json_exact_error((const uint8_t*)"\"abc",4,"out_of_memory"));
+  ku_json_reserve_fail=0;
+  CHECK(!json_exact_error(invalid_utf8,sizeof(invalid_utf8),"parse_error"));
+  ku_json_exact_fail=0;
+  size_t calls=ku_json_exact_calls;
+  KuResult_kuvalue escaped=ku_json_parse(ku_string_static((const uint8_t*)"\"a\\u0000b\"",10));
+  CHECK(escaped.ok && escaped.value.as.s.len==3 && escaped.value.as.s.ptr[1]==0);
+  CHECK(ku_json_exact_calls==calls);
+  ku_value_drop(&escaped.value);ku_error_drop(&escaped.error);CHECK(NO_LIVE_ALLOCATIONS());
+  CHECK(!json_exact_case(body,65));return 0;
+}
+"#,
+    );
 }
 
 #[test]
@@ -5379,6 +5878,14 @@ fn native_json_stringify_sorts_object_keys_stably() {
 fn main(): null! {
     value = json.parse("{\"z\":0,\"é\":1,\"aa\":2,\"a\":3}")?
     println(json.stringify(value)?)
+    println(json.stringify(json.parse("{}")?)?)
+    println(json.stringify(json.parse("{\"only\":1}")?)?)
+    small = json.parse("{\"h\":8,\"g\":7,\"f\":6,\"e\":5,\"d\":4,\"c\":3,\"b\":2,\"a\":1}")?
+    println(json.stringify(small)?)
+    large = json.parse("{\"i\":9,\"h\":8,\"g\":7,\"f\":6,\"e\":5,\"d\":4,\"c\":3,\"b\":2,\"a\":1}")?
+    println(json.stringify(large)?)
+    duplicate = json.parse("{\"b\":1,\"a\":2,\"b\":3}")?
+    println(json.stringify(duplicate)?)
     return ok(null)
 }
 "#,
@@ -5392,7 +5899,7 @@ fn main(): null! {
     let (stdout, code) = run_binary(&exe);
     assert_eq!(
         stdout.replace('\r', ""),
-        "{\"a\":3,\"aa\":2,\"z\":0,\"é\":1}\n"
+        "{\"a\":3,\"aa\":2,\"z\":0,\"é\":1}\n{}\n{\"only\":1}\n{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8}\n{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9}\n{\"a\":2,\"b\":3}\n"
     );
     assert_eq!(code, Some(0));
 
@@ -5409,6 +5916,11 @@ fn native_json_input_and_output_limits_are_hard_boundaries() {
     fs::write(dir.join("float-ok.txt"), vec![b'a'; 999_953]).expect("write float boundary payload");
     fs::write(dir.join("float-too-large.txt"), vec![b'a'; 999_954])
         .expect("write oversized float boundary payload");
+    // INT64_MIN occupies the complete 20-byte integer buffer; these objects
+    // have 44 bytes of syntax/number text, including its minus sign.
+    fs::write(dir.join("int-ok.txt"), vec![b'a'; 999_956]).expect("write integer boundary payload");
+    fs::write(dir.join("int-too-large.txt"), vec![b'a'; 999_957])
+        .expect("write oversized integer boundary payload");
     fs::write(
         dir.join("main.ku"),
         r#"import fs from "std.fs"
@@ -5424,6 +5936,12 @@ fn FloatOutputTooLarge(): null! {
     scale = 10000000000.0
     number = scale * scale
     json.encode({ number: number, padding: fs.read("float-too-large.txt")? })?
+    return ok(null)
+}
+
+fn IntegerOutputTooLarge(): null! {
+    number = -9223372036854775807 - 1
+    json.encode({ number: number, padding: fs.read("int-too-large.txt")? })?
     return ok(null)
 }
 
@@ -5455,6 +5973,21 @@ fn main(): null! {
     }
     if (!caught_float) {
         panic("float decimal marker exceeded the output limit")
+    }
+    minimum = -9223372036854775807 - 1
+    integer_text = json.encode({ number: minimum, padding: fs.read("int-ok.txt")? })?
+    if (integer_text.byte_len() != 1000000) {
+        panic("integer sign or digits were not included in output accounting")
+    }
+    json.decode(integer_text)?
+    caught_integer = false
+    try {
+        IntegerOutputTooLarge()?
+    } catch (err) {
+        caught_integer = err.domain == "json" && err.code == "stringify_error"
+    }
+    if (!caught_integer) {
+        panic("integer sign or digits exceeded the output limit")
     }
     return ok(null)
 }
@@ -5674,6 +6207,209 @@ fn native_json_stringify_typed_primitive_arrays() {
 }
 
 #[test]
+fn native_http_json_uses_existing_writer_in_bare_and_result_functions() {
+    let dir = unique_temp_dir("http-json-owned-result");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import { http, json } from "std"
+fn bare(): HttpResponse { return http.json({text:"owned"}) }
+fn created(): HttpResponse! {
+    decoded = json.decode("{\"text\":\"中文🙂\\u0000\",\"items\":[1,true,null]}")?
+    return ok(http.json(201, decoded))
+}
+fn main(): null! {
+    response = created()?
+    println(response.status)
+    println(response.body)
+    quoted = http.json("quote\"\\\n")
+    println(quoted.body)
+    response = bare()
+    println(response.body)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write native HTTP JSON Result source");
+    let generated = native_emit_c(&dir, "main.ku");
+    assert!(generated.contains("application/json; charset=utf-8"));
+    assert!(generated.contains("ku_http_json_response"));
+    let Some(exe) = native_build(&dir, "main.ku", "httpjsonresult") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(
+        stdout.replace('\r', ""),
+        concat!(
+            "201\n{\"items\":[1,true,null],\"text\":\"中文🙂\\u0000\"}\n",
+            "\"quote\\\"\\\\\\n\"\n{\"text\":\"owned\"}\n"
+        )
+    );
+    assert_eq!(code, Some(0));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_errors_match_interpreter_and_do_not_enter_catch() {
+    let dir = unique_temp_dir("http-json-fatal");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    for (name, expression, expected_prefix, message) in [
+        (
+            "status",
+            "http.json(status(), value())",
+            "status\nvalue\n",
+            "http status must be between 100 and 599",
+        ),
+        (
+            "writer",
+            "http.json(ok(\"owned\" + \" result\"))",
+            "",
+            "json.stringify does not support result",
+        ),
+    ] {
+        let source = format!(
+            r#"import http from "std.http"
+fn status(): int {{ println("status") return 99 }}
+fn value(): str {{ println("value") return "evaluated" }}
+fn response(): HttpResponse {{
+    try {{ return {expression} }}
+    catch (err) {{ println("unexpected-catch") return http.text("caught") }}
+    return http.text("unreachable")
+}}
+fn main(): null! {{
+    result = response()
+    println("unexpected-continuation")
+    return ok(null)
+}}
+"#
+        );
+        fs::write(dir.join("main.ku"), source).unwrap();
+        let mut interpreter = Command::new(ku_binary());
+        interpreter.current_dir(&dir).args(["run", "main.ku"]);
+        let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded interpreter HTTP JSON failure");
+        assert!(!interpreted.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&interpreted.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert!(String::from_utf8_lossy(&interpreted.stderr).contains(message));
+        let Some(exe) = native_build(&dir, "main.ku", &format!("httpjson{name}")) else {
+            return;
+        };
+        let mut command = Command::new(exe);
+        command.current_dir(&dir);
+        let native = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .expect("bounded native HTTP JSON failure");
+        assert_eq!(native.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout).replace('\r', ""),
+            expected_prefix
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stderr).replace('\r', ""),
+            format!("{message}\n")
+        );
+    }
+}
+
+#[test]
+fn native_http_json_keeps_existing_consumed_input_rule() {
+    let dir = unique_temp_dir("http-json-contract");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn main(): null! {
+    value={text:"owned"}
+    response=http.json(value)
+    println(value.text)
+    return ok(null)
+}
+"#,
+    )
+    .expect("write consumed native HTTP JSON source");
+    let output = run_bounded(
+        Command::new(ku_binary())
+            .current_dir(&dir)
+            .args(["check", "main.ku"]),
+        BUILD_TIMEOUT,
+        BUILD_OUTPUT_LIMITS,
+    )
+    .expect("bounded HTTP JSON ownership check");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use of moved value 'value'"));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_json_fatal_mailbox_has_no_owner_and_releases_writer_inputs() {
+    let dir = unique_temp_dir("http-json-fatal-owners");
+    let _cleanup = HttpJsonFixture(dir.clone());
+    fs::write(
+        dir.join("main.ku"),
+        r#"import http from "std.http"
+fn Failure(): HttpResponse { return http.json(ok("owned" + " input")) }
+fn main(): null! { response=Failure() return ok(null) }
+"#,
+    )
+    .unwrap();
+    let generated = native_emit_c(&dir, "main.ku");
+    run_array_capacity_c_harness(
+        &dir,
+        &generated,
+        "httpjsonfatalowners",
+        r#"
+int main(void) {
+  for (unsigned round=0; round<16; ++round) {
+    __ku_sync_reset();
+    KuStruct___ku_http_response failed=Failure();
+    KuSyncExitSignal signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json.stringify does not support result"));
+    CHECK(__ku_sync_error_message_length(signal)==strlen("json.stringify does not support result"));
+    CHECK(!failed.body.ptr && !failed.content_type.ptr && !__ku_call_depth);
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(NO_LIVE_ALLOCATIONS());
+    // A future writer with an owning error must fall back before dropping it.
+    KuError owned=ku_error_make(
+      ku_string_concat(ku_string_static((const uint8_t*)"j",1),ku_string_static((const uint8_t*)"son",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"c",1),ku_string_static((const uint8_t*)"ode",3)),
+      ku_string_concat(ku_string_static((const uint8_t*)"owned",5),ku_string_static((const uint8_t*)" message",8)));
+    CHECK(ku_perf_live_allocations==3);
+    failed=ku_http_json_response(200,(KuResult_str){false,(KuString){0},owned});
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"json stringify failed"));
+    CHECK(NO_LIVE_ALLOCATIONS());
+    ku_drop_struct___ku_http_response(&failed);
+    CHECK(ku_http_json_status(99)==0);
+    signal=__ku_sync_take();
+    CHECK(signal.kind==KU_SYNC_EXIT_HTTP_JSON_FATAL);
+    CHECK(!strcmp(__ku_sync_error_message(signal),"http status must be between 100 and 599"));
+    KuString body=ku_string_concat(ku_string_static((const uint8_t*)"[",1),ku_string_static((const uint8_t*)"]",1));
+    uint8_t* original=body.ptr;
+    KuStruct___ku_http_response good=ku_http_json_response(201,(KuResult_str){true,ku_string_move(&body),{0}});
+    CHECK(good.status==201 && good.body.ptr==original && !body.ptr);
+    CHECK(ku_perf_live_allocations==1 && __ku_sync_take().kind==KU_SYNC_EXIT_NONE);
+    ku_drop_struct___ku_http_response(&good);
+    CHECK(NO_LIVE_ALLOCATIONS());
+  }
+  return 0;
+}
+"#,
+    );
+}
+
+struct HttpJsonFixture(PathBuf);
+impl Drop for HttpJsonFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
 fn native_json_stringify_nested_user_struct_and_arrays() {
     let dir = unique_temp_dir("json-nested-user-struct");
     fs::write(
@@ -5724,6 +6460,116 @@ fn main(): null! {
     );
     assert_eq!(code, Some(0));
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_json_typed_envelope_keeps_dynamic_subtree_without_output_dom() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-typed-envelope"));
+    let dir = &fixture.0;
+    let mut source = include_str!("../examples/json_typed.ku").to_owned();
+    source.push_str(
+        r#"
+struct DynamicLists {
+    items: [KuValue]
+    nested: [[KuValue]]
+}
+enum DynamicCarrier { One(data: KuValue), Many(items: [KuValue]) }
+fn ExerciseDynamicLayouts(): null! {
+    first = json.decode("{\"value\":1}")?
+    second = json.decode("[2,true]")?
+    rows = DynamicLists { items: [first], nested: [[second]] }
+    expected = "{\"items\":[{\"value\":1}],\"nested\":[[[2,true]]]}"
+    if (json.encode(rows)? != expected) { panic("dynamic array layout") }
+    copy = rows.clone()
+    if (json.encode(copy)? != expected) { panic("dynamic array clone") }
+    one = DynamicCarrier.One(json.decode("\"owned\"")?)
+    many = DynamicCarrier.Many([json.decode("null")?])
+    one_copy = one.clone()
+    many_copy = many.clone()
+    return ok(null)
+}
+"#,
+    );
+    fs::write(dir.join("main.ku"), source).expect("write typed JSON envelope source");
+    let generated = native_emit_c(dir, "main.ku");
+    let writer = generated
+        .split("static bool ku_json_write_typed_struct_Envelope(")
+        .nth(2)
+        .expect("typed envelope writer body")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(writer.contains("ku_json_write_value(output, value.data, depth + 1, error)"));
+    assert!(
+        !writer.contains("ku_object_") && !writer.contains("ku_json_write_string(output,"),
+        "static fields must not build a DOM or rescan static keys: {writer}"
+    );
+    let reserve = "static bool ku_json_buffer_reserve(";
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static size_t ku_json_typed_allocations = 0, ku_json_typed_fail = 0;
+static void* ku_json_typed_realloc(void* value, size_t len) {{
+  ku_json_typed_allocations++;
+  if(ku_json_typed_fail && ku_json_typed_allocations==ku_json_typed_fail) return NULL;
+  return realloc(value,len);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(allocation).count(), 1);
+    let generated = generated.replacen(
+        allocation,
+        "uint8_t* data = (uint8_t*)ku_json_typed_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-typed-envelope",
+        r#"
+int main(void) {
+  /* Execute the actual Ku example before the directed allocator failures. */
+  CHECK(ku_fixture_main()==0 && NO_LIVE_ALLOCATIONS());
+  KuResult_null layouts=ExerciseDynamicLayouts();
+  CHECK(layouts.ok);
+  ku_result_drop_null(&layouts);CHECK(NO_LIVE_ALLOCATIONS());
+  uint8_t body[129];memset(body,'x',sizeof(body));
+  KuStruct_Envelope input={0};
+  input.id=ku_string_concat(ku_string_static((const uint8_t*)"owned",5),
+      ku_string_static((const uint8_t*)"-rid",4));
+  input.counter=8;
+  input.data=ku_v_str(ku_string_concat(ku_string_static(body,sizeof(body)),
+      ku_string_static((const uint8_t*)"",0)));
+  uint8_t* id=input.id.ptr;uint8_t* data=input.data.as.s.ptr;
+  size_t live=ku_perf_live_bytes;
+  ku_json_typed_allocations=0;
+  KuResult_str encoded=ku_json_stringify_typed_struct_Envelope(input);
+  CHECK(encoded.ok);size_t allocations=ku_json_typed_allocations;CHECK(allocations>0);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  CHECK(ku_perf_live_bytes==live);
+  for(size_t ordinal=1;ordinal<=allocations;ordinal++) {
+    ku_json_typed_allocations=0;ku_json_typed_fail=ordinal;
+    encoded=ku_json_stringify_typed_struct_Envelope(input);
+    CHECK(!encoded.ok && ku_string_equal(encoded.error.code,
+        ku_string_static((const uint8_t*)"out_of_memory",13)));
+    CHECK(input.id.ptr==id && input.data.as.s.ptr==data && input.counter==8);
+    ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+    CHECK(ku_perf_live_bytes==live);
+  }
+  ku_json_typed_fail=0;
+  encoded=ku_json_stringify_typed_struct_Envelope(input);CHECK(encoded.ok);
+  ku_drop_struct_Envelope(&input);
+  KuResult_kuvalue decoded=ku_json_parse(encoded.value);
+  CHECK(decoded.ok && decoded.value.tag==KU_OBJECT);
+  ku_string_drop(&encoded.value);ku_error_drop(&encoded.error);
+  ku_value_drop(&decoded.value);ku_error_drop(&decoded.error);
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+"#,
+    );
 }
 
 #[test]
@@ -8464,8 +9310,9 @@ fn main(): null! {
 
     assert!(and_body.contains("bool __ku_logical_") && and_body.contains("= false;"));
     assert!(or_body.contains("bool __ku_logical_") && or_body.contains("= true;"));
-    assert!(!and_body.contains("&&"), "logical AND must be explicit CFG");
-    assert!(!or_body.contains("||"), "logical OR must be explicit CFG");
+    // Runtime guard predicates may themselves contain &&/||. Verify the source
+    // RHS's actual selected CFG edge below, rather than forbidding those tokens
+    // throughout unrelated guard/cleanup code. Execution also checks effects.
     assert_rhs_is_behind_branch(and_body, "left", "ExplodeAnd()", true);
     assert_rhs_is_behind_branch(or_body, "left", "ExplodeOr()", false);
     assert_rhs_is_behind_branch(bounds_and_body, "left", "ku_array_get_int", true);

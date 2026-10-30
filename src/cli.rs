@@ -44,7 +44,6 @@ const MAX_IMPORT_EXPANDED_ITEMS: usize = 65_536;
 const MAX_IMPORT_CLONED_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMPORT_EDGES: usize = 16_384;
 const MAX_IMPORT_BINDINGS: usize = 16_384;
-const MAX_RLIB_DIRECTORY_ENTRIES: usize = 16_384;
 const MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES: usize = 128;
 const MAX_PINNED_LINK_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_NATIVE_TLS_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -89,7 +88,10 @@ fn remaining_build_phase_timeout(
     Ok(remaining.min(phase_limit))
 }
 
-fn run_build_process_bounded(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+pub(crate) fn run_build_process_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
     if timeout == Duration::ZERO {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -227,7 +229,7 @@ impl Drop for BuildTemporaryPath {
     }
 }
 
-fn run_build_process_capture_stdout(
+pub(crate) fn run_build_process_capture_stdout(
     command: &mut Command,
     timeout: Duration,
     max_bytes: usize,
@@ -852,94 +854,33 @@ impl BuildProcessTree {
         Err("process-tree containment is unavailable on this host".to_string())
     }
 }
-const HELP: &str = "\
-ku - simple, small, fast language tool
-
-Usage:
-  ku <file.ku>          Run a Ku source file
-  ku create <name>      Create a new Ku project directory
-  ku create <name> --template <template>
-                        Create a project from a built-in template
-  ku create --list      List built-in project templates
-  ku init               Initialize the current directory as a Ku project
-  ku init --template <template>
-                        Initialize the current directory from a template
-  ku template list      List built-in project templates
-  ku supervise [limits] -- <entry>...
-                        Run isolated workers with OS memory limits (see --help)
-  ku run [--locked|--offline] [file.ku]
-                        Run a package entry or Ku source file
-  ku check [--locked|--offline] [file.ku]
-                        Check a package entry or Ku source file without running it
-  ku check --deny-unused [file.ku]
-                        Treat unused local bindings as errors
-  ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
-  ku check --json [--deny-unused] <file.ku>
-                        Check and emit JSON Lines diagnostics
-  ku ir <file.ku>       Print checked Ku IR draft
-  ku llvm <file.ku>     Emit prototype LLVM text IR
-  ku build [--locked|--offline] [file.ku]
-                        Build a runnable executable package
-  ku build .            Build the nearest ku.mod package
-  ku build -o <path> [file.ku]
-                        Build to an explicit executable path
-  ku build --release [file.ku]
-                        Build with release profile
-  ku build --profile <debug|release|small|fast> [file.ku]
-  ku build --emit-c [file.ku]
-                        Also emit prototype native C source under .ku/build
-  ku build --emit-ir [file.ku]
-                        Also emit checked Ku IR draft under .ku/build
-  ku build --backend c [--target <target>] [file.ku]
-                        Build one native binary for host, x86_64-linux,
-                        x86_64-windows, or aarch64-darwin
-  ku build --native [--locked|--offline] <file.ku>
-                        Compatibility form: emit prototype native C source beside file
-  ku package gc [path]
-                        Remove unused package cache entries for a package
-  ku package pack [path]
-                        Create a deterministic source package artifact
-  ku package publish [path]
-                        Publish through the configured HTTPS registry
-  ku package yank [path]
-                        Withdraw one published version without deleting its artifact
-  ku package resolve [path] [--locked|--offline]
-                        Resolve and cache the complete dependency graph
-  ku version            Print version
-  ku -v                 Print version
-  ku -h                 Print this help
-  ku -help              Print this help
-  ku --help             Print this help
-  ku help               Print this help
-
-Examples:
-  ku create hello
-  ku create HelloWorld --template http
-  ku init --template cli
-  ku template list
-  ku run
-  ku run examples\\hello.ku
-  ku check
-  ku check examples\\error.ku
-  ku ir examples\\function.ku
-  ku llvm examples\\function.ku
-  ku build examples\\hello.ku
-  ku build --release -o dist\\hello.exe examples\\hello.ku
-  ku build --backend c --release --target x86_64-linux .
-  ku build --native examples\\function.ku
-  ku package gc .
-  ku package pack .
-  ku package publish .
-  ku package yank .
-  ku package resolve . --locked
-";
+const HELP: &str = crate::cli_contract::TOP_LEVEL_HELP;
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
+    let hint = crate::cli_contract::error_hint(&args);
+    dispatch_cli(args).map_err(|mut error| {
+        if error.message.contains(HELP) && !error.message.contains(&hint) {
+            error.message.push('\n');
+            error.message.push_str(&hint);
+        }
+        error
+    })
+}
+
+fn dispatch_cli(args: Vec<String>) -> Result<(), KuError> {
+    if let Some(result) = crate::cli_contract::intercept(&args) {
+        let text = result.map_err(command_error)?;
+        print!("{text}");
+        return Ok(());
+    }
     match args.get(1).map(String::as_str) {
+        Some("doctor") => crate::runner_bundle::run_doctor(&args),
         Some("create") => run_create_command(&args),
         Some("init") => run_init_command(&args),
         Some("template") => run_template_command(&args),
         Some("supervise") => crate::process_execution::run_supervise_command(&args),
+        Some("service") => crate::service_supervision::run_service_command(&args),
+        Some("__service_child") => crate::service_supervision::run_service_child(&args),
         Some("run") => {
             if args.get(2).is_some_and(|arg| arg == "build") {
                 return Err(command_error(
@@ -1878,6 +1819,9 @@ impl BuildTarget {
             NativeBinaryFormat::ElfX86_64 => {
                 cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")
             }
+            NativeBinaryFormat::ElfArm64 => {
+                cfg!(target_os = "linux") && cfg!(target_arch = "aarch64")
+            }
             NativeBinaryFormat::PeX86_64 => cfg!(windows) && cfg!(target_arch = "x86_64"),
             NativeBinaryFormat::MachOArm64 => {
                 cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")
@@ -1905,6 +1849,7 @@ enum CCompilerKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeBinaryFormat {
     ElfX86_64,
+    ElfArm64,
     PeX86_64,
     MachOArm64,
 }
@@ -2303,7 +2248,7 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
         || value.split('-').any(|part| part == "." || part == "..")
     {
         return Err(command_error(format!(
-            "invalid build target '{raw}'\nhelp: use host, x86_64-linux, x86_64-windows, or aarch64-darwin"
+            "invalid build target '{raw}'\nhelp: use host, x86_64-linux, aarch64-linux, x86_64-windows, or aarch64-darwin"
         )));
     }
     let target = match value {
@@ -2313,6 +2258,13 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
             c_triple: "x86_64-linux-gnu",
             is_windows: false,
             binary_format: NativeBinaryFormat::ElfX86_64,
+        },
+        "aarch64-linux" => BuildTarget {
+            slug: value.to_string(),
+            rust_triple: "aarch64-unknown-linux-gnu",
+            c_triple: "aarch64-linux-gnu",
+            is_windows: false,
+            binary_format: NativeBinaryFormat::ElfArm64,
         },
         "x86_64-windows" => BuildTarget {
             slug: value.to_string(),
@@ -2330,7 +2282,7 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
         },
         _ => {
             return Err(command_error(format!(
-                "unsupported build target '{raw}'\nhelp: this stage supports host, x86_64-linux, x86_64-windows, and aarch64-darwin"
+                "unsupported build target '{raw}'\nhelp: this stage supports host, x86_64-linux, aarch64-linux, x86_64-windows, and aarch64-darwin"
             )))
         }
     };
@@ -2340,6 +2292,9 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
 fn supported_host_build_target() -> Option<BuildTarget> {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return resolve_build_target(Some("x86_64-linux")).ok().flatten();
+    }
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        return resolve_build_target(Some("aarch64-linux")).ok().flatten();
     }
     if cfg!(all(windows, target_arch = "x86_64")) {
         return resolve_build_target(Some("x86_64-windows")).ok().flatten();
@@ -2665,22 +2620,15 @@ fn build_executable_to(
         })?;
     drop(runner_file);
 
-    let exe_dir = env::current_exe()
-        .map_err(|err| KuError::message(format!("failed to locate ku executable: {err}")))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| KuError::message("failed to locate ku executable directory"))?;
-    let target_dir = if exe_dir.file_name().is_some_and(|name| name == "deps") {
-        exe_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| KuError::message("failed to locate ku target directory"))?
-    } else {
-        exe_dir
-    };
-    let lib = find_ku_rlib(&target_dir)?;
-    let dependency_dirs = find_dependency_dirs(&target_dir);
-    let mut command = Command::new("rustc");
+    let bundle =
+        crate::runner_bundle::RuntimeBundle::load(config.target.map(|target| target.rust_triple))?;
+    let compiler = bundle.compiler()?;
+    if bundle.mode == "source-development" {
+        bundle.link_probe(&compiler)?;
+    }
+    let prepared = bundle.prepare(&temp_dir.join("runtime"))?;
+    let lib = &prepared.runtime;
+    let mut command = compiler.command();
     command
         .arg("--edition=2021")
         .arg(&runner)
@@ -2688,14 +2636,8 @@ fn build_executable_to(
         .arg(format!("ku={}", lib.display()))
         .arg("-o")
         .arg(temporary_output);
-    for deps in &dependency_dirs {
-        command
-            .arg("-L")
-            .arg(format!("dependency={}", deps.display()));
-    }
-    if let Some(target) = config.target {
-        command.arg("--target").arg(target.rust_triple);
-    }
+    crate::runner_bundle::add_search_paths(&mut command, &prepared);
+    command.arg("--target").arg(&bundle.target);
     if let Some(opt_level) = config.profile.rustc_opt_level() {
         command.arg("-C").arg(format!("opt-level={opt_level}"));
         command.arg("-C").arg("debuginfo=0");
@@ -2707,6 +2649,12 @@ fn build_executable_to(
         command.arg("-C").arg("strip=symbols");
     }
     if config.verbose {
+        println!(
+            "Runner compiler: {} ({}, source={})",
+            compiler.executable.display(),
+            compiler.identity.release,
+            compiler.source
+        );
         println!("rustc command: {command:?}");
     }
     let status = match run_build_process_bounded(&mut command, RUSTC_PROCESS_TIMEOUT) {
@@ -2720,7 +2668,7 @@ fn build_executable_to(
     temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
-            "ku build failed: rustc exited with {status}\nhelp: make sure Rust is installed and libku.rlib plus its dependency directory match the selected target"
+            "ku build failed: rustc exited with {status}\nhelp: run `ku doctor --backend runner`; keep the compiler diagnostics above. If E0514 is reported, the bundle/compiler identities are still inconsistent; do not mix runtime files"
         )));
     }
     let verified = validate_runner_output_candidate(temporary_output, config.target)?;
@@ -2752,9 +2700,6 @@ fn write_native_c_to(
 ) -> Result<PathBuf, KuError> {
     let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
     let native_task_entry = ir::task_lower::has_async_entry(&program);
-    if !native_task_entry {
-        reject_native_async(&program)?;
-    }
     Checker::new().check(&program).map_err(|err| {
         let id = err.diagnostic_id();
         if matches!(
@@ -2782,9 +2727,16 @@ fn write_native_c_to(
         let tasks = ir::task_lower::lower_program(&program)?;
         backend::c::generate_native_task_c_source(&tasks, &options)?
     } else {
-        let lowered = ir::lower_program(&program)?;
+        // Preserve each async handler's real lexical capture cells before
+        // replacing its setup-side body with a fatal signature placeholder.
+        let (lowered, bindings) = ir::lower_mixed_http_setup(&program)?;
         let optimized = ir::optimize_program(&lowered);
-        backend::c::generate_c_source_with_options(&optimized, &options)?
+        if bindings.is_empty() {
+            backend::c::generate_c_source_with_options(&optimized, &options)?
+        } else {
+            let tasks = ir::task_lower::lower_bound_service_handlers(&program, &bindings)?;
+            backend::c::generate_mixed_http_c_source(&optimized, &tasks, &options)?
+        }
     };
     write_text_artifact(output, c_source)
 }
@@ -5521,7 +5473,8 @@ fn verify_native_binary_target_file(
     target: &BuildTarget,
 ) -> Result<(), String> {
     match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => verify_elf_x86_64(file, file_len)?,
+        NativeBinaryFormat::ElfX86_64 => verify_elf_linux(file, file_len, 62, "x86_64")?,
+        NativeBinaryFormat::ElfArm64 => verify_elf_linux(file, file_len, 183, "aarch64")?,
         NativeBinaryFormat::PeX86_64 => verify_pe_x86_64(file, file_len)?,
         NativeBinaryFormat::MachOArm64 => verify_macho_arm64_macos(file, file_len)?,
     }
@@ -5558,7 +5511,9 @@ fn verify_native_binary_dynamic_dependencies_file(
         return Ok(());
     }
     let names = match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => read_elf_dynamic_dependencies(file, file_len)?,
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::ElfArm64 => {
+            read_elf_dynamic_dependencies(file, file_len)?
+        }
         NativeBinaryFormat::PeX86_64 => read_pe_dynamic_dependencies(file, file_len)?,
         NativeBinaryFormat::MachOArm64 => read_macho_dynamic_dependencies(file, file_len)?,
     };
@@ -5693,7 +5648,9 @@ fn dynamic_dependency_matches_selected_loader(
                 .unwrap_or(expected);
             actual.eq_ignore_ascii_case(expected)
         }
-        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::MachOArm64 => actual == expected,
+        NativeBinaryFormat::ElfX86_64
+        | NativeBinaryFormat::ElfArm64
+        | NativeBinaryFormat::MachOArm64 => actual == expected,
     }
 }
 
@@ -6302,7 +6259,12 @@ fn read_macho_dynamic_metadata(
     })
 }
 
-fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
+fn verify_elf_linux(
+    file: &mut fs::File,
+    file_len: u64,
+    expected_machine: u16,
+    architecture: &str,
+) -> Result<(), String> {
     const ELF_HEADER_SIZE: usize = 64;
     const ELF_PROGRAM_HEADER_SIZE: u64 = 56;
     const MAX_PROGRAM_HEADERS: u16 = 4_096;
@@ -6324,7 +6286,7 @@ fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
         || !matches!(os_abi, 0 | 3)
         || header[8] != 0
         || !matches!(file_type, 2 | 3)
-        || machine != 62
+        || machine != expected_machine
         || version != 1
         || entry == 0
         || header_size as usize != ELF_HEADER_SIZE
@@ -6333,9 +6295,9 @@ fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
         || program_count > MAX_PROGRAM_HEADERS
         || program_offset < ELF_HEADER_SIZE as u64
     {
-        return Err(
-            "expected a Linux-compatible little-endian x86_64 ELF64 executable".to_string(),
-        );
+        return Err(format!(
+            "expected a Linux-compatible little-endian {architecture} ELF64 executable"
+        ));
     }
     let table_size = ELF_PROGRAM_HEADER_SIZE
         .checked_mul(program_count as u64)
@@ -6864,6 +6826,18 @@ fn compile_c_source(
     static_link: bool,
     verbose: bool,
 ) -> Result<(), KuError> {
+    compile_c_source_with_output(source, output, target, profile, static_link, verbose, false)
+}
+
+fn compile_c_source_with_output(
+    source: &Path,
+    output: &Path,
+    target: Option<&BuildTarget>,
+    profile: BuildProfile,
+    static_link: bool,
+    verbose: bool,
+    quiet_stdout: bool,
+) -> Result<(), KuError> {
     let link_started = Instant::now();
     let link_deadline = link_started
         .checked_add(NATIVE_LINK_TOTAL_TIMEOUT)
@@ -6871,7 +6845,7 @@ fn compile_c_source(
     validate_native_output_name(output)?;
     if target.is_none() && supported_host_build_target().is_none() {
         return Err(KuError::message(
-            "native C linking is not validated for this host architecture\nhelp: emit C only, or use an explicit supported target: x86_64-linux, x86_64-windows, aarch64-darwin",
+            "native C linking is not validated for this host architecture\nhelp: emit C only, or use an explicit supported target: x86_64-linux, aarch64-linux, x86_64-windows, aarch64-darwin",
         ));
     }
     let output_directory = link_output_directory(output);
@@ -7233,6 +7207,9 @@ fn compile_c_source(
             "C compiler execution",
         )
         .map_err(|error| KuError::message(error.to_string()))?;
+        if quiet_stdout {
+            command.stdout(Stdio::null());
+        }
         match run_build_process_bounded(&mut command, compiler_timeout) {
             Ok(status) if status.success() => {
                 let verified = match validate_link_output_candidate(
@@ -7396,6 +7373,7 @@ fn compile_c_source(
                         }),
                     },
                     MsvcCompileOptions {
+                        quiet_stdout,
                         profile,
                         static_link,
                         verbose,
@@ -7520,10 +7498,12 @@ fn compiler_target_matches_build(value: &str, target: &BuildTarget) -> bool {
         NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::PeX86_64 => {
             value.contains("x86_64") || value.contains("amd64")
         }
-        NativeBinaryFormat::MachOArm64 => value.contains("aarch64") || value.contains("arm64"),
+        NativeBinaryFormat::ElfArm64 | NativeBinaryFormat::MachOArm64 => {
+            value.contains("aarch64") || value.contains("arm64")
+        }
     };
     let operating_system_matches = match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => value.contains("linux"),
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::ElfArm64 => value.contains("linux"),
         NativeBinaryFormat::PeX86_64 => value.contains("windows") || value.contains("mingw"),
         NativeBinaryFormat::MachOArm64 => {
             value.contains("darwin") || value.contains("apple") || value.contains("macos")
@@ -7681,6 +7661,7 @@ struct MsvcNativeTlsLink<'a> {
 
 #[derive(Clone, Copy)]
 struct MsvcCompileOptions {
+    quiet_stdout: bool,
     profile: BuildProfile,
     static_link: bool,
     verbose: bool,
@@ -7790,6 +7771,9 @@ fn compile_with_msvc(
         "MSVC compiler execution",
     )
     .map_err(|error| KuError::message(error.to_string()))?;
+    if options.quiet_stdout {
+        command.stdout(Stdio::null());
+    }
     let result = run_build_process_bounded(&mut command, timeout);
     let _ = fs::remove_file(&obj);
     match result {
@@ -8077,14 +8061,7 @@ fn split_command_words(value: &str) -> Result<Vec<String>, &'static str> {
     Ok(words)
 }
 
-fn reject_native_async(program: &Program) -> Result<(), KuError> {
-    reject_compiled_async(
-        program,
-        "native C prototype does not support async/await yet; use the interpreter runtime",
-    )
-}
-
-struct TempBuildDir {
+pub(crate) struct TempBuildDir {
     path: PathBuf,
 }
 
@@ -8094,7 +8071,7 @@ impl TempBuildDir {
         Self { path }
     }
 
-    fn create_private(label: &str) -> io::Result<Self> {
+    pub(crate) fn create_private(label: &str) -> io::Result<Self> {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
             let path = unique_build_tool_path(label, "dir")?;
@@ -8119,7 +8096,7 @@ impl TempBuildDir {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -8156,82 +8133,6 @@ fn raw_string_literal(source: &str) -> String {
         }
     }
     format!("{source:?}")
-}
-
-fn find_ku_rlib(exe_dir: &Path) -> Result<PathBuf, KuError> {
-    let direct = exe_dir.join("libku.rlib");
-    let deps = exe_dir.join("deps");
-    let mut candidates = Vec::new();
-    if direct.is_file() {
-        candidates.push(direct.clone());
-    }
-    if let Ok(entries) = fs::read_dir(&deps) {
-        for (index, entry) in entries.enumerate() {
-            if index >= MAX_RLIB_DIRECTORY_ENTRIES {
-                return Err(KuError::message(format!(
-                    "ku build stopped after scanning {MAX_RLIB_DIRECTORY_ENTRIES} entries in '{}'; remove stale target artifacts and retry",
-                    deps.display()
-                )));
-            }
-            let entry = entry.map_err(|err| {
-                KuError::message(format!(
-                    "failed to inspect Rust dependency directory '{}': {err}",
-                    deps.display()
-                ))
-            })?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if name.starts_with("libku-") && name.ends_with(".rlib") && path.is_file() {
-                candidates.push(path);
-            }
-        }
-    }
-    candidates.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-    });
-    candidates.pop().ok_or_else(|| {
-        KuError::message(format!(
-            "ku build needs libku.rlib next to the ku executable; looked in {} and {}",
-            direct.display(),
-            deps.display()
-        ))
-    })
-}
-
-fn find_dependency_dirs(exe_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    push_existing_dir(&mut dirs, exe_dir.join("deps"));
-    if exe_dir.file_name().is_some_and(|name| name == "release") {
-        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
-            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "debug") {
-        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
-            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "release") {
-        if let Some(repo) = exe_dir.parent() {
-            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
-        }
-    }
-    if exe_dir.file_name().is_some_and(|name| name == "debug") {
-        if let Some(repo) = exe_dir.parent() {
-            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
-        }
-    }
-    dirs
-}
-
-fn push_existing_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
-    if path.is_dir() && !dirs.iter().any(|existing| existing == &path) {
-        dirs.push(path);
-    }
 }
 
 fn expected_ku_file(path: &str) -> KuError {
@@ -10577,6 +10478,28 @@ fn namespace_lookup(path: &str, namespaces: &NamespaceMaps) -> Option<String> {
     namespaces.get(namespace)?.get(name).cloned()
 }
 
+/// A bounded real link probe using the same C compiler selection as native build.
+pub(crate) fn doctor_c_toolchain() -> KuResult<String> {
+    let temporary =
+        TempBuildDir::create_private("doctor-c").map_err(|e| KuError::message(e.to_string()))?;
+    let source = temporary.path().join("probe.c");
+    let output = temporary
+        .path()
+        .join(if cfg!(windows) { "probe.exe" } else { "probe" });
+    fs::write(&source, "int main(void) { return 0; }\n")
+        .map_err(|e| KuError::message(e.to_string()))?;
+    compile_c_source_with_output(
+        &source,
+        &output,
+        None,
+        BuildProfile::Debug,
+        false,
+        false,
+        true,
+    )?;
+    Ok("host C compiler/linker probe passed (database/TLS dependencies are separate)".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11179,6 +11102,19 @@ mod tests {
         assert_eq!(linux.c_triple, "x86_64-linux-gnu");
         assert!(!linux.is_windows);
 
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("resolved Linux ARM64 target");
+        assert_eq!(linux_arm64.slug, "aarch64-linux");
+        assert_eq!(linux_arm64.rust_triple, "aarch64-unknown-linux-gnu");
+        assert_eq!(linux_arm64.c_triple, "aarch64-linux-gnu");
+        assert_eq!(linux_arm64.binary_format, NativeBinaryFormat::ElfArm64);
+        assert!(!linux_arm64.is_windows);
+        assert_eq!(
+            linux_arm64.matches_host(),
+            cfg!(all(target_os = "linux", target_arch = "aarch64"))
+        );
+
         let windows = resolve_build_target(Some("x86_64-windows"))
             .expect("windows target")
             .expect("resolved windows target");
@@ -11211,15 +11147,16 @@ mod tests {
     }
 
     #[test]
-    fn three_native_targets_emit_separate_source_free_import_graphs_without_a_linker() {
+    fn native_targets_emit_separate_source_free_import_graphs_without_a_linker() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_nanos();
-        let dir = env::temp_dir().join(format!("ku-three-target-c-{}-{nonce}", std::process::id()));
+        let dir =
+            env::temp_dir().join(format!("ku-native-target-c-{}-{nonce}", std::process::id()));
         let source_dir = dir.join("source");
         let retained_dir = dir.join("retained-c");
-        fs::create_dir_all(&source_dir).expect("create three-target source fixture");
+        fs::create_dir_all(&source_dir).expect("create native-target source fixture");
         fs::create_dir_all(&retained_dir).expect("create retained C fixture");
         fs::write(
             source_dir.join("math.ku"),
@@ -11234,7 +11171,12 @@ mod tests {
         .expect("write target entry fixture");
 
         let mut retained = Vec::new();
-        for target_name in ["x86_64-windows", "x86_64-linux", "aarch64-darwin"] {
+        for target_name in [
+            "x86_64-windows",
+            "x86_64-linux",
+            "aarch64-linux",
+            "aarch64-darwin",
+        ] {
             let args = vec![
                 "ku".to_string(),
                 "build".to_string(),
@@ -11948,6 +11890,11 @@ mod tests {
         let darwin = resolve_build_target(Some("aarch64-darwin"))
             .expect("darwin target")
             .expect("explicit darwin target");
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        let mut arm64_dependencies = dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]);
+        arm64_dependencies[18..20].copy_from_slice(&183u16.to_le_bytes());
         let features = CSourceFeatures {
             libpq: true,
             libmysql: true,
@@ -11958,6 +11905,13 @@ mod tests {
                 dir.join("app-linux"),
                 linux,
                 dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]),
+                "libpq.so.5",
+                "libmysqlclient.so.21",
+            ),
+            (
+                dir.join("app-linux-arm64"),
+                linux_arm64,
+                arm64_dependencies,
                 "libpq.so.5",
                 "libmysqlclient.so.21",
             ),
@@ -12323,6 +12277,19 @@ mod tests {
             .expect("darwin target")
             .expect("explicit darwin target");
         verify_native_binary_target(&elf_path, &linux).expect("matching ELF target");
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        let arm64_path = dir.join("app-linux-arm64");
+        let mut arm64 = elf.clone();
+        arm64[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(&arm64_path, &arm64).expect("write ARM64 ELF fixture");
+        verify_native_binary_target(&arm64_path, &linux_arm64).expect("matching ARM64 ELF");
+        assert!(verify_native_binary_target(&arm64_path, &linux).is_err());
+        assert!(verify_native_binary_target(&elf_path, &linux_arm64).is_err());
+        let truncated_arm64 = dir.join("truncated-arm64-elf");
+        fs::write(&truncated_arm64, &arm64[..100]).expect("write truncated ARM64 ELF");
+        assert!(verify_native_binary_target(&truncated_arm64, &linux_arm64).is_err());
         verify_native_binary_target(&pe_path, &windows).expect("matching PE target");
         verify_native_binary_target(&macho_path, &darwin).expect("matching Mach-O target");
         assert!(verify_native_binary_target(&elf_path, &windows).is_err());
@@ -12553,15 +12520,19 @@ mod tests {
 
     #[test]
     fn explicit_matching_host_target_links_when_a_native_toolchain_is_available() {
-        let Some(target) = ["x86_64-linux", "x86_64-windows", "aarch64-darwin"]
-            .into_iter()
-            .map(|name| {
-                resolve_build_target(Some(name))
-                    .expect("supported target")
-                    .expect("explicit target")
-            })
-            .find(BuildTarget::matches_host)
-        else {
+        let Some(target) = [
+            "x86_64-linux",
+            "aarch64-linux",
+            "x86_64-windows",
+            "aarch64-darwin",
+        ]
+        .into_iter()
+        .map(|name| {
+            resolve_build_target(Some(name))
+                .expect("supported target")
+                .expect("explicit target")
+        })
+        .find(BuildTarget::matches_host) else {
             eprintln!("skip: this host architecture has no first-stage explicit target");
             return;
         };
@@ -13212,15 +13183,20 @@ fn main(): null! {
             .iter()
             .all(|candidate| !candidate.explicitly_configured));
         assert_eq!(automatic[2].kind, CCompilerKind::Preconfigured);
-        let cross_target = ["x86_64-linux", "x86_64-windows", "aarch64-darwin"]
-            .into_iter()
-            .map(|name| {
-                resolve_build_target(Some(name))
-                    .expect("supported target")
-                    .expect("explicit target")
-            })
-            .find(|target| !target.matches_host())
-            .expect("at least one target differs from this host");
+        let cross_target = [
+            "x86_64-linux",
+            "aarch64-linux",
+            "x86_64-windows",
+            "aarch64-darwin",
+        ]
+        .into_iter()
+        .map(|name| {
+            resolve_build_target(Some(name))
+                .expect("supported target")
+                .expect("explicit target")
+        })
+        .find(|target| !target.matches_host())
+        .expect("at least one target differs from this host");
         assert!(c_compiler_supports_explicit_target(
             &candidates[0],
             &cross_target
@@ -13322,6 +13298,25 @@ fn main(): null! {
             c_compiler_target_arguments(&clang, &linux).expect("clang target arguments"),
             vec!["--target=x86_64-unknown-linux-gnu"]
         );
+        let linux_arm64 = resolve_build_target(Some("aarch64-linux"))
+            .expect("supported Linux ARM64 target")
+            .expect("explicit Linux ARM64 target");
+        assert_eq!(
+            c_compiler_target_arguments(&clang, &linux_arm64).expect("ARM64 clang arguments"),
+            vec!["--target=aarch64-unknown-linux-gnu"]
+        );
+        assert!(compiler_target_matches_build(
+            "aarch64-unknown-linux-gnu",
+            &linux_arm64
+        ));
+        assert!(!compiler_target_matches_build(
+            "x86_64-unknown-linux-gnu",
+            &linux_arm64
+        ));
+        assert!(!compiler_target_matches_build(
+            "aarch64-apple-darwin",
+            &linux_arm64
+        ));
         #[cfg(windows)]
         let zig_command = r#""C:\Program Files\zig\zig.exe" cc"#;
         #[cfg(unix)]
@@ -13334,6 +13329,10 @@ fn main(): null! {
         assert_eq!(
             c_compiler_target_arguments(&zig, &linux).expect("Zig target arguments"),
             vec!["-target", "x86_64-linux-gnu"]
+        );
+        assert_eq!(
+            c_compiler_target_arguments(&zig, &linux_arm64).expect("ARM64 Zig target arguments"),
+            vec!["-target", "aarch64-linux-gnu"]
         );
         let preconfigured =
             parse_c_compiler_candidate("x86_64-linux-gnu-gcc", true).expect("parse configured GCC");

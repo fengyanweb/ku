@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "status": "task_mix_fixed_protocol_keep_historical_protocol_separate",
+  "scope": "Open-arrival short HTTP and independent long CPU streams; no database or JSON business requests. database.rows and corpora are required by the unchanged V5 shared loader only.",
+  "endpoints": {
+    "ok": {
+      "method": "GET",
+      "path": "/ok",
+      "expected": "ok:{rid}"
+    },
+    "cpu": {
+      "method": "GET",
+      "path": "/work",
+      "work_units": [
+        512
+      ],
+      "seed_lengths": [
+        3,
+        11
+      ],
+      "expected": "{rid}:{checksum:08d}"
+    }
+  },
+  "cpu_algorithm": {
+    "iterations": "work_units*1000 =512000",
+    "kernel": "total=seed; i=0..511999: total=(total*33+i+seed)%100000000; i64 exact",
+    "seed_selection": "task_mix CPU stream ordinal alternates seed lengths3,11 independently of short arrivals"
+  },
+  "database": {
+    "rows": 1,
+    "loader_only": true,
+    "opened": false
+  },
+  "corpora": {
+    "object": {
+      "path": "corpora/object.json",
+      "bytes": 1048,
+      "sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "array": {
+      "path": "corpora/array.json",
+      "bytes": 937,
+      "sha256": "96e17f4ef99d04bede9f7208d0fa94f8b2f0dbeebc53c417e4b0624e7fda3ae1",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    },
+    "escape": {
+      "path": "corpora/escape.json",
+      "bytes": 4116,
+      "sha256": "a5916fe82167409eb847eb0021da550a2c9bcaa224c80f1d62e91210dd72d8af",
+      "counter": 7,
+      "response_keys": [
+        "id",
+        "counter",
+        "data"
+      ],
+      "response_counter": 8
+    }
+  },
+  "SLO": {
+    "task_mix_short_p99_ms": 20,
+    "ok_p99_ms": 20,
+    "cpu_p99_ms": 3000,
+    "success_fraction_planned": 0.999,
+    "body_errors": 0,
+    "ordinary_absolute_timeout_seconds": 3
+  },
+  "measurement": {
+    "driver_workers": 4096,
+    "driver_queue": 4096,
+    "driver_cpu_fraction_strict_upper": 0.9,
+    "scheduled_to_sent_p99_ms_max": 5,
+    "driver_gate_scope": "Generation/headroom censor only: excessive send lag may include service backpressure; it does not prove a driver root cause.",
+    "cancellation": "Optional fixed every10th CPU plan, RST250us after first positive write. Reset is neither correct completion nor server stop/reuse proof.",
+    "post_driver_cancel_observation_seconds_min": 0.6
+  }
+}

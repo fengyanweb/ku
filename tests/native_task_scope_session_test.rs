@@ -80,7 +80,7 @@ fn native_task_scope_sessions_complete_manifest_and_linearization_execute_in_c()
         assert!(!generated.contains(forbidden));
     }
     for required in [
-        "#define KU_TASK_DRIVER_ABI_VERSION 10u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 12u",
         "ku_task_driver_scope_begin(",
         "ku_task_driver_scope_end(",
         "ku_task_driver_scope_promote_final(",
@@ -209,15 +209,18 @@ static void fixture_promotion_budget_load(const volatile void*);
 
 const CLOCK_HOOK: &str = r#"
 static KuTaskControlDeadlineV1 fixture_clock;
-/* Fail only the actual shutdown caller's clock sample. The worker and later
- * observers retain healthy clocks; the resulting driver clock_fault remains
- * sticky through destruction and is never cleared by this fixture. */
+/* Fail one actual shutdown clock sample, then let diagnostic ready-queue
+ * timestamps use the healthy clock. The resulting driver clock_fault remains
+ * sticky through destruction. Promotion uses FORBID: any clock read there
+ * remains an error, without changing the real cleanup deadline. */
+enum { FIXTURE_CLOCK_FORBID=1, FIXTURE_CLOCK_FAIL_ONCE=2 };
 static KU_THREAD_LOCAL int fixture_fail_clock;
 static KU_THREAD_LOCAL unsigned fixture_failed_clock_reads;
 static uint64_t fixture_original_now(void);
 static uint64_t ku_task_driver_now_ms(void) {
   if (fixture_fail_clock) {
-    CHECK(++fixture_failed_clock_reads <= 2u);
+    CHECK(++fixture_failed_clock_reads == 1u);
+    if (fixture_fail_clock==FIXTURE_CLOCK_FAIL_ONCE) fixture_fail_clock=0;
     return UINT64_MAX;
   }
   uint64_t value=ku_task_control_deadline_load(&fixture_clock);
@@ -302,8 +305,8 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity) {
   runtime->slots=(KuTaskDriverSlotV1*)calloc(capacity,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u && KU_TASK_FRAME_ABI_VERSION==5u);
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==12u && KU_TASK_FRAME_ABI_VERSION==5u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
@@ -660,7 +663,7 @@ static void fixture_action(FixtureRole* r,KuTaskInstance_0* instance,const Fixtu
       fixture_promotion_budget_reads=0;
       fixture_promotion_budget_address=&instance->control.cleanup_deadline_ms;
       fixture_promotion_budget_probe=c->op==OP_PROMOTE_PUBLISHING || c->op==OP_PROMOTE_PUBLISHED;
-      fixture_failed_clock_reads=0; fixture_fail_clock=1;
+      fixture_failed_clock_reads=0; fixture_fail_clock=FIXTURE_CLOCK_FORBID;
       status=ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,c->mask,c->deadline,&output);
       fixture_fail_clock=0; fixture_promotion_budget_probe=0; fixture_promotion_budget_address=NULL;
       CHECK(!fixture_failed_clock_reads);
@@ -1052,7 +1055,7 @@ static void fixture_fault_or_closing_session(int faulted) {
   KuTaskDriverScopeTokenV1 token=roles[0].scope;
   uint64_t shutdown_deadline=fixture_original_now();
   if (faulted) {
-    fixture_failed_clock_reads=0; fixture_fail_clock=1;
+    fixture_failed_clock_reads=0; fixture_fail_clock=FIXTURE_CLOCK_FAIL_ONCE;
     uint32_t result=ku_task_driver_shutdown(rt.driver,shutdown_deadline);
     fixture_fail_clock=0;
     CHECK(result==KU_TASK_DRIVER_INTERNAL && fixture_failed_clock_reads==1u);
@@ -1236,7 +1239,7 @@ static void fixture_promotion_after_clock_fault(void) {
   fixture_issue(&rt,0,0,1,original); fixture_arm(&rt,0,0,original,KU_TASK_DRIVER_PENDING);
   CHECK(!ku_task_driver_request_cancel(&roles[0].ticket,&roles[0].handle.owner.lease,
       KU_TASK_CONTROL_TIMED_OUT,original)); fixture_idle(&rt);
-  fixture_failed_clock_reads=0; fixture_fail_clock=1;
+  fixture_failed_clock_reads=0; fixture_fail_clock=FIXTURE_CLOCK_FAIL_ONCE;
   uint32_t shutdown=ku_task_driver_shutdown(rt.driver,0);
   fixture_fail_clock=0; CHECK(shutdown==KU_TASK_DRIVER_INTERNAL && fixture_failed_clock_reads==1u);
   fixture_rejected_idle(&rt,1,0);

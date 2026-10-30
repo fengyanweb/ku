@@ -71,6 +71,11 @@ fn native_async_boundary_function_type_does_not_lose_async_flag() {
         "enum Handler { Callback(callback: async fn(): int!) } fn main() {}",
     ] {
         rejects_lowering(source);
+        let program = checked(source);
+        assert_async_rejection(
+            ir::lower_mixed_http_setup(&program)
+                .expect_err("mixed setup without handlers must retain the async type boundary"),
+        );
     }
 }
 
@@ -148,7 +153,7 @@ fn native_async_boundary_cli_native_llvm_and_emit_ir_reject_before_artifacts() {
     for (arguments, message) in [
         (
             vec!["build", "--native"],
-            "native C prototype does not support async/await yet",
+            "async/await is not supported by IR/native lowering yet",
         ),
         (
             vec!["build", "--emit-ir"],

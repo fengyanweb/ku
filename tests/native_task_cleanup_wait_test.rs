@@ -302,7 +302,7 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->driver = (KuTaskDriverV1*)calloc(1, sizeof(*runtime->driver));
   runtime->slots = (KuTaskDriverSlotV1*)calloc(capacity, sizeof(*runtime->slots));
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring)); CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
+  size_t fixed = ku_task_driver_fixed_storage_bytes(capacity);
   uint64_t startup_now = ku_task_driver_now_ms();
   CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
   uint64_t startup_deadline = startup_now + 1000u;
@@ -1190,13 +1190,13 @@ static void fixture_corrupt_ack_process(void) {
   CHECK(fixture_count(&roles[1].continuations) == 1 && fixture_count(&roles[1].disposes) == 1);
   CHECK(ku_task_driver_shutdown(runtime->driver, 0) == KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
   CHECK(ku_task_driver_destroy(runtime->driver) == KU_TASK_DRIVER_PENDING);
-  CHECK(fixture_ledger().allocations == 4 && fixture_ledger().bytes != 0);
+  CHECK(fixture_ledger().allocations == 5 && fixture_ledger().bytes != 0);
   /* Normal return with sanitizer handlers intact. The rooted quarantine is
    * NOT ledger-zero or leak-free cleanup; only process isolation reclaims it. */
   puts("task-cleanup-wait-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 10u); CHECK(KU_TASK_FRAME_ABI_VERSION == 5u); ku_task_control_deadline_init(&fixture_clock);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 12u); CHECK(KU_TASK_FRAME_ABI_VERSION == 5u); ku_task_control_deadline_init(&fixture_clock);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);
   fixture_basic_wait(0, 0); fixture_basic_wait(0, 1); fixture_basic_wait(1, 0);

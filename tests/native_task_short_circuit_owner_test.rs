@@ -247,7 +247,7 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_byt
   runtime->slots=(KuTaskDriverSlotV1*)calloc(capacity,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
   /* Exact conservative admission accounting, not a claim about allocator RSS:
    * each hosted Start adds I, transferring the existing A charge once. */
   size_t tasks=sizeof(KuTaskInstance_0)+(capacity-1u)*sizeof(KuTaskInstance_1)+input_bytes;
@@ -255,7 +255,7 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_byt
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(startup_deadline!=UINT64_MAX);
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==10u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==12u);
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
       runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   fixture_idle(runtime);

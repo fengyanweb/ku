@@ -204,6 +204,7 @@ impl Worker {
             oom_kill_count: None,
             memory_limit_event: None,
             memory_limit_termination: None,
+            memory_limit_evidence: None,
             process_count: Some(u64::from(accounting.ActiveProcesses)),
             resource_group: self.group_name.clone(),
         })

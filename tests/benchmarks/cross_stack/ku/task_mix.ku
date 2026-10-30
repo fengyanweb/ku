@@ -1,0 +1,69 @@
+// Permanent short-HTTP / long-CPU comparison fixture. No database is opened.
+// The CPU kernel and helpers are byte-identical to server.ku; /timer is only
+// for focused I/O diagnostics, not the short/long capacity scoring workload.
+// The runner provides an isolated config.json. The 20ms short-client SLO is an
+// experiment rule; the HTTP execution deadline remains 3s for both stacks.
+import { http, json, fs, time, bytes } from "std"
+
+async fn digits(number: int): str! {
+    value = number
+    d0 = 48 + value % 10
+    value = value / 10
+    d1 = 48 + value % 10
+    value = value / 10
+    d2 = 48 + value % 10
+    value = value / 10
+    d3 = 48 + value % 10
+    encoded = bytes.from_array([d3, d2, d1, d0])?
+    return ok(encoded.to_str()?)
+}
+
+async fn ready(req: HttpRequest): HttpResponse! {
+    return ok(http.text("ok:" + req.query.rid))
+}
+
+async fn work(req: HttpRequest): HttpResponse! {
+    iterations = req.query.work.len() * 1000
+    seed = req.query.seed.len()
+    if (iterations < 1000 || iterations > 1000000 || seed < 1 || seed > 1024) {
+        fail "CPU fixture input outside common integer range"
+    }
+    total = seed
+    i = 0
+    while (i < iterations) {
+        total = (total * 33 + i + seed) % 100000000
+        i = i + 1
+    }
+    return (await work_response(req, total))
+}
+
+// Split only the formatting step to stay within the existing 64-slot Task ABI.
+async fn work_response(req: HttpRequest, total: int): HttpResponse! {
+    left = (await digits(total / 10000))?
+    right = (await digits(total % 10000))?
+    return ok(http.text(req.query.rid + ":" + left + right))
+}
+
+async fn timer(req: HttpRequest): HttpResponse! {
+    time.sleep(25)?
+    return ok(http.text("timer:" + req.query.rid))
+}
+
+fn main(): null! {
+    config = json.decode(fs.read("config.json")?)?
+    address = config["addr"]?.as_str()?
+    active_limit = config["max_active_requests"]?.as_int()?
+    connection_limit = config["max_connections"]?.as_int()?
+    pending_limit = config["max_pending_requests"]?.as_int()?
+    app = http.server({max_connections: connection_limit, max_active_requests: active_limit,
+        max_pending_requests: pending_limit, max_buffer_bytes: 67108864,
+        max_header_bytes: 4096, max_body_bytes: 65536,
+        handler_timeout_ms: 3000, idle_timeout_ms: 5000,
+        read_header_timeout_ms: 3000, read_body_timeout_ms: 3000,
+        write_timeout_ms: 3000})
+    app.get("/ok", ready)
+    app.get("/work", work)
+    app.get("/timer", timer)
+    app.listen(address)?
+    return ok(null)
+}

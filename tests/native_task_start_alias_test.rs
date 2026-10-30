@@ -374,7 +374,7 @@ static void fixture_init(FixtureRuntime* runtime,size_t capacity) {
   runtime->driver=(KuTaskDriverV1*)calloc(1,sizeof(*runtime->driver));
   runtime->slots=(KuTaskDriverSlotV1*)calloc(capacity,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring)); CHECK(runtime->driver && runtime->slots && runtime->ring);
-  size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
+  size_t fixed=ku_task_driver_fixed_storage_bytes(capacity);
   size_t tasks=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2)+1u;
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);

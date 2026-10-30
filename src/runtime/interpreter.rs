@@ -705,7 +705,7 @@ impl Interpreter {
             let mut env = captures.clone();
             env.push_scope();
             if let Some(name) = self_name {
-                env.define_owned(
+                env.define_function_self(
                     name.clone(),
                     Value::Function {
                         params: params.to_vec(),
@@ -715,7 +715,6 @@ impl Interpreter {
                         self_name: self_name.clone(),
                         is_async: declared_async,
                     },
-                    false,
                     span,
                 )?;
             }
@@ -1108,7 +1107,7 @@ impl Interpreter {
 
     fn eval_array_map(
         &mut self,
-        target: &Expr,
+        target: Value,
         args: &[Expr],
         env: &mut Env,
         depth: usize,
@@ -1119,10 +1118,6 @@ impl Interpreter {
                 format!("array.map expects 1 argument but got {}", args.len()),
                 span,
             ));
-        }
-        let target = self.eval(target, env, depth)?;
-        if self.pending_fail.is_some() {
-            return Ok(Value::Null);
         }
         let Value::Array(items) = target else {
             return Err(KuError::runtime(
@@ -1429,7 +1424,18 @@ impl Interpreter {
                         })
                     })?;
                     let Some(full_name) = full_name else {
-                        return Ok(None);
+                        // This receiver has already run. Resolve only its selected
+                        // field, as ordinary field access does, before releasing
+                        // any read leases and evaluating the call arguments.
+                        self.tick(callee.span)?;
+                        let callable = value.with_read(callee.span, |value| {
+                            field_value(value, name, callee.span)
+                        })?;
+                        drop(value);
+                        drop(leases);
+                        return self
+                            .eval_callable_arguments(callable, callee, args, env, depth, span)
+                            .map(Some);
                     };
                     values.push(value);
                     full_name
@@ -1444,6 +1450,57 @@ impl Interpreter {
             }
         }
         eval_readonly_builtin(name, &values, span)
+    }
+
+    fn eval_callable_arguments(
+        &mut self,
+        callable: Value,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        callable.with_read(span, |callable| {
+            let Value::Function {
+                params,
+                param_modes,
+                body,
+                captures,
+                self_name,
+                is_async,
+            } = callable
+            else {
+                return Err(KuError::runtime(
+                    format!("cannot call {}", callable.type_name()),
+                    callee.span,
+                ));
+            };
+            let mut leases = Vec::new();
+            let mut values = Vec::with_capacity(args.len());
+            let result = (|| {
+                self.eval_call_arguments(args, param_modes, env, depth, &mut leases, &mut values)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::fail(value));
+                }
+                self.call_function_value_flow(FunctionValueCall {
+                    params,
+                    param_modes,
+                    body,
+                    captures,
+                    self_name,
+                    is_async: *is_async,
+                    args: std::mem::take(&mut values),
+                    span,
+                    depth: depth + 1,
+                })
+            })();
+            let result = self.finish_call_arguments(env, leases, values, result, span);
+            self.call_argument_value(result, span)
+        })
     }
 
     fn eval_std_method_call(
@@ -1467,9 +1524,53 @@ impl Interpreter {
                 return Ok(None);
             }
         }
-        let target_value = self.eval(target, env, depth)?;
+        // `take` is a new KuValue method, not a globally reserved field name.
+        // Preserve already-supported struct/object callable fields. Inspect a
+        // bound source without cloning or consuming it; the ordinary call path
+        // below still evaluates its receiver once before its arguments.
+        let callable_take = if name == "take" {
+            if let ExprKind::Variable(local) = &target.kind {
+                if env.contains(local) {
+                    env.with_value(local, target.span, |value| {
+                        value.with_read(target.span, |value| Ok(has_callable_take_field(value)))
+                    })?
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let target_value = if name == "take" && !callable_take {
+            if let ExprKind::Variable(local) = &target.kind {
+                self.tick(target.span)?;
+                env.take_owned_json_value(local, target.span)?
+            } else {
+                self.eval(target, env, depth)?
+            }
+        } else {
+            self.eval(target, env, depth)?
+        };
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
+        }
+        if name == "take"
+            && target_value.with_read(target.span, |value| Ok(has_callable_take_field(value)))?
+        {
+            self.tick(callee.span)?;
+            let callable = target_value
+                .with_read(callee.span, |value| field_value(value, name, callee.span))?;
+            drop(target_value);
+            return self
+                .eval_callable_arguments(callable, callee, args, env, depth, span)
+                .map(Some);
+        }
+        if name == "map" && matches!(target_value, Value::Array(_)) {
+            return self
+                .eval_array_map(target_value, args, env, depth, span)
+                .map(Some);
         }
         if name == "clone" {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
@@ -1520,10 +1621,9 @@ impl Interpreter {
         }
         let module = target_value.with_read(span, |target| {
             Ok(match target {
-                // KuValue converters win over the concrete-type modules: a value read
-                // from an object may carry any tag, so `.as_int()`/`.as_str()` must
-                // dispatch to the kuvalue path regardless of the runtime tag.
-                _ if name == "as_int" || name == "as_str" => "kuvalue",
+                // A KuValue can carry any runtime tag, including objects with
+                // callable fields. Converters retain their existing priority.
+                _ if matches!(name.as_str(), "as_int" | "as_str" | "take") => "kuvalue",
                 Value::String(_) => "string",
                 Value::Array(_) if name != "map" => "array",
                 Value::Object(_) if name == "get_or" => "object",
@@ -1531,7 +1631,31 @@ impl Interpreter {
             })
         })?;
         if module.is_empty() {
-            return Ok(None);
+            if (matches!(
+                name.as_str(),
+                "get" | "post" | "put" | "del" | "listen" | "bind"
+            ) && is_http_service_object(&target_value))
+                || (matches!(name.as_str(), "run" | "close")
+                    && is_http_listener_object(&target_value))
+            {
+                return self
+                    .eval_http_service_method_call(callee, target_value, args, env, depth, span)?
+                    .map(Some)
+                    .ok_or_else(|| KuError::runtime("unresolved HTTP method", span));
+            }
+            self.tick(callee.span)?;
+            let callable = target_value
+                .with_read(callee.span, |value| field_value(value, name, callee.span))?;
+            drop(target_value);
+            return self
+                .eval_callable_arguments(callable, callee, args, env, depth, span)
+                .map(Some);
+        }
+        if module != "kuvalue" && stdlib::metadata::dotted_signature(module, name).is_none() {
+            return Err(KuError::runtime(
+                format!("unknown {module} method '{name}'"),
+                span,
+            ));
         }
         target_value.require_owned_root(span)?;
         let mut values = Vec::with_capacity(args.len() + 1);
@@ -1544,13 +1668,16 @@ impl Interpreter {
                 return Ok(Some(Value::Null));
             }
         }
-        match module {
+        let value = match module {
             "string" => stdlib::string::eval(name, &values, span),
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
-            "kuvalue" => Ok(eval_kuvalue_method(name, &values)),
+            "kuvalue" => eval_kuvalue_method(name, &mut values, span),
             _ => Ok(None),
-        }
+        }?;
+        value
+            .map(Some)
+            .ok_or_else(|| KuError::runtime(format!("unknown {module} method '{name}'"), span))
     }
 
     fn eval_dotted_builtin(
@@ -1729,7 +1856,11 @@ impl Interpreter {
                         return Ok(value);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name) {
+                        let global_is_visible = self.functions.contains_key(name)
+                            && !env.shadows_global_function(name, expr.span)?;
+                        if let Some(function) =
+                            self.functions.get(name).filter(|_| global_is_visible)
+                        {
                             let modes = explicit_borrow_modes(function);
                             let mut leases = Vec::new();
                             let mut values = Vec::with_capacity(args.len());
@@ -1757,18 +1888,8 @@ impl Interpreter {
                             return self.call_argument_value(result, expr.span);
                         }
                     }
-                    if let ExprKind::Field { target, name } = &callee.kind {
-                        if name == "map" {
-                            return self.eval_array_map(target, args, env, depth, expr.span);
-                        }
-                    }
                     if let Some(value) =
                         self.eval_std_method_call(callee, args, env, depth, expr.span)?
-                    {
-                        return Ok(value);
-                    }
-                    if let Some(value) =
-                        self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
                     {
                         return Ok(value);
                     }
@@ -1779,51 +1900,9 @@ impl Interpreter {
                             || dotted_builtin_module(callee).is_none())
                     {
                         let callable = self.eval(callee, env, depth)?;
-                        return callable.with_read(expr.span, |callable| {
-                            let Value::Function {
-                                params,
-                                param_modes,
-                                body,
-                                captures,
-                                self_name,
-                                is_async,
-                            } = callable
-                            else {
-                                return Err(KuError::runtime(
-                                    format!("cannot call {}", callable.type_name()),
-                                    callee.span,
-                                ));
-                            };
-                            let mut leases = Vec::new();
-                            let mut values = Vec::with_capacity(args.len());
-                            let result = (|| {
-                                self.eval_call_arguments(
-                                    args,
-                                    param_modes,
-                                    env,
-                                    depth,
-                                    &mut leases,
-                                    &mut values,
-                                )?;
-                                if let Some(value) = self.take_pending_fail() {
-                                    return Ok(Flow::fail(value));
-                                }
-                                self.call_function_value_flow(FunctionValueCall {
-                                    params,
-                                    param_modes,
-                                    body,
-                                    captures,
-                                    self_name,
-                                    is_async: *is_async,
-                                    args: std::mem::take(&mut values),
-                                    span: expr.span,
-                                    depth: depth + 1,
-                                })
-                            })();
-                            let result =
-                                self.finish_call_arguments(env, leases, values, result, expr.span);
-                            self.call_argument_value(result, expr.span)
-                        });
+                        return self.eval_callable_arguments(
+                            callable, callee, args, env, depth, expr.span,
+                        );
                     }
                     let mut values = Vec::with_capacity(args.len());
                     for arg in args {
@@ -2529,6 +2608,7 @@ impl Interpreter {
     fn eval_http_service_method_call(
         &mut self,
         callee: &Expr,
+        target_value: Value,
         args: &[Expr],
         env: &mut Env,
         depth: usize,
@@ -2542,13 +2622,6 @@ impl Interpreter {
             "get" | "post" | "put" | "del" | "listen" | "bind" | "run" | "close"
         ) {
             return Ok(None);
-        }
-        if matches!(&target.kind, ExprKind::Variable(module) if module == "http") {
-            return Ok(None);
-        }
-        let target_value = self.eval(target, env, depth)?;
-        if self.pending_fail.is_some() {
-            return Ok(Some(Value::Null));
         }
         if (name == "run" || name == "close") && is_http_listener_object(&target_value) {
             if name == "run" {
@@ -4599,6 +4672,9 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("string", "ends_with") => "string.ends_with",
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
+        ("json", "parse") => "json.parse",
+        ("json", "decode") => "json.decode",
+        ("json", "try_parse") => "json.try_parse",
         ("json", "stringify") => "json.stringify",
         ("json", "encode") => "json.encode",
         _ => return None,
@@ -4653,8 +4729,10 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
         if let Some(method) = name.strip_prefix("array.") {
             return stdlib::array::eval(method, std::slice::from_ref(first), span);
         }
-        if matches!(name, "json.stringify" | "json.encode") {
-            return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
+        if let Some(method) = name.strip_prefix("json.") {
+            // The old parser and writer read synchronously and return their
+            // own storage. Hold the existing loan only through that call.
+            return stdlib::json::eval(method, std::slice::from_ref(first), span);
         }
         if name == "print" {
             print!("{first}");
@@ -4667,11 +4745,46 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
     })
 }
 
+fn has_callable_take_field(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) | Value::Struct { fields, .. } => {
+            matches!(fields.get("take"), Some(Value::Function { .. }))
+        }
+        _ => false,
+    }
+}
+
 /// `KuValue.as_int()` / `.as_str()`: convert a dynamic value read from an object
 /// to a concrete type, returning `T!` (Err on a tag mismatch).
-fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
-    let value = values.first()?;
-    match name {
+fn eval_kuvalue_method(name: &str, values: &mut [Value], span: Span) -> KuResult<Option<Value>> {
+    if name == "take" {
+        expect_runtime_arg_count("KuValue.take", values.len(), 2, span)?;
+        if !matches!(&values[1], Value::String(_)) {
+            return Err(KuError::runtime("KuValue.take requires a string key", span));
+        }
+        // The method owns its receiver. HashMap::remove moves the selected
+        // subtree; dropping the remaining fields cannot invalidate the result.
+        let (receiver, key_value) = values.split_at_mut(1);
+        let Value::String(key) = &key_value[0] else {
+            unreachable!()
+        };
+        let value = std::mem::replace(&mut receiver[0], Value::Null);
+        return Ok(Some(match value {
+            Value::Object(mut fields) => match fields.remove(key) {
+                Some(selected) => stdlib::errors::ok(selected),
+                None => stdlib::errors::err(
+                    "object",
+                    "missing_key",
+                    format!("missing object key: {key}"),
+                ),
+            },
+            _ => stdlib::errors::err("object", "type_unsupported", "expected object value"),
+        }));
+    }
+    let Some(value) = values.first() else {
+        return Ok(None);
+    };
+    Ok(match name {
         "as_int" => Some(match value {
             Value::Int(i) => stdlib::errors::ok(Value::Int(*i)),
             other => stdlib::errors::err(
@@ -4689,7 +4802,7 @@ fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
             ),
         }),
         _ => None,
-    }
+    })
 }
 
 fn eval_index_value(
@@ -7799,6 +7912,9 @@ mod collection_tests {
                 "contains",
                 "starts_with",
                 "ends_with",
+                "parse",
+                "decode",
+                "try_parse",
                 "stringify",
                 "encode",
                 "push",

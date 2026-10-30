@@ -253,6 +253,14 @@ int PQsetClientEncoding(PGconn* connection, const char* encoding) {
 const char* PQparameterStatus(const PGconn* connection, const char* name) {
   (void)name; return connection && connection->utf8 ? "UTF8" : "LATIN1";
 }
+/* Existing failure fixtures intentionally simulate unavailable cancellation.
+   The real loopback HTTP acceptance covers successful cancel + drain. */
+static int ku_test_threadsafe = 1;
+int PQisthreadsafe(void) { return ku_test_threadsafe; }
+int PQsslInUse(PGconn* connection) { (void)connection; return 0; }
+PGcancel* PQgetCancel(PGconn* connection) { (void)connection; return NULL; }
+int PQcancel(PGcancel* cancel, char* error, int length) { (void)cancel; (void)error; (void)length; return 0; }
+void PQfreeCancel(PGcancel* cancel) { (void)cancel; }
 void PQfinish(PGconn* connection) {
   if (!connection) return;
   ku_test_finish_calls++; ku_test_live_connections--; free(connection);
@@ -402,6 +410,16 @@ int main(void) {
   ku_drop_pg_client(&pool);
   if (pool || ku_test_live_connections != 0) return 31;
   if (ku_test_encoding_set_calls != 0) return 32;
+  ku_test_threadsafe=0;
+  int before_thread_rejection=ku_test_start_calls;
+  KuResult_pg_client thread_rejected=ku_pg_client_open(conninfo,1,1,5000,5000,30000);
+  if (thread_rejected.ok || thread_rejected.value
+      || thread_rejected.error.code.len!=sizeof("client_thread_unsupported")-1
+      || memcmp(thread_rejected.error.code.ptr,"client_thread_unsupported",sizeof("client_thread_unsupported")-1)
+      || ku_test_start_calls!=before_thread_rejection
+      || ku_database_budget_snapshot().reserved_connections) return 33;
+  ku_error_drop(&thread_rejected.error); ku_test_threadsafe=1;
+
 
   puts("pg connect poll closed loop");
   return 0;

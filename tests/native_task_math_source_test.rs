@@ -105,6 +105,36 @@ fn compare_case(label: &str, source: &str, stdout: &str, failure: Option<&str>) 
     );
 }
 
+#[test]
+fn native_task_primitive_str_matches_interpreter_and_preserves_source_across_wait() {
+    let source = r#"
+import time from "std.time"
+async fn Show(value: int): null! {
+    text=str(value)
+    time.sleep(1)?
+    println(text)
+    println(value)
+    return ok(null)
+}
+async fn main(): null! {
+    first=(await Show(-9223372036854775807 - 1))?
+    second=(await Show(9223372036854775807))?
+    third=(await Show(0))?
+    println(str(true))
+    println(str(false))
+    println(str(null))
+    text="中文😀\0尾"
+    copy=str(text)
+    time.sleep(1)?
+    println(copy)
+    println(text)
+    return ok(null)
+}
+"#
+    .replace("\\0", "\0");
+    compare_case("primitive-str", &source, "-9223372036854775808\n-9223372036854775808\n9223372036854775807\n9223372036854775807\n0\n0\ntrue\nfalse\nnull\n中文😀\0尾\n中文😀\0尾\n", None);
+}
+
 // Every tested operation executes inside Calc on parameters, not only a
 // compile-time literal expression. Negative quotient/remainder use truncation
 // toward zero, including a negative numerator and a negative denominator.

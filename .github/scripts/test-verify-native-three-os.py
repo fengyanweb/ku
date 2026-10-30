@@ -1150,6 +1150,16 @@ class BoundedProcessTests(unittest.TestCase):
             VERIFIER.close_finished_output_streams((stream,), [reader])
         self.assertTrue(stream.closed)
 
+    def test_success_and_primary_failure_report_only_the_actual_owned_tree_cleanup(self) -> None:
+        completed = VERIFIER.run_bounded([sys.executable, "-B", "-c", "pass"], SCRIPT.parent, "cleanup receipt success")
+        self.assertIs(completed.process_owner_cleanup["process_tree_cleanup_confirmed"], True)
+        self.assertIs(completed.process_owner_cleanup["root_reaped"], True)
+        self.assertEqual(completed.process_owner_cleanup["windows_job_drained"], os.name == "nt")
+        with self.assertRaises(SystemExit) as failure:
+            VERIFIER.run_bounded([sys.executable, "-B", "-c", "raise SystemExit(7)"], SCRIPT.parent, "cleanup receipt failed checks")
+        self.assertIs(failure.exception.process_owner_cleanup["process_tree_cleanup_confirmed"], True)
+        self.assertIs(failure.exception.process_owner_cleanup["root_reaped"], True)
+
     def test_normal_output_is_collected(self) -> None:
         result = VERIFIER.run_bounded(
             [sys.executable, "-B", "-c", "print('bounded-ok')"],
@@ -1378,6 +1388,27 @@ class BoundedProcessTests(unittest.TestCase):
             self.assertLess(time.monotonic() - before, 5)
         finally:
             VERIFIER.COMMAND_TIMEOUT_SECONDS = previous
+
+
+class ExpectedNonzeroProcessTests(unittest.TestCase):
+    def test_expected_nonzero_retains_output_and_confirmed_cleanup(self):
+        result = VERIFIER.run_bounded(
+            [sys.executable, "-B", "-c", "import sys; print('expected'); sys.stderr.write('diagnostic\\n'); sys.exit(7)"],
+            SCRIPT.parent, "expected failure contract", check=False)
+        self.assertEqual(result.returncode, 7)
+        self.assertIn(b"expected", result.stdout)
+        self.assertIn(b"diagnostic", result.stderr)
+        self.assertTrue(result.process_owner_cleanup["root_reaped"])
+        self.assertTrue(result.process_owner_cleanup["process_tree_cleanup_confirmed"])
+        with self.assertRaisesRegex(SystemExit, "exited with 7"):
+            VERIFIER.run_bounded([sys.executable, "-B", "-c", "raise SystemExit(7)"], SCRIPT.parent, "default still checks")
+
+    def test_expected_nonzero_does_not_disable_cleanup_failures(self):
+        with mock.patch.object(VERIFIER, "kill_process_tree", side_effect=OSError("fixture cleanup error")):
+            with self.assertRaises(SystemExit) as failure:
+                VERIFIER.run_bounded([sys.executable, "-B", "-c", "raise SystemExit(7)"], SCRIPT.parent, "cleanup still required", check=False)
+        self.assertIn("cleanup failed", str(failure.exception))
+        self.assertIn("process tree termination (OSError)", str(failure.exception))
 
 
 if __name__ == "__main__":

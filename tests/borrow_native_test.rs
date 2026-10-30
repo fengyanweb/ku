@@ -51,6 +51,9 @@ fn CloneMessage(&value: Message): Message { return value.clone() }
 fn MessageText(value: Message): str { return match value { Message.Text(text) => text } }
 fn JsonArray(&values: [int]): str! { return json.stringify(values) }
 fn JsonEncode(&values: [int]): str! { return json.encode(values) }
+fn JsonDecode(&text: str): str! { value = json.decode(text)? return value.as_str() }
+fn JsonParse(&text: str): str! { value = json.parse(text)? return value.as_str() }
+fn JsonTryParse(&text: str): str! { value = json.try_parse(text)? return value.as_str() }
 fn ReadCode(&code: Code): int { return match code { Code.Number(value) => value } }
 fn Finish(&text: str): str! {
     try { return ok(text.clone()) } finally { println(text) }
@@ -83,6 +86,18 @@ fn main(): null! {
     if (JsonEncode(numbers)? != JsonArray(numbers)? || JsonEncode(numbers)? != "[1,2,3]" || numbers.len() != 3) { panic("borrowed JSON array") }
     object = { name: "Ku" }
     if (json.encode(object)? != json.stringify(object)? || json.encode(object)? != json.encode(object)?) { panic("borrowed JSON object") }
+    json_text = "\"" + "中文😀\\u0000tail\""
+    parsed = JsonDecode(json_text)?
+    if (JsonParse(json_text)? != parsed || JsonTryParse(json_text)? != parsed) { panic("borrowed JSON parser aliases") }
+    json_text = "changed"
+    if (parsed.byte_len() != 15 || !parsed.starts_with("中文😀")) { panic("borrowed JSON decoded storage") }
+    json_bad = "{\"a\":[\"owned\",]}"
+    json_caught = 0
+    try { JsonDecode(json_bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { json_caught++ } }
+    try { JsonParse(json_bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { json_caught++ } }
+    try { JsonTryParse(json_bad)? } catch(error) { if (error.domain == "json" && error.code == "parse_error") { json_caught++ } }
+    json_bad = "\"recovered\""
+    if (json_caught != 3 || JsonDecode(json_bad)? != "recovered") { panic("borrowed JSON error cleanup") }
     failure: str! = err("expected")
     caught = 0
     finalized = 0
@@ -115,6 +130,17 @@ fn borrow_native_c_uses_const_parameter_abi_and_preserves_modes() {
         "borrowed parameter must not be dropped: {read}"
     );
     assert!(!read.contains("ku_string_clone"));
+    for name in ["JsonDecode", "JsonParse", "JsonTryParse"] {
+        let body = c
+            .split(&format!("KuResult_str {name}(const KuString* text) {{"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing borrowed parser definition: {name}"))
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!body.contains("ku_string_clone"), "{name}: {body}");
+        assert!(!body.contains("ku_string_drop(text)"), "{name}: {body}");
+    }
     assert!(!c.contains("run_source") && !c.contains("const SOURCE"));
 }
 
@@ -124,6 +150,14 @@ fn borrow_ir_function_field_call_preserves_parameter_modes() {
     // capability boundary; this test pins mode preservation before that gate.
     let program = ir("struct Reader { read: fn(&str): int } fn Read(&text: str): int { return text.len() } fn Use(&reader: Reader, &text: str): int { return reader.read(text) } fn main() { text = \"Ku\" reader = Reader { read: Read } println(Use(reader, text)) println(reader.read(text)) }");
     let dump = program.to_string();
+    assert!(
+        dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
+        "{dump}"
+    );
+    // Adding KuValue.take must not reserve the same spelling for ordinary
+    // callable struct fields. Keep the old indirect-call path and its modes.
+    let take = ir("struct Reader { take: fn(&str): int } fn Read(&text: str): int { return text.len() } fn Use(&reader: Reader, &text: str): int { return reader.take(text) } fn main() { text = \"Ku\" reader = Reader { take: Read } println(Use(reader, text)) println(reader.take(text)) }");
+    let dump = take.to_string();
     assert!(
         dump.contains("borrow(borrowed text)") || dump.contains("borrow(text)"),
         "{dump}"
