@@ -2318,6 +2318,7 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
       && job->input.route && job->input.route->status==200u
       && ku_http_handler_is_short(job->input.route->invoke)) {
     queue->owner_inline_remaining--;
+    ku_http_count_admitted();
     ku_http_job_run_owner(server,job);return;
   }
   if (!workers || !ku_http_queue_push(queue, job)) {

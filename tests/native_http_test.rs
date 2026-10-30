@@ -5500,6 +5500,7 @@ fn main(): null! {
             &[
                 ("KU_EVENT_LOOPS", &loops),
                 ("KU_BLOCKING_THREADS", "4"),
+                ("KU_HTTP_WORKER_POLICY", "elastic"),
                 ("KU_SERVICE_CONTROL_TOKEN", "regression-token"),
             ],
         ) else {
@@ -5521,6 +5522,49 @@ fn main(): null! {
         let metrics = http_response(&address,
             "GET /__ku/metrics HTTP/1.1\r\nHost: localhost\r\nX-Ku-Control-Token: regression-token\r\nConnection: close\r\n\r\n", Duration::from_secs(3));
         assert_status(&metrics, "HTTP/1.1 200 OK");
+        // This zero-parameter literal handler is compiler-proven owner work.
+        // It must count each accepted invocation without starting a worker or
+        // leaving a queue/job record behind. Management calls are not business
+        // handler admissions.
+        let sum = |section: &str, key: &str| -> u64 {
+            metrics
+                .split_once(section)
+                .unwrap()
+                .1
+                .split_once(']')
+                .unwrap()
+                .0
+                .split(&format!("\"{key}\":"))
+                .skip(1)
+                .map(|value| {
+                    value
+                        .split(|ch: char| !ch.is_ascii_digit())
+                        .next()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap()
+                })
+                .sum()
+        };
+        let expected = (count * 4) as u64;
+        let admitted = sum("\"outcomes\":[", "admitted");
+        let workers = sum("\"loops\":[", "handler_workers");
+        eprintln!("inline admission snapshot owners={count} successful={expected} admitted={admitted} handler_workers={workers}");
+        assert_eq!(
+            admitted, expected,
+            "successful owner handlers must be admitted exactly once: {metrics}"
+        );
+        assert_eq!(
+            workers, 0,
+            "bounded handler must execute on its owner: {metrics}"
+        );
+        for key in ["queued", "running", "resident"] {
+            assert_eq!(
+                sum("\"loops\":[", key),
+                0,
+                "inline handler left {key}: {metrics}"
+            );
+        }
         assert!(metrics.contains("\"limits\":{\"max_active_requests\":8256,\"max_connections\":8320,\"max_pending_requests\":128}"),"{metrics}");
         for index in 0..count {
             assert!(metrics.contains(&format!("\"id\":{index},")), "{metrics}");
