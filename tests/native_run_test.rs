@@ -5004,7 +5004,7 @@ int main(void) {
      Exercise the existing by-value adapter and the private recursive reader. */
   const KuValue* alias=nested;KuJsonBuffer first={0},second={0};KuError error={0};
   CHECK(ku_json_write_value(&first,*alias,1,&error));
-  CHECK(ku_json_write_value_ref(&second,alias,1,&error));
+  CHECK(ku_json_write_value(&second,*alias,1,&error));
   CHECK(first.len==second.len && !memcmp(first.data,second.data,first.len));
   ku_json_buffer_drop(&first);ku_json_buffer_drop(&second);ku_error_drop(&error);
   CHECK(ku_perf_live_bytes==live && ku_perf_live_allocations==allocations);

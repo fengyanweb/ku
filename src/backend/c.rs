@@ -6559,15 +6559,6 @@ static bool ku_json_write_value(
     size_t depth,
     KuError* error);
 
-/* JSON traverses owned input synchronously without retaining or mutating it.
- * Recurse through the existing fields instead of copying each 40-byte value
- * into an aggregate argument. The by-value adapter remains for typed callers. */
-static bool ku_json_write_value_ref(
-    KuJsonBuffer* output,
-    const KuValue* value,
-    size_t depth,
-    KuError* error);
-
 static bool ku_json_write_bytes(
     KuJsonBuffer* output,
     const char* bytes,
@@ -6726,7 +6717,7 @@ static bool ku_json_write_object(
     bool ok = (index == 0 || ku_json_write_byte(output, ',', error))
         && ku_json_write_string(output, entries[index]->key, error)
         && ku_json_write_byte(output, ':', error)
-        && ku_json_write_value_ref(output, &entries[index]->value, depth + 1, error);
+        && ku_json_write_value(output, entries[index]->value, depth + 1, error);
     if (!ok) {
       if (entries != local_entries) free(entries);
       return false;
@@ -6750,16 +6741,16 @@ static bool ku_json_float_needs_fraction(const char* text, size_t len) {
       || (digit_count == 19 && memcmp(digits, limit, 19) > 0);
 }
 
-static bool ku_json_write_value_ref(
+static bool ku_json_write_value(
     KuJsonBuffer* output,
-    const KuValue* value,
+    KuValue value,
     size_t depth,
     KuError* error) {
   if (depth > KU_JSON_MAX_DEPTH) {
     return ku_json_fail(error, "stringify_error", "json value nesting is too deep");
   }
   char number[KU_DTOA_TEXT_CAP];
-  switch (value->tag) {
+  switch (value.tag) {
     case KU_NULL:
       return ku_json_write_bytes(output, "null", 4, error);
     case KU_INT: {
@@ -6767,8 +6758,8 @@ static bool ku_json_write_value_ref(
          INT64_MIN representable without signed negation or extra allocation. */
       char digits[20];
       size_t start = sizeof(digits);
-      uint64_t magnitude = (uint64_t)value->as.i;
-      bool negative = value->as.i < 0;
+      uint64_t magnitude = (uint64_t)value.as.i;
+      bool negative = value.as.i < 0;
       if (negative) magnitude = UINT64_C(0) - magnitude;
       do {
         digits[--start] = (char)('0' + magnitude % UINT64_C(10));
@@ -6778,12 +6769,12 @@ static bool ku_json_write_value_ref(
       return ku_json_write_bytes(output, digits + start, sizeof(digits) - start, error);
     }
     case KU_FLOAT: {
-      if (!isfinite(value->as.f)) {
+      if (!isfinite(value.as.f)) {
         return ku_json_fail(error, "stringify_error",
             "json.stringify does not support non-finite float");
       }
       size_t len = 0;
-      if (!ku_dtoa_format_finite(value->as.f, number, sizeof(number), &len)) {
+      if (!ku_dtoa_format_finite(value.as.f, number, sizeof(number), &len)) {
         return ku_json_fail(error, "stringify_error",
             "json float formatting failed");
       }
@@ -6792,20 +6783,20 @@ static bool ku_json_write_value_ref(
               || ku_json_write_bytes(output, ".0", 2, error));
     }
     case KU_BOOL:
-      return value->as.b
+      return value.as.b
           ? ku_json_write_bytes(output, "true", 4, error)
           : ku_json_write_bytes(output, "false", 5, error);
     case KU_STR:
-      return ku_json_write_string(output, value->as.s, error);
+      return ku_json_write_string(output, value.as.s, error);
     case KU_OBJECT:
-      return ku_json_write_object(output, value->as.o, depth, error);
+      return ku_json_write_object(output, value.as.o, depth, error);
     case KU_ARRAY: {
       if (!ku_json_write_byte(output, '[', error)) return false;
-      KuValueArray* array = value->as.arr;
+      KuValueArray* array = value.as.arr;
       if (array) {
         for (size_t index = 0; index < array->len; index++) {
           if ((index != 0 && !ku_json_write_byte(output, ',', error))
-              || !ku_json_write_value_ref(output, &array->data[index], depth + 1, error)) {
+              || !ku_json_write_value(output, array->data[index], depth + 1, error)) {
             return false;
           }
         }
@@ -6821,18 +6812,10 @@ static bool ku_json_write_value_ref(
   }
 }
 
-static bool ku_json_write_value(
-    KuJsonBuffer* output,
-    KuValue value,
-    size_t depth,
-    KuError* error) {
-  return ku_json_write_value_ref(output, &value, depth, error);
-}
-
 static KuResult_str ku_json_stringify(KuValue value) {
   KuJsonBuffer output = {0};
   KuError error = (KuError){0};
-  bool ok = ku_json_write_value_ref(&output, &value, 0, &error);
+  bool ok = ku_json_write_value(&output, value, 0, &error);
   if (!ok) {
     ku_json_buffer_drop(&output);
     if (!error.code.ptr) error = ku_json_error("stringify_error", "json stringify failed");
