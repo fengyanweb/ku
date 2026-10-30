@@ -44,7 +44,10 @@ fn lowered(source: &str) -> task_lower::NativeTaskProgram {
 }
 
 fn generated(source: &str) -> String {
-    c::generate_native_task_c_source(&lowered(source), &Default::default()).unwrap()
+    // Embedded C may use checkout CRLF; diagnostic anchors use LF.
+    c::generate_native_task_c_source(&lowered(source), &Default::default())
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 fn with_ledger(source: String) -> String {
