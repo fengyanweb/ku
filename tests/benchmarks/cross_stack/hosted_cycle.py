@@ -13,6 +13,7 @@ from linux_harness import ExternalDomain, GIB
 
 ARCHIVE_LIMIT = 384<<20
 BASELINE = '988f32ef496b18b935a3c276ef7933d0563691da'
+FOLLOWUP_PREPATCH = 'bf98a25d58edee602961d7980025fb392961f40b'
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -138,6 +139,19 @@ def diagnostic_plan(versions):
               'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
 
 
+def followup_plan(versions):
+    plan=diagnostic_plan(versions)
+    plan.update(schema='ku-hosted-followup-screen-v1',prepatch=FOLLOWUP_PREPATCH,
+        paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],
+        environment_controls=dict(name='A',workload='json_object',rate=500,warmup_seconds=5,score_seconds=10,count=3),
+        maximum_windows=33,formal_baseline_executed=False,
+        latency_slo_ms={'ok':100,'json_object':100,'db':250},
+        scope='Three prepatch environment controls, then3 paired normal A/B/R turns per business and at most1 B-ledger D. '
+              'A is frozen bf98a25, not historical formal A0=988f32e. Normal CLI C11O2/helpers/text/async/int only. '
+              'No formal/capacity/stability score; candidate adoption requires valid measured normal A/B benefit, not counters.')
+    return plan
+
+
 def build_ledger(a):
     import http_cost_diagnostic as hcd
     m=copy.deepcopy(load(a.root/'B/manifest.json'));build=m['stacks']['ku']['build']
@@ -194,18 +208,19 @@ def build(a,state):
         d=a.root/name;snapshot(a.source,commit,d/'src');(d/'tools').symlink_to(a.tools,target_is_directory=True)
         b=Builder(d,d/'src',uid=uid,gid=gid,candidate=commit,**(mode or {}))
         try:
-            if name in ('A0','B'):b.ku()
+            if name in ('A0','A','B'):b.ku()
             elif name=='R':b.rust();b.go_build(client=True)
             else:b.ku_native(Path(load(a.root/'B/manifest.json')['stacks']['ku']['build']['cli']))
             return b.finish()
         except BaseException as e:b.finish(failed=repr(e));raise
-    diagnostic=getattr(a,'build_set','full')=='diagnostic'
-    builds=[('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
+    build_set=getattr(a,'build_set','full');diagnostic=build_set in ('diagnostic','followup-screen')
+    builds=([('A',FOLLOWUP_PREPATCH,None)] if build_set=='followup-screen' else [])+[
+        ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
-    for name in (['B','R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']):
+    for name in ((['A'] if build_set=='followup-screen' else [])+['B','R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS']):
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else name)/'manifest.json')
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
         if is_r:m['stacks'][stack]['env'].update(BENCH_REQUEST_TIMEOUT_MS='30000',BENCH_LISTEN_BACKLOG='4096',
@@ -217,8 +232,14 @@ def build(a,state):
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
     if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
-    plan=diagnostic_plan(versions) if diagnostic else frozen_plan(versions);save(a.root/'frozen-plan.json',plan)
+    plan=followup_plan(versions) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
+    if build_set=='followup-screen':
+        if identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
+            raise ValueError('paired normal Ku business inputs differ')
+        if bl.benchmark_stack_sources(a.root/'A/src/tests/benchmarks/cross_stack/rust')!=load(a.root/'R/manifest.json')['stacks']['rust']['build']['source_files_sha256']:
+            raise ValueError('reference business source differs from frozen prepatch')
     dependencies={};abi={}
     for binary in sorted({f['path'] for v in identities.values() for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
         linked=subprocess.run(['ldd',binary],capture_output=True,text=True,check=True,timeout=30).stdout
@@ -432,11 +453,95 @@ def diagnostic_observe(call):
     except Exception as error:return {'observer_error':repr(error),'complete':False}
 
 
-def diagnostic(a,state):
+def perf_capability(perf, directory):
+    """One <=18s session; never repeat unsupported sampling for each business."""
+    directory=Path(directory);directory.mkdir();began=time.monotonic();attempts=[]
+    result=dict(available=False,callchain_available=False,attempts=attempts,
+        session_budget_seconds=18,scope='CPU-event sampling capability only, not a service benchmark. '
+              'Generic EOPNOTSUPP does not uniquely identify a physical PMU or guest-kernel cause.')
+    full=['--call-graph','dwarf,8192','--inherit','--switch-events']
+    workload='import time\nend=time.monotonic()+1\nx=1\nwhile time.monotonic()<end: x=(x*1664525+1013904223)&0xffffffff'
+    def attempt(event,flags,label):
+        remaining=18-(time.monotonic()-began)
+        if remaining<=0:return False
+        out=directory/label;out.mkdir();raw=out/'perf.data'
+        row=dict(event=event,flags=flags)
+        row['record']=diagnostic_command([perf,'record','--clockid','mono','-e',event,'-F','499',
+            *flags,'-o',str(raw),'--',sys.executable,'-c',workload],out/'record.log',timeout=min(4,remaining),limit=1<<20)
+        remaining=18-(time.monotonic()-began)
+        if row['record']['complete'] and raw.is_file() and raw.stat().st_size and remaining>0:
+            row['verify']=diagnostic_command([perf,'script','-i',str(raw),'-G','-F','event'],
+                out/'events.log',timeout=min(2,remaining),limit=1<<20)
+            if row['verify']['complete']:
+                row['sample_count']=sum(event in line for line in (out/'events.log').read_text(errors='replace').splitlines())
+        attempts.append(row)
+        return row.get('sample_count',0)>0
+    if perf:
+        for event in ['cpu-clock','task-clock','cycles']:
+            if attempt(event,[],event+'-minimal'):
+                with_chain=attempt(event,full,event+'-full')
+                result.update(available=True,event=event,selected_flags=full if with_chain else [],
+                    callchain_available=with_chain,method='CPU_SELF_plus_DWARF' if with_chain else 'CPU_SELF_only',
+                    interpretation='Clock samples weight CPU time; cycles samples weight cycles. Neither is elapsed blocking time.')
+                break
+    else:result['reason']='perf executable unavailable'
+    if not result['available']:result['reason']='No tested minimal CPU event produced samples; subsequent D skips perf; runtime SELF unknown.'
+    result['seconds']=time.monotonic()-began;save(directory/'capability.json',result);return result
+
+
+def window_quality(row):
+    faults=[];path=Path(row.get('score_report',''))
+    if path.is_file():
+        cost=load(path).get('service_cost',{});samples=Path(cost.get('samples_path',''))
+        groups={}
+        if samples.is_file():
+            for sample in load(samples).get('samples',[]):
+                for domain in sample.get('domains',[]):groups.setdefault(domain['label'],[]).append(domain)
+        for label,values in groups.items():
+            for group,key in [('cpu_stat','throttled_usec'),('memory_stat','pgmajfault'),('memory_events','oom'),('memory_events','oom_kill')]:
+                points=[v.get(group,{}).get(key) for v in values]
+                if len(points)>=2 and all(type(x)is int for x in points) and max(points)>min(points):faults.append(label+':'+key)
+    row['observed_environment_faults']=faults
+    signature=[row.get(k) for k in ('functional_valid','accounting_valid','measurement_invalid','arrival_schedule_quality','environment_quality')]+[sorted(faults)]
+    invalid=(row.get('functional_valid') is False or row.get('accounting_valid') is False or
+        row.get('measurement_invalid') is True or row.get('arrival_schedule_quality')!='pass' or row.get('environment_quality')=='fail' or bool(faults))
+    return invalid,signature
+
+
+def screen_pairs(rows,case,slo):
+    pairs=[];good=[]
+    for group in range(1,4):
+        selected={r['name']:r for r in rows if r['turn'].startswith('group-%d-'%group)}
+        a,b,ref=(selected.get(n) for n in ('A','B',case['reference']))
+        if not all((a,b,ref)):continue
+        valid=all(r.get('functional_valid') is True and r.get('accounting_valid') is True and r.get('all_correct') is True
+            and r.get('natural_reclamation') is True and r.get('arrival_schedule_quality')=='pass'
+            and r.get('environment_quality')=='pass' and not r.get('observed_environment_faults') for r in (a,b,ref))
+        valid=valid and a.get('comparison_contract')==b.get('comparison_contract')==ref.get('comparison_contract')
+        def ratio(x,y):return x/y if type(x)in(int,float) and type(y)in(int,float) and x>0 and y>0 else None
+        p99a,p99b=(r.get('latency',{}).get('p99_ms') for r in (a,b))
+        pair=dict(group=group,eligible=valid,cpu_B_over_A=ratio(b.get('full_cpu_us'),a.get('full_cpu_us')),
+            cpu_B_over_R=ratio(b.get('full_cpu_us'),ref.get('full_cpu_us')),
+            memory_B_over_A=ratio(b.get('memory',{}).get('steady_median_bytes'),a.get('memory',{}).get('steady_median_bytes')),
+            p99_A_ms=p99a,p99_B_ms=p99b,p99_B_over_A=ratio(p99b,p99a),absolute_p99_slo_ms=slo,
+            p99_absolute_pass=all(type(x)in(int,float) and x<=slo for x in (p99a,p99b)))
+        pairs.append(pair)
+        if valid and pair['cpu_B_over_A'] is not None:good.append((b['full_cpu_us'],a['full_cpu_us']))
+    ci=fc.paired_interval([p[0] for p in good],[p[1] for p in good],minimum=3)
+    return dict(pairs=pairs,valid_pair_count=len(good),cpu_paired_bootstrap95=ci,
+        all_three_cpu_directions_lower=len(good)>=3 and all(x<y for x,y in good),
+        cpu_upper95_below_one=ci.get('status')=='estimated' and ci['upper95']<1,
+        confidence_note='Only3 short paired windows; percentile bootstrap is descriptive and stationarity is unproven. '
+                        'No average of p99 values; resource/tail regressions and cancellation regressions require root review.',
+        adopted=False,formal_qualified=False)
+
+
+def diagnostic(a,state,followup=False):
     import http_cost_diagnostic as hcd
     if os.geteuid()!=0:raise ValueError('diagnostic requires root cgroup control')
     plan=load(a.root/'frozen-plan.json')
-    if plan.get('schema')!='ku-hosted-followup-diagnostic-v1':raise ValueError('diagnostic build-set required')
+    expected='ku-hosted-followup-screen-v1' if followup else 'ku-hosted-followup-diagnostic-v1'
+    if plan.get('schema')!=expected:raise ValueError('matching diagnostic/screen build-set required')
     boot=sha('/proc/sys/kernel/random/boot_id')
     if state.setdefault('diagnostic_boot_sha256',boot)!=boot:raise ValueError('cross-host diagnostic resume forbidden')
     directory=a.root/'diagnostic';directory.mkdir(exist_ok=False)
@@ -450,11 +555,12 @@ def diagnostic(a,state):
     diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-before.log')
     perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
     if perf:diagnostic_command([perf,'version'],directory/'perf-version.log')
-    rows=[];stopped=[]
+    rows=[];stopped=[];environment=None;control_rows=[];capability=None
     class DiagnosticHarness(original):
         def __init__(self,*args,**kwargs):
             super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+            if environment:self.manifest['environment_qualification']=environment
         def client(self,service,workload,rate,duration,output,**kwargs):
             if Path(output).name!='score':
                 return super().client(service,workload,rate,duration,output,**kwargs)
@@ -495,14 +601,15 @@ def diagnostic(a,state):
                     try:probe.start()
                     except RuntimeError as error:record.setdefault('observer_start_errors',[]).append(repr(error))
                 record['symbol_snapshot']=diagnostic_observe(lambda:diagnostic_symbols(service,output))
-                if perf:
-                    command=[perf,'record','--clockid','mono','-e','cpu-clock','-F',str(plan['perf_frequency']),
-                        '--call-graph','dwarf,8192','--inherit','--switch-events','-p',str(service.process.pid),
+                if perf and capability and capability['available']:
+                    command=[perf,'record','--clockid','mono','-e',capability['event'],'-F',str(plan['perf_frequency']),
+                        *capability['selected_flags'],'-p',str(service.process.pid),
                         '-o',str(output/'perf.data'),'--','sleep',str(duration+6)]
                     record['perf_command']=command;log=(output/'perf-record.log').open('xb')
                     try:process=subprocess.Popen(command,stdout=log,stderr=log,start_new_session=True)
                     except OSError as error:record['perf_error']=repr(error)
-                else:record['perf_error']='perf unavailable; CPU attribution unknown'
+                else:record['perf_error']='capability probe unavailable; CPU attribution unknown; no repeated business sampling'
+                record['perf_capability']=capability
                 return super().client(service,workload,rate,duration,output,**kwargs)
             finally:
                 stop.set()
@@ -526,11 +633,36 @@ def diagnostic(a,state):
     try:
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
+        capability=perf_capability(perf,directory/'perf-capability')
         fc.Harness=DiagnosticHarness
+        if followup:
+            c=plan['environment_controls']
+            previous=None;consecutive=0
+            for i in range(c['count']):
+                out=directory/'environment-controls'/('control-%d'%(i+1))
+                try:row=fc.window(plan,c['name'],c['workload'],c['rate'],c['warmup_seconds'],c['score_seconds'],out,
+                    job={'phase':'control','contract':'dom'})
+                except Exception as error:row=load(out/'window.json') if (out/'window.json').is_file() else {'error':repr(error)}
+                row.update(turn='environment-control',name=c['name'],score_eligible=False)
+                control_rows.append(row)
+                invalid,signature=window_quality(row)
+                consecutive=consecutive+1 if invalid and signature==previous else 1 if invalid else 0
+                previous=signature if invalid else None
+                if consecutive>=2:break
+            environment=environment_record(dict(rows=control_rows),directory/'environment-qualification.json')
+            environment.update(control_version='A',scope='Three independent frozen prepatch A controls on this runner; not historical A0.')
+            save(directory/'environment-qualification.json',environment)
+            if environment['quality']=='fail':
+                result=dict(execution_complete=False,rows=[],stopped=[{'reason':'prepatch environment qualification failed; no business scores started'}],
+                    environment_controls=control_rows,environment_qualification=environment,perf_capability=capability,
+                    goal_status='blocked',formal_qualified=False,candidate_accepted=False,scope_window_count=len(control_rows))
+                save(directory/'summary.json',result);return result
         for case in plan['cases']:
             failures=0;previous_failure=None;case_rows=[]
-            for turn in plan['order']:
-                name=case['reference'] if turn.startswith('reference') else 'D' if turn=='ledger-sample' else 'B'
+            turns=([(f'group-{i+1}-{name}',case['reference'] if name=='reference' else name)
+                for i,order in enumerate(plan['paired_orders']) for name in order]+[('ledger-sample','D')]) if followup else [
+                (turn,case['reference'] if turn.startswith('reference') else 'D' if turn=='ledger-sample' else 'B') for turn in plan['order']]
+            for turn,name in turns:
                 output=directory/case['workload']/turn
                 try:row=fc.window(plan,name,case['workload'],case['rate'],plan['warmup_seconds'],
                     plan['score_seconds'],output,job={'phase':'explore','contract':case['contract']})
@@ -566,9 +698,7 @@ def diagnostic(a,state):
                     row['flow_ledger_complete']=row['flow_ledger_available'] and ledgers[0].get('complete') is True
                     row['thread_and_perf_observation_path']=str(output/'score/diagnostic-observations.json')
                 case_rows.append(row);rows.append(row);save(directory/'results.json',dict(rows=rows,stopped=stopped))
-                invalid=(row.get('measurement_invalid') is True or row.get('arrival_schedule_quality')!='pass'
-                         or row.get('environment_quality')=='fail')
-                signature=[row.get(k) for k in ('measurement_invalid','arrival_schedule_quality','environment_quality')]
+                invalid,signature=window_quality(row)
                 failures=failures+1 if invalid and signature==previous_failure else 1 if invalid else 0
                 previous_failure=signature if invalid else None
                 if row.get('functional_valid') is False or row.get('accounting_valid') is False or failures>=2:
@@ -577,16 +707,20 @@ def diagnostic(a,state):
                             row.get('accounting_valid') is False else 'two consecutive unusable measurement windows; same quality signature; cause not inferred',
                         quality_signature=signature,
                         no_retry=True));break
-            controls=[r.get('full_cpu_us') for r in case_rows if r['turn'] in ('normal-before','normal-after')]
+            controls=[r.get('full_cpu_us') for r in case_rows if r['name']=='B']
             save(directory/case['workload']/'comparison.json',dict(rows=case_rows,
-                normal_control_cpu_max_min=max(controls)/min(controls) if len(controls)==2 and
+                paired_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
+                normal_control_cpu_max_min=max(controls)/min(controls) if len(controls)>=2 and
                     all(type(x) in (int,float) and x>0 for x in controls) else None,
                 no_formal_performance_claim=True,diagnostic_cost_not_pooled=True,
                 interpretation='Before/after drift and sampling perturbation require review. D and normal differ in '
                     'instrumentation/layout; these windows do not isolate perf overhead from ledger/roles overhead.'))
-        result=dict(execution_complete=len(rows)==15 and not stopped,rows=rows,stopped=stopped,
+        expected_rows=30 if followup else 15
+        result=dict(execution_complete=len(rows)==expected_rows and not stopped,rows=rows,stopped=stopped,
             goal_status='unknown',formal_qualified=False,candidate_accepted=False,
-            scope=plan['scope'],additional_anomaly_windows=0)
+            scope=plan['scope'],additional_anomaly_windows=0,environment_controls=control_rows,
+            environment_qualification=environment,perf_capability=capability,
+            scope_window_count=len(rows)+len(control_rows))
         save(directory/'summary.json',result);return result
     finally:
         fc.Harness=original
@@ -789,17 +923,20 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','followup-screen','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
-    p.add_argument('--build-set',choices=['full','diagnostic'],default='full')
+    p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv);a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     if any(not re.fullmatch('[0-9a-f]{40}',x) for x in [a.baseline,a.candidate]) or a.baseline!=BASELINE:p.error('frozen full commit identities required')
     if a.phase!='archive' and (platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64')):p.error('actual Linux ARM64 required')
     if a.phase=='diagnostic' and a.build_set!='diagnostic':p.error('diagnostic phase requires --build-set diagnostic')
+    if a.phase=='followup-screen' and a.build_set!='followup-screen':p.error('screen phase requires --build-set followup-screen')
+    if a.build_set=='followup-screen' and a.candidate==FOLLOWUP_PREPATCH:p.error('screen candidate must differ from frozen prepatch')
     if a.phase in ('run','tail','lifecycle','compiler') and a.build_set!='full':p.error('formal phases require full build-set')
-    a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=a.build_set)
+    a.root.mkdir(parents=True,exist_ok=True);identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=a.build_set,
+        prepatch=FOLLOWUP_PREPATCH if a.build_set=='followup-screen' else None)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
     if a.phase=='archive':result=archive(a,state)
@@ -808,10 +945,12 @@ def main(argv=None):
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm(130*60-30)
         if a.phase=='diagnostic':signal.alarm(20*60-30)
+        if a.phase=='followup-screen':signal.alarm(25*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
-            'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic}[a.phase]
+            'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
+            'followup-screen':lambda a,s:diagnostic(a,s,followup=True)}[a.phase]
         result=step(state,a.root,a.phase,lambda:operation(a,state),resume=a.phase in ('run','tail','lifecycle','compiler'))
     if a.phase!='archive':state['goal_status']=result.get('goal_status','unknown');save(a.root/'hosted-state.json',state)
-    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle','diagnostic') and result.get('execution_complete') is not True else 0
+    print(json.dumps(result));return 2 if a.phase in ('tail','lifecycle','diagnostic','followup-screen') and result.get('execution_complete') is not True else 0
 
 if __name__=='__main__':raise SystemExit(main())
