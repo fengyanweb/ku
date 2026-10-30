@@ -519,6 +519,9 @@ fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> 
                 | TaskOp::WrapError { .. }
                 | TaskOp::PgResult { .. }
                 | TaskOp::JsonEncodeObject { .. }
+                | TaskOp::JsonDecode { .. }
+                | TaskOp::JsonValue { .. }
+                | TaskOp::JsonObject { .. }
                 | TaskOp::HttpResponse { .. }
                 | TaskOp::CheckForLimit { .. }
                 | TaskOp::Print { .. } => {}

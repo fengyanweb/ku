@@ -83,7 +83,7 @@ def version_identity(plan, name):
     return {'source_commit': commit, 'stack': stack, 'manifest_sha256': digest(manifest_path),
             'source_inventory_sha256': manifest.get('source_inventory_sha256'),
             'build_mode': {key: build[key] for key in ('native_flags', 'flags', 'formatting_mode',
-                'json_response_mode', 'pg_execution_mode', 'pg_read_mode') if key in build},
+                'json_response_mode', 'json_execution_mode', 'pg_execution_mode', 'pg_read_mode') if key in build},
             'files': files, 'dependency_scope': 'declared library/source-lock receipts; extra system libraries require plan artifacts'}
 
 

@@ -798,7 +798,7 @@ fn generate_c_source_with_frames_attempt(
     }
     emit_array_try_get_helpers(&mut out, program)?;
     emit_string_slice_helper(&mut out, program)?;
-    emit_object_result_helpers(&mut out, program)?;
+    emit_object_result_helpers(&mut out, program, task_json)?;
     emit_closure_value_wrappers(&mut out, program)?;
     if program_uses_object(program) || task_json {
         // JSON returns Result<str> and its typed writers borrow fully-defined
@@ -4920,9 +4920,9 @@ fn kuvalue_array_element_supported(ty: &IrType) -> bool {
 /// Emit `ku_object_get_result` (strict `obj[key]` -> Result&lt;KuValue&gt;) after the
 /// result ABI, since it depends on `KuResult_kuvalue`. Missing keys produce
 /// `Err{domain:"object", code:"missing_key", message:"missing object key: <key>"}`.
-fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram, force: bool) -> KuResult<()> {
     out.check()?;
-    if !program_uses_object(program) {
+    if !force && !program_uses_object(program) {
         return Ok(());
     }
     out.push_str(

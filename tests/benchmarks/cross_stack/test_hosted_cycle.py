@@ -51,6 +51,92 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(len(h.diagnostic_turns(plan,case,True)),12)
         self.assertEqual(plan['maximum_windows'],76)
 
+    def test_task_json_is_separate_from_worker_goals_and_does_not_repeat_pg_or_ablations(self):
+        names=['A','B','BT','BF','R','RS','D','HC','C1','C2']
+        versions={n:{'source_commit':'b'*40,'root':'/unused/'+n} for n in names}
+        plan=h.followup_plan(versions,'f'*40)
+        self.assertEqual(plan['candidate_versions'],['B','BT'])
+        self.assertEqual([c['workload'] for c in plan['cases']],['json_object','json_escape','cpu'])
+        for case in plan['cases'][:2]:
+            for order in case.get('paired_orders',plan['paired_orders']):
+                self.assertEqual(set(order),{'A','B','BT','reference'})
+                self.assertEqual(len(order),4)
+        cpu=plan['cases'][2]
+        self.assertEqual({name for _,name in h.diagnostic_turns(plan,cpu,True)},{'A','B','R'})
+        self.assertEqual(plan['maximum_windows'],3+13+12+9+12+1)
+        self.assertEqual(plan['admission']['name'],'B')
+        self.assertFalse(plan['task_json_comparison']['original_worker_score_eligible'])
+        self.assertIn('BT admission is not verified',plan['task_json_comparison']['admission_scope'])
+        self.assertEqual(plan['worker_growth']['names'],['B','BF'])
+        self.assertNotIn('targets',plan)
+
+    def test_task_json_screen_uses_current_worker_denominator_and_all_quality_checks(self):
+        rows=[]
+        for group in range(1,4):
+            for name,cpu in [('A',20),('B',10),('BT',8),('R',9)]:
+                rows.append(dict(turn=f'group-{group}-{name}',name=name,full_cpu_us=cpu,
+                    latency={'p99_ms':1},memory={'steady_median_bytes':100},comparison_contract='same',
+                    functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
+                    arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,
+                    observed_environment_faults=[],diagnostic_only=name=='BT'))
+        case={'reference':'R'}
+        result=h.task_json_screen(rows,case,100)
+        self.assertEqual((result['numerator_name'],result['denominator_name']),('BT','B'))
+        self.assertEqual(result['valid_pair_count'],3)
+        self.assertAlmostEqual(result['cpu_paired_bootstrap95']['estimate'],.8)
+        self.assertFalse(result['original_worker_score_eligible'])
+        self.assertFalse(result['formal_qualified'])
+        self.assertAlmostEqual(h.screen_pairs(rows,case,100)['cpu_paired_bootstrap95']['estimate'],.5)
+        self.assertIsNone(h.task_json_screen([r for r in rows if r['name']!='BT'],case,100))
+        plan={'json_layer_diagnosis':{'execution_complete':True}}
+        gate={'passed':True,'execution_complete':True}
+        control=rows[0]
+        for issue,value in [('environment_quality','fail'),('measurement_invalid',True),
+                            ('arrival_schedule_quality','fail'),('natural_reclamation',False)]:
+            broken=[dict(row) for row in rows]
+            for row in broken:
+                if row['name']=='BT':row[issue]=value
+            with self.subTest(issue=issue):
+                self.assertEqual(h.task_json_screen(broken,case,100)['valid_pair_count'],0)
+                self.assertFalse(h.diagnostic_axes(plan,broken,len(broken),[],control,[],True,gate)['normal_windows_qualified'])
+
+    def test_build_derives_task_json_only_from_the_frozen_product_snapshot(self):
+        from unittest.mock import Mock
+        for supported in (False,True):
+            with self.subTest(supported=supported),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+                root=Path(directory);tools=root/'tools';tools.mkdir()
+                source=root/'checkout';source.mkdir()
+                # Deliberately disagree with the frozen B snapshot.
+                ir=source/'src/ir/task.rs';ir.parent.mkdir(parents=True)
+                ir.write_text('enum TaskOp {\n    JsonDecode {\n}\n' if not supported else 'old tools source')
+                calls=[]
+                def snapshot(checkout,commit,destination):
+                    ir=destination/'src/ir/task.rs';ir.parent.mkdir(parents=True)
+                    ir.write_text('enum TaskOp {\n    JsonDecode {\n}\n' if supported else 'old product')
+                class Builder:
+                    def __init__(self,root,source,**mode):
+                        self.root=root;self.build=root/'build';self.build.mkdir();self.mode=mode
+                    def ku(self):
+                        calls.append(('ku',self.root.name))
+                        cli=self.build/'ku';cli.write_text('inert CLI identity')
+                        h.save(self.root/'manifest.json',{'stacks':{'ku':{'build':{'cli':str(cli)}}}})
+                    def rust(self):calls.append(('rust',self.root.name))
+                    def go_build(self,client=False):calls.append(('client' if client else 'go',self.root.name))
+                    def ku_native(self,cli):calls.append(('native',self.root.name,cli,self.mode.get('ku_json_execution')))
+                    def finish(self,failed=None):return {'execution_complete':failed is None}
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=1))
+                patches.enter_context(patch.object(h.bl,'Builder',Builder))
+                patches.enter_context(patch.object(h,'snapshot',side_effect=snapshot))
+                complete=Mock(return_value={'execution_complete':True})
+                patches.enter_context(patch.object(h,'complete_build',complete))
+                args=types.SimpleNamespace(root=root,source=source,tools=tools,baseline='f'*40,
+                    candidate='b'*40,prepatch='f'*40,build_set='followup-screen',screen_variants=[])
+                self.assertTrue(h.build(args,{'steps':{}})['execution_complete'])
+                native=[c for c in calls if c[0]=='native']
+                self.assertEqual(native,[('native','BT',root/'B/build/ku','task')] if supported else [])
+                self.assertEqual([c[:2] for c in calls[:4]],[('ku','A'),('ku','B'),('rust','R'),('client','R')])
+                complete.assert_called_once()
+
     def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
         rows=[]
         for group in range(1,4):
@@ -160,10 +246,11 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_diagnostic_and_screen_admission_are_required_but_not_timed_windows(self):
         from unittest.mock import Mock
-        for followup,gate_passed in ((False,True),(False,False),(True,True),(True,False)):
-            with self.subTest(followup=followup,gate_passed=gate_passed),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+        for followup,gate_passed,task in ((False,True,False),(False,False,False),(True,True,False),(True,False,False),(True,True,True)):
+            with self.subTest(followup=followup,gate_passed=gate_passed,task=task),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory)
-                versions={name:{'root':str(root/name),'source_commit':'a'*40} for name in ['A','B','R','RS','D','HC']}
+                versions={name:{'root':str(root/name),'source_commit':'a'*40}
+                    for name in ['A','B','R','RS','D','HC',*(['BT'] if task else [])]}
                 plan=h.followup_plan(versions) if followup else h.diagnostic_plan(versions)
                 plan['json_layer_diagnosis']={'execution_complete':True}
                 h.save(root/'frozen-plan.json',plan)
@@ -199,6 +286,16 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(result['scope_window_count'],expected)
                 self.assertEqual(cleanup,['database']);self.assertEqual(result['admission']['passed'],gate_passed)
                 if not gate_passed:self.assertEqual(result['goal_status'],'blocked')
+                if task:
+                    comparison=h.load(root/'diagnostic/json_object/comparison.json')
+                    self.assertEqual(comparison['task_json_screen']['denominator_name'],'B')
+                    self.assertEqual(comparison['candidate_screens']['BT']['denominator_name'],'B')
+                    self.assertEqual(comparison['paired_screen']['denominator_name'],'A')
+                    task_rows=[r for r in result['rows'] if r['name']=='BT']
+                    self.assertEqual(len(task_rows),6)
+                    self.assertTrue(all(r['diagnostic_only'] and not r['normal_score_eligible']
+                        and not r['original_worker_score_eligible'] for r in task_rows))
+                    self.assertEqual({r['workload'] for r in task_rows},{'json_object','json_escape'})
 
     def test_five_registered_groups_and_pg_sharing_are_actual_windows(self):
         plan=self.plan();jobs=fc.jobs_for(plan,'final');self.assertEqual(len(jobs),80)

@@ -13,8 +13,9 @@ use std::{
 use crate::error::KuResult;
 use crate::ir::task::{
     SlotId, TaskBinaryOp, TaskBytesOperation, TaskConstant, TaskFinallyPlan, TaskFramePlan,
-    TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan, TaskLimits, TaskNetOperation, TaskOp,
-    TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
+    TaskFunction, TaskFunctionFrame, TaskIndirectCallPlan, TaskJsonOperation, TaskLimits,
+    TaskNetOperation, TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType,
+    TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -275,11 +276,18 @@ pub(super) fn uses_postgres(tasks: &TaskProgram) -> bool {
 }
 pub(super) fn uses_json(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
-        function.states.iter().any(|state| {
-            state
-                .operations
-                .iter()
-                .any(|operation| matches!(operation, TaskOp::JsonEncodeObject { .. }))
+        function.slots.iter().any(|slot| {
+            matches!(&slot.ty, TaskSlotType::Value { ty, .. } if crate::ir::task::local_json_type(ty))
+        }) || function.states.iter().any(|state| {
+            state.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    TaskOp::JsonEncodeObject { .. }
+                        | TaskOp::JsonDecode { .. }
+                        | TaskOp::JsonValue { .. }
+                        | TaskOp::JsonObject { .. }
+                )
+            })
         })
     })
 }
@@ -489,6 +497,7 @@ impl<'a> FrameEmitter<'a> {
                             || crate::ir::task::local_bytes_type(ty)
                             || crate::ir::task::local_net_type(ty)
                             || crate::ir::task::local_pg_type(ty)
+                            || crate::ir::task::local_json_type(ty)
                             || crate::ir::task::http_type(ty))
                         && !persistent.contains(&index)
                     {
@@ -730,6 +739,7 @@ impl<'a> FrameEmitter<'a> {
                         || crate::ir::task::local_bytes_type(ty)
                         || crate::ir::task::local_net_type(ty)
                         || crate::ir::task::local_pg_type(ty)
+                        || crate::ir::task::local_json_type(ty)
                         || crate::ir::task::http_type(ty))
             }
         }
@@ -3637,6 +3647,88 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!("  {}={call};\n", self.place(*dst)));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::JsonDecode { dst, text } => {
+                out.push_str(&format!(
+                    "  {}=ku_task_host_json_decode((KuTaskAdapterHostV1*)clock->host,{});\n",
+                    self.place(*dst),
+                    self.place(*text)
+                ));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::JsonValue {
+                dst,
+                source,
+                key,
+                operation,
+            } => {
+                let (function, consumes) = match operation {
+                    TaskJsonOperation::Encode => ("encode", false),
+                    TaskJsonOperation::Get => ("get", false),
+                    TaskJsonOperation::Take => ("take", true),
+                    TaskJsonOperation::AsInt => ("as_int", true),
+                    TaskJsonOperation::AsStr => ("as_str", true),
+                };
+                let argument = if consumes {
+                    format!("&{}", self.place(*source))
+                } else {
+                    self.place(*source)
+                };
+                let key = key
+                    .map(|slot| format!(",{}", self.place(slot)))
+                    .unwrap_or_default();
+                out.push_str(&format!("  {}=ku_task_host_json_{function}((KuTaskAdapterHostV1*)clock->host,{argument}{key});\n",self.place(*dst)));
+                if consumes {
+                    self.set_init(out, *source, false);
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::JsonObject { dst, fields } => {
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                for (key, slot) in fields {
+                    keys.push(c_static_utf8_string(key));
+                    values.push(match self.slot_type(*slot)? {
+                        IrType::Int => format!("ku_v_int({})", self.place(*slot)),
+                        IrType::Bool => format!("ku_v_bool({})", self.place(*slot)),
+                        IrType::Null => "ku_v_null()".into(),
+                        IrType::Str => format!("ku_v_str({})", self.place(*slot)),
+                        IrType::Named(name) if name == "__ku_value" => self.place(*slot),
+                        _ => return Err(unsupported("Task JSON object field type")),
+                    });
+                }
+                // The array initially aliases registered frame owners. The
+                // host first reserves while those owners are still visible,
+                // then consumes every field on success and on failure. It
+                // cannot reconcile between that move and this publication.
+                let call = if fields.is_empty() {
+                    "ku_task_host_json_build_object((KuTaskAdapterHostV1*)clock->host,NULL,NULL,0u)"
+                        .to_string()
+                } else {
+                    format!("ku_task_host_json_build_object((KuTaskAdapterHostV1*)clock->host,(KuString[]){{{}}},(KuValue[]){{{}}},{}u)",keys.join(","),values.join(","),fields.len())
+                };
+                out.push_str(&format!(
+                    "  {{ KuResult_kuvalue json_object_result={call};\n"
+                ));
+                for (_, slot) in fields {
+                    if self.owns_slot(*slot) {
+                        out.push_str(&format!(
+                            "  {}={};\n",
+                            self.place(*slot),
+                            c_zero_initializer(self.slot_type(*slot)?)?
+                        ));
+                        self.set_init(out, *slot, false);
+                    }
+                }
+                out.push_str("  if(!json_object_result.ok) {\n  if(cleanup)ku_error_drop(&json_object_result.error);\n");
+                self.emit_runtime_error(out, "ku_error_move(&json_object_result.error)")?;
+                out.push_str("  }\n");
+                out.push_str(&format!(
+                    "  {}=ku_value_move(&json_object_result.value);\n",
+                    self.place(*dst)
+                ));
+                self.set_init(out, *dst, true);
+                out.push_str("  }\n");
+            }
             TaskOp::JsonEncodeObject { dst, fields } => {
                 let mut keys = Vec::new();
                 let mut values = Vec::new();
@@ -4071,6 +4163,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
         || crate::ir::task::local_net_type(ty)
         || crate::ir::task::http_type(ty)
         || crate::ir::task::local_pg_type(ty)
+        || crate::ir::task::local_json_type(ty)
     {
         return Ok(());
     }
@@ -4113,6 +4206,9 @@ pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
 pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+    if matches!(ty, IrType::Named(name) if name == "__ku_value") {
+        return Ok(format!("({place}).tag == KU_NULL"));
+    }
     if matches!(ty, IrType::Named(name) if name == "__ku_pg_result") {
         return Ok(format!("({place}) == NULL"));
     }

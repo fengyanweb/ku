@@ -162,7 +162,24 @@ def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH):
         plan['paired_orders']=[names,names[1:]+names[:1],names[2:]+names[:2]]
         plan['maximum_windows']=3+len(plan['cases'])*(3*len(names)+1)
         plan['scope']+=' Additional C1..C7 are preregistered normal commit ablations, not selected post hoc. BF is the identical B binary with explicit fixed workers.'
-    if 'C1' in versions and 'C2' in versions:
+    if 'BT' in versions:
+        # This is a separately identified execution path, not a replacement
+        # for the frozen worker fixture or its original sixteen goal rows.
+        names=['A','B','BT','reference']
+        plan['paired_orders']=[names,names[1:]+names[:1],names[2:]+names[:2]]
+        plan['candidate_versions']=['B','BT']
+        plan['cases']=[dict(workload='json_object',rate=500,reference='R',contract='dom'),
+            dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',ledger=False)]
+        plan['latency_slo_ms']={'json_object':100,'json_escape':100}
+        plan['task_json_comparison']=dict(numerator='BT',denominator='B',reference='R',
+            diagnostic_only=True,original_worker_score_eligible=False,
+            admission_scope='B synchronous worker only; BT admission is not verified by this gate',
+            scope='Normal O2/helpers/text native Task JSON locals versus the same-current synchronous worker; '
+                  'old A/B worker comparison retained; no PG/old-ablation repetition or old-goal substitution')
+        plan['scope']='Three frozen prepatch JSON environment controls, then separate A/B/BT/R JSON object and Unicode pairs, '
+        plan['scope']+='plus the unchanged A/B/R CPU guard. BT uses normal O2/helpers/text without probes; '
+        plan['scope']+='it is excluded from original worker goals. B admission, cold/burst and HC retain their separate scope.'
+    elif 'C1' in versions and 'C2' in versions:
         names=['A','C1','C2','B','reference']
         plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
             paired_orders=[names,names[2:]+names[:2],names[4:]+names[:4]],ledger=False))
@@ -202,7 +219,7 @@ def diagnostic_turns(plan,case,followup):
 
 def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup,admission=None):
     normal=len(rows)==expected and not stopped
-    qualified=not followup or all(r.get('diagnostic_only') or
+    qualified=not followup or all((r.get('name')=='D' and r.get('diagnostic_only')) or
         (r.get('functional_valid') is True and r.get('accounting_valid') is True
          and r.get('all_correct') is True and r.get('natural_reclamation') is True
          and r.get('arrival_schedule_quality')=='pass' and r.get('environment_quality')=='pass'
@@ -330,6 +347,11 @@ def build(a,state):
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
+    # Inspect the frozen product snapshot, never the current tools checkout.
+    # Old products/build reuse keep their original plan and build identities.
+    task_ir=a.root/'B/src/src/ir/task.rs'
+    if build_set=='followup-screen' and task_ir.is_file() and '\n    JsonDecode {' in task_ir.read_text():
+        step(state,a.root,'build-BT',lambda:one('BT',a.candidate,{'ku_json_execution':'task'}))
     return complete_build(a,state,build_set,prepatch,variants)
 
 
@@ -341,6 +363,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
+    if build_set=='followup-screen' and (a.root/'BT/manifest.json').is_file():names.append('BT')
     for name in names:
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else 'B' if name=='BF' else name)/'manifest.json')
         m=normalize_manifest(m,protocol,client);stack='rust' if is_r else 'ku';m['stacks']={stack:m['stacks'][stack]}
@@ -352,8 +375,12 @@ def complete_build(a,state,build_set,prepatch,variants):
             BENCH_PG_MODE='reset-equivalent' if name in ('RS','RPS') else 'normal',
             BENCH_PG_API='typed-text-key' if name in ('RP','RPS') else 'normal',BENCH_JSON_MODE='typed' if name=='RJ' else 'generic')
         if name=='BD':m.update(diagnostic_only=True,normal_score_eligible=False)
+        if name=='BT':m.update(diagnostic_only=True,normal_score_eligible=False,
+            diagnostic_role='native-task-json-local-values',original_worker_score_eligible=False)
         save(d/'manifest.json',m);binary=m['stacks'][stack]['command'][0]
         versions[name]=dict(root=str(d),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary))
+        if name=='BT':versions[name].update(diagnostic_only=True,normal_score_eligible=False,
+            original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
     if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
@@ -370,8 +397,19 @@ def complete_build(a,state,build_set,prepatch,variants):
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
     if build_set=='followup-screen':
         for name in plan['candidate_versions']:
+            if name=='BT':continue
             if identities['A']['files']['expanded source']['sha256']!=identities[name]['files']['expanded source']['sha256']:
                 raise ValueError('paired normal Ku business inputs differ: '+name)
+        if 'BT' in versions:
+            worker=Path(identities['B']['files']['expanded source']['path']).read_text()
+            selected=Path(identities['BT']['files']['expanded source']['path']).read_text()
+            expected=bl.ku_json_execution_evidence(worker,selected,'task')
+            actual=load(a.root/'BT/manifest.json')['stacks']['ku']['build']
+            if (actual.get('json_execution_mode')!='task' or actual.get('json_execution')!=expected
+                    or identities['B']['files']['Ku CLI']['sha256']!=identities['BT']['files']['Ku CLI']['sha256']):
+                raise ValueError('Task JSON entry is not an identified same-CLI single-declaration derivation')
+            save(a.root/'task-json-source-identity.json',dict(**expected,source_commit=a.candidate,
+                worker_binding=identities['B'],task_binding=identities['BT'],formal_qualified=False))
         if bl.benchmark_stack_sources(a.root/'A/src/tests/benchmarks/cross_stack/rust')!=load(a.root/'R/manifest.json')['stacks']['rust']['build']['source_files_sha256']:
             raise ValueError('reference business source differs from frozen prepatch')
     dependencies={};abi={}
@@ -693,7 +731,8 @@ def screen_pairs(rows,case,slo,numerator='B',denominator='A'):
         if not all((a,b,ref)):continue
         valid=all(r.get('functional_valid') is True and r.get('accounting_valid') is True and r.get('all_correct') is True
             and r.get('natural_reclamation') is True and r.get('arrival_schedule_quality')=='pass'
-            and r.get('environment_quality')=='pass' and not r.get('observed_environment_faults') for r in (a,b,ref))
+            and r.get('environment_quality')=='pass' and not r.get('measurement_invalid')
+            and not r.get('observed_environment_faults') for r in (a,b,ref))
         valid=valid and a.get('comparison_contract')==b.get('comparison_contract')==ref.get('comparison_contract')
         def ratio(x,y):return x/y if type(x)in(int,float) and type(y)in(int,float) and x>0 and y>0 else None
         p99a,p99b=(r.get('latency',{}).get('p99_ms') for r in (a,b))
@@ -711,6 +750,14 @@ def screen_pairs(rows,case,slo,numerator='B',denominator='A'):
         confidence_note='Only3 short paired windows; percentile bootstrap is descriptive and stationarity is unproven. '
                         'No average of p99 values; resource/tail regressions and cancellation regressions require root review.',
         adopted=False,formal_qualified=False)
+
+
+def task_json_screen(rows,case,slo):
+    if not any(r['name']=='BT' for r in rows):return None
+    return dict(screen_pairs(rows,case,slo,'BT','B'),diagnostic_only=True,
+        original_worker_score_eligible=False,
+        scope='Same-current native Task JSON versus synchronous worker; distinct execution-path diagnostic, '
+              'not an original sixteen-goal result or proof from changing the fixture declaration alone')
 
 
 def diagnostic(a,state,followup=False):
@@ -844,8 +891,10 @@ def diagnostic(a,state,followup=False):
                     plan['score_seconds'],output,job={'phase':'explore','contract':case['contract']})
                 except Exception as error:
                     row=load(output/'window.json') if (output/'window.json').is_file() else {'error':repr(error)}
-                row.update(turn=turn,workload=case['workload'],name=name,diagnostic_only=name=='D',
-                    normal_score_eligible=name!='D',formal_qualified=False,candidate_accepted=False)
+                row.update(turn=turn,workload=case['workload'],name=name,diagnostic_only=name in ('D','BT'),
+                    normal_score_eligible=name not in ('D','BT'),formal_qualified=False,candidate_accepted=False)
+                if name=='BT':row.update(json_execution_mode='task',original_worker_score_eligible=False,
+                    scope='Native Task JSON local-value execution diagnostic; all ordinary quality checks remain required')
                 if name=='D':
                     log=output/'service/service.log';ledgers=[]
                     if log.is_file():
@@ -886,8 +935,9 @@ def diagnostic(a,state,followup=False):
             controls=[r.get('full_cpu_us') for r in case_rows if r['name']=='B']
             save(directory/case['workload']/'comparison.json',dict(rows=case_rows,
                 paired_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
-                candidate_screens={n:screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],n)
+                candidate_screens={n:screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],n,'B' if n=='BT' else 'A')
                     for n in plan.get('candidate_versions',['B']) if any(r['name']==n for r in case_rows)} if followup else {},
+                task_json_screen=task_json_screen(case_rows,case,plan['latency_slo_ms'][case['workload']]) if followup else None,
                 worker_policy_screen=screen_pairs(case_rows,case,plan['latency_slo_ms'][case['workload']],'B','BF')
                     if followup and 'BF' in plan['versions'] else None,
                 normal_control_cpu_max_min=max(controls)/min(controls) if len(controls)>=2 and

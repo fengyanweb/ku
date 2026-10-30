@@ -6618,6 +6618,73 @@ int main(void) {
 }
 
 #[test]
+fn native_http_async_json_values_cross_timer_and_keep_request_projection_and_errors() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let source = r#"
+import { http, json, time } from "std"
+async fn encode(req: HttpRequest): HttpResponse! {
+    output=""
+    status=200
+    try {
+        decoded=json.decode(req.body)?
+        counter=decoded["counter"]?.as_int()?
+        time.sleep(2)?
+        data=decoded.take("data")?
+        output=json.encode({id:req.query.rid,counter:counter+1,data:data})?
+    } catch(error) { output=error.code status=400 }
+    return ok(http.text(status,output))
+}
+async fn healthy():HttpResponse! { return ok(http.text("healthy")) }
+fn main():null! {
+    app=http.server({handler_timeout_ms:2000,max_buffer_bytes:2097152})
+    app.post("/json",encode)
+    app.get("/healthy",healthy)
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+    let address = unused_local_address();
+    let Some(mut server) = spawn_finite_native_server("async-json-owner", source, &address, 4)
+    else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for (body, status, expected) in [
+        (
+            r#"{"counter":7,"data":{"text":"中文😀\u0000","items":[1,true,null]}}"#,
+            "HTTP/1.1 200 OK",
+            r#"{"counter":8,"data":{"items":[1,true,null],"text":"中文😀\u0000"},"id":"probe"}"#,
+        ),
+        (
+            r#"{"allocated":["prefix",1],"bad":}"#,
+            "HTTP/1.1 400 Bad Request",
+            "parse_error",
+        ),
+        (
+            r#"{"data":[1,2]}"#,
+            "HTTP/1.1 400 Bad Request",
+            "missing_key",
+        ),
+    ] {
+        let response=http_response(&address,&format!(
+            "POST /json?rid=probe HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()),Duration::from_secs(3));
+        assert_status(&response, status);
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1, expected);
+    }
+    let response = http_response(
+        &address,
+        "GET /healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert!(response.ends_with("healthy"));
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(3))
+        .success());
+    assert!(!watchdog.timed_out());
+}
+
+#[test]
 fn native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let source = r#"

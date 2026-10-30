@@ -86,11 +86,74 @@ async fn main():null! {
         .unwrap_err()
         .message
         .contains("duplicate field"));
-    for unsupported in [
-        r#"import json from "std.json" async fn main():null! {body=json.encode({a:1.5})? return ok(null)}"#,
+    let unsupported = r#"import json from "std.json" async fn main():null! {body=json.encode({a:1.5})? return ok(null)}"#;
+    assert!(task_lower::lower_program(&parsed(unsupported)).is_err());
+    let local = lowered_json(
         r#"import json from "std.json" async fn main():null! {value={a:1} body=json.encode(value)? return ok(null)}"#,
-    ] {
-        assert!(task_lower::lower_program(&parsed(unsupported)).is_err());
+    );
+    task::verify_and_plan(&local.tasks, Default::default())
+        .expect("a JSON object local is supported");
+}
+
+#[test]
+fn native_task_json_frame_values_cannot_escape_or_be_reused_after_consumption() {
+    use ku::ir::{
+        task::{SlotId, TaskJsonOperation, TaskSlotType},
+        IrType,
+    };
+    let native = lowered_json(
+        r#"
+import json from "std.json"
+async fn main():null! {
+    value=json.decode("{\"a\":1}")?
+    leaf=value.take("a")?
+    number=leaf.as_int()?
+    println(number)
+    return ok(null)
+}
+"#,
+    );
+    task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    let json_slot=native.tasks.functions[0].slots.iter().position(|slot|
+        matches!(&slot.ty,TaskSlotType::Value{ty:IrType::Named(name),..} if name=="__ku_value")).unwrap();
+    let mut parameter = native.tasks.clone();
+    parameter.functions[0].parameters.push(SlotId(json_slot));
+    assert!(task::verify_and_plan(&parameter, Default::default())
+        .unwrap_err()
+        .message
+        .contains("cannot enter async parameters"));
+    let mut outcome = native.tasks.clone();
+    outcome.functions[0].result = IrType::Result(Box::new(IrType::Named("__ku_value".into())));
+    assert!(task::verify_and_plan(&outcome, Default::default())
+        .unwrap_err()
+        .message
+        .contains("function completion"));
+    for consuming in [TaskJsonOperation::Take, TaskJsonOperation::AsInt] {
+        let mut reused = native.tasks.clone();
+        let (state, index, source) = reused.functions[0]
+            .states
+            .iter()
+            .enumerate()
+            .find_map(|(state, block)| {
+                block
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, operation)| match operation {
+                        TaskOp::JsonValue {
+                            source, operation, ..
+                        } if *operation == consuming => Some((state, index, *source)),
+                        _ => None,
+                    })
+            })
+            .unwrap();
+        reused.functions[0].states[state]
+            .operations
+            .insert(index + 1, TaskOp::Read { slot: source });
+        assert!(task::verify_and_plan(&reused, Default::default())
+            .unwrap_err()
+            .message
+            .contains("not definitely initialized"));
     }
 }
 
@@ -381,13 +444,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
         "true < false",
         "null == null",
         "\"a\" + 1",
-        "\"a\" == \"b\"",
         "ok(1) == ok(1)",
         "Child() == Child()",
         "1 && true",
         "true || 1",
         "false && (1 + true)",
-        "true || (\"a\" == \"a\")",
+        "true || (1 == true)",
     ] {
         // Deliberately bypass the checker: this internal backend API must still
         // reject wider types and must validate an unreachable RHS.
@@ -397,6 +459,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             error.message.contains("not support"),
             "{expression}: {error}"
         );
+    }
+    // String equality is already a supported read-only operation. Keep its
+    // positive source contract separate from genuinely invalid operand types.
+    for expression in ["\"a\" == \"b\"", "true || (\"a\" == \"a\")"] {
+        let source = format!("async fn main():null! {{ value={expression} return ok(null) }}");
+        task_lower::lower_program(&parsed(&source)).expect("supported string comparison");
     }
     // Parser/checker retain their separate, tighter depth limits. Construct a
     // typed AST only here to reach the lowerer's independent slot/depth gates;

@@ -110,6 +110,17 @@ pub enum TaskPgResultOperation {
     IsNull,
 }
 
+/// Frame-local JSON only. Access follows the existing dynamic-value contract:
+/// Encode/Get borrow; Take/AsInt/AsStr consume their source owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskJsonOperation {
+    Encode,
+    Get,
+    Take,
+    AsInt,
+    AsStr,
+}
+
 /// Copy-only operations: source lowering maps existing syntax to these tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskUnaryOp {
@@ -282,6 +293,23 @@ pub enum TaskOp {
         row: Option<SlotId>,
         col: Option<SlotId>,
         operation: TaskPgResultOperation,
+    },
+    /// Parse with the existing strict engine; the text is read, never consumed.
+    JsonDecode {
+        dst: SlotId,
+        text: SlotId,
+    },
+    JsonValue {
+        dst: SlotId,
+        source: SlotId,
+        key: Option<SlotId>,
+        operation: TaskJsonOperation,
+    },
+    /// Fields are materialized once, in source order. Owned field payloads move
+    /// even on construction failure; no frame retains aliases into the object.
+    JsonObject {
+        dst: SlotId,
+        fields: Vec<(String, SlotId)>,
     },
     /// Static scalar object keys are canonicalized only after every source
     /// expression has been materialized, left to right, exactly once.
@@ -574,6 +602,12 @@ pub(crate) fn local_pg_type(ty: &IrType) -> bool {
         || matches!(ty, IrType::Named(name) if name == "__ku_pg_result")
         || matches!(ty, IrType::Result(inner) if matches!(inner.as_ref(), IrType::Named(name) if name == "__ku_pg_result"))
 }
+pub(crate) fn json_value_type(ty: &IrType) -> bool {
+    matches!(ty, IrType::Named(name) if name == "__ku_value")
+}
+pub(crate) fn local_json_type(ty: &IrType) -> bool {
+    json_value_type(ty) || matches!(ty, IrType::Result(inner) if json_value_type(inner))
+}
 fn parameter_type(ty: &IrType) -> bool {
     primitive(ty)
         || error_type(ty)
@@ -588,6 +622,7 @@ fn value_type(ty: &IrType) -> bool {
         || local_bytes_type(ty)
         || local_net_type(ty)
         || local_pg_type(ty)
+        || local_json_type(ty)
 }
 
 /// A local-only typed PostgreSQL parameter vector. It cannot become a Task
@@ -639,6 +674,9 @@ pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
             | TaskOp::HttpMapGet { .. }
             | TaskOp::PgResult { .. }
             | TaskOp::JsonEncodeObject { .. }
+            | TaskOp::JsonDecode { .. }
+            | TaskOp::JsonValue { .. }
+            | TaskOp::JsonObject { .. }
             | TaskOp::StringClone { .. }
             | TaskOp::PrimitiveString { .. }
             | TaskOp::StringConcat { .. }
@@ -808,7 +846,9 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                 "operation limit exceeded",
             )?;
             for operation in &state.operations {
-                if let TaskOp::JsonEncodeObject { fields, .. } = operation {
+                if let TaskOp::JsonEncodeObject { fields, .. } | TaskOp::JsonObject { fields, .. } =
+                    operation
+                {
                     if fields.len() > limits.max_slots {
                         return Err(invalid("JSON literal field limit exceeded"));
                     }
@@ -996,7 +1036,7 @@ fn validate_shape(
     let mut has_error_projection = http_type(&function.result) || array_result(&function.result) || function
         .slots
         .iter()
-        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || pg_params_array(ty) || array_result(ty) || http_type(ty)));
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty) || pg_params_array(ty) || array_result(ty) || http_type(ty) || local_json_type(ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -1427,7 +1467,8 @@ fn validate_shape(
                     if dst == src
                         || borrowed
                         || source_borrowed
-                        || !result_type(destination)
+                        || !(result_type(destination)
+                            || matches!(destination, IrType::Result(inner) if json_value_type(inner)))
                         || !error_type(source)
                     {
                         return Err(invalid(
@@ -1535,6 +1576,78 @@ fn validate_shape(
                     for input in [row, col].into_iter().flatten() {
                         if input == dst || slot_type(get_slot(*input)?)? != (&IrType::Int, false) {
                             return Err(invalid("PgResult indexes must be Copy integers"));
+                        }
+                    }
+                }
+                TaskOp::JsonDecode { dst, text } => {
+                    has_error_projection = true;
+                    if dst == text
+                        || slot_type(get_slot(*text)?)?.0 != &IrType::Str
+                        || slot_type(get_slot(*dst)?)?
+                            != (
+                                &IrType::Result(Box::new(IrType::Named("__ku_value".into()))),
+                                false,
+                            )
+                    {
+                        return Err(invalid(
+                            "JsonDecode requires text and an owned JSON Result destination",
+                        ));
+                    }
+                }
+                TaskOp::JsonValue {
+                    dst,
+                    source,
+                    key,
+                    operation,
+                } => {
+                    has_error_projection = true;
+                    let (source_type, borrowed) = slot_type(get_slot(*source)?)?;
+                    let expected = IrType::Result(Box::new(match operation {
+                        TaskJsonOperation::Encode | TaskJsonOperation::AsStr => IrType::Str,
+                        TaskJsonOperation::AsInt => IrType::Int,
+                        TaskJsonOperation::Get | TaskJsonOperation::Take => {
+                            IrType::Named("__ku_value".into())
+                        }
+                    }));
+                    if dst == source
+                        || borrowed
+                        || !json_value_type(source_type)
+                        || slot_type(get_slot(*dst)?)? != (&expected, false)
+                        || key.is_some()
+                            != matches!(operation, TaskJsonOperation::Get | TaskJsonOperation::Take)
+                    {
+                        return Err(invalid(
+                            "JsonValue requires a JSON owner and matching Result/key operands",
+                        ));
+                    }
+                    if let Some(key) = key {
+                        if key == dst
+                            || key == source
+                            || slot_type(get_slot(*key)?)?.0 != &IrType::Str
+                        {
+                            return Err(invalid("JsonValue requires a separate string key"));
+                        }
+                    }
+                }
+                TaskOp::JsonObject { dst, fields } => {
+                    has_error_projection = true;
+                    if slot_type(get_slot(*dst)?)? != (&IrType::Named("__ku_value".into()), false) {
+                        return Err(invalid("JsonObject requires an owned JSON destination"));
+                    }
+                    let mut owners = 0u64;
+                    for (_, source) in fields {
+                        let (ty, borrowed) = slot_type(get_slot(*source)?)?;
+                        if source == dst
+                            || borrowed
+                            || !(primitive(ty) || json_value_type(ty))
+                            || (!copy_type(ty) && owners & bit(*source) != 0)
+                        {
+                            return Err(invalid(
+                                "JsonObject requires distinct materialized scalar/JSON owners",
+                            ));
+                        }
+                        if !copy_type(ty) {
+                            owners |= bit(*source);
                         }
                     }
                 }
@@ -2209,6 +2322,9 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::PgResult { dst, .. }
         | TaskOp::JsonEncodeObject { dst, .. }
+        | TaskOp::JsonDecode { dst, .. }
+        | TaskOp::JsonValue { dst, .. }
+        | TaskOp::JsonObject { dst, .. }
         | TaskOp::ArrayMake { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::StartIndirect { dst, .. }
@@ -2571,9 +2687,32 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::HttpMapGet { dst, .. }
         | TaskOp::PgResult { dst, .. }
         | TaskOp::JsonEncodeObject { dst, .. }
+        | TaskOp::JsonDecode { dst, .. }
         | TaskOp::Binary { dst, .. } => {
             state.must |= bit(*dst);
             state.may |= bit(*dst);
+        }
+        TaskOp::JsonValue {
+            dst,
+            source,
+            operation,
+            ..
+        } => {
+            let consumed = if matches!(
+                operation,
+                TaskJsonOperation::Take | TaskJsonOperation::AsInt | TaskJsonOperation::AsStr
+            ) {
+                bit(*source)
+            } else {
+                0
+            };
+            state.must = (state.must & !consumed) | bit(*dst);
+            state.may = (state.may & !consumed) | bit(*dst);
+        }
+        TaskOp::JsonObject { dst, fields } => {
+            let consumed = fields.iter().fold(0, |mask, (_, slot)| mask | bit(*slot)) & owned;
+            state.must = (state.must & !consumed) | bit(*dst);
+            state.may = (state.may & !consumed) | bit(*dst);
         }
         TaskOp::Move { dst, src } => {
             state.must = (state.must & !bit(*src)) | bit(*dst);
@@ -2631,7 +2770,9 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Unary { .. } => budget.spend()?,
-        TaskOp::JsonEncodeObject { fields, .. } => budget.spend_many(fields.len())?,
+        TaskOp::JsonEncodeObject { fields, .. } | TaskOp::JsonObject { fields, .. } => {
+            budget.spend_many(fields.len())?
+        }
         TaskOp::Binary { .. } | TaskOp::StringConcat { .. } | TaskOp::ArrayTryGet { .. } => {
             budget.spend_many(2)?
         }
@@ -2967,10 +3108,15 @@ fn live_states(
                     } => {
                         live = (live & !bit(*dst)) | body.map_or(0, bit) | status.map_or(0, bit);
                     }
-                    TaskOp::JsonEncodeObject { dst, fields } => {
+                    TaskOp::JsonEncodeObject { dst, fields }
+                    | TaskOp::JsonObject { dst, fields } => {
                         live = (live & !bit(*dst))
                             | fields.iter().fold(0, |mask, (_, slot)| mask | bit(*slot));
                     }
+                    TaskOp::JsonDecode { dst, text } => live = (live & !bit(*dst)) | bit(*text),
+                    TaskOp::JsonValue {
+                        dst, source, key, ..
+                    } => live = (live & !bit(*dst)) | bit(*source) | key.map_or(0, bit),
                     TaskOp::PgResult {
                         dst,
                         source,
@@ -3107,6 +3253,8 @@ fn validate_ownership_and_plan(
                 | TaskOp::WrapError { src, .. }
                 | TaskOp::MakeError { message: src, .. }
                 | TaskOp::ErrorField { src, .. }
+                | TaskOp::JsonDecode { text: src, .. }
+                | TaskOp::JsonValue { source: src, .. }
                 | TaskOp::Unary { src, .. } => Some(*src),
                 TaskOp::Read { slot } | TaskOp::CheckForLimit { slot } | TaskOp::Drop { slot } => {
                     Some(*slot)
@@ -3128,10 +3276,17 @@ fn validate_ownership_and_plan(
                     return Err(invalid("HttpResponse reads an uninitialized operand"));
                 }
             }
-            if let TaskOp::JsonEncodeObject { fields, .. } = operation {
+            if let TaskOp::JsonEncodeObject { fields, .. } | TaskOp::JsonObject { fields, .. } =
+                operation
+            {
                 budget.spend_many(fields.len())?;
                 if fields.iter().any(|(_, slot)| state.must & bit(*slot) == 0) {
                     return Err(invalid("JSON literal reads an uninitialized field"));
+                }
+            }
+            if let TaskOp::JsonValue { key: Some(key), .. } = operation {
+                if state.must & bit(*key) == 0 {
+                    return Err(invalid("JsonValue reads an uninitialized key"));
                 }
             }
             if let TaskOp::PgResult {
@@ -4061,10 +4216,23 @@ fn source_op_slots(operation: &mut TaskOp, visit: &mut impl FnMut(&mut SlotId)) 
             visit(left);
             visit(right);
         }
-        TaskOp::JsonEncodeObject { dst, fields } => {
+        TaskOp::JsonEncodeObject { dst, fields } | TaskOp::JsonObject { dst, fields } => {
             visit(dst);
             for (_, slot) in fields {
                 visit(slot);
+            }
+        }
+        TaskOp::JsonDecode { dst, text } => {
+            visit(dst);
+            visit(text);
+        }
+        TaskOp::JsonValue {
+            dst, source, key, ..
+        } => {
+            visit(dst);
+            visit(source);
+            if let Some(key) = key {
+                visit(key);
             }
         }
         TaskOp::PgResult {

@@ -17,7 +17,7 @@ import profile_training
 from compile_variants import profile_input, native_flags
 from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
-from build_linux import (expand_ku_server, file_identity, native_emission_source,
+from build_linux import (expand_ku_server, file_identity, ku_json_execution_evidence, native_emission_source,
                          normal_compiler_receipt, normal_compiler_recorder)
 
 
@@ -30,6 +30,58 @@ class KuCompilerCommandTests(unittest.TestCase):
         for argument in ['a"b', 'a\nb', 'a\rb']:
             with self.assertRaisesRegex(ValueError, 'KU_CC'):
                 compile_variants.ku_cc_command(['clang-18', argument])
+
+
+class KuJsonExecutionTests(unittest.TestCase):
+    """Separate Task JSON diagnostic inputs without changing the frozen fixture."""
+
+    def source(self):
+        return Path(__file__).with_name('ku').joinpath('server.ku')
+
+    def test_default_is_unchanged_and_task_changes_only_its_handler_declaration(self):
+        source_path=self.source();frozen=source_path.read_bytes();source=frozen.decode('utf-8')
+        worker=expand_ku_server(source,19191)
+        self.assertEqual(worker,source.replace('__PEER_PORT__','19191'))
+        self.assertEqual(expand_ku_server(source,19191,json_execution='worker'),worker)
+        task=expand_ku_server(source,19191,json_execution='task')
+        original='fn encode(req: HttpRequest): HttpResponse! {'
+        selected='async '+original
+        self.assertEqual(task.count(selected),1)
+        self.assertEqual(task.replace(selected,original,1),worker)
+        self.assertEqual(task.split('fn main():',1)[1],worker.split('fn main():',1)[1])
+        self.assertEqual(source_path.read_bytes(),frozen)
+
+        default=ku_json_execution_evidence(worker,worker,'worker')
+        self.assertEqual(default['mode'],'worker')
+        self.assertFalse(default['diagnostic_only'])
+        self.assertTrue(default['original_worker_score_eligible'])
+        self.assertEqual(default['source_diff'],'')
+        self.assertEqual(default['worker_source_sha256'],default['selected_source_sha256'])
+        selected=ku_json_execution_evidence(worker,task,'task')
+        self.assertEqual(selected['mode'],'task')
+        self.assertTrue(selected['diagnostic_only'])
+        self.assertFalse(selected['original_worker_score_eligible'])
+        self.assertIn('separate from the frozen synchronous JSON score',selected['scope'])
+        self.assertEqual(selected['worker_source_sha256'],hashlib.sha256(worker.encode('utf-8')).hexdigest())
+        self.assertEqual(selected['selected_source_sha256'],hashlib.sha256(task.encode('utf-8')).hexdigest())
+        self.assertEqual(selected['source_diff_sha256'],hashlib.sha256(selected['source_diff'].encode('utf-8')).hexdigest())
+        changed=[line for line in selected['source_diff'].splitlines()
+                 if line.startswith(('+','-')) and not line.startswith(('+++','---'))]
+        self.assertEqual(changed,['-'+original,'+async '+original])
+        with self.assertRaisesRegex(RuntimeError,'differs beyond'):
+            ku_json_execution_evidence(worker,task.replace('counter + 1','counter + 2'),'task')
+
+    def test_task_requires_one_original_handler_and_normal_helpers_text(self):
+        source=self.source().read_text();handler='fn encode(req: HttpRequest): HttpResponse! {'
+        for changed in [source.replace(handler,'async '+handler),
+                        source+'\n'+handler+'\n',source.replace(handler,'fn changed(req) {')]:
+            with self.subTest(source=changed[-80:]),self.assertRaisesRegex(RuntimeError,'exactly one original synchronous'):
+                expand_ku_server(changed,19191,json_execution='task')
+        for mode,json_mode in [('helpers','typed'),('helpers','response'),('direct','text')]:
+            with self.subTest(mode=mode,json_mode=json_mode),self.assertRaisesRegex(ValueError,'normal helpers/text'):
+                expand_ku_server(source,19191,mode=mode,json_mode=json_mode,json_execution='task')
+        with self.assertRaisesRegex(ValueError,'JSON execution mode'):
+            expand_ku_server(source,19191,json_execution='automatic')
 
 
 class NormalCompilerReceiptTests(unittest.TestCase):
