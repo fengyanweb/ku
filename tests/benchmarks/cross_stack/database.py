@@ -2,7 +2,7 @@
 """Prepare/stop only ROOT/database's private benchmark PostgreSQL 16 cluster.
 
 Run as root on the disposable Linux guest. Every database process is attached
-to its independent CPU7/512MiB cgroup before dropping to the fixture user and
+to its configured CPU set (default CPU7)/512MiB cgroup before dropping to the fixture user and
 exec. This never operates a system cluster, production address or remote DB.
 """
 from __future__ import annotations
@@ -244,7 +244,7 @@ class Database:
             manifest.update(db_url=f"postgresql://bench@127.0.0.1:{PORT}/bench?sslmode=disable", db_cgroup=str(domain.path),
                             database=dict(status="running", state=str(self.state_path), postgres_version=version,
                                           rows=1024, rows_sha256=sha(rows), fixture_sql_sha256=sha(sql.encode()),
-                                          cpu_set="7", memory_bytes=512*1048576, shared_buffers="64MB", max_connections=80))
+                                          cpu_set=domain.settings["cpuset.cpus"], memory_bytes=512*1048576, shared_buffers="64MB", max_connections=80))
             self.save_manifest(manifest)
             return dict(status="running", pid=process.pid, cgroup=str(domain.path), state=str(self.state_path), rows_sha256=sha(rows))
         except BaseException as error:
