@@ -26,7 +26,7 @@ Parsing and encoding use the existing strict JSON engine, a depth limit of 32 an
 
 ## Supported scope
 
-Local dynamic values can hold, transfer and re-encode JSON objects, arrays, strings, numbers, booleans and null. Arrays may come from decoding; this does not add integer indexing of dynamic JSON or heterogeneous array literals to native Tasks. Object operations include string-key indexing, `take`, `as_int` and `as_str`. No `.get()` method was added to KuValue.
+Local dynamic values can hold, transfer and re-encode JSON objects, arrays, strings, numbers, booleans and null. A dynamic object literal constructed inside a Task supports at most 64 fields; decoded objects retain the existing parser rules. Arrays may come from decoding; this does not add integer indexing of dynamic JSON or heterogeneous array literals to native Tasks. Object operations include string-key indexing, `take`, `as_int` and `as_str`. No `.get()` method was added to KuValue.
 
 Task parameters, captures and public Task outcomes were not extended to arbitrary JSON. Native Task floating-point locals and other operations remain subject to the existing type subset. Unsupported programs are rejected at compile time. Consult the separate interpreter, synchronous C and LLVM documentation for their own capabilities.
 
