@@ -8689,6 +8689,29 @@ static int fixture_normal(void) {
   CHECK(fixture_attr_inits==fixture_attr_drops);
   return 0;
 }
+static int fixture_owner_storage_refunds_real_task_budget(void) {
+  for(size_t point=1;point<=4;point++) {
+    fixture_reset(0,0);
+    KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)ku_http_task_runtime_new(1u,4u,8u*1024u*1024u,NULL,fixture_wake,fixture_deadline());
+    CHECK(runtime);KuHttpServer* server=ku_http_server_new();
+    KuHttpLoopGroup group={0};group.server=server;group.tasks=runtime;group.listener=KU_HTTP_INVALID_SOCKET;
+    group.count=group.created=1;group.started=group.draining=1;
+    CHECK(ku_http_mutex_init(&group.lock) && ku_http_wake_init(&group.wake));
+    group.loops[0].group=&group;group.loops[0].slots=3;group.loops[0].pending=4;group.loops[0].request_limit=4;
+    size_t reserved=runtime->driver.reserved_bytes,live=ku_perf_live_allocations,bytes=ku_perf_live_bytes;
+    fixture_calloc_attempts=0;fixture_calloc_fail_at=point;
+    CHECK(ku_http_loop_run(&group.loops[0]));fixture_calloc_fail_at=0;
+    CHECK(runtime->driver.reserved_bytes==reserved && ku_perf_live_allocations==live && ku_perf_live_bytes==bytes);
+    ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);ku_http_server_free(server);
+    CHECK(ku_http_task_runtime_close(runtime,fixture_deadline())==KU_TASK_DRIVER_OK);
+    uint64_t next=UINT64_MAX;
+    for(size_t turn=0;turn<8u && runtime->driver.workers_exited!=runtime->driver.workers_created;turn++)
+      CHECK(ku_http_task_pump(runtime,0u,32u,&next)<=KU_TASK_DRIVER_PENDING);
+    CHECK(ku_http_task_runtime_free(runtime,fixture_deadline())==KU_TASK_DRIVER_OK);
+    CHECK(!ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  }
+  return 0;
+}
 int main(void) {
   CHECK(!ku_perf_calls && !ku_perf_live_allocations && !ku_perf_live_bytes);
   /* Every runtime/table calloc can fail before native acquisition. A following
@@ -8718,6 +8741,7 @@ int main(void) {
     }
   }
   CHECK(!failures);
+  CHECK(!fixture_owner_storage_refunds_real_task_budget());
   CHECK(!fixture_normal());
   puts("http-task-partial-init-reclaimed-ok");return 0;
 }
@@ -9301,7 +9325,7 @@ fn main(): null! {
 "#,
     );
     let instrumentation = format!(
-        "{}\n{}\n{}\n{}\nstatic void fixture_worker_gate(void);\nstatic int fixture_worker_spawn_failed(void);\nstatic void* fixture_worker_handles(size_t,size_t);\nstatic void* fixture_zero_calloc(size_t,size_t);\n",
+        "{}\n{}\n{}\n{}\nstatic void fixture_worker_gate(void);\nstatic int fixture_worker_spawn_failed(void);\nstatic void* fixture_worker_handles(size_t,size_t);\nstatic void* fixture_zero_calloc(size_t,size_t);\nstatic void* fixture_loop_calloc(size_t,size_t);\nstatic void* fixture_owner_calloc(size_t,size_t);\nstatic void fixture_owner_free(void*);\nstatic void fixture_owner_observe(void*,void*,void*,size_t,size_t,size_t,size_t);\nstatic int fixture_owner_wake(void*);\nstatic int fixture_owner_sync(void*,void*);\n#undef calloc\n#define calloc fixture_loop_calloc\n",
         native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
         native_task_ledger::LEDGER_LOCK,
         native_allocation_harness::ALLOCATION_HOOK,
@@ -9312,6 +9336,11 @@ fn main(): null! {
         .replacen("typedef struct KuString {", &format!("{instrumentation}typedef struct KuString {{"), 1)
         .replacen("    ku_http_job_run(context->server, job);", "    fixture_worker_gate();\n    ku_http_job_run(context->server, job);", 1)
         .replacen("static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {", "static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {\n  if(fixture_worker_spawn_failed())return 0;", 1)
+        .replacen("calloc(1,owner_storage_bytes)", "fixture_owner_calloc(1,owner_storage_bytes)", 1)
+        .replace("free(connections);", "fixture_owner_free(connections);")
+        .replacen("  KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count", "  fixture_owner_observe(connections,poll_items,net_storage,(size_t)slot_count,poll_capacity,net_bytes,owner_storage_bytes);\n  KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count", 1)
+        .replacen("if (!ku_http_wake_init(&wake))", "if (!fixture_owner_wake(&wake))", 1)
+        .replacen("ku_http_sync_init(&queue->lock, &queue->not_empty)", "fixture_owner_sync(&queue->lock, &queue->not_empty)", 1)
         .replace("(HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE))", "(HANDLE*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(HANDLE))")
         .replace("(pthread_t*)malloc((size_t)nworkers * sizeof(pthread_t))", "(pthread_t*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(pthread_t))")
         .replace("calloc((size_t)slot_count,", "fixture_zero_calloc((size_t)slot_count,");
@@ -9327,6 +9356,74 @@ static void* fixture_worker_handles(size_t count,size_t bytes) {
 static void* fixture_zero_calloc(size_t count,size_t bytes) {
   if(!count) {fixture_zero_allocations++;return NULL;}
   return calloc(count,bytes);
+}
+#if defined(_MSC_VER)
+#define FIXTURE_STORAGE_ALIGNOF(T) __alignof(T)
+#else
+#define FIXTURE_STORAGE_ALIGNOF(T) _Alignof(T)
+#endif
+static size_t fixture_loop_count,fixture_loop_fail_at,fixture_owner_calls,fixture_owner_frees,fixture_owner_observations;
+static int fixture_loop_counting,fixture_fail_wake,fixture_fail_sync,fixture_owner_allocated;
+static void* fixture_owner_base;
+static void* fixture_loop_calloc(size_t count,size_t bytes) {
+  if(fixture_loop_counting && ++fixture_loop_count==fixture_loop_fail_at)return NULL;
+  return fixture_calloc(count,bytes);
+}
+static void* fixture_owner_calloc(size_t count,size_t bytes) {
+  fixture_owner_calls++;CHECK(count==1 && bytes);fixture_owner_base=calloc(count,bytes);fixture_owner_allocated=fixture_owner_base!=NULL;return fixture_owner_base;
+}
+static void fixture_owner_free(void* value) {
+  if(value) {CHECK(value==fixture_owner_base && !fixture_owner_frees);fixture_owner_frees++;}
+  free(value);fixture_owner_base=NULL;
+}
+static int fixture_owner_wake(void* raw) {
+  return fixture_fail_wake?0:ku_http_wake_init((KuHttpWake*)raw);
+}
+static int fixture_owner_sync(void* lock,void* condition) {
+  return fixture_fail_sync?0:ku_http_sync_init((KuHttpMutex*)lock,(KuHttpCondition*)condition);
+}
+static void fixture_owner_observe(void* base,void* polls,void* net,size_t slots,size_t count,size_t net_bytes,size_t bytes) {
+  fixture_owner_observations++;size_t total=0,poll_offset=0,net_offset=0;
+  CHECK(ku_http_owner_storage_size(slots,count,net_bytes,&total,&poll_offset,&net_offset) && total==bytes);
+  if(!base) {CHECK(!polls && !net);return;}
+  CHECK(base==fixture_owner_base && polls==(unsigned char*)base+poll_offset);
+  CHECK((uintptr_t)polls%FIXTURE_STORAGE_ALIGNOF(KuHttpPollFd)==0 && (!net_bytes?!net:net==(unsigned char*)base+net_offset));
+  for(size_t i=0;i<bytes;i++)CHECK(!((unsigned char*)base)[i]);
+}
+static void fixture_storage_layout(void) {
+  for(size_t slots=0;slots<=3;slots++)for(size_t polls=0;polls<=3;polls++)for(size_t net=0;net<=64;net+=64) {
+    size_t bytes=0,poll_offset=0,net_offset=0;
+    CHECK(ku_http_owner_storage_size(slots,polls,net,&bytes,&poll_offset,&net_offset));
+    CHECK(poll_offset==slots*sizeof(KuHttpConnection) && net_offset==poll_offset+polls*sizeof(KuHttpPollFd) && bytes==net_offset+net);
+    if(!bytes)continue;
+    unsigned char* base=(unsigned char*)calloc(1,bytes);CHECK(base);
+    for(size_t i=0;i<bytes;i++)CHECK(!base[i]);
+    CHECK((uintptr_t)(base+poll_offset)%FIXTURE_STORAGE_ALIGNOF(KuHttpPollFd)==0 && (uintptr_t)(base+net_offset)%FIXTURE_STORAGE_ALIGNOF(uint64_t)==0);
+    memset(base,0x11,poll_offset);memset(base+poll_offset,0x22,net_offset-poll_offset);memset(base+net_offset,0x33,net);
+    for(size_t i=0;i<bytes;i++)CHECK(base[i]==(i<poll_offset?0x11:i<net_offset?0x22:0x33));
+    free(base);
+  }
+  size_t total=1,poll=2,net=3;
+  CHECK(!ku_http_owner_storage_size(SIZE_MAX,1,0,&total,&poll,&net));
+  CHECK(!ku_http_owner_storage_size(1,SIZE_MAX,0,&total,&poll,&net));
+  CHECK(!ku_http_owner_storage_size(1,1,SIZE_MAX,&total,&poll,&net));
+  CHECK(!ku_http_owner_storage_size(SIZE_MAX/sizeof(KuHttpConnection),SIZE_MAX/sizeof(KuHttpPollFd),0,&total,&poll,&net));
+  CHECK(total==1 && poll==2 && net==3);
+}
+static const char* fixture_storage_loop(KuHttpServer* server,int slots,size_t fail_at,int fail_wake,int fail_sync) {
+  FixtureLedger before=fixture_ledger();KuHttpLoopGroup group={0};group.server=server;group.listener=KU_HTTP_INVALID_SOCKET;
+  group.count=group.created=1;group.started=group.draining=1;
+  CHECK(ku_http_mutex_init(&group.lock));CHECK(ku_http_wake_init(&group.wake));
+  group.loops[0].group=&group;group.loops[0].slots=slots;group.loops[0].pending=4;group.loops[0].request_limit=4;
+  fixture_loop_count=fixture_owner_calls=fixture_owner_frees=fixture_owner_observations=0;
+  fixture_loop_fail_at=fail_at;fixture_fail_wake=fail_wake;fixture_fail_sync=fail_sync;fixture_loop_counting=1;
+  const char* failure=ku_http_loop_run(&group.loops[0]);fixture_loop_counting=0;fixture_fail_wake=fixture_fail_sync=0;
+  CHECK(fixture_owner_calls==1 && fixture_owner_observations==1);
+  CHECK(fixture_owner_frees==(fixture_owner_allocated?1u:0u));
+  if(!failure)CHECK(!group.loops[0].handler_workers && !group.failure);
+  ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);
+  FixtureLedger after=fixture_ledger();CHECK(after.allocations==before.allocations && after.bytes==before.bytes && !after.overflow);
+  return failure;
 }
 static int fixture_worker_spawn_failed(void) {
   int fail=fixture_fail_next_spawn;fixture_fail_next_spawn=0;return fail;
@@ -9429,19 +9526,17 @@ int main(void) {
       ku_string_static((const uint8_t*)"/",1u),(void*)Work__thunk,NULL,0,0);
   ku_http_server_add_route(server,ku_string_static((const uint8_t*)"POST",4u),
       ku_string_static((const uint8_t*)"/worker",7u),(void*)WorkerTransport__thunk,NULL,0,0);
+  fixture_storage_layout();
+  CHECK(!fixture_storage_loop(server,3,0,0,0));size_t allocation_points=fixture_loop_count;CHECK(allocation_points);
+  for(size_t point=1;point<=allocation_points;point++)CHECK(fixture_storage_loop(server,3,point,0,0));
+  CHECK(fixture_storage_loop(server,0,1,0,0)); /* Zero slots still require the shared base. */
+  CHECK(fixture_storage_loop(server,3,0,1,0));CHECK(fixture_storage_loop(server,3,0,0,1));
   /* Zero physical slots/workers are legal for a non-accepting owner. Force
    * every affected zero-size reserve to return NULL, as libc may legally do. */
   for(int fixed=0;fixed<2;fixed++) {
-    KuHttpLoopGroup group={0};group.server=server;group.listener=KU_HTTP_INVALID_SOCKET;
-    group.count=group.created=1;group.started=group.draining=1;
-    CHECK(ku_http_mutex_init(&group.lock));CHECK(ku_http_wake_init(&group.wake));
-    group.loops[0].group=&group;group.loops[0].pending=4;group.loops[0].request_limit=4;
-    server->elastic_workers=!fixed;
-    CHECK(!ku_http_loop_run(&group.loops[0]));
-    CHECK(!group.loops[0].handler_workers && !group.failure);
-    ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);
+    size_t zero_before=fixture_zero_allocations;server->elastic_workers=!fixed;
+    CHECK(!fixture_storage_loop(server,0,0,0,0));CHECK(fixture_zero_allocations>zero_before);
   }
-  CHECK(fixture_zero_allocations>=8u);
   fixture_elastic_transport(server);
   for(int fixed=0;fixed<2;fixed++) {
     fixture_started=0;fixture_fail_next_spawn=0;

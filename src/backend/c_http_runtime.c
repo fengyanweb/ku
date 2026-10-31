@@ -3946,6 +3946,26 @@ static int ku_http_reactor_init(KuHttpReactor* r,KuHttpActiveSet* active,size_t 
 }
 #endif
 /* End persistent owner reactor. */
+/* Compile-time layout proof: no padding or independent scratch ownership. */
+#if defined(_MSC_VER)
+#define KU_HTTP_STORAGE_ALIGNOF(T) __alignof(T)
+#else
+#define KU_HTTP_STORAGE_ALIGNOF(T) _Alignof(T)
+#endif
+typedef char KuHttpOwnerPollAlignment[(sizeof(KuHttpConnection)%KU_HTTP_STORAGE_ALIGNOF(KuHttpPollFd)==0)?1:-1];
+#if defined(KU_HTTP_HAS_TASK_NET)
+typedef char KuHttpOwnerNetAlignment[(sizeof(KuHttpConnection)%KU_HTTP_STORAGE_ALIGNOF(KuTaskNetPollV1)==0
+    && sizeof(KuHttpPollFd)%KU_HTTP_STORAGE_ALIGNOF(KuTaskNetPollV1)==0)?1:-1];
+#endif
+#undef KU_HTTP_STORAGE_ALIGNOF
+static int ku_http_owner_storage_size(size_t slots,size_t polls,size_t net_bytes,
+    size_t* total,size_t* poll_offset,size_t* net_offset) {
+  if(slots>SIZE_MAX/sizeof(KuHttpConnection) || polls>SIZE_MAX/sizeof(KuHttpPollFd))return 0;
+  size_t connections=slots*sizeof(KuHttpConnection),polls_bytes=polls*sizeof(KuHttpPollFd);
+  if(connections>SIZE_MAX-polls_bytes || connections+polls_bytes>SIZE_MAX-net_bytes)return 0;
+  *poll_offset=connections;*net_offset=connections+polls_bytes;*total=*net_offset+net_bytes;
+  return 1;
+}
 static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpLoopGroup* group = owner->group;
   KuHttpServer* server = group->server;
@@ -3961,6 +3981,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   if(!net_capacity || net_capacity>KU_TASK_NET_POLL_CAPACITY)return "Task network capacity invalid";
   poll_capacity+=net_capacity;net_bytes=net_capacity*sizeof(KuTaskNetPollV1);
 #endif
+  size_t owner_storage_bytes=0,poll_offset=0,net_offset=0;
+  if(!ku_http_owner_storage_size((size_t)slot_count,poll_capacity,net_bytes,
+      &owner_storage_bytes,&poll_offset,&net_offset))return "reactor storage size overflow";
   /* Configuration limits bound all products below on every supported target.
      One receipt includes every owner array; no Task/connection consumes an
      independent copy of the service's configured byte budget. */
@@ -3978,21 +4001,21 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
   if(ku_http_task_fixed_reserve(group->tasks,fixed_bytes)!=0u)return "reactor fixed storage exceeds Task budget";
 #endif
-  KuHttpConnection* connections=(KuHttpConnection*)calloc((size_t)slot_count,sizeof(KuHttpConnection));
+  KuHttpConnection* connections=(KuHttpConnection*)calloc(1,owner_storage_bytes);
   owner->connection_base=connections;
-  KuHttpPollFd* poll_items=(KuHttpPollFd*)calloc(poll_capacity,sizeof(KuHttpPollFd));
+  KuHttpPollFd* poll_items=connections?(KuHttpPollFd*)((unsigned char*)connections+poll_offset):NULL;
   int* active_indices=(int*)calloc((size_t)slot_count,sizeof(int));
   KuHttpPollConnection* poll_connections=(KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection));
-  void* net_storage=net_bytes?calloc(1,net_bytes):NULL;
+  void* net_storage=net_bytes && connections?(unsigned char*)connections+net_offset:NULL;
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
 #endif
   KuHttpActiveSet active={.connections=connections,.indices=active_indices,.capacity=slot_count,.free_head=-1,.request_limit=request_limit};
   KuHttpPending pending={0};pending.cap=max_pending;
   pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));
-  if((slot_count && (!connections || !active_indices || !poll_connections))
+  if(!connections || (slot_count && (!active_indices || !poll_connections))
       || !poll_items || !pending.items || (net_bytes && !net_storage)) {
-    free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
+    free(connections);free(pending.items);free(active_indices);free(poll_connections);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
@@ -4002,7 +4025,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   KuHttpReactor reactor;
   if(!ku_http_reactor_init_pending(&reactor,&active,net_capacity,(size_t)max_pending)) {
-    free(connections);free(poll_items);free(pending.items);free(active_indices);free(poll_connections);free(net_storage);
+    free(connections);free(pending.items);free(active_indices);free(poll_connections);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
@@ -4019,7 +4042,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     ku_http_reactor_destroy(&reactor);
 #endif
-    free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections); free(net_storage);
+    free(connections); free(pending.items); free(active_indices); free(poll_connections);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
@@ -4033,7 +4056,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
     ku_http_reactor_destroy(&reactor);
 #endif
-    free(connections); free(poll_items); free(pending.items); free(active_indices); free(poll_connections); free(net_storage);
+    free(connections); free(pending.items); free(active_indices); free(poll_connections);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
     (void)ku_http_task_fixed_refund(group->tasks,fixed_bytes);
 #endif
@@ -4701,7 +4724,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   ku_http_reactor_destroy(&reactor);
 #endif
-  free(pending.items); free(poll_items); free(connections); free(active_indices); free(poll_connections);free(net_storage);
+  free(pending.items); free(connections); free(active_indices); free(poll_connections);
 #if defined(KU_HTTP_HAS_TASK_RUNTIME)
   if(ku_http_task_fixed_refund(group->tasks,fixed_bytes)!=0u)return "reactor fixed storage refund failed";
 #endif
