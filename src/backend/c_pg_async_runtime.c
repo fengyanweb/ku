@@ -348,7 +348,10 @@ static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
   if(p->closing) error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);
   else if(now>=op->acquire_deadline) {ku_pg_async_capture_acquire_locked(op,now);error=ku_pg_client_acquire_timeout_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);}
   if(error.code.len) {ku_pg_async_unlink_locked(op);ku_pg_mutex_unlock(&p->lock);ku_pg_async_finish(op,error,0);return -1;}
-  int can_claim=op->waiting || p->waiters==0;
+  /* A wake grants a chance to run, not permission to pass older async waiters.
+   * Otherwise a ready younger Task can win every turnover while the head is
+   * repeatedly polled and still expires. Unlink hands spare capacity onward. */
+  int can_claim=op->waiting ? p->async_head==&op->waiter : p->waiters==0;
   if(can_claim) for(size_t i=0;i<p->size;i++) if(p->conns[i] && !p->in_use[i]) {
     p->in_use[i]=1;p->active++;ku_database_pg_pool_delta(1,0);op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_claim_locked(op,now);ku_pg_async_unlink_locked(op);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);break;
   }

@@ -752,6 +752,51 @@ fn native_pg_async_successful_waiter_hands_remaining_idle_lease_to_later_waiter(
     run_async_acquire_waiter_handoff(2);
 }
 
+fn run_async_queued_waiter_progress(empty_slot: bool) {
+    let directory = TempDir::new("async-query-queued-progress");
+    let harness = query_stub_harness(&directory).replacen(
+        "int main(void) {",
+        "static int ku_legacy_query_tests(void) {",
+        1,
+    ) + &ASYNC_QUERY_SUITE.replace(
+        "int main(void) {",
+        "static int ku_async_sequential_tests(void) {",
+    ) + &format!(
+        "\n#define KU_TEST_QUEUED_EMPTY_SLOT {}\n",
+        u8::from(empty_slot)
+    ) + ASYNC_QUEUED_PROGRESS_SUITE;
+    let source = directory.path().join("async-query-queued-progress.c");
+    fs::write(&source, harness).expect("write PG queued progress harness");
+    let Some(executable) =
+        compile_harness(directory.path(), &source, "async-query-queued-progress")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("PG queued progress test exceeded process bounds");
+    eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "PG queued progress (empty_slot={empty_slot}) failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .replace('\r', "")
+        .ends_with("pg async queued waiter progress closed loop\n"));
+}
+
+#[test]
+fn native_pg_async_queued_waiter_is_not_starved_by_younger_queued_borrowers() {
+    run_async_queued_waiter_progress(false);
+}
+
+#[test]
+fn native_pg_async_queued_waiter_is_not_starved_when_next_slot_needs_connect() {
+    run_async_queued_waiter_progress(true);
+}
+
 fn run_async_acquire_lock_deadline(connect: bool, out_of_memory: bool) {
     let directory = TempDir::new("async-acquire-lock-deadline");
     let harness = query_stub_harness(&directory)
@@ -3301,6 +3346,110 @@ int main(void) {
   CHECK(starts==finishes && runtime_peak_bytes>0 && !ku_test_pg_pool_lock_depth && !ku_test_pg_finishes_while_pool_locked);
   track_runtime_allocations=0;
   puts("pg async waiter handoff closed loop");return 0;
+}
+"#;
+
+const ASYNC_QUEUED_PROGRESS_SUITE: &str = r#"
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
+  track_runtime_allocations=1;
+  const size_t maximum_rounds=16;
+  AsyncBudget initial_budget={0},head_budget={0},younger_budgets[16]={{0}};
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,8,1000,250,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;
+  KuPgAsyncOp* held=async_create(p,&initial_budget);AsyncBudget* held_budget=&initial_budget;
+  CHECK(!ku_pg_async_step(held,0,clock_ms,0) && held->sent && p->active==1);
+  KuPgAsyncOp* head=async_create(p,&head_budget);
+  CHECK(!ku_pg_async_step(head,0,clock_ms,0) && head->waiting && p->async_head==&head->waiter);
+  unsigned long long original_deadline=head->acquire_deadline;
+  int before_user_sends=user_sends,before_resets=reset_sends;
+  size_t rounds=0,younger_claims=0,head_attempts=0;
+  int head_progress=0,head_acquire_timeout=0;
+  KuPgAsyncOp* pending_younger=NULL;AsyncBudget* pending_budget=NULL;
+  for(size_t i=0;i<maximum_rounds;i++) {
+    /* Each younger operation is admitted while the only lease is busy, so it
+     * joins behind head. This is queued-waiter overtaking, not new-arrival
+     * barging or a request that was refused by the waiter cap. */
+    clock_ms++;
+    KuPgAsyncOp* younger=async_create(p,&younger_budgets[i]);
+    CHECK(!ku_pg_async_step(younger,0,clock_ms,0));
+    CHECK(younger->waiting && p->async_head==&head->waiter && p->waiters==2);
+    clock_ms+=19;
+    held->conn->mode=T_OK;
+    /* Failure of mandatory reset legitimately retires the old connection.
+     * The user's detached result stays valid; the next head must reserve and
+     * establish the empty slot rather than losing it to a younger waiter. */
+    if(KU_TEST_QUEUED_EMPTY_SLOT)reset_mode_on_send=T_FLUSH_FAIL;
+    CHECK(async_finish(held,0) && held->output.ok);
+    async_drop_output(held,held_budget,1);held=NULL;held_budget=NULL;
+    reset_mode_on_send=T_RESTORE;
+    CHECK(p->active==0 && !p->in_use[0]);
+    CHECK(!!p->conns[0]==!KU_TEST_QUEUED_EMPTY_SLOT);
+    CHECK(head->waiter.notified && younger->waiter.notified);
+    /* A legal owner scheduling order: the younger ready Task runs first,
+     * then the older Task runs in the very same round. The old Task therefore
+     * receives both its wake and CPU on every lease turnover. */
+    mode_on_send=T_READ_TIMEOUT;
+    CHECK(!ku_pg_async_step(younger,0,clock_ms,0));
+    if(younger->phase==KU_PG_ASYNC_CONNECT && !younger->connect_ready) {
+      ku_pg_async_connect_run(younger,0);
+      CHECK(!ku_pg_async_step(younger,0,clock_ms,0));
+    }
+    int head_done=ku_pg_async_step(head,0,clock_ms,0);head_attempts++;rounds++;
+    if(head->phase==KU_PG_ASYNC_CONNECT && !head->connect_ready) {
+      ku_pg_async_connect_run(head,0);
+      head_done=ku_pg_async_step(head,0,clock_ms,0);
+    }
+    CHECK(head->acquire_deadline==original_deadline);
+    if(younger->sent) {
+      younger_claims++;held=younger;held_budget=&younger_budgets[i];
+    } else {
+      CHECK(younger->waiting);pending_younger=younger;pending_budget=&younger_budgets[i];
+    }
+    if(head->sent) {head_progress=1;break;}
+    if(head_done) {
+      head_acquire_timeout=ku_string_equal(head->output.error.code,
+          ku_string_static((const uint8_t*)"acquire_timeout",15));
+      break;
+    }
+    CHECK(held && !pending_younger && head->waiting && p->async_head==&head->waiter);
+  }
+  unsigned long long observed_ms=clock_ms;
+  uint64_t head_wakes=(uint64_t)head_budget.wakes;
+  uint64_t head_consumed=head->waiter.diagnostic.consumed;
+  if(head_progress) {
+    head->conn->mode=T_OK;CHECK(async_finish(head,0) && head->output.ok);
+    async_drop_output(head,&head_budget,1);
+  } else {
+    CHECK(head_acquire_timeout && !head->sent && head->phase==KU_PG_ASYNC_DONE);
+    async_drop_output(head,&head_budget,0);
+  }
+  if(held) {
+    held->conn->mode=T_OK;CHECK(async_finish(held,0) && held->output.ok);
+    async_drop_output(held,held_budget,1);
+  }
+  if(pending_younger) {
+    mode_on_send=T_OK;
+    CHECK(async_finish(pending_younger,0) && pending_younger->output.ok);
+    async_drop_output(pending_younger,pending_budget,1);
+  }
+  CHECK(p->active==0 && p->waiters==0 && p->async_operations==0);
+  CHECK(user_sends==before_user_sends+(int)younger_claims+head_progress+(pending_younger!=NULL));
+  CHECK(reset_sends==before_resets+1+(int)younger_claims+head_progress+(pending_younger!=NULL));
+  CHECK(!initial_budget.bytes && !head_budget.bytes);
+  for(size_t i=0;i<maximum_rounds;i++)CHECK(!younger_budgets[i].bytes);
+  ku_pg_client_close_owned(p);
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  CHECK(starts==finishes && !ku_test_pg_pool_lock_depth && !ku_test_pg_finishes_while_pool_locked);
+  track_runtime_allocations=0;
+  printf("queued-progress: rounds=%zu younger_claims=%zu head_attempts=%zu head_wakes=%llu head_consumed=%llu elapsed_ms=%llu head_sent=%d acquire_timeout=%d\n",
+      rounds,younger_claims,head_attempts,(unsigned long long)head_wakes,
+      (unsigned long long)head_consumed,observed_ms-1000,head_progress,head_acquire_timeout);
+  /* All operations, results, leases and budget charges have already retired.
+   * A busy but repeatedly available pool must not let a serviced old waiter
+   * expire solely because younger queued Tasks win the next owner turn. */
+  CHECK(head_progress && !head_acquire_timeout);
+  puts("pg async queued waiter progress closed loop");return 0;
 }
 "#;
 
