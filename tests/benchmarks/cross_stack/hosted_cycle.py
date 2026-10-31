@@ -696,30 +696,58 @@ def perf_capability(perf, directory):
     """One <=18s session; never repeat unsupported sampling for each business."""
     directory=Path(directory);directory.mkdir();began=time.monotonic();attempts=[]
     result=dict(available=False,callchain_available=False,attempts=attempts,
+        callchain_completeness='unknown',
         session_budget_seconds=18,scope='CPU-event sampling capability only, not a service benchmark. '
               'Generic EOPNOTSUPP does not uniquely identify a physical PMU or guest-kernel cause.')
     full=['--call-graph','dwarf,8192','--inherit','--switch-events']
+    dwarf=['--call-graph','dwarf,8192']
     workload='import time\nend=time.monotonic()+1\nx=1\nwhile time.monotonic()<end: x=(x*1664525+1013904223)&0xffffffff'
+    def remaining():
+        # diagnostic_command can spend5s reaping a killed observer and polls
+        # every50ms. Reserve that cleanup inside this one shared18s session.
+        return 18-(time.monotonic()-began)-5.1
     def attempt(event,flags,label):
-        remaining=18-(time.monotonic()-began)
-        if remaining<=0:return False
+        left=remaining()
+        if left<=0:return None
         out=directory/label;out.mkdir();raw=out/'perf.data'
         row=dict(event=event,flags=flags)
         row['record']=diagnostic_command([perf,'record','--clockid','mono','-e',event,'-F','499',
-            *flags,'-o',str(raw),'--',sys.executable,'-c',workload],out/'record.log',timeout=min(4,remaining),limit=1<<20)
-        remaining=18-(time.monotonic()-began)
-        if row['record']['complete'] and raw.is_file() and raw.stat().st_size and remaining>0:
-            row['verify']=diagnostic_command([perf,'script','-i',str(raw),'-G','-F','event'],
-                out/'events.log',timeout=min(2,remaining),limit=1<<20)
+            *flags,'-o',str(raw),'--',sys.executable,'-c',workload],out/'record.log',timeout=min(4,left),limit=1<<20)
+        left=remaining()
+        if row['record']['complete'] and raw.is_file() and raw.stat().st_size and left>0:
+            fields=['-F','event,ip,sym'] if flags else ['-G','-F','event']
+            row['verify']=diagnostic_command([perf,'script','-i',str(raw),*fields],
+                out/'events.log',timeout=min(2,left),limit=1<<20)
             if row['verify']['complete']:
-                row['sample_count']=sum(event in line for line in (out/'events.log').read_text(errors='replace').splitlines())
+                lines=(out/'events.log').read_text(errors='replace').splitlines()
+                row['sample_count']=sum(event+':' in line for line in lines)
+                if flags:
+                    frames=set();multi=0;active=False
+                    for line in lines:
+                        if event+':' in line:
+                            multi+=len(frames)>=2;frames=set()
+                            active=True
+                            line=line.split(event+':',1)[1]
+                        if not active:continue
+                        match=re.fullmatch(r'\s*(?:0x)?([0-9a-fA-F]+)\s+(\S+).*',line)
+                        if (match and int(match[1],16) and match[2] not in ('[unknown]','??')
+                                and not match[2].startswith('0x')):
+                            frames.add(int(match[1],16))
+                    row['multi_frame_samples']=multi+(len(frames)>=2)
+                    row['callchain_check']='at least two distinct named nonzero PCs in one sample; completeness unknown'
         attempts.append(row)
-        return row.get('sample_count',0)>0
+        return row
     if perf:
         for event in ['cpu-clock','task-clock','cycles']:
-            if attempt(event,[],event+'-minimal'):
-                with_chain=attempt(event,full,event+'-full')
-                result.update(available=True,event=event,selected_flags=full if with_chain else [],
+            minimal=attempt(event,[],event+'-minimal')
+            if minimal and minimal.get('sample_count',0)>0:
+                chain=attempt(event,full,event+'-full')
+                if not chain or not chain.get('multi_frame_samples',0):
+                    # Failure of the full flag group does not isolate DWARF.
+                    # One smaller combination, within the same total budget.
+                    chain=attempt(event,dwarf,event+'-dwarf-only')
+                with_chain=bool(chain and chain.get('multi_frame_samples',0))
+                result.update(available=True,event=event,selected_flags=chain['flags'] if with_chain else [],
                     callchain_available=with_chain,method='CPU_SELF_plus_DWARF' if with_chain else 'CPU_SELF_only',
                     interpretation='Clock samples weight CPU time; cycles samples weight cycles. Neither is elapsed blocking time.')
                 break
@@ -940,7 +968,7 @@ def diagnostic(a,state,followup=False):
                         diagnostic_command([perf,'report','-i',str(raw),*symbols,'--stdio','--no-children',
                             '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=60)
                         diagnostic_command([perf,'script','-i',str(raw),*symbols,'--ns','--show-switch-events',
-                            '--show-lost-events','--show-task-events','-F','+pid,+tid,+cpu,+ip,+symoff,+srcline,+misc'],
+                            '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],
                             output/'score/perf-stacks.log',timeout=60,limit=64<<20)
                     row['flow_ledger_path']=str(output/'flow-ledger.json')
                     row['flow_ledger_available']=len(ledgers)==1 and 'unparseable' not in ledgers[0] and 'unavailable' not in ledgers[0]
