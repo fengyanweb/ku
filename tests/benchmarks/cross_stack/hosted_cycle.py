@@ -15,7 +15,7 @@ ARCHIVE_LIMIT = 384<<20
 BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
-HTTP_WAKE_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
+HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -36,14 +36,16 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
-    if getattr(a,'http_wake_screen',False):
+    if getattr(a,'http_short_screen',False):
+        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
+            raise ValueError('--http-short-goal must be cpu or memory')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
-            raise ValueError('--http-wake-screen requires diagnostic build-set and no other opt-in screen')
-        if getattr(a,'prepatch',None)!=HTTP_WAKE_PREPATCH or a.candidate==HTTP_WAKE_PREPATCH:
-            raise ValueError('--http-wake-screen requires frozen b765f9b prepatch and a distinct candidate')
+            raise ValueError('--http-short-screen requires diagnostic build-set and no other opt-in screen')
+        if getattr(a,'prepatch',None)!=HTTP_SHORT_PREPATCH or a.candidate==HTTP_SHORT_PREPATCH:
+            raise ValueError('--http-short-screen requires frozen b765f9b prepatch and a distinct candidate')
     if getattr(a,'memory_owner_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
-            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','http_wake_screen'))):
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen'))):
         raise ValueError('--memory-owner-probe requires diagnostic build-set and no other opt-in mode')
     if getattr(a,'pg_driver_screen',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
             ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen'))):
@@ -70,12 +72,13 @@ def validate_screen_selection(a,build_set):
 def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
     identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
-        prepatch=a.prepatch if build_set=='followup-screen' or getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False) else None,screen_variants=a.screen_variants,
+        prepatch=a.prepatch if build_set=='followup-screen' or getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False) else None,screen_variants=a.screen_variants,
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):identity['normal_self_probe']=True
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
-    if getattr(a,'http_wake_screen',False):identity['http_wake_screen']=True
+    if getattr(a,'http_short_screen',False):
+        identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
     return identity
 
@@ -256,7 +259,8 @@ def normal_self_plan(versions):
                 'SELF shares are not exclusive whole-request CPU attribution; inclusive chains are unavailable.')
 
 
-def http_wake_plan(versions):
+def http_short_plan(versions,goal='cpu'):
+    if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
         rate=500,warmup_seconds=5,score_seconds=10) for g in (1,2,3)]
     windows=[dict(name=n,phase='normal',workload=w,contract=c,group=g,rate=r,warmup_seconds=3,score_seconds=15)
@@ -264,22 +268,27 @@ def http_wake_plan(versions):
         for g,order in enumerate((('A','B'),('B','A'),('A','B')),1) for n in order]
     windows += [dict(name=n,phase='compute-guard',workload='cpu',contract='compute-guard',group=1,
         rate=100,warmup_seconds=3,score_seconds=15) for n in ('A','B')]
-    return dict(schema='ku-hosted-http-wake-screen-v1',versions=versions,prepatch=HTTP_WAKE_PREPATCH,
+    thresholds=(dict(json_geometric_ratio_maximum=.98,json_upper95_strictly_below=1,
+        other_business_regression='lower95>1 blocks; crossing1 remains inconclusive',compute_ratio_maximum=1.03)
+        if goal=='cpu' else dict(json_memory_geometric_ratio_maximum=.95,json_memory_upper95_strictly_below=1,
+            cpu_lower95_maximum=1,cpu_upper95_maximum=1.03,compute_ratio_maximum=1.03,
+            memory_metric='memory.steady_median_bytes',memory_scope='Whole service cgroup memory.current; score middle60% median'))
+    thresholds['final_decision']='root reviews raw host/CPU/memory/correctness/arrival evidence; never automatic adoption'
+    return dict(schema='ku-hosted-http-short-screen-v1',versions=versions,prepatch=HTTP_SHORT_PREPATCH,http_short_goal=goal,
         resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),windows=controls+windows,
         maximum_windows=23,maximum_replacements=0,observation_alarm_seconds=690,workflow_limit_seconds=720,
-        adoption_thresholds=dict(json_geometric_ratio_maximum=.98,json_upper95_strictly_below=1,
-            other_business_regression='lower95>1 blocks; crossing1 remains inconclusive',compute_ratio_maximum=1.03,
-            final_decision='root reviews raw host/CPU/correctness/arrival evidence; never automatic adoption'),
+        adoption_thresholds=thresholds,
         diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
-        purpose='Three original frozen-A environment controls then20 serial normal A/B windows for the explicit wake-transport candidate. Three JSON/ok/strictPG '
+        purpose='Three original frozen-A environment controls then20 serial normal A/B windows for one HTTP candidate. Three JSON/ok/strictPG '
                 'pairs and one coarse compute guard. Identical business, driver, deadlines, resources and SQL; '
                 'Compute100/s supplies1500 scored arrivals for the unchanged p999 gate; this guard load is separate '
                 'from original formal CPU results. No R/D/HC/BF, cold/burst, long run, capacity, retry or formal qualification. Unknown environment stays unknown.')
 
 
-def http_wake_comparison(rows,complete,environment=None):
+def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
-        formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment)
+        formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment,http_short_goal=goal)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification unresolved or failed')
     if not complete:
         result['reasons'].append('incomplete or invalid observation/cleanup; no scoring or retry');return result
@@ -294,16 +303,28 @@ def http_wake_comparison(rows,complete,environment=None):
     cpu={r['name']:r for r in rows if r['workload']=='cpu'}
     result['compute_guard']=dict(B_over_A=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us'],pairs=1,
         confidence_interval=None,scope='Correctness and coarse guard only; one pair cannot establish a precise confidence interval')
-    j=result['comparisons']['json_object']
-    if j.get('status')!='estimated' or j['estimate']>.98 or j['upper95']>=1:
-        result['reasons'].append('JSON CPU criterion not demonstrated: geometric B/A<=.98 and upper95<1 required')
-    for workload in ('ok','db'):
-        interval=result['comparisons'][workload]
-        if interval.get('status')!='estimated' or interval['lower95']>1:
-            result['reasons'].append(workload+' CPU regression or unavailable interval')
+    if goal=='cpu':
+        j=result['comparisons']['json_object']
+        if j.get('status')!='estimated' or j['estimate']>.98 or j['upper95']>=1:
+            result['reasons'].append('JSON CPU criterion not demonstrated: geometric B/A<=.98 and upper95<1 required')
+        for workload in ('ok','db'):
+            interval=result['comparisons'][workload]
+            if interval.get('status')!='estimated' or interval['lower95']>1:
+                result['reasons'].append(workload+' CPU regression or unavailable interval')
+    else:
+        selected=[r for r in rows if r['workload']=='json_object']
+        pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
+        result['json_memory']=j=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+            [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+        result['memory_scope']='Whole service cgroup memory.current sampled during score; middle60% median; not endpoints, RSS, virtual or requested bytes'
+        if j.get('status')!='estimated' or j['estimate']>.95 or j['upper95']>=1:
+            result['reasons'].append('JSON service memory criterion not demonstrated: geometric B/A<=.95 and upper95<1 required')
+        for workload,interval in result['comparisons'].items():
+            if interval.get('status')!='estimated' or interval['lower95']>1 or interval['upper95']>1.03:
+                result['reasons'].append(workload+' CPU guard requires lower95<=1 and upper95<=1.03')
     if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
     result['eligible_for_root_review']=not result['reasons']
-    result['note']='Screen evidence only; CI crossing1 does not prove equivalence. Raw host/CPU/arrival review and adoption remain with root.'
+    result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
     return result
 
 
@@ -557,7 +578,7 @@ def build(a,state):
     builds=([('A',prepatch,None),*[(f'C{i+1}',commit,None) for i,commit in enumerate(variants)]] if build_set=='followup-screen' else [])+[
         ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
     if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
@@ -575,13 +596,13 @@ def complete_build(a,state,build_set,prepatch,variants):
     final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
-    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_wake_screen',False) else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
+    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) or getattr(a,'http_short_screen',False) else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
     if getattr(a,'pg_driver_screen',False):client['command'].append('--diagnostic-arrival-ledger')
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False):names=['A','B']
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):names=['A','B']
     if getattr(a,'pg_driver_screen',False):names=['B']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
@@ -606,7 +627,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
-    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen','pg_driver_screen','http_wake_screen')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
+    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
     layers=None
     if build_set=='followup-screen':
         layers=step(state,a.root,'build-json-layers',lambda:build_json_layers(a))
@@ -614,7 +635,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    if getattr(a,'http_wake_screen',False):plan=http_wake_plan(versions)
+    if getattr(a,'http_short_screen',False):plan=http_short_plan(versions,getattr(a,'http_short_goal','cpu'))
     elif getattr(a,'pg_driver_screen',False):plan=pg_driver_plan(versions)
     elif getattr(a,'pg_queue_screen',False):plan=pg_queue_plan(versions,prepatch)
     elif getattr(a,'normal_self_probe',False):plan=normal_self_plan(versions)
@@ -625,7 +646,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
+    if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     if build_set=='followup-screen':
         for name in plan['candidate_versions']:
@@ -1465,21 +1486,22 @@ def normal_diagnostic_quality(row):
 
 def pg_queue_screen(a,state):
     if os.geteuid()!=0:raise ValueError('PG queue screen requires root cgroup control')
-    wake=getattr(a,'http_wake_screen',False);plan=load(a.root/'frozen-plan.json')
-    prepatch=HTTP_WAKE_PREPATCH if wake else PG_QUEUE_PREPATCH
-    expected_plan=http_wake_plan(plan.get('versions',{})) if wake else pg_queue_plan(plan.get('versions',{}),prepatch)
+    short=getattr(a,'http_short_screen',False);plan=load(a.root/'frozen-plan.json')
+    prepatch=HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
+    expected_plan=http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
     if bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
-    if wake and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
+    if short and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
-    directory=a.root/('http-wake-screen' if wake else 'pg-queue-screen');directory.mkdir(exist_ok=False)
+    directory=a.root/('http-short-screen' if short else 'pg-queue-screen');directory.mkdir(exist_ok=False)
     fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None;environment=None
-    result=dict(schema='ku-http-wake-screen-v1' if wake else 'ku-pg-queue-screen-v1',diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+    result=dict(schema='ku-http-short-screen-v1' if short else 'ku-pg-queue-screen-v1',diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
         candidate_accepted=False,goal_status='unknown',execution_complete=False,rows=[],stopped=[],purpose=plan['purpose'])
+    if short:result['http_short_goal']=plan['http_short_goal']
     began=time.monotonic()
     class QueueHarness(original):
         def __init__(self,*args,**kwargs):
@@ -1490,10 +1512,10 @@ def pg_queue_screen(a,state):
         fixture.start();private=load(fixture.manifest_path);fc.Harness=QueueHarness
         save(directory/'identity.json',dict(bindings=bindings,resources=plan['resources'],quality_policy=plan['quality_policy'],
             database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id'),purpose=plan['purpose'],
-            **({'adoption_thresholds':plan['adoption_thresholds']} if wake else {})))
+            **({'http_short_goal':plan['http_short_goal'],'adoption_thresholds':plan['adoption_thresholds']} if short else {})))
         for config in plan['windows']:
             name=config['name'];phase=config['phase'];workload=config.get('workload','db')
-            output=directory/(('environment-controls' if phase=='environment-control' else workload) if wake else phase)/f"g{config['group']}-{name}"
+            output=directory/(('environment-controls' if phase=='environment-control' else workload) if short else phase)/f"g{config['group']}-{name}"
             try:
                 row=fc.window(plan,name,workload,config['rate'],config['warmup_seconds'],config['score_seconds'],output,
                     binding=bindings[name],job={'phase':'diagnostic','contract':config.get('contract','pg-default')})
@@ -1511,28 +1533,28 @@ def pg_queue_screen(a,state):
                 bool(cleanup) and all(fc.service_termination_succeeded('ku',x) for x in cleanup))
             obtained=row.get('status') in ('warmup_failure','observed','functional_failure','accounting_failure') and 'observer_error' not in row
             observed=obtained and natural and all(c['report_present'] and c['cleanup_ok'] for c in clients)
-            if phase=='normal' or wake:
+            if phase=='normal' or short:
                 quality,_=normal_diagnostic_quality(row);observed=observed and quality
-                if wake and environment:
+                if short and environment:
                     row['diagnostic_quality'].update(registered_environment_evidence=environment['evidence'],
                         scope='Diagnostic A/B observation with separately registered original environment controls; '
                             'row quality is preserved. This is not formal ranking or automatic adoption.')
             row.update(observation_complete=observed,client_cleanup=clients,natural_reclamation=natural,
                 interpretation='Pressure is an error-cause observation only; failed responses and driver lateness remain recorded. '
                     'No formal capacity or performance pass is inferred.' if phase=='pressure' else
-                    'Normal A/B diagnostic; environment controls remain separate, no formal ranking or automatic adoption.' if wake else
+                    'Normal A/B diagnostic; environment controls remain separate, no formal ranking or automatic adoption.' if short else
                     'Normal low-load diagnostic pair, not formal ranking; unregistered environment stays unknown.')
             result['rows'].append(row);save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
             if not observed:
                 result['stopped'].append(dict(name=name,phase=phase,group=config['group'],reason='normal quality or observation/physical cleanup failed; no retries'));break
-            if wake and phase=='environment-control' and config['group']==3:
+            if short and phase=='environment-control' and config['group']==3:
                 environment=environment_record(dict(rows=result['rows']),directory/'environment-qualification.json')
                 environment.update(control_version='A',scope='Three independent frozen prepatch A controls; original registered qualification checks.')
                 save(directory/'environment-qualification.json',environment);result['environment_qualification']=environment
                 if environment['quality']!='pass':
                     result['stopped'].append(dict(phase=phase,reason='environment qualification unresolved or failed; business windows not started'));break
         normal=[row for row in result['rows'] if row['phase']=='normal']
-        if not wake and len(normal)==6 and all(r['observation_complete'] for r in normal):
+        if not short and len(normal)==6 and all(r['observation_complete'] for r in normal):
             pairs=[{r['name']:r for r in normal if r['group']==g} for g in (1,2,3)]
             result['normal_cpu_pairs']=[dict(group=g,A=p['A']['full_cpu_us'],B=p['B']['full_cpu_us']) for g,p in enumerate(pairs,1)]
             result['normal_cpu_B_over_A']=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
@@ -1547,13 +1569,13 @@ def pg_queue_screen(a,state):
         dbok=cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0
         result.update(seconds=time.monotonic()-began,execution_complete=len(result['rows'])==plan['maximum_windows']
             and not result['stopped'] and dbok and 'observer_error' not in result)
-        if wake:result['comparison']=http_wake_comparison(result['rows'],result['execution_complete'],environment)
+        if short:result['comparison']=http_short_comparison(result['rows'],result['execution_complete'],environment,plan['http_short_goal'])
         result['goal_status']='unknown' if result['execution_complete'] else 'blocked';save(directory/'summary.json',result)
         selected=[directory/name for name in ('summary.json','identity.json','results.json','environment-qualification.json')]
-        selected.extend(directory/(('environment-controls' if c['phase']=='environment-control' else c['workload']) if wake else c['phase'])/f"g{c['group']}-{c['name']}"/relative for c in plan['windows'] for relative in (
+        selected.extend(directory/(('environment-controls' if c['phase']=='environment-control' else c['workload']) if short else c['phase'])/f"g{c['group']}-{c['name']}"/relative for c in plan['windows'] for relative in (
             'window.json','full-lifecycle.json','warmup/client.json','score/client.json','warmup/runtime-after-failure.json','service/service.log'))
-        result['small_artifact']=pg_failure_export(a,directory,output_name='http-wake-observation' if wake else 'pg-queue-observation',
-            schema='ku-http-wake-small-artifact-v1' if wake else 'ku-pg-queue-small-artifact-v1',selected=selected)
+        result['small_artifact']=pg_failure_export(a,directory,output_name='http-short-observation' if short else 'pg-queue-observation',
+            schema='ku-http-short-small-artifact-v1' if short else 'ku-pg-queue-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
     return result
 
@@ -1803,7 +1825,7 @@ def normal_self_probe(a,state):
 def diagnostic(a,state,followup=False):
     if getattr(a,'memory_owner_probe',False):return memory_owner_probe(a,state)
     if getattr(a,'pg_driver_screen',False):return pg_driver_screen(a,state)
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False):return pg_queue_screen(a,state)
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):return pg_queue_screen(a,state)
     if getattr(a,'normal_self_probe',False):return normal_self_probe(a,state)
     if getattr(a,'pg_failure_probe',False):return pg_failure_probe(a,state)
     import http_cost_diagnostic as hcd
@@ -2350,7 +2372,8 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-wake-screen',action='store_true',help='Explicit23-window control+normal A/B wake-transport diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
+    p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
@@ -2361,7 +2384,7 @@ def main(argv=None):
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
     if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/preflight/archive')
     if a.phase=='perf-preflight' and not a.normal_self_probe:p.error('perf-preflight requires explicit normal-self mode')
-    if a.http_wake_screen and a.phase not in ('build','diagnostic','archive'):p.error('--http-wake-screen only supports fresh build/diagnostic/archive')
+    if a.http_short_screen and a.phase not in ('build','diagnostic','archive'):p.error('--http-short-screen only supports fresh build/diagnostic/archive')
     if a.pg_driver_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-driver-screen only supports fresh build/diagnostic/archive')
     if a.pg_queue_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-queue-screen only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
@@ -2394,7 +2417,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_wake_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

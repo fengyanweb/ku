@@ -43,10 +43,16 @@ on:
         type: boolean
         default: false
 
-      http_wake_screen:
-        description: 'Three A environment controls then20 normal wake-transport A/B windows; diagnostic only'
+      http_short_screen:
+        description: 'Three A environment controls then20 normal single-candidate HTTP A/B windows; diagnostic only'
         type: boolean
         default: false
+
+      http_short_goal:
+        description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
+        type: choice
+        default: cpu
+        options: [cpu, memory]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -490,7 +496,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_wake_screen || inputs.memory_owner_probe)
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -510,7 +516,8 @@ jobs:
       KU_PERFORMANCE_V2_FINAL_TASK_JSON: ${{ inputs.final_task_json && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}
-      KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN: ${{ inputs.http_wake_screen && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}
+      KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN: ${{ inputs.http_short_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE: ${{ inputs.memory_owner_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_DRIVER_SCREEN: ${{ inputs.pg_driver_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}
@@ -531,7 +538,7 @@ jobs:
 
       - name: Verify runner entry contracts without starting workloads
         run: |
-          if [ "$KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN" = true ]; then
+          if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
             test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false
@@ -549,7 +556,7 @@ jobs:
             test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41182804290
             test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6
             test "$KU_PERFORMANCE_V2_CANDIDATE" = 4e5f5d94da277654862d8679f7ae4a7fda3f05ff
-            test "${KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN:-false}" = false
+            test "${KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN:-false}" = false
             for mode in PG_DRIVER_SCREEN PG_QUEUE_SCREEN PG_FAILURE_PROBE NORMAL_SELF_PROBE TASK_JSON_SCREEN COMMON_HTTP_SCREEN FINAL_TASK_JSON; do
               mode="KU_PERFORMANCE_V2_$mode"; test "${!mode}" = false
             done
@@ -689,11 +696,11 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
-          if [ "$KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN" = true ]; then
+          if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
-            performance_task_json_args+=(--http-wake-screen)
+            performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")
           fi
           if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -763,7 +770,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
@@ -786,11 +793,11 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
-          if [ "$KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN" = true ]; then
+          if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
-            performance_task_json_args+=(--http-wake-screen)
+            performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")
           fi
           if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -852,10 +859,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          performance_archive_args=()
+          if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
+            performance_archive_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH")
+          fi
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive \
             --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
             --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE"
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" "${performance_archive_args[@]}"
           sudo -n chown "$(id -u):$(id -g)" \
             "$KU_PERFORMANCE_V2_ROOT/ku-performance-v2-evidence.tar.gz" "$KU_PERFORMANCE_V2_ROOT/archive.json"
 
@@ -897,12 +908,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Retain the small redacted HTTP wake observation
-        if: always() && inputs.http_wake_screen
+      - name: Retain the small redacted HTTP short observation
+        if: always() && inputs.http_short_screen
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ku-http-wake-observation
-          path: ${{ runner.temp }}/ku-performance-v2/http-wake-observation
+          name: ku-http-short-observation
+          path: ${{ runner.temp }}/ku-performance-v2/http-short-observation
           retention-days: 1
           if-no-files-found: error
 

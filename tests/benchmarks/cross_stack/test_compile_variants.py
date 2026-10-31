@@ -177,7 +177,7 @@ class HostedWorkflowContracts(unittest.TestCase):
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
         self.assertIn("task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_wake_screen || inputs.memory_owner_probe)",job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
@@ -212,7 +212,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',run)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',run)
         for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
             self.assertNotIn(sdk,job)
 
@@ -251,7 +251,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-failure-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted PG failure observation',1)[1]
         self.assertIn('if: always() && inputs.pg_failure_probe',small)
         self.assertIn('name: ku-pg-failure-observation',small)
@@ -271,7 +271,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--normal-self-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted normal SELF observation',1)[1]
         self.assertIn('if: always() && inputs.normal_self_probe',small)
         self.assertIn('name: ku-normal-self-observation',small)
@@ -288,12 +288,12 @@ class HostedWorkflowContracts(unittest.TestCase):
         artifact=job.split('- name: Retain the isolated perf control preflight',1)[1].split('\n      - name:',1)[0]
         self.assertIn('if: always() && inputs.normal_self_probe',artifact);self.assertIn('name: ku-normal-perf-preflight',artifact)
 
-    def test_http_wake_screen_is_explicit_frozen_fresh_and_bounded(self):
+    def test_http_short_screen_is_explicit_frozen_fresh_and_bounded(self):
         text,job=self.workflow()
-        self.assertIn('http_wake_screen:\n',text)
-        self.assertIn("KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN: ${{ inputs.http_wake_screen && 'true' || 'false' }}",job)
+        self.assertIn('http_short_screen:\n',text)
+        self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN: ${{ inputs.http_short_screen && 'true' || 'false' }}",job)
         verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
-        mode=verify.split('if [ "$KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN" = true ]; then',1)[1].split('fi',1)[0]
+        mode=verify.split('if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then',1)[1].split('fi',1)[0]
         for check in ('test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic',
                 'test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69',
                 'test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false','test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false',
@@ -301,11 +301,19 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false','test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false',
                 'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false','test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',
                 'test -z "$KU_PERFORMANCE_V2_VARIANTS"'):self.assertIn(check,mode)
-        self.assertEqual(job.count('performance_task_json_args+=(--http-wake-screen)'),2)
-        self.assertIn('inputs.http_wake_screen && 12',job)
-        self.assertIn('if: always() && inputs.http_wake_screen',job)
-        self.assertIn('name: ku-http-wake-observation',job)
-        self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/http-wake-observation',job)
+        self.assertEqual(job.count('performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")'),2)
+        self.assertIn('inputs.http_short_screen && 12',job)
+        self.assertIn('if: always() && inputs.http_short_screen',job)
+        self.assertIn('name: ku-http-short-observation',job)
+        self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/http-short-observation',job)
+        self.assertNotIn('http_wake_screen:',text)
+        self.assertNotIn('--http-wake-screen',text)
+        self.assertIn('http_short_goal:\n',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory]',text)
+        self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
+        archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
+        self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)
+        self.assertIn('"${performance_archive_args[@]}"',archive)
 
     def test_pg_driver_screen_is_fresh_exclusive_and_never_a_capacity_ranking(self):
         text,job=self.workflow()
@@ -335,7 +343,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false','test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',
                 'test -z "$KU_PERFORMANCE_V2_VARIANTS"'):self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-queue-screen)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         self.assertIn('if: always() && inputs.pg_queue_screen',job)
         self.assertIn('name: ku-pg-queue-observation',job)
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-queue-observation',job)
