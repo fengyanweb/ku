@@ -13,6 +13,79 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def perf_probe(self, outcomes):
+        """Only mocked observer commands; never execute perf or a workload."""
+        calls=[];clock=[0.0]
+        def command(argv,output,timeout,limit):
+            output=Path(output);label=output.parent.name
+            outcome=outcomes.get(label,{'record':False})
+            calls.append(dict(argv=argv,timeout=timeout,limit=limit,started=clock[0]))
+            if argv[1]=='record':
+                clock[0]+=outcome.get('record_seconds',.1)
+                complete=outcome.get('record',True)
+                if complete:Path(argv[argv.index('-o')+1]).write_bytes(b'mocked perf data')
+            else:
+                clock[0]+=outcome.get('verify_seconds',.1)
+                complete=outcome.get('verify',True)
+                output.write_text(outcome.get('events','cpu-clock:\n'))
+            return dict(complete=complete,exit_code=0 if complete else 255)
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(h,'diagnostic_command',side_effect=command), \
+                patch.object(h.time,'monotonic',side_effect=lambda:clock[0]):
+            result=h.perf_capability('/unused/perf',Path(root)/'capability')
+        return result,calls
+
+    def test_perf_group_failure_checks_dwarf_only_and_verifies_real_frames(self):
+        result,calls=self.perf_probe({
+            'cpu-clock-minimal':{},'cpu-clock-full':{'record':False},
+            'cpu-clock-dwarf-only':{'events':'cpu-clock: 1234 leaf (/elf)\n\t1234 leaf (/elf)\n\t5678 caller (/elf)\n'}})
+        self.assertTrue(result['available'])
+        self.assertTrue(result['callchain_available'])
+        self.assertEqual(result['selected_flags'],['--call-graph','dwarf,8192'])
+        self.assertEqual(result['callchain_completeness'],'unknown')
+        self.assertEqual([r['flags'] for r in result['attempts']],
+            [[],['--call-graph','dwarf,8192','--inherit','--switch-events'],['--call-graph','dwarf,8192']])
+        self.assertEqual(result['attempts'][-1]['multi_frame_samples'],1)
+        self.assertEqual(len([c for c in calls if c['argv'][1]=='record']),3)
+        self.assertTrue(all(c['limit']==1<<20 for c in calls))
+        for c in calls:
+            if c['argv'][1]=='script' and 'event,ip,sym' in c['argv']:
+                self.assertNotIn('-G',c['argv'])
+                self.assertNotIn('+cpu',c['argv'])
+
+    def test_perf_samples_alone_or_separate_single_frames_do_not_prove_a_chain(self):
+        result,_=self.perf_probe({'cpu-clock-minimal':{},
+            'cpu-clock-full':{'events':'cpu-clock: 1234 leaf (/elf)\n\t1234 leaf (/elf)\n'},
+            'cpu-clock-dwarf-only':{'events':'cpu-clock: 1234 leaf (/elf)\ncpu-clock: 5678 caller (/elf)\n'}})
+        self.assertTrue(result['available'])
+        self.assertFalse(result['callchain_available'])
+        self.assertEqual(result['selected_flags'],[])
+        self.assertEqual(result['method'],'CPU_SELF_only')
+        self.assertEqual(result['attempts'][-1]['multi_frame_samples'],0)
+
+    def test_perf_full_observed_chain_needs_no_extra_probe_and_unknown_frames_do_not_count(self):
+        result,calls=self.perf_probe({'cpu-clock-minimal':{},
+            'cpu-clock-full':{'events':'cpu-clock: 0x1234 leaf (/elf)\n\t0x5678 caller (/elf)\n'}})
+        self.assertTrue(result['callchain_available'])
+        self.assertEqual(len(result['attempts']),2)
+        self.assertNotIn('fp',str(result['selected_flags']))
+        self.assertNotIn('dwarf-only',str(calls))
+        unknown,_=self.perf_probe({'cpu-clock-minimal':{},
+            'cpu-clock-full':{'events':'cpu-clock: 1234 leaf (/elf)\n\t5678 [unknown] ([unknown])\n'},
+            'cpu-clock-dwarf-only':{'events':'1234 leaf (/elf)\n5678 caller (/elf)\n'}})
+        self.assertFalse(unknown['callchain_available'])
+
+    def test_perf_shared_budget_reserves_cleanup_and_skips_late_fallback(self):
+        result,calls=self.perf_probe({'cpu-clock-minimal':{'record_seconds':4,'verify_seconds':2},
+            'cpu-clock-full':{'record':False,'record_seconds':9}})
+        self.assertTrue(result['available'])
+        self.assertFalse(result['callchain_available'])
+        self.assertEqual(len(result['attempts']),2)
+        self.assertLessEqual(result['seconds'],18)
+        for c in calls:
+            self.assertLessEqual(c['started']+c['timeout']+5.1,18)
+        self.assertNotIn('dwarf-only',str(calls))
+
     def test_screen_freezes_each_candidate_without_mixing_direct_or_diagnostic(self):
         names=['A','B','R','RS','D',*[f'C{i}' for i in range(1,7)]]
         versions={n:{'source_commit':str(i)*40,'root':'/unused/'+n} for i,n in enumerate(names)}
@@ -382,19 +455,30 @@ class HostedCycleTests(unittest.TestCase):
                     natural_reclamation=True,arrival_schedule_quality='pass',environment_quality='pass',
                     measurement_invalid=False,observed_environment_faults=[],full_cpu_us=10,latency={'p99_ms':1},
                     memory={'steady_median_bytes':100},comparison_contract='same')
-                window=Mock(side_effect=lambda *args,**kwargs:dict(good))
+                def observed_window(*args,**kwargs):
+                    if args[1]=='D':
+                        score=Path(args[6])/'score';score.mkdir(parents=True,exist_ok=True)
+                        (score/'perf.data').write_bytes(b'mocked recorded IP samples without CPU field')
+                    return dict(good)
+                window=Mock(side_effect=observed_window)
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
                 patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
                 patches.enter_context(patch.object(h,'sha',return_value='boot'))
                 patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
-                patches.enter_context(patch.object(h,'diagnostic_command',return_value={}))
+                observer=patches.enter_context(patch.object(h,'diagnostic_command',return_value={}))
                 patches.enter_context(patch.object(h,'perf_capability',return_value={'available':False}))
-                patches.enter_context(patch.object(h.shutil,'which',return_value=None))
+                patches.enter_context(patch.object(h.shutil,'which',return_value='/unused/perf'))
                 patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'pass'}))
                 patches.enter_context(patch.object(h,'admission_window',gate))
                 patches.enter_context(patch.object(h,'window_quality',return_value=(False,None)))
                 patches.enter_context(patch.object(fc,'window',window))
                 result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools'),state,followup=followup)
+                exports=[call.args[0] for call in observer.call_args_list if call.args[0][1]=='script']
+                self.assertTrue(exports)
+                for command in exports:
+                    fields=set(command[command.index('-F')+1].split(','))
+                    self.assertTrue({'+pid','+tid','+time','+ip','+sym','+dso'}<=fields)
+                    self.assertNotIn('+cpu',fields)
                 self.assertEqual(gate.call_count,2 if task and gate_passed else 1)
                 self.assertEqual(result['execution_complete'],gate_passed)
                 controls=plan['environment_controls']['count'] if followup else 0
