@@ -467,24 +467,31 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
     replace('pending-exchange-once', '  if (ku_http_wake_pending_exchange(wake,1)) return;',
             '  if (ku_http_wake_pending_exchange(wake,1)) {\n'
             '    ku_flow_count(KUF_WAKE_PENDING_SKIP);ku_flow_source_count(KUF_SM_PENDING_SKIP);return;\n  }')
-    replace('wake-physical-write', '    ssize_t sent = write(wake->write_socket, &byte, 1);',
+    wake_counter_transport='write(wake->write_socket, marker, marker_size)' in text
+    wake_write='write(wake->write_socket, marker, marker_size)' if wake_counter_transport else 'write(wake->write_socket, &byte, 1)'
+    wake_write_size='(int)marker_size' if wake_counter_transport else '1'
+    replace('wake-physical-write', '    ssize_t sent = '+wake_write+';',
             '    ku_flow_count(KUF_WAKE_WRITE_ATTEMPT);ku_flow_source_count(KUF_SM_WRITE_ATTEMPT);\n'
-            '    ssize_t sent = write(wake->write_socket, &byte, 1);')
-    replace('wake-write-result', '    if (sent == 1) return;\n'
+            '    ssize_t sent = '+wake_write+';')
+    replace('wake-write-result', '    if (sent == '+wake_write_size+') return;\n'
             '    int error = ku_http_socket_last_error();\n'
             '    if (sent < 0 && ku_http_socket_would_block(error)) return;\n'
             '    if (sent < 0 && ku_http_socket_error_interrupted(error)) continue;',
-            '    if (sent == 1) {ku_flow_count(KUF_WAKE_WRITE_SUCCESS);ku_flow_source_count(KUF_SM_WRITE_SUCCESS);return;}\n'
+            '    if (sent == '+wake_write_size+') {ku_flow_count(KUF_WAKE_WRITE_SUCCESS);ku_flow_source_count(KUF_SM_WRITE_SUCCESS);return;}\n'
             '    int error = ku_http_socket_last_error();\n'
             '    if (sent < 0 && ku_http_socket_would_block(error)) {ku_flow_count(KUF_WAKE_WRITE_EAGAIN);ku_flow_source_count(KUF_SM_WRITE_EAGAIN);return;}\n'
             '    if (sent < 0 && ku_http_socket_error_interrupted(error)) {ku_flow_count(KUF_WAKE_WRITE_EINTR);ku_flow_source_count(KUF_SM_WRITE_EINTR);continue;}\n'
             '    ku_flow_count(KUF_WAKE_WRITE_ERROR);')
     replace('wake-drain-entry', 'static void ku_http_wake_drain(KuHttpWake* wake) {\n',
             'static void ku_http_wake_drain(KuHttpWake* wake) {\n  ku_flow_count(KUF_WAKE_DRAIN);\n')
-    replace('wake-drain-read', '    ssize_t received = read(wake->read_socket, bytes, sizeof(bytes));\n    if (received > 0) continue;',
+    wake_read='read(wake->read_socket, bytes, read_size)' if wake_counter_transport else 'read(wake->read_socket, bytes, sizeof(bytes))'
+    replace('wake-drain-read', '    ssize_t received = '+wake_read+';',
             '    ku_flow_count(KUF_WAKE_DRAIN_READ_ATTEMPT);\n'
-            '    ssize_t received = read(wake->read_socket, bytes, sizeof(bytes));\n'
+            '    ssize_t received = '+wake_read+';')
+    replace('wake-drain-positive', '    if (received > 0) continue;',
             '    if (received > 0) {ku_flow_count(KUF_WAKE_DRAIN_POSITIVE);ku_flow_add(KUF_WAKE_DRAIN_BYTES,(unsigned long long)received);continue;}')
+    replace('wake-counter-read-width-error','      fputs("http reactor event counter read size failed\\n",stderr);exit(1);',
+            '      ku_flow_count(KUF_WAKE_DRAIN_ERROR);fputs("http reactor event counter read size failed\\n",stderr);exit(1);',optional=True)
     replace('wake-drain-result', '    if (ku_http_socket_would_block(error)) break;\n'
             '    if (ku_http_socket_error_interrupted(error)) continue;\n'
             '    fputs("http reactor wake read failed\\n", stderr); exit(1);',

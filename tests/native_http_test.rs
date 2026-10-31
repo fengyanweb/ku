@@ -6117,7 +6117,9 @@ fn native_http_wake_coalesces_without_losing_work_at_clear_or_concurrent_publica
     let wake = runtime[start..end].replace(
         "  (void)ku_http_wake_pending_exchange(wake,0);",
         "  test_at_clear(wake,0);\n  (void)ku_http_wake_pending_exchange(wake,0);\n  test_at_clear(wake,1);",
-    ).replace("write(wake->write_socket, &byte, 1)", "test_write(wake->write_socket, &byte, 1)");
+    ).replace("write(wake->write_socket, marker, marker_size)", "test_write(wake->write_socket, marker, marker_size)")
+        .replace("read(wake->read_socket, bytes, read_size)", "test_read(wake->read_socket, bytes, read_size)")
+        .replace("eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC)", "test_eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC)");
     let header = r#"
 #include <stdint.h>
 #include <stdio.h>
@@ -6129,6 +6131,10 @@ fn native_http_wake_coalesces_without_losing_work_at_clear_or_concurrent_publica
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/eventfd.h>
+#endif
 typedef int KuHttpSocket;
 typedef _Atomic size_t KuAtomicRefcount;
 #define KU_HTTP_INVALID_SOCKET (-1)
@@ -6138,11 +6144,41 @@ static void counter_add(KuAtomicRefcount* p) { (void)atomic_fetch_add_explicit(p
 static int ku_http_socket_last_error(void) { return errno; }
 static int ku_http_socket_would_block(int e) { return e==EAGAIN || e==EWOULDBLOCK; }
 static int ku_http_socket_error_interrupted(int e) { return e==EINTR; }
-static void ku_http_socket_close(KuHttpSocket s) { if(s>=0) close(s); }
+static int fixture_close_calls,fixture_reuse_target=-1,fixture_reused=-1;
+static void ku_http_socket_close(KuHttpSocket s) {
+ if(s<0)return;fixture_close_calls++;
+ if(close(s)) {perror("fixture close");exit(98);}
+ if(s==fixture_reuse_target) {
+  fixture_reuse_target=-1;fixture_reused=open("/dev/null",O_RDONLY);
+  if(fixture_reused!=s) {fputs("fixture FD reuse mismatch\n",stderr);exit(98);}
+ }
+}
 static int ku_http_socket_nonblocking(KuHttpSocket s) { int f=fcntl(s,F_GETFL,0); return f>=0 && !fcntl(s,F_SETFL,f|O_NONBLOCK); }
 static int ready(KuHttpSocket s,int timeout) { struct pollfd f={s,POLLIN,0}; return poll(&f,1,timeout)>0 && (f.revents&POLLIN); }
 static KuAtomicRefcount publications,send_calls;
-static ssize_t test_write(KuHttpSocket s,const char* p,size_t n) { counter_add(&send_calls);return write(s,p,n); }
+static int fixture_write_eintr,fixture_read_eintr,fixture_write_size=-1,fixture_read_size=-1,fixture_write_error,fixture_read_error;
+static size_t fixture_read_calls;
+static ssize_t test_write(KuHttpSocket s,const void* p,size_t n) {
+ counter_add(&send_calls);
+ if(fixture_write_eintr>0) {fixture_write_eintr--;errno=EINTR;return -1;}
+ if(fixture_write_error) {errno=EBADF;return -1;}
+ if(fixture_write_size>=0)return fixture_write_size;
+ return write(s,p,n);
+}
+static ssize_t test_read(KuHttpSocket s,void* p,size_t n) {
+ fixture_read_calls++;
+ if(fixture_read_eintr>0) {fixture_read_eintr--;errno=EINTR;return -1;}
+ if(fixture_read_error) {errno=EBADF;return -1;}
+ if(fixture_read_size>=0)return fixture_read_size;
+ return read(s,p,n);
+}
+#if defined(__linux__)
+static int fixture_eventfd_error;
+static int test_eventfd(unsigned int value,int flags) {
+ if(fixture_eventfd_error) {errno=fixture_eventfd_error;return -1;}
+ return eventfd(value,flags);
+}
+#endif
 static void test_at_clear(void*,int);
 "#;
     let checks = r#"
@@ -6171,9 +6207,16 @@ static void* baton_producer(void* raw) {
  }
  return NULL;
 }
-int main(void) {
- counter_init(&publications);counter_init(&send_calls);
+static void run_transport(int expected_counter) {
+ counter_init(&publications);counter_init(&send_calls);baton_permit=baton_ack=0;
  KuHttpWake w;CHECK(ku_http_wake_init(&w));
+#if defined(__linux__)
+ CHECK(w.eventfd_transport==expected_counter);
+ CHECK((w.read_socket==w.write_socket)==expected_counter);
+#else
+ (void)expected_counter;
+#endif
+ CHECK((fcntl(w.read_socket,F_GETFL)&O_NONBLOCK) && (fcntl(w.write_socket,F_GETFL)&O_NONBLOCK));
  CHECK((fcntl(w.read_socket,F_GETFD)&FD_CLOEXEC) && (fcntl(w.write_socket,F_GETFD)&FD_CLOEXEC));
  for(int i=0;i<512;i++) publish(&w);
  CHECK(counter_read(&send_calls)==1 && ready(w.read_socket,0));
@@ -6186,13 +6229,24 @@ int main(void) {
  CHECK(counter_read(&send_calls)==before+1);
  CHECK(counter_read(&publications)==516 && ready(w.read_socket,0));
  ku_http_wake_drain(&w);
- /* For a one-byte nonblocking pipe write, EAGAIN has an independently
-    observable readable endpoint. No equivalent assertion is made for UDP. */
- char fill[512];memset(fill,1,sizeof(fill));size_t filled=0;
- for(;;) { ssize_t n=write(w.write_socket,fill,sizeof(fill));if(n>0) {filled+=(size_t)n;continue;} CHECK(n<0 && ku_http_socket_would_block(errno));break; }
- CHECK(filled>0 && ready(w.read_socket,0));
- while(write(w.write_socket,fill,1)==1) filled++;
- CHECK(ku_http_socket_would_block(errno));
+ /* Saturate the selected nonblocking channel without relying on publication
+    counters. EAGAIN must have an independently readable endpoint; no such
+    assertion is made for UDP. */
+#if defined(__linux__)
+ if(w.eventfd_transport) {
+  uint64_t maximum=UINT64_MAX-1;
+  CHECK(write(w.write_socket,&maximum,sizeof(maximum))==(ssize_t)sizeof(maximum));
+  uint64_t one=1;CHECK(write(w.write_socket,&one,sizeof(one))<0 && errno==EAGAIN);
+ } else
+#endif
+ {
+  char fill[512];memset(fill,1,sizeof(fill));size_t filled=0;
+  for(;;) {ssize_t n=write(w.write_socket,fill,sizeof(fill));if(n>0) {filled+=(size_t)n;continue;}CHECK(n<0 && ku_http_socket_would_block(errno));break;}
+  CHECK(filled>0 && ready(w.read_socket,0));
+  while(write(w.write_socket,fill,1)==1)filled++;
+  CHECK(ku_http_socket_would_block(errno));
+ }
+ CHECK(ready(w.read_socket,0));
  before=counter_read(&send_calls);publish(&w);
  CHECK(counter_read(&send_calls)==before+1 && errno==EAGAIN && ready(w.read_socket,0));
  do {ku_http_wake_drain(&w);} while(ready(w.read_socket,0));
@@ -6217,8 +6271,57 @@ int main(void) {
   CHECK(!pthread_cond_broadcast(&baton_cond));CHECK(!pthread_mutex_unlock(&baton_lock));
  }
  CHECK(!pthread_join(baton,NULL));
+ fixture_reuse_target=w.read_socket;int before_close=fixture_close_calls;
  ku_http_wake_close(&w);
  CHECK(w.read_socket==KU_HTTP_INVALID_SOCKET && w.write_socket==KU_HTTP_INVALID_SOCKET);
+ CHECK(fixture_close_calls-before_close==(expected_counter?1:2));
+ CHECK(fixture_reused>=0 && fcntl(fixture_reused,F_GETFD)>=0);CHECK(!close(fixture_reused));fixture_reused=-1;
+ ku_http_wake_close(&w);CHECK(fixture_close_calls-before_close==(expected_counter?1:2));
+ printf("http-wake-transport-%s-ok\n",expected_counter?"eventfd":"pipe");
+}
+static void expect_io_failure(int kind) {
+ pid_t child=fork();CHECK(child>=0);
+ if(!child) {
+  alarm(2);KuHttpWake wake;CHECK(ku_http_wake_init(&wake));
+  if(kind==0) {fixture_write_size=0;ku_http_wake_notify(&wake);}
+  if(kind==1) {fixture_write_eintr=8;ku_http_wake_notify(&wake);}
+  if(kind==2) {fixture_read_size=0;ku_http_wake_drain(&wake);}
+  if(kind==3) {fixture_read_error=1;ku_http_wake_drain(&wake);}
+  if(kind==6) {fixture_write_error=1;ku_http_wake_notify(&wake);}
+#if defined(__linux__)
+  if(kind==4) {CHECK(wake.eventfd_transport);fixture_read_size=4;ku_http_wake_drain(&wake);}
+  if(kind==5) {CHECK(wake.eventfd_transport);fixture_write_size=4;ku_http_wake_notify(&wake);}
+#endif
+  _Exit(99);
+ }
+ int status=0;CHECK(waitpid(child,&status,0)==child);CHECK(WIFEXITED(status) && WEXITSTATUS(status)==1);
+}
+int main(void) {
+#if defined(__linux__)
+ run_transport(1);
+ fixture_eventfd_error=EPERM;run_transport(0);
+ fixture_eventfd_error=ENOSYS;KuHttpWake fallback;CHECK(ku_http_wake_init(&fallback) && !fallback.eventfd_transport);
+ ku_http_wake_close(&fallback);fixture_eventfd_error=0;
+#else
+ run_transport(0);
+#endif
+ /* Shared-FD close is testable on every POSIX host without emulating eventfd. */
+ KuHttpWake alias={0};alias.read_socket=open("/dev/null",O_RDONLY);CHECK(alias.read_socket>=0);
+ alias.write_socket=alias.read_socket;fixture_reuse_target=alias.read_socket;int closes=fixture_close_calls;
+ ku_http_wake_close(&alias);CHECK(fixture_close_calls==closes+1);
+ CHECK(fcntl(fixture_reused,F_GETFD)>=0);CHECK(!close(fixture_reused));fixture_reused=-1;
+ ku_http_wake_close(&alias);CHECK(fixture_close_calls==closes+1);
+ KuHttpWake wake;CHECK(ku_http_wake_init(&wake));
+ fixture_write_eintr=3;size_t before=counter_read(&send_calls);ku_http_wake_notify(&wake);
+ CHECK(counter_read(&send_calls)==before+4 && ready(wake.read_socket,0));
+ fixture_read_eintr=256;size_t reads=fixture_read_calls;ku_http_wake_drain(&wake);
+ CHECK(fixture_read_calls==reads+256 && ready(wake.read_socket,0));
+ fixture_read_eintr=3;reads=fixture_read_calls;ku_http_wake_drain(&wake);
+ CHECK(fixture_read_calls==reads+5 && !ready(wake.read_socket,0));ku_http_wake_close(&wake);
+ for(int kind=0;kind<4;kind++)expect_io_failure(kind);expect_io_failure(6);
+#if defined(__linux__)
+ expect_io_failure(4);expect_io_failure(5);
+#endif
  CHECK(!pthread_cond_destroy(&baton_cond));CHECK(!pthread_mutex_destroy(&baton_lock));
  puts("http-wake-coalescing-ok");return 0;
 }
@@ -6285,6 +6388,9 @@ fn native_http_task_self_wake_keeps_late_work_and_cross_thread_retirement() {
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#if defined(__linux__)
+#include <sys/eventfd.h>
+#endif
 typedef int KuHttpSocket;
 typedef _Atomic size_t KuAtomicRefcount;
 #define KU_HTTP_INVALID_SOCKET (-1)
@@ -6301,7 +6407,7 @@ static void fixture_before_notify(void*);
 "#;
     let model = r#"
 /* Field-only group model; the exact production callback/late-wait block below
- * runs against real mutexes, native wake pipes and independently created TLS. */
+ * runs against real mutexes, native wake channels and independently created TLS. */
 typedef pthread_mutex_t KuHttpMutex;
 typedef struct KuHttpLoopGroup KuHttpLoopGroup;
 typedef struct KuHttpLoopOwner {

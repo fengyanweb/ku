@@ -4,6 +4,7 @@
 #endif
 #if defined(__linux__)
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <dirent.h>
 #define KU_HTTP_PERSISTENT_EVENT_LOOP 1
@@ -1450,12 +1451,16 @@ static int ku_http_socket_nonblocking(KuHttpSocket socket_value) {
 static int ku_http_socket_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
 #endif
 
-/* POSIX owners use a nonblocking byte pipe: a one-byte write is atomic and
-   EAGAIN means data is already buffered for poll. Windows keeps its existing
+/* Linux prefers a counter event, falling back to the existing byte pipe before
+   publication if eventfd is unavailable. Other POSIX owners keep that pipe.
+   EAGAIN means this selected channel is already readable. Windows keeps its existing
    nonblocking loopback datagrams without coalescing; UDP send pressure alone
    does not establish that its receiver is readable. */
 typedef struct {
   KuHttpSocket read_socket; KuHttpSocket write_socket;
+#if defined(__linux__)
+  int eventfd_transport;
+#endif
 #if !defined(_WIN32)
   KuAtomicRefcount pending;
 #endif
@@ -1466,14 +1471,23 @@ static size_t ku_http_wake_pending_exchange(KuHttpWake* wake,size_t value) {
 }
 #endif
 static void ku_http_wake_close(KuHttpWake* wake) {
-  ku_http_socket_close(wake->read_socket);
-  ku_http_socket_close(wake->write_socket);
+  KuHttpSocket read_socket=wake->read_socket,write_socket=wake->write_socket;
   wake->read_socket = wake->write_socket = KU_HTTP_INVALID_SOCKET;
+  ku_http_socket_close(read_socket);
+  if (write_socket!=read_socket) ku_http_socket_close(write_socket);
 }
 static int ku_http_wake_init(KuHttpWake* wake) {
   wake->read_socket = wake->write_socket = KU_HTTP_INVALID_SOCKET;
 #if !defined(_WIN32)
   atomic_init(&wake->pending,(size_t)0);
+#if defined(__linux__)
+  wake->eventfd_transport=0;
+  int counter=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+  if(counter>=0) {
+    wake->read_socket=wake->write_socket=counter;wake->eventfd_transport=1;
+    return 1;
+  }
+#endif
   int descriptors[2];
   if (pipe(descriptors) != 0) return 0;
   wake->read_socket=descriptors[0]; wake->write_socket=descriptors[1];
@@ -1505,18 +1519,26 @@ failed:
 static void ku_http_wake_notify(KuHttpWake* wake) {
 #if !defined(_WIN32)
   /* The consumer clears with acquire before its next work scan. A producer
-     after that clear installs a fresh byte; earlier publications join the scan.
-     This eight-byte marker is owner-stack storage, not a Task heap charge. */
+     after that clear installs a fresh wake marker; earlier publications join the scan.
+     Markers are owner-stack storage, not a Task heap charge. */
   if (ku_http_wake_pending_exchange(wake,1)) return;
 #endif
   const char byte = 1;
+  size_t marker_size=1;
+#if !defined(_WIN32)
+  const void* marker=&byte;
+#endif
+#if defined(__linux__)
+  const uint64_t counter=1;
+  if(wake->eventfd_transport) {marker=&counter;marker_size=sizeof(counter);}
+#endif
   for (int attempt = 0; attempt < 8; attempt++) {
 #if defined(_WIN32)
     int sent = ku_http_socket_send(wake->write_socket, &byte, 1);
 #else
-    ssize_t sent = write(wake->write_socket, &byte, 1);
+    ssize_t sent = write(wake->write_socket, marker, marker_size);
 #endif
-    if (sent == 1) return;
+    if (sent == (int)marker_size) return;
     int error = ku_http_socket_last_error();
     if (sent < 0 && ku_http_socket_would_block(error)) return;
     if (sent < 0 && ku_http_socket_error_interrupted(error)) continue;
@@ -1526,12 +1548,23 @@ static void ku_http_wake_notify(KuHttpWake* wake) {
 }
 static void ku_http_wake_drain(KuHttpWake* wake) {
   char bytes[64];
+#if !defined(_WIN32)
+  size_t read_size=sizeof(bytes);
+#if defined(__linux__)
+  if(wake->eventfd_transport)read_size=sizeof(uint64_t);
+#endif
+#endif
   for (int turn = 0; turn < 256; turn++) {
 #if defined(_WIN32)
     int received = ku_http_socket_recv(wake->read_socket, bytes, sizeof(bytes));
     if (received >= 0) continue;
 #else
-    ssize_t received = read(wake->read_socket, bytes, sizeof(bytes));
+    ssize_t received = read(wake->read_socket, bytes, read_size);
+#if defined(__linux__)
+    if(wake->eventfd_transport && received>=0 && received!=(ssize_t)sizeof(uint64_t)) {
+      fputs("http reactor event counter read size failed\n",stderr);exit(1);
+    }
+#endif
     if (received > 0) continue;
     if (received == 0) { fputs("http reactor wake pipe closed\n",stderr); exit(1); }
 #endif
@@ -1542,7 +1575,7 @@ static void ku_http_wake_drain(KuHttpWake* wake) {
   }
 #if !defined(_WIN32)
   /* All three callers scan published work before their next poll. At the
-     bounded drain limit remaining pipe bytes also keep the descriptor ready. */
+     bounded drain limit remaining bytes/counter also keep the descriptor ready. */
   (void)ku_http_wake_pending_exchange(wake,0);
 #endif
 }
@@ -3011,7 +3044,7 @@ invalid:
 }
 static void ku_http_group_notify(KuHttpLoopGroup* group) {
   /* The lock protects wake-pointer lifetime against loop teardown. notify does
-     not acquire this mutex and sends at most one nonblocking datagram. */
+     not acquire this mutex and sends at most one nonblocking wake marker. */
   ku_http_mutex_lock(&group->lock);
   for (int i=0; i<group->created; i++) if (group->loops[i].wake) ku_http_wake_notify(group->loops[i].wake);
   ku_http_mutex_unlock(&group->lock);
