@@ -9301,7 +9301,7 @@ fn main(): null! {
 "#,
     );
     let instrumentation = format!(
-        "{}\n{}\n{}\n{}\nstatic void fixture_worker_gate(void);\nstatic int fixture_worker_spawn_failed(void);\nstatic void* fixture_worker_handles(size_t,size_t);\nstatic void* fixture_zero_calloc(size_t,size_t);\n",
+        "{}\n{}\n{}\n{}\nstatic void fixture_worker_gate(void);\nstatic int fixture_worker_spawn_failed(void);\nstatic void* fixture_worker_handles(size_t,size_t);\nstatic void* fixture_zero_calloc(size_t,size_t);\nstatic void fixture_publish_before_signal(void*);\nstatic void fixture_publish_after_signal(void*);\nstatic void fixture_publish_waiting(void*);\n",
         native_c_harness::NATIVE_THREAD_LIFECYCLE_HARNESS,
         native_task_ledger::LEDGER_LOCK,
         native_allocation_harness::ALLOCATION_HOOK,
@@ -9312,6 +9312,8 @@ fn main(): null! {
         .replacen("typedef struct KuString {", &format!("{instrumentation}typedef struct KuString {{"), 1)
         .replacen("    ku_http_job_run(context->server, job);", "    fixture_worker_gate();\n    ku_http_job_run(context->server, job);", 1)
         .replacen("static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {", "static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {\n  if(fixture_worker_spawn_failed())return 0;", 1)
+        .replacen("  if (accepted) ku_http_condition_signal(&queue->not_empty);", "  if (accepted) { fixture_publish_before_signal(queue); ku_http_condition_signal(&queue->not_empty); fixture_publish_after_signal(queue); }", 1)
+        .replacen("  while (queue->count == 0 && !queue->closed) ku_http_condition_wait(&queue->not_empty, &queue->lock);", "  while (queue->count == 0 && !queue->closed) { fixture_publish_waiting(queue); ku_http_condition_wait(&queue->not_empty, &queue->lock); }", 1)
         .replace("(HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE))", "(HANDLE*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(HANDLE))")
         .replace("(pthread_t*)malloc((size_t)nworkers * sizeof(pthread_t))", "(pthread_t*)fixture_worker_handles((size_t)nworkers,(size_t)nworkers * sizeof(pthread_t))")
         .replace("calloc((size_t)slot_count,", "fixture_zero_calloc((size_t)slot_count,");
@@ -9342,6 +9344,85 @@ static KuHttpJob* fixture_elastic_job(KuHttpServer* server,KuHttpQueue* queue,Ku
   CHECK(!ku_http_parse_complete_header(server,header,strlen(header),&input));
   KuHttpJob* job=ku_http_job_new(queue,&input);CHECK(job);
   job->request_deadline=ku_http_deadline_ms(5000u);return job;
+}
+/* Keep publication/late-notification races in the real full-capacity fixture.
+ * These events never wait while holding queue.lock. No timing sleep decides correctness. */
+typedef struct FixturePublish {
+  KuHttpQueue* queue;KuHttpJob* job;KuHttpServer* server;
+  KuTestEvent waiting,published,allow_signal,consumed;
+  size_t input_charge,signals;int mode;
+} FixturePublish;
+static FixturePublish* fixture_publication;
+static void fixture_publish_waiting(void* raw) {
+  if(fixture_publication && raw==fixture_publication->queue)
+    CHECK(ku_test_event_set(&fixture_publication->waiting));
+}
+static void fixture_publish_before_signal(void* raw) {
+  FixturePublish* f=fixture_publication;if(!f || raw!=f->queue)return;
+  ku_http_mutex_lock(&f->queue->lock);
+  CHECK(f->queue->resident==1 && f->queue->count<=1 && f->queue->running<=1
+      && f->queue->peak_queued_bytes==f->input_charge);
+  ku_http_mutex_unlock(&f->queue->lock);
+  CHECK(ku_test_event_set(&f->published));
+  if(f->mode)CHECK(ku_test_event_wait(&f->allow_signal,2000u));
+}
+static void fixture_publish_after_signal(void* raw) {
+  if(fixture_publication && raw==fixture_publication->queue)fixture_publication->signals++;
+}
+static int fixture_publish_producer(void* raw) {
+  FixturePublish* f=(FixturePublish*)raw;return ku_http_queue_push(f->queue,f->job);
+}
+static int fixture_publish_consumer(void* raw) {
+  FixturePublish* f=(FixturePublish*)raw;KuHttpJob* job=ku_http_queue_pop(f->queue);
+  if(f->mode==3)CHECK(!job); /* Abort consumed the real queued owner before pop. */
+  else {
+    CHECK(job==f->job);ku_http_job_run(f->server,job);
+    ku_http_mutex_lock(&f->queue->lock);CHECK(f->queue->running==1);
+    f->queue->running--;ku_http_mutex_unlock(&f->queue->lock);
+    ku_http_job_release(job);
+  }
+  CHECK(ku_test_event_set(&f->consumed));return 1;
+}
+static void fixture_publication_races(KuHttpServer* server) {
+  for(int mode=0;mode<4;mode++) {
+    KuHttpBufferBudget budget={0};budget.limit=1048576;CHECK(ku_http_mutex_init(&budget.lock));
+    KuHttpWake wake={0};CHECK(ku_http_wake_init(&wake));
+    KuHttpQueue queue={0};CHECK(ku_http_queue_init(&queue,2,&wake));
+    KuHttpJob* job=fixture_elastic_job(server,&queue,&budget);
+    FixturePublish f={.queue=&queue,.job=job,.server=server,.mode=mode,
+        .input_charge=job->input.body_charge+job->input.metadata_charge};
+    CHECK(f.input_charge && ku_test_event_init(&f.waiting) && ku_test_event_init(&f.published)
+        && ku_test_event_init(&f.allow_signal) && ku_test_event_init(&f.consumed));
+    fixture_publication=&f;KuTestThread consumer={0},producer={0};
+    if(mode!=3) {
+      CHECK(ku_test_thread_start(&consumer,fixture_publish_consumer,&f));
+      /* The next producer lock cannot pass this waiter's atomic unlock/wait. */
+      CHECK(ku_test_event_wait(&f.waiting,2000u));
+    }
+    CHECK(ku_test_thread_start(&producer,fixture_publish_producer,&f));
+    CHECK(ku_test_event_wait(&f.published,2000u));
+    if(mode==1) {
+      /* An independent permitted wake may retire the job before its own signal. */
+      ku_http_mutex_lock(&queue.lock);ku_http_condition_broadcast(&queue.not_empty);ku_http_mutex_unlock(&queue.lock);
+    } else if(mode>=2)ku_http_queue_close(&queue,mode==2);
+    if(mode==3)CHECK(ku_test_thread_start(&consumer,fixture_publish_consumer,&f));
+    CHECK(ku_test_event_wait(&f.consumed,2000u));
+    CHECK(ku_test_thread_join(&consumer,2000u) && consumer.outcome==1);
+    if(mode) {CHECK(!f.signals);CHECK(ku_test_event_set(&f.allow_signal));}
+    CHECK(ku_test_thread_join(&producer,2000u) && producer.outcome==1 && f.signals==1);
+    CHECK(ku_http_job_only_owner(job) && job->completed);
+    if(mode==3)CHECK(job->cancelled && !job->started && !job->response.body.ptr);
+    else CHECK(job->started && !job->cancelled && job->response.status==200
+        && job->response.body.len==6 && !memcmp(job->response.body.ptr,"worked",6));
+    ku_http_job_release(job);ku_http_queue_close(&queue,mode!=3);
+    KuHttpJob* rejected=fixture_elastic_job(server,&queue,&budget);
+    CHECK(!ku_http_queue_push(&queue,rejected) && f.signals==1 && ku_http_job_only_owner(rejected));
+    ku_http_job_release(rejected);
+    CHECK(!queue.count && !queue.running && !queue.resident && !queue.queued_bytes && !budget.current);
+    fixture_publication=NULL;ku_http_queue_free(&queue);ku_http_wake_close(&wake);ku_http_mutex_destroy(&budget.lock);
+    CHECK(ku_test_event_destroy(&f.waiting) && ku_test_event_destroy(&f.published)
+        && ku_test_event_destroy(&f.allow_signal) && ku_test_event_destroy(&f.consumed));
+  }
 }
 static void fixture_transport_pair(KuHttpSocket* accepted,KuHttpSocket* peer) {
   KuHttpSocket listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);CHECK(listener!=KU_HTTP_INVALID_SOCKET);
@@ -9442,6 +9523,7 @@ int main(void) {
     ku_http_wake_close(&group.wake);ku_http_mutex_destroy(&group.lock);
   }
   CHECK(fixture_zero_allocations>=8u);
+  fixture_publication_races(server);
   fixture_elastic_transport(server);
   for(int fixed=0;fixed<2;fixed++) {
     fixture_started=0;fixture_fail_next_spawn=0;

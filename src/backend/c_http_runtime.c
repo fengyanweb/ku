@@ -1749,10 +1749,12 @@ static int ku_http_queue_push(KuHttpQueue* queue, KuHttpJob* job) {
     queue->count++;
     queue->queued_bytes+=job->input.body_charge+job->input.metadata_charge;
     if (queue->queued_bytes>queue->peak_queued_bytes) queue->peak_queued_bytes=queue->queued_bytes;
-    ku_http_condition_signal(&queue->not_empty);
     accepted = 1;
   }
   ku_http_mutex_unlock(&queue->lock);
+  /* Publication uses the waiter's predicate lock. This owner cannot retire
+     the queue before push returns; wake after unlock avoids immediate contention. */
+  if (accepted) ku_http_condition_signal(&queue->not_empty);
   return accepted;
 }
 static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
