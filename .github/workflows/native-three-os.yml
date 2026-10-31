@@ -38,6 +38,11 @@ on:
         type: boolean
         default: false
 
+      json_plain_profile:
+        description: 'Fixed normal JSON plain ELF: three diagnostic CPU SELF windows, no HTTP score or rebuild'
+        type: boolean
+        default: false
+
       normal_self_probe:
         description: 'Six normal B/R JSON before/sample/after windows; fresh diagnostic build, minimal SELF only, no acceptance'
         type: boolean
@@ -495,8 +500,83 @@ jobs:
           "$fixture/program" > "$fixture/actual.txt"
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
+  json-plain-profile:
+    if: github.event_name == 'workflow_dispatch' && inputs.json_plain_profile
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the isolated plain diagnostic selection
+        env:
+          SCOPE: ${{ inputs.scope }}
+          OTHER: ${{ inputs.normal_self_probe || inputs.http_short_screen || inputs.memory_owner_probe || inputs.pg_driver_screen || inputs.pg_queue_screen || inputs.pg_failure_probe || inputs.task_json_screen || inputs.common_http_screen || inputs.final_task_json }}
+          REUSE: ${{ inputs.reuse_build_run }}
+          VARIANTS: ${{ inputs.screen_variants }}
+        run: |
+          set -euo pipefail
+          test "$SCOPE" = performance-followup-diagnostic
+          test "$OTHER" = false
+          test -z "$REUSE"
+          test -z "$VARIANTS"
+          test "$(id -u)" != 0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-performance-v2-evidence
+          path: ${{ runner.temp }}/json-plain-archive
+          run-id: 41182804290
+          github-token: ${{ github.token }}
+      - name: Prepare C and perf on this temporary runner only
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$(uname -m)" = aarch64
+          sudo -n apt-get update
+          sudo -n apt-get install -y --no-install-recommends clang-18 llvm-18 libpq-dev linux-tools-common
+          for package in "linux-tools-$(uname -r)" linux-tools-generic; do
+            if apt-cache show "$package" >/dev/null 2>&1; then sudo -n apt-get install -y --no-install-recommends "$package"; break; fi
+          done
+          perf_binary="$(find /usr/lib/linux-tools* -type f -name perf 2>/dev/null | sort -V | tail -n 1)"
+          test -x "$perf_binary"
+          mkdir -p "$RUNNER_TEMP/json-plain-tools"
+          ln -s "$perf_binary" "$RUNNER_TEMP/json-plain-tools/perf"
+          printf '%s\n' "$RUNNER_TEMP/json-plain-tools" >> "$GITHUB_PATH"
+          { id; sysctl kernel.perf_event_paranoid kernel.kptr_restrict; } > "$RUNNER_TEMP/json-plain-perf-settings.log"
+          sudo -n sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 >> "$RUNNER_TEMP/json-plain-perf-settings.log"
+      - name: Compile once and collect three serial plain windows as ordinary user
+        timeout-minutes: 6
+        run: |
+          test "$(id -u)" != 0
+          python3 -B tests/benchmarks/cross_stack/json_dense.py --plain-profile \
+            --archive "$RUNNER_TEMP/json-plain-archive/ku-performance-v2-evidence.tar.gz" \
+            --output "$RUNNER_TEMP/ku-json-plain-profile"
+      - name: Preserve plain ELF C inputs and bounded analysis exports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-json-plain-profile
+          path: |
+            ${{ runner.temp }}/ku-json-plain-profile
+            !${{ runner.temp }}/ku-json-plain-profile/raw/*.perf.data
+            ${{ runner.temp }}/json-plain-perf-settings.log
+          retention-days: 1
+          if-no-files-found: error
+      - name: Preserve original small perf-exec data
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-json-plain-raw
+          path: ${{ runner.temp }}/ku-json-plain-profile/raw/*.perf.data
+          retention-days: 1
+          if-no-files-found: error
+
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe) && !inputs.json_plain_profile
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180

@@ -17,6 +17,7 @@ import platform
 import re
 import shlex
 import time
+import signal, struct, subprocess, sys, tarfile, shutil
 
 from compile_variants import Commands, digest, save
 
@@ -520,7 +521,172 @@ def validate_output(text, cases, family, repeat=0, cpu_seconds=0, context='http'
     return value
 
 
+
+# One isolated plain-ELF diagnostic; none of these gates change ordinary main().
+PLAIN_RUN='41182804290'
+PLAIN_ARCHIVE='5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6'
+PLAIN_PRODUCT='4e5f5d94da277654862d8679f7ae4a7fda3f05ff'
+PLAIN_C='5d65826ab66bb24039aa256339ae20c314337c9379711a047a934f408b6166d1'
+PLAIN_CLI='25182f1d307952451e93c6c4074fff55d058b770d9ccbb0c90cc4e4c8f1fc74d'
+PLAIN_TEMPLATE='35dbe8a9dc0765a7545ac704ded648e702352af7a8680ea1ea8c18bdfe1ada85'
+PLAIN_N=1572864
+
+
+def plain_run(command,output,timeout,*,environment=None,raw=None):
+    """Ordinary-user child group, finite time/log/raw; failure never retries as root."""
+    output=Path(output);began=time.monotonic();process=None
+    receipt=dict(argv=list(map(str,command)),uid=os.getuid(),timeout_seconds=timeout,log_limit_bytes=1<<20,raw_limit_bytes=16<<20)
+    try:
+        with output.open('xb') as stream:
+            process=subprocess.Popen(receipt['argv'],stdout=stream,stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,env=environment,start_new_session=True)
+            while process.poll() is None:
+                if time.monotonic()-began>timeout or output.stat().st_size>1<<20 or (raw and Path(raw).exists() and Path(raw).stat().st_size>16<<20):
+                    raise RuntimeError('plain command time/output bound')
+                time.sleep(.025)
+        if process.returncode or output.stat().st_size>1<<20:raise RuntimeError('plain command failed: '+str(output))
+        if raw and not 0<Path(raw).stat().st_size<=16<<20:raise ValueError('bounded nonempty perf raw required')
+        return output.read_text(errors='replace')
+    finally:
+        if process is not None and process.poll() is None:
+            os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=2);receipt['forced_cleanup']=True
+        receipt.update(exit_code=process.returncode if process else None,seconds=time.monotonic()-began)
+        save(output.with_suffix(output.suffix+'.json'),receipt)
+
+
+def plain_raw_counts(path):
+    """Raw record modes/loss only; exact target-PID/PC attribution remains offline."""
+    raw=Path(path).read_bytes()
+    if not 104<=len(raw)<=16<<20 or raw[:8]!=b'PERFILE2':raise ValueError('bounded PERFILE2 required')
+    offset,size=struct.unpack_from('<QQ',raw,40)
+    if not 0<offset<=len(raw) or size>len(raw)-offset:raise ValueError('perf data bounds')
+    end=offset+size;counts=dict(all=0,user=0,kernel=0,other=0)
+    while offset<end:
+        if offset+8>end:raise ValueError('truncated perf record')
+        kind,misc,n=struct.unpack_from('<IHH',raw,offset)
+        if n<8 or offset+n>end:raise ValueError('perf record bounds')
+        if kind in (2,5,6,13):raise ValueError('perf loss/throttle invalidates this capture')
+        if kind==9:
+            counts['all']+=1;counts['kernel' if misc&7==1 else 'user' if misc&7==2 else 'other']+=1
+        offset+=n
+    if not counts['all']:raise ValueError('no CPU samples')
+    return counts
+
+
+def plain_inputs(archive,output):
+    """Fixed archive, selected immutable inputs only; no old measurement or build launcher."""
+    if digest(archive)!=PLAIN_ARCHIVE:raise ValueError('fixed normal archive SHA required')
+    output=Path(output);output.mkdir()
+    prefix='${EVIDENCE_ROOT}/'
+    with tarfile.open(archive,'r:gz') as tar:
+        members=tar.getmembers();names=[m.name for m in members]
+        if len(names)>20000 or len(set(names))!=len(names):raise ValueError('archive member identity')
+        index=json.load(tar.extractfile('portable-file-map.json'));mapping={r['path']:r for r in index['files']}
+        if index.get('path_root')!='${EVIDENCE_ROOT}' or len(mapping)!=len(index['files']):raise ValueError('portable provenance required')
+        selected={}
+        def take(name):
+            member=tar.getmember(name)
+            if not member.isfile() or not 0<member.size<=4<<20:raise ValueError('bounded regular input required')
+            data=tar.extractfile(member).read();entry=mapping[name]
+            if entry['bytes']!=len(data) or hashlib.sha256(data).hexdigest()!=entry['archived_sha256']:raise ValueError('archive input SHA mismatch')
+            selected[name]=dict(entry);return data
+        manifest_bytes=take('B/manifest.json');manifest=json.loads(manifest_bytes);build=manifest['stacks']['ku']['build'];native=build['native']['server']
+        if manifest['candidate_base']!=PLAIN_PRODUCT or build['cli_sha256']!=PLAIN_CLI or native['generated_c_sha256']!=PLAIN_C:raise ValueError('normal source/CLI/C identity mismatch')
+        source=take(native['generated_c'].removeprefix(prefix))
+        if hashlib.sha256(source).hexdigest()!=PLAIN_C:raise ValueError('normal C bytes mismatch')
+        receipt_bytes=take(manifest['build_receipt'].removeprefix(prefix));receipt=json.loads(receipt_bytes)
+        (output/'original-build.json').write_bytes(receipt_bytes)
+        if receipt.get('candidate_base')!=PLAIN_PRODUCT or receipt.get('failure') or not receipt.get('commands') or any(r.get('exit_code')!=0 for r in receipt.get('commands',[])):raise ValueError('original build not completed')
+        (output/'original-compiler.json').write_bytes(take(native['compiler_receipt'].removeprefix(prefix)))
+        libraries=native['compiler_invocation']['library_inputs']
+        if native['compiler_invocation']['flags']!=['-std=c11','-O2','-pthread'] or len(libraries)!=1 or libraries[0]['role']!='libpq':raise ValueError('original normal compiler contract mismatch')
+        library=libraries[0]['selected_input'];lib=take(library['path'].removeprefix(prefix))
+        if hashlib.sha256(lib).hexdigest()!=library['sha256']:raise ValueError('exact libpq mismatch')
+        for name in ['protocol.json','corpora/object.json','corpora/array.json','corpora/escape.json']:
+            path=HERE/name;entry=mapping['B/src/tests/benchmarks/cross_stack/'+name]
+            if digest(path)!=entry['original_sha256']:raise ValueError('frozen JSON input changed')
+            target=output/'inputs'/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(path,target)
+        (output/'normal.c').write_bytes(source);(output/'libpq.so').write_bytes(lib)
+        os.link(output/'libpq.so',output/'libpq.so.5')
+        (output/'manifest.json').write_bytes(manifest_bytes);save(output/'provenance.json',dict(source_run=PLAIN_RUN,archive_sha256=PLAIN_ARCHIVE,
+            original_product=PLAIN_PRODUCT,CLI_sha256=PLAIN_CLI,CLI_executed=False,selected=selected,imported_measurement_windows=0))
+    return output/'normal.c',output/'libpq.so'
+
+
+def plain_profile(archive,output):
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):raise ValueError('ordinary Linux ARM64 runner required; no root fallback')
+    if digest(HERE/'json_dense.c.inc')!=PLAIN_TEMPLATE:raise ValueError('frozen plain template changed')
+    checkout=HERE.parents[2]
+    subprocess.run(['git','-C',str(checkout),'diff','--exit-code',PLAIN_PRODUCT,'--','src','std','build.rs','Cargo.toml','Cargo.lock','crates'],check=True,timeout=10)
+    affinity=sorted(os.sched_getaffinity(0))
+    if not affinity:raise ValueError('nonempty allowed CPU affinity required')
+    out=Path(output).resolve();out.mkdir(parents=True,exist_ok=False);deadline=time.monotonic()+300
+    summary=dict(complete=False,diagnostic_only=True,normal_score_eligible=False,source_product=PLAIN_PRODUCT,source_runtime='f181894173c7bd722091f6525ac04466bdc1cded',
+        allowed_affinity=affinity,pinned_core=affinity[0],thread_core_distribution='unknown without scheduler evidence; raw COMM/TID retained',tool_commit=subprocess.check_output(['git','-C',str(checkout),'rev-parse','HEAD'],text=True,timeout=10).strip(),uid=os.getuid(),iterations=PLAIN_N,order=['before','sample','after'],rows=[],
+        scope='perf SELF is COMPLETE process lifetime: loader/setup/loop/printing/cleanup/exit. Dense internal intervals do not sum to that denominator; not HTTP score or subtraction.')
+    def run(command,name,seconds=10,raw=None):
+        remaining=min(seconds,deadline-time.monotonic())
+        if remaining<=0:raise TimeoutError('plain total wall bound')
+        return plain_run(command,out/(name+'.log'),remaining,environment=environment,raw=raw)
+    environment=dict(os.environ)
+    for key in ('CFLAGS','CXXFLAGS','LDFLAGS','LLVM_PROFILE_FILE','LD_PRELOAD'):environment.pop(key,None)
+    try:
+        source,lib=plain_inputs(archive,out/'reuse');cases=make_cases();wrapper=emit(source,cases,HERE/'json_dense.c.inc',False)
+        dense=out/'plain.c';dense.write_text(wrapper);binary=out/'plain';environment['LD_LIBRARY_PATH']=str(lib.parent.resolve())
+        run(['clang-18',str(dense),'-std=c11','-O2','-g','-pthread','-lm',str(lib),'-o',str(binary)],'compile',120)
+        summary.update(ELF_sha256=digest(binary),C_sha256=digest(dense),normal_C_sha256=digest(source),template_sha256=PLAIN_TEMPLATE,cases_sha256=case_identity(cases),phase_ledger=False,phase_clocks=False)
+        rawdir=out/'raw';rawdir.mkdir();perf=shutil.which('perf')
+        if not perf:raise ValueError('perf unavailable')
+        summary.update(perf_sha256=digest(perf),compiler_sha256=digest(shutil.which('clang-18')),whole_loop_correct=3*PLAIN_N,setup_encode_calls_each_window=16,process_total_encode_calls_each_window=PLAIN_N+16)
+        run(['clang-18','--version'],'compiler-version')
+        pre=rawdir/'preflight.perf.data'
+        run(['taskset','-c',str(affinity[0]),perf,'record','--clockid','mono','-e','cpu-clock','-F','499','-o',str(pre),'--',sys.executable,'-c',
+            'import time\nend=time.process_time()+.25\nwhile time.process_time()<end: pass'],'perf-exec-preflight',10,pre)
+        summary['preflight']=plain_raw_counts(pre)
+        for turn in summary['order']:
+            if digest(binary)!=summary['ELF_sha256']:raise ValueError('same plain ELF changed')
+            command=[str(binary),'http-object','0',str(PLAIN_N),'45','http','30000','45000'];raw=rawdir/'sample.perf.data'
+            if turn=='sample':command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','-o',str(raw),'--',*command]
+            result=validate_output(run(['taskset','-c',str(affinity[0]),*command],turn,45,raw if turn=='sample' else None),cases,'http-object',PLAIN_N,0,'http',30000,45000,None)
+            summary['rows'].append(dict(turn=turn,measurement=result,ELF_sha256=digest(binary)))
+            if turn=='sample':
+                summary['raw_record_mode_counts_not_final_PC_denominator']=plain_raw_counts(raw)
+                summary['raw_sha256']=digest(raw)
+                run([perf,'report','-i',str(raw),'--header','--stdio','--no-children','--show-nr-samples','--percent-limit','0','--sort','symbol,dso,comm'],'SELF',20)
+                run([perf,'script','-i',str(raw),'--ns','--show-lost-events','--show-task-events','-F','comm,pid,tid,time,ip,sym,dso,symoff,misc'],'PC',20)
+                run([perf,'buildid-list','-i',str(raw)],'buildIDs')
+        run(['readelf','-n',str(binary)],'ELF-buildID');modules=run(['ldd',str(binary)],'modules')
+        directory=out/'modules';directory.mkdir();copies=[];paths=set(re.findall(r'(/[^\s()]+)',modules))
+        paths.update(re.findall(r'^[0-9a-f]+\s+(/[^\n]+)$',(out/'buildIDs.log').read_text(),re.M))
+        total=0
+        for path in sorted(paths):
+            file=Path(path)
+            if file==binary or not file.is_file():continue
+            total+=file.stat().st_size
+            if len(copies)>=32 or total>128<<20:raise ValueError('module evidence bound')
+            target=directory/(digest(file)[:16]+'-'+file.name);shutil.copyfile(file,target)
+            if digest(target)!=digest(file):raise ValueError('module identity changed')
+            notes=run(['readelf','-n',str(target)],'module-'+str(len(copies)))
+            copies.append(dict(mapped_path=path,file=target.name,sha256=digest(target),build_ids=re.findall(r'Build ID: ([0-9a-f]+)',notes)))
+        save(directory/'identities.json',copies)
+        run(['llvm-objcopy-18','-O','binary','--only-section=.text',str(binary),str(out/'plain.text')],'instructions')
+        summary['instruction_sha256']=digest(out/'plain.text');summary['complete']=True
+        summary['cpu_drift_after_over_before']=summary['rows'][2]['measurement']['thread_cpu_ns']/summary['rows'][0]['measurement']['thread_cpu_ns']
+        summary['sampling_CPU_over_controls_geomean']=summary['rows'][1]['measurement']['thread_cpu_ns']/math.sqrt(summary['rows'][0]['measurement']['thread_cpu_ns']*summary['rows'][2]['measurement']['thread_cpu_ns'])
+    except Exception as error:summary['blocked']=repr(error);raise
+    finally:save(out/'summary.json',summary)
+    return summary
+
+
+def plain_profile_main(argv):
+    parser=argparse.ArgumentParser(description='Fixed uninstrumented JSON plain SELF diagnostic only')
+    parser.add_argument('--plain-profile',action='store_true',required=True);parser.add_argument('--archive',type=Path,required=True);parser.add_argument('--output',type=Path,required=True)
+    a=parser.parse_args(argv);plain_profile(a.archive,a.output)
+
+
 def main(argv=None):
+    selected=sys.argv[1:] if argv is None else argv
+    if '--plain-profile' in selected:return plain_profile_main(selected)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--generated-c', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True, help='fresh emission/evidence directory')

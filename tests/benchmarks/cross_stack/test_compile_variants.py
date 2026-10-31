@@ -1007,5 +1007,75 @@ class HttpProfileTrainingTests(unittest.TestCase):
                     profile_training.run_http(manifest_path,root/'wrong','ku','validate',root/'tools')
 
 
+class JsonPlainProfileTests(unittest.TestCase):
+    def test_plain_raw_record_loss_and_mode_boundaries(self):
+        import struct
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'perf.data';raw=bytearray(104);raw[:8]=b'PERFILE2'
+            rows=struct.pack('<IHHQQQQ',9,1,40,1,2,3,4)+struct.pack('<IHHQQQQ',9,2,40,1,2,3,4)
+            struct.pack_into('<QQ',raw,40,104,len(rows));path.write_bytes(raw+rows)
+            self.assertEqual(json_dense.plain_raw_counts(path),dict(all=2,user=1,kernel=1,other=0))
+            for kind in (2,5,6,13):
+                broken=bytearray(raw+rows);struct.pack_into('<I',broken,104,kind);path.write_bytes(broken)
+                with self.assertRaises(ValueError):json_dense.plain_raw_counts(path)
+            path.write_bytes((raw+rows)[:-1])
+            with self.assertRaises(ValueError):json_dense.plain_raw_counts(path)
+
+    def test_root_and_archive_identity_fail_before_work(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(json_dense.os,'geteuid',return_value=0),patch.object(json_dense,'plain_inputs') as inputs:
+            out=Path(temp)/'output'
+            with self.assertRaisesRegex(ValueError,'ordinary'):json_dense.plain_profile(Path(temp)/'missing',out)
+            self.assertFalse(out.exists());inputs.assert_not_called()
+        with tempfile.TemporaryDirectory() as temp:
+            archive=Path(temp)/'fake';archive.write_bytes(b'not approved');out=Path(temp)/'out'
+            with self.assertRaisesRegex(ValueError,'SHA'):json_dense.plain_inputs(archive,out)
+            self.assertFalse(out.exists())
+
+    def test_plain_opt_in_rejects_phase_or_nonfrozen_arguments(self):
+        import contextlib,io
+        for extra in ('--phase-ledger','--phase-clocks','--iterations','--cpu-seconds','--runner-prefix'):
+            with self.subTest(extra=extra),patch.object(json_dense,'plain_profile') as profile,contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                json_dense.main(['--plain-profile','--archive','unused','--output','unused',extra])
+            profile.assert_not_called()
+
+    def test_plain_three_windows_reuse_one_elf_and_no_real_child(self):
+        from contextlib import ExitStack
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            patches.enter_context(patch.object(json_dense.os,'geteuid',return_value=1000));patches.enter_context(patch.object(json_dense.os,'sched_getaffinity',return_value={4,3},create=True))
+            patches.enter_context(patch.object(json_dense.platform,'system',return_value='Linux'));patches.enter_context(patch.object(json_dense.platform,'machine',return_value='aarch64'))
+            patches.enter_context(patch.object(json_dense,'digest',side_effect=lambda p:json_dense.PLAIN_TEMPLATE if Path(p).name=='json_dense.c.inc' else 'e'*64))
+            patches.enter_context(patch.object(json_dense.subprocess,'run'));patches.enter_context(patch.object(json_dense.subprocess,'check_output',return_value='a'*40))
+            patches.enter_context(patch.object(json_dense.shutil,'which',return_value='/usr/bin/perf'))
+            patches.enter_context(patch.object(json_dense,'plain_inputs',return_value=(root/'normal.c',root/'libpq.so')))
+            emitter=patches.enter_context(patch.object(json_dense,'emit',return_value='unchanged generated handler'))
+            patches.enter_context(patch.object(json_dense,'plain_raw_counts',return_value=dict(all=2,user=1,kernel=1,other=0)))
+            validator=patches.enter_context(patch.object(json_dense,'validate_output',return_value=dict(thread_cpu_ns=100,correct=json_dense.PLAIN_N)))
+            def run(command,path,timeout,**kwargs):
+                calls.append((list(map(str,command)),path.stem));path.write_text('')
+                if 'clang-18'==str(command[0]) and '-o' in command:Path(command[-1]).write_bytes(b'one ELF')
+                if 'llvm-objcopy-18'==str(command[0]):Path(command[-1]).write_bytes(b'instructions')
+                if kwargs.get('raw'):Path(kwargs['raw']).parent.mkdir(exist_ok=True);Path(kwargs['raw']).write_bytes(b'raw')
+                return ''
+            patches.enter_context(patch.object(json_dense,'plain_run',side_effect=run));child=patches.enter_context(patch.object(json_dense.subprocess,'Popen'))
+            result=json_dense.plain_profile(root/'archive',root/'out')
+            self.assertTrue(result['complete']);child.assert_not_called();self.assertFalse(emitter.call_args.args[-1])
+            self.assertEqual([r['turn'] for r in result['rows']],['before','sample','after'])
+            windows=[cmd for cmd,name in calls if name in ('before','sample','after')]
+            self.assertEqual(len(windows),3);self.assertTrue(all(cmd[:3]==['taskset','-c','3'] for cmd in windows))
+            self.assertEqual(sum('record' in cmd for cmd in windows),1)
+            self.assertTrue(all(cmd[-7:]==['http-object','0','1572864','45','http','30000','45000'] for cmd in windows))
+            self.assertEqual(validator.call_count,3);self.assertTrue(all(c.args[-1] is None for c in validator.call_args_list))
+
+    def test_plain_workflow_is_separate_ordinary_and_small(self):
+        source=(Path(__file__).parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=source.split('  json-plain-profile:',1)[1].split('  performance-v2:',1)[0]
+        self.assertIn('inputs.json_plain_profile',job);self.assertIn('run-id: 41182804290',job)
+        self.assertNotIn('cargo ',job);self.assertNotIn('sudo -n python',job);self.assertIn('--plain-profile',job)
+        self.assertIn('json-plain-perf-settings.log',job);self.assertIn('ku-json-plain-raw',job)
+        old=source.split('  performance-v2:',1)[1].split('  full-tests:',1)[0]
+        self.assertIn('&& !inputs.json_plain_profile',old)
+
+
 if __name__=='__main__':
     unittest.main()
