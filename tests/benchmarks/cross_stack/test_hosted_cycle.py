@@ -114,6 +114,115 @@ class HostedCycleTests(unittest.TestCase):
                     http_short_goal='cpu' if issue=='goal' else 'memory'),{'uid':1,'gid':1,'steps':{}})
                 binding.assert_not_called();database.assert_not_called()
 
+    def test_http_short_pg_goal_keeps_schedule_and_rejects_frozen_goal_changes_before_access(self):
+        pg=h.http_short_plan({'A':{},'B':{}},'pg-cpu')
+        for goal in ('cpu','memory'):
+            old=h.http_short_plan({'A':{},'B':{}},goal)
+            for key in ('windows','resources','quality_policy','maximum_windows','maximum_replacements','prepatch'):
+                self.assertEqual(pg[key],old[key])
+        t=pg['adoption_thresholds']
+        self.assertEqual((t['pg_cpu_geometric_ratio_maximum'],t['pg_cpu_upper95_strictly_below']),(.98,1))
+        self.assertEqual((t['other_cpu_lower95_maximum'],t['other_cpu_upper95_maximum'],t['compute_ratio_maximum']),(1,1.03,1.03))
+        self.assertEqual((t['database_cpu_geometric_ratio_maximum'],t['combined_cpu_geometric_ratio_strictly_below']),(1,1))
+        self.assertEqual(t['pg_service_metric'],'full_cpu_us')
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[],http_short_screen=True)
+        identities=[h.hosted_identity(types.SimpleNamespace(**base,http_short_goal=g),'diagnostic') for g in ('cpu','memory','pg-cpu')]
+        self.assertEqual(len({h.encoded(x) for x in identities}),3)
+        for issue in ('goal','pg-threshold','database-threshold'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.http_short_plan({},'pg-cpu')
+                if issue!='goal':plan['adoption_thresholds']['pg_cpu_geometric_ratio_maximum' if issue=='pg-threshold' else 'database_cpu_geometric_ratio_maximum']=1.1
+                h.save(root/'frozen-plan.json',plan);patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                binding=patches.enter_context(patch.object(fc,'version_identity'));database=patches.enter_context(patch.object(h.db,'Database'))
+                with self.assertRaises(ValueError):h.diagnostic(types.SimpleNamespace(root=root,http_short_screen=True,
+                    http_short_goal='cpu' if issue=='goal' else 'pg-cpu'),{'steps':{}})
+                binding.assert_not_called();database.assert_not_called()
+
+    def test_http_short_pg_cpu_and_two_domain_guards_never_adopt(self):
+        for issue in ('none','pg-small','pg-upper','json-lower','ok-lower','json-upper','ok-upper','compute',
+                'database-up','combined-flat','domain-missing','domain-invalid','domain-nan','environment','incomplete'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for c in h.http_short_plan({'A':{},'B':{}},'pg-cpu')['windows']:
+                    row=dict(c,environment_quality='pass');ratio=.97 if c['workload']=='db' else 1
+                    if issue=='pg-small' and c['workload']=='db':ratio=.99
+                    if issue=='pg-upper' and c['workload']=='db':ratio=[.93,.96,1.01][c['group']-1]
+                    if issue=={'json_object':'json-lower','ok':'ok-lower'}.get(c['workload']):ratio=1.001
+                    if issue=={'json_object':'json-upper','ok':'ok-upper'}.get(c['workload']):ratio=[.99,1,1.04][c['group']-1]
+                    if issue=='compute' and c['workload']=='cpu':ratio=1.031
+                    row['full_cpu_us']=100*(ratio if c['name']=='B' else 1)
+                    row['pg_domain_cpu']=dict(available=issue!='domain-invalid',
+                        database_cpu_us=20*(1.001 if issue=='database-up' and c['name']=='B' else 1),
+                        combined_cpu_us=100*(.98 if issue!='combined-flat' and c['name']=='B' else 1))
+                    if issue=='domain-missing':row.pop('pg_domain_cpu')
+                    if issue=='domain-nan':row['pg_domain_cpu']['database_cpu_us']=float('nan')
+                    rows.append(row)
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='environment' else 'pass'},'pg-cpu')
+                self.assertEqual(result['eligible_for_root_review'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                if issue=='none':self.assertAlmostEqual(result['pg_domains']['combined_cpu_us']['estimate'],.98)
+
+    @staticmethod
+    def pg_resource_fixture(output,service_ratio=1):
+        report=dict(ledger={'correct_total':30},service_cost=dict(before={'label':'service-ku','observed':True},
+            after={'label':'service-ku','observed':True},driver_headroom={'fraction_of_quota':.3,'saturated':False}))
+        h.save(output/'score/client.json',report)
+        samples=[dict(domains=[dict(label='service-ku',monotonic_ns=(i+1)*1000,
+            cpu_stat={'usage_usec':100+int(450*i*service_ratio)}),dict(label='database',monotonic_ns=(i+1)*1000+10,
+                cpu_stat={'usage_usec':500+300*i})]) for i in range(3)]
+        h.save(output/'score/resources.json',dict(samples=samples,error=None,overflow=False));return report,samples
+
+    def test_http_short_pg_domains_reuse_raw_and_fail_on_missing_reset_duplicate_nan_denominator(self):
+        for issue in ('none','missing','missing-domain','duplicate-domain','reset','time-backwards','bool-counter','nan-denominator','zero-denominator','overflow'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp:
+                output=Path(temp);report,samples=self.pg_resource_fixture(output)
+                if issue=='missing':(output/'score/resources.json').unlink()
+                else:
+                    if issue=='missing-domain':samples[1]['domains'].pop()
+                    if issue=='duplicate-domain':samples[1]['domains'].append(samples[1]['domains'][-1].copy())
+                    if issue=='reset':samples[1]['domains'][1]['cpu_stat']['usage_usec']=1
+                    if issue=='time-backwards':samples[1]['domains'][1]['monotonic_ns']=1
+                    if issue=='bool-counter':samples[1]['domains'][1]['cpu_stat']['usage_usec']=True
+                    h.save(output/'score/resources.json',dict(samples=samples,overflow=issue=='overflow'))
+                if issue in ('nan-denominator','zero-denominator'):
+                    report['ledger']['correct_total']=float('nan') if issue=='nan-denominator' else 0;h.save(output/'score/client.json',report)
+                with patch.object(h,'ExternalDomain',side_effect=AssertionError('no probe')):result=h.http_short_pg_domain_cpu(output)
+                self.assertEqual(result['available'],issue=='none')
+                if issue=='none':
+                    self.assertEqual((result['service_cpu_us'],result['database_cpu_us'],result['combined_cpu_us']),(30,20,50))
+                    self.assertIn('not the service full-lifecycle interval',result['scope'])
+
+    def test_http_short_pg_runner_exports_six_original_pg_windows_before_file_bound(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')},'pg-cpu');h.save(root/'frozen-plan.json',plan)
+            manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json';h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
+            fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,stop=lambda:dict(forced=False,cgroup_removed=True,after={'process_count':0}))
+            mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',pg_read_mode='int',
+                native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+            patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,source_commit=h.HTTP_SHORT_PREPATCH if n=='A' else 'b'*40,files={'expanded source':{'sha256':'f'*64}})))
+            patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
+            patches.enter_context(patch.object(h,'environment_record',return_value={'evidence':str(root/'qualified.json'),'quality':'pass'}))
+            real_sha=h.sha
+            patches.enter_context(patch.object(h,'sha',side_effect=lambda p:'f'*64 if str(p)=='/proc/sys/kernel/random/boot_id' else real_sha(p)))
+            measured=[]
+            def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                measured.append((name,workload));report,samples=self.pg_resource_fixture(output,.95 if name=='B' else 1)
+                for part in ('warmup','score'):
+                    h.save(Path(output)/part/'client.json',report);h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=True,cgroup_removed=True,after={'process_count':0}))
+                h.save(Path(output)/'full-lifecycle.json',dict(cpu_seconds_per_correct=.000097 if name=='B' else .000100))
+                row=dict(status='observed',score_started=True,functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
+                    arrival_schedule_quality='pass',environment_quality='pass',measurement_invalid=False,full_cpu_us=97 if workload=='db' and name=='B' else 100,
+                    cleanup=[{'natural':True}],score_report=str(Path(output)/'score/client.json'));h.save(Path(output)/'window.json',row);return row
+            patches.enter_context(patch.object(fc,'window',side_effect=window))
+            result=h.diagnostic(types.SimpleNamespace(root=root,http_short_screen=True,http_short_goal='pg-cpu'),{'uid':1,'gid':1,'steps':{}})
+            self.assertEqual(len(measured),23);self.assertTrue(result['execution_complete']);self.assertTrue(result['comparison']['eligible_for_root_review'])
+            names={x['path'] for x in h.load(root/'http-short-observation/export.json')['entries']}
+            for g in (1,2,3):
+                for n in ('A','B'):
+                    for relative in ('window.json','full-lifecycle.json','warmup/client.json','score/client.json','score/resources.json','pg-domain-cpu.json'):
+                        self.assertIn(f'db/g{g}-{n}/{relative}',names)
+            self.assertLessEqual(len(names),64)
+
     def test_http_short_selection_freezes_prepatch_is_exclusive_and_is_not_default(self):
         base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
         self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('http_short_screen',False))

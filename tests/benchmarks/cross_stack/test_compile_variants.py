@@ -309,11 +309,25 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('http_wake_screen:',text)
         self.assertNotIn('--http-wake-screen',text)
         self.assertIn('http_short_goal:\n',text)
-        self.assertIn('default: cpu\n        options: [cpu, memory]',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory, pg-cpu]',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)
         self.assertIn('"${performance_archive_args[@]}"',archive)
+
+    def test_pg_pump_suite_is_listed_exactly_once_before_linux_detectors(self):
+        text,job=self.workflow()
+        step=text.split('- name: Check scalar growth, retained banks, async I/O and reset cleanup with Linux detectors',1)[1].split('- name:',1)[0]
+        name='native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins'
+        self.assertIn("if: runner.os == 'Linux'",step)
+        self.assertIn('ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"',step)
+        self.assertIn('UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"',step)
+        self.assertIn('-- --exact --list > "$RUNNER_TEMP/ku-pg-pump-tests.list"',step)
+        self.assertIn("grep -Fx '"+name+": test'",step)
+        self.assertIn("grep -c ': test$'",step)
+        self.assertIn('"$RUNNER_TEMP/ku-pg-pump-tests.list")" -eq 1',step)
+        self.assertEqual(step.count(name),3)
+        self.assertLess(step.index('-- --exact --list'),step.index(name,step.index('-eq 1')))
 
     def test_pg_driver_screen_is_fresh_exclusive_and_never_a_capacity_ranking(self):
         text,job=self.workflow()

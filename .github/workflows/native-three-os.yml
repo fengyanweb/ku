@@ -52,7 +52,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory]
+        options: [cpu, memory, pg-cpu]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -361,6 +361,15 @@ jobs:
           test "$(grep -c '^native_pg_async_queued_.*: test$' "$RUNNER_TEMP/ku-pg-queue-tests.list")" -eq 5
           cargo test --release --locked --test native_pg_query_poll_test \
             native_pg_async_queued_ -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_pg_query_poll_test \
+            native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins \
+            -- --exact --list > "$RUNNER_TEMP/ku-pg-pump-tests.list"
+          cat "$RUNNER_TEMP/ku-pg-pump-tests.list"
+          grep -Fx 'native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins: test' "$RUNNER_TEMP/ku-pg-pump-tests.list"
+          test "$(grep -c ': test$' "$RUNNER_TEMP/ku-pg-pump-tests.list")" -eq 1
+          cargo test --release --locked --test native_pg_query_poll_test \
+            native_pg_async_pump_suspends_preserves_owned_results_and_drains_all_waiter_pins \
+            -- --exact --nocapture --test-threads=1
           cargo test --release --locked --test native_task_json_test --test native_task_json_budget_test \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_source_test native_task_scalar_ \
