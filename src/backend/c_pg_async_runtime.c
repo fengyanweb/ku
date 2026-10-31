@@ -336,6 +336,26 @@ static KuPgAsyncOp* ku_pg_async_create_one_typed(KuPgClient* p,KuString sql,cons
   return ku_pg_async_create_inputs(p,sql,(KuArray_str){0},params,count,param_types,result_types,1,
       absolute_deadline,budget,wake,context,error);
 }
+/* Caller owns p->lock. Older async waiters retain one available idle lease
+ * each, but do not withhold spare leases from other ready owners. The first
+ * waiter not covered by idle capacity may start the existing single connect.
+ * No lease is assigned to another executor. Both scans are bounded by size;
+ * a waiter farther back cannot use any of this pool's current capacity. */
+static unsigned int ku_pg_async_available_locked(KuPgAsyncOp* op,unsigned long long now) {
+  KuPgClient* p=op->pool;
+  if(!op->waiting)return p->waiters==0?3u:0u;
+  size_t ahead=0;
+  KuPgAsyncWaiter* node=p->async_head;
+  while(node && node!=&op->waiter && ahead<p->size) {ahead++;node=node->next;}
+  if(node!=&op->waiter || ahead>=p->size)return 0;
+  size_t idle=0,empty=0;
+  for(size_t i=0;i<p->size;i++)if(!p->in_use[i]) {
+    if(p->conns[i])idle++;else empty++;
+  }
+  unsigned int available=ahead<idle?1u:0u;
+  if(ahead<=idle && empty && !p->connect_in_flight && now>=p->reconnect_not_before_ms)available|=2u;
+  return available;
+}
 /* Return 1 when a background connect is required, 0 while parked/leased,
  * and -1 after a completed acquisition error. Never waits on a condition. */
 static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
@@ -348,16 +368,20 @@ static int ku_pg_async_acquire(KuPgAsyncOp* op,unsigned long long now) {
   if(p->closing) error=ku_pg_client_error("client_closed",sizeof("client_closed")-1,"PostgreSQL client is closed",sizeof("PostgreSQL client is closed")-1);
   else if(now>=op->acquire_deadline) {ku_pg_async_capture_acquire_locked(op,now);error=ku_pg_client_acquire_timeout_error("acquire_timeout",sizeof("acquire_timeout")-1,"timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1);}
   if(error.code.len) {ku_pg_async_unlink_locked(op);ku_pg_mutex_unlock(&p->lock);ku_pg_async_finish(op,error,0);return -1;}
-  int can_claim=op->waiting || p->waiters==0;
-  if(can_claim) for(size_t i=0;i<p->size;i++) if(p->conns[i] && !p->in_use[i]) {
+  unsigned int available=ku_pg_async_available_locked(op,now);
+  if(available&1u) for(size_t i=0;i<p->size;i++) if(p->conns[i] && !p->in_use[i]) {
     p->in_use[i]=1;p->active++;ku_database_pg_pool_delta(1,0);op->slot=(int)i;op->conn=p->conns[i];ku_pg_async_claim_locked(op,now);ku_pg_async_unlink_locked(op);ku_pg_async_set_phase(op,KU_PG_ASYNC_PREPARE);break;
   }
-  if(op->slot<0 && can_claim && !p->connect_in_flight && now>=p->reconnect_not_before_ms)
+  if(op->slot<0 && (available&2u) && !p->connect_in_flight && now>=p->reconnect_not_before_ms)
     for(size_t i=0;i<p->size;i++) if(!p->conns[i] && !p->in_use[i]) {make=(int)i;p->in_use[i]=1;p->active++;ku_database_pg_pool_delta(1,0);p->connect_in_flight=1;op->slot=make;op->connecting=1;ku_pg_async_claim_locked(op,now);ku_pg_async_set_phase(op,KU_PG_ASYNC_CONNECT);ku_pg_async_unlink_locked(op);break;}
   if(op->slot<0 && !op->waiting) {
     if(p->waiters>=p->max_waiters) error=ku_pg_client_pool_busy_error("pool_busy",sizeof("pool_busy")-1,"PostgreSQL client waiter limit reached",sizeof("PostgreSQL client waiter limit reached")-1);
     else {op->waiting=1;p->waiters++;ku_database_pg_pool_delta(0,1);op->waiter.linked=1;op->waiter.notified=0;
-      op->waiter.previous=p->async_tail;if(p->async_tail)p->async_tail->next=&op->waiter;else p->async_head=&op->waiter;p->async_tail=&op->waiter;}
+      op->waiter.previous=p->async_tail;if(p->async_tail)p->async_tail->next=&op->waiter;else p->async_head=&op->waiter;p->async_tail=&op->waiter;
+      /* Admission itself can make this waiter eligible for spare capacity.
+       * Publish through the existing pinned wake protocol; a later release or
+       * the older owner's dispatch need not occur. No capacity means no wake. */
+      if(ku_pg_async_available_locked(op,now))ku_pg_client_handoff_available_locked(p);}
   } else if(op->waiting) op->waiter.notified=0;
   if(make>=0) {op->connect_deadline=ku_pg_client_saturating_add_ms(now,p->connect_timeout_ms);if(op->acquire_deadline<op->connect_deadline)op->connect_deadline=op->acquire_deadline;}
   ku_pg_mutex_unlock(&p->lock);
