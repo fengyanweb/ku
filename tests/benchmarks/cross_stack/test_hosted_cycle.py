@@ -67,7 +67,7 @@ class HostedCycleTests(unittest.TestCase):
                         '-p','99999999','-o',str(output/'perf.data'),'--','sleep','21'])
 
     def test_normal_self_six_windows_stop_on_failure_or_control_drift(self):
-        for issue in ('none','functional','accounting','cleanup','observer','quality','drift','database'):
+        for issue in ('none','unknown-environment','functional','accounting','cleanup','observer','quality','driver','drift','database'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 root=Path(temp);plan=h.normal_self_plan({name:{'root':str(root/name),'stack':stack,'binary_sha256':'f'*64}
                     for name,stack in (('B','ku'),('R','rust'))});h.save(root/'frozen-plan.json',plan)
@@ -91,18 +91,25 @@ class HostedCycleTests(unittest.TestCase):
                     bad=name=='B' and turn=='sample'
                     row=dict(status='observed',functional_valid=not(bad and issue=='functional'),accounting_valid=not(bad and issue=='accounting'),
                         all_correct=True,natural_reclamation=not(bad and issue=='cleanup'),arrival_schedule_quality='pass',
-                        environment_quality='fail' if bad and issue=='quality' else 'pass',measurement_invalid=False,
+                        environment_quality='fail' if bad and issue=='quality' else 'unknown' if issue=='unknown-environment' else 'pass',measurement_invalid=False,
                         full_cpu_us=12 if name=='B' and turn=='after' and issue=='drift' else 10)
+                    report=Path(output)/'score/client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
+                        driver_headroom={'fraction_of_quota':.95 if bad and issue=='driver' else .3,'saturated':bad and issue=='driver'})))
+                    row['score_report']=str(report)
                     h.save(Path(output)/'score/normal-self-observations.json',{'record_complete':not(bad and issue=='observer')})
                     return row
                 patches.enter_context(patch.object(fc,'window',side_effect=window));old=fc.Harness
                 result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools',normal_self_probe=True),{'uid':1,'gid':1,'steps':{}})
                 self.assertIs(fc.Harness,old);perf_probe.assert_not_called();matrix.assert_not_called()
-                expected=6 if issue in ('none','database') else 3 if issue=='drift' else 2
-                self.assertEqual(len(measured),expected);self.assertEqual(result['execution_complete'],issue=='none')
-                self.assertFalse(result['attribution_eligible']);self.assertEqual(result['attribution_controls_passed'],issue=='none');self.assertFalse(result['formal_qualified'])
+                expected=6 if issue in ('none','unknown-environment','database') else 3 if issue=='drift' else 2
+                complete=issue in ('none','unknown-environment')
+                self.assertEqual(len(measured),expected);self.assertEqual(result['execution_complete'],complete)
+                self.assertFalse(result['attribution_eligible']);self.assertEqual(result['attribution_controls_passed'],complete);self.assertFalse(result['formal_qualified'])
+                if issue=='unknown-environment':
+                    self.assertTrue(all(r['environment_quality']=='unknown' and r['diagnostic_quality']['environment_quality_preserved']=='unknown'
+                        and not r['diagnostic_quality']['formal_environment_qualified'] for r in result['rows']))
                 self.assertEqual(result['perf_attempts'],2 if expected==6 else 1)
-                self.assertEqual(result['goal_status'],'unknown' if issue=='none' else 'blocked')
+                self.assertEqual(result['goal_status'],'unknown' if complete else 'blocked')
                 self.assertTrue(all('--call-graph' not in call.args[0] for call in commands.call_args_list))
 
     def test_normal_self_raw_perf_and_mapped_elf_are_in_full_archive_allowlist(self):
@@ -110,6 +117,53 @@ class HostedCycleTests(unittest.TestCase):
         self.assertTrue(h.evidence_file(root/'normal-self-probe/B/sample/score/perf.data',root))
         self.assertTrue(h.evidence_file(root/'normal-self-probe/B/sample/score/symfs/usr/lib/libc.so.6',root))
         self.assertFalse(h.evidence_file(root/'normal-self-probe/B/sample/score/unknown.data',root))
+
+    def test_normal_self_real_window_keeps_unregistered_environment_unknown(self):
+        from linux_harness import result_assessment
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);plan=h.normal_self_plan({name:dict(root=str(root/name),stack=stack,binary_sha256='f'*64)
+                for name,stack in (('B','ku'),('R','rust'))});h.save(root/'frozen-plan.json',plan)
+            manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+            h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'})
+            h.save(state_path,{'limits':{}})
+            fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
+                stop=lambda:dict(forced=False,cgroup_removed=True,after={'process_count':0}))
+            mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+            bindings={name:dict(stack=stack,build_mode=mode,source_commit='b'*40,files={'driver ELF':{'sha256':'f'*64}})
+                for name,stack in (('B','ku'),('R','rust'))}
+            class Harness:
+                def __init__(self,source,output):
+                    self.root=source;self.manifest=dict(driver_cores=1,driver_cpuset='2',quality_policy=h.POLICY)
+                    self.identity={'protocol_sha256':'f'*64};self.services=[]
+                def start(self,stack,**kwargs):
+                    s=types.SimpleNamespace(startup={},domain=types.SimpleNamespace(snapshot=lambda:{}),
+                        process=types.SimpleNamespace(poll=lambda:None),metrics=lambda:{},stop=lambda:{})
+                    self.services.append(s);return s
+                def close(self):return []
+                def client(self,service,workload,rate,duration,output,**kwargs):
+                    n=rate*duration;hist=dict(count=n,p99_ms=.1,p999_ms=.1,max_ms=.1)
+                    report=dict(valid_driver=True,configuration={},ledger=dict(results={'correct':n},planned=n,attempted=n,
+                        correct_total=n,planned_reconciled=True,scheduled_to_attempt=hist,scheduled_to_sent=hist,correct_scheduled_to_complete=hist),
+                        service_cost=dict(before={'observed':True},after={'observed':True},cpu_seconds_per_correct=.00001,
+                            arrival_window_memory={},driver_headroom={'fraction_of_quota':.3,'saturated':False}))
+                    report['assessment']=result_assessment(report,h.POLICY,self.manifest.get('environment_qualification'))
+                    h.save(Path(output)/'client.json',report);return report
+            def sampler(client,service,output,*args,**kwargs):
+                result=client();h.save(Path(output)/'normal-self-observations.json',{'record_complete':True});return result
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+            patches.enter_context(patch.object(fc,'Harness',Harness));patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:bindings[n]))
+            patches.enter_context(patch.object(fc,'quiet_metrics',return_value=True));patches.enter_context(patch.object(fc,'service_termination_succeeded',return_value=True))
+            patches.enter_context(patch.object(fc,'window_lifecycle_cost',return_value={'cpu_seconds_per_correct':.00001}))
+            patches.enter_context(patch.object(fc,'qualification',side_effect=lambda report,w:dict(qualified=False,reasons=['environment_quality:'+report['assessment']['environment_quality']])) )
+            patches.enter_context(patch.object(fc,'upper_point',return_value={}));patches.enter_context(patch.object(fc,'overload_boundary',return_value={}))
+            patches.enter_context(patch.object(h,'normal_self_client',side_effect=sampler));patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
+            patches.enter_context(patch.object(h,'sha',return_value='f'*64));patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
+            result=h.normal_self_probe(types.SimpleNamespace(root=root,tools=root/'tools'),{'uid':1,'gid':1,'steps':{}})
+            self.assertEqual(len(result['rows']),6);self.assertTrue(result['execution_complete'])
+            self.assertFalse(result['attribution_eligible']);self.assertFalse(result['formal_qualified'])
+            self.assertTrue(all(row['environment_quality']=='unknown' and not row['qualification']['qualified']
+                and row['diagnostic_quality']['valid'] for row in result['rows']))
 
     def test_normal_self_main_has_a_separate_bounded_coordinator_alarm(self):
         import io

@@ -1117,6 +1117,26 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
         save(output/'normal-self-observations.json',record)
 
 
+def normal_diagnostic_quality(row):
+    """Local observation gate; an unregistered environment stays unknown."""
+    invalid,signature=window_quality(row);cost={};report=Path(row.get('score_report',''))
+    if report.is_file() and report.stat().st_size<=2<<20:cost=load(report).get('service_cost',{})
+    driver=cost.get('driver_headroom',{});fraction=driver.get('fraction_of_quota')
+    headroom=(driver.get('saturated') is False and type(fraction)in(int,float) and 0<=fraction<.9)
+    resources=bool(cost.get('before') and cost.get('after'))
+    observed_fault=bool(cost.get('sampler_error') or cost.get('sampler_overflow') or row.get('independent_collector_fault'))
+    valid=(row.get('functional_valid') is True and row.get('accounting_valid') is True
+        and row.get('all_correct') is True and row.get('natural_reclamation') is True
+        and row.get('environment_quality') in ('pass','unknown') and not invalid
+        and headroom and resources and not observed_fault)
+    row['diagnostic_quality']=dict(valid=valid,driver_headroom=driver,resource_endpoints_present=resources,
+        environment_quality_preserved=row.get('environment_quality'),formal_environment_qualified=False,
+        scope='Diagnostic observation only. Independent environment qualification was not run; unknown remains unknown. '
+              'Functional/accounting/arrival, driver CPU headroom, available resource endpoints and observed resource faults '
+              'are checked, then before/after drift and raw sampling still require review; this is not formal qualification.')
+    return valid,signature
+
+
 def normal_self_probe(a,state):
     """Six windows at most, exact normal binaries, never a new performance score."""
     if os.geteuid()!=0:raise ValueError('normal SELF probe requires root cgroup control')
@@ -1173,10 +1193,8 @@ def normal_self_probe(a,state):
                     '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],
                     output/'score/perf-pcs.log',timeout=20,limit=8<<20))
                 row['exports_complete']=all(x['complete'] for x in exports)
-            invalid,signature=window_quality(row)
-            valid=(row.get('functional_valid') is True and row.get('accounting_valid') is True
-                and row.get('all_correct') is True and row.get('natural_reclamation') is True
-                and row.get('environment_quality')=='pass' and not invalid and row['observation_complete']
+            quality,signature=normal_diagnostic_quality(row)
+            valid=(quality and row['observation_complete']
                 and (not active['sample'] or row.get('exports_complete') is True))
             row['diagnostic_qualified']=valid;result['rows'].append(row)
             save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
