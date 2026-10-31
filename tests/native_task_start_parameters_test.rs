@@ -143,6 +143,19 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     map(request);
                     map(key);
                 }
+                TaskOp::JsonDecode { dst, text } => {
+                    map(dst);
+                    map(text);
+                }
+                TaskOp::JsonValue {
+                    dst, source, key, ..
+                } => {
+                    map(dst);
+                    map(source);
+                    if let Some(key) = key {
+                        map(key);
+                    }
+                }
                 TaskOp::PgResult {
                     dst,
                     source,
@@ -159,7 +172,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(col);
                     }
                 }
-                TaskOp::JsonEncodeObject { dst, fields } => {
+                TaskOp::JsonEncodeObject { dst, fields } | TaskOp::JsonObject { dst, fields } => {
                     map(dst);
                     for (_, value) in fields {
                         map(value);

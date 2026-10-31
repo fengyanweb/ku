@@ -100,7 +100,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::pg_params_array(ty) || task::error_type(ty) || task::local_bytes_type(ty) || task::local_net_type(ty) || task::http_type(ty) || task::local_pg_type(ty) || task::local_json_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -970,35 +970,11 @@ impl<'a> FunctionLowerer<'a> {
                 self.array_literal_expression(elements, expression.span, depth)
             }
             ExprKind::Variable(name) => self.variable_expression(name, expression.span),
+            ExprKind::ObjectLiteral { fields } => {
+                self.json_object_expression(fields, expression.span, depth)
+            }
             ExprKind::Index { target, index } => {
-                let ExprKind::Field {
-                    target: request,
-                    name: map,
-                } = &target.kind
-                else {
-                    return Err(unsupported("this index projection", expression.span));
-                };
-                if !matches!(map.as_str(), "params" | "query" | "headers") {
-                    return Err(unsupported("this index projection", expression.span));
-                }
-                let request = self.expression(request, depth + 2)?;
-                let key = self.expression(index, depth + 1)?;
-                if !matches!(&self.function.slots[request.0].ty,TaskSlotType::Value {ty,..} if task::http_request_type(ty))
-                    || self.function.slots[key.0].ty != value_slot(IrType::Str)
-                {
-                    return Err(unsupported("this request map index", expression.span));
-                }
-                let dst = self.slot(value_slot(IrType::Str))?;
-                self.emit(TaskOp::HttpMapGet {
-                    dst,
-                    request,
-                    key,
-                    map: map.clone(),
-                })?;
-                if !matches!(&index.kind, ExprKind::Variable(_)) {
-                    self.emit(TaskOp::Drop { slot: key })?;
-                }
-                Ok(dst)
+                self.index_expression(target, index, expression.span, depth)
             }
             ExprKind::Field { target, name } => {
                 if let ExprKind::Field {
@@ -1573,6 +1549,28 @@ impl<'a> FunctionLowerer<'a> {
         {
             return self.json_encode_literal(args, span, depth);
         }
+        if matches!(&object.kind,ExprKind::Variable(module) if module=="json")
+            && matches!(name, "decode" | "parse")
+            && self.std_json
+            && self.local("json").is_none()
+            && !self.signatures.contains_key("json")
+        {
+            let [argument] = args else {
+                return Err(unsupported("json.decode argument count", span));
+            };
+            let text = self.expression(argument, depth + 1)?;
+            if self.function.slots[text.0].ty != value_slot(IrType::Str) {
+                return Err(unsupported("json.decode requires a string", span));
+            }
+            let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Named(
+                "__ku_value".into(),
+            )))))?;
+            self.emit(TaskOp::JsonDecode { dst, text })?;
+            if !matches!(&argument.kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: text })?;
+            }
+            return Ok(dst);
+        }
         if let ExprKind::Variable(variable) = &object.kind {
             if let Some(source) = self.local(variable) {
                 if matches!(&self.function.slots[source.0].ty, TaskSlotType::Value {ty,borrowed:false} if task::local_pg_type(ty))
@@ -1667,10 +1665,19 @@ impl<'a> FunctionLowerer<'a> {
             }
             return Ok(result);
         }
-        if matches!(&object.kind, ExprKind::Variable(name) if self.local(name).is_some_and(|slot| matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value {ty, ..} if (task::local_net_type(ty) || task::local_bytes_type(ty)) && !matches!(ty, IrType::Result(_)))))
+        // Shared value methods dispatch on their materialized receiver type,
+        // never on the method name alone. JSON accessors must not intercept
+        // bytes.get(). A selected receiver is evaluated exactly once;
+        // no fallback below may evaluate it again after this branch begins.
+        if matches!(&object.kind, ExprKind::Variable(name) if self.local(name).is_some_and(|slot| matches!(&self.function.slots[slot.0].ty, TaskSlotType::Value {ty, ..} if (task::local_net_type(ty) || task::local_bytes_type(ty) || task::json_value_type(ty)) && !matches!(ty, IrType::Result(_)))))
+            || matches!(name, "get" | "take" | "as_int" | "as_str")
         {
             let source = self.expression(object, depth + 1)?;
             let ty = &self.function.slots[source.0].ty;
+            if matches!(ty, TaskSlotType::Value {ty, borrowed: false} if task::json_value_type(ty))
+            {
+                return self.json_method_expression(source, name, args, span, depth);
+            }
             if matches!(ty, TaskSlotType::Value {ty, ..} if task::local_net_type(ty) && !matches!(ty, IrType::Result(_)))
             {
                 return self.blocking_net_method(source, name, args, span, depth);
@@ -1699,14 +1706,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 return Ok(result);
             }
-            // The ordinary receiver helpers below evaluate their own source.
-            // A nontrivial receiver must not be evaluated twice.
-            if !matches!(&object.kind, ExprKind::Variable(_)) {
-                return Err(unsupported(
-                    "this nontrivial method receiver in a Task",
-                    span,
-                ));
-            }
+            return Err(unsupported("this typed method receiver in a Task", span));
         }
         if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
             && matches!(
@@ -1918,59 +1918,240 @@ impl<'a> FunctionLowerer<'a> {
         Ok(dst)
     }
 
-    fn json_encode_literal(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
-        let [argument] = args else {
-            return Err(unsupported("json.encode argument count", span));
-        };
-        let ExprKind::ObjectLiteral { fields } = &argument.kind else {
-            return Err(unsupported(
-                "Task JSON encoding other than a scalar object literal",
-                span,
-            ));
-        };
+    fn json_materialized_fields(
+        &mut self,
+        fields: &[(String, Expr)],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<Vec<(String, SlotId)>> {
         if fields.len() > 64 {
-            return Err(unsupported("more than 64 JSON literal fields", span));
+            return Err(unsupported("more than 64 JSON object fields", span));
         }
         self.budget.analysis(fields.len(), span)?;
-        let mut canonical = std::collections::BTreeMap::new();
-        let mut owners = Vec::new();
+        let mut values = Vec::with_capacity(fields.len());
         for (key, expression) in fields {
-            if canonical.contains_key(key) {
-                return Err(unsupported(
-                    "duplicate field in a JSON object literal",
-                    expression.span,
-                ));
-            }
             self.budget.text(key.len(), expression.span)?;
-            // Freeze each value before evaluating the next expression. A
-            // literal still moves its owned fields, exactly like sync JSON;
-            // only the writer's later inspection is a read-only borrow.
             let source = self.expression(expression, depth + 1)?;
-            if !matches!(
-                &self.function.slots[source.0].ty,
-                TaskSlotType::Value {
-                    ty: IrType::Int | IrType::Bool | IrType::Null | IrType::Str,
-                    borrowed: false
-                }
-            ) {
+            if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,borrowed:false}
+                if matches!(ty,IrType::Int|IrType::Bool|IrType::Null|IrType::Str) || task::json_value_type(ty))
+            {
                 return Err(unsupported(
-                    "Task JSON fields other than int/bool/null/str",
+                    "Task JSON field other than scalar or JSON value",
                     expression.span,
                 ));
             }
             let value = self.copy_or_move(source)?;
-            if owned_value(&self.function.slots[value.0].ty) {
-                owners.push(value);
+            values.push((key.clone(), value));
+        }
+        Ok(values)
+    }
+
+    fn json_object_expression(
+        &mut self,
+        fields: &[(String, Expr)],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let fields = self.json_materialized_fields(fields, span, depth)?;
+        let dst = self.slot(value_slot(IrType::Named("__ku_value".into())))?;
+        self.emit(TaskOp::JsonObject { dst, fields })?;
+        Ok(dst)
+    }
+
+    fn index_expression(
+        &mut self,
+        target: &Expr,
+        index: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if let ExprKind::Field {
+            target: request,
+            name: map,
+        } = &target.kind
+        {
+            if matches!(map.as_str(), "params" | "query" | "headers") {
+                let request = self.expression(request, depth + 2)?;
+                let key = self.expression(index, depth + 1)?;
+                if !matches!(&self.function.slots[request.0].ty,TaskSlotType::Value{ty,..} if task::http_request_type(ty))
+                    || self.function.slots[key.0].ty != value_slot(IrType::Str)
+                {
+                    return Err(unsupported("this request map index", span));
+                }
+                let dst = self.slot(value_slot(IrType::Str))?;
+                self.emit(TaskOp::HttpMapGet {
+                    dst,
+                    request,
+                    key,
+                    map: map.clone(),
+                })?;
+                if !matches!(&index.kind, ExprKind::Variable(_)) {
+                    self.emit(TaskOp::Drop { slot: key })?;
+                }
+                return Ok(dst);
             }
-            canonical.insert(key.clone(), value);
+        }
+        self.json_read_expression(target, index, span, depth)
+    }
+
+    fn json_read_expression(
+        &mut self,
+        object: &Expr,
+        key: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let source = self.expression(object, depth + 1)?;
+        self.json_read_materialized(
+            source,
+            !matches!(&object.kind, ExprKind::Variable(_)),
+            key,
+            span,
+            depth,
+        )
+    }
+
+    fn json_read_materialized(
+        &mut self,
+        source: SlotId,
+        temporary: bool,
+        key: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::json_value_type(ty))
+        {
+            return Err(unsupported("JSON index requires an owned JSON value", span));
+        }
+        let key_slot = self.expression(key, depth + 1)?;
+        if self.function.slots[key_slot.0].ty != value_slot(IrType::Str) {
+            return Err(unsupported("Task JSON object key other than str", span));
+        }
+        let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Named(
+            "__ku_value".into(),
+        )))))?;
+        self.emit(TaskOp::JsonValue {
+            dst,
+            source,
+            key: Some(key_slot),
+            operation: task::TaskJsonOperation::Get,
+        })?;
+        if !matches!(&key.kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: key_slot })?;
+        }
+        if temporary {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        Ok(dst)
+    }
+
+    fn json_method_expression(
+        &mut self,
+        source: SlotId,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let expected = usize::from(name == "take");
+        if args.len() != expected {
+            return Err(unsupported("JSON method argument count", span));
+        }
+        if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::json_value_type(ty))
+        {
+            return Err(unsupported(
+                "JSON method requires an owned JSON value",
+                span,
+            ));
+        }
+        // These existing methods consume the receiver. Freeze it before any
+        // argument evaluation, exactly once; no implicit deep clone is added.
+        let source = self.copy_or_move(source)?;
+        let (operation, result) = match name {
+            "take" => (
+                task::TaskJsonOperation::Take,
+                IrType::Named("__ku_value".into()),
+            ),
+            "as_int" => (task::TaskJsonOperation::AsInt, IrType::Int),
+            "as_str" => (task::TaskJsonOperation::AsStr, IrType::Str),
+            _ => return Err(unsupported("this JSON method", span)),
+        };
+        let key = if let Some(argument) = args.first() {
+            let key = self.expression(argument, depth + 1)?;
+            if self.function.slots[key.0].ty != value_slot(IrType::Str) {
+                return Err(unsupported("JSON take requires a string key", span));
+            }
+            Some(key)
+        } else {
+            None
+        };
+        let dst = self.slot(value_slot(IrType::Result(Box::new(result))))?;
+        self.emit(TaskOp::JsonValue {
+            dst,
+            source,
+            key,
+            operation,
+        })?;
+        if let (Some(argument), Some(key)) = (args.first(), key) {
+            if !matches!(&argument.kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: key })?;
+            }
+        }
+        Ok(dst)
+    }
+
+    fn json_encode_literal(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        let [argument] = args else {
+            return Err(unsupported("json.encode argument count", span));
+        };
+        if let ExprKind::ObjectLiteral { fields } = &argument.kind {
+            let fields = self.json_materialized_fields(fields, span, depth)?;
+            if fields.iter().all(|(_,slot)|matches!(&self.function.slots[slot.0].ty,TaskSlotType::Value{ty,..} if !task::json_value_type(ty))) {
+                // Keep the existing scalar literal encoder. Sources were
+                // evaluated in source order before sorting the output keys.
+                let mut canonical=std::collections::BTreeMap::new();
+                let mut owners=Vec::new();
+                for (key,slot) in fields {
+                    if canonical.insert(key,slot).is_some(){return Err(unsupported("duplicate field in a JSON scalar literal",span));}
+                    if owned_value(&self.function.slots[slot.0].ty){owners.push(slot);}
+                }
+                let dst=self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
+                self.emit(TaskOp::JsonEncodeObject{dst,fields:canonical.into_iter().collect()})?;
+                for slot in owners.into_iter().rev(){self.emit(TaskOp::Drop{slot})?;}
+                return Ok(dst);
+            }
+            let source = self.slot(value_slot(IrType::Named("__ku_value".into())))?;
+            self.emit(TaskOp::JsonObject {
+                dst: source,
+                fields,
+            })?;
+            let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
+            self.emit(TaskOp::JsonValue {
+                dst,
+                source,
+                key: None,
+                operation: task::TaskJsonOperation::Encode,
+            })?;
+            self.emit(TaskOp::Drop { slot: source })?;
+            return Ok(dst);
+        }
+        let source = self.expression(argument, depth + 1)?;
+        if !matches!(&self.function.slots[source.0].ty,TaskSlotType::Value{ty,borrowed:false} if task::json_value_type(ty))
+        {
+            return Err(unsupported(
+                "Task JSON encoding requires a JSON value or scalar object literal",
+                span,
+            ));
         }
         let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
-        self.emit(TaskOp::JsonEncodeObject {
+        self.emit(TaskOp::JsonValue {
             dst,
-            fields: canonical.into_iter().collect(),
+            source,
+            key: None,
+            operation: task::TaskJsonOperation::Encode,
         })?;
-        for slot in owners.into_iter().rev() {
-            self.emit(TaskOp::Drop { slot })?;
+        if !matches!(&argument.kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: source })?;
         }
         Ok(dst)
     }

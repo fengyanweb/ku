@@ -17,7 +17,7 @@ import profile_training
 from compile_variants import profile_input, native_flags
 from pg_variants import derive
 from profile_training import PLANS, expected, identity, plan, parse_output
-from build_linux import (expand_ku_server, file_identity, native_emission_source,
+from build_linux import (expand_ku_server, file_identity, ku_json_execution_evidence, native_emission_source,
                          normal_compiler_receipt, normal_compiler_recorder)
 
 
@@ -30,6 +30,58 @@ class KuCompilerCommandTests(unittest.TestCase):
         for argument in ['a"b', 'a\nb', 'a\rb']:
             with self.assertRaisesRegex(ValueError, 'KU_CC'):
                 compile_variants.ku_cc_command(['clang-18', argument])
+
+
+class KuJsonExecutionTests(unittest.TestCase):
+    """Separate Task JSON diagnostic inputs without changing the frozen fixture."""
+
+    def source(self):
+        return Path(__file__).with_name('ku').joinpath('server.ku')
+
+    def test_default_is_unchanged_and_task_changes_only_its_handler_declaration(self):
+        source_path=self.source();frozen=source_path.read_bytes();source=frozen.decode('utf-8')
+        worker=expand_ku_server(source,19191)
+        self.assertEqual(worker,source.replace('__PEER_PORT__','19191'))
+        self.assertEqual(expand_ku_server(source,19191,json_execution='worker'),worker)
+        task=expand_ku_server(source,19191,json_execution='task')
+        original='fn encode(req: HttpRequest): HttpResponse! {'
+        selected='async '+original
+        self.assertEqual(task.count(selected),1)
+        self.assertEqual(task.replace(selected,original,1),worker)
+        self.assertEqual(task.split('fn main():',1)[1],worker.split('fn main():',1)[1])
+        self.assertEqual(source_path.read_bytes(),frozen)
+
+        default=ku_json_execution_evidence(worker,worker,'worker')
+        self.assertEqual(default['mode'],'worker')
+        self.assertFalse(default['diagnostic_only'])
+        self.assertTrue(default['original_worker_score_eligible'])
+        self.assertEqual(default['source_diff'],'')
+        self.assertEqual(default['worker_source_sha256'],default['selected_source_sha256'])
+        selected=ku_json_execution_evidence(worker,task,'task')
+        self.assertEqual(selected['mode'],'task')
+        self.assertTrue(selected['diagnostic_only'])
+        self.assertFalse(selected['original_worker_score_eligible'])
+        self.assertIn('separate from the frozen synchronous JSON score',selected['scope'])
+        self.assertEqual(selected['worker_source_sha256'],hashlib.sha256(worker.encode('utf-8')).hexdigest())
+        self.assertEqual(selected['selected_source_sha256'],hashlib.sha256(task.encode('utf-8')).hexdigest())
+        self.assertEqual(selected['source_diff_sha256'],hashlib.sha256(selected['source_diff'].encode('utf-8')).hexdigest())
+        changed=[line for line in selected['source_diff'].splitlines()
+                 if line.startswith(('+','-')) and not line.startswith(('+++','---'))]
+        self.assertEqual(changed,['-'+original,'+async '+original])
+        with self.assertRaisesRegex(RuntimeError,'differs beyond'):
+            ku_json_execution_evidence(worker,task.replace('counter + 1','counter + 2'),'task')
+
+    def test_task_requires_one_original_handler_and_normal_helpers_text(self):
+        source=self.source().read_text();handler='fn encode(req: HttpRequest): HttpResponse! {'
+        for changed in [source.replace(handler,'async '+handler),
+                        source+'\n'+handler+'\n',source.replace(handler,'fn changed(req) {')]:
+            with self.subTest(source=changed[-80:]),self.assertRaisesRegex(RuntimeError,'exactly one original synchronous'):
+                expand_ku_server(changed,19191,json_execution='task')
+        for mode,json_mode in [('helpers','typed'),('helpers','response'),('direct','text')]:
+            with self.subTest(mode=mode,json_mode=json_mode),self.assertRaisesRegex(ValueError,'normal helpers/text'):
+                expand_ku_server(source,19191,mode=mode,json_mode=json_mode,json_execution='task')
+        with self.assertRaisesRegex(ValueError,'JSON execution mode'):
+            expand_ku_server(source,19191,json_execution='automatic')
 
 
 class NormalCompilerReceiptTests(unittest.TestCase):
@@ -124,7 +176,7 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
+        self.assertIn("task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen')",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
@@ -133,7 +185,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
+        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
@@ -401,6 +453,92 @@ class JsonDenseEntryTests(unittest.TestCase):
             source.write_text(runtime.replace('encode(KuStruct___ku_http_request req)', 'different(req)'))
             with self.assertRaisesRegex(ValueError, 'ordinary generated'):
                 json_dense.emit(source, [], Path(__file__).with_name('json_dense.c.inc'))
+
+    def test_explicit_phase_ledger_and_http_control_remain_diagnostic_only(self):
+        source = ('typedef struct KuString { /* ordinary ABI */ } KuString;\n'
+                  'KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {\n'
+                  '  KuResult_kuvalue decoded=ku_json_parse(req.body);\n'
+                  '  KuResult_str encoded=ku_json_stringify(decoded.value);\n'
+                  '  ku_object_drop(NULL);\n'
+                  '  ku_drop_struct___ku_http_request(&req);\n'
+                  '  return result;\n'
+                  '__ku_sync_epilogue:;\n'
+                  '  return fallback;\n}\n'
+                  'int main(void) { return original_startup(); }\n')
+        phases = json_dense.instrument_phases(source)
+        self.assertIn('normal_score_eligible', phases)
+        self.assertIn('ku_dense_decode(req.body)', phases)
+        self.assertIn('ku_dense_encode(decoded.value)', phases)
+        self.assertIn('ku_dense_object_drop(NULL)', phases)
+        self.assertIn('ku_dense_request_drop(&req)', phases)
+        self.assertEqual(phases.count('ku_dense_change_phase(ku_dense_outer);'), 2)
+        self.assertIn('allocator_retained_bytes', phases)
+        self.assertIn('ku_perf_allocate', phases)  # Existing shared allocation hook.
+        # Generated insertion guards close at column zero too; a textual
+        # first "\n}\n" would truncate the Transform before its encode call.
+        nested = source.replace('  KuResult_str encoded=',
+            '  if (condition) {\n    text="} /* not a closing brace */";\n}\n  KuResult_str encoded=')
+        self.assertIn('ku_dense_encode(decoded.value)', json_dense.instrument_phases(nested))
+        with self.assertRaisesRegex(ValueError, 'boundaries changed'):
+            json_dense.instrument_phases(source.replace('ku_json_parse(', 'different('))
+        control, identity = json_dense.make_http_control_source(source, json_dense.make_cases())
+        self.assertTrue(identity['diagnostic_only'])
+        self.assertFalse(identity['normal_score_eligible'])
+        self.assertEqual(identity['input_body_bytes'], 1048)
+        self.assertEqual(identity['output_body_bytes'], 1071)
+        self.assertEqual(identity['rid_bytes'], 16)
+        self.assertIn('memcpy(body.ptr+', control)
+        self.assertIn('rid.ptr,16u)', control)
+        self.assertIn('body.storage=KU_STRING_OWNED', control)
+        self.assertIn('malloc(sizeof(template_body))', control)
+        self.assertNotIn('ku_json_parse(req.body)', control)
+        self.assertIn('int main(void) { return original_startup(); }', control)
+
+    def test_http_control_cli_supplies_clean_environment_to_compiler(self):
+        source=('KuResult_struct___ku_http_response encode(KuStruct___ku_http_request req) {\n'
+                '  KuResult_kuvalue decoded=ku_json_parse(req.body);\n'
+                '  KuResult_str encoded=ku_json_stringify(decoded.value);\n'
+                '  return result;\n__ku_sync_epilogue:;\n  return fallback;\n}\n'
+                'int main(void) { return original_startup(); }\n')
+        calls=[]
+        def compile_only(commands,label,argv,cwd,**kwargs):
+            calls.append((label,argv,dict(commands.environment)))
+            Path(argv[-1]).write_bytes(b'explicit fake compiler output; no executable started')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);generated=root/'normal.c';generated.write_text(source)
+            with patch.object(json_dense.Commands,'run',new=compile_only),patch.dict(os.environ,{'CFLAGS':'-O3','LLVM_PROFILE_FILE':'unexpected'}),patch('builtins.print'):
+                json_dense.main(['--generated-c',str(generated),'--output',str(root/'control'),
+                    '--source-commit','a'*40,'--cli-sha256','b'*64,'--http-control'])
+            self.assertEqual(len(calls),1)
+            self.assertIn('-O2',calls[0][1]);self.assertNotIn('CFLAGS',calls[0][2])
+            self.assertNotIn('LLVM_PROFILE_FILE',calls[0][2])
+            receipt=json.loads((root/'control/emission.json').read_text())
+            self.assertTrue(receipt['diagnostic_only']);self.assertFalse(receipt['normal_score_eligible'])
+
+    def test_phase_output_cannot_silently_become_plain_performance(self):
+        rows = json_dense.make_cases()
+        value = self.result(rows)
+        phases = ['request_projection', 'object_and_control', 'decode', 'encode', 'drop', 'validation']
+        value['phase_ledger'] = {'diagnostic_only': True, 'normal_score_eligible': False,
+            'exclusive': True, 'allocation_hook_enabled': True,
+            'rows': [{'phase': p, 'gross_thread_cpu_ns': 0, 'segments': 0} for p in phases],
+            'phase_clock_reads': 0, 'clock_calibration_reads': 20000,
+            'clock_calibration_ns': 1000000, 'live_after_cleanup_bytes': 0}
+        parse = lambda x, **kw: json_dense.validate_output(
+            json.dumps(x, separators=(',', ':')), rows, 'ascii', **kw)
+        self.assertTrue(parse(value, phase_mode='allocation')['phase_ledger']['diagnostic_only'])
+        with self.assertRaisesRegex(ValueError, 'plain dense'):
+            parse(value)
+        malformed = copy.deepcopy(value)
+        malformed['phase_ledger']['rows'][2]['segments'] = 1
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            parse(malformed, phase_mode='allocation')
+        malformed = copy.deepcopy(value)
+        malformed['phase_ledger']['live_after_cleanup_bytes'] = 1
+        with self.assertRaisesRegex(ValueError, 'return to zero'):
+            parse(malformed, phase_mode='allocation')
+        with self.assertRaisesRegex(ValueError, 'mismatched'):
+            parse(value, phase_mode='clocks')
 
 
 class ProfileReceiptTests(unittest.TestCase):

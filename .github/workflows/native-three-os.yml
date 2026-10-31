@@ -9,7 +9,32 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+      prepatch:
+        description: 'Full prepatch commit for followup-screen only; blank uses the current frozen 9567271 baseline'
+        type: string
+        default: ''
+      screen_variants:
+        description: 'Up to seven full commit ablations, comma-separated, in one serial followup-screen; no extra formal matrix'
+        type: string
+        default: ''
+      task_json_screen:
+        description: 'Explicit separate native Task JSON screen (followup-screen only); false preserves the normal PG/HTTP screen'
+        type: boolean
+        default: false
+
+      reuse_build_run:
+        description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
+        type: string
+        default: ''
+      reuse_build_sha256:
+        description: 'Exact prior evidence tar SHA256; required with reuse_build_run'
+        type: string
+        default: ''
+      reuse_product_commit:
+        description: 'Original product commit inside reused binaries; separate from current measurement tools'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -101,6 +126,9 @@ jobs:
       - name: Verify borrowed lifetimes, checked Task and synchronous arithmetic, source-free cleanup
         run: cargo test --locked --test borrow_allocation_test --test borrow_native_test --test native_generic_test --test native_generic_import_test --test native_forward_call_test --test native_temporary_string_method_test --test native_task_join_retry_test --test native_task_frame_c_test --test native_task_control_test --test native_task_driver_test --test native_task_adapter_test --test native_task_wait_test --test native_task_receipt_test --test native_task_cleanup_wait_test --test native_task_source_test --test native_task_source_safety_test --test native_task_start_charge_test --test native_task_start_alias_test --test native_task_start_failure_test --test native_task_start_parameters_test --test native_task_runtime_deadline_test --test native_task_integer_test --test native_task_expression_source_test --test native_task_math_source_test --test native_task_expression_safety_test --test native_task_expression_pending_test --test native_outer_finally_test --test native_error_slot_test --test native_cleanup_catch_test --test native_cleanup_escape_test --test native_template_stream_test --test native_first_cleanup_timeout_test --test native_closure_cleanup_zero_test --test native_closure_drop_test --test native_sync_arithmetic_pilot_test --test native_sync_integer_matrix_test --test native_sync_borrow_arguments_test --test native_sync_map_closure_test --test native_sync_tls_isolation_test --test native_sync_aggregate_owners_test --test native_sync_zero_return_test --test native_task_scope_session_test --test native_task_short_circuit_owner_test --test native_task_exit_bridge_test --test native_task_publishing_deadline_test --test native_task_cleanup_commit_test --test bootstrap_ast_canonical_performance_test --test native_task_scope_frame_test --test native_task_scope_adapter_test --test native_task_empty_scope_adapter_test --test native_task_if_ir_test --test native_task_if_source_test --test native_task_await_progress_test -- --nocapture
 
+      - name: Verify local JSON Task owners, allocation refusal and release under sanitizers
+        run: cargo test --locked --test native_task_json_test --test native_task_json_budget_test -- --nocapture --test-threads=1
+
       - name: Verify synchronous HTTP failure isolation under sanitizers
         run: cargo test --locked --test native_http_test native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504 -- --nocapture
 
@@ -159,14 +187,14 @@ jobs:
           if-no-files-found: error
 
   task-main-path:
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path'
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
     name: ${{ matrix.os }} Task main-path regressions
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15]
+        os: ${{ inputs.scope == 'windows-task-main-path' && fromJSON('["windows-2025"]') || fromJSON('["ubuntu-24.04","windows-2025","macos-15"]') }}
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
@@ -234,7 +262,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_run_test \
+            native_object_insertion_preserves_collisions_ownership_and_oom -- --exact --nocapture --test-threads=1
           cargo test --release --locked \
+            --test native_task_json_test \
+            --test native_task_json_budget_test \
+            --test native_task_expression_source_test \
             --test native_http_test \
             --test native_task_source_test \
             --test native_task_expression_ir_test \
@@ -274,6 +308,8 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           set -euo pipefail
+          cargo test --release --locked --test native_task_json_test --test native_task_json_budget_test \
+            -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_source_test native_task_scalar_ \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_source_test native_task_string_equality_ \
@@ -413,12 +449,19 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
+      actions: read
     env:
       CARGO_INCREMENTAL: "0"
       RUST_BACKTRACE: "1"
       GOTOOLCHAIN: local
-      KU_PERFORMANCE_V2_BASELINE: 988f32ef496b18b935a3c276ef7933d0563691da
+      KU_PERFORMANCE_V2_BASELINE: 956727188a058119fdb3790959063f1496ccb4cc
       KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
+      KU_PERFORMANCE_V2_PREPATCH: ${{ inputs.prepatch || '956727188a058119fdb3790959063f1496ccb4cc' }}
+      KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
+      KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
+      KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
+      KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
 
     steps:
       - name: Check out the exact candidate and baseline history
@@ -433,8 +476,12 @@ jobs:
 
       - name: Verify runner entry contracts without starting workloads
         run: |
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+          fi
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_reuse_build.py
 
       - name: Install only the fixed Rust compiler and LLVM profile tools
         shell: bash
@@ -479,6 +526,15 @@ jobs:
           test "$(stat -c %g "$KU_PERFORMANCE_V2_ROOT")" = "$(id -g)"
           go version
 
+      - name: Download the exact optional prior build archive
+        if: inputs.reuse_build_run != ''
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ku-performance-v2-evidence
+          path: ${{ runner.temp }}/ku-reused-build
+          run-id: ${{ inputs.reuse_build_run }}
+          github-token: ${{ github.token }}
+
       - name: Build frozen sources and plans as the benchmark user
         timeout-minutes: 35
         shell: bash
@@ -490,10 +546,32 @@ jobs:
           elif [ "$KU_PERFORMANCE_V2_SCOPE" = followup-screen ]; then
             performance_build_set=followup-screen
           fi
-          python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
-            --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
-            --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+          performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            performance_task_json_args+=(--task-json-screen)
+          fi
+          if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
+            test "$performance_build_set" = followup-screen
+            python3 -B tests/benchmarks/cross_stack/reuse_build.py \
+              --archive "$RUNNER_TEMP/ku-reused-build/ku-performance-v2-evidence.tar.gz" \
+              --archive-sha256 "$KU_PERFORMANCE_V2_REUSE_SHA256" \
+              --source-run "$KU_PERFORMANCE_V2_REUSE_RUN" \
+              --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+              --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
+          else
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
+            python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
+              --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+              --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
+          fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
         timeout-minutes: 130
@@ -518,11 +596,18 @@ jobs:
             performance_phases=(followup-screen)
             performance_build_set=followup-screen
           fi
+          performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            performance_task_json_args+=(--task-json-screen)
+          fi
           for performance_phase in "${performance_phases[@]}"; do
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
               --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+              --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE" \
+              --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
+              "${performance_task_json_args[@]}"
           done
 
       - name: Always archive the allowlisted evidence and goal_status
@@ -534,7 +619,7 @@ jobs:
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive \
             --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
             --tools "$KU_PERFORMANCE_V2_ROOT/tools" \
-            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$GITHUB_SHA"
+            --baseline "$KU_PERFORMANCE_V2_BASELINE" --candidate "$KU_PERFORMANCE_V2_CANDIDATE"
           sudo -n chown "$(id -u):$(id -g)" \
             "$KU_PERFORMANCE_V2_ROOT/ku-performance-v2-evidence.tar.gz" "$KU_PERFORMANCE_V2_ROOT/archive.json"
 
@@ -550,7 +635,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

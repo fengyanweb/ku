@@ -67,6 +67,8 @@ type corpus struct {
 	hash    string
 }
 type config struct {
+	admissionPressure                                                       bool
+	admissionAdminAddress                                                   string
 	responseLiteral, pathOverride                                           string
 	responseLiteralSet, pathOverrideSet                                     bool
 	address, workload, protocolPath, corporaDir, corpusPath, output, events string
@@ -1506,6 +1508,8 @@ func parse() (config, error) {
 	var idleMS int
 	var cancelDelayUS int64
 	flag.StringVar(&c.address, "address", "", "HTTP host:port")
+	flag.BoolVar(&c.admissionPressure, "admission-pressure", false, "separate bounded loopback admission gate; never a throughput result")
+	flag.StringVar(&c.admissionAdminAddress, "admission-admin-address", "", "admission gate: separate loopback management host:port; token only from KU_SERVICE_CONTROL_TOKEN")
 	flag.StringVar(&c.workload, "workload", "ok", "ok/json_object/json_array/json_escape/cpu/timer/wait/tcp/db/mixed/task_mix")
 	flag.StringVar(&c.protocolPath, "protocol", "tests/benchmarks/cross_stack/protocol.json", "frozen protocol JSON")
 	flag.StringVar(&c.corporaDir, "corpora-dir", "", "optional corpus directory, frozen hashes still verified")
@@ -1565,13 +1569,20 @@ func parse() (config, error) {
 	if _, ok := c.protocol.Endpoints[c.workload]; !ok && c.workload != "task_mix" {
 		return c, fmt.Errorf("unsupported workload")
 	}
+	if e := validateAdmissionConfig(c); e != nil {
+		return c, e
+	}
 	return c, nil
 }
 func main() {
 	c, e := parse()
 	if e == nil {
 		var out map[string]any
-		out, e = run(c)
+		if c.admissionPressure {
+			out, e = runAdmissionPressure(c)
+		} else {
+			out, e = run(c)
+		}
 		if e == nil {
 			var data []byte
 			data, e = json.Marshal(out)
@@ -1593,6 +1604,9 @@ func main() {
 					}
 				}
 			}
+		}
+		if e == nil && c.admissionPressure && out["passed"] != true {
+			e = fmt.Errorf("bounded admission gate failed; see emitted JSON evidence")
 		}
 	}
 	if e != nil {

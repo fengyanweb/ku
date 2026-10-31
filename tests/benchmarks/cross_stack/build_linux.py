@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import difflib
 import fcntl
 import hashlib
 import json
@@ -176,11 +177,44 @@ def benchmark_stack_sources(directory):
             and not {"target", "node_modules", "__pycache__", ".git"}.intersection(path.relative_to(directory).parts)}
 
 
-def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="int", pg_execution="async"):
+def select_ku_json_execution(text, execution):
+    if execution not in ("worker", "task"):
+        raise ValueError("unknown Ku JSON execution mode")
+    if execution == "worker":
+        return text
+    handler = r"^fn encode\(req: HttpRequest\): HttpResponse! \{$"
+    matches = list(re.finditer(handler, text, re.MULTILINE))
+    if len(matches) != 1:
+        raise RuntimeError("expected exactly one original synchronous JSON handler")
+    position = matches[0].start()
+    return text[:position] + "async " + text[position:]
+
+
+def ku_json_execution_evidence(worker_source, selected_source, execution):
+    if selected_source != select_ku_json_execution(worker_source, execution):
+        raise RuntimeError("JSON execution source differs beyond its selected handler declaration")
+    difference = "".join(difflib.unified_diff(
+        worker_source.splitlines(keepends=True), selected_source.splitlines(keepends=True),
+        fromfile="worker/server.ku", tofile=execution + "/server.ku"))
+    return dict(mode=execution, diagnostic_only=execution == "task",
+                original_worker_score_eligible=execution == "worker",
+                scope=("native Task JSON local-value comparison; separate from the frozen synchronous JSON score"
+                       if execution == "task" else "original bounded synchronous JSON worker"),
+                worker_source_sha256=hashlib.sha256(worker_source.encode("utf-8")).hexdigest(),
+                selected_source_sha256=hashlib.sha256(selected_source.encode("utf-8")).hexdigest(),
+                source_diff=difference,
+                source_diff_sha256=hashlib.sha256(difference.encode("utf-8")).hexdigest())
+
+
+def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read="int", pg_execution="async", json_execution="worker"):
     if mode not in ("helpers", "direct"):
         raise ValueError("unknown Ku formatting mode")
     if json_mode not in ("text", "response", "typed"):
         raise ValueError("unknown Ku JSON response mode")
+    if json_execution not in ("worker", "task"):
+        raise ValueError("unknown Ku JSON execution mode")
+    if json_execution == "task" and (mode != "helpers" or json_mode != "text"):
+        raise ValueError("Task JSON comparison requires normal helpers/text modes")
     if pg_read not in ("value", "int", "typed"):
         raise ValueError("unknown Ku PG result read mode")
     if pg_execution not in ("async", "sync"):
@@ -242,11 +276,11 @@ def expand_ku_server(text, peer_port, mode="helpers", json_mode="text", pg_read=
             raise RuntimeError("expected exactly one typed PG numeric result read")
         if pg_read == "value":
             text = text.replace(original_read, replacement)
-    return text
+    return select_ku_json_execution(text, json_execution)
 
 
 class Builder:
-    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE, ku_format="helpers", ku_json="text", ku_pg_read="int", ku_pg_execution="async"):
+    def __init__(self, root, source, uid=501, gid=1000, peer_port=19191, candidate=CANDIDATE, ku_format="helpers", ku_json="text", ku_pg_read="int", ku_pg_execution="async", ku_json_execution="worker"):
         if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
             raise RuntimeError("build helper requires the actual ARM64 Linux benchmark guest")
         if os.geteuid() != uid or os.getegid() != gid:
@@ -290,6 +324,7 @@ class Builder:
         self.candidate, self.uid, self.gid = candidate, uid, gid
         self.ku_format, self.ku_json, self.ku_pg_read = ku_format, ku_json, ku_pg_read
         self.ku_pg_execution = ku_pg_execution
+        self.ku_json_execution = ku_json_execution
         self.manifest_path = self.root / "manifest.json"
         self.manifest = json.loads(self.manifest_path.read_text()) if self.manifest_path.exists() else {}
         previous = self.manifest.get("candidate_base")
@@ -382,7 +417,10 @@ class Builder:
         source = self.benchmark / "ku/server.ku"
         text = source.read_text(encoding="utf-8")
         expanded = work / "server.ku"
-        expanded.write_text(expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read, self.ku_pg_execution), encoding="utf-8")
+        worker_source = expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read, self.ku_pg_execution)
+        selected_source = expand_ku_server(text, self.peer_port, self.ku_format, self.ku_json, self.ku_pg_read, self.ku_pg_execution, self.ku_json_execution)
+        json_execution = ku_json_execution_evidence(worker_source, selected_source, self.ku_json_execution)
+        expanded.write_text(selected_source, encoding="utf-8")
         batch = work / "batch.ku"
         shutil.copyfile(self.benchmark / "ku/batch.ku", batch)
         outputs = {}
@@ -422,6 +460,8 @@ class Builder:
                                                env={}, build=dict(cli=str(ku), cli_sha256=digest(ku),
                                                                   formatting_mode=self.ku_format,
                                                                   json_response_mode=self.ku_json,
+                                                                  json_execution_mode=self.ku_json_execution,
+                                                                  json_execution=json_execution,
                                                                   pg_execution_mode=self.ku_pg_execution,
                                                                   pg_execution_semantics="async uses public local named handler capturing the original shared pool; query/reset suspend on the existing Task reactor; sync is the separately identified bounded HTTP worker baseline; no SQL retries",
                                                                   pg_read_mode=self.ku_pg_read,
@@ -626,6 +666,8 @@ def main():
                         help="helpers preserves legacy benchmark; direct requires a candidate CLI with public str(int), records separate source identity")
     parser.add_argument("--ku-json", choices=("text", "response", "typed"), default="text",
                         help="text keeps generic encode+http.text; response uses http.json; typed uses public static Envelope writer+http.text; separately identified")
+    parser.add_argument("--ku-json-execution", choices=("worker", "task"), default="worker",
+                        help="worker preserves the frozen JSON score; task is a separately identified native Task JSON diagnostic using normal helpers/text")
     parser.add_argument("--ku-pg-execution", choices=("async", "sync"), default="async",
                         help="async uses the public captured-pool Task path; sync preserves the bounded-worker baseline, separately identified")
     parser.add_argument("--ku-pg-read", choices=("value", "int", "typed"), default="int",
@@ -633,7 +675,7 @@ def main():
     parser.add_argument("--only", nargs="+", choices=("ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"),
                         default=["ku", "go", "rust", "node", "java", "dotnet", "cpp", "client"])
     args = parser.parse_args()
-    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate, args.ku_format, args.ku_json, args.ku_pg_read, args.ku_pg_execution)
+    builder = Builder(args.root, args.source or args.root/"src", args.uid, args.gid, args.peer_port, args.candidate, args.ku_format, args.ku_json, args.ku_pg_read, args.ku_pg_execution, args.ku_json_execution)
     try:
         for item in args.only:
             print(f"building {item}", flush=True)

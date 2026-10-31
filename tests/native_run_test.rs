@@ -2894,6 +2894,104 @@ fn native_object_missing_key_and_get_or() {
 }
 
 #[test]
+fn native_object_insertion_preserves_collisions_ownership_and_oom() {
+    let dir = unique_temp_dir("object-probe-slot");
+    fs::write(dir.join("main.ku"), "fn main() { item = { keep: 1 } }\n")
+        .expect("write object insertion source");
+    let generated = native_emit_c(&dir, "main.ku").replace(
+        "#define KU_NATIVE_TEST_OBJECT_OOM 0",
+        "#define KU_NATIVE_TEST_OBJECT_OOM 1",
+    );
+    let checks = r#"
+static int fixture_owned(KuString value,KuString* out) {
+  uint8_t* bytes=(uint8_t*)malloc(value.len?value.len:1u);if(!bytes)return 0;
+  if(value.len)memcpy(bytes,value.ptr,value.len);
+  *out=(KuString){bytes,value.len,value.len?value.len:1u,KU_STRING_OWNED};return 1;
+}
+static void fixture_fault(const char* site) {
+#if defined(_WIN32)
+  _putenv_s("KU_NATIVE_TEST_OBJECT_OOM_SITE",site);
+  _putenv_s("KU_NATIVE_TEST_OBJECT_OOM_ORDINAL","1");
+#else
+  setenv("KU_NATIVE_TEST_OBJECT_OOM_SITE",site,1);
+  setenv("KU_NATIVE_TEST_OBJECT_OOM_ORDINAL","1",1);
+#endif
+}
+int main(void) {
+  KuObject* object=NULL;CHECK(ku_object_try_new(0,&object));
+  char keys[32][24];size_t found=0;
+  /* Force wraparound collision chains in the initial table. Later table
+   * growth must re-evaluate bucket positions, not reuse a stale empty index. */
+  for(size_t candidate=0;candidate<65536 && found<32;candidate++) {
+    char text[24];int length=snprintf(text,sizeof(text),"collision-%zu",candidate);
+    CHECK(length>0 && (size_t)length<sizeof(text));
+    KuString key=ku_string_static((const uint8_t*)text,(size_t)length);
+    if((ku_obj_hash(key)&7u)==7u)memcpy(keys[found++],text,(size_t)length+1u);
+  }
+  CHECK(found==32);
+  for(size_t i=0;i<32;i++) {
+    KuString key={0},payload={0};
+    KuString borrowed=ku_string_static((const uint8_t*)keys[i],strlen(keys[i]));
+    CHECK(fixture_owned(borrowed,&key));
+    CHECK(fixture_owned(ku_string_static((const uint8_t*)"payload",7),&payload));
+    KuValue value=ku_v_str(ku_string_move(&payload));
+    size_t old_cap=object->cap,old_len=object->len;
+    if(i==5) {
+      size_t live=ku_perf_live_allocations,bytes=ku_perf_live_bytes;
+      const uint8_t* original_key=key.ptr;const uint8_t* original_value=value.as.s.ptr;
+      fixture_fault("object_rehash");
+      CHECK(!ku_object_try_set_owned(object,&key,&value));
+      CHECK(key.ptr==original_key && value.tag==KU_STR && value.as.s.ptr==original_value);
+      CHECK(object->cap==old_cap && object->len==old_len);
+      CHECK(ku_perf_live_allocations==live && ku_perf_live_bytes==bytes);
+      CHECK(ku_object_get(object,borrowed)==NULL);
+      fixture_fault("");
+    }
+    CHECK(ku_object_try_set_owned(object,&key,&value));
+    CHECK(!key.ptr && !key.len && value.tag==KU_NULL);
+    CHECK(object->len==old_len+1u);
+    for(size_t prior=0;prior<=i;prior++) {
+      KuValue* loaded=ku_object_get(object,ku_string_static((const uint8_t*)keys[prior],strlen(keys[prior])));
+      CHECK(loaded && loaded->tag==KU_STR && loaded->as.s.len==7u);
+      CHECK(!memcmp(loaded->as.s.ptr,"payload",7));
+    }
+  }
+  CHECK(object->cap>=64 && object->len==32);
+  /* An existing key replaces exactly once without insertion/rehash. */
+  KuString duplicate={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)keys[7],strlen(keys[7])),&duplicate));
+  KuValue replacement=ku_v_int(73);size_t cap=object->cap;
+  CHECK(ku_object_try_set_owned(object,&duplicate,&replacement));
+  CHECK(object->cap==cap && object->len==32);
+  CHECK(!duplicate.ptr && replacement.tag==KU_NULL);
+  CHECK(ku_object_get(object,ku_string_static((const uint8_t*)keys[7],strlen(keys[7])))->as.i==73);
+  /* Copy-key insertion retains the caller's borrowed key. It cannot
+   * consume or free that key on success. */
+  KuString borrowed=ku_string_static((const uint8_t*)"borrowed-new",12);
+  KuValue copied=ku_v_int(91);
+  CHECK(ku_object_try_set_copy_key(object,borrowed,&copied));
+  CHECK(copied.tag==KU_NULL);
+  CHECK(borrowed.len==12u && !memcmp(borrowed.ptr,"borrowed-new",12));
+  CHECK(ku_object_get(object,borrowed)->as.i==91);
+  KuString held={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)"held",4),&held));
+  KuValue failed=ku_v_str(ku_string_move(&held));const uint8_t* held_ptr=failed.as.s.ptr;
+  KuString new_key={0};CHECK(fixture_owned(ku_string_static((const uint8_t*)"clone-failure",13),&new_key));
+  size_t length=object->len,live=ku_perf_live_allocations,bytes=ku_perf_live_bytes;
+  fixture_fault("string_clone");
+  CHECK(!ku_object_try_set_copy_key(object,new_key,&failed));
+  CHECK(failed.tag==KU_STR && failed.as.s.ptr==held_ptr && object->len==length);
+  CHECK(ku_perf_live_allocations==live && ku_perf_live_bytes==bytes);
+  CHECK(new_key.len==13u && !memcmp(new_key.ptr,"clone-failure",13));
+  fixture_fault("");CHECK(ku_object_try_set_copy_key(object,new_key,&failed));
+  CHECK(failed.tag==KU_NULL && object->len==length+1u);ku_string_drop(&new_key);
+  ku_object_drop(object);CHECK(NO_LIVE_ALLOCATIONS());
+  puts("object-probe-slot-ok");return 0;
+}
+"#;
+    run_array_capacity_c_harness(&dir, &generated, "object-probe-slot", checks);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_dynamic_object_store_bracket_and_dot_are_owned_and_readable() {
     let dir = unique_temp_dir("object-store");
     fs::write(
@@ -4830,6 +4928,89 @@ fn native_json_encode_decode_example_keeps_values_usable() {
     assert!(stdout.contains("byte 7"), "{stdout}");
     assert_eq!(code, Some(0));
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_json_recursive_writer_borrows_input_across_output_failures() {
+    let fixture = HttpJsonFixture(unique_temp_dir("json-writer-borrow"));
+    let dir = &fixture.0;
+    fs::write(
+        dir.join("main.ku"),
+        "import json from \"std.json\"\nfn main(): null! { json.encode(json.decode(\"null\")?)?; return ok(null) }\n",
+    )
+    .expect("write recursive JSON writer fixture");
+    let generated = native_emit_c(dir, "main.ku");
+    let reserve = "static bool ku_json_buffer_reserve(";
+    let generated = generated.replacen(
+        reserve,
+        &format!(
+            r#"static size_t writer_reserves = 0, writer_fail_at = 0;
+static void* writer_output_realloc(void* value,size_t bytes) {{
+  writer_reserves++;
+  if(writer_fail_at && writer_reserves==writer_fail_at)return NULL;
+  return realloc(value,bytes);
+}}
+{reserve}"#
+        ),
+        1,
+    );
+    let allocation = "uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);";
+    assert_eq!(generated.matches(allocation).count(), 1);
+    let generated = generated.replacen(
+        allocation,
+        "uint8_t* data = (uint8_t*)writer_output_realloc(buffer->data, next ? next : 1);",
+        1,
+    );
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "json-writer-borrow",
+        r#"
+int main(void) {
+  static const char text[]="{\"tail\":true,\"nested\":[{\"message\":\"中文😀\\u0000abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"},[1,2,-9223372036854775808]]}";
+  KuResult_kuvalue parsed=ku_json_parse(ku_string_static((const uint8_t*)text,sizeof(text)-1));
+  CHECK(parsed.ok && parsed.value.tag==KU_OBJECT);
+  KuObject* root=parsed.value.as.o;KuEntry* entries=root->entries;
+  KuValue* nested=ku_object_get(root,ku_string_static((const uint8_t*)"nested",6));
+  CHECK(nested && nested->tag==KU_ARRAY && nested->as.arr->len==2);
+  KuValueArray* array=nested->as.arr;KuValue* elements=array->data;
+  KuValue* message=ku_object_get(elements[0].as.o,ku_string_static((const uint8_t*)"message",7));
+  CHECK(message && message->tag==KU_STR && message->as.s.storage==KU_STRING_OWNED);
+  uint8_t* payload=message->as.s.ptr;size_t length=message->as.s.len;
+  writer_reserves=0;
+  KuResult_str golden=ku_json_stringify(parsed.value);
+  CHECK(golden.ok && writer_reserves>1);size_t reserves=writer_reserves;
+  size_t live=ku_perf_live_bytes,allocations=ku_perf_live_allocations;
+  for(size_t ordinal=0;ordinal<=reserves;ordinal++) {
+    writer_reserves=0;writer_fail_at=ordinal;
+    KuResult_str output=ku_json_stringify(parsed.value);
+    if(ordinal)CHECK(!output.ok && ku_string_equal(output.error.code,
+        ku_string_static((const uint8_t*)"out_of_memory",13)));
+    else CHECK(output.ok && ku_string_equal(output.value,golden.value));
+    CHECK(parsed.value.tag==KU_OBJECT && parsed.value.as.o==root && root->entries==entries);
+    CHECK(nested->as.arr==array && array->data==elements && array->len==2);
+    CHECK(message->as.s.ptr==payload && message->as.s.len==length);
+    ku_string_drop(&output.value);ku_error_drop(&output.error);
+    CHECK(ku_perf_live_bytes==live && ku_perf_live_allocations==allocations);
+  }
+  writer_fail_at=0;
+  /* Two overlapping read aliases are legal; neither becomes another owner.
+     Exercise the existing by-value adapter and the private recursive reader. */
+  const KuValue* alias=nested;KuJsonBuffer first={0},second={0};KuError error={0};
+  CHECK(ku_json_write_value(&first,*alias,1,&error));
+  CHECK(ku_json_write_value(&second,*alias,1,&error));
+  CHECK(first.len==second.len && !memcmp(first.data,second.data,first.len));
+  ku_json_buffer_drop(&first);ku_json_buffer_drop(&second);ku_error_drop(&error);
+  CHECK(ku_perf_live_bytes==live && ku_perf_live_allocations==allocations);
+  KuResult_str last=ku_json_stringify(parsed.value);CHECK(last.ok);
+  ku_value_drop(&parsed.value);ku_error_drop(&parsed.error);
+  CHECK(ku_string_equal(last.value,golden.value));
+  ku_string_drop(&last.value);ku_error_drop(&last.error);
+  ku_string_drop(&golden.value);ku_error_drop(&golden.error);
+  CHECK(NO_LIVE_ALLOCATIONS());return 0;
+}
+"#,
+    );
 }
 
 #[test]

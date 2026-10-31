@@ -297,6 +297,7 @@ typedef struct KuHttpBufferBudget KuHttpBufferBudget;
 struct KuHttpServer {
   KuHttpNode* root;
   int has_native_task_route, has_sync_route;
+  int elastic_workers;
   KuHttpBufferBudget* buffer_budget;
   long long max_buffer_bytes;
   long long max_connections;
@@ -337,6 +338,7 @@ static KuHttpServer* ku_http_server_new(void) {
   KuHttpServer* s = (KuHttpServer*)calloc(1, sizeof(KuHttpServer));
   if (!s) { fprintf(stderr, "out of memory\n"); exit(1); }
   s->root = ku_http_node_new();
+  s->elastic_workers=1;
   s->max_connections = 1024;
   s->max_active_requests = 256;
   s->max_pending_requests = 1024;
@@ -518,6 +520,15 @@ static int ku_http_utf8_valid(const uint8_t* data, size_t len) {
   if (len != 0 && !data) return 0;
   size_t i = 0;
   while (i < len) {
+    if (data[i] <= 0x7f) {
+      while (len - i >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, data + i, sizeof(word));
+        if (word & UINT64_C(0x8080808080808080)) break;
+        i += sizeof(word);
+      }
+      if (i == len) break;
+    }
     uint8_t c = data[i];
     if (c <= 0x7f) { i++; continue; }
     if (c >= 0xc2 && c <= 0xdf) {
@@ -754,7 +765,8 @@ enum {
   KU_HTTP_ERROR_TASK_LIMIT, KU_HTTP_ERROR_TASK_CLOSED, KU_HTTP_ERROR_TASK_OOM,
   KU_HTTP_ERROR_DRIVER, KU_HTTP_ERROR_INVALID_RESPONSE, KU_HTTP_ERROR_ALLOCATION,
   KU_HTTP_ERROR_PROJECTION, KU_HTTP_ERROR_QUEUE, KU_HTTP_ERROR_DEADLINE,
-  KU_HTTP_ERROR_HANDLER_EXIT, KU_HTTP_ERROR_PARSER_INVARIANT, KU_HTTP_ERROR_PEER_RESET, KU_HTTP_ERROR_COUNT
+  KU_HTTP_ERROR_HANDLER_EXIT, KU_HTTP_ERROR_PARSER_INVARIANT, KU_HTTP_ERROR_PEER_RESET,
+  KU_HTTP_ERROR_WORKER_START, KU_HTTP_ERROR_COUNT
 };
 typedef struct KuHttpFailure {
   uint64_t task_slot,task_generation,function_id;
@@ -1130,8 +1142,7 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   KuHttpHandler* selected=NULL;
   int route_status=ku_http_select_route(server,input->method,hdr+target_start,path_len,
       &selected,param_values,param_lengths,&param_count);
-  unsigned int fields_mask=selected && selected->returns_result!=2
-      ?ku_http_handler_request_fields(selected->invoke):63u;
+  unsigned int fields_mask=selected?ku_http_handler_request_fields(selected->invoke):63u;
   int public_headers=!server->root || (selected && selected->arity==1 && (fields_mask&1u));
   size_t header_capacity=public_headers?ku_http_map_capacity(header_fields):0;
   size_t control_bytes=control_length<=128u?control_length:0;
@@ -1207,9 +1218,9 @@ static int ku_http_parse_complete_header(KuHttpServer* server, const char* hdr, 
   return 0;
 }
 typedef struct KuHttpJob KuHttpJob;
-/* A native consumer without a parser token keeps the complete public ABI. Task
-   factories likewise retain all fields; only a compiler-proven sync thunk can
-   carry a reduced mask. Validation and framed body ownership are independent. */
+/* A native consumer without a parser token keeps the complete public ABI.
+   Only a compiler-proven synchronous thunk or Task factory carries a reduced
+   mask. Validation and framed body ownership remain independent. */
 static unsigned int ku_http_input_fields(const KuHttpInput* input) {
   return input->route?input->route->fields_mask:63u;
 }
@@ -1581,6 +1592,7 @@ static size_t ku_http_buffer_admit_response(KuHttpBufferBudget* budget, KuStruct
   }
   return response_charge;
 }
+typedef struct KuHttpWorkerCtx KuHttpWorkerCtx;
 typedef struct KuHttpQueue {
   KuHttpJob** items;
   int cap; int head; int tail; int count; int closed; int abort;
@@ -1590,7 +1602,9 @@ typedef struct KuHttpQueue {
   KuHttpWake* wake;
   int owner_work_pending; /* Only the matching event owner reads/writes this. */
   unsigned int owner_inline_remaining;
+  KuHttpWorkerCtx* workers;
 } KuHttpQueue;
+static int ku_http_queue_prepare_worker(KuHttpQueue*);
 static int ku_http_queue_is_current_owner(const KuHttpQueue* queue);
 static void ku_http_queue_notify(KuHttpQueue* queue) {
   if(ku_http_queue_is_current_owner(queue)) queue->owner_work_pending=1;
@@ -1720,6 +1734,9 @@ static void ku_http_job_run_owner(KuHttpServer* server,KuHttpJob* job) {
   __ku_sync_return_signal=signal;ku_http_failure_current=failure;
 }
 static int ku_http_queue_push(KuHttpQueue* queue, KuHttpJob* job) {
+  /* No job reference/queue ownership changes if physical worker creation
+   * fails. Existing fixed/manual queues keep their original admission path. */
+  if(!ku_http_queue_prepare_worker(queue))return 0;
   int accepted = 0;
   ku_http_mutex_lock(&queue->lock);
   if (!queue->closed) {
@@ -1813,7 +1830,16 @@ static void ku_http_queue_free(KuHttpQueue* queue) {
   ku_http_sync_destroy(&queue->lock, &queue->not_empty);
   free(queue->items); queue->items = NULL;
 }
-typedef struct { KuHttpServer* server; KuHttpQueue* queue; } KuHttpWorkerCtx;
+#if defined(_WIN32)
+typedef HANDLE KuHttpWorkerThread;
+#else
+typedef pthread_t KuHttpWorkerThread;
+#endif
+struct KuHttpWorkerCtx {
+  KuHttpServer* server; KuHttpQueue* queue;
+  KuHttpWorkerThread* threads;
+  int capacity,spawned,elastic,creation_failed; /* Admission fields belong to the event owner only. */
+};
 #if defined(_WIN32)
 static unsigned __stdcall ku_http_worker(void* argument) {
 #else
@@ -1839,6 +1865,44 @@ static void* ku_http_worker(void* argument) {
 #else
   return NULL;
 #endif
+}
+/* Only the event owner grows this bounded list. Every successful OS creation
+ * is recorded before another request may be admitted, including attribute
+ * teardown failure; all recorded handles are joined before ctx/queue free. */
+static int ku_http_worker_spawn(KuHttpWorkerCtx* context) {
+  if(context->spawned>=context->capacity)return 1;
+#if defined(_WIN32)
+  uintptr_t handle=_beginthreadex(NULL,(unsigned)ku_runtime_thread_stack_bytes(),ku_http_worker,context,0,NULL);
+  if(!handle)return 0;
+  context->threads[context->spawned++]=(HANDLE)handle;
+#else
+  pthread_t worker;pthread_attr_t attributes;
+  if(pthread_attr_init(&attributes))return 0;
+  int status=pthread_attr_setstacksize(&attributes,ku_runtime_thread_stack_bytes());
+  if(!status)status=pthread_create(&worker,&attributes,ku_http_worker,context);
+  int destroyed=pthread_attr_destroy(&attributes);
+  if(status)return 0;
+  context->threads[context->spawned++]=worker;
+  if(destroyed)return 0;
+#endif
+  return 1;
+}
+static int ku_http_queue_prepare_worker(KuHttpQueue* queue) {
+  KuHttpWorkerCtx* context=queue->workers;
+  if(!context)return 1;
+  context->creation_failed=0;
+  if(!context->elastic)return 1;
+  if(context->capacity<=0)return 0;
+  ku_http_mutex_lock(&queue->lock);
+  int closed=queue->closed;
+  size_t demand=queue->running+(size_t)queue->count+1u;
+  ku_http_mutex_unlock(&queue->lock);
+  if(closed)return 0;
+  if(demand>(size_t)context->capacity)demand=(size_t)context->capacity;
+  while((size_t)context->spawned<demand)if(!ku_http_worker_spawn(context)) {
+    context->creation_failed=1;return 0;
+  }
+  return 1;
 }
 
 typedef struct { const char* bytes; size_t length; } KuHttpPart;
@@ -2256,9 +2320,19 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
       && job->input.route && job->input.route->status==200u
       && ku_http_handler_is_short(job->input.route->invoke)) {
     queue->owner_inline_remaining--;
+    ku_http_count_admitted();
     ku_http_job_run_owner(server,job);return;
   }
   if (!workers || !ku_http_queue_push(queue, job)) {
+    if(workers && queue->workers && queue->workers->creation_failed) {
+      /* No queue retain/publication occurred. Retire the sole job/input owner
+       * before preparing output, while its request lease still owns A until
+       * the actual 503 write/close. Ordinary no-worker/closed rejection keeps
+       * its previous transport-close behavior. */
+      connection->job=NULL;ku_http_job_release(job);
+      connection->failure.reason=KU_HTTP_ERROR_WORKER_START;connection->failure.stage=1;
+      ku_http_connection_status(connection,server,503);return;
+    }
     ku_http_count_transport_close(connection,KU_HTTP_CLOSE_QUEUE_NOT_ADMITTED);
     ku_http_connection_close(connection);
   } else ku_http_count_admitted();
@@ -2266,12 +2340,6 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
 static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpServer* server, KuHttpQueue* queue, int workers) {
   if (ku_http_now_ms() >= connection->deadline) { ku_http_connection_status(connection, server, 408); return; }
   if (!ku_http_request_prepare(connection,server)) return;
-  /* Empty C-only sockets do not allocate input backing or consume A. */
-  if (!connection->header) {
-    if (!ku_http_buffer_reserve(connection->budget,1024u)) {connection->failure.reason=KU_HTTP_ERROR_PROJECTION;ku_http_connection_status(connection,server,503);return;}
-    connection->capacity=1024u;connection->header=(char*)malloc(connection->capacity);
-    if (!connection->header) {connection->failure.reason=KU_HTTP_ERROR_ALLOCATION;ku_http_connection_status(connection,server,500);return;}
-  }
   char incoming[KU_HTTP_READ_CHUNK];
   int received;
   if (connection->carry_length) {
@@ -2300,7 +2368,10 @@ static void ku_http_connection_read_header(KuHttpConnection* connection, KuHttpS
   if ((size_t)received > SIZE_MAX - scan_from) { connection->failure.reason=KU_HTTP_ERROR_PARSER_INVARIANT; ku_http_connection_status(connection, server, 500); return; }
   size_t needed = scan_from + (size_t)received;
   if (needed > connection->capacity) {
-    size_t capacity = connection->capacity;
+    /* First reserve only after receiving bytes, when the required backing is
+     * known. A complete larger packet must not allocate an unused 1KiB buffer
+     * and immediately grow it. Partial headers keep the same doubling policy. */
+    size_t capacity = connection->capacity ? connection->capacity : 1024u;
     while (capacity < needed) {
       if (capacity > SIZE_MAX / 2) { capacity = needed; break; }
       capacity *= 2;
@@ -2777,6 +2848,7 @@ typedef struct KuHttpLoopGroup KuHttpLoopGroup;
 typedef struct KuHttpLoopOwner {
   KuHttpLoopGroup* group;
   int index, slots, request_limit, pending, workers, ready, exited, drained;
+  size_t handler_workers;
   unsigned long long heartbeat, accepted, requests, admitted, success, rejected, timed_out, other_responses, peak_loop_delay_ms;
   KuHttpConnection* connection_base; uint64_t connection_generation;
   uint64_t cpu_ns, cpu_sample_ms, cpu_clock_errors; /* Published under group->lock. */
@@ -2784,6 +2856,7 @@ typedef struct KuHttpLoopOwner {
   size_t resident, queued, running, connections, pending_count, queued_bytes, peak_queued_bytes;
   size_t active_requests,peak_active_requests;
   KuHttpWake* wake;
+  KuHttpQueue* handler_queue; /* Lifetime protected by group->lock. */
   int task_work_pending; /* Only this event owner reads/writes Task self-work. */
 #if defined(_WIN32)
   HANDLE thread;
@@ -2817,6 +2890,19 @@ static void ku_http_owner_cpu_sample(KuHttpLoopOwner* owner,uint64_t cpu_ns,uint
     return;
   }
   owner->cpu_ns=cpu_ns; owner->cpu_sample_ms=sampled_ms;
+}
+/* Management samples independently of the event owner's cached telemetry.
+ * Hold group->lock for the queue's published lifetime, then take queue->lock.
+ * Workers never acquire group->lock while holding queue->lock. Reading live
+ * counters here preserves observation without waking HTTP for telemetry. */
+static void ku_http_owner_queue_sample_locked(KuHttpLoopOwner* owner) {
+  KuHttpQueue* queue=owner->handler_queue;
+  if(!queue)return;
+  ku_http_mutex_lock(&queue->lock);
+  owner->queued=(size_t)queue->count;owner->running=queue->running;
+  owner->resident=queue->resident;owner->queued_bytes=queue->queued_bytes;
+  owner->peak_queued_bytes=queue->peak_queued_bytes;
+  ku_http_mutex_unlock(&queue->lock);
 }
 static KuHttpLoopGroup* ku_http_live_group;
 static KU_THREAD_LOCAL KuHttpLoopOwner* ku_http_current_loop;
@@ -2993,15 +3079,18 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
     for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
     projection_charge=ku_http_projection_bytes(input,route->nparams,parameter_names);
     if (!ku_http_buffer_reserve(connection->budget,projection_charge)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection,server,503); return 1; }
-    req.params = ku_object_new(ku_http_map_capacity(route->nparams));
-    for (size_t i=0; i<route->nparams; i++)
-      ku_object_set(req.params,ku_http_string_copy(route->param_names[i],strlen(route->param_names[i])),
-        ku_v_str(ku_http_string_copy(param_values[i],param_value_lens[i])));
-    req.method = ku_http_string_copy(method,strlen(method));
-    req.path = ku_http_string_copy(target,path_len);
-    req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
-    req.query = ku_http_parse_query(target,path_len);
-    req.headers = input->headers; input->headers = NULL;
+    unsigned int fields=ku_http_input_fields(input);
+    if(fields&2u) {
+      req.params = ku_object_new(ku_http_map_capacity(route->nparams));
+      for (size_t i=0; i<route->nparams; i++)
+        ku_object_set(req.params,ku_http_string_copy(route->param_names[i],strlen(route->param_names[i])),
+          ku_v_str(ku_http_string_copy(param_values[i],param_value_lens[i])));
+    }
+    if(fields&8u)req.method = ku_http_string_copy(method,strlen(method));
+    if(fields&16u)req.path = ku_http_string_copy(target,path_len);
+    if(fields&32u)req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
+    if(fields&4u)req.query = ku_http_parse_query(target,path_len);
+    if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
   }
   KuHttpLoopOwner* owner = ku_http_current_loop;
   /* One original handler deadline is carried through every PG wait/reset.
@@ -3146,16 +3235,17 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     used = (size_t)n;
     for (int i=0; i<group->created; i++) {
       KuHttpLoopOwner* owner = &group->loops[i];
+      ku_http_owner_queue_sample_locked(owner);
       uint64_t sampled_now=ku_http_now_ms();
       uint64_t sample_age=sampled_now>=owner->cpu_sample_ms ? sampled_now-owner->cpu_sample_ms : 0;
-      n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"active_requests\":%llu,\"peak_active_requests\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu}",
+      n = snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"accepted\":%llu,\"requests\":%llu,\"queued\":%llu,\"running\":%llu,\"resident\":%llu,\"connections\":%llu,\"pending\":%llu,\"active_requests\":%llu,\"peak_active_requests\":%llu,\"cpu_ns\":%llu,\"cpu_sample_ms\":%llu,\"cpu_sample_age_ms\":%llu,\"cpu_clock_errors\":%llu,\"handler_workers\":%llu,\"max_handler_workers\":%d}",
         i?",":"",i,owner->accepted,owner->requests,(unsigned long long)owner->queued,(unsigned long long)owner->running,(unsigned long long)owner->resident,(unsigned long long)owner->connections,(unsigned long long)owner->pending_count,
         (unsigned long long)owner->active_requests,(unsigned long long)owner->peak_active_requests,
-        (unsigned long long)owner->cpu_ns,(unsigned long long)owner->cpu_sample_ms,(unsigned long long)sample_age,(unsigned long long)owner->cpu_clock_errors);
+        (unsigned long long)owner->cpu_ns,(unsigned long long)owner->cpu_sample_ms,(unsigned long long)sample_age,(unsigned long long)owner->cpu_clock_errors,(unsigned long long)owner->handler_workers,owner->workers);
       if (n<0 || (size_t)n>=management_capacity-used) _Exit(79);
       used+=(size_t)n;
     }
-    n=snprintf(text+used,management_capacity-used,"],\"accepted\":%llu,\"draining\":%s",group->accepted,group->draining?"true":"false");
+    n=snprintf(text+used,management_capacity-used,"],\"accepted\":%llu,\"draining\":%s,\"handler_worker_policy\":\"%s\"",group->accepted,group->draining?"true":"false",server->elastic_workers?"elastic":"fixed");
     if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
     ku_http_mutex_unlock(&group->lock);
     n=snprintf(text+used,management_capacity-used,",\"outcomes\":[");
@@ -3163,6 +3253,7 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     ku_http_mutex_lock(&group->lock);
     for (int i=0;i<group->created;i++) {
       KuHttpLoopOwner* owner=&group->loops[i];
+      ku_http_owner_queue_sample_locked(owner);
       n=snprintf(text+used,management_capacity-used,"%s{\"id\":%d,\"admitted\":%llu,\"success_responses\":%llu,\"rejected_responses\":%llu,\"timeout_responses\":%llu,\"other_responses\":%llu,\"peak_loop_delay_ms\":%llu,\"queued_bytes\":%llu,\"peak_queued_bytes\":%llu}",i?",":"",i,
         owner->admitted,owner->success,owner->rejected,owner->timed_out,owner->other_responses,owner->peak_loop_delay_ms,(unsigned long long)owner->queued_bytes,(unsigned long long)owner->peak_queued_bytes);
       if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
@@ -3181,7 +3272,7 @@ static int ku_http_control_request(KuHttpConnection* connection, KuHttpServer* s
     ku_http_mutex_unlock(&group->lock);
     text[used++]=']';
     {
-      static const char* reasons[KU_HTTP_ERROR_COUNT]={"unknown","handler_result","handler_500","task_limit","task_closed","task_oom","driver_invariant","invalid_response","allocation","projection_budget","queue_admission","deadline","handler_exit","parser_invariant","peer_reset"};
+      static const char* reasons[KU_HTTP_ERROR_COUNT]={"unknown","handler_result","handler_500","task_limit","task_closed","task_oom","driver_invariant","invalid_response","allocation","projection_budget","queue_admission","deadline","handler_exit","parser_invariant","peer_reset","worker_start"};
       n=snprintf(text+used,management_capacity-used,",\"errors\":{\"sample_limit\":8,\"request_id_encoding\":\"hex\",\"counts\":{");
       if(n<0 || (size_t)n>=management_capacity-used) _Exit(79); used+=(size_t)n;
       ku_http_mutex_lock(&group->lock);
@@ -3948,29 +4039,17 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
     return "handler queue initialization failed";
   }
-  KuHttpWorkerCtx ctx; ctx.server = server; ctx.queue = &queue;
+  KuHttpWorkerCtx ctx={0};ctx.server=server;ctx.queue=&queue;
+  ctx.capacity=nworkers;ctx.elastic=server->elastic_workers;queue.workers=&ctx;
 #if defined(_WIN32)
   HANDLE* workers = (HANDLE*)malloc((size_t)nworkers * sizeof(HANDLE));
 #else
   pthread_t* workers = (pthread_t*)malloc((size_t)nworkers * sizeof(pthread_t));
 #endif
-  int spawned = 0;
-  if (workers) for (int index = 0; index < nworkers; index++) {
-#if defined(_WIN32)
-    uintptr_t handle = _beginthreadex(NULL, (unsigned)ku_runtime_thread_stack_bytes(), ku_http_worker, &ctx, 0, NULL);
-    if (!handle) break;
-    workers[spawned++] = (HANDLE)handle;
-#else
-    pthread_t worker;
-    pthread_attr_t attributes;
-    if (pthread_attr_init(&attributes) != 0) break;
-    int status = pthread_attr_setstacksize(&attributes, ku_runtime_thread_stack_bytes());
-    if (!status) status = pthread_create(&worker, &attributes, ku_http_worker, &ctx);
-    pthread_attr_destroy(&attributes);
-    if (status) break;
-    workers[spawned++] = worker;
-#endif
-  }
+  ctx.threads=workers;
+  int worker_start_failed=nworkers>0 && workers==NULL;
+  if(workers && !ctx.elastic)for(int index=0;index<nworkers;index++)
+    if(!ku_http_worker_spawn(&ctx)) {worker_start_failed=1;break;}
   int listening = 1;
   int failure_handled = 0;
   int peer_accept_errors = 0;
@@ -3982,9 +4061,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
   KuHttpTaskIoBatch task_io_batch={0};
   KuHttpTaskSliceTurn task_io_slice_turn={0,UINT64_MAX};
 #endif
-  const char* listen_failure = spawned == nworkers ? NULL : "handler thread startup failed";
+  const char* listen_failure = worker_start_failed ? "handler thread startup failed" : NULL;
   ku_http_mutex_lock(&group->lock);
-  owner->wake = &wake; owner->ready = !listen_failure;
+  owner->wake = &wake; owner->handler_queue=&queue; owner->ready = !listen_failure;
   if (listen_failure) group->failure = listen_failure;
   ku_http_mutex_unlock(&group->lock);
   ku_http_wake_notify(&group->wake);
@@ -4007,6 +4086,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
     ku_http_mutex_lock(&group->lock);
     if (cpu_sample_due) ku_http_owner_cpu_sample(owner,sampled_cpu_ns,sampled_cpu_ms,cpu_sample_valid);
     owner->queued = queued; owner->running = running; owner->resident = resident;
+    owner->handler_workers=(size_t)ctx.spawned;
     owner->queued_bytes=queued_bytes; owner->peak_queued_bytes=peak_queued_bytes;
     owner->connections = occupied_connections; owner->pending_count = (size_t)pending.count;
     owner->active_requests=(size_t)active.request_active;owner->peak_active_requests=(size_t)active.request_peak;
@@ -4111,7 +4191,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         if (stuck) listen_failure = "native handler exceeded its cleanup deadline";
       }
       if (connection->phase == KU_HTTP_IO_HEADER && connection->carry_length)
-        ku_http_connection_read_header(connection, server, &queue, spawned);
+        ku_http_connection_read_header(connection, server, &queue, nworkers);
       /* Only real C-record exhaustion can retire a reused idle connection.
          Waiting for A alone must preserve idle connections and their bytes. */
       if (pending.raw_count && ku_http_free_slot(&active)<0 && connection->phase == KU_HTTP_IO_HEADER &&
@@ -4487,9 +4567,9 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       if (!events) continue;
       if (events & POLLNVAL) { ku_http_connection_close(connection); continue; }
       if (connection->phase == KU_HTTP_IO_HEADER && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
-        ku_http_connection_read_header(connection, server, &queue, spawned);
+        ku_http_connection_read_header(connection, server, &queue, nworkers);
       else if (connection->phase == KU_HTTP_IO_BODY && (events & (KU_HTTP_POLL_READ | POLLERR | POLLHUP)))
-        ku_http_connection_read_body(connection, server, &queue, spawned);
+        ku_http_connection_read_body(connection, server, &queue, nworkers);
       else if (connection->phase == KU_HTTP_IO_WRITE && (events & (KU_HTTP_POLL_WRITE | POLLERR | POLLHUP)))
         ku_http_connection_write(connection, server);
       else if ((connection->phase==KU_HTTP_IO_ASYNC || connection->phase==KU_HTTP_IO_JOB)
@@ -4597,21 +4677,23 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
      actual owner retirement before stopping workers. Fatal accept failure has
      already cancelled queued work, without touching a running handler's TLS. */
   ku_http_queue_close(&queue, listen_failure == NULL);
-  if (spawned > 0) {
+  if (ctx.spawned > 0) {
 #if defined(_WIN32)
-    if (WaitForMultipleObjects((DWORD)spawned, workers, TRUE, INFINITE) == WAIT_FAILED) {
+    if (WaitForMultipleObjects((DWORD)ctx.spawned, workers, TRUE, INFINITE) == WAIT_FAILED) {
       fputs("http worker join failed\n", stderr); exit(1);
     }
-    for (int index = 0; index < spawned; index++) CloseHandle(workers[index]);
+    for (int index = 0; index < ctx.spawned; index++) CloseHandle(workers[index]);
 #else
-    for (int w = 0; w < spawned; w++) {
+    for (int w = 0; w < ctx.spawned; w++) {
       if (pthread_join(workers[w], NULL) != 0) { fputs("http worker join failed\n", stderr); exit(1); }
     }
 #endif
   }
   free(workers);
+  ku_http_mutex_lock(&group->lock);
+  owner->handler_queue=NULL;owner->wake=NULL;
+  ku_http_mutex_unlock(&group->lock);
   ku_http_queue_free(&queue);
-  ku_http_mutex_lock(&group->lock); owner->wake = NULL; ku_http_mutex_unlock(&group->lock);
 #if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)
   ku_http_reactor_delete(&reactor,(size_t)slot_count);
 #endif
@@ -4673,6 +4755,7 @@ static void* ku_http_loop_thread(void* argument) {
   int final_cpu_valid=ku_http_thread_cpu_ns(&final_cpu_ns);
   ku_http_mutex_lock(&owner->group->lock);
   ku_http_owner_cpu_sample(owner,final_cpu_ns,final_cpu_ms,final_cpu_valid);
+  owner->handler_workers = 0;
   owner->ready = 0; owner->exited = 1;
   ku_http_mutex_unlock(&owner->group->lock);
   ku_http_group_notify(owner->group);
@@ -4721,6 +4804,12 @@ failed:
 }
 static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
   ku_http_validate_server(server);
+  const char* worker_policy=getenv("KU_HTTP_WORKER_POLICY");
+  if(worker_policy && strcmp(worker_policy,"elastic") && strcmp(worker_policy,"fixed")) {
+    ku_string_drop(&address);
+    return ku_http_listen_err(server,"KU_HTTP_WORKER_POLICY must be elastic or fixed");
+  }
+  server->elastic_workers=!worker_policy || !strcmp(worker_policy,"elastic");
   if (address.len == 0 || memchr(address.ptr, 0, address.len) != NULL) {
     ku_string_drop(&address);
     return ku_http_listen_err(server, "invalid listen address");

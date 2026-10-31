@@ -1,4 +1,5 @@
-//! Conservative, private proof for owner-local synchronous HTTP handlers.
+//! Conservative, private proofs for short synchronous HTTP work and request
+//! field materialization in synchronous handlers and native Task factories.
 //! Unknown work keeps the existing worker path. This is a size/work bound,
 //! never a promise about OS scheduling or allocator latency.
 use std::collections::{HashMap, HashSet};
@@ -438,7 +439,130 @@ fn request_fields(function: &IrFunction) -> Option<u32> {
     Some(fields)
 }
 
-pub(super) fn emit(out: &mut COutput, program: &IrProgram, async_names: &HashSet<String>) {
+fn task_request_fields(function: &crate::ir::task::TaskFunction) -> Option<u32> {
+    use crate::ir::task::{TaskOp, TaskSlotType, TaskTerminator};
+    let request = |slot: &crate::ir::task::SlotId| {
+        matches!(&function.slots[slot.0].ty, TaskSlotType::Value { ty, .. }
+            if crate::ir::task::http_request_type(ty))
+    };
+    let mut fields = 0;
+    // This consumes verified, typed Task IR, not the signature-only async
+    // placeholder in synchronous IR. All whole-request transfers fall back;
+    // there is no interprocedural or alias assumption. The exhaustive matches
+    // force new Task capabilities to be reviewed before projection admits them.
+    for state in &function.states {
+        for operation in &state.operations {
+            match operation {
+                TaskOp::HttpMapGet { map, .. } => {
+                    fields |= match map.as_str() {
+                        "headers" => 1,
+                        "params" => 2,
+                        "query" => 4,
+                        _ => return None,
+                    };
+                }
+                TaskOp::ErrorField { src, field, .. } => {
+                    if request(src) {
+                        fields |= match field.as_str() {
+                            "method" => 8,
+                            "path" => 16,
+                            "body" => 32,
+                            _ => return None,
+                        };
+                    }
+                }
+                TaskOp::Move { src, dst } | TaskOp::Copy { src, dst } => {
+                    if request(src) || request(dst) {
+                        return None;
+                    }
+                }
+                TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } => {
+                    if arguments.iter().any(request) {
+                        return None;
+                    }
+                }
+                TaskOp::Read { slot } => {
+                    if request(slot) {
+                        return None;
+                    }
+                }
+                // The typed verifier restricts all remaining operands to
+                // primitives, errors, responses, flat arrays, PG/net handles,
+                // or Task/callable identities; they cannot observe a request.
+                // Drop accepts the zero owners of omitted fields.
+                TaskOp::Drop { .. }
+                | TaskOp::DropIfInit { .. }
+                | TaskOp::FinallyEnter { .. }
+                | TaskOp::FinallyLeave { .. }
+                | TaskOp::FinallyUnwindBegin
+                | TaskOp::FinallyUnwindEnd
+                | TaskOp::ScopeExitBegin { .. }
+                | TaskOp::ScopeExitEnd { .. }
+                | TaskOp::ScopeEnter { .. }
+                | TaskOp::Init { .. }
+                | TaskOp::InitCallable { .. }
+                | TaskOp::CloneCallable { .. }
+                | TaskOp::ArrayMake { .. }
+                | TaskOp::ArrayClone { .. }
+                | TaskOp::ArrayLen { .. }
+                | TaskOp::StringLen { .. }
+                | TaskOp::StringClone { .. }
+                | TaskOp::PrimitiveString { .. }
+                | TaskOp::StringConcat { .. }
+                | TaskOp::ArrayTryGet { .. }
+                | TaskOp::ArrayTake { .. }
+                | TaskOp::Bytes { .. }
+                | TaskOp::Unary { .. }
+                | TaskOp::Binary { .. }
+                | TaskOp::WrapOk { .. }
+                | TaskOp::MakeError { .. }
+                | TaskOp::WrapError { .. }
+                | TaskOp::PgResult { .. }
+                | TaskOp::JsonEncodeObject { .. }
+                | TaskOp::JsonDecode { .. }
+                | TaskOp::JsonValue { .. }
+                | TaskOp::JsonObject { .. }
+                | TaskOp::HttpResponse { .. }
+                | TaskOp::CheckForLimit { .. }
+                | TaskOp::Print { .. } => {}
+            }
+        }
+        match &state.terminator {
+            TaskTerminator::Complete { value } | TaskTerminator::Exit { value } => {
+                if request(value) {
+                    return None;
+                }
+            }
+            TaskTerminator::ScopeDrain { .. }
+            | TaskTerminator::Jump { .. }
+            | TaskTerminator::Branch { .. }
+            | TaskTerminator::Suspend { .. }
+            | TaskTerminator::Await { .. }
+            | TaskTerminator::Timer { .. }
+            | TaskTerminator::BlockingWrite { .. }
+            | TaskTerminator::BlockingRead { .. }
+            | TaskTerminator::BlockingReadDir { .. }
+            | TaskTerminator::BlockingExists { .. }
+            | TaskTerminator::BlockingNet { .. }
+            | TaskTerminator::PgQuery { .. }
+            | TaskTerminator::TryResult { .. }
+            | TaskTerminator::Terminate => {}
+        }
+    }
+    Some(fields)
+}
+
+pub(super) fn emit(
+    out: &mut COutput,
+    program: &IrProgram,
+    tasks: Option<&crate::ir::task::TaskProgram>,
+    task_factories: bool,
+) {
+    let async_names: HashSet<_> = tasks
+        .into_iter()
+        .flat_map(|tasks| &tasks.functions)
+        .map(|function| function.name.as_str())
+        .collect();
     let targets = closure_thunk_targets(program);
     out.push_str("static int ku_http_handler_is_short(void* invoke) {\n");
     for function in &program.functions {
@@ -457,7 +581,7 @@ pub(super) fn emit(out: &mut COutput, program: &IrProgram, async_names: &HashSet
     out.push_str("  return 0;\n}\n");
     out.push_str("static unsigned int ku_http_handler_request_fields(void* invoke) {\n");
     for function in &program.functions {
-        if async_names.contains(&function.name)
+        if async_names.contains(function.name.as_str())
             || (!function.is_closure_body && !targets.iter().any(|target| target.id == function.id))
         {
             continue;
@@ -468,7 +592,19 @@ pub(super) fn emit(out: &mut COutput, program: &IrProgram, async_names: &HashSet
             out.push_str(&format!("  if(invoke==(void*){symbol}) return {mask}u;\n"));
         }
     }
-    out.push_str("  return 63u; /* unknown or Task handler: retain complete request */\n}\n");
+    if let Some(tasks) = tasks.filter(|_| task_factories) {
+        for function in &tasks.functions {
+            if super::task_http::is_handler(function) {
+                if let Some(mask) = task_request_fields(function) {
+                    out.push_str(&format!(
+                        "  if(invoke==(void*)ku_http_task_start_{}) return {mask}u;\n",
+                        function.id.0
+                    ));
+                }
+            }
+        }
+    }
+    out.push_str("  return 63u; /* unknown use: retain complete request */\n}\n");
 }
 
 #[cfg(test)]
@@ -587,5 +723,33 @@ mod tests {
         assert_eq!(mask("import \"std.http\" fn Read(req: HttpRequest): HttpResponse { return http.text(req.body) } fn Ready(req: HttpRequest): HttpResponse { return Read(req) } fn main() {}"),None);
         assert_eq!(mask("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { copy=req.clone() return http.text(copy.body) } fn main() {}"),None);
         assert_eq!(mask("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.headers.host + req.params.id + req.path + req.method) } fn main() {}"),Some(27));
+    }
+
+    #[test]
+    fn task_request_projection_uses_real_body_and_rejects_whole_request_forwarding() {
+        fn mask(body: &str) -> Option<u32> {
+            let ast =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(body).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            let tasks = crate::ir::task_lower::lower_service_handlers(&ast).unwrap();
+            task_request_fields(tasks.functions.iter().find(|f| f.name == "Ready").unwrap())
+        }
+        for (expression, expected) in [
+            ("req.headers.host", 1),
+            ("req.params.id", 2),
+            ("req.query.rid", 4),
+            ("req.method", 8),
+            ("req.path", 16),
+            ("req.body", 32),
+        ] {
+            let source = format!("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! {{ return ok(http.text({expression})) }} fn main() {{}}");
+            assert_eq!(mask(&source), Some(expected), "field {expression}");
+        }
+        assert_eq!(mask("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! { return ok(http.text(req.query.rid)) } fn main() {}"),Some(4));
+        assert_eq!(mask("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! { return ok(http.text(req.headers.host + req.params.id + req.method + req.path + req.body)) } fn main() {}"),Some(59));
+        assert_eq!(mask("import \"std.http\" async fn Ready(): HttpResponse! { return ok(http.text(\"ok\")) } fn main() {}"),Some(0));
+        assert_eq!(mask("import \"std.http\" async fn Child(req: HttpRequest): HttpResponse! { return ok(http.text(req.body)) } async fn Ready(req: HttpRequest): HttpResponse! { return await Child(req) } fn main() {}"),None);
+        assert_eq!(mask("import \"std.http\" async fn Ready(req: HttpRequest): HttpResponse! { alias=req return ok(http.text(alias.body)) } fn main() {}"),None);
     }
 }

@@ -64,6 +64,7 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     }
     if super::super::task::uses_json(tasks) {
         out.push_str(JSON_HOST);
+        out.push_str(include_str!("c_task_json.c"));
     }
     for function in &tasks.functions {
         out.check()?;

@@ -1,0 +1,14 @@
+import json from "std.json"
+import time from "std.time"
+async fn tick():int! { time.sleep(2)? return ok(1) }
+async fn main():null! {
+    decoded=json.decode("{\"counter\":7,\"data\":{\"message\":\"中文😀\",\"items\":[1,true,null]}}")?
+    selected=decoded["counter"]?
+    counter=selected.as_int()?
+    copied=decoded["data"]?
+    next=(await tick())?
+    data=decoded.take("data")?
+    body=json.encode({counter:counter+next,id:"rid",data:data,copy:copied})?
+    println(body)
+    return ok(null)
+}

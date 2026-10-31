@@ -1263,6 +1263,145 @@ class ResourceSamplerTests(unittest.TestCase):
             self.assertTrue(sampler.stream_path.exists())
 
 
+class AdmissionPressureHarnessTests(unittest.TestCase):
+    @staticmethod
+    def valid_driver():
+        return {'schema':'ku-admission-pressure-v1','passed':True,'formal_throughput_score':False,
+                'expected_limits':{'max_connections':4096,'max_active_requests':1024,'max_pending_requests':128},
+                'counts':{'explicit_503':32,'planned_cancel':16,'correct_200':1136},
+                'resources_recovered':True,'normal_flow_recovered_within_5s':True,'recovery_elapsed_ns':1000000,
+                'recovery_probe':[{'category':'correct_200','status':200,'body_bytes':1071} for _ in range(8)]}
+
+    @contextmanager
+    def fixture(self, directory, controls=None):
+        controls={} if controls is None else controls
+        controls.setdefault('report',self.valid_driver())
+        root=Path(directory);output=root/'admission';trace=[];captured={}
+        class DomainFake:
+            def __init__(self,harness,label,cores,memory,cpus):
+                self.path=root/'driver-cgroup';self.label=label;self.settings={'memory.max':str(memory)}
+                self.killed=False;captured['domain_args']=(label,cores,memory,cpus);trace.append('domain_init')
+                if controls.get('domain_error'):raise OSError('cgroup setting failed')
+            def snapshot(self):
+                if controls.get('snapshot_error'):raise OSError('driver snapshot failed')
+                return {'label':self.label,'monotonic_ns':10,'cpu_stat':{'usage_usec':5},'process_count':0 if self.killed else 1}
+            def kill(self):self.killed=True;trace.append('kill')
+            def remove(self):trace.append('remove');return not controls.get('remove_failed',False)
+        class SamplerFake:
+            def __init__(self,domains,path,**kwargs):
+                self.output=path;self.error=controls.get('sampler_error');self.overflow=controls.get('sampler_overflow',False)
+                captured['sampler_domains']=domains;captured['sampler_kwargs']=kwargs
+            def start(self):
+                trace.append('sampler_start')
+                if controls.get('sampler_start_error'):raise OSError('sampler start failed')
+                return self
+            def stop(self):
+                trace.append('sampler_stop');write_json(self.output,{'samples':[]})
+                if controls.get('sampler_stop_error'):raise OSError('sampler stop failed')
+                return [{'domains':[]}]
+        class ProcessFake:
+            returncode=None
+            calls=0
+            def wait(self,timeout):
+                self.calls+=1;captured.setdefault('wait_deadlines',[]).append(timeout)
+                if self.calls==1:
+                    if not controls.get('omit_report'):
+                        if controls.get('invalid_report'):(output/'admission-driver.json').write_text('{invalid')
+                        else:write_json(output/'admission-driver.json',controls['report'])
+                    if controls.get('wait_error'):raise controls['wait_error']
+                    self.returncode=controls.get('exit_code',0)
+                elif self.returncode is None:self.returncode=-9
+                trace.append('reap');return self.returncode
+            def poll(self):return self.returncode
+        h=Harness.__new__(Harness);h.root=root;h.protocol=root/'protocol.json';h.uid=os.getuid();h.gid=os.getgid()
+        h.db_domain=types.SimpleNamespace(label='database')
+        h.identity={'protocol_sha256':'a'*64,'manifest_sha256':'b'*64}
+        h.manifest={'client':{'command':['{root}/client']},'driver_cores':2,'driver_cpuset':'4-5'}
+        quiet={'limits':self.valid_driver()['expected_limits'],
+               'loops':[dict.fromkeys(('queued','running','resident','pending','connections','active_requests'),0)],
+               'tasks':[dict.fromkeys(('ready','waiting','running','resident','timers'),0)],
+               'task_blocking':dict.fromkeys(('resident','queued','running','net_wait','net_step','cancelled_still_running','output_charge_bytes'),0),
+               'task_driver':{'resident':0},'buffer_bytes':0}
+        service=types.SimpleNamespace(stack='ku',address='127.0.0.1:8091',management_address='127.0.0.1:8092',
+            control_token='synthetic-test-token-do-not-publish',metrics=lambda:quiet,
+            startup={'identity':{'stack':'ku'},'configured_admission_limits':self.valid_driver()['expected_limits']},
+            domain=types.SimpleNamespace(label='service-ku',snapshot=lambda:{'process_count':1,'cpu_stat':{'usage_usec':2}}),
+            process=types.SimpleNamespace(poll=lambda:None))
+        def launch(command,cwd,env,domain,log):
+            trace.append('launch');captured.update(command=command,env=env,cwd=cwd)
+            if controls.get('launch_error'):raise OSError(service.control_token+' launch failed')
+            return ProcessFake()
+        h.launch=launch
+        with mock.patch.object(linux_harness,'Domain',DomainFake),mock.patch.object(linux_harness,'Sampler',SamplerFake),mock.patch.object(linux_harness.os,'chown'):
+            yield h,service,output,trace,captured
+
+    def test_success_is_separate_from_scores_and_keeps_token_in_environment_only(self):
+        with tempfile.TemporaryDirectory() as directory,self.fixture(directory) as (h,s,output,trace,captured):
+            result=h.admission_pressure(s,output)
+            self.assertTrue(result['passed']);self.assertTrue(result['recovery']['passed'])
+            self.assertIsNone(result['driver_error']);self.assertTrue(result['driver_cleanup_ok'])
+            self.assertFalse(result['formal_throughput_score']);self.assertNotIn('service_cost',result)
+            self.assertEqual(captured['domain_args'],('driver',2,GIB,'4-5'))
+            self.assertEqual([d.label for d in captured['sampler_domains']],['service-ku','driver','database'])
+            self.assertEqual(captured['wait_deadlines'],[20,3])
+            self.assertIn('--admission-pressure',captured['command']);self.assertNotIn('--rate',captured['command'])
+            self.assertNotIn(s.control_token,' '.join(captured['command']))
+            self.assertEqual(captured['env']['KU_SERVICE_CONTROL_TOKEN'],s.control_token)
+            for path in output.glob('*.json'):self.assertNotIn(s.control_token,path.read_text())
+            self.assertLess(trace.index('kill'),trace.index('remove'));self.assertIn('sampler_stop',trace)
+            self.assertEqual(read_json(output/'admission-driver.json'),self.valid_driver())
+            for name in ('admission.json','environment.json','runtime-before.json','runtime-after.json','resources.json','driver-cleanup.json'):
+                self.assertTrue((output/name).exists(),name)
+
+    def test_driver_failure_preserves_json_and_cleanup_never_implies_gate_success(self):
+        controls={'exit_code':2,'report':dict(self.valid_driver(),passed=False,normal_flow_recovered_within_5s=False,failure='unknown reset')}
+        with tempfile.TemporaryDirectory() as directory,self.fixture(directory,controls) as (h,s,output,trace,captured):
+            result=h.admission_pressure(s,output)
+            self.assertFalse(result['passed']);self.assertFalse(result['recovery']['passed'])
+            self.assertTrue(result['driver_cleanup_ok']);self.assertIn('exit=2',result['driver_error'])
+            self.assertEqual(read_json(output/'admission-driver.json'),controls['report'])
+
+    def test_launch_timeout_and_invalid_output_keep_receipts_on_all_paths(self):
+        scenarios=({'launch_error':True},{'wait_error':linux_harness.subprocess.TimeoutExpired('driver',20)},
+                   {'invalid_report':True},{'omit_report':True},{'sampler_start_error':True},
+                   {'sampler_stop_error':True},{'domain_error':True},{'snapshot_error':True},
+                   {'remove_failed':True},{'sampler_overflow':True})
+        for controls in scenarios:
+            with self.subTest(controls=controls),tempfile.TemporaryDirectory() as directory,self.fixture(directory,controls) as (h,s,output,trace,captured):
+                result=h.admission_pressure(s,output)
+                self.assertFalse(result['passed']);self.assertIn('kill',trace);self.assertIn('remove',trace)
+                self.assertTrue((output/'driver-cleanup.json').exists());self.assertTrue((output/'admission.json').exists())
+                self.assertTrue((output/'environment.json').exists());self.assertTrue((output/'runtime-after.json').exists())
+                self.assertNotIn(s.control_token,json.dumps(result))
+                if controls.get('invalid_report'):self.assertEqual((output/'admission-driver.json').read_text(),'{invalid')
+
+    def test_coordinator_interrupt_is_rethrown_after_retaining_failure_and_reaping(self):
+        controls={'wait_error':KeyboardInterrupt('coordinator stop')}
+        with tempfile.TemporaryDirectory() as directory,self.fixture(directory,controls) as (h,s,output,trace,captured):
+            with self.assertRaises(KeyboardInterrupt):h.admission_pressure(s,output)
+            result=read_json(output/'admission.json')
+            self.assertFalse(result['passed']);self.assertTrue(result['driver_cleanup_ok'])
+            self.assertEqual(captured['wait_deadlines'],[20,3]);self.assertIn('kill',trace);self.assertIn('remove',trace)
+
+    def test_forged_pass_does_not_hide_extra_transport_errors_or_bad_recovery(self):
+        bad_count=dict(self.valid_driver(),counts={'explicit_503':31,'planned_cancel':16,'correct_200':1136,'transport_reset':1})
+        for report in (bad_count,dict(self.valid_driver(),recovery_probe=[])):
+            with tempfile.TemporaryDirectory() as directory,self.fixture(directory,{'report':report}) as (h,s,output,trace,captured):
+                result=h.admission_pressure(s,output)
+                self.assertFalse(result['passed']);self.assertIsNotNone(result['driver_error'])
+
+    def test_rejects_changed_limits_external_targets_and_existing_evidence_before_launch(self):
+        with tempfile.TemporaryDirectory() as directory,self.fixture(directory) as (h,s,output,trace,captured):
+            original=copy.deepcopy(s.startup['configured_admission_limits'])
+            s.startup['configured_admission_limits']['max_active_requests']=16
+            with self.assertRaisesRegex(ValueError,'unchanged'):h.admission_pressure(s,output)
+            s.startup['configured_admission_limits']=original;s.address='192.168.1.10:8091'
+            with self.assertRaisesRegex(ValueError,'loopback'):h.admission_pressure(s,output)
+            s.address='127.0.0.1:8091';write_json(output/'admission.json',{'preserve':True})
+            with self.assertRaisesRegex(RuntimeError,'already exists'):h.admission_pressure(s,output)
+            self.assertEqual(read_json(output/'admission.json'),{'preserve':True});self.assertNotIn('launch',trace)
+
+
 class DriverOwnedCleanupTests(unittest.TestCase):
     def test_finalizer_recovers_owned_domain_after_interrupted_stop_flag(self):
         with tempfile.TemporaryDirectory() as d:

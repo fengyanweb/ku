@@ -86,12 +86,192 @@ async fn main():null! {
         .unwrap_err()
         .message
         .contains("duplicate field"));
-    for unsupported in [
-        r#"import json from "std.json" async fn main():null! {body=json.encode({a:1.5})? return ok(null)}"#,
+    let unsupported = r#"import json from "std.json" async fn main():null! {body=json.encode({a:1.5})? return ok(null)}"#;
+    assert!(task_lower::lower_program(&parsed(unsupported)).is_err());
+    let local = lowered_json(
         r#"import json from "std.json" async fn main():null! {value={a:1} body=json.encode(value)? return ok(null)}"#,
-    ] {
-        assert!(task_lower::lower_program(&parsed(unsupported)).is_err());
+    );
+    task::verify_and_plan(&local.tasks, Default::default())
+        .expect("a JSON object local is supported");
+}
+
+#[test]
+fn native_task_json_frame_values_cannot_escape_or_be_reused_after_consumption() {
+    use ku::ir::{
+        task::{SlotId, TaskJsonOperation, TaskSlotType},
+        IrType,
+    };
+    let native = lowered_json(
+        r#"
+import json from "std.json"
+async fn main():null! {
+    value=json.decode("{\"a\":1}")?
+    leaf=value.take("a")?
+    number=leaf.as_int()?
+    println(number)
+    return ok(null)
+}
+"#,
+    );
+    task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    let json_slot=native.tasks.functions[0].slots.iter().position(|slot|
+        matches!(&slot.ty,TaskSlotType::Value{ty:IrType::Named(name),..} if name=="__ku_value")).unwrap();
+    let mut parameter = native.tasks.clone();
+    parameter.functions[0].parameters.push(SlotId(json_slot));
+    assert!(task::verify_and_plan(&parameter, Default::default())
+        .unwrap_err()
+        .message
+        .contains("cannot enter async parameters"));
+    let mut outcome = native.tasks.clone();
+    outcome.functions[0].result = IrType::Result(Box::new(IrType::Named("__ku_value".into())));
+    assert!(task::verify_and_plan(&outcome, Default::default())
+        .unwrap_err()
+        .message
+        .contains("function completion"));
+    for consuming in [TaskJsonOperation::Take, TaskJsonOperation::AsInt] {
+        let mut reused = native.tasks.clone();
+        let (state, index, source) = reused.functions[0]
+            .states
+            .iter()
+            .enumerate()
+            .find_map(|(state, block)| {
+                block
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, operation)| match operation {
+                        TaskOp::JsonValue {
+                            source, operation, ..
+                        } if *operation == consuming => Some((state, index, *source)),
+                        _ => None,
+                    })
+            })
+            .unwrap();
+        reused.functions[0].states[state]
+            .operations
+            .insert(index + 1, TaskOp::Read { slot: source });
+        assert!(task::verify_and_plan(&reused, Default::default())
+            .unwrap_err()
+            .message
+            .contains("not definitely initialized"));
     }
+}
+
+#[test]
+fn native_task_json_bytes_and_existing_methods_dispatch_receivers_once() {
+    let source = r#"
+import json from "std.json"
+import bytes from "std.bytes"
+async fn Text(marker:int,value:str):str! { println(marker) return ok(value) }
+async fn Index(marker:int):int! { println(marker) return ok(0) }
+async fn Key(marker:int):str! { println(marker) return ok("a") }
+async fn ByteNamed():null! {
+    value=bytes.from_str((await Text(1,"AB"))?)?
+    code=value.get((await Index(2))?)?
+    println(code)
+    copied=value.clone()
+    println(value.len())
+    println(copied.len())
+    return ok(null)
+}
+async fn JsonNamed():null! {
+    value=json.decode((await Text(5,"{\"a\":\"named\"}"))?)?
+    selected=value[(await Key(6))?]?
+    println(selected.as_str()?)
+    println(json.encode(value)?)
+    return ok(null)
+}
+async fn JsonTemporary():null! {
+    selected=(json.decode((await Text(7,"{\"a\":9}"))?)?)[(await Key(8))?]?
+    println(selected.as_int()?)
+    return ok(null)
+}
+async fn JsonTake():null! {
+    selected=(json.decode((await Text(9,"{\"a\":\"taken\"}"))?)?).take((await Key(10))?)?
+    println(selected.as_str()?)
+    return ok(null)
+}
+async fn ExistingMethods():null! {
+    values=[11,12]
+    cloned=values.clone()
+    println(values.len())
+    println(cloned.try_get((await Index(11))?)?)
+    value=(await Text(12,"plain"))?
+    copied=value.clone()
+    println(value.len())
+    println(copied.byte_len())
+    return ok(null)
+}
+async fn main():null! {
+    done=(await ByteNamed())?
+    done=(await JsonNamed())?
+    done=(await JsonTemporary())?
+    done=(await JsonTake())?
+    done=(await ExistingMethods())?
+    return ok(null)
+}
+"#;
+    let mut ast = parsed(source);
+    for name in ["std:json", "std:bytes"] {
+        ast.items.insert(
+            0,
+            ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: name.into(),
+                span: Default::default(),
+            }),
+        );
+    }
+    Checker::new()
+        .check(&ast)
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
+    let native =
+        task_lower::lower_program(&ast).unwrap_or_else(|error| panic!("{error}\n{source}"));
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let directory = TempDir::new("task-json-typed-methods");
+    let path = directory.path().join("methods.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "methods") else {
+        return;
+    };
+    let result = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8(result.stdout).unwrap().replace('\r', "");
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "1",
+            "2",
+            "65",
+            "2",
+            "2",
+            "5",
+            "6",
+            "named",
+            r#"{"a":"named"}"#,
+            "7",
+            "8",
+            "9",
+            "9",
+            "10",
+            "taken",
+            "2",
+            "11",
+            "11",
+            "12",
+            "5",
+            "5",
+        ]
+    );
 }
 
 #[test]
@@ -381,13 +561,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
         "true < false",
         "null == null",
         "\"a\" + 1",
-        "\"a\" == \"b\"",
         "ok(1) == ok(1)",
         "Child() == Child()",
         "1 && true",
         "true || 1",
         "false && (1 + true)",
-        "true || (\"a\" == \"a\")",
+        "true || (1 == true)",
     ] {
         // Deliberately bypass the checker: this internal backend API must still
         // reject wider types and must validate an unreachable RHS.
@@ -397,6 +576,12 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             error.message.contains("not support"),
             "{expression}: {error}"
         );
+    }
+    // String equality is already a supported read-only operation. Keep its
+    // positive source contract separate from genuinely invalid operand types.
+    for expression in ["\"a\" == \"b\"", "true || (\"a\" == \"a\")"] {
+        let source = format!("async fn main():null! {{ value={expression} return ok(null) }}");
+        task_lower::lower_program(&parsed(&source)).expect("supported string comparison");
     }
     // Parser/checker retain their separate, tighter depth limits. Construct a
     // typed AST only here to reach the lowerer's independent slot/depth gates;
