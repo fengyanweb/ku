@@ -3980,10 +3980,10 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
 #endif
   KuHttpConnection* connections=(KuHttpConnection*)calloc((size_t)slot_count,sizeof(KuHttpConnection));
   owner->connection_base=connections;
-  KuHttpPollFd* poll_items=(KuHttpPollFd*)calloc(poll_capacity,sizeof(KuHttpPollFd));
+  KuHttpPollFd* poll_items=(KuHttpPollFd*)malloc(poll_capacity*sizeof(KuHttpPollFd));
   int* active_indices=(int*)calloc((size_t)slot_count,sizeof(int));
   KuHttpPollConnection* poll_connections=(KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection));
-  void* net_storage=net_bytes?calloc(1,net_bytes):NULL;
+  void* net_storage=net_bytes?malloc(net_bytes):NULL;
 #if defined(KU_HTTP_HAS_TASK_NET)
   KuTaskNetPollV1* net_interests=(KuTaskNetPollV1*)net_storage;
 #endif

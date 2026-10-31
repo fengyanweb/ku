@@ -3471,6 +3471,55 @@ static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1* pool,size_t owne
     // include_str! preserves a Windows checkout's CRLF in the reactor C file.
     // Normalize this fixture's injection text, without changing emitted logic.
     generated = generated.replace("\r\n", "\n");
+    // The TCP fixture has no libpq dependency. Enable only the production
+    // collector's PG branch with a descriptor/deadline stub so a WAIT member
+    // with no FD still occupies snapshot scratch, but is not a poll result.
+    let job_header = "typedef struct KuTaskBlockingJobV1 {";
+    assert_eq!(generated.matches(job_header).count(), 1);
+    generated = generated.replacen(
+        job_header,
+        r#"
+    typedef struct FixturePgInterest {
+      uint64_t deadline; int phase,fd; unsigned int events;
+    } FixturePgInterest;
+    typedef struct KuTaskBlockingJobV1 {
+      FixturePgInterest* pg_operation;
+      uint32_t pg_ready;
+"#,
+        1,
+    );
+    let interests = "static size_t ku_task_net_interests(KuTaskBlockingPoolV1* pool,size_t owner,KuTaskNetPollV1* items,size_t capacity,uint64_t* deadline) {";
+    assert_eq!(generated.matches(interests).count(), 1);
+    generated = generated.replacen(interests, &format!(r#"
+static int fixture_pg_interest(FixturePgInterest* op,int* fd,unsigned int* events,unsigned long long* next) {{
+  *fd=op->fd;*events=op->events;*next=op->deadline;return 0;
+}}
+static int fixture_pg_can_dispose(FixturePgInterest* op) {{(void)op;return 1;}}
+static unsigned long long fixture_pg_now_ms(void) {{return ku_net_now_ms();}}
+#undef KU_TASK_BLOCKING_PG
+#define KU_TASK_BLOCKING_PG 1
+#define KuPgAsyncOp FixturePgInterest
+#define ku_pg_async_interest fixture_pg_interest
+#define ku_pg_async_can_dispose fixture_pg_can_dispose
+#define ku_pg_now_ms fixture_pg_now_ms
+#define KU_PG_ASYNC_DONE 77u
+{interests}
+"#), 1);
+    let after_interests = "typedef struct KuTaskNetWakeV1 {";
+    assert_eq!(generated.matches(after_interests).count(), 1);
+    generated = generated.replacen(
+        after_interests,
+        r#"
+#undef KU_TASK_BLOCKING_PG
+#define KU_TASK_BLOCKING_PG 0
+#undef KuPgAsyncOp
+#undef ku_pg_async_interest
+#undef ku_pg_async_can_dispose
+#undef ku_pg_now_ms
+#undef KU_PG_ASYNC_DONE
+typedef struct KuTaskNetWakeV1 {"#,
+        1,
+    );
     let scan = "    KuTaskBlockingJobV1* snapshot_job=&pool->jobs[member-1u];";
     assert_eq!(generated.matches(scan).count(), 1);
     generated = generated.replacen(scan, &format!("    fixture_net_scanned++;\n{scan}"), 1);
@@ -3478,6 +3527,23 @@ static uint32_t fixture_original_dispatch(KuTaskBlockingPoolV1* pool,size_t owne
         "{generated}\n{}",
         r#"
 #define CHECK(c) do {if(!(c)){fprintf(stderr,"late TCP readiness line %d: %s\n",__LINE__,#c);return 1;}}while(0)
+static int fixture_poisoned(const void* data,size_t bytes,unsigned char poison) {
+  const unsigned char* p=(const unsigned char*)data;
+  for(size_t i=0;i<bytes;i++)if(p[i]!=poison)return 0;
+  return 1;
+}
+/* Mirror both production callers' count guard. SIZE_MAX never authorizes
+   reading any partially built snapshot as a returned poll prefix. */
+static size_t fixture_collect_prefix(KuTaskBlockingPoolV1* pool,size_t owner,
+    KuTaskNetPollV1* items,size_t capacity,uint64_t* deadline,size_t* consumed) {
+  size_t count=ku_task_net_interests(pool,owner,items,capacity,deadline);*consumed=0;
+  if(count>capacity)return count;
+  for(size_t i=0;i<count;i++) {
+    if(!items[i].generation || !items[i].events || items[i].slot>=pool->capacity)abort();
+    (*consumed)++;
+  }
+  return count;
+}
 static int fixture_prepare_wait(KuTaskBlockingPoolV1* pool,size_t index,size_t owner,uint64_t generation,int cancelled,uint64_t deadline) {
   KuTaskBlockingJobV1* job=&pool->jobs[index];
   if(job->state==KU_TASK_BLOCKING_NET_WAIT)
@@ -3489,8 +3555,9 @@ static int fixture_prepare_wait(KuTaskBlockingPoolV1* pool,size_t index,size_t o
   return 0;
 }
 static int fixture_members(KuTaskBlockingPoolV1* pool,size_t owner,const size_t* expected,size_t count) {
-  KuTaskNetPollV1 items[8]={{0}};uint64_t deadline=UINT64_MAX;
+  KuTaskNetPollV1 items[8];memset(items,0xA5,sizeof(items));uint64_t deadline=UINT64_MAX;
   CHECK(ku_task_net_interests(pool,owner,items,8u,&deadline)==count);
+  CHECK(fixture_poisoned(items+count,(8u-count)*sizeof(*items),0xA5));
   for(size_t i=0;i<count;i++) {
     size_t seen=0;
     for(size_t j=0;j<count;j++)if(items[j].slot==expected[i])seen++;
@@ -3504,14 +3571,16 @@ int main(void) {
   KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*pool));
   CHECK(pool);uint64_t deadline=ku_task_driver_now_ms()+1000u;
   CHECK(ku_task_blocking_init(pool,KU_TASK_DRIVER_MAX_SLOTS,1u,deadline)==KU_TASK_DRIVER_OK);
-  KuTaskNetPollV1 interests[2]={{0}};uint64_t next=UINT64_MAX;
+  KuTaskNetPollV1 interests[2];memset(interests,0xA5,sizeof(interests));uint64_t next=UINT64_MAX;
   size_t before=fixture_locks;
   CHECK(ku_task_net_interests(NULL,0u,interests,2u,&next)==0u && fixture_locks==before);
   CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==0u);
   CHECK(fixture_locks-before==1u && !fixture_depth && next==UINT64_MAX);
   CHECK(!fixture_net_scanned && !pool->net_waiting[0]);
-  fixture_fail_after=1u;
+  CHECK(fixture_poisoned(interests,sizeof(interests),0xA5));
+  fixture_fail_after=1u;memset(interests,0x5A,sizeof(interests));
   CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==SIZE_MAX && !fixture_depth);
+  CHECK(fixture_poisoned(interests,sizeof(interests),0x5A) && next==UINT64_MAX);
   CHECK(!ku_net_socket_startup());
   for(size_t i=0;i<2u;i++) {
     fixture_clients[i].socket_value=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
@@ -3556,7 +3625,9 @@ int main(void) {
     CHECK(pool->net_waiting[0]==1u && !pool->net_waiting[1]);
     ku_task_blocking_unlock(pool);
     fixture_mode=mode;next=UINT64_MAX;before=fixture_locks;
-    size_t count=ku_task_net_interests(pool,0u,interests,2u,&next);
+    memset(interests,mode&1 ? 0xA5:0x5A,sizeof(interests));size_t consumed=99u;
+    size_t count=fixture_collect_prefix(pool,0u,interests,2u,&next,&consumed);
+    CHECK(!consumed); /* zero real interests or an explicit SIZE_MAX failure */
     CHECK(!fixture_depth && !fixture_bad_dispatch);
     if(mode==1) {
       /* A new generation is deliberately deferred to the next owner wake,
@@ -3582,6 +3653,52 @@ int main(void) {
   CHECK(pool->net_waiting[0]==1u);
   CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
   memset(job,0,sizeof(*job));
+  /* A PG WAIT member without a descriptor still needs a snapshot cell.
+     Reusing poisoned scratch across shrink/grow must publish only count. */
+  FixturePgInterest pg={deadline,1,-1,0};KuTaskNetPollV1 sparse[4];size_t consumed=99u;
+  /* The preceding original transition still owns the pool mutex here. */
+  CHECK(!fixture_prepare_wait(pool,index,0u,200u,0,deadline));
+  KuTaskBlockingJobV1* pg_job=&pool->jobs[3u];
+  memset(pg_job,0,sizeof(*pg_job));pg_job->generation=201u;pg_job->kind=9u;
+  pg_job->net_owner=1u;pg_job->net_deadline=deadline;pg_job->pg_operation=&pg;
+  CHECK(ku_task_blocking_net_state_locked(pool,pg_job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+  CHECK(pool->net_waiting[0]==2u);ku_task_blocking_unlock(pool);
+  memset(sparse,0xA5,sizeof(sparse));next=UINT64_MAX;
+  CHECK(fixture_collect_prefix(pool,0u,sparse,4u,&next,&consumed)==1u && consumed==1u);
+  CHECK(sparse[0].slot==index && sparse[0].generation==200u && next==deadline);
+  CHECK(fixture_poisoned(sparse+2u,2u*sizeof(*sparse),0xA5));
+  CHECK(!ku_task_blocking_lock(pool));
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  memset(job,0,sizeof(*job));CHECK(pool->net_waiting[0]==1u);ku_task_blocking_unlock(pool);
+  memset(sparse,0x5A,sizeof(sparse));next=UINT64_MAX;
+  CHECK(fixture_collect_prefix(pool,0u,sparse,4u,&next,&consumed)==0u && !consumed && next==deadline);
+  CHECK(fixture_poisoned(sparse+1u,3u*sizeof(*sparse),0x5A));
+  CHECK(!ku_task_blocking_lock(pool));
+  pg.fd=0;pg.events=KU_TASK_NET_READ; /* Valid PG metadata; this stub never polls an OS descriptor. */
+  CHECK(!fixture_prepare_wait(pool,index,0u,202u,0,deadline));
+  ku_task_blocking_unlock(pool);memset(sparse,0xA5,sizeof(sparse));next=UINT64_MAX;
+  CHECK(fixture_collect_prefix(pool,0u,sparse,4u,&next,&consumed)==2u && consumed==2u && next==deadline);
+  CHECK((sparse[0].slot==index && sparse[1].slot==3u) || (sparse[0].slot==3u && sparse[1].slot==index));
+  CHECK(fixture_poisoned(sparse+2u,2u*sizeof(*sparse),0xA5));
+  CHECK(!ku_task_blocking_lock(pool));
+  CHECK(ku_task_blocking_net_state_locked(pool,job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_net_state_locked(pool,pg_job,KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  memset(job,0,sizeof(*job));memset(pg_job,0,sizeof(*pg_job));
+  /* A broken second member can leave an initialized first snapshot behind.
+     The explicit error count must prevent consuming that half-built prefix. */
+  CHECK(!fixture_prepare_wait(pool,0u,0u,203u,0,deadline));
+  CHECK(!fixture_prepare_wait(pool,1u,0u,204u,0,deadline));
+  pool->jobs[0].generation=0;ku_task_blocking_unlock(pool);
+  memset(interests,0x5A,sizeof(interests));next=UINT64_MAX;
+  CHECK(fixture_collect_prefix(pool,0u,interests,2u,&next,&consumed)==SIZE_MAX && !consumed);
+  CHECK(interests[0].slot==1u && interests[0].generation==204u);
+  CHECK(fixture_poisoned(interests+1u,sizeof(*interests),0x5A) && next==UINT64_MAX);
+  CHECK(!ku_task_blocking_lock(pool));CHECK(pool->fault==KU_TASK_DRIVER_INTERNAL);
+  pool->jobs[0].generation=203u;pool->fault=0;
+  CHECK(ku_task_blocking_net_state_locked(pool,&pool->jobs[1],KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_net_state_locked(pool,&pool->jobs[0],KU_TASK_BLOCKING_DONE)==KU_TASK_DRIVER_OK);
+  memset(&pool->jobs[0],0,sizeof(*job));memset(&pool->jobs[1],0,sizeof(*job));
+  /* Resume the original following transitions with the mutex still held. */
   /* Head, middle and tail removal plus reinsertion preserve every remaining
      member exactly once. A repeated WAIT transition never duplicates a link. */
   const size_t nodes[]={index,5u,2u,0u};
@@ -3591,8 +3708,9 @@ int main(void) {
   CHECK(pool->net_waiting[0]==4u);
   ku_task_blocking_unlock(pool);
   before=fixture_net_scanned;CHECK(!fixture_members(pool,0u,nodes,4u));CHECK(fixture_net_scanned-before==4u);
-  next=UINT64_MAX;
-  CHECK(ku_task_net_interests(pool,0u,interests,2u,&next)==SIZE_MAX && !fixture_depth);
+  next=UINT64_MAX;memset(interests,0xA5,sizeof(interests));
+  CHECK(fixture_collect_prefix(pool,0u,interests,2u,&next,&consumed)==SIZE_MAX && !fixture_depth && !consumed);
+  CHECK(fixture_poisoned(interests,sizeof(interests),0xA5) && next==UINT64_MAX);
   CHECK(!ku_task_blocking_lock(pool));CHECK(pool->fault==KU_TASK_DRIVER_LIMIT);pool->fault=0;
   /* All affected links are checked before the first removal write. */
   uint32_t previous=pool->jobs[5].net_previous_plus_one;

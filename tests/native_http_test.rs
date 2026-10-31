@@ -289,7 +289,9 @@ fn spawn_native_server_settings_with_observation(
     let exe = if settings.iter().any(|(name, _)| {
         matches!(
             *name,
-            "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE" | "KU_NATIVE_HTTP_TEST_JOB_GATE"
+            "KU_NATIVE_HTTP_TEST_PEER_PAUSE_FILE"
+                | "KU_NATIVE_HTTP_TEST_JOB_GATE"
+                | "KU_NATIVE_HTTP_TEST_DIRTY_SCRATCH"
         )
     }) {
         // Observe the real positive MSG_PEEK -> pause transition without reading
@@ -444,6 +446,71 @@ fn spawn_native_server_settings_with_observation(
     if(fprintf(file,"%llu %llu %llu\n",connection->request_deadline,connection->deadline,
         ku_http_now_ms())<0 || fclose(file)) _Exit(91);
   }}"#),1);
+        }
+        if settings
+            .iter()
+            .any(|(name, _)| *name == "KU_NATIVE_HTTP_TEST_DIRTY_SCRATCH")
+        {
+            // Poison only the two real output allocations; no alternate owner
+            // or collector is substituted. The production poll writer must
+            // initialize every consumed field before the actual OS wait.
+            let helper = r#"
+static void* fixture_dirty_scratch_malloc(size_t bytes,unsigned char pattern) {
+  void* result=malloc(bytes);if(result)memset(result,pattern,bytes);return result;
+}
+"#;
+            witnessed = witnessed.replacen(
+                "typedef struct KuString {",
+                &format!("{helper}typedef struct KuString {{"),
+                1,
+            );
+            for (old, new) in [
+                (
+                    "malloc(poll_capacity*sizeof(KuHttpPollFd))",
+                    "fixture_dirty_scratch_malloc(poll_capacity*sizeof(KuHttpPollFd),0xA5)",
+                ),
+                (
+                    "net_bytes?malloc(net_bytes):NULL",
+                    "net_bytes?fixture_dirty_scratch_malloc(net_bytes,0x5A):NULL",
+                ),
+            ] {
+                assert_eq!(witnessed.matches(old).count(), 1);
+                witnessed = witnessed.replacen(old, new, 1);
+            }
+            let initialized = "  item->fd = socket_value; item->events = events;";
+            assert_eq!(witnessed.matches(initialized).count(), 1);
+            witnessed = witnessed.replacen(
+                initialized,
+                &format!("{initialized}\n  if(item->revents) _Exit(92);"),
+                1,
+            );
+            let wait="#if defined(KU_HTTP_PERSISTENT_EVENT_LOOP)\n    int selected=ku_http_reactor_wait(&reactor,poll_items,wait_ms);";
+            assert_eq!(witnessed.matches(wait).count(), 1);
+            witnessed = witnessed.replacen(
+                wait,
+                &format!(
+                    r#"
+    /* Deliberately readable/garbage unused descriptors must not enter wait. */
+    for(size_t unused=(size_t)poll_count;unused<poll_capacity;unused++)
+      poll_items[unused]=(KuHttpPollFd){{0,0x5A5A,0x5A5A}};
+{wait}"#
+                ),
+                1,
+            );
+            let after =
+                "#if defined(KU_HTTP_HAS_TASK_RUNTIME)\n    ku_http_task_io_batch_probe_result(";
+            assert_eq!(witnessed.matches(after).count(), 1);
+            witnessed = witnessed.replacen(
+                after,
+                &format!(
+                    r#"
+    for(size_t unused=(size_t)poll_count;unused<poll_capacity;unused++)
+      if(poll_items[unused].fd!=0 || poll_items[unused].events!=0x5A5A
+          || poll_items[unused].revents!=0x5A5A) _Exit(93);
+{after}"#
+                ),
+                1,
+            );
         }
         let witness_source = dir.join("server-peer-pause-witness.c");
         fs::write(&witness_source, witnessed).expect("write temporary peer pause witness");
@@ -7094,6 +7161,7 @@ fn main(): null! {{
         None,
         &[
             ("KU_EVENT_LOOPS", "2"),
+            ("KU_NATIVE_HTTP_TEST_DIRTY_SCRATCH", "1"),
             ("KU_BLOCKING_THREADS", "3"),
             ("KU_SERVICE_CONTROL_TOKEN", "net-regression"),
             ("KU_TASK_MAX_BYTES", "67108864"),
