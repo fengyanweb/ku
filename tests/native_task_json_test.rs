@@ -111,22 +111,7 @@ fn execute(name: &str, source: String) -> String {
 
 #[test]
 fn native_task_json_locals_survive_await_and_preserve_get_take_ownership() {
-    let source = r#"
-import json from "std.json"
-import time from "std.time"
-async fn tick():int! { time.sleep(2)? return ok(1) }
-async fn main():null! {
-    decoded=json.decode("{\"counter\":7,\"data\":{\"message\":\"中文😀\",\"items\":[1,true,null]}}")?
-    selected=decoded["counter"]?
-    counter=selected.as_int()?
-    copied=decoded["data"]?
-    next=(await tick())?
-    data=decoded.take("data")?
-    body=json.encode({counter:counter+next,id:"rid",data:data,copy:copied})?
-    println(body)
-    return ok(null)
-}
-"#;
+    let source = include_str!("../examples/task_json.ku");
     let generated = generated(source);
     assert!(generated.contains("ku_task_host_json_decode"));
     assert!(generated.contains("ku_task_host_json_take"));
