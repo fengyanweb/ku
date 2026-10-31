@@ -293,6 +293,39 @@ type secondStats struct {
 	completedKinds                    map[string]uint64
 }
 
+const (
+	errorSampleHTTP500 = iota
+	errorSampleOther5xx
+	errorSampleAdmission
+	errorSampleBodyProtocol
+	errorSampleDeadline
+	errorSampleOther
+	errorSampleClasses
+	errorSamplesPerClass = 4
+	maxErrorSamples      = errorSampleClasses * errorSamplesPerClass
+)
+
+var errorSampleClassNames = [errorSampleClasses]string{
+	"http_500", "other_http_5xx", "admission_429_503", "body_or_protocol", "timeout_or_not_started", "other_failure",
+}
+
+func errorSampleClass(r result) int {
+	switch {
+	case r.status == 500:
+		return errorSampleHTTP500
+	case r.status >= 500 && r.status < 600 && r.status != 503:
+		return errorSampleOther5xx
+	case r.status == 503 || r.status == 429:
+		return errorSampleAdmission
+	case r.category == "body_error" || r.category == "protocol_error":
+		return errorSampleBodyProtocol
+	case r.category == "timeout" || strings.HasPrefix(r.category, "not_started_"):
+		return errorSampleDeadline
+	default:
+		return errorSampleOther
+	}
+}
+
 // Completion history, producer counts/type registration, and resources have
 // separate lock domains. Only finish nests locks: mu -> planMu or resourceMu,
 // never the reverse. Resource sections contain scalar updates/copies only.
@@ -311,6 +344,8 @@ type ledger struct {
 	lastTerminalRID                                                   string
 	active, peakActive, live, peakLive, dials, peakQueue, poolExpired uint64
 	samples                                                           []map[string]any
+	sampleSlots                                                       [errorSampleClasses][errorSamplesPerClass]int
+	sampleCounts                                                      [errorSampleClasses]int
 	cancelSamples                                                     []map[string]any
 	events                                                            *eventWriter
 }
@@ -521,16 +556,49 @@ func (l *ledger) finish(j job, began time.Time, r result, c config) {
 	if r.category == "planned_reset" && len(l.cancelSamples) < 24 {
 		l.cancelSamples = append(l.cancelSamples, map[string]any{"rid": j.rid, "cpu_sequence": j.streamIndex, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "reset_due_ns": offset(r.cancelDue, l.origin), "reset_issued_ns": offset(r.cancelIssued, l.origin), "terminal_ns": r.completed.Sub(l.origin).Nanoseconds()})
 	}
-	if r.category != "correct" && r.category != "planned_reset" && len(l.samples) < 24 {
-		sample := map[string]any{"rid": j.rid, "index": j.index, "type": j.kind, "terminal": r.category, "status": r.status, "stage": r.stage, "detail": truncate(r.detail), "reused_connection": r.reused, "scheduled_ns": j.scheduled.Sub(l.origin).Nanoseconds(), "sent_ns": offset(r.sent, l.origin), "completed_ns": r.completed.Sub(l.origin).Nanoseconds(), "bytes_written": r.bytesWritten, "bytes_read": r.bytesRead}
-		if c.workload == "task_mix" {
-			sample["stream_index"], sample["planned_cpu_cancel"] = j.streamIndex, j.cpuCancel
-			sample["reset_due_ns"], sample["reset_issued_ns"] = offset(r.cancelDue, l.origin), offset(r.cancelIssued, l.origin)
-		}
-		l.samples = append(l.samples, sample)
+	if r.category != "correct" && r.category != "planned_reset" {
+		l.sampleError(j, r, c)
 	}
 	if l.events != nil {
 		l.events.offer(event{j: j, began: began, result: r, origin: l.origin})
+	}
+}
+
+// Caller holds mu. Six fixed classes reserve space for late HTTP500 even when
+// early admission rejections dominate. Keep at most four distinct examples per
+// class: the first three and a replaceable fourth. Reuse replacement maps so an
+// error flood cannot grow the retained history or allocate one map per error.
+func (l *ledger) sampleError(j job, r result, c config) {
+	class, detail := errorSampleClass(r), truncate(r.detail)
+	count := l.sampleCounts[class]
+	for _, index := range l.sampleSlots[class][:count] {
+		s := l.samples[index]
+		if s["type"] == j.kind && s["terminal"] == r.category && s["status"] == r.status && s["stage"] == r.stage && s["detail"] == detail {
+			return
+		}
+	}
+	var sample map[string]any
+	if count < errorSamplesPerClass {
+		l.sampleSlots[class][count] = len(l.samples)
+		l.sampleCounts[class]++
+		sample = make(map[string]any)
+		l.samples = append(l.samples, sample)
+	} else {
+		sample = l.samples[l.sampleSlots[class][errorSamplesPerClass-1]]
+		clear(sample)
+	}
+	// Copy only the retained prefix, rather than pinning a large response/error
+	// string through a 256-byte substring.
+	sample["rid"], sample["index"], sample["type"] = j.rid, j.index, j.kind
+	sample["terminal"], sample["status"], sample["stage"] = r.category, r.status, r.stage
+	sample["detail"], sample["sample_class"] = strings.Clone(detail), errorSampleClassNames[class]
+	sample["reused_connection"] = r.reused
+	sample["scheduled_ns"], sample["sent_ns"] = j.scheduled.Sub(l.origin).Nanoseconds(), offset(r.sent, l.origin)
+	sample["completed_ns"] = r.completed.Sub(l.origin).Nanoseconds()
+	sample["bytes_written"], sample["bytes_read"] = r.bytesWritten, r.bytesRead
+	if c.workload == "task_mix" {
+		sample["stream_index"], sample["planned_cpu_cancel"] = j.streamIndex, j.cpuCancel
+		sample["reset_due_ns"], sample["reset_issued_ns"] = offset(r.cancelDue, l.origin), offset(r.cancelIssued, l.origin)
 	}
 }
 func offset(t, origin time.Time) any {
@@ -1436,6 +1504,11 @@ func run(c config) (map[string]any, error) {
 	}
 	out := map[string]any{"schema": "ku-cross-stack-client-v5", "valid_driver": valid, "ledger": l.all.view(c.duration.Seconds()), "by_type": byType, "per_second": seconds, "first_errors": l.samples, "events": events, "resources": map[string]any{"pid": os.Getpid(), "go_version": runtime.Version(), "gomaxprocs": runtime.GOMAXPROCS(0), "dials": finalResources.dials, "pool_idle_expirations": finalResources.poolExpired, "requests_per_dial": float64(l.all.Sent) / float64(max(finalResources.dials, 1)), "peak_connections": finalResources.peakLive, "connections_after_cleanup": finalResources.live, "peak_inflight": finalResources.peakActive, "active_after_cleanup": finalResources.active, "queue_peak": finalResources.peakQueue, "histogram_unique_buckets": l.budget.keys, "histogram_cells_per_distribution": maxHistogramKeys, "histogram_overflow": l.budget.overflow}, "configuration": map[string]any{"address": c.address, "workload": c.workload, "protocol_sha256": c.protocolHash, "corpora_sha256": hashes, "duration_seconds": c.duration.Seconds(), "rate": c.rate, "concurrency": c.concurrency, "queue": c.queue, "timeout_seconds": c.timeout.Seconds(), "absolute_deadline_origin": "scheduled_at; includes client queue, dial, write and complete response", "keepalive_idle_ms": c.idle.Milliseconds(), "rid_prefix": c.prefix, "no_retry": true, "http": "1.1 keep-alive; no TLS/proxy/pipeline/compression", "primary_latency": "scheduled_to_complete", "sent_definition": "first socket Write that returned n>0, timestamp before that Write; dial failures are attempted but unsent", "event_clock": "nanoseconds relative to run origin, Go monotonic clock; sent null if no bytes written", "origin_unix_ns": l.origin.UnixNano(), "cleanup_seconds": finished.Sub(l.cutoff).Seconds(), "histogram_minimum_resolution_us": 10, "histogram_maximum_relative_bucket_width": 1.0 / 128, "event_compression": "gzip.BestSpeed", "validation_in_driver_cost": true}}
 
+	out["first_errors_policy"] = map[string]any{
+		"total_limit": maxErrorSamples, "per_class_limit": errorSamplesPerClass, "classes": errorSampleClassNames,
+		"selection":          "up to four distinct examples per class; keep first three and replace fourth for a new example",
+		"detail_limit_bytes": 256, "scope": "bounded evidence only; complete outcome counters are unchanged; driver identity differs from older captures",
+	}
 	clocks := out["configuration"].(map[string]any)
 	if c.responseLiteralSet {
 		literalHash := sha256.Sum256([]byte(c.responseLiteral))

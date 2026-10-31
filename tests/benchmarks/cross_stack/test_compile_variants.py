@@ -177,7 +177,7 @@ class HostedWorkflowContracts(unittest.TestCase):
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
         self.assertIn("task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json)",job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
@@ -212,7 +212,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
-        self.assertIn('timeout-minutes: ${{ inputs.final_task_json && 150 || 130 }}',run)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.final_task_json && 150 || 130 }}',run)
         for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
             self.assertNotIn(sdk,job)
 
@@ -221,12 +221,31 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),1)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),2)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
         self.assertIn('goal_status',archive)
         self.assertNotIn('path: ${{ runner.temp }}/ku-performance-v2\n',job)
+
+    def test_pg_failure_probe_is_explicit_fresh_diagnostic_and_exports_only_small_receipts(self):
+        text,job=self.workflow()
+        self.assertIn('pg_failure_probe:\n',text)
+        self.assertIn("KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}",job)
+        verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
+        for check in ('test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic',
+                'test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false',
+                'test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false',
+                'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false',
+                'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
+            self.assertIn(check,verify)
+        self.assertEqual(job.count('performance_task_json_args+=(--pg-failure-probe)'),2)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.final_task_json && 150 || 130 }}',job)
+        small=job.split('- name: Retain the small redacted PG failure observation',1)[1]
+        self.assertIn('if: always() && inputs.pg_failure_probe',small)
+        self.assertIn('name: ku-pg-failure-observation',small)
+        self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-failure-observation',small)
+        self.assertNotIn('*.csv',small);self.assertNotIn('bin/',small)
 
 
 class BatchWindowTests(unittest.TestCase):

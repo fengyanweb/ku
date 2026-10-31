@@ -365,6 +365,22 @@ class MeasurementRulesTest(unittest.TestCase):
             self.assertEqual(receipt['cleanup']['termination']['exit_code'],0)
             self.assertEqual(read_json(case.path/'warmups/ku-001/client.json')['ledger'],original['ledger'])
 
+    def test_preparation_client_failure_keeps_existing_metrics_without_report_or_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            case,service,_=self.preparation_case(folder,'warmup')
+            case.h.client.side_effect=OSError('fixture client did not write a report')
+            def metrics():
+                self.assertFalse(service.stopped)
+                return {'database':{'pg_acquire_failures':[{'code':'query_timeout'}]}}
+            service.metrics.side_effect=metrics
+            with self.assertRaisesRegex(RuntimeError,'preparation'):
+                case.activate('ku')
+            case.h.client.assert_called_once();service.metrics.assert_called_once();service.stop.assert_called_once()
+            receipt=read_json(case.path/'preparation-failure.json')
+            self.assertEqual(receipt['status'],'failed');self.assertFalse(receipt['target_window_started'])
+            self.assertEqual(receipt['runtime_before_cleanup']['metrics']['database']['pg_acquire_failures'][0]['code'],'query_timeout')
+            self.assertTrue(receipt['cleanup']['natural_exit_verified'])
+
     def test_target_cache_without_preparation_policy_is_not_reused(self):
         with tempfile.TemporaryDirectory() as folder:
             case,service,_=self.preparation_case(folder,'prime',bad=False)
@@ -693,6 +709,70 @@ class FocusCycleTests(unittest.TestCase):
                     'qualification':{'qualified':not invalid and not failed},'natural_reclamation':True,
                     'formal_duration':kwargs['job']['phase']=='final','comparison_contract':{'same':'contract'}}
         return run
+
+    def test_failed_warmup_keeps_one_ku_snapshot_before_cleanup_without_retry(self):
+        for issue in (None, 'timeout', 'write', 'rust', 'missing-control'):
+            with self.subTest(issue=issue), tempfile.TemporaryDirectory() as directory:
+                plan=self.plan();trace=[];stack='rust' if issue=='rust' else 'ku'
+                plan['versions']['B']['stack']=stack
+                warm={'assessment':{'functional_valid':False,'accounting_valid':True,
+                    'arrival_schedule_quality':'fail','environment_quality':'pass','measurement_invalid':False},
+                    'ledger':{'planned':128000,'http_500_total':217,'results':{'other_http':217}}}
+                service=types.SimpleNamespace(startup={},stopped=False,management_address='127.0.0.1:1234',control_token='fixture')
+                if issue=='missing-control':service.control_token=None
+                def metrics(*, timeout):
+                    self.assertFalse(service.stopped)
+                    self.assertEqual(timeout,.5);trace.append('metrics')
+                    if issue=='timeout':raise TimeoutError('bounded socket observation failed')
+                    return {'database':{'pg_acquire_failures':[{'code':'query_timeout'}]}}
+                service.metrics=metrics
+                class FakeHarness:
+                    def __init__(self,*unused):
+                        self.manifest={'driver_cores':1,'driver_cpuset':'2','quality_policy':{}}
+                        self.services=[]
+                    def start(self,*unused,**kwargs):
+                        trace.append('start');self.services.append(service);return service
+                    def client(self,*args,**kwargs):
+                        self_outer.assertEqual(kwargs,{'runtime_metrics':False})
+                        trace.append('client');return copy.deepcopy(warm)
+                    def close(self):
+                        trace.append('close');service.stopped=True;return []
+                self_outer=self
+                original_write=focus_cycle.write_json
+                def write(path,value):
+                    if issue=='write' and Path(path).name=='runtime-after-failure.json':
+                        raise OSError('fixture output unavailable')
+                    return original_write(path,value)
+                output=Path(directory)/'window'
+                with mock.patch.object(focus_cycle,'Harness',FakeHarness), mock.patch.object(focus_cycle,'write_json',side_effect=write):
+                    row=focus_cycle.window(plan,'B','db',12800,10,30,output,binding=self.binding(plan,'B'))
+                self.assertEqual(trace.count('client'),1)
+                self.assertEqual(trace[-1],'close')
+                self.assertEqual(row['status'],'warmup_failure')
+                self.assertFalse(row['score_started']);self.assertFalse(row['functional_valid'])
+                self.assertEqual(row['warmup_ledger'],warm['ledger'])
+                observation=row['warmup_failure_observation']
+                if issue=='write':
+                    self.assertIsNone(observation['path']);self.assertIn('write_error',observation)
+                else:
+                    recorded=read_json(observation['path'])
+                    self.assertEqual(recorded['socket_timeout_seconds'],.5)
+                    self.assertEqual(recorded['maximum_response_bytes'],1<<20)
+                    self.assertGreaterEqual(recorded['elapsed_seconds'],0)
+                    if issue is None:
+                        self.assertEqual(recorded['status'],'observed')
+                        self.assertEqual(recorded['metrics']['database']['pg_acquire_failures'][0]['code'],'query_timeout')
+                    else:
+                        self.assertEqual(recorded['status'],'unavailable');self.assertIn('reason',recorded)
+                self.assertEqual(trace.count('metrics'),0 if issue in ('rust','missing-control') else 1)
+
+    def test_ku_management_snapshot_uses_control_address_and_requested_socket_timeout(self):
+        service=linux_harness.Service(None,'ku','public:80',None,None,None,{'cores':2},
+                                     management_address='control:81',control_token='fixture')
+        with mock.patch.object(linux_harness,'request',return_value=(200,b'{"loops":[{},{}]}')) as request:
+            service.metrics(timeout=.5)
+        request.assert_called_once_with('control:81','/__ku/metrics',
+            headers={'X-Ku-Control-Token':'fixture'},timeout=.5)
 
     def test_old_flags_and_final_duration_remain_explicit(self):
         p=self.plan()

@@ -661,12 +661,12 @@ class Service:
     management_address: str | None = None
     control_token: str | None = None
     stopped: bool = False
-    def metrics(self):
+    def metrics(self, *, timeout=2):
         if self.stack == 'ku':
             status, body = request(self.management_address, '/__ku/metrics',
-                                   headers={'X-Ku-Control-Token': self.control_token})
+                                   headers={'X-Ku-Control-Token': self.control_token}, timeout=timeout)
         else:
-            status, body = request(self.address, '/metrics')
+            status, body = request(self.address, '/metrics', timeout=timeout)
         if status != 200:
             raise RuntimeError(f'metrics HTTP {status}')
         result=json.loads(body)
@@ -1604,6 +1604,10 @@ class Case:
         write_json(marker,receipt)
         try: metrics=service.metrics()
         except Exception as error: metrics={'observation_error':str(error)}
+        # Keep the already-collected snapshot even when the failed client did
+        # not leave the complete report needed by full_lifecycle_cost below.
+        receipt['runtime_before_cleanup']={'metrics':metrics,
+            'scope':'Existing preparation-failure observation before Service.stop; no additional request or retry.'}
         try:
             termination=service.stop(); after=termination.get('after',{})
             natural=(service_termination_succeeded(stack,termination) and termination.get('cgroup_removed') is True

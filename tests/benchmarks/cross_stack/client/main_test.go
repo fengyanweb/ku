@@ -29,6 +29,84 @@ func testConfig(t *testing.T) config {
 	return c
 }
 func testLedger() *ledger { return &ledger{all: newStats(), types: map[string]*stats{}} }
+
+func TestErrorSamplesRetainLateHTTP500WithoutChangingCounters(t *testing.T) {
+	c := testConfig(t)
+	c.workload = "db"
+	origin := time.Unix(100, 0)
+	l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, 1), origin: origin, cutoff: origin.Add(time.Second)}
+	record := func(index int, status int, category, detail string) {
+		j := job{index: uint64(index), kind: "db", rid: fmt.Sprint(index), scheduled: origin}
+		l.plan(j)
+		l.start()
+		l.finish(j, origin, result{category: category, status: status, detail: detail, stage: "complete_body", sent: origin, completed: origin.Add(time.Millisecond)}, c)
+	}
+	// The former first24 policy lost every later HTTP500 after this flood.
+	for i := 0; i < 100; i++ {
+		record(i, 503, "rejected_503", fmt.Sprintf("database_error:pool_busy_%d", i))
+	}
+	for i := 0; i < 6; i++ {
+		record(100+i, 500, "other_http", fmt.Sprintf("database_error:query_failure_%d", i))
+	}
+	if l.all.Planned != 106 || l.all.Sent != 106 || l.all.http500 != 6 || l.all.Results["rejected_503"] != 100 || l.all.Results["other_http"] != 6 || l.active != 0 {
+		t.Fatalf("sampling changed complete accounting: %+v", l.all)
+	}
+	seen := map[string]bool{}
+	for _, sample := range l.samples {
+		if sample["status"] == 500 {
+			seen[sample["detail"].(string)] = true
+		}
+	}
+	for _, i := range []int{0, 1, 2, 5} {
+		if !seen[fmt.Sprintf("database_error:query_failure_%d", i)] {
+			t.Fatal("late500 detail missing", seen)
+		}
+	}
+	if len(l.samples) != 8 || len(seen) != 4 {
+		t.Fatal("fixed per-class budget changed", l.samples)
+	}
+}
+
+func TestErrorSamplesBoundClassesDetailsAndRepeatedFailures(t *testing.T) {
+	l := testLedger()
+	c := config{}
+	classes := []result{
+		{status: 500, category: "other_http"},
+		{status: 502, category: "other_http"},
+		{status: 503, category: "rejected_503"},
+		{status: 200, category: "body_error"},
+		{category: "timeout"},
+		{category: "connection_error"},
+	}
+	for _, r := range classes {
+		for i := 0; i < 6; i++ {
+			r.detail = fmt.Sprint(i) + strings.Repeat("x", 1024)
+			l.sampleError(job{kind: "db", rid: fmt.Sprint(i)}, r, c)
+		}
+	}
+	if len(l.samples) != maxErrorSamples || maxErrorSamples != 24 {
+		t.Fatal("retained error history grew", len(l.samples))
+	}
+	for _, sample := range l.samples {
+		if len(sample["detail"].(string)) != 256 {
+			t.Fatal("unbounded detail retained", sample)
+		}
+	}
+	for class, r := range classes {
+		if l.sampleCounts[class] != errorSamplesPerClass {
+			t.Fatal("class budget differs", l.sampleCounts)
+		}
+		// Same failure with a different RID does not spend another slot or
+		// discard a distinct class representative.
+		r.detail = "5" + strings.Repeat("x", 1024)
+		before := l.samples[l.sampleSlots[class][3]]["rid"]
+		l.sampleError(job{kind: "db", rid: "duplicate"}, r, c)
+		if l.samples[l.sampleSlots[class][3]]["rid"] != before {
+			t.Fatal("duplicate replaced distinct evidence")
+		}
+	}
+}
+
 func testWorker(c config, l *ledger) worker {
 	return worker{c: c, l: l, pool: newConnectionPool(c, l)}
 }

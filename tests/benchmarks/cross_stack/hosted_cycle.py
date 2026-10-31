@@ -34,6 +34,9 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'pg_failure_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
+            ('task_json_screen','common_http_screen','final_task_json'))):
+        raise ValueError('--pg-failure-probe requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'final_task_json',False) and (build_set!='full' or getattr(a,'task_json_screen',False) or getattr(a,'common_http_screen',False)):
         raise ValueError('--final-task-json requires full build-set and cannot select followup screens')
     if getattr(a,'task_json_screen',False) and build_set!='followup-screen':
@@ -46,7 +49,7 @@ def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
     return dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
         prepatch=a.prepatch if build_set=='followup-screen' else None,screen_variants=a.screen_variants,
-        task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False))
+        task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
 
 
 def require_task_json_support(root):
@@ -196,6 +199,18 @@ def diagnostic_plan(versions):
               'No A0, typed/direct alternatives, compiler variants, capacity or 30-minute acceptance. '
               'D CPU is diagnostic only; inclusive samples overlap and cannot be added. '
               'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
+
+
+def pg_failure_plan(versions):
+    """One identified normal Ku pressure point; failure evidence, never a score."""
+    return dict(schema='ku-hosted-pg-failure-probe-v1',versions=versions,
+        resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
+        pg_failure_probe=dict(name='B',workload='db',rate=12800,warmup_seconds=10,
+            score_seconds=30,contract='pg-default'),maximum_windows=1,maximum_replacements=0,
+        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+        observation_alarm_seconds=120,workflow_limit_seconds=180,
+        purpose='Investigate HTTP500 at the original12800/s PG point. No SQL retry, changed timeout, '
+                'new matrix, perf probe or performance acceptance. A captured failure remains a failure.')
 
 
 def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False,common_http_screen=False):
@@ -471,7 +486,10 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False)) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions,final_task_json=final_task_json)
+    if getattr(a,'pg_failure_probe',False):plan=pg_failure_plan(versions)
+    elif build_set=='followup-screen':plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False))
+    elif diagnostic:plan=diagnostic_plan(versions)
+    else:plan=frozen_plan(versions,final_task_json=final_task_json)
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
@@ -893,7 +911,127 @@ def task_json_screen(rows,case,slo):
               'not an original sixteen-goal result or proof from changing the fixture declaration alone')
 
 
+def pg_failure_export(a,directory):
+    """Small redacted receipts only; raw originals remain in the full archive."""
+    output=a.root/'pg-failure-observation';output.mkdir(exist_ok=False);output.chmod(0o755)
+    entries=[];skipped=[];total=0;paths=[];metadata_reserve=128<<10
+    for path in directory.rglob('*'):
+        if not path.is_file() or path.is_symlink() or path.suffix not in ('.json','.log'):continue
+        if len(paths)>=64:
+            skipped.append(dict(path='*',reason='small artifact64-file limit; other raw receipts retained'));break
+        paths.append(path)
+    for path in sorted(paths):
+        relative=path.relative_to(directory)
+        if len(str(relative))>512:
+            skipped.append(dict(path=str(relative)[:512],reason='receipt path exceeds512 characters'));continue
+        if path.stat().st_size>2<<20:
+            skipped.append(dict(path=str(relative),reason='receipt exceeds2MiB; retained in full archive'));continue
+        raw=path.read_bytes()
+        try:data=encoded(redact(json.loads(raw),a.root)) if path.suffix=='.json' else redact(raw.decode(),a.root).encode()
+        except (ValueError,UnicodeError):
+            skipped.append(dict(path=str(relative),reason='unreadable text receipt; raw not exported'));continue
+        if total+len(data)>(8<<20)-metadata_reserve:
+            skipped.append(dict(path=str(relative),reason='small artifact8MiB limit; retained in full archive'));continue
+        dest=output/relative;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data);dest.chmod(0o644);total+=len(data)
+        parent=dest.parent
+        while parent!=output:
+            parent.chmod(0o755);parent=parent.parent
+        entries.append(dict(path=str(relative),original_sha256=hashlib.sha256(raw).hexdigest(),
+            exported_sha256=hashlib.sha256(data).hexdigest(),bytes=len(data)))
+    record=dict(schema='ku-pg-failure-small-artifact-v1',entries=entries,skipped=skipped,bytes=total,
+        metadata_reservation_bytes=metadata_reserve,total_limit_bytes=8<<20,
+        raw_receipts_in_full_archive=True,redacted=True,normal_score_eligible=False)
+    data=encoded(record)
+    if len(data)>metadata_reserve:raise ValueError('small artifact metadata limit exceeded')
+    (output/'export.json').write_bytes(data);(output/'export.json').chmod(0o644)
+    return record
+
+
+def pg_failure_probe(a,state):
+    if os.geteuid()!=0:raise ValueError('PG failure probe requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan!=pg_failure_plan(plan.get('versions',{})):raise ValueError('matching frozen PG failure probe plan required')
+    binding=fc.version_identity(plan,'B');mode=binding['build_mode']
+    expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
+        pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    if binding['stack']!='ku' or mode!=expected:raise ValueError('PG failure probe requires identified normal Release C11O2/helpers/text/async/int')
+    directory=a.root/'pg-failure-probe';directory.mkdir(exist_ok=False)
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None
+    result=dict(schema='ku-pg-failure-observation-v1',diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,candidate_accepted=False,goal_status='unknown',execution_complete=False,
+        contract=plan['pg_failure_probe'],maximum_windows=1,windows_attempted=0,
+        no_retry=True,perf_executed=False,scope=plan['purpose'])
+    began=time.monotonic()
+    class ProbeHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+    try:
+        fixture.start();private=load(a.root/'fixture/manifest.json')
+        save(directory/'identity.json',dict(binding=binding,resources=plan['resources'],quality_policy=plan['quality_policy'],
+            database_limits=load(fixture.state_path)['limits'],contract=plan['pg_failure_probe'],
+            boot_sha256=sha('/proc/sys/kernel/random/boot_id'),purpose=plan['purpose']))
+        fc.Harness=ProbeHarness;c=plan['pg_failure_probe'];output=directory/'window'
+        result['windows_attempted']=1
+        try:
+            row=fc.window(plan,c['name'],c['workload'],c['rate'],c['warmup_seconds'],c['score_seconds'],
+                output,binding=binding,job={'phase':'diagnostic','contract':c['contract']})
+        except Exception as error:
+            row=load(output/'window.json') if (output/'window.json').is_file() else {}
+            row['observer_error']=repr(error)
+        result['window']=row
+        clients=[]
+        for phase in ['warmup',*(['score'] if row.get('score_started') else [])]:
+            report=output/phase/'client.json';path=output/phase/'driver-cleanup.json'
+            record=dict(phase=phase,report_present=report.is_file(),cleanup_present=path.is_file(),cleanup_ok=False)
+            if report.is_file() and report.stat().st_size<=2<<20:
+                client=load(report);policy=client.get('first_errors_policy',{})
+                record.update(report_sha256=sha(report),first_errors_policy=policy,
+                    first_errors=client.get('first_errors',[])[:24],results=client.get('ledger',{}).get('results',{}),
+                    error_sampling_policy_valid=policy.get('total_limit')==24 and policy.get('per_class_limit')==4
+                        and policy.get('detail_limit_bytes')==256 and 'http_500' in policy.get('classes',[]))
+            if path.is_file() and path.stat().st_size<=2<<20:
+                cleanup_receipt=load(path);record['cleanup_sha256']=sha(path)
+                record['cleanup_ok']=(cleanup_receipt.get('process_reaped') is True
+                    and cleanup_receipt.get('cgroup_removed') is True
+                    and cleanup_receipt.get('after',{}).get('process_count')==0)
+            clients.append(record)
+        result['client_evidence']=clients
+        result['driver_cleanup_ok']=bool(clients) and all(x['report_present'] and x['cleanup_ok'] for x in clients)
+        result['error_evidence_ready']=bool(clients) and all(x.get('error_sampling_policy_valid') is True for x in clients)
+        term=row.get('termination');cleanup=row.get('cleanup',[])
+        natural=(isinstance(term,dict) and fc.service_termination_succeeded('ku',term)) or (
+            bool(cleanup) and all(fc.service_termination_succeeded('ku',x) for x in cleanup))
+        result.update(functional_valid=row.get('functional_valid'),accounting_valid=row.get('accounting_valid'),
+            natural_reclamation=natural,
+            record_obtained=row.get('status') in ('warmup_failure','observed','functional_failure','accounting_failure')
+                and 'observer_error' not in row)
+    except BaseException as error:
+        result.update(observer_error=repr(error),observation_interrupted=isinstance(error,(KeyboardInterrupt,SystemExit)))
+        if not isinstance(error,Exception):raise
+    finally:
+        fc.Harness=original
+        try:result['database_cleanup']=fixture.stop()
+        except Exception as error:result['database_cleanup']={'error':repr(error)}
+        state['database_cleanup']=result['database_cleanup']
+        cleanup=result['database_cleanup'];database_ok=(cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True
+            and cleanup.get('after',{}).get('process_count')==0)
+        result['seconds']=time.monotonic()-began
+        result['execution_complete']=(result.get('record_obtained') is True and result.get('natural_reclamation') is True
+            and result.get('driver_cleanup_ok') is True and result.get('error_evidence_ready') is True
+            and database_ok and result['seconds']<=180 and 'observer_error' not in result)
+        result['goal_status']='unknown' if result['execution_complete'] else 'blocked'
+        save(directory/'summary.json',result)
+        try:result['small_artifact']=pg_failure_export(a,directory)
+        except Exception as error:
+            result.update(execution_complete=False,goal_status='blocked',small_artifact_error=repr(error))
+            save(directory/'summary.json',result);raise
+        save(a.root/'hosted-state.json',state)
+    return result
+
+
 def diagnostic(a,state,followup=False):
+    if getattr(a,'pg_failure_probe',False):return pg_failure_probe(a,state)
     import http_cost_diagnostic as hcd
     if os.geteuid()!=0:raise ValueError('diagnostic requires root cgroup control')
     plan=load(a.root/'frozen-plan.json')
@@ -1436,9 +1574,11 @@ def main(argv=None):
     p.add_argument('--task-json-screen',action='store_true',help='Explicit separate native Task JSON comparison; followup-screen only, never an implicit product-capability switch')
     p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
+    p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
+    if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
     a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -1461,7 +1601,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.pg_failure_probe else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

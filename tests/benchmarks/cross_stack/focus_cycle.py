@@ -215,6 +215,32 @@ def window(plan, name, workload, rate, warmup, duration, output, *, job=None, bi
                     key: warm['assessment'][key] for key in ('functional_valid', 'accounting_valid',
                         'arrival_schedule_quality', 'environment_quality', 'measurement_invalid')})
                 row['warmup_ledger'] = warm['ledger']
+                # Preserve one failure-time snapshot before finally closes the
+                # service. No score/recovery/retry follows a failed warmup.
+                observation = {'status':'unavailable', 'started_unix_ns':time.time_ns(),
+                    'socket_timeout_seconds':.5, 'maximum_response_bytes':1<<20,
+                    'scope':'One Ku management snapshot before owned cleanup; socket timeout is not a hard total wall deadline.'}
+                began = time.monotonic()
+                if stack != 'ku':
+                    observation['reason'] = 'Ku management metrics are not available for this stack'
+                elif not getattr(s, 'management_address', None) or not getattr(s, 'control_token', None):
+                    observation['reason'] = 'Ku management address or control token unavailable'
+                else:
+                    try:
+                        observation.update(status='observed', metrics=s.metrics(timeout=.5))
+                    except Exception as error:
+                        observation['reason'] = repr(error)
+                observation.update(ended_unix_ns=time.time_ns(), elapsed_seconds=time.monotonic()-began)
+                path = output/'warmup/runtime-after-failure.json'
+                row['warmup_failure_observation'] = {key:observation[key] for key in
+                    ('status', 'started_unix_ns', 'ended_unix_ns', 'elapsed_seconds')}
+                try:
+                    write_json(path, observation)
+                    row['warmup_failure_observation']['path'] = str(path)
+                except OSError as error:
+                    # An observer failure must not erase the known HTTP500 or
+                    # turn this into a retryable/missing preparation window.
+                    row['warmup_failure_observation'].update(status='unavailable', path=None, write_error=repr(error))
                 return row
         row['score_started'] = True
         write_json(output/'progress.json', row)

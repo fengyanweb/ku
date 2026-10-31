@@ -13,6 +13,113 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_pg_failure_probe_is_one_identified_non_scoring_point(self):
+        versions={'B':{'root':'/unused/B','stack':'ku'}}
+        plan=h.pg_failure_plan(versions)
+        self.assertEqual(plan['pg_failure_probe'],dict(name='B',workload='db',rate=12800,
+            warmup_seconds=10,score_seconds=30,contract='pg-default'))
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(1,0))
+        self.assertEqual(plan['resources'],h.RESOURCES);self.assertEqual(plan['quality_policy'],h.POLICY)
+        self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
+        self.assertNotIn('schedule',plan);self.assertNotIn('targets',plan);self.assertNotIn('capacity',plan)
+
+    def test_pg_failure_selection_rejects_other_screens_and_phases(self):
+        import io
+        from contextlib import redirect_stderr
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.BASELINE,screen_variants=[])
+        ordinary=types.SimpleNamespace(**base)
+        explicit=types.SimpleNamespace(**base,pg_failure_probe=True)
+        self.assertFalse(h.hosted_identity(ordinary,'diagnostic')['pg_failure_probe'])
+        self.assertTrue(h.hosted_identity(explicit,'diagnostic')['pg_failure_probe'])
+        for mode,extra in [('full',{}),('followup-screen',{}),('diagnostic',{'final_task_json':True}),
+                ('diagnostic',{'common_http_screen':True}),('diagnostic',{'task_json_screen':True})]:
+            with self.subTest(mode=mode,extra=extra),self.assertRaisesRegex(ValueError,'--pg-failure-probe'):
+                h.validate_screen_selection(types.SimpleNamespace(**base,pg_failure_probe=True,**extra),mode)
+        with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as invalid:
+            h.main(['--phase','run','--build-set','diagnostic','--pg-failure-probe','--candidate','b'*40,
+                '--root','/unused','--source','/unused','--tools','/unused'])
+        self.assertEqual(invalid.exception.code,2)
+
+    def test_pg_failure_window_records_failure_once_without_perf_and_checks_cleanup(self):
+        for issue in ('failure','success','service-cleanup','driver-cleanup','database-cleanup','observer','old-driver'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.pg_failure_plan({'B':{'root':str(root/'B'),'stack':'ku'}})
+                h.save(root/'frozen-plan.json',plan)
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'})
+                h.save(dbstate,{'limits':{'cpuset.cpus':'3','memory.max':'536870912'}})
+                closed=[];fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:closed.append(True) or dict(forced=issue=='database-cleanup',cgroup_removed=True,after={'process_count':0}))
+                binding={'stack':'ku','source_commit':'b'*40,'build_mode':dict(formatting_mode='helpers',json_response_mode='text',
+                    json_execution_mode='worker',pg_execution_mode='async',pg_read_mode='int',
+                    native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})}
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(fc,'version_identity',return_value=binding))
+                raw_sha=h.sha;patches.enter_context(patch.object(h,'sha',side_effect=lambda p:'f'*64 if str(p)=='/proc/sys/kernel/random/boot_id' else raw_sha(p)))
+                perf=patches.enter_context(patch.object(h,'perf_capability'))
+                matrix=patches.enter_context(patch.object(fc,'execute'))
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    self.assertEqual((name,workload,rate,warmup,duration),('B','db',12800,10,30))
+                    self.assertEqual(kwargs['job'],{'phase':'diagnostic','contract':'pg-default'})
+                    cleanup=dict(forced=issue=='service-cleanup',cgroup_removed=True,exit_code=0)
+                    row=dict(status='observed' if issue=='success' else 'warmup_failure',functional_valid=issue=='success',score_started=issue=='success',
+                        accounting_valid=True,cleanup=[cleanup],warmup_ledger={'results':{'http_500':217}})
+                    for phase in ['warmup',*(['score'] if issue=='success' else [])]:
+                        h.save(Path(output)/phase/'client.json',{'first_errors':[{'detail':'database_error:acquire_timeout'}],
+                            'first_errors_policy':{} if issue=='old-driver' else dict(total_limit=24,per_class_limit=4,detail_limit_bytes=256,classes=['http_500']),
+                            'db_url':'postgresql://private@localhost/test'})
+                        h.save(Path(output)/phase/'driver-cleanup.json',dict(process_reaped=issue!='driver-cleanup',
+                            cgroup_removed=True,after={'process_count':0}))
+                    if issue=='observer':
+                        row['status']='execution_error';h.save(Path(output)/'window.json',row);raise ValueError('observer failed')
+                    h.save(Path(output)/'window.json',row);return row
+                measured=patches.enter_context(patch.object(fc,'window',side_effect=window))
+                old=fc.Harness;state={'uid':1,'gid':1,'steps':{}}
+                result=h.diagnostic(types.SimpleNamespace(root=root,pg_failure_probe=True),state)
+                self.assertIs(fc.Harness,old);self.assertEqual(closed,[True]);measured.assert_called_once()
+                perf.assert_not_called();matrix.assert_not_called()
+                self.assertEqual(result['execution_complete'],issue in ('failure','success'))
+                self.assertEqual(result['functional_valid'],issue=='success')
+                self.assertEqual(result['goal_status'],'unknown' if issue in ('failure','success') else 'blocked')
+                self.assertFalse(result['normal_score_eligible']);self.assertFalse(result['formal_qualified'])
+                exported=h.load(root/'pg-failure-observation/window/warmup/client.json')
+                self.assertNotIn('db_url',exported)
+                self.assertEqual(exported['first_errors'][0]['detail'],'database_error:acquire_timeout')
+
+    def test_pg_failure_small_export_is_bounded_redacted_and_keeps_raw(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);directory=root/'pg-failure-probe';directory.mkdir()
+            raw={'db_url':'postgresql://private@localhost/fixture','text':'postgresql://private@localhost/fixture',
+                'control_token':'private-token','first_errors':[{'detail':'database_error:acquire_timeout'}]}
+            h.save(directory/'client.json',raw);original=(directory/'client.json').read_bytes()
+            (directory/'events.csv').write_text('raw events');(directory/'server').write_bytes(b'ELF')
+            (directory/'oversized.log').write_bytes(b'x'*((2<<20)+1))
+            result=h.pg_failure_export(types.SimpleNamespace(root=root),directory)
+            self.assertEqual((directory/'client.json').read_bytes(),original)
+            exported=h.load(root/'pg-failure-observation/client.json')
+            self.assertNotIn('db_url',exported);self.assertNotIn('control_token',exported)
+            self.assertEqual(exported['text'],'<private-db-uri-redacted>')
+            self.assertFalse((root/'pg-failure-observation/events.csv').exists())
+            self.assertFalse((root/'pg-failure-observation/server').exists())
+            self.assertLessEqual(result['bytes'],8<<20);self.assertEqual(len(result['skipped']),1)
+
+    def test_pg_failure_main_has_only_the_short_coordinator_alarm(self):
+        import io
+        from contextlib import redirect_stdout
+        for requested,complete in ((False,True),(True,True),(True,False)):
+            with self.subTest(requested=requested,complete=complete),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);source=root/'source';tools=root/'tools';source.mkdir();tools.mkdir()
+                patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(h.signal,'signal'));alarm=patches.enter_context(patch.object(h.signal,'alarm'))
+                patches.enter_context(patch.object(h,'diagnostic',return_value={'execution_complete':complete,'functional_valid':False,'goal_status':'unknown'}))
+                with redirect_stdout(io.StringIO()):code=h.main(['--phase','diagnostic','--build-set','diagnostic',
+                    '--root',str(root/'out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40,
+                    *(['--pg-failure-probe'] if requested else [])])
+                self.assertEqual(code,0 if complete else 2)
+                alarm.assert_called_once_with(120 if requested else 20*60-30)
+
     def perf_probe(self, outcomes):
         """Only mocked observer commands; never execute perf or a workload."""
         calls=[];clock=[0.0]
@@ -641,7 +748,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
