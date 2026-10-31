@@ -6042,6 +6042,14 @@ static inline int ku_json_parse_unescaped_string(
   const uint8_t* end = parser->end;
   while (current < end) {
     uint8_t byte = *current;
+    if (byte >= 0x80) {
+      size_t length = (size_t)(current - start);
+      if (length >= KU_JSON_MAX_INPUT_BYTES) return 0;
+      size_t width = ku_json_utf8_width(current, end);
+      if (!width || width > KU_JSON_MAX_INPUT_BYTES - length) return 0;
+      current += width;
+      continue;
+    }
     if (byte == '"') {
       size_t len = (size_t)(current - start);
       if (len == 0) {
@@ -6062,16 +6070,10 @@ static inline int ku_json_parse_unescaped_string(
     }
     size_t length = (size_t)(current - start);
     if (byte < 0x20 || byte == '\\' || length >= KU_JSON_MAX_INPUT_BYTES) return 0;
-    if (byte < 0x80) {
-      size_t room = KU_JSON_MAX_INPUT_BYTES - length;
-      const uint8_t* scan_end = (size_t)(end - current) < room ? end : current + room;
-      const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
-      current = ascii == current ? current + 1 : ascii;
-    } else {
-      size_t width = ku_json_utf8_width(current, end);
-      if (!width || width > KU_JSON_MAX_INPUT_BYTES - length) return 0;
-      current += width;
-    }
+    size_t room = KU_JSON_MAX_INPUT_BYTES - length;
+    const uint8_t* scan_end = (size_t)(end - current) < room ? end : current + room;
+    const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
+    current = ascii == current ? current + 1 : ascii;
   }
   return 0;
 }
@@ -6591,30 +6593,32 @@ static bool ku_json_write_string(
   const uint8_t* span = current;
   while (current < end) {
     uint8_t byte = *current;
-    if (byte >= 0x20 && byte != '"' && byte != '\\') {
-      if (byte < 0x80) {
-        /* Bound speculative reads by both the actual input and output limit.
-           Invalid UTF8 after an over-limit prefix must not replace that error. */
-        size_t room = KU_JSON_MAX_OUTPUT_BYTES - pos;
-        size_t pending = (size_t)(current - span);
-        if (pending <= room && room - pending >= sizeof(uint64_t)) {
-          size_t scan_len = room - pending;
-          const uint8_t* scan_end = (size_t)(end - current) < scan_len
-              ? end : current + scan_len;
-          const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
-          if (ascii != current) {
-            current = ascii;
-            continue;
-          }
-        }
-        current++;
-      } else {
-        size_t width = ku_json_utf8_width(current, end);
-        if (!width) {
-          KU_JSON_STRING_FAIL("stringify_error", "invalid utf-8 in json string");
-        }
-        current += width;
+    if (byte >= 0x80) {
+      size_t width = ku_json_utf8_width(current, end);
+      if (!width) {
+        KU_JSON_STRING_FAIL("stringify_error", "invalid utf-8 in json string");
       }
+      current += width;
+      if ((size_t)(current - span) > KU_JSON_MAX_OUTPUT_BYTES - pos)
+        KU_JSON_STRING_FAIL("stringify_error", "json.stringify output is too large");
+      continue;
+    }
+    if (byte >= 0x20 && byte != '"' && byte != '\\') {
+      /* Bound speculative reads by both the actual input and output limit.
+         Invalid UTF8 after an over-limit prefix must not replace that error. */
+      size_t room = KU_JSON_MAX_OUTPUT_BYTES - pos;
+      size_t pending = (size_t)(current - span);
+      if (pending <= room && room - pending >= sizeof(uint64_t)) {
+        size_t scan_len = room - pending;
+        const uint8_t* scan_end = (size_t)(end - current) < scan_len
+            ? end : current + scan_len;
+        const uint8_t* ascii = ku_json_scan_ascii(current, scan_end);
+        if (ascii != current) {
+          current = ascii;
+          continue;
+        }
+      }
+      current++;
       if ((size_t)(current - span) > KU_JSON_MAX_OUTPUT_BYTES - pos)
         KU_JSON_STRING_FAIL("stringify_error", "json.stringify output is too large");
       continue;

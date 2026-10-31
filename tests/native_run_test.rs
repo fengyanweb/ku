@@ -5586,7 +5586,7 @@ fn main(): null! {
         "json-raw-utf8-boundaries",
         r#"
 static int json_utf8_valid_case(const uint8_t* bytes,size_t len,const char* escaped) {
-  uint8_t input[8]={'a'},expected[16]={'"','a'};
+  uint8_t input[32]={'a'},expected[64]={'"','a'};
   memcpy(input+1,bytes,len);input[len+1]='z';
   size_t encoded_len=escaped?strlen(escaped):len;
   memcpy(expected+2,escaped?(const uint8_t*)escaped:bytes,encoded_len);
@@ -5660,6 +5660,10 @@ int main(void) {
   }
   for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
     CHECK(!json_utf8_invalid_case(invalid[i].bytes,invalid[i].len));
+  // Adjacent valid widths must return to byte classification at each scalar.
+  static const uint8_t mixed[]={'a',0xc2,0x80,0xe0,0xa0,0x80,0xed,0x9f,0xbf,
+      0xf0,0x90,0x80,0x80,0xf4,0x8f,0xbf,0xbf,'z'};
+  CHECK(!json_utf8_valid_case(mixed,sizeof(mixed),NULL));
   return 0;
 }
 "#,
@@ -5814,6 +5818,22 @@ int main(void) {
       CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
     }
   }
+  // A complete UTF8 scalar is validated before its output-limit check; a
+  // later invalid byte wins only if that scalar still fits after the quote.
+  static const struct {uint8_t bytes[4];size_t len;} scalars[]={
+    {{0xc2,0x80},2},{{0xe0,0xa0,0x80},3},{{0xed,0x9f,0xbf},3},
+    {{0xf0,0x90,0x80,0x80},4},{{0xf4,0x8f,0xbf,0xbf},4}
+  };
+  for(size_t room=0;room<=16;room++)for(size_t prefix=0;prefix<=16;prefix++)
+    for(size_t i=0;i<sizeof(scalars)/sizeof(scalars[0]);i++) {
+      uint8_t input[24];memset(input,'a',prefix);
+      memcpy(input+prefix,scalars[i].bytes,scalars[i].len);input[prefix+scalars[i].len]=0x80;
+      KuJsonBuffer buffer={output,KU_JSON_MAX_OUTPUT_BYTES-room,KU_JSON_MAX_OUTPUT_BYTES};KuError error={0};
+      CHECK(!ku_json_write_string(&buffer,ku_string_static(input,prefix+scalars[i].len+1),&error));
+      CHECK(json_word_error(error,"stringify_error",room==0 || prefix+scalars[i].len>room-1
+          ?"json.stringify output is too large":"invalid utf-8 in json string"));
+      CHECK(buffer.data==output && buffer.cap==KU_JSON_MAX_OUTPUT_BYTES);ku_error_drop(&error);
+    }
   free(output);CHECK(NO_LIVE_ALLOCATIONS());
   // Reserve OOM must not consume input, lose old allocation, or be overwritten
   // by the later malformed byte. Exercise first allocation,byte,2/6 escape and
