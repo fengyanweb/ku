@@ -292,9 +292,9 @@ class HostedWorkflowContracts(unittest.TestCase):
         detector=task.split('- name: Check scalar growth',1)[1].split('\n      - name:',1)[0]
         self.assertIn('KU_CC: "clang -fsanitize=address,undefined',detector)
         self.assertIn('ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"',detector)
-        self.assertEqual(detector.count('native_pg_async_queued_waiter_is_not_starved -- --'),2)
+        self.assertEqual(detector.count('native_pg_async_queued_ -- --'),2)
         self.assertIn('-- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"',detector)
-        self.assertIn('test "$(grep -c',detector);self.assertIn('-eq 2',detector)
+        self.assertIn('test "$(grep -c',detector);self.assertIn('-eq 5',detector)
 
 
 class BatchWindowTests(unittest.TestCase):

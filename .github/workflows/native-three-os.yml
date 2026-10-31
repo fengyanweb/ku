@@ -335,11 +335,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --release --locked --test native_pg_query_poll_test \
-            native_pg_async_queued_waiter_is_not_starved -- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"
+            native_pg_async_queued_ -- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"
           cat "$RUNNER_TEMP/ku-pg-queue-tests.list"
-          test "$(grep -c '^native_pg_async_queued_waiter_is_not_starved.*: test$' "$RUNNER_TEMP/ku-pg-queue-tests.list")" -eq 2
+          test "$(grep -c '^native_pg_async_queued_.*: test$' "$RUNNER_TEMP/ku-pg-queue-tests.list")" -eq 5
           cargo test --release --locked --test native_pg_query_poll_test \
-            native_pg_async_queued_waiter_is_not_starved -- --nocapture --test-threads=1
+            native_pg_async_queued_ -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_json_test --test native_task_json_budget_test \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_source_test native_task_scalar_ \

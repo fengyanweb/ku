@@ -797,6 +797,62 @@ fn native_pg_async_queued_waiter_is_not_starved_when_next_slot_needs_connect() {
     run_async_queued_waiter_progress(true);
 }
 
+fn run_async_queued_parallelism(kind: u8) {
+    let directory = TempDir::new("async-query-queued-parallel");
+    let harness = query_stub_harness(&directory)
+        .replacen(
+            "#define KU_PG_TEST_ALLOCATION_RECORDS 16",
+            "#define KU_PG_TEST_ALLOCATION_RECORDS 64",
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_legacy_query_tests(void) {",
+            1,
+        )
+        + &ASYNC_QUERY_SUITE.replace(
+            "int main(void) {",
+            "static int ku_async_sequential_tests(void) {",
+        )
+        + &format!("\n#define KU_TEST_PARALLEL_KIND {kind}\n")
+        + ASYNC_QUEUED_PARALLEL_SUITE;
+    let source = directory.path().join("async-query-queued-parallel.c");
+    fs::write(&source, harness).expect("write PG queued parallelism harness");
+    let Some(executable) =
+        compile_harness(directory.path(), &source, "async-query-queued-parallel")
+    else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS)
+        .expect("PG queued parallelism test exceeded process bounds");
+    eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "PG queued parallelism (kind={kind}) failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .replace('\r', "")
+        .ends_with("pg async queued parallelism closed loop\n"));
+}
+
+#[test]
+fn native_pg_async_queued_waiters_use_parallel_idle_leases_without_head_dispatch() {
+    run_async_queued_parallelism(0);
+}
+
+#[test]
+fn native_pg_async_queued_new_waiter_wakes_for_spare_idle_lease() {
+    run_async_queued_parallelism(1);
+}
+
+#[test]
+fn native_pg_async_queued_waiter_connects_while_preserving_older_idle_lease() {
+    run_async_queued_parallelism(2);
+}
+
 fn run_async_acquire_lock_deadline(connect: bool, out_of_memory: bool) {
     let directory = TempDir::new("async-acquire-lock-deadline");
     let harness = query_stub_harness(&directory)
@@ -3294,9 +3350,10 @@ int main(void) {
   b->waiter.wake=handoff_wake;b->waiter.context=&b_wake;
   unsigned long long b_deadline=b->acquire_deadline;
   CHECK(b_deadline==1499u && !ku_pg_async_step(b,0,clock_ms,0));
-  CHECK(b->waiting && !b->waiter.notified && !b_budget.wakes && p->waiters==2);
+  CHECK(b->waiting && p->waiters==2);
+  CHECK(!!b->waiter.notified==KU_TEST_HANDOFF_SUCCESS && b_budget.wakes==(KU_TEST_HANDOFF_SUCCESS?1:0));
   int fd=-2;unsigned int events=99u;unsigned long long deadline=0;
-  CHECK(!ku_pg_async_interest(b,&fd,&events,&deadline));
+  CHECK(!!ku_pg_async_interest(b,&fd,&events,&deadline)==KU_TEST_HANDOFF_SUCCESS);
   CHECK(fd==-1 && !events && deadline==b_deadline && !b->sent);
   if(KU_TEST_HANDOFF_SUCCESS) {
     /* A claims only one lease and remains blocked in its own query. B must be
@@ -3450,6 +3507,114 @@ int main(void) {
    * expire solely because younger queued Tasks win the next owner turn. */
   CHECK(head_progress && !head_acquire_timeout);
   puts("pg async queued waiter progress closed loop");return 0;
+}
+"#;
+
+const ASYNC_QUEUED_PARALLEL_SUITE: &str = r#"
+static size_t parallel_idle(KuPgClient* p) {
+  size_t n=0;for(size_t i=0;i<p->size;i++)if(p->conns[i] && !p->in_use[i])n++;
+  return n;
+}
+int main(void) {
+  clock_ms=1000;clock_step=0;mode_on_send=T_READ_TIMEOUT;reset_mode_on_send=T_RESTORE;
+  track_runtime_allocations=1;
+  KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),2,8,1000,250,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;
+  AsyncBudget held_budgets[2]={{0}},head_budget={0},younger_budget={0},later_budget={0};
+  KuPgAsyncOp* held[2]={NULL,NULL};
+  for(size_t i=0;i<2;i++) {
+    held[i]=async_create(p,&held_budgets[i]);
+    CHECK(!ku_pg_async_step(held[i],0,clock_ms,0));
+    if(held[i]->phase==KU_PG_ASYNC_CONNECT) {
+      ku_pg_async_connect_run(held[i],0);CHECK(!ku_pg_async_step(held[i],0,clock_ms,0));
+    }
+    CHECK(held[i]->sent && held[i]->phase==KU_PG_ASYNC_READ);
+  }
+  CHECK(p->active==2 && !parallel_idle(p));
+  KuPgAsyncOp* head=async_create(p,&head_budget);
+  CHECK(!ku_pg_async_step(head,0,clock_ms,0) && head->waiting);
+  KuPgAsyncOp* younger=NULL;
+  if(KU_TEST_PARALLEL_KIND!=1) {
+    clock_ms++;younger=async_create(p,&younger_budget);
+    CHECK(!ku_pg_async_step(younger,0,clock_ms,0) && younger->waiting);
+    CHECK(p->async_head==&head->waiter && p->async_tail==&younger->waiter && p->waiters==2);
+  }
+  KuPgAsyncOp* later=NULL;
+  if(KU_TEST_PARALLEL_KIND==0) {
+    clock_ms++;later=async_create(p,&later_budget);
+    CHECK(!ku_pg_async_step(later,0,clock_ms,0) && later->waiting && p->waiters==3);
+    CHECK(p->async_tail==&later->waiter);
+  }
+  unsigned long long head_deadline=head->acquire_deadline;
+  clock_ms=1010;
+  for(size_t i=0;i<2;i++) {
+    if(KU_TEST_PARALLEL_KIND==2 && i==1)reset_mode_on_send=T_FLUSH_FAIL;
+    held[i]->conn->mode=T_OK;CHECK(async_finish(held[i],0) && held[i]->output.ok);
+    async_drop_output(held[i],&held_budgets[i],1);
+  }
+  reset_mode_on_send=T_RESTORE;
+  size_t expected_idle=KU_TEST_PARALLEL_KIND==2?1u:2u;
+  CHECK(p->active==0 && parallel_idle(p)==expected_idle);
+  if(KU_TEST_PARALLEL_KIND==1) {
+    /* This borrower initially cannot barge past the existing head. Once it is
+     * linked, a second free lease can serve it without consuming head's lease.
+     * The reactor must observe readiness before we call its owner step again. */
+    younger=async_create(p,&younger_budget);
+    CHECK(!ku_pg_async_step(younger,0,clock_ms,0) && younger->waiting);
+  }
+  CHECK(head->waiter.notified && younger && younger->waiting);
+  unsigned long long younger_deadline=younger->acquire_deadline,interest_deadline=0;
+  int fd=-2;unsigned int events=99u;
+  int younger_ready=ku_pg_async_interest(younger,&fd,&events,&interest_deadline);
+  int later_blocked=0;
+  if(later) {
+    /* Rank2 is just outside two available leases. Dispatch it first to prove
+     * the younger eligible borrower's parallelism does not grant an extra
+     * lease or consume capacity reserved for either older queued borrower. */
+    CHECK(ku_pg_async_interest(later,&fd,&events,&interest_deadline));
+    CHECK(!ku_pg_async_step(later,0,clock_ms,0) && later->waiting && !later->sent);
+    CHECK(p->active==0 && parallel_idle(p)==2);later_blocked=1;
+  }
+  /* Two leases can satisfy both already-queued borrowers. Running the younger
+   * ready owner first must leave one lease available for head, rather than
+   * withholding both until the other owner's next dispatch. */
+  int used_connect=0;
+  if(younger_ready) {
+    CHECK(!ku_pg_async_step(younger,0,clock_ms,0));
+    if(younger->phase==KU_PG_ASYNC_CONNECT) {
+      CHECK(KU_TEST_PARALLEL_KIND==2 && parallel_idle(p)==1 && p->connect_in_flight);
+      used_connect=1;ku_pg_async_connect_run(younger,0);
+      CHECK(!ku_pg_async_step(younger,0,clock_ms,0));
+    }
+  }
+  int younger_parallel=younger->sent;
+  size_t idle_before_head=parallel_idle(p),active_before_head=p->active;
+  CHECK(head->waiting && p->async_head==&head->waiter && !head->sent);
+  CHECK(head->acquire_deadline==head_deadline && younger->acquire_deadline==younger_deadline);
+  CHECK(!ku_pg_async_step(head,0,clock_ms,0) && head->sent);
+  /* Complete and retire every operation even on the head-only red path. */
+  head->conn->mode=T_OK;CHECK(async_finish(head,0) && head->output.ok);
+  async_drop_output(head,&head_budget,1);
+  mode_on_send=T_OK;if(younger->conn)younger->conn->mode=T_OK;
+  CHECK(async_finish(younger,0) && younger->output.ok);
+  async_drop_output(younger,&younger_budget,1);
+  if(later) {
+    CHECK(ku_pg_async_interest(later,&fd,&events,&interest_deadline));
+    CHECK(async_finish(later,0) && later->output.ok);
+    async_drop_output(later,&later_budget,1);
+  }
+  CHECK(!p->active && !p->waiters && !p->async_operations);
+  CHECK(!held_budgets[0].bytes && !held_budgets[1].bytes && !head_budget.bytes && !younger_budget.bytes && !later_budget.bytes);
+  ku_pg_client_close_owned(p);
+  CHECK(!live_connections && !live_results && !live_runtime_allocations && !runtime_bytes && !bad_calls);
+  CHECK(starts==finishes && !ku_test_pg_pool_lock_depth && !ku_test_pg_finishes_while_pool_locked);
+  track_runtime_allocations=0;
+  printf("queued-parallel: kind=%d younger_ready=%d younger_sent_before_head=%d active_before_head=%zu idle_before_head=%zu used_connect=%d later_blocked=%d\n",
+      KU_TEST_PARALLEL_KIND,younger_ready,younger_parallel,active_before_head,idle_before_head,used_connect,later_blocked);
+  CHECK(younger_ready && younger_parallel && active_before_head==1 && idle_before_head==1);
+  CHECK(used_connect==(KU_TEST_PARALLEL_KIND==2));
+  CHECK(later_blocked==(KU_TEST_PARALLEL_KIND==0));
+  puts("pg async queued parallelism closed loop");return 0;
 }
 "#;
 
