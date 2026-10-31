@@ -1359,13 +1359,13 @@ fn run_pg_live_loopback(name: &str, suite: &str, pipeline: bool) -> Option<Strin
         1,
     );
     if pipeline {
-        // Interpose only this isolated experiment. Production keeps its original
-        // send path and never enables pipeline mode.
+        // Observe both reset send APIs only in this isolated experiment. Its
+        // explicit pipeline commands below retain the extended protocol.
         let anchor = "extern int PQsetSingleRowMode(PGconn*);";
         assert_eq!(harness.matches(anchor).count(), 1);
         harness = harness.replacen(anchor,
-            "static int p8_reset_sends;\nstatic int p8_send(PGconn*, const char*, int, const void*, const char* const*, const int*, const int*, int);\n#define PQsendQueryParams p8_send\nextern int PQsetSingleRowMode(PGconn*);", 1);
-        harness.push_str("\n#undef PQsendQueryParams\n");
+            "static int p8_reset_sends,p8_simple_resets,p8_params_resets;\nstatic int p8_send(PGconn*, const char*, int, const void*, const char* const*, const int*, const int*, int);\nstatic int p8_send_simple(PGconn*, const char*);\n#define PQsendQueryParams p8_send\n#define PQsendQuery p8_send_simple\nextern int PQsetSingleRowMode(PGconn*);", 1);
+        harness.push_str("\n#undef PQsendQueryParams\n#undef PQsendQuery\n");
     }
     harness.push_str(suite);
     let source = directory.path().join(format!("{name}.c"));
@@ -1672,8 +1672,12 @@ extern int PQpipelineSync(PGconn*);
 extern int PQpipelineStatus(const PGconn*);
 static int p8_send(PGconn* connection,const char* sql,int count,const void* types,
     const char* const* values,const int* lengths,const int* formats,int format) {
-  if(!strcmp(sql,"DISCARD ALL"))p8_reset_sends++;
+  if(!strcmp(sql,"DISCARD ALL")){p8_reset_sends++;p8_params_resets++;}
   return PQsendQueryParams(connection,sql,count,types,values,lengths,formats,format);
+}
+static int p8_send_simple(PGconn* connection,const char* sql) {
+  if(!strcmp(sql,"DISCARD ALL")){p8_reset_sends++;p8_simple_resets++;}
+  return PQsendQuery(connection,sql);
 }
 typedef struct P8Trace {
   int queued,sync_requests,sync_results,single_rows,tuples,command_ok,errors,aborted;
@@ -1737,12 +1741,7 @@ expired:
 static int p8_reserve(void* raw,size_t bytes) {size_t* value=(size_t*)raw;if(bytes>SIZE_MAX-*value)return 0;*value+=bytes;return 1;}
 static void p8_refund(void* raw,size_t bytes) {size_t* value=(size_t*)raw;if(bytes>*value)abort();*value-=bytes;}
 static void p8_wake(void* raw) {(void)raw;}
-static int p8_old_encoding(const char* conninfo,int* retained,int* evicted,int* resets) {
-  KuResult_pg_client opened=ku_pg_client_open(ku_test_text(conninfo),1,8,1000,1000,2000);LIVE_CHECK(opened.ok);
-  KuPgClient* pool=opened.value;size_t charge=0;KuError error={0};int before=p8_reset_sends;
-  KuPgAsyncOp* op=ku_pg_async_create(pool,ku_test_text("SELECT set_config('client_encoding','LATIN1',false)"),
-      (KuArray_str){0},ku_pg_now_ms()+2000u,(KuPgAsyncBudget){&charge,p8_reserve,p8_refund},p8_wake,NULL,&error);
-  LIVE_CHECK(op);
+static int p8_drive(KuPgAsyncOp* op) {
   for(size_t turns=0;op->phase!=KU_PG_ASYNC_DONE && turns<512u;turns++) {
     if(ku_pg_async_step(op,3u,ku_pg_now_ms(),0))break;
     if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,0);
@@ -1751,6 +1750,37 @@ static int p8_old_encoding(const char* conninfo,int* retained,int* evicted,int* 
       int ready=ku_pg_wait_socket(fd,interest,deadline);LIVE_CHECK(ready>=0);
     }
   }
+  LIVE_CHECK(op->phase==KU_PG_ASYNC_DONE);return 0;
+}
+static int p8_async_reset_reuse(const char* conninfo) {
+  KuResult_pg_client opened=ku_pg_client_open(ku_test_text(conninfo),1,8,1000,1000,2000);LIVE_CHECK(opened.ok);
+  KuPgClient* pool=opened.value;PGconn* original=pool->conns[0];size_t charge=0;
+  int simple_before=p8_simple_resets,params_before=p8_params_resets;
+  const char* sql[]={"SELECT set_config('application_name','ku-async-reset-witness',false)",
+      "SELECT current_setting('application_name') <> 'ku-async-reset-witness'","SELECT 1/0","SELECT 42"};
+  const char* expected[]={"ku-async-reset-witness","t",NULL,"42"};
+  for(size_t i=0;i<4u;i++) {
+    KuError error={0};KuPgAsyncOp* op=ku_pg_async_create(pool,ku_test_text(sql[i]),(KuArray_str){0},
+        ku_pg_now_ms()+2000u,(KuPgAsyncBudget){&charge,p8_reserve,p8_refund},p8_wake,NULL,&error);
+    LIVE_CHECK(op && !p8_drive(op));
+    LIVE_CHECK(pool->conns[0]==original && ku_test_typed_live_idle(pool) && !PQisBusy(original) && PQgetResult(original)==NULL);
+    KuResult_pg_result result=ku_pg_async_take(op);size_t bytes=0;
+    if(expected[i]) {
+      LIVE_CHECK(result.ok && ku_test_value(result.value,expected[i]) && ku_pg_result_owned_bytes(result.value,&bytes));
+      ku_drop_pg_result(&result.value);p8_refund(&charge,bytes);
+    } else {LIVE_CHECK(ku_test_code(result,"query_error"));ku_error_drop(&result.error);}
+    ku_pg_async_dispose(op,1);LIVE_CHECK(!charge);
+  }
+  LIVE_CHECK(p8_simple_resets==simple_before+4 && p8_params_resets==params_before);
+  ku_pg_client_close_owned(pool);return 0;
+}
+static int p8_old_encoding(const char* conninfo,int* retained,int* evicted,int* resets) {
+  KuResult_pg_client opened=ku_pg_client_open(ku_test_text(conninfo),1,8,1000,1000,2000);LIVE_CHECK(opened.ok);
+  KuPgClient* pool=opened.value;size_t charge=0;KuError error={0};int before=p8_reset_sends;
+  KuPgAsyncOp* op=ku_pg_async_create(pool,ku_test_text("SELECT set_config('client_encoding','LATIN1',false)"),
+      (KuArray_str){0},ku_pg_now_ms()+2000u,(KuPgAsyncBudget){&charge,p8_reserve,p8_refund},p8_wake,NULL,&error);
+  LIVE_CHECK(op);
+  LIVE_CHECK(!p8_drive(op));
   LIVE_CHECK(op->phase==KU_PG_ASYNC_DONE && op->output.ok);
   *retained=ku_test_value(op->output.value,"LATIN1");*evicted=pool->conns[0]==NULL;*resets=p8_reset_sends-before;
   KuResult_pg_result result=ku_pg_async_take(op);size_t bytes=0;LIVE_CHECK(ku_pg_result_owned_bytes(result.value,&bytes));
@@ -1768,6 +1798,7 @@ int main(void) {
   FILE* file=fopen(path,"rb");LIVE_CHECK(file);char conninfo[8193];size_t size=fread(conninfo,1,sizeof(conninfo)-1u,file);
   int read_failed=ferror(file);fclose(file);LIVE_CHECK(!read_failed && size<sizeof(conninfo)-1u);conninfo[size]=0;
   if(strlen(conninfo)!=size || !ku_test_conninfo_is_loopback(conninfo))return 77;
+  LIVE_CHECK(!p8_async_reset_reuse(conninfo));
   int retained=0,evicted=0,resets=0;
   LIVE_CHECK(!p8_old_encoding(conninfo,&retained,&evicted,&resets));
   LIVE_CHECK(retained && evicted && !resets);
@@ -1952,6 +1983,8 @@ static int live_results = 0, live_connections = 0, shutdowns = 0, bad_calls = 0;
 static int both_waits = 0, read_waits = 0, get_gate = 0, restore_mode = T_RESTORE;
 static int mode_on_send = T_OK, fail_nonblocking = 0, parameter_checks = 0;
 static int reset_mode_on_send = T_RESTORE, reset_sends = 0, user_sends = 0;
+static int simple_reset_sends = 0, params_reset_sends = 0;
+static int reset_transaction_status = KU_PQTRANS_IDLE;
 static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
 static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
@@ -2166,11 +2199,15 @@ static int send_query(PGconn* conn, const char* sql) {
     case T_EMPTY: case T_COPY: case T_COPY_OUT: case T_COPY_BOTH: case T_BAD: case T_ENCODING: case T_RESTORE: case T_NO_ROWS: case T_MISSING_TERMINAL: case T_BINARY_ZERO_ROWS: conn->total = 1; break;
     default: conn->total = 2; break;
   }
+  if (conn->is_reset && (conn->mode == T_BACKPRESSURE || conn->mode == T_PARTIAL_TIMEOUT)) conn->total = 1;
   conn->received_reads = 0; conn->notice_consumed = 0; conn->interruption = 0; conn->active = 1;
   if (conn->mode == T_SEND_OVERRUN) clock_ms = test_deadline;
   return conn->mode != T_SEND_FAIL;
 }
-int PQsendQuery(PGconn* conn, const char* sql) { return send_query(conn, sql); }
+int PQsendQuery(PGconn* conn, const char* sql) {
+  if (!strcmp(sql, "DISCARD ALL")) simple_reset_sends++;
+  return send_query(conn, sql);
+}
 int PQsetSingleRowMode(PGconn* conn) {
   single_row_calls++;
   if (!conn->mode_window || !conn->active) { bad_calls++; return 0; }
@@ -2180,6 +2217,7 @@ int PQsetSingleRowMode(PGconn* conn) {
 }
 int PQsendQueryParams(PGconn* conn, const char* sql, int count, const void* types, const char* const* values, const int* lengths, const int* formats, int format) {
   param_sends++;
+  if (!strcmp(sql, "DISCARD ALL")) params_reset_sends++;
   int valid_empty = count == 0 && !values;
   int valid_two = count == 2 && values && strcmp(sql, "SELECT $1::text, $2::text") == 0
       && strcmp(values[0], "x'; SELECT pg_sleep(999); --") == 0 && strcmp(values[1], "UTF8") == 0
@@ -2223,7 +2261,7 @@ PGresult* PQgetResult(PGconn* conn) {
     conn->active = 0;
     if (conn->mode == T_ENCODING) conn->utf8 = 0;
     if (conn->mode == T_RESTORE) conn->utf8 = 1;
-    if (conn->is_reset && conn->mode == T_RESTORE) conn->transaction_status = KU_PQTRANS_IDLE;
+    if (conn->is_reset && conn->mode == T_RESTORE) conn->transaction_status = reset_transaction_status;
     else if (!conn->is_reset) conn->transaction_status = conn->transaction_after_query;
     return 0;
   }
@@ -2244,6 +2282,7 @@ PGresult* PQgetResult(PGconn* conn) {
   else if (conn->mode == T_COPY_BOTH) result->status = KU_PGRES_COPY_BOTH;
   else if (conn->mode == T_BAD) result->status = KU_PGRES_BAD_RESPONSE;
   else if (conn->mode == T_ENCODING || conn->mode == T_RESTORE) result->status = KU_PGRES_COMMAND_OK;
+  if (conn->is_reset && (conn->mode == T_BACKPRESSURE || conn->mode == T_PARTIAL_TIMEOUT)) result->status = KU_PGRES_COMMAND_OK;
   if (conn->mode == T_GET_OVERRUN && result->number == 2) clock_ms = test_deadline;
   if (result->number == 1 && conn->mode >= T_OOM_RESULT && conn->mode <= T_OOM_BYTES)
     fail_runtime_allocation_after = conn->mode - T_OOM_RESULT + 1;
@@ -3069,6 +3108,14 @@ static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
   size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
   ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
 }
+static int async_reset_wait(KuPgAsyncOp* op,int phase) {
+  for(size_t turns=0;turns<32u;turns++) {
+    if(op->phase==phase && op->interest)return 1;
+    if(ku_pg_async_step(op,0,clock_ms,0))return 0;
+    if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,0);
+  }
+  return op->phase==phase && op->interest;
+}
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
   KuResult_pg_client captured=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
@@ -3082,8 +3129,10 @@ int main(void) {
   KuResult_pg_client opened=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
   CHECK(opened.ok);KuPgClient* p=opened.value;AsyncBudget b={0};
   int waits_before=both_waits+read_waits;
+  int before_params=param_sends,before_simple=simple_reset_sends,before_params_reset=params_reset_sends;
   KuPgAsyncOp* op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok);
   CHECK(both_waits+read_waits==waits_before);CHECK(reset_sends==1);CHECK(p->active==0 && p->waiters==0);
+  CHECK(param_sends==before_params+1 && simple_reset_sends==before_simple+1 && params_reset_sends==before_params_reset);
   CHECK(op->output.value->rows==1);KuResult_str value=ku_pg_value(op->output.value,0,0);CHECK(value.ok && value.value.len);ku_string_drop(&value.value);
   async_drop_output(op,&b,1);
   mode_on_send=T_NULL_EMPTY_UTF8;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok && op->output.value->rows==2 && op->output.value->cols==3);
@@ -3097,7 +3146,37 @@ int main(void) {
   CHECK(async_finish(op,1));CHECK(!op->output.ok);CHECK(ku_string_equal(op->output.error.code,ku_string_static((const uint8_t*)"execution_unknown",17)));
   CHECK(p->active==0 && p->conns[0]==NULL);async_drop_output(op,&b,0);
   mode_on_send=T_OK;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok);async_drop_output(op,&b,1);
-  reset_mode_on_send=T_FLUSH_FAIL;op=async_create(p,&b);CHECK(async_finish(op,0));CHECK(op->output.ok && !p->conns[0]);async_drop_output(op,&b,1);
+  /* Reset is a fixed simple query; business SQL still uses separately bound
+   * parameters. Failure never replays the completed business statement. */
+  const int reset_failures[]={T_SEND_FAIL,T_SINGLE_FAIL,T_FLUSH_FAIL,T_CONSUME_FAIL,T_ERROR,T_NO_RESULT,T_ENCODING};
+  for(size_t i=0;i<sizeof(reset_failures)/sizeof(reset_failures[0]);i++) {
+    reset_mode_on_send=reset_failures[i];int before_user=user_sends;
+    before_simple=simple_reset_sends;op=async_create(p,&b);
+    CHECK(async_finish(op,0) && op->output.ok && !p->conns[0] && !p->active && !live_results);
+    CHECK(user_sends==before_user+1 && simple_reset_sends==before_simple+1 && params_reset_sends==before_params_reset);
+    async_drop_output(op,&b,1);
+  }
+  reset_mode_on_send=T_RESTORE;reset_transaction_status=2;op=async_create(p,&b);
+  CHECK(async_finish(op,0) && op->output.ok && !p->conns[0] && !p->active);async_drop_output(op,&b,1);
+  reset_transaction_status=KU_PQTRANS_IDLE;
+  /* Backpressure retains the lease until flush and all results finish. */
+  reset_mode_on_send=T_BACKPRESSURE;op=async_create(p,&b);
+  CHECK(async_reset_wait(op,KU_PG_ASYNC_RESET_FLUSH) && op->interest==3u && op->output.ok && p->active==1);
+  op->conn->pending_read=1;CHECK(!ku_pg_async_step(op,1u,clock_ms,0));
+  CHECK(async_finish(op,0) && op->output.ok && p->conns[0] && !p->active);async_drop_output(op,&b,1);
+  /* COMMAND_OK is not completion: the terminal NULL is still mandatory.
+   * A pending tail must retain the lease; cancellation/expiry must evict it. */
+  for(int finish_kind=0;finish_kind<3;finish_kind++) {
+    reset_mode_on_send=T_PARTIAL_TIMEOUT;op=async_create(p,&b);
+    CHECK(async_reset_wait(op,KU_PG_ASYNC_RESET_READ) && op->reset_ok && op->output.ok);
+    PGconn* pending=op->conn;CHECK(pending->index==1 && pending->active && p->active==1 && p->conns[0]==pending && !live_results);
+    int before_user=user_sends;unsigned long long saved_clock=clock_ms;
+    if(finish_kind==0)pending->mode=T_RESTORE; /* Only now can the peer supply NULL. */
+    if(finish_kind==2)clock_ms=op->deadline;
+    CHECK(async_finish(op,finish_kind==1) && op->output.ok && !p->active && user_sends==before_user);
+    CHECK(finish_kind==0 ? p->conns[0]==pending : p->conns[0]==NULL);
+    async_drop_output(op,&b,1);clock_ms=saved_clock;
+  }
   reset_mode_on_send=T_RESTORE;op=async_create(p,&b);CHECK(async_finish(op,0));async_drop_output(op,&b,1);
   /* More waiters than one notification batch, with close and no subsequent
    * lease release to hide a dropped notification. Every pin must be drained. */
@@ -3107,7 +3186,7 @@ int main(void) {
   CHECK(p->waiters==128 && p->async_operations==129);ku_pg_client_close_owned(p);
   for(size_t i=0;i<128;i++){CHECK(budgets[i].wakes==1);CHECK(waiters[i]->waiter.in_flight==0);CHECK(async_finish(waiters[i],1));async_drop_output(waiters[i],&budgets[i],0);}
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
-  CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
+  CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0 && !bad_calls);
   puts("pg async pump closed loop");return 0;
 }
 "#;
