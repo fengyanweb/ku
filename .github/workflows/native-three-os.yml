@@ -43,6 +43,11 @@ on:
         type: boolean
         default: false
 
+      pg_queue_screen:
+        description: 'Eight normal A/B PG fix windows; frozen f39c673 prepatch, no perf/matrix/capacity claim'
+        type: boolean
+        default: false
+
       reuse_build_run:
         description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
         type: string
@@ -286,6 +291,7 @@ jobs:
           cargo test --release --locked --test native_run_test \
             native_object_insertion_preserves_collisions_ownership_and_oom -- --exact --nocapture --test-threads=1
           cargo test --release --locked \
+            --test native_pg_query_poll_test \
             --test native_task_json_test \
             --test native_task_json_budget_test \
             --test native_task_expression_source_test \
@@ -328,6 +334,12 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           set -euo pipefail
+          cargo test --release --locked --test native_pg_query_poll_test \
+            native_pg_async_queued_waiter_is_not_starved -- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"
+          cat "$RUNNER_TEMP/ku-pg-queue-tests.list"
+          test "$(grep -c '^native_pg_async_queued_waiter_is_not_starved.*: test$' "$RUNNER_TEMP/ku-pg-queue-tests.list")" -eq 2
+          cargo test --release --locked --test native_pg_query_poll_test \
+            native_pg_async_queued_waiter_is_not_starved -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_json_test --test native_task_json_budget_test \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_task_source_test native_task_scalar_ \
@@ -463,7 +475,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe)
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -483,6 +495,7 @@ jobs:
       KU_PERFORMANCE_V2_FINAL_TASK_JSON: ${{ inputs.final_task_json && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
       KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
       KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
@@ -501,6 +514,7 @@ jobs:
       - name: Verify runner entry contracts without starting workloads
         run: |
           if [ "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = true ]; then
+            test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false
             test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = false
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
@@ -510,8 +524,20 @@ jobs:
             test -z "$KU_PERFORMANCE_V2_VARIANTS"
           fi
           if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true ]; then
+            test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
+            test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
+            test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            test -z "$KU_PERFORMANCE_V2_VARIANTS"
+          fi
+          if [ "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$KU_PERFORMANCE_V2_PREPATCH" = f39c673df0cd08232f184141a7e2aedef4f585c9
+            test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false
+            test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = false
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
             test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
             test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false
@@ -599,6 +625,12 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$performance_build_set" = diagnostic
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            performance_task_json_args+=(--pg-queue-screen)
+          fi
           if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
@@ -650,7 +682,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
@@ -673,6 +705,12 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$performance_build_set" = diagnostic
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            performance_task_json_args+=(--pg-queue-screen)
+          fi
           if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
@@ -749,6 +787,15 @@ jobs:
         with:
           name: ku-normal-self-observation
           path: ${{ runner.temp }}/ku-performance-v2/normal-self-observation
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain the small redacted PG queue observation
+        if: always() && inputs.pg_queue_screen
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-pg-queue-observation
+          path: ${{ runner.temp }}/ku-performance-v2/pg-queue-observation
           retention-days: 1
           if-no-files-found: error
 

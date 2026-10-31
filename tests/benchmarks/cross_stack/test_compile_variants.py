@@ -177,7 +177,7 @@ class HostedWorkflowContracts(unittest.TestCase):
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
         self.assertIn("task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe)",job)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
@@ -212,7 +212,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}',run)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',run)
         for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
             self.assertNotIn(sdk,job)
 
@@ -221,7 +221,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),3)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),4)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
@@ -240,7 +240,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-failure-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted PG failure observation',1)[1]
         self.assertIn('if: always() && inputs.pg_failure_probe',small)
         self.assertIn('name: ku-pg-failure-observation',small)
@@ -260,12 +260,41 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--normal-self-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted normal SELF observation',1)[1]
         self.assertIn('if: always() && inputs.normal_self_probe',small)
         self.assertIn('name: ku-normal-self-observation',small)
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/normal-self-observation',small)
         self.assertNotIn('*.csv',small);self.assertNotIn('bin/',small)
+
+    def test_pg_queue_screen_is_explicit_frozen_and_never_a_formal_matrix(self):
+        text,job=self.workflow()
+        self.assertIn('pg_queue_screen:\n',text)
+        self.assertIn("KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}",job)
+        verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
+        for check in ('test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic',
+                'test "$KU_PERFORMANCE_V2_PREPATCH" = f39c673df0cd08232f184141a7e2aedef4f585c9',
+                'test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = false','test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false',
+                'test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false','test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false',
+                'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false','test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',
+                'test -z "$KU_PERFORMANCE_V2_VARIANTS"'):self.assertIn(check,verify)
+        self.assertEqual(job.count('performance_task_json_args+=(--pg-queue-screen)'),2)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('if: always() && inputs.pg_queue_screen',job)
+        self.assertIn('name: ku-pg-queue-observation',job)
+        self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-queue-observation',job)
+
+    def test_actual_pg_queue_regressions_are_required_on_three_platforms_and_linux_detectors(self):
+        text,_=self.workflow()
+        task=text.split('\n  task-main-path:\n',1)[1].split('\n  task-main-path-linux-arm64:\n',1)[0]
+        serial=task.split('- name: Run affected native HTTP and Task regressions serially',1)[1].split('- name: Check scalar growth',1)[0]
+        self.assertIn('--test native_pg_query_poll_test',serial)
+        detector=task.split('- name: Check scalar growth',1)[1].split('\n      - name:',1)[0]
+        self.assertIn('KU_CC: "clang -fsanitize=address,undefined',detector)
+        self.assertIn('ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"',detector)
+        self.assertEqual(detector.count('native_pg_async_queued_waiter_is_not_starved -- --'),2)
+        self.assertIn('-- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"',detector)
+        self.assertIn('test "$(grep -c',detector);self.assertIn('-eq 2',detector)
 
 
 class BatchWindowTests(unittest.TestCase):

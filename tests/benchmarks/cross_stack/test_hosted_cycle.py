@@ -13,6 +13,89 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_pg_queue_plan_has_only_six_normal_and_two_diagnostic_pressure_windows(self):
+        plan=h.pg_queue_plan({'A':{},'B':{}},h.PG_QUEUE_PREPATCH)
+        self.assertEqual(len(plan['windows']),8);self.assertEqual(plan['maximum_replacements'],0)
+        self.assertEqual([(c['group'],c['name']) for c in plan['windows'][:6]],[(1,'A'),(1,'B'),(2,'B'),(2,'A'),(3,'A'),(3,'B')])
+        self.assertTrue(all((c['rate'],c['warmup_seconds'],c['score_seconds'])==(200,3,15) for c in plan['windows'][:6]))
+        self.assertEqual([c['name'] for c in plan['windows'][6:]],['A','B'])
+        self.assertTrue(all((c['rate'],c['warmup_seconds'],c['score_seconds'])==(12800,10,30) for c in plan['windows'][6:]))
+        self.assertFalse(plan['formal_qualified']);self.assertFalse(plan['normal_score_eligible'])
+        self.assertEqual(plan['resources'],h.RESOURCES);self.assertNotIn('targets',plan);self.assertNotIn('capacity',plan)
+
+    def test_pg_queue_selection_is_exclusive_and_freezes_prepatch(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.PG_QUEUE_PREPATCH,screen_variants=[])
+        identity=h.hosted_identity(types.SimpleNamespace(**base,pg_queue_screen=True),'diagnostic')
+        self.assertEqual(identity['prepatch'],h.PG_QUEUE_PREPATCH);self.assertTrue(identity['pg_queue_screen'])
+        for flag in ('normal_self_probe','pg_failure_probe','task_json_screen','common_http_screen','final_task_json'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**base,pg_queue_screen=True,**{flag:True}),'diagnostic')
+        for change in ({'prepatch':h.BASELINE},{'candidate':h.PG_QUEUE_PREPATCH}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change),pg_queue_screen=True),'diagnostic')
+
+    def test_pg_queue_build_uses_only_fresh_A_B_and_go_driver(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            class Builder:
+                def __init__(self,directory,source,**kwargs):self.name=directory.name
+                def ku(self):calls.append((self.name,'ku'))
+                def go_build(self,client=False):calls.append((self.name,'driver',client))
+                def rust(self):raise AssertionError('Rust is not part of this screen')
+                def ku_native(self,*args):raise AssertionError('each A/B must build its own identified CLI')
+                def finish(self,**kwargs):return {}
+            patches.enter_context(patch.object(h.bl,'Builder',Builder))
+            patches.enter_context(patch.object(h,'snapshot',side_effect=lambda s,c,d:d.mkdir(parents=True)))
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
+            complete=patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
+            a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.BASELINE,candidate='b'*40,
+                prepatch=h.PG_QUEUE_PREPATCH,screen_variants=[],build_set='diagnostic',pg_queue_screen=True)
+            self.assertEqual(h.build(a,{'steps':{}}),{'ready':True})
+            self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)]);complete.assert_called_once()
+
+    def test_pg_queue_screen_preserves_baseline_500_and_continues_only_after_cleanup(self):
+        for issue in ('none','low-functional','low-arrival','low-driver','pressure-cleanup','database'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.pg_queue_plan({name:dict(root=str(root/name),stack='ku') for name in ('A','B')},h.PG_QUEUE_PREPATCH)
+                h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
+                fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
+                    stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
+                    source_commit=h.PG_QUEUE_PREPATCH if n=='A' else 'b'*40)))
+                patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64));perf=patches.enter_context(patch.object(h,'perf_capability'))
+                paired=patches.enter_context(patch.object(fc,'paired_interval',return_value={'status':'estimated','estimate':.9}))
+                measured=[]
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    pressure=rate==12800;measured.append((name,rate));failed=pressure and name=='A'
+                    self.assertEqual((workload,warmup,duration),('db',10 if pressure else 3,30 if pressure else 15))
+                    row=dict(status='warmup_failure' if failed else 'observed',score_started=not failed,
+                        functional_valid=not failed and not(issue=='low-functional' and not pressure),accounting_valid=True,
+                        all_correct=not failed,natural_reclamation=True,arrival_schedule_quality='fail' if failed or issue=='low-arrival' else 'pass',
+                        environment_quality='unknown',measurement_invalid=False,full_cpu_us=10 if name=='A' else 9,
+                        cleanup=[{'natural':True}],results={'http_500':217} if failed else {'correct':3000})
+                    for part in ['warmup',*(['score'] if not failed else [])]:
+                        report=Path(output)/part/'client.json';h.save(report,dict(first_errors=[{'detail':'database_error:acquire_timeout'}] if failed else [],
+                            service_cost=dict(before={'observed':True},after={'observed':True},driver_headroom={
+                                'fraction_of_quota':.95 if issue=='low-driver' else .3,'saturated':issue=='low-driver'})))
+                        h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='pressure-cleanup' and pressure),cgroup_removed=True,after={'process_count':0}))
+                    if not failed:row['score_report']=str(Path(output)/'score/client.json')
+                    return row
+                patches.enter_context(patch.object(fc,'window',side_effect=window));old=fc.Harness
+                result=h.diagnostic(types.SimpleNamespace(root=root,pg_queue_screen=True),{'uid':1,'gid':1,'steps':{}})
+                self.assertIs(fc.Harness,old);perf.assert_not_called()
+                self.assertEqual(len(measured),1 if issue.startswith('low-') else 7 if issue=='pressure-cleanup' else 8)
+                self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['formal_qualified'])
+                if len(measured)==8:
+                    self.assertFalse(result['rows'][-2]['functional_valid']);self.assertEqual(result['rows'][-2]['results']['http_500'],217)
+                    self.assertEqual(measured[-1],('B',12800));self.assertEqual(paired.call_args.kwargs['minimum'],3)
+                    self.assertTrue(all(row['environment_quality']=='unknown' for row in result['rows']))
+                self.assertEqual(result['goal_status'],'unknown' if issue=='none' else 'blocked')
+
     def test_normal_self_plan_is_six_normal_windows_without_ledger_or_acceptance(self):
         plan=h.normal_self_plan({'B':{},'R':{}})
         self.assertEqual(plan['order'],[[name,turn] for name in ('B','R') for turn in ('before','sample','after')])
@@ -39,25 +122,31 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(invalid.exception.code,2)
 
     def test_normal_self_sampler_wraps_original_client_and_owns_only_minimal_perf(self):
-        for sample,exit_code in ((False,0),(True,0),(True,130)):
-            with self.subTest(sample=sample,exit_code=exit_code),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+        for sample,exit_code,timed_out in ((False,0,False),(True,0,False),(True,130,False),(True,-2,False),(True,0,True)):
+            with self.subTest(sample=sample,exit_code=exit_code,timed_out=timed_out),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
                     domain=types.SimpleNamespace(snapshot=lambda:{'memory_stat':{'anon':42}}))
                 patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
                 memory=patches.enter_context(patch.object(h,'diagnostic_memory',return_value={'categories':{}}))
                 symbols=patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'files':[]}))
                 class Process:
-                    pid=99999999;returncode=exit_code
+                    pid=99999999;returncode=None if timed_out else exit_code
                     def poll(self):return self.returncode
-                    def wait(self,timeout):return self.returncode
+                    def wait(self,timeout):
+                        if timeout==8 and timed_out:raise h.subprocess.TimeoutExpired('perf',timeout)
+                        self.returncode=exit_code;return self.returncode
                 calls=[]
                 def popen(argv,**kwargs):
                     calls.append(argv);Path(argv[argv.index('-o')+1]).write_bytes(b'perf data');return Process()
                 launch=patches.enter_context(patch.object(h.subprocess,'Popen',side_effect=popen))
+                kill=patches.enter_context(patch.object(h.os,'killpg'))
                 invoked=[]
                 result=h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample)
                 self.assertEqual(result,{'original':True});self.assertEqual(invoked,[True])
-                record=h.load(output/'normal-self-observations.json');self.assertEqual(record['record_complete'],not sample or exit_code==0)
+                record=h.load(output/'normal-self-observations.json');self.assertEqual(record['record_complete'],not sample or exit_code==0 and not timed_out)
+                self.assertLessEqual(record['client_started_monotonic_ns'],record['client_finished_monotonic_ns'])
+                if timed_out:kill.assert_called_once_with(99999999,h.signal.SIGINT)
+                else:kill.assert_not_called()
                 self.assertIn('not a simultaneous',record['before']['scope'])
                 self.assertIn('unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
                 self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
@@ -92,11 +181,13 @@ class HostedCycleTests(unittest.TestCase):
                     row=dict(status='observed',functional_valid=not(bad and issue=='functional'),accounting_valid=not(bad and issue=='accounting'),
                         all_correct=True,natural_reclamation=not(bad and issue=='cleanup'),arrival_schedule_quality='pass',
                         environment_quality='fail' if bad and issue=='quality' else 'unknown' if issue=='unknown-environment' else 'pass',measurement_invalid=False,
-                        full_cpu_us=12 if name=='B' and turn=='after' and issue=='drift' else 10)
+                        full_cpu_us=100 if turn=='sample' else 10,
+                        cpu_us=12 if name=='B' and turn=='after' and issue=='drift' else 10)
                     report=Path(output)/'score/client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
                         driver_headroom={'fraction_of_quota':.95 if bad and issue=='driver' else .3,'saturated':bad and issue=='driver'})))
                     row['score_report']=str(report)
-                    h.save(Path(output)/'score/normal-self-observations.json',{'record_complete':not(bad and issue=='observer')})
+                    h.save(Path(output)/'score/normal-self-observations.json',{'record_complete':not(bad and issue=='observer'),
+                        'client_started_monotonic_ns':10_000_000_001,'client_finished_monotonic_ns':25_000_000_002})
                     return row
                 patches.enter_context(patch.object(fc,'window',side_effect=window));old=fc.Harness
                 result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools',normal_self_probe=True),{'uid':1,'gid':1,'steps':{}})
@@ -108,9 +199,15 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='unknown-environment':
                     self.assertTrue(all(r['environment_quality']=='unknown' and r['diagnostic_quality']['environment_quality_preserved']=='unknown'
                         and not r['diagnostic_quality']['formal_environment_qualified'] for r in result['rows']))
+                if complete:
+                    self.assertEqual(result['controls']['B']['sampled_cpu_over_control_geomean'],1)
+                    self.assertEqual(result['controls']['B']['sampled_full_cpu_over_control_geomean'],10)
                 self.assertEqual(result['perf_attempts'],2 if expected==6 else 1)
                 self.assertEqual(result['goal_status'],'unknown' if complete else 'blocked')
                 self.assertTrue(all('--call-graph' not in call.args[0] for call in commands.call_args_list))
+                for call in commands.call_args_list:
+                    if call.args[0][1] in ('report','script'):
+                        args=call.args[0];self.assertEqual(args[args.index('--time')+1],'10.000000001,25.000000002')
 
     def test_normal_self_raw_perf_and_mapped_elf_are_in_full_archive_allowlist(self):
         root=Path('/unused')
@@ -150,7 +247,8 @@ class HostedCycleTests(unittest.TestCase):
                     report['assessment']=result_assessment(report,h.POLICY,self.manifest.get('environment_qualification'))
                     h.save(Path(output)/'client.json',report);return report
             def sampler(client,service,output,*args,**kwargs):
-                result=client();h.save(Path(output)/'normal-self-observations.json',{'record_complete':True});return result
+                result=client();h.save(Path(output)/'normal-self-observations.json',{'record_complete':True,
+                    'client_started_monotonic_ns':10_000_000_001,'client_finished_monotonic_ns':25_000_000_002});return result
             patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
             patches.enter_context(patch.object(fc,'Harness',Harness));patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:bindings[n]))
             patches.enter_context(patch.object(fc,'quiet_metrics',return_value=True));patches.enter_context(patch.object(fc,'service_termination_succeeded',return_value=True))
@@ -177,6 +275,11 @@ class HostedCycleTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):code=h.main(['--phase','diagnostic','--build-set','diagnostic','--normal-self-probe',
                 '--root',str(root/'out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40])
             self.assertEqual(code,0);alarm.assert_called_once_with(330)
+            alarm.reset_mock()
+            with redirect_stdout(io.StringIO()):code=h.main(['--phase','diagnostic','--build-set','diagnostic','--pg-queue-screen',
+                '--root',str(root/'pg-out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40,
+                '--prepatch',h.PG_QUEUE_PREPATCH])
+            self.assertEqual(code,0);alarm.assert_called_once_with(420)
 
     def test_pg_failure_probe_is_one_identified_non_scoring_point(self):
         versions={'B':{'root':'/unused/B','stack':'ku'}}
@@ -913,7 +1016,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
