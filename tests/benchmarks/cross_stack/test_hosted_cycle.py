@@ -14,11 +14,11 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
-    def test_http_wake_plan_is_three_original_controls_and_only_twenty_business_windows(self):
-        plan=h.http_wake_plan({'A':{},'B':{}})
+    def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
+        plan=h.http_short_plan({'A':{},'B':{}})
         controls,business=plan['windows'][:3],plan['windows'][3:]
         self.assertEqual(len(plan['windows']),23);self.assertEqual(plan['maximum_windows'],23)
-        self.assertEqual(plan['prepatch'],h.HTTP_WAKE_PREPATCH);self.assertEqual(plan['maximum_replacements'],0)
+        self.assertEqual(plan['prepatch'],h.HTTP_SHORT_PREPATCH);self.assertEqual(plan['maximum_replacements'],0)
         self.assertTrue(all((x['name'],x['phase'],x['workload'],x['rate'],x['warmup_seconds'],x['score_seconds'])==
             ('A','environment-control','json_object',500,5,10) for x in controls))
         for workload,rate,contract in [('json_object',500,'dom'),('ok',2000,'text'),('db',200,'pg-strict')]:
@@ -31,7 +31,7 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(plan['adoption_thresholds']['json_upper95_strictly_below'],1)
         self.assertEqual(plan['adoption_thresholds']['compute_ratio_maximum'],1.03)
 
-    def test_http_wake_compute_uses_real_assessment_and_preserves_low_sample_rejection(self):
+    def test_http_short_compute_uses_real_assessment_and_preserves_low_sample_rejection(self):
         from linux_harness import result_assessment
         for count in (300,1500):
             with self.subTest(count=count),tempfile.TemporaryDirectory() as temp:
@@ -52,20 +52,82 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(valid,count==1500)
                 self.assertFalse(assessed['candidate_accepted'])
 
-    def test_http_wake_selection_freezes_prepatch_is_exclusive_and_is_not_default(self):
-        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_WAKE_PREPATCH,screen_variants=[])
-        self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('http_wake_screen',False))
-        identity=h.hosted_identity(types.SimpleNamespace(**base,http_wake_screen=True),'diagnostic')
-        self.assertEqual(identity['prepatch'],h.HTTP_WAKE_PREPATCH);self.assertTrue(identity['http_wake_screen'])
+    def test_http_short_goal_freezes_identity_plan_and_does_not_affect_other_modes(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
+        plain=h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')
+        self.assertEqual(plain,h.hosted_identity(types.SimpleNamespace(**base,http_short_goal='memory'),'diagnostic'))
+        identities=[]
+        for goal in ('cpu','memory'):
+            identity=h.hosted_identity(types.SimpleNamespace(**base,http_short_screen=True,http_short_goal=goal),'diagnostic')
+            self.assertEqual(identity['http_short_goal'],goal);identities.append(identity)
+        self.assertNotEqual(identities[0],identities[1])
+        cpu,memory=(h.http_short_plan({'A':{},'B':{}},goal) for goal in ('cpu','memory'))
+        self.assertEqual(cpu['windows'],memory['windows']);self.assertEqual(cpu['resources'],memory['resources'])
+        self.assertEqual(memory['adoption_thresholds']['json_memory_geometric_ratio_maximum'],.95)
+        self.assertEqual(memory['adoption_thresholds']['json_memory_upper95_strictly_below'],1)
+        self.assertEqual(memory['adoption_thresholds']['cpu_lower95_maximum'],1)
+        self.assertEqual(memory['adoption_thresholds']['cpu_upper95_maximum'],1.03)
+        self.assertEqual(memory['adoption_thresholds']['memory_metric'],'memory.steady_median_bytes')
+        for flag in ('memory_owner_probe','pg_driver_screen','normal_self_probe'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**base,http_short_screen=True,http_short_goal='memory',**{flag:True}),'diagnostic')
+        with self.assertRaises(ValueError):h.http_short_plan({},'rss')
+
+    def test_http_short_memory_goal_reads_only_score_steady_cgroup_median_and_guards_cpu(self):
+        cases=('none','memory-small','memory-upper','memory-missing','virtual-only','memory-nan','unknown',
+            'json-cpu-lower','ok-cpu-lower','db-cpu-lower','cpu-upper','compute-regression')
+        for issue in cases:
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({'A':{},'B':{}},'memory')['windows']:
+                    row=dict(config,environment_quality='unknown' if issue=='unknown' else 'pass')
+                    ratio=1
+                    if issue=={'json_object':'json-cpu-lower','ok':'ok-cpu-lower','db':'db-cpu-lower'}.get(row['workload']):ratio=1.001
+                    if issue=='cpu-upper' and row['workload']=='json_object':ratio=[.99,1,1.04][row['group']-1]
+                    if issue=='compute-regression' and row['workload']=='cpu':ratio=1.04
+                    row['full_cpu_us']=100*(ratio if row['name']=='B' else 1)
+                    memratio=.96 if issue=='memory-small' else [.90,.92,1.01][row['group']-1] if issue=='memory-upper' else .94
+                    row['memory']={'steady_median_bytes':1_000_000*(memratio if row['name']=='B' else 1),'sample_count':12}
+                    # Misleading endpoints/virtual/requested values must not override the score metric.
+                    row.update(endpoint_memory_current=10_000_000 if row['name']=='B' else 1,
+                        virtual_bytes=1,requested_bytes=1)
+                    if issue in ('memory-missing','virtual-only'):row['memory']={'virtual_bytes':1,'endpoint_memory_current':1}
+                    if issue=='memory-nan':row['memory']['steady_median_bytes']=float('nan')
+                    rows.append(row)
+                result=h.http_short_comparison(rows,True,{'quality':'pass'},'memory')
+                self.assertEqual(result['http_short_goal'],'memory');self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(result['eligible_for_root_review'],issue=='none')
+                if issue=='none':self.assertAlmostEqual(result['json_memory']['estimate'],.94)
+                if issue in ('memory-missing','virtual-only','memory-nan'):
+                    self.assertEqual(result['json_memory']['status'],'unavailable_nonpositive_or_missing_window')
+
+    def test_http_short_goal_or_threshold_change_rejected_before_product_or_database_access(self):
+        for issue in ('goal','threshold'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.http_short_plan({'A':{},'B':{}},'memory')
+                if issue=='threshold':plan['adoption_thresholds']['json_memory_geometric_ratio_maximum']=.99
+                h.save(root/'frozen-plan.json',plan)
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                binding=patches.enter_context(patch.object(fc,'version_identity'))
+                database=patches.enter_context(patch.object(h.db,'Database'))
+                with self.assertRaises(ValueError):h.diagnostic(types.SimpleNamespace(root=root,http_short_screen=True,
+                    http_short_goal='cpu' if issue=='goal' else 'memory'),{'uid':1,'gid':1,'steps':{}})
+                binding.assert_not_called();database.assert_not_called()
+
+    def test_http_short_selection_freezes_prepatch_is_exclusive_and_is_not_default(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
+        self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('http_short_screen',False))
+        identity=h.hosted_identity(types.SimpleNamespace(**base,http_short_screen=True),'diagnostic')
+        self.assertEqual(identity['prepatch'],h.HTTP_SHORT_PREPATCH);self.assertTrue(identity['http_short_screen'])
         for flag in ('normal_self_probe','pg_failure_probe','task_json_screen','common_http_screen','final_task_json','pg_queue_screen','pg_driver_screen'):
             with self.subTest(flag=flag),self.assertRaises(ValueError):
-                h.validate_screen_selection(types.SimpleNamespace(**base,http_wake_screen=True,**{flag:True}),'diagnostic')
-        for change in ({'prepatch':h.BASELINE},{'candidate':h.HTTP_WAKE_PREPATCH}):
+                h.validate_screen_selection(types.SimpleNamespace(**base,http_short_screen=True,**{flag:True}),'diagnostic')
+        for change in ({'prepatch':h.BASELINE},{'candidate':h.HTTP_SHORT_PREPATCH}):
             with self.subTest(change=change),self.assertRaises(ValueError):
-                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change),http_wake_screen=True),'diagnostic')
-        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(http_wake_screen=True),'full')
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change),http_short_screen=True),'diagnostic')
+        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(http_short_screen=True),'full')
 
-    def test_http_wake_build_only_fresh_normal_A_B_and_same_driver(self):
+    def test_http_short_build_only_fresh_normal_A_B_and_same_driver(self):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
             root=Path(temp);calls=[]
             class Builder:
@@ -80,12 +142,12 @@ class HostedCycleTests(unittest.TestCase):
             patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
             patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
             a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.BASELINE,candidate='b'*40,
-                prepatch=h.HTTP_WAKE_PREPATCH,screen_variants=[],build_set='diagnostic',http_wake_screen=True)
+                prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[],build_set='diagnostic',http_short_screen=True)
             self.assertEqual(h.build(a,{'steps':{}}),{'ready':True})
             self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)])
 
-    def test_http_wake_comparison_never_adopts_and_blocks_invalid_environment_and_guards(self):
-        plan=h.http_wake_plan({'A':{},'B':{}})
+    def test_http_short_comparison_never_adopts_and_blocks_invalid_environment_and_guards(self):
+        plan=h.http_short_plan({'A':{},'B':{}})
         for issue in ('none','environment-unknown','business-environment-unknown','incomplete','json-small','pg-regression','compute-regression'):
             with self.subTest(issue=issue):
                 rows=[]
@@ -96,16 +158,16 @@ class HostedCycleTests(unittest.TestCase):
                     if issue=='compute-regression' and row['workload']=='cpu':ratio=1.04
                     row['full_cpu_us']=100*(ratio if row['name']=='B' else 1)
                     row['environment_quality']='unknown' if issue=='business-environment-unknown' else 'pass';rows.append(row)
-                result=h.http_wake_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='environment-unknown' else 'pass'})
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='environment-unknown' else 'pass'})
                 self.assertEqual(result['eligible_for_root_review'],issue=='none');self.assertFalse(result['candidate_accepted'])
                 if issue=='environment-unknown':self.assertIn('environment qualification unresolved or failed',result['reasons'])
                 if issue!='incomplete':
                     self.assertEqual(result['compute_guard']['pairs'],1);self.assertIsNone(result['compute_guard']['confidence_interval'])
 
-    def test_http_wake_runner_stops_failed_controls_or_invalid_business_without_replacement(self):
+    def test_http_short_runner_stops_failed_controls_or_invalid_business_without_replacement(self):
         for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);plan=h.http_wake_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+                root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
                 h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
                 h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
                 fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
@@ -115,7 +177,7 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
-                    source_commit=h.HTTP_WAKE_PREPATCH if n=='A' else 'b'*40,
+                    source_commit=h.HTTP_SHORT_PREPATCH if n=='A' else 'b'*40,
                     files={'expanded source':{'sha256':'a'*64 if issue=='business' and n=='A' else 'b'*64}})))
                 patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
                 patches.enter_context(patch.object(h,'sha',return_value='f'*64));measured=[]
@@ -133,7 +195,7 @@ class HostedCycleTests(unittest.TestCase):
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
                         h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
                     row['score_report']=str(Path(output)/'score/client.json');return row
-                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_wake_screen=True)
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_short_screen=True)
                 if issue in ('flags','business'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue
@@ -147,7 +209,7 @@ class HostedCycleTests(unittest.TestCase):
                 else:self.assertFalse(result['comparison']['eligible_for_root_review'])
 
     def test_owner_mode_is_single_unscored_reuse_only_window(self):
-        for flag in ('pg_driver_screen','normal_self_probe','http_wake_screen','task_json_screen','final_task_json'):
+        for flag in ('pg_driver_screen','normal_self_probe','http_short_screen','task_json_screen','final_task_json'):
             with self.subTest(flag=flag),self.assertRaises(ValueError):
                 h.validate_screen_selection(types.SimpleNamespace(memory_owner_probe=True,**{flag:True}),'diagnostic')
         plan=h.memory_owner_plan({'M':{}})
@@ -1442,7 +1504,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
