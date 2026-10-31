@@ -541,7 +541,8 @@ jobs:
           for package in "linux-tools-$(uname -r)" linux-tools-generic; do
             if apt-cache show "$package" >/dev/null 2>&1; then sudo -n apt-get install -y --no-install-recommends "$package"; break; fi
           done
-          perf_binary="$(find /usr/lib/linux-tools* -type f -name perf 2>/dev/null | sort -V | tail -n 1)"
+          perf_binary="$(find -L /usr/lib/linux-tools* -maxdepth 3 -type f -name perf -print 2>/dev/null | sort -V | tail -n 1 || true)"
+          printf 'Selected perf executable: %s\n' "$perf_binary"
           test -x "$perf_binary"
           mkdir -p "$RUNNER_TEMP/json-plain-tools"
           ln -s "$perf_binary" "$RUNNER_TEMP/json-plain-tools/perf"
