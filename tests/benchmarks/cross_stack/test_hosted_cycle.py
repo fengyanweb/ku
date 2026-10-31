@@ -13,6 +13,96 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_pg_driver_plan_is_two_conditions_with_original_deadlines_and_recovery(self):
+        plan=h.pg_driver_plan({'B':{}})
+        self.assertEqual([x['concurrency'] for x in plan['windows']],[256,1024])
+        self.assertTrue(all((x['rate'],x['warmup_seconds'],x['score_seconds'])==(12800,3,10) for x in plan['windows']))
+        self.assertEqual((plan['timeout_seconds'],plan['queue'],plan['maximum_replacements']),(3,65536,0))
+        self.assertEqual((plan['recovery']['rate'],plan['recovery']['seconds'],plan['recovery']['maximum_seconds']),(100,2,5))
+        self.assertFalse(plan['formal_qualified']);self.assertFalse(plan['normal_score_eligible'])
+        self.assertEqual(plan['resources'],h.RESOURCES)
+
+    def test_pg_driver_selection_is_exclusive_and_not_implicit(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.BASELINE,screen_variants=[])
+        self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('pg_driver_screen',False))
+        self.assertTrue(h.hosted_identity(types.SimpleNamespace(**base,pg_driver_screen=True),'diagnostic')['pg_driver_screen'])
+        for flag in ('normal_self_probe','pg_failure_probe','task_json_screen','common_http_screen','final_task_json','pg_queue_screen'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**base,pg_driver_screen=True,**{flag:True}),'diagnostic')
+        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(pg_driver_screen=True),'full')
+
+    def test_pg_driver_build_is_only_fresh_normal_B_and_same_go_driver(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            class Builder:
+                def __init__(self,directory,source,**kwargs):self.name=directory.name
+                def ku(self):calls.append((self.name,'ku'))
+                def go_build(self,client=False):calls.append((self.name,'driver',client))
+                def rust(self):raise AssertionError('Rust is not part of this screen')
+                def finish(self,**kwargs):return {}
+            patches.enter_context(patch.object(h.bl,'Builder',Builder))
+            patches.enter_context(patch.object(h,'snapshot',side_effect=lambda s,c,d:d.mkdir(parents=True)))
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
+            complete=patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
+            a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.BASELINE,candidate='b'*40,
+                prepatch=h.BASELINE,screen_variants=[],build_set='diagnostic',pg_driver_screen=True)
+            self.assertEqual(h.build(a,{'steps':{}}),{'ready':True})
+            self.assertEqual(calls,[('B','ku'),('Driver','driver',True)]);complete.assert_called_once()
+
+    def test_pg_driver_screen_keeps_failed_warmup_and_stops_on_resource_or_process_failure(self):
+        for issue in ('none','warmup-functional','recovery-deadline','driver-cleanup','memory-limit','service-exit','database-cleanup'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.pg_driver_plan({'B':dict(root=str(root/'B'),stack='ku')});trace=[]
+                h.save(root/'frozen-plan.json',plan);h.save(root/'B/manifest.json',{'client':{'command':['driver','--diagnostic-arrival-ledger']}})
+                manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
+                fixture=types.SimpleNamespace(start=lambda:trace.append('database-start'),manifest_path=manifest,state_path=state_path,
+                    stop=lambda:dict(forced=issue=='database-cleanup',cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                class Domain:
+                    def snapshot(self):return {'memory_events':{}}
+                class Service:
+                    startup={'identity':'same-product'};domain=Domain();process=types.SimpleNamespace(poll=lambda:None)
+                    def metrics(self,**kwargs):return {'quiet':True}
+                    def stop(self):trace.append('service-stop');return {'natural':True}
+                class Harness:
+                    def __init__(self,*args):self.manifest={};self.db_domain=None
+                    def start(self,*args,**kwargs):trace.append('service-start');return Service()
+                    def client(self,service,kind,rate,seconds,output,**kwargs):
+                        phase=Path(output).name;trace.append((kwargs['concurrency'],phase));self_test.assertEqual(kind,'db')
+                        self_test.assertEqual(kwargs['timeout'],3);self_test.assertTrue(kwargs['runtime_metrics'])
+                        good=not(issue=='warmup-functional' and phase=='warmup')
+                        report=dict(assessment=dict(functional_valid=good,accounting_valid=True,arrival_schedule_quality='fail',environment_quality='unknown'),
+                            ledger=dict(planned=rate*seconds,correct_total=rate*seconds if good else 0,results={'correct':rate*seconds} if good else {'other_http':rate*seconds}),
+                            configuration=dict(origin_monotonic_uncertainty_ns=1),resources={},first_errors=[] if good else [{'detail':'retained-500'}],
+                            service_cost=dict(before={'memory_events':{}},after={'memory_events':{'max':1} if issue=='memory-limit' else {}},
+                                driver_after={'memory_events':{}},service_exited=issue=='service-exit'))
+                        h.save(Path(output)/'client.json',report);h.save(Path(output)/'driver-cleanup.json',dict(process_reaped=issue!='driver-cleanup',exit_code=0,cgroup_removed=True,after={'process_count':0}))
+                        return report
+                self_test=self
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(h,'ExternalDomain',return_value=Domain()));patches.enter_context(patch.object(fc,'Harness',Harness))
+                patches.enter_context(patch.object(fc,'version_identity',return_value=dict(stack='ku',build_mode=mode)))
+                patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
+                patches.enter_context(patch.object(fc,'quiet_metrics',return_value=True));patches.enter_context(patch.object(h,'sha',return_value='f'*64))
+                patches.enter_context(patch.object(fc,'measurement_clock',side_effect=lambda c:dict(available=True,
+                    origin_ns=h.time.monotonic_ns()-(16_000_000_000 if issue=='recovery-deadline' else 10_000_000_000))))
+                patches.enter_context(patch.object(fc,'window_lifecycle_cost',return_value={'retained':True}))
+                result=h.diagnostic(types.SimpleNamespace(root=root,pg_driver_screen=True),{'uid':1,'gid':1,'steps':{}})
+                fatal=issue in ('driver-cleanup','memory-limit','service-exit')
+                expected=[(256,'warmup')] if fatal else [(n,p) for n in (256,1024) for p in ('warmup','score','recovery')]
+                self.assertEqual([x for x in trace if isinstance(x,tuple)],expected)
+                self.assertEqual(trace.count('service-start'),1 if fatal else 2)
+                self.assertEqual(trace.count('service-stop'),trace.count('service-start'))
+                self.assertEqual(result['execution_complete'],issue in ('none','warmup-functional','recovery-deadline'))
+                self.assertFalse(result['formal_qualified']);self.assertFalse(result['candidate_accepted'])
+                self.assertTrue(all(r['qualified'] is False for r in result['rows']))
+                if issue=='warmup-functional':
+                    self.assertFalse(result['rows'][0]['phases']['warmup']['assessment']['functional_valid'])
+                    self.assertEqual(result['rows'][0]['phases']['warmup']['first_errors'][0]['detail'],'retained-500')
+                if not fatal:self.assertTrue(all(r['recovery']['passed'] is (issue!='recovery-deadline') for r in result['rows']))
+
     def test_pg_queue_plan_has_only_six_normal_and_two_diagnostic_pressure_windows(self):
         plan=h.pg_queue_plan({'A':{},'B':{}},h.PG_QUEUE_PREPATCH)
         self.assertEqual(len(plan['windows']),8);self.assertEqual(plan['maximum_replacements'],0)
@@ -1134,7 +1224,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

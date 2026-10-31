@@ -156,6 +156,14 @@ they must never determine recovery or resource-window association. Other systems
 emit null anchor/derived values with an explicit unsupported-platform reason.
 macOS smoke results do not establish Linux cross-process timing accuracy.
 
+The explicit DB-only `--diagnostic-arrival-ledger` probe retains the already
+captured enqueue timestamp as `generated_ns` and records its existing bounded
+histogram. It uses the same 128-byte event slots and 21-column formatter as
+`task_mix`; the unused CPU/reset columns remain zero, empty or false. It adds no
+request, timer, clock read, retry or deadline renewal. The report is marked
+diagnostic and excluded from normal scores. Without this flag, the original
+DB 15-column CSV and absent generation timestamps remain unchanged.
+
 CSV recording reserves a checked 128-byte slot per planned request plus a seen
 bitmap before arrivals, with a 256-MiB backing limit. Request completion stores
 one indexed record; it cannot overflow a streaming CSV queue. After requests

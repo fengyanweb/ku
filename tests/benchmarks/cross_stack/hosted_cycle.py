@@ -35,16 +35,19 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'pg_driver_screen',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen'))):
+        raise ValueError('--pg-driver-screen requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'pg_queue_screen',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
-            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe'))):
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_driver_screen'))):
         raise ValueError('--pg-queue-screen requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'pg_queue_screen',False) and (getattr(a,'prepatch',None)!=PG_QUEUE_PREPATCH or a.candidate==PG_QUEUE_PREPATCH):
         raise ValueError('--pg-queue-screen requires frozen f39c673 prepatch and a distinct fixed candidate')
     if getattr(a,'normal_self_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
-            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','pg_queue_screen'))):
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','pg_queue_screen','pg_driver_screen'))):
         raise ValueError('--normal-self-probe requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'pg_failure_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
-            ('task_json_screen','common_http_screen','final_task_json','normal_self_probe','pg_queue_screen'))):
+            ('task_json_screen','common_http_screen','final_task_json','normal_self_probe','pg_queue_screen','pg_driver_screen'))):
         raise ValueError('--pg-failure-probe requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'final_task_json',False) and (build_set!='full' or getattr(a,'task_json_screen',False) or getattr(a,'common_http_screen',False)):
         raise ValueError('--final-task-json requires full build-set and cannot select followup screens')
@@ -61,6 +64,7 @@ def hosted_identity(a,build_set):
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
     if getattr(a,'normal_self_probe',False):identity['normal_self_probe']=True
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
+    if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     return identity
 
 
@@ -238,6 +242,19 @@ def normal_self_plan(versions):
                 'same fixed corpus and driver, before/sample/after per stack. No D ledger, retries, '
                 'callchain probe, capacity, product change or performance acceptance. '
                 'SELF shares are not exclusive whole-request CPU attribution; inclusive chains are unavailable.')
+
+
+def pg_driver_plan(versions):
+    return dict(schema='ku-hosted-pg-driver-screen-v1',versions=versions,
+        resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
+        windows=[dict(concurrency=n,rate=12800,warmup_seconds=3,score_seconds=10) for n in (256,1024)],
+        recovery=dict(rate=100,seconds=2,maximum_seconds=5,origin='score planned cutoff, including request tail and CSV export'),
+        timeout_seconds=3,queue=65536,diagnostic_arrival_ledger=True,maximum_windows=2,maximum_replacements=0,
+        observation_alarm_seconds=180,workflow_limit_seconds=240,diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,candidate_accepted=False,
+        purpose='Only sender concurrency256 versus1024 on one fresh normal B product. Both arms explicitly retain existing '
+                'enqueue timestamps in the same identified diagnostic driver. Failed warmup is retained and score may be '
+                'observed, never accepted; no timeout renewal, SQL retry, product change, matrix or capacity ranking.')
 
 
 def pg_queue_plan(versions,prepatch):
@@ -477,6 +494,7 @@ def build(a,state):
         ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
     if getattr(a,'pg_queue_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     # Inspect the frozen product snapshot, never the current tools checkout.
@@ -493,12 +511,14 @@ def complete_build(a,state,build_set,prepatch,variants):
     final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
-    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) else 'R')/'manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
+    rm=load(a.root/('Driver' if getattr(a,'pg_queue_screen',False) or getattr(a,'pg_driver_screen',False) else 'R')/'manifest.json');client=copy.deepcopy(rm['client']);protocol=Path(rm['protocol']);versions={}
+    if getattr(a,'pg_driver_screen',False):client['command'].append('--diagnostic-arrival-ledger')
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
     if getattr(a,'pg_queue_screen',False):names=['A','B']
+    if getattr(a,'pg_driver_screen',False):names=['B']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
         if not (a.root/'BT/manifest.json').is_file():raise ValueError('explicit Task JSON mode requires the completed BT build')
@@ -522,7 +542,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
-    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
+    if diagnostic and not any(getattr(a,k,False) for k in ('normal_self_probe','pg_queue_screen','pg_driver_screen')):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
     layers=None
     if build_set=='followup-screen':
         layers=step(state,a.root,'build-json-layers',lambda:build_json_layers(a))
@@ -530,7 +550,8 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    if getattr(a,'pg_queue_screen',False):plan=pg_queue_plan(versions,prepatch)
+    if getattr(a,'pg_driver_screen',False):plan=pg_driver_plan(versions)
+    elif getattr(a,'pg_queue_screen',False):plan=pg_queue_plan(versions,prepatch)
     elif getattr(a,'normal_self_probe',False):plan=normal_self_plan(versions)
     elif getattr(a,'pg_failure_probe',False):plan=pg_failure_plan(versions)
     elif build_set=='followup-screen':plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False))
@@ -1343,6 +1364,133 @@ def pg_queue_screen(a,state):
     return result
 
 
+def pg_driver_screen(a,state):
+    """Two owned serial sender conditions; failed observations never become scores."""
+    if os.geteuid()!=0:raise ValueError('PG driver screen requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan!=pg_driver_plan(plan.get('versions',{})):raise ValueError('matching frozen PG driver plan required')
+    binding=fc.version_identity(plan,'B');expected=dict(formatting_mode='helpers',json_response_mode='text',
+        json_execution_mode='worker',pg_execution_mode='async',pg_read_mode='int',
+        native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    if binding['stack']!='ku' or binding['build_mode']!=expected:raise ValueError('normal Release B mode required')
+    manifest=load(Path(plan['versions']['B']['root'])/'manifest.json')
+    if manifest['client']['command'].count('--diagnostic-arrival-ledger')!=1:
+        raise ValueError('same explicitly identified diagnostic driver required for both conditions')
+    directory=a.root/'pg-driver-screen';directory.mkdir(exist_ok=False)
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);result=dict(schema='ku-pg-driver-screen-v1',
+        rows=[],stopped=[],execution_complete=False,diagnostic_only=True,formal_qualified=False,
+        normal_score_eligible=False,candidate_accepted=False,goal_status='unknown',purpose=plan['purpose'])
+    began=time.monotonic();selected=[]
+    try:
+        fixture.start();private=load(fixture.manifest_path)
+        save(directory/'identity.json',dict(binding=binding,resources=plan['resources'],quality_policy=plan['quality_policy'],
+            database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id'),
+            driver_command=manifest['client']['command'],plan=plan))
+        for config in plan['windows']:
+            output=directory/('c%d'%config['concurrency']);output.mkdir();service=None;termination=None;quiet=False
+            row=dict(concurrency=config['concurrency'],diagnostic_only=True,formal_qualified=False,
+                normal_score_eligible=False,candidate_accepted=False,qualified=False,phases={},observation_complete=False)
+            result['rows'].append(row)
+            try:
+                if fc.version_identity(plan,'B')!=binding:raise ValueError('product/driver identity changed before condition')
+                harness=fc.Harness(Path(plan['versions']['B']['root']),output)
+                harness.manifest=copy.deepcopy(harness.manifest);harness.manifest['db_url']=private['db_url']
+                harness.db_domain=ExternalDomain(private['db_cgroup'])
+                service=harness.start('ku',cores=plan['resources']['service_cores'],
+                    memory=plan['resources']['service_memory_bytes'],output=output/'service')
+                save(output/'service/service.json',service.startup)
+                reports={}
+                for phase,rate,seconds in (('warmup',config['rate'],config['warmup_seconds']),
+                        ('score',config['rate'],config['score_seconds']),
+                        ('recovery',plan['recovery']['rate'],plan['recovery']['seconds'])):
+                    if service.process.poll() is not None:raise ValueError('service exited before '+phase)
+                    database_before=harness.db_domain.snapshot()
+                    report=harness.client(service,'db',rate,seconds,output/phase,concurrency=config['concurrency'],
+                        timeout=plan['timeout_seconds'],runtime_metrics=True)
+                    reports[phase]=report;cost=report['service_cost'];database_after=harness.db_domain.snapshot()
+                    save(output/phase/'database-endpoints.json',dict(before=database_before,after=database_after))
+                    cleanup=load(output/phase/'driver-cleanup.json')
+                    if not (cleanup.get('process_reaped') is True and cleanup.get('exit_code')==0
+                            and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0):
+                        raise ValueError('owned driver failed or cleanup incomplete in '+phase)
+                    if cost.get('service_exited') or service.process.poll() is not None:
+                        raise ValueError('service exited during '+phase)
+                    if database_after.get('process_count')==0:raise ValueError('database exited during '+phase)
+                    if cost.get('sampler_error') or cost.get('sampler_overflow'):
+                        raise ValueError('bounded resource observer failed during '+phase)
+                    for label,before,after in (('service',cost['before'],cost['after']),
+                            ('driver',{},cost['driver_after']),('database',database_before,database_after)):
+                        if any(after.get('memory_events',{}).get(key,0)>before.get('memory_events',{}).get(key,0)
+                                for key in ('max','oom','oom_kill','oom_group_kill')):
+                            raise ValueError(label+' memory limit event in '+phase)
+                    metrics=service.metrics(timeout=.5);save(output/phase/'runtime-after.json',metrics)
+                    row['phases'][phase]=dict(assessment=report['assessment'],ledger=report['ledger'],
+                        resources=report['resources'],first_errors=report['first_errors'],
+                        configuration=report['configuration'],report=str(output/phase/'client.json'),
+                        driver_cleanup_ok=True,database_endpoint_report=str(output/phase/'database-endpoints.json'))
+                    save(output/'window.json',row)
+                score,recovery=reports['score'],reports['recovery'];anchor=fc.measurement_clock(score['configuration'])
+                cutoff=(anchor['origin_ns']+int(config['score_seconds']*1e9)) if anchor['available'] else None
+                until=time.monotonic()+5;metrics={}
+                while time.monotonic()<until:
+                    metrics=service.metrics(timeout=.5);quiet=fc.quiet_metrics('ku',metrics)
+                    if quiet:break
+                    time.sleep(.1)
+                recovery_elapsed=((time.monotonic_ns()-cutoff+score['configuration']['origin_monotonic_uncertainty_ns'])/1e9
+                    if cutoff is not None else None)
+                recovery_ok=(recovery['assessment']['functional_valid'] is True
+                    and recovery['assessment']['accounting_valid'] is True
+                    and recovery['ledger']['planned']==recovery['ledger']['correct_total']==200
+                    and quiet and recovery_elapsed is not None and 0<=recovery_elapsed<=plan['recovery']['maximum_seconds'])
+                row['recovery']=dict(passed=recovery_ok,elapsed_until_quiet_seconds=recovery_elapsed,
+                    origin=plan['recovery']['origin'],maximum_seconds=plan['recovery']['maximum_seconds'])
+                physical=service.domain.snapshot();termination=service.stop()
+                row['termination']=termination;natural=fc.service_termination_succeeded('ku',termination)
+                save(output/'full-lifecycle.json',fc.window_lifecycle_cost(score,physical,quiet,termination,metrics,recovery))
+                save(output/'termination.json',termination)
+                row.update(quiet=quiet,natural_reclamation=quiet and natural,observation_complete=quiet and natural,
+                    warmup_qualified=False,score_qualified=False,
+                    warmup_issues_preserved=reports['warmup']['assessment'],
+                    interpretation='All conditions are diagnostic and unqualified. Failed warmup/arrival/requests are retained; '
+                        'continued score observation is not a retry or a capacity/performance pass.')
+                if not natural or not quiet:raise ValueError('physical quiet or natural reclamation failed')
+                if fc.version_identity(plan,'B')!=binding:raise ValueError('product/driver identity changed during condition')
+            except BaseException as error:
+                row.update(observer_error=repr(error),observation_complete=False)
+                result['stopped'].append(dict(concurrency=config['concurrency'],reason=repr(error)))
+                if not isinstance(error,Exception):raise
+            finally:
+                if service is not None and termination is None:
+                    try:
+                        termination=service.stop();row['termination']=termination
+                    except BaseException as error:
+                        row['cleanup_error']=repr(error)
+                        if not isinstance(error,Exception):raise
+                save(output/'window.json',row);save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
+            if result['stopped']:break
+    except BaseException as error:
+        result['observer_error']=repr(error)
+        if not isinstance(error,Exception):raise
+    finally:
+        try:result['database_cleanup']=fixture.stop()
+        except Exception as error:result['database_cleanup']={'error':repr(error)}
+        cleanup=result['database_cleanup'];dbok=(cleanup.get('forced') is False
+            and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0)
+        result.update(seconds=time.monotonic()-began,execution_complete=len(result['rows'])==2
+            and all(r['observation_complete'] for r in result['rows']) and not result['stopped'] and dbok and 'observer_error' not in result)
+        result['goal_status']='unknown' if result['execution_complete'] else 'blocked'
+        save(directory/'summary.json',result);state['pg_driver_database_cleanup']=cleanup
+        selected=[directory/name for name in ('summary.json','identity.json','results.json')]
+        selected.extend(directory/('c%d'%n)/relative for n in (256,1024) for relative in (
+            'window.json','full-lifecycle.json','termination.json','service/service.log'))
+        selected.extend(directory/('c%d'%n)/phase/name for n in (256,1024) for phase in ('warmup','score','recovery')
+            for name in ('client.json','driver-cleanup.json','runtime-after.json','runtime-metrics.json','database-endpoints.json'))
+        result['small_artifact']=pg_failure_export(a,directory,output_name='pg-driver-observation',
+            schema='ku-pg-driver-small-artifact-v1',selected=selected)
+        save(a.root/'hosted-state.json',state)
+    return result
+
+
 def normal_self_probe(a,state):
     """Six windows at most, exact normal binaries, never a new performance score."""
     if os.geteuid()!=0:raise ValueError('normal SELF probe requires root cgroup control')
@@ -1459,6 +1607,7 @@ def normal_self_probe(a,state):
 
 
 def diagnostic(a,state,followup=False):
+    if getattr(a,'pg_driver_screen',False):return pg_driver_screen(a,state)
     if getattr(a,'pg_queue_screen',False):return pg_queue_screen(a,state)
     if getattr(a,'normal_self_probe',False):return normal_self_probe(a,state)
     if getattr(a,'pg_failure_probe',False):return pg_failure_probe(a,state)
@@ -2006,6 +2155,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
+    p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
@@ -2013,6 +2163,7 @@ def main(argv=None):
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
     if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/preflight/archive')
     if a.phase=='perf-preflight' and not a.normal_self_probe:p.error('perf-preflight requires explicit normal-self mode')
+    if a.pg_driver_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-driver-screen only supports fresh build/diagnostic/archive')
     if a.pg_queue_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-queue-screen only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
@@ -2044,7 +2195,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

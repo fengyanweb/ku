@@ -68,6 +68,7 @@ type corpus struct {
 }
 type config struct {
 	admissionPressure                                                       bool
+	diagnosticArrival                                                       bool
 	admissionAdminAddress                                                   string
 	responseLiteral, pathOverride                                           string
 	responseLiteralSet, pathOverrideSet                                     bool
@@ -863,7 +864,7 @@ func enqueuePlanned(c config, l *ledger, j job, queue chan<- job, now time.Time)
 	// This existing timestamp distinguishes a late dispatcher from delay in
 	// the client queue, connection acquisition, Write, or service backpressure.
 	// It adds no timer, syscall or per-arrival ledger lock.
-	if c.workload == "task_mix" {
+	if c.workload == "task_mix" || c.diagnosticArrival {
 		j.generated = now
 	}
 	// The cutoff defines the arrival plan and the throughput window, not a
@@ -1402,6 +1403,9 @@ func load(c *config) error {
 	return nil
 }
 func run(c config) (map[string]any, error) {
+	if c.diagnosticArrival && c.workload != "db" {
+		return nil, fmt.Errorf("diagnostic-arrival-ledger requires db workload")
+	}
 	if err := validateConstantDiagnostic(c); err != nil {
 		return nil, err
 	}
@@ -1510,6 +1514,11 @@ func run(c config) (map[string]any, error) {
 		"detail_limit_bytes": 256, "scope": "bounded evidence only; complete outcome counters are unchanged; driver identity differs from older captures",
 	}
 	clocks := out["configuration"].(map[string]any)
+	if c.diagnosticArrival {
+		out["diagnostic_only"], out["normal_score_eligible"] = true, false
+		clocks["diagnostic_arrival_ledger"] = true
+		clocks["generated_definition"] = "existing enqueue now; before bounded request queue; no additional clock read"
+	}
 	if c.responseLiteralSet {
 		literalHash := sha256.Sum256([]byte(c.responseLiteral))
 		out["diagnostic_only"] = true
@@ -1588,6 +1597,7 @@ func parse() (config, error) {
 	flag.StringVar(&c.corporaDir, "corpora-dir", "", "optional corpus directory, frozen hashes still verified")
 	flag.StringVar(&c.corpusPath, "corpus", "", "override selected JSON corpus path, frozen hash still verified")
 	flag.StringVar(&c.output, "output", "", "exclusive-create JSON output, stdout if omitted")
+	flag.BoolVar(&c.diagnosticArrival, "diagnostic-arrival-ledger", false, "diagnostic db only: retain existing enqueue timestamp; no send or deadline changes")
 	flag.StringVar(&c.events, "events", "", "exclusive-create finite planned CSV, 256MiB backing; export after request completion")
 	flag.StringVar(&c.responseLiteral, "response-literal", "", "diagnostic only: exact complete response <=64KiB; requires --path-override")
 	flag.StringVar(&c.pathOverride, "path-override", "", "diagnostic only: escaped origin path <=8KiB, no query/fragment; requires --response-literal")

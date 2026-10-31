@@ -30,6 +30,64 @@ func testConfig(t *testing.T) config {
 }
 func testLedger() *ledger { return &ledger{all: newStats(), types: map[string]*stats{}} }
 
+func TestDiagnosticDBArrivalIsExplicitAndKeepsOriginalSchedule(t *testing.T) {
+	origin := time.Unix(100, 0)
+	for _, diagnostic := range []bool{false, true} {
+		c := config{workload: "db", diagnosticArrival: diagnostic, timeout: 3 * time.Second}
+		l := &ledger{all: newStats(), types: map[string]*stats{}, seconds: make([]secondStats, 1), origin: origin, cutoff: origin.Add(time.Second)}
+		j := job{index: 0, kind: "db", rid: "request", scheduled: origin}
+		l.plan(j)
+		queue := make(chan job, 1)
+		now := origin.Add(20 * time.Millisecond)
+		enqueuePlanned(c, l, j, queue, now)
+		got := <-queue
+		if !got.scheduled.Equal(origin) || diagnostic && !got.generated.Equal(now) || !diagnostic && !got.generated.IsZero() {
+			t.Fatalf("diagnostic=%v changed original schedule or default timestamp: %+v", diagnostic, got)
+		}
+		l.start()
+		l.finish(got, now, result{category: "timeout", stage: "before_write_deadline", completed: origin.Add(3 * time.Second)}, c)
+		if l.all.Planned != 1 || l.all.Results["timeout"] != 1 || l.all.Attempted != 1 || l.all.Sent != 0 || l.active != 0 {
+			t.Fatal("arrival evidence changed request outcome", l.all)
+		}
+		if diagnostic && l.all.generationLag.count != 1 || !diagnostic && l.all.generationLag.count != 0 {
+			t.Fatal("default mode acquired diagnostic samples")
+		}
+	}
+	if _, err := run(config{workload: "ok", diagnosticArrival: true}); err == nil {
+		t.Fatal("DB diagnostic was silently allowed for another workload")
+	}
+}
+
+func TestDiagnosticDBArrivalUsesExistingBoundedCSVStorage(t *testing.T) {
+	origin := time.Unix(100, 0)
+	c := config{workload: "db", diagnosticArrival: true}
+	path := filepath.Join(t.TempDir(), "events.csv.gz")
+	events, err := openPlannedEvents(path, c, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events.offer(event{j: job{kind: "db", rid: "request", scheduled: origin, generated: origin.Add(25 * time.Millisecond)}, origin: origin,
+		began: origin.Add(100 * time.Millisecond), result: result{category: "timeout", stage: "before_write_deadline", completed: origin.Add(3 * time.Second)}})
+	events.close()
+	if events.err != "" || events.written != 1 || events.dropped != 0 || events.planned.backingBytes != 136 {
+		t.Fatal("diagnostic event changed bounded backing", events.err, events.planned)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	rows, err := csv.NewReader(gz).ReadAll()
+	if err != nil || len(rows) != 2 || len(rows[0]) != 21 || rows[0][20] != "generated_ns" || rows[1][20] != "25000000" || rows[1][6] != "100000000" {
+		t.Fatal("existing formatter lost diagnostic enqueue/attempt evidence", rows, err)
+	}
+}
+
 func TestErrorSamplesRetainLateHTTP500WithoutChangingCounters(t *testing.T) {
 	c := testConfig(t)
 	c.workload = "db"

@@ -138,7 +138,7 @@ func openPlannedEvents(path string, c config, count uint64) (*eventWriter, error
 	}
 	// Reuse the original exclusive file, 21/15-column formatter and compressor.
 	// Its writer waits for EOF export; no CSV events enter its channel in-flight.
-	w, err := openEvents(path, c.workload == "task_mix")
+	w, err := openEvents(path, c.workload == "task_mix" || c.diagnosticArrival)
 	if err != nil {
 		return nil, err
 	}
