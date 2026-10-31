@@ -33,10 +33,18 @@ def save(p, v): bl.write_json(p, v)
 def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n').encode()
 
 
+def validate_screen_selection(a,build_set):
+    if getattr(a,'task_json_screen',False) and build_set!='followup-screen':
+        raise ValueError('--task-json-screen requires followup-screen build-set')
+    if getattr(a,'common_http_screen',False) and (build_set!='followup-screen' or not getattr(a,'task_json_screen',False)):
+        raise ValueError('--common-http-screen requires followup-screen build-set and --task-json-screen')
+
+
 def hosted_identity(a,build_set):
+    validate_screen_selection(a,build_set)
     return dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
         prepatch=a.prepatch if build_set=='followup-screen' else None,screen_variants=a.screen_variants,
-        task_json_screen=getattr(a,'task_json_screen',False))
+        task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False))
 
 
 def require_task_json_support(root):
@@ -156,12 +164,14 @@ def diagnostic_plan(versions):
               'Exit ledger covers readiness, warmup, score and drain, not just score requests.')
 
 
-def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False):
+def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False,common_http_screen=False):
+    if common_http_screen and not task_json_screen:
+        raise ValueError('--common-http-screen requires --task-json-screen')
     if task_json_screen and 'BT' not in versions:
         raise ValueError('--task-json-screen requires the identified BT build')
     plan=diagnostic_plan(versions)
     plan.update(schema='ku-hosted-followup-screen-v1',prepatch=prepatch,
-        task_json_screen=task_json_screen,
+        task_json_screen=task_json_screen,common_http_screen=common_http_screen,
         paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],
         environment_controls=dict(name='A',workload='json_object',rate=500,warmup_seconds=5,score_seconds=10,count=3),
         maximum_windows=33,formal_baseline_executed=False,
@@ -206,20 +216,28 @@ def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False):
         plan['cases'].append(dict(workload='json_escape',rate=500,reference='R',contract='escaped-unicode',
             paired_orders=copy.deepcopy(plan['paired_orders']),ledger=False))
         plan['latency_slo_ms']['json_escape']=100
+    if common_http_screen:
+        normal_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']]
+        plan['cases']=[dict(workload='ok',rate=2000,reference='R',contract='text',ledger=False,paired_orders=copy.deepcopy(normal_orders)),
+            *plan['cases'],dict(workload='db',rate=200,reference='RS',contract='pg-strict',ledger=False,paired_orders=copy.deepcopy(normal_orders))]
+        plan['latency_slo_ms'].update(ok=100,db=250)
+        plan['scope']='Explicit common HTTP screen: normal A/B/reference pairs for ok, strict PG and CPU guard; '
+        plan['scope']+='only JSON object/Unicode add separate same-current BT. Original worker goals stay separate. '
+        plan['scope']+='B and BT admission/recovery remain required; unchanged worker-growth and HC are not rerun or declared newly passed.'
     plan['cases'].append(dict(workload='cpu',rate=80,reference='R',contract='compute-guard',
         paired_orders=[['A','B','reference'],['B','reference','A'],['reference','A','B']],ledger=False))
     plan['latency_slo_ms']['cpu']=1000
-    if fixed:
+    if fixed and not common_http_screen:
         plan['worker_growth']=dict(names=['B','BF'],orders=[['B','BF'],['BF','B'],['B','BF']],
             cold=dict(rate=500,seconds=3),burst=dict(rate=8000,seconds=5),warmup_seconds=0,
             workload='json_object',maximum_p99_ms=100,diagnostic_only=True,normal_score_eligible=False)
-    if 'HC' in versions:
+    if 'HC' in versions and not common_http_screen:
         plan['transport_control']=dict(name='HC',workload='json_object',rate=500,warmup_seconds=3,score_seconds=15,
             diagnostic_only=True,normal_score_eligible=False,
             scope='Same1048bytebody/1071byteresponseandworkerpath;omitsTransform;notJSON-onlytimeorranking')
     plan['maximum_windows']=3+sum(len(diagnostic_turns(plan,c,True)) for c in plan['cases'])
-    if fixed:plan['maximum_windows']+=12
-    if 'HC' in versions:plan['maximum_windows']+=1
+    if plan.get('worker_growth'):plan['maximum_windows']+=12
+    if plan.get('transport_control'):plan['maximum_windows']+=1
     return plan
 
 
@@ -241,15 +259,20 @@ def diagnostic_axes(plan,rows,expected,stopped,control,growth,followup,admission
          and r.get('arrival_schedule_quality')=='pass' and r.get('environment_quality')=='pass'
          and not r.get('measurement_invalid') and not r.get('observed_environment_faults')) for r in rows)
     layers=not followup or plan.get('json_layer_diagnosis',{}).get('execution_complete') is True
-    control_ok=not followup or (isinstance(control,dict) and control.get('functional_valid') is True
+    omitted_common_controls=followup and plan.get('common_http_screen') is True
+    control_ok=not followup or omitted_common_controls or (isinstance(control,dict) and control.get('functional_valid') is True
         and control.get('accounting_valid') is True and control.get('all_correct') is True
         and control.get('natural_reclamation') is True and control.get('arrival_schedule_quality')=='pass'
         and not control.get('measurement_invalid') and not control.get('observed_environment_faults'))
     growth_ok=not plan.get('worker_growth') or len(growth)==12 and all(r.get('valid') for r in growth)
     admission_ok=isinstance(admission,dict) and admission.get('passed') is True and admission.get('execution_complete') is True
-    return dict(normal_windows_complete=normal,normal_windows_qualified=qualified,json_layers_complete=layers,
+    result=dict(normal_windows_complete=normal,normal_windows_qualified=qualified,json_layers_complete=layers,
         transport_control_complete=control_ok,worker_growth_complete=growth_ok,admission_complete=admission_ok,
         execution_complete=normal and qualified and layers and control_ok and growth_ok and admission_ok)
+    if omitted_common_controls:
+        result.update(transport_control_complete=None,worker_growth_complete=None,
+            unchanged_control_scope='worker growth and HC not required and not run in this common screen; no new pass')
+    return result
 
 
 def build_ledger(a):
@@ -336,8 +359,7 @@ def build_json_layers(a):
 
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
-    if getattr(a,'task_json_screen',False) and getattr(a,'build_set','full')!='followup-screen':
-        raise ValueError('--task-json-screen requires followup-screen build-set')
+    validate_screen_selection(a,getattr(a,'build_set','full'))
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
     class Builder(bl.Builder):
         def command(self,label,command,**kwargs):
@@ -376,8 +398,7 @@ def build(a,state):
 def complete_build(a,state,build_set,prepatch,variants):
     """Freeze/verify prepared normal builds; shared by fresh and byte-verified reuse."""
     task_json_screen=getattr(a,'task_json_screen',False)
-    if task_json_screen and build_set!='followup-screen':
-        raise ValueError('--task-json-screen requires followup-screen build-set')
+    validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
     b_normal=load(a.root/'B/manifest.json')['stacks']['ku']['build']['native']['server']
@@ -415,7 +436,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False)) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
@@ -1353,9 +1374,11 @@ def main(argv=None):
     p.add_argument('--prepatch',default=FOLLOWUP_PREPATCH)
     p.add_argument('--screen-variants',default='',help='Up to seven explicit full commits, comma separated; normal preregistered short ablations only')
     p.add_argument('--task-json-screen',action='store_true',help='Explicit separate native Task JSON comparison; followup-screen only, never an implicit product-capability switch')
+    p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
-    if a.task_json_screen and a.build_set!='followup-screen':p.error('--task-json-screen requires followup-screen build-set')
+    try:validate_screen_selection(a,a.build_set)
+    except ValueError as error:p.error(str(error))
     a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
     if a.phase!='archive' and (a.root==a.source or a.source in a.root.parents or a.root in a.source.parents):p.error('output must be independent of checkout')
     a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
