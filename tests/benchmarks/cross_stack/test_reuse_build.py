@@ -71,6 +71,12 @@ class ReuseBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'--task-json-screen'):r.prepare(args)
             extract.assert_not_called()
 
+    def test_final_task_json_cannot_reuse_a_followup_archive(self):
+        args=types.SimpleNamespace(final_task_json=True,task_json_screen=False,common_http_screen=False)
+        with patch.object(r,'extract_builds') as extract:
+            with self.assertRaisesRegex(ValueError,'--final-task-json'):r.prepare(args)
+            extract.assert_not_called()
+
     def test_reformatted_source_json_is_recovered_from_exact_commit_without_redefining_corpus(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);source=root/'repository';source.mkdir()

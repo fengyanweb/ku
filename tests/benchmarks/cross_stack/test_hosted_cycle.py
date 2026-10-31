@@ -251,8 +251,8 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_build_derives_task_json_only_from_the_frozen_product_snapshot(self):
         from unittest.mock import Mock
-        for supported,requested in ((False,None),(True,None),(False,False),(True,False),(False,True),(True,True)):
-            with self.subTest(supported=supported,requested=requested),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+        for supported,requested,final in ((False,None,False),(True,None,False),(False,False,False),(True,False,False),(False,True,False),(True,True,False),(True,False,True),(False,False,True)):
+            with self.subTest(supported=supported,requested=requested,final=final),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory);tools=root/'tools';tools.mkdir()
                 source=root/'checkout';source.mkdir()
                 # Deliberately disagree with the frozen B snapshot.
@@ -279,18 +279,18 @@ class HostedCycleTests(unittest.TestCase):
                 complete=Mock(return_value={'execution_complete':True})
                 patches.enter_context(patch.object(h,'complete_build',complete))
                 args=types.SimpleNamespace(root=root,source=source,tools=tools,baseline='f'*40,
-                    candidate='b'*40,prepatch='f'*40,build_set='followup-screen',screen_variants=[])
+                    candidate='b'*40,prepatch='f'*40,build_set='full' if final else 'followup-screen',screen_variants=[],final_task_json=final)
                 if requested is not None:args.task_json_screen=requested
-                if requested and not supported:
+                if (requested or final) and not supported:
                     with self.assertRaisesRegex(ValueError,'frozen B product'):
                         h.build(args,{'steps':{}})
                     complete.assert_not_called()
                 else:
                     self.assertTrue(h.build(args,{'steps':{}})['execution_complete'])
                     complete.assert_called_once()
-                native=[c for c in calls if c[0]=='native']
-                self.assertEqual(native,[('native','BT',root/'B/build/ku','task')] if requested and supported else [])
-                self.assertEqual([c[:2] for c in calls[:4]],[('ku','A'),('ku','B'),('rust','R'),('client','R')])
+                native=[c for c in calls if c[0]=='native' and c[1]=='BT']
+                self.assertEqual(native,[('native','BT',root/'B/build/ku','task')] if (requested or final) and supported else [])
+                self.assertEqual([c[:2] for c in calls[:4]],[('ku','A0' if final else 'A'),('ku','B'),('rust','R'),('client','R')])
 
     def test_task_json_selection_is_part_of_identity_and_cannot_select_other_phases(self):
         import io
@@ -590,6 +590,108 @@ class HostedCycleTests(unittest.TestCase):
         self.assertFalse(any(x['name']=='BD' for x in jobs))
         self.assertTrue(all(x['warmup']==10 and x['duration']==30 for x in jobs))
 
+    def test_final_task_json_preserves_80_and_16_and_uses_independent_15_window_contract(self):
+        versions=dict(self.plan()['versions'],BT={'root':'/unused/BT','stack':'ku'})
+        old=h.frozen_plan(versions);new=h.frozen_plan(versions,final_task_json=True)
+        self.assertEqual(new['schedule'],old['schedule']);self.assertEqual(new['targets'],old['targets'])
+        self.assertEqual(len(fc.jobs_for(new,'all')),80);self.assertEqual(len(new['targets']),16)
+        extra=h.supplemental_task_json_plan(new);jobs=fc.jobs_for(extra,'all')
+        self.assertEqual(len(jobs),15);self.assertEqual(len(extra['targets']),2)
+        self.assertEqual(extra['schedule'][0]['orders'],[['B','BT','R'],['BT','R','B'],['R','B','BT'],['B','R','BT'],['BT','B','R']])
+        self.assertEqual({(j['workload'],j['rate'],j['warmup'],j['duration']) for j in jobs},{('json_object',500,10,30)})
+        self.assertEqual({j['contract'] for j in jobs},{'task-json-supplemental-dom'})
+        self.assertTrue(extra['supplemental_only']);self.assertFalse(extra['original_worker_score_eligible'])
+        self.assertEqual({(t['numerator'],t['denominator'],t['metric'],t['maximum_ratio'],t['minimum_pairs']) for t in extra['targets']},
+            {('BT','R','full_cpu_us',.9,5),('BT','R','memory.steady_median_bytes',1,5)})
+        self.assertEqual(new['resources'],old['resources']);self.assertEqual(new['quality_policy'],old['quality_policy'])
+        self.assertEqual(new['stability'],old['stability']);self.assertEqual(new['coordinator_run_budget_seconds'],150*60-30)
+        self.assertNotIn('coordinator_run_budget_seconds',old)
+        cap=new['capacity'];self.assertEqual((cap['maximum_points'],cap['maximum_coarse_points'],cap['refinements']),(12,10,2))
+        self.assertEqual(cap['maximum_rates'],{'json_object':64000,'db':64000})
+        for key in ['factor','maximum_rate','warmup_seconds','score_seconds','recovery_maximum_seconds','contracts']:
+            self.assertEqual(cap[key],old['capacity'][key])
+        self.assertEqual(old['capacity']['maximum_points'],8);self.assertEqual(old['capacity']['maximum_rates']['db'],6400)
+        rows=[]
+        for j in jobs:
+            rows.append(dict(j,full_cpu_us={'B':110,'BT':80,'R':100}[j['name']],memory={'steady_median_bytes':100},
+                qualification={'qualified':True},formal_duration=True,natural_reclamation=True,comparison_contract='same'))
+        paired=fc.compare_goals(extra,rows)
+        self.assertTrue(all(g['paired_windows']==5 and g['goal_status']=='met' for g in paired))
+        # Original DOM selectors cannot accidentally pool the supplemental contract.
+        self.assertTrue(all(g['paired_windows']==0 for g in fc.compare_goals(old,rows)))
+        costs=h.supplemental_task_json_costs(extra,rows)
+        self.assertTrue(all(g['paired_windows']==5 and 'goal_status' not in g for g in costs))
+        self.assertAlmostEqual(costs[0]['interval']['estimate'],80/110)
+
+    def test_final_task_json_flag_is_full_only_distinct_and_rejected_by_followup_reuse(self):
+        import io
+        from contextlib import redirect_stderr
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch='f'*40,screen_variants=[])
+        plain=types.SimpleNamespace(**base);final=types.SimpleNamespace(**base,final_task_json=True)
+        self.assertFalse(h.hosted_identity(plain,'full')['final_task_json'])
+        self.assertTrue(h.hosted_identity(final,'full')['final_task_json'])
+        for mode,task,common in [('followup-screen',False,False),('diagnostic',False,False),('full',True,False),('full',False,True)]:
+            with self.subTest(mode=mode,task=task,common=common):
+                a=types.SimpleNamespace(**base,final_task_json=True,task_json_screen=task,common_http_screen=common)
+                with self.assertRaisesRegex(ValueError,'--final-task-json'):h.hosted_identity(a,mode)
+        with self.assertRaisesRegex(ValueError,'identified BT'):h.frozen_plan(self.plan()['versions'],final_task_json=True)
+        error=io.StringIO()
+        with redirect_stderr(error),self.assertRaises(SystemExit) as invalid:
+            h.main(['--phase','tail','--build-set','full','--final-task-json','--candidate','b'*40,
+                '--source','/unused','--tools','/unused','--root','/unused-output'])
+        self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        self.assertIn('timeout-minutes: ${{ inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
+        self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
+
+    def test_final_task_json_run_keeps_supplemental_goals_separate_and_never_hides_failures(self):
+        for issue in (None,'BT-admission','supplemental-cleanup'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);versions=dict(self.plan()['versions'],BT={'root':'/unused/BT','stack':'ku'})
+                h.save(root/'frozen-plan.json',h.frozen_plan(versions,final_task_json=True))
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'fixture','db_cgroup':'/unused','database':{}});h.save(dbstate,{'limits':{'cpuset.cpus':'3'}})
+                cleanup=[];fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:cleanup.append('database') or {'stopped':True})
+                state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}};calls=[]
+                read_bytes,read_text=Path.read_bytes,Path.read_text
+                patches.enter_context(patch.object(Path,'read_bytes',lambda p:b'boot' if str(p)=='/proc/sys/kernel/random/boot_id' else read_bytes(p)))
+                patches.enter_context(patch.object(Path,'read_text',lambda p,*a,**k:'MemTotal: 16777216 kB' if str(p)=='/proc/meminfo' else read_text(p,*a,**k)))
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
+                patches.enter_context(patch.object(h.db,'Database',return_value=fixture));patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'pass'}))
+                gate=patches.enter_context(patch.object(h,'admission_window',side_effect=lambda p,o,name='B':
+                    dict(passed=not(issue=='BT-admission' and name=='BT'),execution_complete=True,binding={'source_commit':'a'*40})))
+                def measure(path,output,phase,**unused):
+                    config=h.load(path);label=Path(output).name;calls.append(label)
+                    good=dict(status='observed',functional_valid=True,accounting_valid=True,arrival_schedule_quality='pass',
+                        environment_quality='pass',measurement_invalid=False,natural_reclamation=True)
+                    if label in ('control','final'):return dict(execution_complete=True,goal_status='met',rows=[good])
+                    if label=='task-json-supplemental':
+                        rows=[dict(j,**good,full_cpu_us={'B':110,'BT':80,'R':100}[j['name']],memory={'steady_median_bytes':200 if j['name']=='BT' else 100},
+                            qualification={'qualified':True},formal_duration=True,comparison_contract='same') for j in fc.jobs_for(config,'all')]
+                        if issue=='supplemental-cleanup':rows[1]['natural_reclamation']=False
+                        return dict(execution_complete=True,goal_status='not_met',rows=rows)
+                    if label.startswith('capacity-'):
+                        kind=label.removeprefix('capacity-');self.assertEqual(config['capacity']['maximum_rate'],64000)
+                        return dict(execution_complete=True,capacity=[dict(name=n,workload=kind,functional_valid=True,accounting_valid=True,
+                            all_recovery_passed=True,qualified_lower_rate=100,upper_rate=None,boundary_observed=False) for n in ['B','R']])
+                    self.assertEqual(label,'stability')
+                    return dict(execution_complete=True,formal_qualified=False,rows=[{'natural_reclamation':True,
+                        'segments':[{'streams':{'mixed':{'assessment':{'functional_valid':True,'accounting_valid':True}}}}]}])
+                patches.enter_context(patch.object(fc,'execute',side_effect=measure))
+                result=h.run(types.SimpleNamespace(root=root),state)
+                self.assertEqual([c.kwargs['name'] for c in gate.call_args_list],['B','BT'])
+                self.assertEqual(cleanup,['database'])
+                if issue:
+                    self.assertFalse(result['execution_complete']);self.assertEqual(result['goal_status'],'blocked')
+                    self.assertNotIn('capacity',state['steps']);self.assertNotIn('stability',state['steps'])
+                else:
+                    self.assertTrue(result['execution_complete']);self.assertEqual(result['original_16_goal_status'],'met')
+                    self.assertEqual(result['supplemental_goal_status'],'not_met')
+                    self.assertEqual(calls,['control','final','task-json-supplemental','capacity-json_object','capacity-db','stability'])
+                    self.assertEqual(state['steps']['final']['result']['goal_status'],'met')
+
     def test_capacity_and_continuous_limits_are_frozen(self):
         plan=self.plan();self.assertEqual(plan['capacity']['maximum_points'],8)
         self.assertEqual(plan['capacity']['refinements'],2);self.assertEqual(plan['capacity']['recovery_maximum_seconds'],5)
@@ -804,18 +906,19 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertIn('capacity',h.load(frozen));self.assertIn('stability',h.load(frozen))
 
     def test_incomplete_run_returns_nonzero_without_treating_goal_failure_as_incomplete(self):
-        for complete in (False,True):
-            with self.subTest(complete=complete),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+        for complete,final in ((False,False),(True,False),(False,True),(True,True)):
+            with self.subTest(complete=complete,final=final),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
                 root=Path(d);source=root/'source';tools=root/'tools'
                 source.mkdir();tools.mkdir()
                 patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
                 patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
-                patches.enter_context(patch.object(h.signal,'signal'));patches.enter_context(patch.object(h.signal,'alarm'))
+                patches.enter_context(patch.object(h.signal,'signal'));alarm=patches.enter_context(patch.object(h.signal,'alarm'))
                 patches.enter_context(patch.object(h,'run',return_value={'execution_complete':complete,'goal_status':'not_met'}))
                 patches.enter_context(patch('builtins.print'))
                 code=h.main(['--phase','run','--root',str(root/'output'),'--source',str(source),
-                             '--tools',str(tools),'--candidate','1'*40])
+                             '--tools',str(tools),'--candidate','1'*40,*(['--final-task-json'] if final else [])])
                 self.assertEqual(code,0 if complete else 2)
+                alarm.assert_called_once_with((150 if final else 130)*60-30)
 
 
     def test_compiler_phase_has_48_short_balanced_comparisons_no_formal_or_capacity(self):

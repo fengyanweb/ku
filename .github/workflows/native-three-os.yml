@@ -28,6 +28,11 @@ on:
         type: boolean
         default: false
 
+      final_task_json:
+        description: 'Separate formal Task JSON15-window supplement; performance-v2 only, preserves original80/16, fresh full build required'
+        type: boolean
+        default: false
+
       reuse_build_run:
         description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
         type: string
@@ -448,7 +453,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen)
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -465,6 +470,7 @@ jobs:
       KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
       KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN: ${{ inputs.common_http_screen && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_FINAL_TASK_JSON: ${{ inputs.final_task_json && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
       KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
       KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
@@ -488,6 +494,12 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
+          fi
+          if [ "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
+            test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
           fi
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
@@ -566,6 +578,13 @@ jobs:
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
             performance_task_json_args+=(--common-http-screen)
           fi
+          if [ "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            test "$performance_build_set" = full
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
+            test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
+            performance_task_json_args+=(--final-task-json)
+          fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
             test "$performance_build_set" = followup-screen
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
@@ -589,7 +608,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: 130
+        timeout-minutes: ${{ inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
@@ -620,6 +639,13 @@ jobs:
             test "$performance_build_set" = followup-screen
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
             performance_task_json_args+=(--common-http-screen)
+          fi
+          if [ "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            test "$performance_build_set" = full
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
+            test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
+            performance_task_json_args+=(--final-task-json)
           fi
           for performance_phase in "${performance_phases[@]}"; do
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \

@@ -34,6 +34,8 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'final_task_json',False) and (build_set!='full' or getattr(a,'task_json_screen',False) or getattr(a,'common_http_screen',False)):
+        raise ValueError('--final-task-json requires full build-set and cannot select followup screens')
     if getattr(a,'task_json_screen',False) and build_set!='followup-screen':
         raise ValueError('--task-json-screen requires followup-screen build-set')
     if getattr(a,'common_http_screen',False) and (build_set!='followup-screen' or not getattr(a,'task_json_screen',False)):
@@ -44,16 +46,16 @@ def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
     return dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
         prepatch=a.prepatch if build_set=='followup-screen' else None,screen_variants=a.screen_variants,
-        task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False))
+        task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False))
 
 
 def require_task_json_support(root):
     task_ir=Path(root)/'B/src/src/ir/task.rs'
     if not task_ir.is_file() or '\n    JsonDecode {' not in task_ir.read_text():
-        raise ValueError('--task-json-screen requires a frozen B product with native Task JSON support')
+        raise ValueError('explicit Task JSON mode requires a frozen B product with native Task JSON support')
 
 
-def frozen_plan(versions):
+def frozen_plan(versions,final_task_json=False):
     """Seven named rows, PG Ku shared only inside the same registered group."""
     triples = [['A0','B','R'], ['B','R','A0'], ['R','A0','B'], ['A0','R','B'], ['B','A0','R']]
     pairs = [['B','R'], ['R','B'], ['B','R'], ['R','B'], ['B','R']]
@@ -74,7 +76,7 @@ def frozen_plan(versions):
                 denominator='RS' if contract=='pg-shared' else 'RPS',maximum_ratio=.90 if contract=='pg-shared' else 1,
                 metric='full_cpu_us',minimum_pairs=5,display_contract='pg-strict' if contract=='pg-shared' else 'typed-pg-strict'))
             targets.append(dict(targets[-1],metric='memory.steady_median_bytes',maximum_ratio=1))
-    return dict(versions=versions,resources=RESOURCES,quality_policy=POLICY,rates={'json_object':500,'db':200,'ok':2000,'cpu':80},
+    plan=dict(versions=versions,resources=RESOURCES,quality_policy=POLICY,rates={'json_object':500,'db':200,'ok':2000,'cpu':80},
         schedule=schedule,targets=targets,admission=copy.deepcopy(ADMISSION),resume={'maximum_replacements':0},bootstrap_resamples=20000,
         stop_after_consecutive_unusable_windows=2,control_cpu_max_min=1.10,
         pg_shared_scope='one Ku window serves default/strict only within the SAME preregistered entry/group; R normal/reset separate',
@@ -87,6 +89,38 @@ def frozen_plan(versions):
         stability=dict(name='B',frozen_final=True,seconds=1800,segment_seconds=300,mixed_rate=500,short_rate=800,cpu_rate=10,
             short_slo_ms=20,maximum_start_skew_seconds=2,maximum_segment_gap_seconds=10,
             growth_limits={'service_memory_bytes':64<<20,'coordinator_rss_bytes':32<<20,'service_fd':32,'service_threads':8}))
+    if final_task_json:
+        if 'BT' not in versions:raise ValueError('--final-task-json requires the identified BT build')
+        plan.update(final_task_json=True,task_json_admission=dict(copy.deepcopy(ADMISSION),name='BT'),
+            coordinator_run_budget_seconds=150*60-30,
+            coordinator_budget_scope='Whole serial95-window/deeper-capacity/30min test coordinator budget only; product, driver, recovery and per-window deadlines unchanged')
+        contract='task-json-supplemental-dom'
+        plan['task_json_supplemental']=dict(supplemental_only=True,original_worker_score_eligible=False,
+            schedule=[dict(phase='final',workload='json_object',rate=500,contract=contract,
+                orders=[['B','BT','R'],['BT','R','B'],['R','B','BT'],['B','R','BT'],['BT','B','R']],
+                warmup_seconds=10,score_seconds=30)],
+            targets=[dict(phase='final',workload='json_object',contract=contract,numerator='BT',denominator='R',
+                maximum_ratio=limit,metric=metric,minimum_pairs=5) for metric,limit in
+                [('full_cpu_us',.90),('memory.steady_median_bytes',1)]],
+            scope='Separate15 normal O2/helpers/text Task JSON windows; original80 schedule and16 targets unchanged; BT/B is cost change only')
+        plan['capacity'].update(maximum_points=12,maximum_coarse_points=10,
+            maximum_rates={'json_object':64000,'db':64000})
+    return plan
+
+
+def supplemental_task_json_plan(plan):
+    config=copy.deepcopy(plan)
+    for key in ('capacity','stability','admission','task_json_admission','task_json_supplemental'):config.pop(key,None)
+    config.update(copy.deepcopy(plan['task_json_supplemental']))
+    return config
+
+
+def supplemental_task_json_costs(config,rows):
+    targets=[dict(t,denominator='B',maximum_ratio=1) for t in config['targets']]
+    comparisons=fc.compare_goals(dict(config,targets=targets),rows)
+    return [dict(metric=g['target']['metric'],paired_windows=g['paired_windows'],interval=g['interval'],
+        formal_qualified=g['formal_qualified'],scope='BT/B cost change only; not a performance acceptance target') for g in comparisons]
+
 
 
 def step(state, root, name, call, resume=False):
@@ -389,7 +423,7 @@ def build(a,state):
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
     # Inspect the frozen product snapshot, never the current tools checkout.
     # Old products/build reuse keep their original plan and build identities.
-    if getattr(a,'task_json_screen',False):
+    if getattr(a,'task_json_screen',False) or getattr(a,'final_task_json',False):
         require_task_json_support(a.root)
         step(state,a.root,'build-BT',lambda:one('BT',a.candidate,{'ku_json_execution':'task'}))
     return complete_build(a,state,build_set,prepatch,variants)
@@ -398,6 +432,7 @@ def build(a,state):
 def complete_build(a,state,build_set,prepatch,variants):
     """Freeze/verify prepared normal builds; shared by fresh and byte-verified reuse."""
     task_json_screen=getattr(a,'task_json_screen',False)
+    final_task_json=getattr(a,'final_task_json',False)
     validate_screen_selection(a,build_set)
     diagnostic=build_set in ('diagnostic','followup-screen')
     rm=load(a.root/'R/manifest.json');client=rm['client'];protocol=Path(rm['protocol']);versions={}
@@ -405,9 +440,9 @@ def complete_build(a,state,build_set,prepatch,variants):
     fixed_control=build_set=='followup-screen' and 'KU_HTTP_WORKER_POLICY' in Path(b_normal['generated_c']).read_text()
     names=((['A',*[f'C{i+1}' for i in range(len(variants))]] if build_set=='followup-screen' else [])
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
-    if task_json_screen:
+    if task_json_screen or final_task_json:
         require_task_json_support(a.root)
-        if not (a.root/'BT/manifest.json').is_file():raise ValueError('--task-json-screen requires the completed BT build')
+        if not (a.root/'BT/manifest.json').is_file():raise ValueError('explicit Task JSON mode requires the completed BT build')
         names.append('BT')
     for name in names:
         d=a.root/name;is_r=name.startswith('R');m=load(a.root/('R' if is_r else 'B' if name=='BF' else name)/'manifest.json')
@@ -420,12 +455,12 @@ def complete_build(a,state,build_set,prepatch,variants):
             BENCH_PG_MODE='reset-equivalent' if name in ('RS','RPS') else 'normal',
             BENCH_PG_API='typed-text-key' if name in ('RP','RPS') else 'normal',BENCH_JSON_MODE='typed' if name=='RJ' else 'generic')
         if name=='BD':m.update(diagnostic_only=True,normal_score_eligible=False)
-        if name=='BT':m.update(diagnostic_only=True,normal_score_eligible=False,
-            diagnostic_role='native-task-json-local-values',original_worker_score_eligible=False)
+        if name=='BT':m.update(diagnostic_only=not final_task_json,normal_score_eligible=final_task_json,
+            supplemental_only=final_task_json,diagnostic_role='native-task-json-local-values',original_worker_score_eligible=False)
         save(d/'manifest.json',m);binary=m['stacks'][stack]['command'][0]
         versions[name]=dict(root=str(d),stack=stack,source_commit=m['candidate_base'],binary_sha256=sha(binary))
-        if name=='BT':versions[name].update(diagnostic_only=True,normal_score_eligible=False,
-            original_worker_score_eligible=False,json_execution_mode='task')
+        if name=='BT':versions[name].update(diagnostic_only=not final_task_json,normal_score_eligible=final_task_json,
+            supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
     if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
@@ -436,7 +471,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False)) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions)
+    plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False)) if build_set=='followup-screen' else diagnostic_plan(versions) if diagnostic else frozen_plan(versions,final_task_json=final_task_json)
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
@@ -445,18 +480,23 @@ def complete_build(a,state,build_set,prepatch,variants):
             if name=='BT':continue
             if identities['A']['files']['expanded source']['sha256']!=identities[name]['files']['expanded source']['sha256']:
                 raise ValueError('paired normal Ku business inputs differ: '+name)
-        if 'BT' in versions:
-            worker=Path(identities['B']['files']['expanded source']['path']).read_text()
-            selected=Path(identities['BT']['files']['expanded source']['path']).read_text()
-            expected=bl.ku_json_execution_evidence(worker,selected,'task')
-            actual=load(a.root/'BT/manifest.json')['stacks']['ku']['build']
-            if (actual.get('json_execution_mode')!='task' or actual.get('json_execution')!=expected
-                    or identities['B']['files']['Ku CLI']['sha256']!=identities['BT']['files']['Ku CLI']['sha256']):
-                raise ValueError('Task JSON entry is not an identified same-CLI single-declaration derivation')
-            save(a.root/'task-json-source-identity.json',dict(**expected,source_commit=a.candidate,
-                worker_binding=identities['B'],task_binding=identities['BT'],formal_qualified=False))
         if bl.benchmark_stack_sources(a.root/'A/src/tests/benchmarks/cross_stack/rust')!=load(a.root/'R/manifest.json')['stacks']['rust']['build']['source_files_sha256']:
             raise ValueError('reference business source differs from frozen prepatch')
+    if 'BT' in versions:
+        worker=Path(identities['B']['files']['expanded source']['path']).read_text()
+        selected=Path(identities['BT']['files']['expanded source']['path']).read_text()
+        expected=bl.ku_json_execution_evidence(worker,selected,'task')
+        actual=load(a.root/'BT/manifest.json')['stacks']['ku']['build']
+        if (actual.get('json_execution_mode')!='task' or actual.get('json_execution')!=expected
+                or identities['B']['files']['Ku CLI']['sha256']!=identities['BT']['files']['Ku CLI']['sha256']):
+            raise ValueError('Task JSON entry is not an identified same-CLI single-declaration derivation')
+        if final_task_json:
+            worker_mode={k:v for k,v in identities['B']['build_mode'].items() if k!='json_execution_mode'}
+            task_mode={k:v for k,v in identities['BT']['build_mode'].items() if k!='json_execution_mode'}
+            if actual.get('diagnostic') or worker_mode!=task_mode:
+                raise ValueError('formal Task JSON must be an uninstrumented same-mode/same-CLI build')
+        save(a.root/'task-json-source-identity.json',dict(**expected,source_commit=a.candidate,
+            worker_binding=identities['B'],task_binding=identities['BT'],formal_qualified=False))
     dependencies={};abi={}
     for binary in sorted({f['path'] for v in identities.values() for k,f in v['files'].items() if k in ('ELF','Ku CLI','driver ELF')}):
         linked=subprocess.run(['ldd',binary],capture_output=True,text=True,check=True,timeout=30).stdout
@@ -504,7 +544,9 @@ def run(a,state,tail_only=False,stability_only=False):
     if os.geteuid()!=0:raise ValueError('run requires root cgroup control')
     boot=hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()
     if state.setdefault('run_boot_sha256',boot)!=boot:raise ValueError('resume across hosts/boots forbidden; new root required')
-    plan=load(a.root/'frozen-plan.json');fixture=db.Database(a.root/'fixture',state['uid'],state['gid'])
+    plan=load(a.root/'frozen-plan.json')
+    if plan.get('final_task_json') and tail_only:raise ValueError('final Task JSON requires the complete performance-v2 run, not tail-only')
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid'])
     original=fc.Harness;environment=None;private=None
     state['execution_environment']={'machine':platform.machine(),'kernel':platform.release(),'cpu_count':os.cpu_count(),
         'coordinator_affinity':sorted(os.sched_getaffinity(0)),'MemTotal':next(x for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')),
@@ -524,6 +566,7 @@ def run(a,state,tail_only=False,stability_only=False):
         pending=['final','capacity','stability'] if 'final' not in axes and not tail_only else ['capacity','stability']
         if stability_only:pending=['stability']
         if 'admission' not in axes:pending.insert(0,'admission')
+        if plan.get('final_task_json') and 'task_json_supplemental' not in axes:pending.append('task-json-supplemental')
         state['deferred']={label:reason for label in pending}
         return dict(execution_complete=False,goal_status='blocked',candidate_accepted=False,
             environment_quality=environment['quality'],fixed_matrix_executed='final' in axes,
@@ -532,7 +575,7 @@ def run(a,state,tail_only=False,stability_only=False):
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
         fc.Harness=HostedHarness
-        fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None);fixed.pop('admission',None)
+        fixed=copy.deepcopy(plan);fixed.pop('capacity',None);fixed.pop('stability',None);fixed.pop('admission',None);fixed.pop('task_json_admission',None);fixed.pop('task_json_supplemental',None)
         control=copy.deepcopy(fixed);control.update(targets=[],schedule=[dict(phase='control',workload='json_object',rate=500,
             orders=[['A0'],['A0'],['A0']],warmup_seconds=5,score_seconds=10)])
         control['stop_after_consecutive_unusable_windows']=2
@@ -541,7 +584,7 @@ def run(a,state,tail_only=False,stability_only=False):
             return blocked('environment control quality is '+environment['quality'],{'control':summary})
         if summary.get('execution_complete') is not True:
             return blocked('environment control execution incomplete',{'control':summary})
-        admission=required_admission(plan,a.root,state,boot,a.root/'results/admission')
+        admission=required_screen_admission(plan,a.root,state,boot,a.root/'results/admission')
         if admission.get('passed') is not True:
             return blocked('actual admission/recovery gate did not pass; retained without retry',{'control':summary,'admission':admission})
         final=None if tail_only else execute('final',fixed,'all')
@@ -553,6 +596,19 @@ def run(a,state,tail_only=False,stability_only=False):
         if not function_ok:
             return blocked('fixed/control measurement incomplete, invalid or function/accounting/cleanup failed',
                 {'control':summary,'admission':admission,**({'final':final} if final is not None else {})})
+        supplemental=None
+        if plan.get('final_task_json'):
+            config=supplemental_task_json_plan(plan)
+            supplemental=execute('task-json-supplemental',config,'all')
+            supplemental['BT_B_cost_change']=supplemental_task_json_costs(config,supplemental.get('rows',[]))
+            save(a.root/'results/task-json-supplemental/summary-with-costs.json',supplemental)
+            supplemental_ok=(supplemental.get('execution_complete') is True and len(supplemental.get('rows',[]))==15 and all(
+                row.get('status')=='observed' and row.get('functional_valid') is True and row.get('accounting_valid') is True
+                and row.get('arrival_schedule_quality')=='pass' and row.get('environment_quality')=='pass'
+                and row.get('measurement_invalid') is False and row.get('natural_reclamation') is True for row in supplemental['rows']))
+            if not supplemental_ok:
+                return blocked('supplemental Task JSON execution/quality/function/accounting/cleanup failed; original16 results retained',
+                    {'control':summary,'admission':admission,'final':final,'task_json_supplemental':supplemental})
         if function_ok:
             def capacities():
                 results=[]
@@ -585,6 +641,10 @@ def run(a,state,tail_only=False,stability_only=False):
         goal='not_met' if 'not_met' in (core_status,final.get('goal_status')) else 'met' if core_status==final.get('goal_status')=='met' else 'unknown'
         acceptance=acceptance_result(final,state['steps'].get('capacity',{}).get('result',{}),
             state['steps'].get('stability',{}).get('result',{}),goal,admission)
+        if supplemental is not None:
+            acceptance.update(task_json_supplemental=supplemental,supplemental_goal_status=supplemental.get('goal_status','unknown'),
+                original_16_goal_status=final.get('goal_status','unknown'),
+                supplemental_scope='Independent15 windows/2 goals; never substitute into original80/16. Functional failures block the entire run.')
         return dict(acceptance,core_advantage_goal_status=core_status,
             admission=admission,
             formal_qualified=final.get('formal_qualified',False),environment_quality=environment['quality'],candidate_accepted=False,
@@ -1074,9 +1134,9 @@ def diagnostic(a,state,followup=False):
 def required_screen_admission(plan, root, state, boot, output):
     """Keep old B receipts unchanged; explicit Task JSON adds its own real gate."""
     worker=required_admission(plan,root,state,boot,output)
-    if not plan.get('task_json_screen'):return worker
+    if not (plan.get('task_json_screen') or plan.get('final_task_json')):return worker
     if plan.get('task_json_admission',{}).get('name')!='BT':
-        raise ValueError('Task JSON screen requires its separate BT admission contract')
+        raise ValueError('explicit Task JSON mode requires its separate BT admission contract')
     if worker.get('passed') is True and worker.get('execution_complete') is True:
         task=required_admission(plan,root,state,boot,Path(output)/'BT',name='BT')
     else:
@@ -1375,8 +1435,10 @@ def main(argv=None):
     p.add_argument('--screen-variants',default='',help='Up to seven explicit full commits, comma separated; normal preregistered short ablations only')
     p.add_argument('--task-json-screen',action='store_true',help='Explicit separate native Task JSON comparison; followup-screen only, never an implicit product-capability switch')
     p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
+    p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
+    if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
     a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -1398,7 +1460,7 @@ def main(argv=None):
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
-        if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm(130*60-30)
+        if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
         if a.phase=='diagnostic':signal.alarm(20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
