@@ -370,6 +370,14 @@ jobs:
           cargo test --release --locked --test native_http_test native_http_async_ \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test \
+            native_http_handler_deadline_is_capped_by_absolute_request_deadline \
+            -- --exact --list > "$RUNNER_TEMP/ku-request-cap-tests.list"
+          grep -Fx 'native_http_handler_deadline_is_capped_by_absolute_request_deadline: test' "$RUNNER_TEMP/ku-request-cap-tests.list"
+          test "$(grep -c ': test$' "$RUNNER_TEMP/ku-request-cap-tests.list")" -eq 1
+          cargo test --release --locked --test native_http_test \
+            native_http_handler_deadline_is_capped_by_absolute_request_deadline \
+            -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
             native_http_task_self_wake_keeps_late_work_and_cross_thread_retirement \
             -- --exact --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test \
