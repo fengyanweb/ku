@@ -1689,6 +1689,10 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
   unsigned long long remaining = job->request_deadline > now ? job->request_deadline-now : 0;
   if (timeout_ms > remaining) timeout_ms = remaining;
   __ku_handler_timeout_begin(timeout_ms);
+  /* The helper samples time again; that relative conversion must not renew
+     the original absolute request budget. Publish the same capped TLS value. */
+  if (job->request_deadline && __ku_handler_deadline > job->request_deadline)
+    __ku_handler_deadline = job->request_deadline;
   ku_http_mutex_lock(&job->lock);
   if (job->started) { fputs("http handler deadline restarted\n", stderr); exit(1); }
   job->handler_deadline = __ku_handler_deadline;
