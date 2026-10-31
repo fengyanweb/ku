@@ -10,6 +10,7 @@ from unittest.mock import patch
 import unittest
 import hosted_cycle as h
 import focus_cycle as fc
+import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
@@ -144,6 +145,91 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertEqual([x[2] for x in measured[:3]],[True]*3)
                     self.assertEqual(result['environment_qualification']['quality'],'pass')
                 else:self.assertFalse(result['comparison']['eligible_for_root_review'])
+
+    def test_owner_mode_is_single_unscored_reuse_only_window(self):
+        for flag in ('pg_driver_screen','normal_self_probe','http_wake_screen','task_json_screen','final_task_json'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(memory_owner_probe=True,**{flag:True}),'diagnostic')
+        plan=h.memory_owner_plan({'M':{}})
+        self.assertEqual((plan['rate'],plan['warmup_seconds'],plan['score_seconds'],plan['timeout_seconds']),(500,3,5,3))
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(1,0))
+        self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
+        with patch.object(h.os,'geteuid',return_value=1),self.assertRaisesRegex(ValueError,'fixed archive reuse'):
+            h.build(types.SimpleNamespace(memory_owner_probe=True,build_set='diagnostic'),{})
+
+    def test_owner_source_preserves_normal_and_rejects_ambiguous_anchors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'normal.c';out=root/'owner.c'
+            original='#include <math.h>\n'+'\n'.join(x[0] for x in hcd.OWNER_SITES)+'\n'
+            source.write_text(original);receipt=hcd.prepare_allocation_owner_source(source,out,'b'*40)
+            self.assertEqual(source.read_text(),original)
+            self.assertEqual((receipt['maximum_records'],receipt['maximum_write_bytes']),(30,5730))
+            self.assertFalse(receipt['normal_score_eligible'])
+            self.assertEqual(out.read_text().count('ku_temp_startup_owner_map_v1('),20)
+            self.assertNotIn('malloc(',hcd.OWNER_HELPER);self.assertNotIn('_Thread_local',hcd.OWNER_HELPER)
+            with self.assertRaises(ValueError):hcd.prepare_allocation_owner_source(source,out)
+            for i,changed in enumerate((original.replace(hcd.OWNER_SITES[0][0],''),original+hcd.OWNER_SITES[0][0],out.read_text())):
+                source.write_text(changed)
+                with self.subTest(i=i),self.assertRaises(ValueError):hcd.prepare_allocation_owner_source(source,root/('bad%d.c'%i))
+
+    def test_owner_pages_hide_PFNs_and_keep_zero_shared_or_changed_pages_unknown(self):
+        owners={'complete':True,'records':[{'pid':123,'label':'fixture','context':'0x1',
+            'pointer':hex(4096*(i+1)),'requested_bytes':4096} for i in range(30)]}
+        class FD:
+            def __init__(self,n):self.n=n
+            def fileno(self):return self.n
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+        state='(target) '+' '.join(['x']*19+['77'])
+        for mode in ('valid','hidden','zero','shared','identity','changed','budget','page-bound'):
+            with self.subTest(mode=mode),ExitStack() as stack:
+                stack.enter_context(patch.object(hcd,'read_text',side_effect=[state,state.replace('77','78')] if mode=='identity' else [state,state]))
+                stack.enter_context(patch.object(hcd.os,'sysconf',return_value=4096))
+                stack.enter_context(patch.object(hcd.Path,'open',autospec=True,
+                    side_effect=lambda path,*args,**kwargs:FD(11 if path.name=='pagemap' else 22)))
+                calls={}
+                def pread(fd,n,offset):
+                    calls[(fd,offset)]=calls.get((fd,offset),0)+1
+                    value=((1<<63)|(1<<56)|(0 if mode=='hidden' else 100+offset//8)) if fd==11 else (1<<12)
+                    if mode=='zero' and fd==22:value|=1<<24
+                    if mode=='shared' and fd==11:value|=1<<61
+                    if mode=='changed' and fd==11 and calls[(fd,offset)]%2==0:value|=1<<55
+                    return value.to_bytes(8,'little')
+                stack.enter_context(patch.object(hcd.os,'pread',side_effect=pread))
+                if mode=='budget':stack.enter_context(patch.object(hcd.time,'monotonic',side_effect=[0,2]))
+                selected=owners if mode!='page-bound' else dict(owners,records=[dict(owners['records'][0],requested_bytes=8193*4096),*owners['records'][1:]])
+                result=hcd.allocation_owner_pages(123,selected,'77')
+                self.assertFalse(result['PFNs_exported'])
+                if mode in ('hidden','identity','budget','page-bound'):
+                    self.assertFalse(result['available']);self.assertNotIn('records',result)
+                else:
+                    self.assertTrue(result['available']);self.assertEqual(result['observed_unique_pages'],30)
+                    expected=4096 if mode=='valid' else 0
+                    self.assertTrue(all(r['exclusive_ordinary_anon_interior_bytes']==expected for r in result['records']))
+                    self.assertTrue(all('PFN' not in k for row in result['records'] for k in row))
+
+    def test_owner_ranges_require_all_labels_and_never_divide_VMA_resident(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log=Path(temp)/'service.log';lines=[];offset=0
+            for _,records,scope,_ in hcd.OWNER_SITES:
+                for label,*_ in records:
+                    for owner in range(1 if scope=='shared' else 2):
+                        lines.append('KU_OWNER_MAP v=1 pid=123 label=%s ptr=0x%x bytes=16 context=0x%x\n'%(label,0x1000+offset*32,0x100+owner));offset+=1
+            memory={'complete':True,'mappings':[{'start':'1000','end':'9000','rss_bytes':4096}]}
+            log.write_text(''.join(lines));result=hcd.allocation_owner_ranges(log,123,memory)
+            self.assertEqual(len(result['records']),30);self.assertFalse(result['resident_bytes_attributed'])
+            self.assertNotIn('rss_bytes',result['records'][0])
+            variants=[lines[:-1],lines+[lines[0]],lines[:-1]+[lines[0]],
+                [lines[0].replace('pid=123','pid=124'),*lines[1:]],
+                [lines[0].replace('bytes=16','bytes=18446744073709551616'),*lines[1:]],
+                [lines[0].replace('ptr=0x1000','ptr=(nil)'),*lines[1:]],
+                [lines[0].rstrip('\n'),*lines[1:]]]
+            for i,rows in enumerate(variants):
+                log.write_text(''.join(rows))
+                with self.subTest(i=i),self.assertRaises(ValueError):hcd.allocation_owner_ranges(log,123,memory)
+            log.write_text(''.join(lines))
+            with self.assertRaises(ValueError):hcd.allocation_owner_ranges(log,123,dict(memory,complete=False))
+            with self.assertRaises(ValueError):hcd.allocation_owner_ranges(log,123,dict(memory,mappings=[]))
 
     def test_pg_driver_plan_is_two_conditions_with_original_deadlines_and_recovery(self):
         plan=h.pg_driver_plan({'B':{}})
@@ -1356,7 +1442,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

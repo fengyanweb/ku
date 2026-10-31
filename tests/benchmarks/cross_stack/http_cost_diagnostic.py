@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import stat
 import time
 
 ROLE_ENTRIES = {
@@ -842,7 +843,11 @@ def main() -> None:
     sample = sub.add_parser('sample'); sample.add_argument('--pid', type=int, required=True)
     sample.add_argument('--cgroup', type=Path); sample.add_argument('--seconds', type=float, default=15)
     sample.add_argument('--interval', type=float, default=.1); sample.add_argument('--output', type=Path, required=True)
+    pages=sub.add_parser('owner-pages');pages.add_argument('--pid',type=int,required=True)
+    pages.add_argument('--ranges',type=Path,required=True);pages.add_argument('--start-ticks',required=True)
     args = parser.parse_args()
+    if args.operation=='owner-pages':
+        print(json.dumps(allocation_owner_pages(args.pid,json.loads(read_text(args.ranges)),args.start_ticks)));return
     if args.operation == 'prepare':
         receipt = prepare_source(args.source, args.destination, args.source_commit)
         print(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -863,6 +868,139 @@ def main() -> None:
         write_json(args.output, result)
         print(json.dumps({'samples': len(result['samples']), 'bounded_stop': result['bounded_stop'],
                           'roles': result['summary']['roles']}, indent=2))
+
+
+
+
+# Startup address labels only; no per-request/TLS counter bank or scored path.
+OWNER_MARKER = 'KU_TEMP_STARTUP_OWNER_MAP_V1'
+OWNER_HELPER = '\n/* KU_TEMP_STARTUP_OWNER_MAP_V1: diagnostic only; no hot-path counters/logs.\n * Frozen single-listen fixture: 8 shared + 11 records per HTTP owner.\n * STDERR must be an existing private regular file, never an HTTP/client pipe.\n * A missing/partial line invalidates the observation; do not retry writes.\n * Integer/pointer formatting uses existing libc, but this probe is not claimed\n * to have zero observer cost or exactly the normal allocator\'s page layout. */\n#if defined(_WIN32)\n#error temporary startup owner map requires POSIX; not a product feature\n#endif\n#include <unistd.h>\nstatic void ku_temp_startup_owner_map_v1(const char* label, const void* pointer,\n    size_t requested, const void* context) {\n  int saved_errno = errno;\n  char line[192];\n  int length = snprintf(line, sizeof(line),\n      "KU_OWNER_MAP v=1 pid=%ld label=%s ptr=%p bytes=%zu context=%p\\n",\n      (long)getpid(), label, pointer, requested, context);\n  if (length > 0 && (size_t)length < sizeof(line))\n    (void)write(STDERR_FILENO, line, (size_t)length);\n  errno = saved_errno;\n}\n'
+OWNER_SITES = [
+    ('  KuHttpTaskRuntime* runtime=(KuHttpTaskRuntime*)calloc(1,sizeof(*runtime));', [('task-runtime', 'runtime', 'sizeof(*runtime)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:268'),
+    ('  runtime->slots=(KuTaskDriverSlotV1*)calloc(task_capacity,sizeof(*runtime->slots));', [('task-slots', 'runtime->slots', 'task_capacity*sizeof(*runtime->slots)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:271'),
+    ('  runtime->ring=(size_t*)calloc(task_capacity,sizeof(*runtime->ring));', [('task-ring', 'runtime->ring', 'task_capacity*sizeof(*runtime->ring)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:272'),
+    ('  runtime->handles=(KuHttpTaskHandle*)calloc(capacity,sizeof(*runtime->handles));', [('task-handles', 'runtime->handles', 'capacity*sizeof(*runtime->handles)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:273'),
+    ('  runtime->free_handles=(uint32_t*)calloc(capacity,sizeof(*runtime->free_handles));', [('task-free-handles', 'runtime->free_handles', 'capacity*sizeof(*runtime->free_handles)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:274'),
+    ('  KuTaskControlV1** binding_keys=(KuTaskControlV1**)calloc(binding_cells,sizeof(*binding_keys));', [('task-bindings', 'binding_keys', 'binding_cells*sizeof(*binding_keys)', 'driver')], 'shared', 'src/backend/c_task_driver.rs:3327'),
+    ('  runtime->blocking=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*runtime->blocking));', [('task-blocking-pool', 'runtime->blocking', 'sizeof(*runtime->blocking)', 'runtime')], 'shared', 'src/backend/c_task_http.rs:507'),
+    ('  pool->storage=calloc(1,pool->storage_bytes);', [('task-blocking-storage', 'pool->storage', 'pool->storage_bytes', 'pool')], 'shared', 'src/backend/c_task_blocking.rs:775'),
+    ('  r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));', [('reactor-registrations', 'r->registrations', 'r->capacity*sizeof(*r->registrations)', 'r')], 'owner', 'src/backend/c_http_runtime.c:3929'),
+    ('  r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));', [('reactor-token-hash', 'r->hash', 'r->hash_capacity*sizeof(*r->hash)', 'r')], 'owner', 'src/backend/c_http_runtime.c:3930'),
+    ('  r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));', [('reactor-fd-entries', 'r->fd_entries', 'r->hash_capacity*sizeof(*r->fd_entries)', 'r')], 'owner', 'src/backend/c_http_runtime.c:3931'),
+    ('  r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));', [('reactor-work', 'r->work', '(size_t)r->slots*sizeof(int)', 'r'), ('reactor-idle-heap', 'r->idle_heap', '(size_t)r->slots*sizeof(int)', 'r')], 'owner', 'src/backend/c_http_runtime.c:3932'),
+    ('  KuHttpConnection* connections=(KuHttpConnection*)calloc((size_t)slot_count,sizeof(KuHttpConnection));', [('http-connections', 'connections', '(size_t)slot_count*sizeof(KuHttpConnection)', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3981'),
+    ('  KuHttpPollFd* poll_items=(KuHttpPollFd*)calloc(poll_capacity,sizeof(KuHttpPollFd));', [('http-poll-items', 'poll_items', 'poll_capacity*sizeof(KuHttpPollFd)', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3983'),
+    ('  int* active_indices=(int*)calloc((size_t)slot_count,sizeof(int));', [('http-active-indices', 'active_indices', '(size_t)slot_count*sizeof(int)', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3984'),
+    ('  KuHttpPollConnection* poll_connections=(KuHttpPollConnection*)calloc((size_t)slot_count,sizeof(KuHttpPollConnection));', [('http-poll-connections', 'poll_connections', '(size_t)slot_count*sizeof(KuHttpPollConnection)', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3985'),
+    ('  void* net_storage=net_bytes?calloc(1,net_bytes):NULL;', [('task-net-interests', 'net_storage', 'net_bytes', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3986'),
+    ('  pending.items=(KuHttpPendingItem*)calloc((size_t)max_pending,sizeof(KuHttpPendingItem));', [('http-pending-items', 'pending.items', '(size_t)max_pending*sizeof(KuHttpPendingItem)', 'owner')], 'owner', 'src/backend/c_http_runtime.c:3992'),
+]
+
+
+def prepare_allocation_owner_source(source, destination, source_commit=None):
+    source,destination=Path(source),Path(destination)
+    identity=destination.with_suffix(destination.suffix+'.identity.json')
+    if source.resolve()==destination.resolve() or destination.exists() or identity.exists():
+        raise ValueError('owner probe requires a fresh output, never overwrite normal C')
+    with source.open('rb') as stream:raw=stream.read((32<<20)+1)
+    if len(raw)>32<<20:raise ValueError('generated C exceeds32MiB')
+    text=raw.decode();marker='#include <math.h>\n'
+    if OWNER_MARKER in text or text.count(marker)!=1:raise ValueError('normal owner emission required')
+    for anchor,records,scope,origin in OWNER_SITES:
+        if text.count(anchor)!=1:raise ValueError('allocation anchor missing/duplicated: '+origin)
+    changed=text.replace(marker,marker+OWNER_HELPER,1)
+    for anchor,records,scope,origin in OWNER_SITES:
+        calls=''.join('\n  ku_temp_startup_owner_map_v1("%s", %s, %s, %s);'%record for record in records)
+        changed=changed.replace(anchor,anchor+calls,1)
+    destination.parent.mkdir(parents=True,exist_ok=True);destination.write_text(changed)
+    receipt=dict(schema='ku-startup-owner-source-v1',source_commit=source_commit,diagnostic_only=True,
+        normal_score_eligible=False,normal_source=str(source),normal_source_sha256=hashlib.sha256(raw).hexdigest(),
+        generated_c=str(destination),generated_c_sha256=hashlib.sha256(changed.encode()).hexdigest(),
+        tool_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),maximum_records=30,maximum_write_bytes=5730,
+        scope='Frozen single-listen/two-owner startup only; no hot logs/counters, no normal .text or allocator equality claim')
+    write_json(identity,receipt);return receipt
+
+
+def allocation_owner_ranges(log, pid, memory):
+    path=Path(log)
+    if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size>65536 or not memory.get('complete'):raise ValueError('owner log/smaps bound')
+    raw=path.read_bytes();lines=[line for line in raw.splitlines(keepends=True) if line.startswith(b'KU_OWNER_MAP')]
+    if len(lines)!=30 or any(len(line)>=192 for line in lines) or sum(map(len,lines))>5730:raise ValueError('expected30 bounded complete owner records')
+    expected={r[0]:(1 if scope=='shared' else 2) for _,records,scope,_ in OWNER_SITES for r in records}
+    counts={};result=[];intervals=[];contexts={}
+    pattern=rb'KU_OWNER_MAP v=1 pid=(\d+) label=([a-z-]+) ptr=(0x[0-9a-f]+) bytes=(\d+) context=(0x[0-9a-f]+)\n'
+    for line in lines:
+        match=re.fullmatch(pattern,line)
+        if not match:raise ValueError('malformed/partial owner record')
+        process,label,pointer,size,context=match.groups();label=label.decode();start=int(pointer,16);size=int(size);end=start+size
+        if int(process)!=pid or label not in expected or not 0<start<end<=1<<64 or not 0<int(context,16)<1<<64:raise ValueError('owner identity/range mismatch')
+        if any(start<b and a<end for a,b in intervals):raise ValueError('overlapping startup backing')
+        intervals.append((start,end));counts[label]=counts.get(label,0)+1
+        contexts.setdefault(label,set()).add(int(context,16))
+        intersect=[dict(start=max(start,int(m['start'],16)),end=min(end,int(m['end'],16)),VMA_start=m['start'],VMA_end=m['end'])
+            for m in memory['mappings'] if start<int(m['end'],16) and int(m['start'],16)<end]
+        if sum(x['end']-x['start'] for x in intersect)!=size:raise ValueError('owner backing outside captured mappings')
+        result.append(dict(label=label,pid=pid,pointer=hex(start),requested_bytes=size,context=context.decode(),intersections=intersect))
+    if counts!=expected or any(len(contexts[k])!=count for k,count in expected.items()):raise ValueError('missing/duplicate owner labels/contexts')
+    return dict(complete=True,records=result,log_sha256=hashlib.sha256(raw).hexdigest(),resident_bytes_attributed=False,
+        scope='Address intersections only. Requested/virtual bytes are not resident; shared VMA RSS/PSS/Anonymous are not assigned to each label.')
+
+
+def allocation_owner_pages(pid, owners, expected_start):
+    """Own-process pages only; caller runs this optional observer with a2s bound.
+
+    Kernel bit meanings: https://docs.kernel.org/admin-guide/mm/pagemap.html
+    PFNs never leave this function. Shared/compound/boundary pages stay unknown.
+    """
+    result=dict(available=False,maximum_pages=8192,PFNs_exported=False,
+        scope='Sequential pagemap/kpageflags observation, not an atomic snapshot, PSS or cgroup charge. '
+              'Only stable exclusively mapped ordinary ANON non-ZERO full interior pages are counted; boundaries/shared/compound pages are not assigned.')
+    try:
+        if pid<=0 or not owners.get('complete') or len(owners.get('records',[]))!=30:raise ValueError('validated own30 allocations required')
+        def start():return read_text(Path('/proc')/str(pid)/'stat').rsplit(')',1)[1].split()[19]
+        if start()!=str(expected_start):raise ValueError('own process start identity changed')
+        size=os.sysconf('SC_PAGE_SIZE');pages=set();ranges=[];deadline=time.monotonic()+1.5
+        for record in owners['records']:
+            if record['pid']!=pid:raise ValueError('mixed process allocation map')
+            lo=int(record['pointer'],16);hi=lo+record['requested_bytes']
+            if not 0<lo<hi<=1<<64:raise ValueError('invalid allocation range')
+            selected=range(lo//size,(hi-1)//size+1)
+            if len(selected)>8192:raise ValueError('allocation page bound')
+            pages.update(selected);ranges.append((record,lo,hi,selected))
+        if len(pages)>8192:raise ValueError('total allocation page bound')
+        values={};visible=0
+        with (Path('/proc')/str(pid)/'pagemap').open('rb',buffering=0) as pm,Path('/proc/kpageflags').open('rb',buffering=0) as kf:
+            def word(fd,offset):
+                raw=os.pread(fd.fileno(),8,offset)
+                if len(raw)!=8:raise ValueError('short page metadata read')
+                return int.from_bytes(raw,'little')
+            for page in sorted(pages):
+                if time.monotonic()>deadline:raise TimeoutError('page observer1.5s work budget')
+                entry=word(pm,page*8);present=bool(entry>>63);swapped=bool(entry&(1<<62));frame=entry&((1<<55)-1)
+                known=present and not swapped and frame!=0
+                flags=word(kf,frame*8) if known else 0;visible+=int(known)
+                stable=word(pm,page*8)==entry
+                ordinary=not flags&sum(1<<i for i in (15,16,17,21,22,24))
+                anon=known and stable and bool(flags&(1<<12)) and not flags&(1<<24)
+                exclusive=anon and ordinary and bool(entry&(1<<56)) and not entry&(1<<61)
+                values[page]=(known and stable,exclusive,anon,present,swapped,known and stable and bool(flags&(1<<24)))
+        if not visible:raise PermissionError('nonzero PFNs unavailable or no observable present allocation pages')
+        if start()!=str(expected_start):raise ValueError('own process exited/reused during page observation')
+        rows=[]
+        for record,lo,hi,selected in ranges:
+            interior=[p for p in selected if lo<=p*size and (p+1)*size<=hi]
+            boundary=[p for p in selected if p not in interior]
+            rows.append(dict(label=record['label'],context=record['context'],requested_bytes=hi-lo,
+                interior_pages=len(interior),exclusive_ordinary_anon_interior_bytes=sum(values[p][1] for p in interior)*size,
+                known_nonzero_anon_interior_bytes=sum(values[p][2] for p in interior)*size,
+                not_present_interior_pages=sum(not values[p][3] and not values[p][4] for p in interior),
+                swapped_interior_pages=sum(values[p][4] for p in interior),
+                zero_page_interior_pages=sum(values[p][5] for p in interior),
+                unclassified_present_interior_pages=sum(values[p][3] and not values[p][1] and not values[p][5] for p in interior),
+                boundary_pages=len(boundary),boundary_lower_bytes=0,boundary_upper_bytes=len(boundary)*size))
+        result.update(available=True,page_size=size,observed_unique_pages=len(pages),records=rows)
+    except (OSError,ValueError,TimeoutError) as error:result['unavailable_reason']=str(error)
+    return result
 
 
 if __name__ == '__main__':

@@ -31,6 +31,33 @@ def archive(path, changes=None, old_run=False):
 
 
 class ReuseBuildTests(unittest.TestCase):
+
+    def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
+        args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)
+        with patch.object(r,'extract_builds') as extract,self.assertRaisesRegex(ValueError,'fixed verified'):
+            r.prepare(args)
+        extract.assert_not_called()
+
+    def test_measured_owner_archive_exception_never_imports_observations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'owner.tgz'
+            files={'B/build/bin/ku-server':b'B','R/build/bin/client':b'client',
+                'normal-self-probe/summary.json':b'old observation',
+                'hosted-state.json':json.dumps({'steps':{k:{'state':'completed'} for k in ('build','build-B','build-R','diagnostic')}}).encode()}
+            index={'path_root':r.TOKEN,'raw_and_redacted_hashes_distinct':True,'files':[
+                {'path':k,'bytes':len(v),'archived_sha256':hashlib.sha256(v).hexdigest()} for k,v in files.items()]}
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,raw in files.items():
+                    info=tarfile.TarInfo(name);info.size=len(raw);tar.addfile(info,io.BytesIO(raw))
+            digest=r.h.sha(path)
+            with self.assertRaisesRegex(ValueError,'build-only'):r.extract_builds(path,root/'old',digest,{'B','R'})
+            with self.assertRaisesRegex(ValueError,'build-only'):r.extract_builds(path,root/'wrong',digest,{'B','R'},owner_observation=True)
+            with patch.object(r,'OWNER_ARCHIVE_SHA',digest):r.extract_builds(path,root/'good',digest,{'B','R'},owner_observation=True)
+            self.assertFalse((root/'good/normal-self-probe').exists())
+            self.assertNotIn('diagnostic',r.h.load(root/'good/reuse-original-state.json')['steps'])
+            self.assertEqual((root/'good/B/build/bin/ku-server').read_bytes(),b'B')
+
     def test_reuse_selection_and_state_identity_match_the_explicit_hosted_flag(self):
         for selected,common in ((None,None),(False,False),(True,False),(True,True)):
             with self.subTest(selected=selected,common=common),tempfile.TemporaryDirectory() as d,ExitStack() as patches:

@@ -38,10 +38,13 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 def validate_screen_selection(a,build_set):
     if getattr(a,'http_wake_screen',False):
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
-                'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen')):
+                'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
             raise ValueError('--http-wake-screen requires diagnostic build-set and no other opt-in screen')
         if getattr(a,'prepatch',None)!=HTTP_WAKE_PREPATCH or a.candidate==HTTP_WAKE_PREPATCH:
             raise ValueError('--http-wake-screen requires frozen b765f9b prepatch and a distinct candidate')
+    if getattr(a,'memory_owner_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','http_wake_screen'))):
+        raise ValueError('--memory-owner-probe requires diagnostic build-set and no other opt-in mode')
     if getattr(a,'pg_driver_screen',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
             ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen'))):
         raise ValueError('--pg-driver-screen requires diagnostic build-set and no other opt-in screen')
@@ -73,6 +76,7 @@ def hosted_identity(a,build_set):
     if getattr(a,'pg_queue_screen',False):identity['pg_queue_screen']=True
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     if getattr(a,'http_wake_screen',False):identity['http_wake_screen']=True
+    if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
     return identity
 
 
@@ -525,6 +529,7 @@ def build_json_layers(a):
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
+    if getattr(a,'memory_owner_probe',False):raise ValueError('owner probe requires verified fixed archive reuse, not a fresh build')
     if getattr(a,'normal_self_probe',False):require_normal_perf_preflight(a)
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
     class Builder(bl.Builder):
@@ -1330,6 +1335,114 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
 
 
 
+
+def memory_owner_plan(versions):
+    return dict(schema='ku-memory-owner-plan-v1',versions=versions,resources=copy.deepcopy(RESOURCES),
+        quality_policy=copy.deepcopy(POLICY),diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,workload='json_object',rate=500,warmup_seconds=3,score_seconds=5,
+        maximum_windows=1,maximum_replacements=0,timeout_seconds=3)
+
+
+def prepare_memory_owner(a,state):
+    import http_cost_diagnostic as hcd
+    from compile_variants import Commands, clean_environment
+    directory=a.root/'M';directory.mkdir();m=copy.deepcopy(load(a.root/'B/manifest.json'))
+    stack=m['stacks']['ku'];build=stack['build'];native=build['native']['server'];original=copy.deepcopy(native)
+    emission=hcd.prepare_allocation_owner_source(Path(native['generated_c']),directory/'owner.c',a.candidate)
+    invocation=native['compiler_invocation'];libs=invocation['library_inputs']
+    if len(libs)!=1 or libs[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
+        raise ValueError('owner probe requires original normal C11O2 and single libpq input')
+    binary=directory/'bin/ku-owner';binary.parent.mkdir()
+    command=[invocation['compiler']['path'],str(directory/'owner.c'),*invocation['flags'],
+        libs[0]['selected_input']['real_path'],'-o',str(binary)]
+    log=Commands(directory/'logs',clean_environment(a.tools));log.run('owner-link',command,directory,timeout=120)
+    with binary.open('rb') as stream:header=stream.read(20)
+    if len(header)!=20 or header[:6]!=b'\x7fELF\x02\x01' or int.from_bytes(header[18:20],'little')!=183:
+        raise ValueError('owner link is not ELF64 little-endian AArch64')
+    save(directory/'owner-compile.json',dict(command=command,commands=log.rows,diagnostic_only=True,normal_score_eligible=False))
+    native.update(binary=str(binary),binary_sha256=sha(binary),generated_c=str(directory/'owner.c'),
+        generated_c_sha256=emission['generated_c_sha256'],compiler_receipt=str(directory/'owner-compile.json'),
+        compiler_receipt_sha256=sha(directory/'owner-compile.json'),
+        compiler_invocation=dict(invocation,argv=command,output=str(binary),source=dict(path=str(directory/'owner.c'),
+            sha256=emission['generated_c_sha256']),cwd=str(directory)))
+    stack['command']=[str(binary)];build.update(instrumented='startup-allocation-owner-map-v1',normal_score_eligible=False)
+    m.update(diagnostic_only=True,normal_score_eligible=False,build_receipt=str(directory/'owner-compile.json'))
+    m=normalize_manifest(m,Path(m['protocol']),m['client']);save(directory/'manifest.json',m)
+    fixture=copy.deepcopy(m);fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
+    versions={name:dict(root=str(a.root/name),stack='ku',source_commit=a.candidate,
+        binary_sha256=load(a.root/name/'manifest.json')['stacks']['ku']['build']['native']['server']['binary_sha256'],
+        diagnostic_only=name=='M',normal_score_eligible=False) for name in ('B','M')}
+    plan=memory_owner_plan(versions);save(a.root/'frozen-plan.json',plan)
+    save(a.root/'build-identities.json',{name:fc.version_identity(plan,name) for name in versions})
+    if sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']:
+        raise ValueError('normal B artifact changed while preparing owner probe')
+    return dict(execution_complete=True,goal_status='unknown',diagnostic_only=True,normal_score_eligible=False)
+
+
+def memory_owner_probe(a,state):
+    import http_cost_diagnostic as hcd
+    if os.geteuid()!=0:raise ValueError('owner probe requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan!=memory_owner_plan(plan.get('versions',{})):raise ValueError('matching single-window owner plan required')
+    binding=fc.version_identity(plan,'M');normal=fc.version_identity(plan,'B')
+    directory=a.root/'memory-owner-probe';directory.mkdir();fixture=db.Database(a.root/'fixture',state['uid'],state['gid'])
+    original=fc.Harness;private=None;captured={};result=dict(execution_complete=False,goal_status='blocked',
+        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,candidate_accepted=False)
+    class OwnerHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+        def start(self,*args,**kwargs):
+            service=super().start(*args,**kwargs)
+            try:
+                memory=diagnostic_memory(service,directory/'startup-smaps.log')
+                captured['startup']=dict(memory=memory,owners=hcd.allocation_owner_ranges(
+                    Path(service.cwd).parent/'service.log',service.process.pid,memory))
+                return service
+            except BaseException:
+                service.stop();raise
+        def client(self,service,workload,rate,duration,output,**kwargs):
+            report=super().client(service,workload,rate,duration,output,**kwargs)
+            if Path(output).name=='score':
+                memory=diagnostic_memory(service,directory/'after-smaps.log')
+                captured.update(memory=memory,context=diagnostic_context(service),
+                    owners=hcd.allocation_owner_ranges(Path(service.cwd).parent/'service.log',service.process.pid,memory))
+                with (Path('/proc')/str(service.process.pid)/'maps').open('rb') as stream:maps=stream.read((1<<20)+1)
+                if len(maps)>1<<20:raise ValueError('owner maps exceeds1MiB')
+                (directory/'after-maps.log').write_bytes(maps);save(directory/'live-owner-map.json',captured)
+                owner_input=directory/'owner-ranges.json';save(owner_input,captured['owners'])
+                ticks=(Path('/proc')/str(service.process.pid)/'stat').read_text().rsplit(')',1)[1].split()[19]
+                captured['optional_pages']=diagnostic_command([sys.executable,'-B',str(Path(hcd.__file__)),
+                    'owner-pages','--pid',str(service.process.pid),'--ranges',str(owner_input),'--start-ticks',ticks],
+                    directory/'owner-pages.json',timeout=2,limit=65536)
+                save(directory/'live-owner-map.json',captured)
+            return report
+    try:
+        fixture.start();private=load(fixture.manifest_path);fc.Harness=OwnerHarness
+        row=fc.window(plan,'M','json_object',500,3,5,directory/'window',binding=binding,job={'phase':'diagnostic'})
+        for key in ('cpu_us','full_cpu_us','memory','qualification','upper_point','overload_boundary'):row.pop(key,None)
+        row.update(diagnostic_only=True,normal_score_eligible=False,formal_qualified=False)
+        valid=(row.get('correct')==2500 and row.get('all_correct') is True and row.get('functional_valid') is True
+            and row.get('accounting_valid') is True and row.get('arrival_schedule_quality')=='pass'
+            and row.get('natural_reclamation') is True and captured.get('owners',{}).get('complete') is True)
+        if fc.version_identity(plan,'B')!=normal or fc.version_identity(plan,'M')!=binding:raise ValueError('owner artifact changed')
+        result.update(row=row,execution_complete=valid,goal_status='unknown' if valid else 'blocked')
+    except Exception as error:result['observer_error']=repr(error)
+    finally:
+        fc.Harness=original
+        try:result['database_cleanup']=fixture.stop()
+        except Exception as error:result['database_cleanup']={'error':repr(error)}
+        cleanup=result['database_cleanup']
+        if cleanup.get('forced') is not False or cleanup.get('cgroup_removed') is not True or cleanup.get('after',{}).get('process_count')!=0:
+            result.update(execution_complete=False,goal_status='blocked')
+        save(directory/'summary.json',result);save(a.root/'hosted-state.json',state)
+        selected=[p for p in directory.rglob('*') if p.is_file() and p.name in ('summary.json','live-owner-map.json',
+            'startup-smaps.log','after-smaps.log','after-maps.log','owner-pages.json','owner-pages.json.json','owner-pages.json.log','service.log','termination.json','window.json','client.json','driver-cleanup.json')]
+        result['small_artifact']=pg_failure_export(a,directory,output_name='memory-owner-observation',
+            schema='ku-memory-owner-small-v1',selected=selected)
+    return result
+
+
 def normal_diagnostic_quality(row):
     """Local observation gate; an unregistered environment stays unknown."""
     invalid,signature=window_quality(row);cost={};report=Path(row.get('score_report',''))
@@ -1688,6 +1801,7 @@ def normal_self_probe(a,state):
 
 
 def diagnostic(a,state,followup=False):
+    if getattr(a,'memory_owner_probe',False):return memory_owner_probe(a,state)
     if getattr(a,'pg_driver_screen',False):return pg_driver_screen(a,state)
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_wake_screen',False):return pg_queue_screen(a,state)
     if getattr(a,'normal_self_probe',False):return normal_self_probe(a,state)
@@ -2237,10 +2351,12 @@ def main(argv=None):
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--http-wake-screen',action='store_true',help='Explicit23-window control+normal A/B wake-transport diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
+    p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
+    if a.memory_owner_probe and a.phase not in ('diagnostic','archive'):p.error('--memory-owner-probe requires fixed archive reuse before diagnostic')
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
     if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/preflight/archive')
@@ -2278,7 +2394,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(690 if a.http_wake_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_wake_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

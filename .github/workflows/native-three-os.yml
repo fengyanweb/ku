@@ -48,6 +48,11 @@ on:
         type: boolean
         default: false
 
+      memory_owner_probe:
+        description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
+        type: boolean
+        default: false
+
       pg_driver_screen:
         description: 'Two fresh normal B PG sender conditions256/1024; diagnostic arrival ledger, no capacity ranking'
         type: boolean
@@ -485,7 +490,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_wake_screen)
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_wake_screen || inputs.memory_owner_probe)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -506,6 +511,7 @@ jobs:
       KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN: ${{ inputs.http_wake_screen && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE: ${{ inputs.memory_owner_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_DRIVER_SCREEN: ${{ inputs.pg_driver_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
@@ -536,6 +542,17 @@ jobs:
             test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
             test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            test -z "$KU_PERFORMANCE_V2_VARIANTS"
+          fi
+          if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41182804290
+            test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = 4e5f5d94da277654862d8679f7ae4a7fda3f05ff
+            test "${KU_PERFORMANCE_V2_HTTP_WAKE_SCREEN:-false}" = false
+            for mode in PG_DRIVER_SCREEN PG_QUEUE_SCREEN PG_FAILURE_PROBE NORMAL_SELF_PROBE TASK_JSON_SCREEN COMMON_HTTP_SCREEN FINAL_TASK_JSON; do
+              mode="KU_PERFORMANCE_V2_$mode"; test "${!mode}" = false
+            done
             test -z "$KU_PERFORMANCE_V2_VARIANTS"
           fi
           if [ "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = true ]; then
@@ -678,6 +695,11 @@ jobs:
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--http-wake-screen)
           fi
+          if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$performance_build_set" = diagnostic
+            performance_task_json_args+=(--memory-owner-probe)
+          fi
           if [ "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
@@ -719,7 +741,7 @@ jobs:
             performance_task_json_args+=(--final-task-json)
           fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
-            test "$performance_build_set" = followup-screen
+            if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
               --archive "$RUNNER_TEMP/ku-reused-build/ku-performance-v2-evidence.tar.gz" \
               --archive-sha256 "$KU_PERFORMANCE_V2_REUSE_SHA256" \
@@ -741,7 +763,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
@@ -769,6 +791,11 @@ jobs:
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--http-wake-screen)
+          fi
+          if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+            test "$performance_build_set" = diagnostic
+            performance_task_json_args+=(--memory-owner-probe)
           fi
           if [ "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -876,6 +903,15 @@ jobs:
         with:
           name: ku-http-wake-observation
           path: ${{ runner.temp }}/ku-performance-v2/http-wake-observation
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain the small allocation owner observation
+        if: always() && inputs.memory_owner_probe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-memory-owner-observation
+          path: ${{ runner.temp }}/ku-performance-v2/memory-owner-observation
           retention-days: 1
           if-no-files-found: error
 
