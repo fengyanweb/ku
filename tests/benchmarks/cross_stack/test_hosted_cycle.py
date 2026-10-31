@@ -13,6 +13,117 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_normal_self_plan_is_six_normal_windows_without_ledger_or_acceptance(self):
+        plan=h.normal_self_plan({'B':{},'R':{}})
+        self.assertEqual(plan['order'],[[name,turn] for name in ('B','R') for turn in ('before','sample','after')])
+        self.assertEqual((plan['workload'],plan['rate'],plan['warmup_seconds'],plan['score_seconds']),('json_object',4000,10,15))
+        self.assertEqual((plan['event'],plan['perf_frequency'],plan['perf_flags']),('cpu-clock',499,[]))
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(6,0))
+        self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
+        self.assertEqual(plan['resources'],h.RESOURCES);self.assertEqual(plan['quality_policy'],h.POLICY)
+        for key in ('targets','admission','capacity','schedule'):self.assertNotIn(key,plan)
+
+    def test_normal_self_selection_is_exclusive(self):
+        import io
+        from contextlib import redirect_stderr
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.BASELINE,screen_variants=[])
+        self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('normal_self_probe',False))
+        self.assertTrue(h.hosted_identity(types.SimpleNamespace(**base,normal_self_probe=True),'diagnostic')['normal_self_probe'])
+        for mode,extra in [('full',{}),('followup-screen',{}),*[( 'diagnostic',{flag:True}) for flag in
+                ('pg_failure_probe','task_json_screen','common_http_screen','final_task_json')]]:
+            with self.subTest(mode=mode,extra=extra),self.assertRaisesRegex(ValueError,'normal-self-probe'):
+                h.validate_screen_selection(types.SimpleNamespace(**base,normal_self_probe=True,**extra),mode)
+        with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as invalid:
+            h.main(['--phase','run','--build-set','diagnostic','--normal-self-probe','--candidate','b'*40,
+                '--root','/unused','--source','/unused','--tools','/unused'])
+        self.assertEqual(invalid.exception.code,2)
+
+    def test_normal_self_sampler_wraps_original_client_and_owns_only_minimal_perf(self):
+        for sample,exit_code in ((False,0),(True,0),(True,130)):
+            with self.subTest(sample=sample,exit_code=exit_code),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
+                    domain=types.SimpleNamespace(snapshot=lambda:{'memory_stat':{'anon':42}}))
+                patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
+                memory=patches.enter_context(patch.object(h,'diagnostic_memory',return_value={'categories':{}}))
+                symbols=patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'files':[]}))
+                class Process:
+                    pid=99999999;returncode=exit_code
+                    def poll(self):return self.returncode
+                    def wait(self,timeout):return self.returncode
+                calls=[]
+                def popen(argv,**kwargs):
+                    calls.append(argv);Path(argv[argv.index('-o')+1]).write_bytes(b'perf data');return Process()
+                launch=patches.enter_context(patch.object(h.subprocess,'Popen',side_effect=popen))
+                invoked=[]
+                result=h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample)
+                self.assertEqual(result,{'original':True});self.assertEqual(invoked,[True])
+                record=h.load(output/'normal-self-observations.json');self.assertEqual(record['record_complete'],not sample or exit_code==0)
+                self.assertIn('not a simultaneous',record['before']['scope'])
+                self.assertIn('unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
+                self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
+                self.assertEqual(launch.call_count,1 if sample else 0)
+                if sample:
+                    self.assertEqual(calls[0],['/perf','record','--clockid','mono','-e','cpu-clock','-F','499',
+                        '-p','99999999','-o',str(output/'perf.data'),'--','sleep','21'])
+
+    def test_normal_self_six_windows_stop_on_failure_or_control_drift(self):
+        for issue in ('none','functional','accounting','cleanup','observer','quality','drift','database'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.normal_self_plan({name:{'root':str(root/name),'stack':stack,'binary_sha256':'f'*64}
+                    for name,stack in (('B','ku'),('R','rust'))});h.save(root/'frozen-plan.json',plan)
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'})
+                h.save(dbstate,{'limits':{'cpuset.cpus':'3','memory.max':'536870912'}})
+                fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack=p['versions'][n]['stack'],build_mode=mode)))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64));patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
+                commands=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
+                perf_probe=patches.enter_context(patch.object(h,'perf_capability'));matrix=patches.enter_context(patch.object(fc,'execute'))
+                measured=[]
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    turn=Path(output).name;measured.append((name,turn))
+                    self.assertEqual((workload,rate,warmup,duration),('json_object',4000,10,15))
+                    self.assertEqual(kwargs['job'],dict(phase='diagnostic',contract='dom'))
+                    bad=name=='B' and turn=='sample'
+                    row=dict(status='observed',functional_valid=not(bad and issue=='functional'),accounting_valid=not(bad and issue=='accounting'),
+                        all_correct=True,natural_reclamation=not(bad and issue=='cleanup'),arrival_schedule_quality='pass',
+                        environment_quality='fail' if bad and issue=='quality' else 'pass',measurement_invalid=False,
+                        full_cpu_us=12 if name=='B' and turn=='after' and issue=='drift' else 10)
+                    h.save(Path(output)/'score/normal-self-observations.json',{'record_complete':not(bad and issue=='observer')})
+                    return row
+                patches.enter_context(patch.object(fc,'window',side_effect=window));old=fc.Harness
+                result=h.diagnostic(types.SimpleNamespace(root=root,tools=root/'tools',normal_self_probe=True),{'uid':1,'gid':1,'steps':{}})
+                self.assertIs(fc.Harness,old);perf_probe.assert_not_called();matrix.assert_not_called()
+                expected=6 if issue in ('none','database') else 3 if issue=='drift' else 2
+                self.assertEqual(len(measured),expected);self.assertEqual(result['execution_complete'],issue=='none')
+                self.assertFalse(result['attribution_eligible']);self.assertEqual(result['attribution_controls_passed'],issue=='none');self.assertFalse(result['formal_qualified'])
+                self.assertEqual(result['perf_attempts'],2 if expected==6 else 1)
+                self.assertEqual(result['goal_status'],'unknown' if issue=='none' else 'blocked')
+                self.assertTrue(all('--call-graph' not in call.args[0] for call in commands.call_args_list))
+
+    def test_normal_self_raw_perf_and_mapped_elf_are_in_full_archive_allowlist(self):
+        root=Path('/unused')
+        self.assertTrue(h.evidence_file(root/'normal-self-probe/B/sample/score/perf.data',root))
+        self.assertTrue(h.evidence_file(root/'normal-self-probe/B/sample/score/symfs/usr/lib/libc.so.6',root))
+        self.assertFalse(h.evidence_file(root/'normal-self-probe/B/sample/score/unknown.data',root))
+
+    def test_normal_self_main_has_a_separate_bounded_coordinator_alarm(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);source=root/'source';tools=root/'tools';source.mkdir();tools.mkdir()
+            patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+            patches.enter_context(patch.object(h.signal,'signal'));alarm=patches.enter_context(patch.object(h.signal,'alarm'))
+            patches.enter_context(patch.object(h,'diagnostic',return_value={'execution_complete':True,'goal_status':'unknown'}))
+            with redirect_stdout(io.StringIO()):code=h.main(['--phase','diagnostic','--build-set','diagnostic','--normal-self-probe',
+                '--root',str(root/'out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40])
+            self.assertEqual(code,0);alarm.assert_called_once_with(330)
+
     def test_pg_failure_probe_is_one_identified_non_scoring_point(self):
         versions={'B':{'root':'/unused/B','stack':'ku'}}
         plan=h.pg_failure_plan(versions)
@@ -748,7 +859,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

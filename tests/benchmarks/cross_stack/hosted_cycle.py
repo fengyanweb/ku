@@ -34,8 +34,11 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'normal_self_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe'))):
+        raise ValueError('--normal-self-probe requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'pg_failure_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
-            ('task_json_screen','common_http_screen','final_task_json'))):
+            ('task_json_screen','common_http_screen','final_task_json','normal_self_probe'))):
         raise ValueError('--pg-failure-probe requires diagnostic build-set and no other opt-in screen')
     if getattr(a,'final_task_json',False) and (build_set!='full' or getattr(a,'task_json_screen',False) or getattr(a,'common_http_screen',False)):
         raise ValueError('--final-task-json requires full build-set and cannot select followup screens')
@@ -47,9 +50,11 @@ def validate_screen_selection(a,build_set):
 
 def hosted_identity(a,build_set):
     validate_screen_selection(a,build_set)
-    return dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
+    identity=dict(baseline=a.baseline,candidate=a.candidate,entry_sha256=sha(__file__),build_set=build_set,
         prepatch=a.prepatch if build_set=='followup-screen' else None,screen_variants=a.screen_variants,
         task_json_screen=getattr(a,'task_json_screen',False),common_http_screen=getattr(a,'common_http_screen',False),final_task_json=getattr(a,'final_task_json',False),pg_failure_probe=getattr(a,'pg_failure_probe',False))
+    if getattr(a,'normal_self_probe',False):identity['normal_self_probe']=True
+    return identity
 
 
 def require_task_json_support(root):
@@ -211,6 +216,21 @@ def pg_failure_plan(versions):
         observation_alarm_seconds=120,workflow_limit_seconds=180,
         purpose='Investigate HTTP500 at the original12800/s PG point. No SQL retry, changed timeout, '
                 'new matrix, perf probe or performance acceptance. A captured failure remains a failure.')
+
+
+def normal_self_plan(versions):
+    """Normal Release SELF, bounded by two unsampled controls per stack."""
+    return dict(schema='ku-hosted-normal-self-probe-v1',versions=versions,
+        resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
+        workload='json_object',contract='dom',rate=4000,warmup_seconds=10,score_seconds=15,
+        order=[[name,turn] for name in ('B','R') for turn in ('before','sample','after')],
+        event='cpu-clock',perf_frequency=499,perf_flags=[],maximum_windows=6,maximum_replacements=0,
+        maximum_control_cpu_ratio=1.10,observation_alarm_seconds=330,workflow_limit_seconds=420,
+        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
+        purpose='Identify current normal B/R synchronous JSON SELF; only normal Release binaries, '
+                'same fixed corpus and driver, before/sample/after per stack. No D ledger, retries, '
+                'callchain probe, capacity, product change or performance acceptance. '
+                'SELF shares are not exclusive whole-request CPU attribution; inclusive chains are unavailable.')
 
 
 def followup_plan(versions, prepatch=FOLLOWUP_PREPATCH,task_json_screen=False,common_http_screen=False):
@@ -478,7 +498,7 @@ def complete_build(a,state,build_set,prepatch,variants):
             supplemental_only=final_task_json,original_worker_score_eligible=False,json_execution_mode='task')
     fixture=normalize_manifest(copy.deepcopy(load(a.root/'B/manifest.json')),protocol,client)
     fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
-    if diagnostic:versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
+    if diagnostic and not getattr(a,'normal_self_probe',False):versions['D']=step(state,a.root,'build-ledger',lambda:build_ledger(a))
     layers=None
     if build_set=='followup-screen':
         layers=step(state,a.root,'build-json-layers',lambda:build_json_layers(a))
@@ -486,7 +506,8 @@ def complete_build(a,state,build_set,prepatch,variants):
             m=load(a.root/'HC/manifest.json');versions['HC']=dict(root=str(a.root/'HC'),stack='ku',
                 source_commit=m['candidate_base'],binary_sha256=sha(m['stacks']['ku']['command'][0]),
                 diagnostic_only=True,normal_score_eligible=False)
-    if getattr(a,'pg_failure_probe',False):plan=pg_failure_plan(versions)
+    if getattr(a,'normal_self_probe',False):plan=normal_self_plan(versions)
+    elif getattr(a,'pg_failure_probe',False):plan=pg_failure_plan(versions)
     elif build_set=='followup-screen':plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False))
     elif diagnostic:plan=diagnostic_plan(versions)
     else:plan=frozen_plan(versions,final_task_json=final_task_json)
@@ -911,11 +932,11 @@ def task_json_screen(rows,case,slo):
               'not an original sixteen-goal result or proof from changing the fixture declaration alone')
 
 
-def pg_failure_export(a,directory):
+def pg_failure_export(a,directory,*,output_name='pg-failure-observation',schema='ku-pg-failure-small-artifact-v1',selected=None):
     """Small redacted receipts only; raw originals remain in the full archive."""
-    output=a.root/'pg-failure-observation';output.mkdir(exist_ok=False);output.chmod(0o755)
+    output=a.root/output_name;output.mkdir(exist_ok=False);output.chmod(0o755)
     entries=[];skipped=[];total=0;paths=[];metadata_reserve=128<<10
-    for path in directory.rglob('*'):
+    for path in directory.rglob('*') if selected is None else selected:
         if not path.is_file() or path.is_symlink() or path.suffix not in ('.json','.log'):continue
         if len(paths)>=64:
             skipped.append(dict(path='*',reason='small artifact64-file limit; other raw receipts retained'));break
@@ -938,7 +959,7 @@ def pg_failure_export(a,directory):
             parent.chmod(0o755);parent=parent.parent
         entries.append(dict(path=str(relative),original_sha256=hashlib.sha256(raw).hexdigest(),
             exported_sha256=hashlib.sha256(data).hexdigest(),bytes=len(data)))
-    record=dict(schema='ku-pg-failure-small-artifact-v1',entries=entries,skipped=skipped,bytes=total,
+    record=dict(schema=schema,entries=entries,skipped=skipped,bytes=total,
         metadata_reservation_bytes=metadata_reserve,total_limit_bytes=8<<20,
         raw_receipts_in_full_archive=True,redacted=True,normal_score_eligible=False)
     data=encoded(record)
@@ -1030,7 +1051,176 @@ def pg_failure_probe(a,state):
     return result
 
 
+def normal_self_client(client,service,output,duration,perf,*,sample):
+    """Observe the existing scored client; never change its requests or deadlines."""
+    output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
+        cpu_distribution='unknown: no CPU field; instantaneous last-CPU is not a residency distribution',
+        sample_scope='perf attaches before scored client launch and stops after its return, including client startup/drain; not an exact planned-arrival-only interval')
+    def endpoint(label):
+        started=time.monotonic_ns()
+        snapshot=diagnostic_observe(lambda:diagnostic_context(service))
+        proc=Path('/proc')/str(service.process.pid)/'task';threads=[]
+        try:tasks=sorted(proc.iterdir(),key=lambda p:int(p.name))
+        except OSError:tasks=[]
+        for task in tasks[:128]:
+            try:
+                with (task/'stat').open('rb') as stream:raw=stream.read(4097)
+                threads.append(dict(tid=int(task.name),stat=raw[:4096].decode(errors='replace'),truncated=len(raw)>4096))
+            except OSError as error:threads.append(dict(tid=int(task.name),unavailable=repr(error)))
+        value=dict(context=snapshot,thread_stat=threads,task_limit=128)
+        if sample:
+            value['memory']=diagnostic_observe(lambda:diagnostic_memory(service,output/(label+'-smaps.log')))
+            value['cgroup']=diagnostic_observe(lambda:service.domain.snapshot())
+        value.update(capture_started_monotonic_ns=started,capture_ended_monotonic_ns=time.monotonic_ns(),
+            scope='Sequential endpoint reads, not a simultaneous snapshot or thread/core residency histogram.')
+        return value
+    process=None;log=None;watch=None;stop=threading.Event();raw=output/'perf.data';limit=16<<20
+    record['before']=endpoint('before')
+    try:
+        if sample:
+            if not perf:raise ValueError('perf unavailable; no replacement/capability retry')
+            record['symbols']=diagnostic_symbols(service,output)
+            command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499',
+                '-p',str(service.process.pid),'-o',str(raw),'--','sleep',str(duration+6)]
+            record.update(command=command,raw_limit_bytes=limit,started_monotonic_ns=time.monotonic_ns())
+            log=(output/'perf-record.log').open('xb')
+            process=subprocess.Popen(command,stdout=log,stderr=log,stdin=subprocess.DEVNULL,start_new_session=True)
+            def bounded():
+                while not stop.wait(.1):
+                    if process.poll() is not None:return
+                    if raw.exists() and raw.stat().st_size>limit:
+                        record['raw_limit_exceeded']=True
+                        try:os.killpg(process.pid,signal.SIGINT)
+                        except ProcessLookupError:pass
+                        return
+            watch=threading.Thread(target=bounded,daemon=True);watch.start()
+        return client()
+    finally:
+        stop.set()
+        if watch is not None:watch.join(timeout=1)
+        record['observer_thread_stopped']=watch is None or not watch.is_alive()
+        if process is not None:
+            if process.poll() is None:
+                try:os.killpg(process.pid,signal.SIGINT)
+                except ProcessLookupError:pass
+            try:process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5);record['forced_cleanup']=True
+            record.update(perf_exit_code=process.returncode,ended_monotonic_ns=time.monotonic_ns())
+        if log is not None:log.close()
+        record['after']=endpoint('after')
+        record['raw_bytes']=raw.stat().st_size if raw.is_file() else 0
+        record['record_complete']=(not sample or (process is not None and process.returncode==0
+            and 0<record['raw_bytes']<=limit and not record.get('raw_limit_exceeded') and not record.get('forced_cleanup')))
+        record['record_complete'] &= record['observer_thread_stopped']
+        save(output/'normal-self-observations.json',record)
+
+
+def normal_self_probe(a,state):
+    """Six windows at most, exact normal binaries, never a new performance score."""
+    if os.geteuid()!=0:raise ValueError('normal SELF probe requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan!=normal_self_plan(plan.get('versions',{})):raise ValueError('matching frozen normal SELF plan required')
+    bindings={name:fc.version_identity(plan,name) for name in ('B','R')}
+    mode=bindings['B']['build_mode']
+    expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
+        pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    if bindings['B']['stack']!='ku' or mode!=expected or bindings['R']['stack']!='rust':
+        raise ValueError('identified normal B/R binaries required; no D instrumentation')
+    directory=a.root/'normal-self-probe';directory.mkdir(exist_ok=False)
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None
+    perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
+    result=dict(schema='ku-normal-self-observation-v1',diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,candidate_accepted=False,execution_complete=False,attribution_eligible=False,
+        goal_status='unknown',rows=[],stopped=[],controls={},maximum_windows=6,perf_attempts=0,purpose=plan['purpose'])
+    active={'sample':False}
+    class SelfHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+        def client(self,service,workload,rate,duration,output,**kwargs):
+            parent=super().client
+            if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
+            return normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
+                service,output,duration,perf,sample=active['sample'])
+    began=time.monotonic()
+    try:
+        fixture.start();private=load(fixture.manifest_path);fc.Harness=SelfHarness
+        save(directory/'identity.json',dict(bindings=bindings,resources=plan['resources'],quality_policy=plan['quality_policy'],
+            database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id'),
+            kernel=platform.release(),machine=platform.machine(),perf=perf,purpose=plan['purpose']))
+        diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-before.log')
+        for name,turn in plan['order']:
+            active['sample']=turn=='sample';output=directory/name/turn
+            if active['sample']:result['perf_attempts']+=1
+            try:
+                row=fc.window(plan,name,plan['workload'],plan['rate'],plan['warmup_seconds'],plan['score_seconds'],
+                    output,binding=bindings[name],job={'phase':'diagnostic','contract':plan['contract']})
+            except Exception as error:
+                row=load(output/'window.json') if (output/'window.json').is_file() else {}
+                row['observer_error']=repr(error)
+            row.update(name=name,turn=turn,diagnostic_only=True,normal_score_eligible=False,formal_qualified=False)
+            sampled=output/'score/normal-self-observations.json'
+            observation=load(sampled) if sampled.is_file() else {}
+            row['observation_complete']=observation.get('record_complete') is True
+            exports=[]
+            if active['sample'] and row['observation_complete']:
+                raw=output/'score/perf.data';symfs=output/'score/symfs'
+                exports.append(diagnostic_command([perf,'report','-i',str(raw),'--symfs',str(symfs),'--stdio','--no-children',
+                    '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=20,limit=4<<20))
+                exports.append(diagnostic_command([perf,'script','-i',str(raw),'--symfs',str(symfs),'--ns',
+                    '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],
+                    output/'score/perf-pcs.log',timeout=20,limit=8<<20))
+                row['exports_complete']=all(x['complete'] for x in exports)
+            invalid,signature=window_quality(row)
+            valid=(row.get('functional_valid') is True and row.get('accounting_valid') is True
+                and row.get('all_correct') is True and row.get('natural_reclamation') is True
+                and row.get('environment_quality')=='pass' and not invalid and row['observation_complete']
+                and (not active['sample'] or row.get('exports_complete') is True))
+            row['diagnostic_qualified']=valid;result['rows'].append(row)
+            save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
+            if not valid:
+                result['stopped'].append(dict(name=name,turn=turn,reason='functional/accounting/quality/observer/cleanup failure; no retry',quality_signature=signature));break
+            if turn=='after':
+                controls=[r['full_cpu_us'] for r in result['rows'] if r['name']==name and r['turn']!='sample']
+                ratio=max(controls)/min(controls) if len(controls)==2 and all(type(x)in(int,float) and x>0 for x in controls) else None
+                sample=next(r for r in result['rows'] if r['name']==name and r['turn']=='sample')
+                sampled_cpu=sample.get('full_cpu_us')
+                result['controls'][name]=dict(unsampled_cpu_max_min=ratio,
+                    drift_valid=ratio is not None and ratio<=plan['maximum_control_cpu_ratio'],
+                    sampled_cpu_over_control_geomean=sampled_cpu/(controls[0]*controls[1])**.5
+                        if ratio is not None and type(sampled_cpu)in(int,float) and sampled_cpu>0 else None,
+                    scope='Single before/sample/after sequence; perturbation descriptive, no CI or automatic performance adoption')
+                if not result['controls'][name]['drift_valid']:
+                    result['stopped'].append(dict(name=name,turn=turn,reason='unsampled CPU drift exceeds1.10 or missing; attribution invalid, no retry'));break
+    except BaseException as error:
+        result.update(observer_error=repr(error),observation_interrupted=not isinstance(error,Exception))
+        if not isinstance(error,Exception):raise
+    finally:
+        fc.Harness=original
+        try:result['database_cleanup']=fixture.stop()
+        except Exception as error:result['database_cleanup']={'error':repr(error)}
+        state['database_cleanup']=result['database_cleanup']
+        cleanup=result['database_cleanup'];dbok=(cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0)
+        complete=len(result['rows'])==6 and not result['stopped'] and dbok and 'observer_error' not in result
+        result.update(seconds=time.monotonic()-began,execution_complete=complete,
+            attribution_controls_passed=complete,
+            attribution_review='Pending raw sample denominator/loss/sparsity/PC mapping and perturbation review; controls alone do not validate attribution.')
+        result['goal_status']='unknown' if result['execution_complete'] else 'blocked'
+        save(directory/'summary.json',result)
+        selected=[directory/name for name in ('summary.json','identity.json','results.json','processes-before.log')]
+        selected.extend(directory/name/turn/relative for name,turn in plan['order'] for relative in (
+            'window.json','full-lifecycle.json','score/client.json','score/driver-cleanup.json',
+            'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
+            'score/symbol-identities.json','score/maps.log'))
+        result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
+        save(a.root/'hosted-state.json',state)
+    return result
+
+
 def diagnostic(a,state,followup=False):
+    if getattr(a,'normal_self_probe',False):return normal_self_probe(a,state)
     if getattr(a,'pg_failure_probe',False):return pg_failure_probe(a,state)
     import http_cost_diagnostic as hcd
     if os.geteuid()!=0:raise ValueError('diagnostic requires root cgroup control')
@@ -1505,7 +1695,7 @@ def evidence_file(path, root):
         return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:] in (('rust-cargo','release','ku-cross-stack-rust'),('target','release','ku-cross-stack-rust'))
     return path.name not in ('ku-performance-v2-evidence.tar.gz','archive.json') and not path.name.endswith('.writing') and (
         path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or (path.suffix=='.profraw' and 'http-profiles' in parts) or
-        (parts[0]=='diagnostic' and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
+        (parts[0] in ('diagnostic','normal-self-probe') and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
 
 
 def immutable_benchmark_json(path,root):
@@ -1575,10 +1765,12 @@ def main(argv=None):
     p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
+    p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
+    if a.normal_self_probe and a.phase not in ('build','diagnostic','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
     a.root=a.root.resolve();a.source=a.source.resolve(strict=a.phase!='archive');a.tools=a.tools.resolve(strict=a.phase!='archive')
@@ -1601,7 +1793,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.pg_failure_probe else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.pg_failure_probe else 330 if a.normal_self_probe else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
