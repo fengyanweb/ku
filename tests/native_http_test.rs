@@ -8199,69 +8199,78 @@ static int fixture_fd_index_clusters(void) {
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-fd-index-collision-backshift-ok");return 0;
 }
+/* No kernel operation: model stable fake-fd ownership using the actual
+   preflight, map helpers and publication order. */
+static int fixture_token_index_publish(KuHttpReactor* r,size_t index,uint64_t token) {
+  if(!ku_http_reactor_fd_prepare(r) || !ku_http_reactor_hash_add(r,token,index))return 0;
+  KuHttpSocket fd=(int)(500u+index);
+  size_t bucket=ku_http_reactor_fd_bucket(r,fd);
+  if(bucket==SIZE_MAX || r->fd_entries[bucket])return 0;
+  r->registrations[index]=(KuHttpRegistration){fd,token,index+1u,0,1,-1,0};
+  r->fd_entries[bucket]=(uint32_t)(index+1u);r->fd_count++;
+  return !r->fault;
+}
+static void fixture_token_index_unpublish(KuHttpReactor* r,size_t index) {
+  ku_http_reactor_hash_remove(r,r->registrations[index].token);
+  ku_http_reactor_fd_remove(r,index);r->registrations[index]=(KuHttpRegistration){0};
+}
 static int fixture_token_index_prefix_and_growth(void) {
   KuHttpConnection connections[64]={{0}};KuHttpActiveSet active={connections,64,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init_pending(&r,&active,16u,8u));
   size_t calls=fixture_alloc_calls,bytes=fixture_live_bytes,full=r.hash_capacity;
-  CHECK(r.token_capacity==32u && full>32u && !r.token_count);
-  /* A wrapped token collision cluster must survive every back-shift. The
-     fd index uses a separate capacity mask and is checked independently. */
+  CHECK(r.fd_capacity==32u && full>32u && !r.fd_count);
+  /* A wrapped token collision cluster must survive every back-shift. Both
+     maps share capacity while retaining their independent keys/members. */
   uint64_t collision[4];size_t found=0;
   for(uint64_t token=1000000u;found<4u && token<1100000u;token++)
-    if(ku_http_reactor_hash_start(&r,token)==r.token_capacity-1u)collision[found++]=token;
+    if(ku_http_reactor_hash_start(&r,token)==r.fd_capacity-1u)collision[found++]=token;
   CHECK(found==4u);
   for(size_t i=0;i<4u;i++) {
-    CHECK(ku_http_reactor_hash_add(&r,collision[i],i));
-    r.registrations[i]=(KuHttpRegistration){(int)(500u+i),collision[i],1u,0,1,-1,0};
+    CHECK(fixture_token_index_publish(&r,i,collision[i]));
   }
   const size_t deleted[4]={1u,0u,3u,2u};
   for(size_t step=0;step<4u;step++) {
-    size_t index=deleted[step];ku_http_reactor_hash_remove(&r,collision[index]);
-    r.registrations[index]=(KuHttpRegistration){0};
+    size_t index=deleted[step];fixture_token_index_unpublish(&r,index);
     CHECK(!r.fault && ku_http_reactor_lookup(&r,collision[index])==SIZE_MAX);
     for(size_t j=0;j<4u;j++)if(r.registrations[j].registered)
       CHECK(ku_http_reactor_lookup(&r,collision[j])==j);
   }
-  CHECK(!r.token_count);
+  CHECK(!r.fd_count);
   /* Real production map churn must not scatter writes across the reserved
      suffix while only three registrations are simultaneously present. */
   for(size_t i=0;i<2u;i++) {
-    r.registrations[i]=(KuHttpRegistration){(int)(500u+i),i+1u,1u,0,1,-1,0};
-    CHECK(ku_http_reactor_hash_add(&r,i+1u,i));
+    CHECK(fixture_token_index_publish(&r,i,i+1u));
   }
   for(uint64_t token=3u;token<30003u;token++) {
-    CHECK(ku_http_reactor_hash_add(&r,token,2u));
+    CHECK(fixture_token_index_publish(&r,2u,token));
     CHECK(ku_http_reactor_lookup(&r,token)==2u);
-    ku_http_reactor_hash_remove(&r,token);
+    fixture_token_index_unpublish(&r,2u);
     CHECK(ku_http_reactor_lookup(&r,token)==SIZE_MAX);
     CHECK(ku_http_reactor_lookup(&r,1u)==0u && ku_http_reactor_lookup(&r,2u)==1u);
-    CHECK(!r.fault && r.token_count==2u && r.token_capacity==32u);
+    CHECK(!r.fault && r.fd_count==2u && r.fd_capacity==32u);
   }
-  for(size_t i=r.token_capacity;i<full;i++)CHECK(!r.hash[i].token && !r.hash[i].entry);
-  ku_http_reactor_hash_remove(&r,1u);ku_http_reactor_hash_remove(&r,2u);
-  r.registrations[0]=(KuHttpRegistration){0};r.registrations[1]=(KuHttpRegistration){0};
-  CHECK(!r.token_count && r.token_capacity==32u && !r.fault);
+  for(size_t i=r.fd_capacity;i<full;i++)CHECK(!r.hash[i].token && !r.hash[i].entry);
+  fixture_token_index_unpublish(&r,0u);fixture_token_index_unpublish(&r,1u);
+  CHECK(!r.fd_count && r.fd_capacity==32u && !r.fault);
   /* Exercise every configured registration slot, including network/pending
      tail slots. Growth rehashes stable owners without any allocation, changed
      budget, token truncation, or reduced maximum registration capacity. */
   for(size_t i=0;i<r.capacity;i++) {
     uint64_t token=UINT64_MAX-1000u-i;
-    CHECK(ku_http_reactor_hash_add(&r,token,i));
-    r.registrations[i]=(KuHttpRegistration){(int)(500u+i),token,i+1u,0,1,-1,0};
-    CHECK(r.token_count==i+1u && r.token_count<=r.token_capacity/2u);
+    CHECK(fixture_token_index_publish(&r,i,token));
+    CHECK(r.fd_count==i+1u && r.fd_count<=r.fd_capacity/2u);
     for(size_t j=0;j<=i;j++)CHECK(ku_http_reactor_lookup(&r,UINT64_MAX-1000u-j)==j);
-    for(size_t j=r.token_capacity;j<full;j++)CHECK(!r.hash[j].token && !r.hash[j].entry);
+    for(size_t j=r.fd_capacity;j<full;j++)CHECK(!r.hash[j].token && !r.hash[j].entry);
   }
-  CHECK(r.token_capacity==full && fixture_alloc_calls==calls && fixture_live_bytes==bytes);
+  CHECK(r.fd_capacity==full && fixture_alloc_calls==calls && fixture_live_bytes==bytes);
   /* Odd/even deletion stresses probe-cluster back-shift at grown masks. */
   for(size_t parity=0;parity<2u;parity++)for(size_t i=parity;i<r.capacity;i+=2u) {
-    uint64_t old=r.registrations[i].token;ku_http_reactor_hash_remove(&r,old);
-    r.registrations[i]=(KuHttpRegistration){0};
+    uint64_t old=r.registrations[i].token;fixture_token_index_unpublish(&r,i);
     CHECK(!r.fault && ku_http_reactor_lookup(&r,old)==SIZE_MAX);
     for(size_t j=0;j<r.capacity;j++)if(r.registrations[j].registered)
       CHECK(ku_http_reactor_lookup(&r,r.registrations[j].token)==j);
   }
-  CHECK(!r.token_count && r.token_capacity==full);
+  CHECK(!r.fd_count && r.fd_capacity==full);
   for(size_t i=0;i<full;i++)CHECK(!r.hash[i].token && !r.hash[i].entry);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-token-prefix-growth-budget-cleanup-ok");return 0;
@@ -8275,9 +8284,47 @@ static int fixture_token_growth_preserves_kernel_identities(void) {
     CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pairs[i]));
     ku_http_reactor_interest(&r,i,pairs[i][0],KU_HTTP_POLL_READ,UINT64_MAX-100u-i,-1);
     CHECK(!r.fault);tokens[i]=r.registrations[i].token;
+    if(i==15u) {
+      CHECK(r.fd_count==16u && r.fd_capacity==32u);
+      int closed=dup(pairs[0][0]);CHECK(closed>=0 && !close(closed));
+      /* Grow at the half-full boundary, then fail NEW before publication.
+         Every prior token/fd and kernel identity must survive that rollback. */
+      ku_http_reactor_interest(&r,63u,closed,KU_HTTP_POLL_READ,999u,-1);
+      CHECK(r.fault && r.fd_capacity==64u && r.fd_count==16u && !r.registrations[63].registered);
+      r.fault=0;
+      for(size_t j=0;j<=i;j++) {
+        CHECK(ku_http_reactor_lookup(&r,tokens[j])==j);
+        size_t bucket=ku_http_reactor_fd_bucket(&r,pairs[j][0]);
+        CHECK(bucket!=SIZE_MAX && r.fd_entries[bucket]==j+1u);
+      }
+    }
+    if(i==31u) {
+      CHECK(r.fd_count==32u && r.fd_capacity==64u);
+      KuHttpReadyEvent retired={0u,tokens[0],r.registrations[0].generation,pairs[0][0],KU_HTTP_POLL_READ};
+      int replacement[2];CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,replacement));
+      CHECK(!close(pairs[0][0]) && dup2(replacement[0],pairs[0][0])==pairs[0][0]);
+      CHECK(!close(replacement[0]) && !close(pairs[0][1]));pairs[0][1]=replacement[1];
+      /* An externally closed fd is reused while its old snapshot is live.
+         The shared rebuild precedes NEW; alias retirement must delete only
+         the old token, without deleting the new kernel registration. */
+      ku_http_reactor_interest(&r,63u,pairs[0][0],KU_HTTP_POLL_READ,UINT64_MAX-4u,-1);
+      CHECK(!r.fault && r.fd_capacity==128u && r.fd_count==32u);
+      CHECK(!r.registrations[0].registered && r.registrations[63].registered);
+      CHECK(ku_http_reactor_lookup(&r,retired.token)==SIZE_MAX && !ku_http_reactor_event_valid(&r,&retired));
+      ku_http_reactor_delete(&r,0u);CHECK(!r.fault);
+      CHECK(write(pairs[0][1],"a",1)==1 && ku_http_reactor_wait(&r,items,1000)>0);
+      int current=0;
+      for(size_t j=0;j<r.ready_count;j++)if(r.ready[j].entry==63u) {
+        CHECK(ku_http_reactor_event_valid(&r,&r.ready[j]));current=1;
+      }
+      char byte;CHECK(current && read(pairs[0][0],&byte,1)==1 && byte=='a');
+      ku_http_reactor_delete(&r,63u);CHECK(!r.fault && r.fd_count==31u);
+      ku_http_reactor_interest(&r,0u,pairs[0][0],KU_HTTP_POLL_READ,UINT64_MAX-3u,-1);
+      CHECK(!r.fault && r.fd_count==32u);tokens[0]=r.registrations[0].token;
+    }
     for(size_t j=0;j<=i;j++)CHECK(ku_http_reactor_lookup(&r,tokens[j])==j);
   }
-  CHECK(r.token_capacity==128u && r.fd_capacity==128u && r.token_count==40u && r.fd_count==40u);
+  CHECK(r.fd_capacity==128u && r.fd_count==40u);
   CHECK(fixture_alloc_calls==calls);
   for(size_t i=0;i<40u;i++)CHECK(write(pairs[i][1],"g",1)==1);
   CHECK(ku_http_reactor_wait(&r,items,1000)>0);
@@ -8296,7 +8343,7 @@ static int fixture_token_growth_preserves_kernel_identities(void) {
     ku_http_reactor_delete(&r,i);CHECK(!r.fault);
     CHECK(!close(pairs[i][0]) && !close(pairs[i][1]));
   }
-  CHECK(!r.fd_count && !r.token_count && r.token_capacity==128u);
+  CHECK(!r.fd_count && r.fd_capacity==128u);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   puts("http-persistent-token-growth-kernel-identity-ok");return 0;
 }
