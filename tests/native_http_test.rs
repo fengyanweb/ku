@@ -3652,6 +3652,155 @@ int main(int argc,char** argv) {
 }
 
 #[test]
+fn native_http_handler_deadline_is_capped_by_absolute_request_deadline() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = native_c_harness::TempDir::new("http-handler-request-cap");
+    let mut generated = native_c_harness::emit_c(
+        directory.path(),
+        r#"
+import "std.http"
+fn main(): null! {
+    app = http.server()
+    app.get("/", fn() { return http.text("ok") })
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#,
+    );
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_application_main(void) {",
+        1,
+    );
+    // Both HTTP and handler helpers read this one clock in production. Script
+    // only its reads, leaving the real relative-to-absolute conversion intact.
+    let clock_start = generated
+        .find("static unsigned long long __ku_handler_now_ms(void) {")
+        .expect("generated handler clock");
+    let clock_end = generated[clock_start..]
+        .find("static void __ku_handler_timeout_begin(")
+        .map(|offset| clock_start + offset)
+        .expect("generated timeout helper");
+    generated.replace_range(
+        clock_start..clock_end,
+        r#"
+static unsigned long long fixture_ticks[2];
+static size_t fixture_tick_count,fixture_tick_index;
+static void fixture_clock(unsigned long long first,unsigned long long second,size_t count) {
+  fixture_ticks[0]=first;fixture_ticks[1]=second;
+  fixture_tick_count=count;fixture_tick_index=0;
+}
+static unsigned long long __ku_handler_now_ms(void) {
+  if(fixture_tick_index>=fixture_tick_count) {
+    fputs("unexpected deadline clock read\n",stderr);exit(2);
+  }
+  return fixture_ticks[fixture_tick_index++];
+}
+"#,
+    );
+    generated.push_str(
+        r#"
+#define EXPECT(condition) do { if(!(condition)) { \
+  fprintf(stderr,"request cap check failed at line %d: %s\n",__LINE__,#condition);failed=1; \
+} } while(0)
+int main(void) {
+  int failed=0;
+  KuHttpWake wake={0};KuHttpQueue queue={0};queue.wake=&wake;
+  KuHttpLoopOwner owner={0};owner.wake=&wake;ku_http_current_loop=&owner;
+  struct { const char* name;unsigned long long request,timeout,first,second,expected; } cases[]={
+    {"request-cap",1050u,100u,1000u,1003u,1050u},
+    {"short-handler",1050u,10u,1000u,1003u,1013u},
+    {"near-request",1001u,100u,1000u,1003u,1001u},
+    {"equal-request",1000u,100u,1000u,1003u,1000u},
+    {"expired-request",999u,100u,1000u,1003u,999u},
+    {"zero-handler",1050u,0u,1000u,1003u,1003u},
+    {"saturated-helper",~0ULL-1u,100u,~0ULL-10u,~0ULL-2u,~0ULL-1u}
+  };
+  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+    KuHttpJob job={0};job.queue=&queue;job.request_deadline=cases[i].request;
+    EXPECT(ku_http_mutex_init(&job.lock));
+    __ku_handler_timed_out=1;__ku_handler_unwind_depth=3;__ku_handler_cleanup_deadline=7;
+    fixture_clock(cases[i].first,cases[i].second,2u);
+    ku_http_job_begin(&job,cases[i].timeout);
+    printf("%s R=%llu t0=%llu t1=%llu H=%llu TLS=%llu job=%llu reads=%zu\n",
+        cases[i].name,cases[i].request,cases[i].first,cases[i].second,cases[i].timeout,
+        __ku_handler_deadline,job.handler_deadline,fixture_tick_index);
+    EXPECT(fixture_tick_index==2u);
+    EXPECT(job.started && job.handler_deadline==__ku_handler_deadline);
+    EXPECT(job.handler_deadline<=job.request_deadline);
+    EXPECT(job.handler_deadline==cases[i].expected && job.handler_deadline!=0);
+    EXPECT(!__ku_handler_timed_out && !__ku_handler_unwind_depth && !__ku_handler_cleanup_deadline);
+    EXPECT(queue.owner_work_pending);queue.owner_work_pending=0;
+    unsigned long long current=cases[i].second;
+    fixture_clock(current,0u,1u);
+    EXPECT(__ku_handler_timeout_poll()==(current>=job.handler_deadline));
+    if(current<job.handler_deadline)current=job.handler_deadline;
+    fixture_clock(current,0u,1u);EXPECT(__ku_handler_timeout_poll()==1);
+    EXPECT(__ku_handler_timed_out && __ku_handler_deadline==job.handler_deadline);
+    if(current<~0ULL-KU_HANDLER_CLEANUP_GRACE_MS) {
+      fixture_clock(current,0u,1u);__ku_handler_timeout_enter();
+      EXPECT(__ku_handler_unwind_depth==1u);
+      EXPECT(__ku_handler_cleanup_deadline==current+KU_HANDLER_CLEANUP_GRACE_MS);
+      fixture_clock(current,0u,1u);EXPECT(!__ku_handler_timeout_poll());
+      fixture_clock(current+KU_HANDLER_CLEANUP_GRACE_MS,0u,1u);
+      EXPECT(__ku_handler_timeout_poll()==1);__ku_handler_timeout_leave();
+    }
+    fixture_clock(current,0u,1u);EXPECT(__ku_handler_timeout_finish()==1);
+    EXPECT(!__ku_handler_deadline && !__ku_handler_cleanup_deadline
+        && !__ku_handler_timed_out && !__ku_handler_unwind_depth);
+    ku_http_mutex_destroy(&job.lock);
+  }
+  /* Zero is not a public no-cap job: the real worker/owner entry cancels it
+     before begin. Preserve that path, including absence of TLS clock renewal. */
+  for(int owner_path=0;owner_path<2;owner_path++) {
+    KuHttpJob job={0};job.queue=&queue;EXPECT(ku_http_mutex_init(&job.lock));
+    __ku_handler_deadline=17;__ku_handler_cleanup_deadline=19;
+    __ku_handler_timed_out=1;__ku_handler_unwind_depth=2;
+    fixture_clock(1000u,0u,1u);
+    if(owner_path)ku_http_job_run_owner(NULL,&job);else ku_http_job_run(NULL,&job);
+    EXPECT(job.cancelled && job.completed && !job.started && !job.handler_deadline);
+    EXPECT(fixture_tick_index==1u);
+    EXPECT(__ku_handler_deadline==17 && __ku_handler_cleanup_deadline==19
+        && __ku_handler_timed_out==1 && __ku_handler_unwind_depth==2);
+    ku_http_mutex_destroy(&job.lock);
+  }
+  __ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;
+  __ku_handler_timed_out=0;__ku_handler_unwind_depth=0;ku_http_current_loop=NULL;
+  if(!failed)puts("http-handler-absolute-request-cap-ok");return failed;
+}
+"#,
+    );
+    let path = directory.path().join("request-cap.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) =
+        native_c_harness::compile_harness(directory.path(), &path, "request-cap")
+    else {
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("http-handler-absolute-request-cap-ok")
+    );
+}
+
+#[test]
 fn native_http_validates_unmaterialized_headers_and_owns_route_snapshot() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = native_c_harness::TempDir::new("http-route-snapshot");
