@@ -309,6 +309,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
+          cargo test --release --locked --test native_run_test native_json_ \
+            -- --list > "$RUNNER_TEMP/ku-json-tests.list"
+          test "$(grep -c '^native_json_.*: test$' "$RUNNER_TEMP/ku-json-tests.list")" -eq 24
+          cargo test --release --locked --test native_run_test native_json_ \
+            -- --nocapture --test-threads=1
           cargo test --release --locked --test native_run_test \
             native_object_insertion_preserves_collisions_ownership_and_oom -- --exact --nocapture --test-threads=1
           cargo test --release --locked \
@@ -355,6 +360,11 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           set -euo pipefail
+          cargo test --release --locked --test native_run_test native_json_ \
+            -- --list > "$RUNNER_TEMP/ku-json-tests.list"
+          test "$(grep -c '^native_json_.*: test$' "$RUNNER_TEMP/ku-json-tests.list")" -eq 24
+          cargo test --release --locked --test native_run_test native_json_ \
+            -- --nocapture --test-threads=1
           cargo test --release --locked --test native_pg_query_poll_test \
             native_pg_async_queued_ -- --list > "$RUNNER_TEMP/ku-pg-queue-tests.list"
           cat "$RUNNER_TEMP/ku-pg-queue-tests.list"
