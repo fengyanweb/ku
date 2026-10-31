@@ -5,7 +5,7 @@ No product patch, remote dispatch, SDK matrix, installation or release operation
 from __future__ import annotations
 import argparse, copy, gzip, hashlib, io, json, os
 from pathlib import Path
-import platform, pwd, re, shutil, signal, subprocess, sys, tarfile, threading, time
+import platform, pwd, re, select, shutil, signal, struct, subprocess, sys, tarfile, threading, time
 import build_linux as bl
 import focus_cycle as fc
 import database as db
@@ -449,6 +449,7 @@ def build_json_layers(a):
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
+    if getattr(a,'normal_self_probe',False):require_normal_perf_preflight(a)
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
     class Builder(bl.Builder):
         def command(self,label,command,**kwargs):
@@ -1077,13 +1078,139 @@ def pg_failure_probe(a,state):
     return result
 
 
+def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20):
+    """Readiness is an acknowledged enable, completion an acknowledged stop+exit0."""
+    output=Path(output);raw=output/'perf.data';fds=[];process=watch=None;stop=threading.Event()
+    def remaining(seconds):
+        value=min(seconds,deadline-time.monotonic()) if deadline is not None else seconds
+        if value<=0:raise TimeoutError('perf observer wall bound exceeded')
+        return value
+    try:
+        read_ctl,write_ctl=os.pipe();fds.extend((read_ctl,write_ctl));read_ack,write_ack=os.pipe();fds.extend((read_ack,write_ack))
+        os.set_blocking(write_ctl,False);os.set_blocking(read_ack,False)
+        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','--delay=-1',
+            f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
+        record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
+            control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
+        with (output/'perf-record.log').open('xb') as log:
+            process=subprocess.Popen(command,stdout=log,stderr=log,stdin=subprocess.DEVNULL,
+                start_new_session=True,pass_fds=(read_ctl,write_ack))
+            record['perf_pid']=process.pid
+            os.close(read_ctl);fds.remove(read_ctl);os.close(write_ack);fds.remove(write_ack)
+            def control(command,seconds):
+                began=time.monotonic_ns();until=time.monotonic()+remaining(seconds);data=b''
+                payload=(command+'\n').encode()
+                if os.write(write_ctl,payload)!=len(payload):raise RuntimeError('partial perf control write')
+                while len(data)<5:
+                    left=until-time.monotonic()
+                    if left<=0 or not select.select([read_ack],[],[],max(0,left))[0]:raise TimeoutError('perf '+command+' ACK timeout')
+                    chunk=os.read(read_ack,65-len(data));data+=chunk
+                    if not chunk or len(data)>64:raise RuntimeError('perf ACK EOF/64-byte bound')
+                if data!=b'ack\n\0':raise RuntimeError('unexpected perf ACK: '+repr(data))
+                record['control'].append(dict(command=command,started_monotonic_ns=began,ack_monotonic_ns=time.monotonic_ns(),ack_wire_bytes=len(data)))
+            def bounded():
+                while not stop.wait(.1):
+                    if process.poll() is not None:return
+                    if (raw.exists() and raw.stat().st_size>limit) or (output/'perf-record.log').stat().st_size>1<<20:
+                        record['output_limit_exceeded']=True
+                        try:os.killpg(process.pid,signal.SIGKILL)
+                        except ProcessLookupError:pass
+                        return
+            watch=threading.Thread(target=bounded,daemon=True);watch.start();control('enable',8)
+            record['client_started_monotonic_ns']=time.monotonic_ns()
+            try:result=client()
+            finally:record['client_finished_monotonic_ns']=time.monotonic_ns()
+            control('stop',2);process.wait(timeout=remaining(5));record['controlled_stop_exit']=process.returncode==0
+            return result
+    except BaseException as error:
+        record['perf_observer_error']=repr(error);raise
+    finally:
+        stop.set()
+        if watch is not None:watch.join(timeout=1)
+        if process is not None and process.poll() is None:
+            try:os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+            record['forced_cleanup']=True
+            try:process.wait(timeout=1)
+            except subprocess.TimeoutExpired:record['cleanup_error']='owned perf did not reap within1 second after KILL'
+        for fd in fds:os.close(fd)
+        record.update(perf_exit_code=process.returncode if process is not None else None,
+            ended_monotonic_ns=time.monotonic_ns(),observer_thread_stopped=watch is None or not watch.is_alive(),
+            raw_bytes=raw.stat().st_size if raw.is_file() else 0)
+        record['record_complete']=(record.get('controlled_stop_exit') is True and record['perf_exit_code']==0
+            and 0<record['raw_bytes']<=limit and not record.get('output_limit_exceeded')
+            and not record.get('forced_cleanup') and record['observer_thread_stopped'] and 'perf_observer_error' not in record)
+
+
+def normal_perf_preflight(a):
+    """One short owned child, before any build or service; no hosted-state mutation."""
+    output=a.root/'normal-perf-preflight';output.mkdir();deadline=time.monotonic()+18;child=None
+    perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
+    record=dict(complete=False,maximum_wall_seconds=25,coordinator_alarm_seconds=19,entry_sha256=sha(__file__),candidate=a.candidate,
+        boot_sha256=sha('/proc/sys/kernel/random/boot_id'),perf_path=perf,child_reaped=False)
+    try:
+        if not perf:raise ValueError('perf unavailable; preflight blocks build and six windows')
+        record.update(perf_sha256=sha(perf),perf_real_path=str(Path(perf).resolve()))
+        record['version']=diagnostic_command([perf,'version'],output/'perf-version.log',timeout=2,limit=65536)
+        record['perf_version_text']=(output/'perf-version.log').read_text()[:4096]
+        code='import sys,time\nsys.stdin.buffer.read(1)\nend=time.monotonic()+1\nwhile time.monotonic()<end: pass\nprint("done",flush=True)\nsys.stdin.buffer.read(1)\n'
+        child=subprocess.Popen([sys.executable,'-c',code],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,start_new_session=True)
+        def busy():
+            os.write(child.stdin.fileno(),b'x');until=min(deadline,time.monotonic()+3);data=b''
+            while b'\n' not in data:
+                left=until-time.monotonic()
+                if left<=0 or not select.select([child.stdout.fileno()],[],[],max(0,left))[0]:raise TimeoutError('owned busy child did not finish')
+                chunk=os.read(child.stdout.fileno(),17-len(data));data+=chunk
+                if not chunk or len(data)>16:raise ValueError('owned busy child EOF/16-byte bound')
+            if data!=b'done\n':raise ValueError('owned busy child completion mismatch')
+        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=1<<20)
+        os.write(child.stdin.fileno(),b'x');child.stdin.close();child.wait(timeout=1);record['child_reaped']=child.returncode==0
+        size_on_disk=(output/'perf.data').stat().st_size
+        with (output/'perf.data').open('rb') as stream:header=stream.read(56)
+        offset,size=struct.unpack_from('<QQ',header,40)
+        record['header_bounds_valid']=header[:8]==b'PERFILE2' and 0<offset<size_on_disk<=1<<20 and 0<size<=size_on_disk-offset
+        start=record['client_started_monotonic_ns'];end=record['client_finished_monotonic_ns']
+        selected=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
+        record['exports']=[diagnostic_command([perf,kind,'-i',str(output/'perf.data'),'--time',selected,*flags],
+            output/('perf-'+kind+'.log'),timeout=max(.01,min(2,deadline-time.monotonic())),limit=1<<20)
+            for kind,flags in [('report',['--stdio','--no-children','--show-nr-samples']),('script',['--ns','-F','pid,tid,time,event,ip'])]]
+        text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
+        record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
+            and record['sample_count']>0 and record['version']['complete'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
+    except BaseException as error:
+        record['error']=repr(error)
+        if not isinstance(error,Exception):raise
+    finally:
+        if child is not None and child.poll() is None:
+            try:os.killpg(child.pid,signal.SIGKILL)
+            except ProcessLookupError:pass
+            record.update(child_forced_cleanup=True,complete=False)
+            try:child.wait(timeout=1)
+            except subprocess.TimeoutExpired:record['child_cleanup_error']='owned child did not reap within1 second after KILL'
+        for stream in (child.stdin,child.stdout) if child is not None else ():
+            if stream is not None:stream.close()
+        record['seconds']=time.monotonic()-(deadline-18);save(output/'preflight.json',record)
+        for path in output.iterdir():
+            if path.is_file():path.chmod(0o644)
+    return record
+
+
+def require_normal_perf_preflight(a):
+    path=a.root/'normal-perf-preflight/preflight.json';record=load(path) if path.is_file() else {}
+    if not (record.get('complete') is True and record.get('candidate')==a.candidate and record.get('entry_sha256')==sha(__file__)
+            and record.get('boot_sha256')==sha('/proc/sys/kernel/random/boot_id') and record.get('perf_path')
+            and record.get('perf_sha256')==sha(record['perf_path'])):
+        raise ValueError('matching successful controlled-perf preflight required before build/normal six-window capture')
+
+
 def normal_self_client(client,service,output,duration,perf,*,sample):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
         cpu_distribution='unknown: no CPU field; instantaneous last-CPU is not a residency distribution',
-        sample_scope='Raw perf includes setup and natural sleep tail. Filter mono-clock raw events by client_started/finished_monotonic_ns; '
-            'that interval includes client startup/drain, not only planned arrivals. Full lifecycle CPU includes post-client perf wait; '
+        sample_scope='Controlled perf enable is acknowledged before client launch; stop follows client return. Filter mono-clock raw events by client_started/finished_monotonic_ns; '
+            'that interval includes client startup/drain, not only planned arrivals. Full lifecycle CPU includes post-client perf finalization; '
             'scored-client cpu_us retains the existing h.client accounting interval.')
     def endpoint(label):
         started=time.monotonic_ns()
@@ -1103,55 +1230,19 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
         value.update(capture_started_monotonic_ns=started,capture_ended_monotonic_ns=time.monotonic_ns(),
             scope='Sequential endpoint reads, not a simultaneous snapshot or thread/core residency histogram.')
         return value
-    process=None;log=None;watch=None;stop=threading.Event();raw=output/'perf.data';limit=16<<20
     record['before']=endpoint('before')
     try:
         if sample:
-            if not perf:raise ValueError('perf unavailable; no replacement/capability retry')
+            if not perf:raise ValueError('perf unavailable; preflight required')
             record['symbols']=diagnostic_symbols(service,output)
-            command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499',
-                '-p',str(service.process.pid),'-o',str(raw),'--','sleep',str(duration+6)]
-            record.update(command=command,raw_limit_bytes=limit,started_monotonic_ns=time.monotonic_ns())
-            log=(output/'perf-record.log').open('xb')
-            process=subprocess.Popen(command,stdout=log,stderr=log,stdin=subprocess.DEVNULL,start_new_session=True)
-            def bounded():
-                while not stop.wait(.1):
-                    if process.poll() is not None:return
-                    if raw.exists() and raw.stat().st_size>limit:
-                        record['raw_limit_exceeded']=True
-                        try:os.killpg(process.pid,signal.SIGINT)
-                        except ProcessLookupError:pass
-                        return
-            watch=threading.Thread(target=bounded,daemon=True);watch.start()
+            return controlled_perf(client,service.process.pid,output,perf,record)
         record['client_started_monotonic_ns']=time.monotonic_ns()
         try:return client()
         finally:record['client_finished_monotonic_ns']=time.monotonic_ns()
     finally:
-        stop.set()
-        if watch is not None:watch.join(timeout=1)
-        record['observer_thread_stopped']=watch is None or not watch.is_alive()
-        if process is not None:
-            began=time.monotonic()
-            try:
-                process.wait(timeout=8);record['natural_perf_exit']=True
-            except subprocess.TimeoutExpired:
-                record['natural_perf_exit']=False;record['post_client_natural_exit_timeout']=True
-                if process.poll() is None:
-                    try:os.killpg(process.pid,signal.SIGINT)
-                    except ProcessLookupError:pass
-                try:process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=5);record['forced_cleanup']=True
-            record.update(perf_exit_code=process.returncode,ended_monotonic_ns=time.monotonic_ns(),
-                post_client_perf_wait_seconds=time.monotonic()-began)
-        if log is not None:log.close()
-        record['after']=endpoint('after')
-        record['raw_bytes']=raw.stat().st_size if raw.is_file() else 0
-        record['record_complete']=(not sample or (process is not None and process.returncode==0
-            and record.get('natural_perf_exit') is True and 0<record['raw_bytes']<=limit
-            and not record.get('raw_limit_exceeded') and not record.get('forced_cleanup')))
-        record['record_complete'] &= record['observer_thread_stopped']
+        record['after']=endpoint('after');record.setdefault('record_complete',not sample)
         save(output/'normal-self-observations.json',record)
+
 
 
 def normal_diagnostic_quality(row):
@@ -1251,6 +1342,7 @@ def pg_queue_screen(a,state):
 def normal_self_probe(a,state):
     """Six windows at most, exact normal binaries, never a new performance score."""
     if os.geteuid()!=0:raise ValueError('normal SELF probe requires root cgroup control')
+    require_normal_perf_preflight(a)
     plan=load(a.root/'frozen-plan.json')
     if plan!=normal_self_plan(plan.get('versions',{})):raise ValueError('matching frozen normal SELF plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('B','R')}
@@ -1304,7 +1396,7 @@ def normal_self_probe(a,state):
                 raw=output/'score/perf.data';symfs=output/'score/symfs'
                 sample_time=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
                 row['perf_export_time_range']=dict(clock='mono',start_ns=start,end_ns=end,argument=sample_time,
-                    scope='Full raw retained; SELF and PC exports limited to scored-client launch/return, excluding post-client natural perf wait')
+                    scope='Full raw retained; SELF and PC exports limited to scored-client launch/return, excluding post-client perf stop/finalization')
                 exports.append(diagnostic_command([perf,'report','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--stdio','--no-children',
                     '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=20,limit=4<<20))
                 exports.append(diagnostic_command([perf,'script','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--ns',
@@ -1332,8 +1424,8 @@ def normal_self_probe(a,state):
                     drift_valid=ratio is not None and ratio<=plan['maximum_control_cpu_ratio'],
                     sampled_cpu_over_control_geomean=client_ratio,sampled_full_cpu_over_control_geomean=full_ratio,
                     cpu_contract='cpu_us: existing scored-client lifetime service CPU/correct; before/sample/after and drift use this same field',
-                    full_cpu_contract='full_cpu_us: complete service lifecycle including post-client natural perf wait tail; descriptive separately',
-                    scope='Single before/sample/after sequence, no CI or automatic adoption. Full CPU includes natural perf wait tail; '
+                    full_cpu_contract='full_cpu_us: complete service lifecycle including post-client perf finalization/cleanup; descriptive separately',
+                    scope='Single before/sample/after sequence, no CI or automatic adoption. Full CPU includes post-client perf finalization; '
                         'client CPU uses existing h.client lifetime. Neither ratio alone proves observer overhead.')
                 if not result['controls'][name]['drift_valid']:
                     result['stopped'].append(dict(name=name,turn=turn,reason='unsampled CPU drift exceeds1.10 or missing; attribution invalid, no retry'));break
@@ -1356,7 +1448,7 @@ def normal_self_probe(a,state):
         selected.extend(directory/name/turn/relative for name,turn in plan['order'] for relative in (
             'window.json','full-lifecycle.json','score/client.json','score/driver-cleanup.json',
             'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
-            'score/symbol-identities.json','score/maps.log'))
+            'score/symbol-identities.json','score/maps.log','score/perf-record.log'))
         result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
     return result
@@ -1839,7 +1931,7 @@ def evidence_file(path, root):
         return path.name=='ku' and parts[-3:]==('ku-cargo','release','ku') or path.name=='ku-cross-stack-rust' and parts[-3:] in (('rust-cargo','release','ku-cross-stack-rust'),('target','release','ku-cross-stack-rust'))
     return path.name not in ('ku-performance-v2-evidence.tar.gz','archive.json') and not path.name.endswith('.writing') and (
         path.suffix in ('.json','.ku','.c','.md','.log','.sql','.gz','.csv','.py','.lock','.toml','.rs','.go','.mod','.sum','.profdata') or (path.suffix=='.profraw' and 'http-profiles' in parts) or
-        (parts[0] in ('diagnostic','normal-self-probe') and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
+        (parts[0] in ('diagnostic','normal-self-probe','normal-perf-preflight') and (path.name=='perf.data' or 'symfs' in parts)) or 'bin' in parts or path.name=='libpq.so')
 
 
 def immutable_benchmark_json(path,root):
@@ -1900,7 +1992,7 @@ def archive(a,state):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','followup-screen','archive']);p.add_argument('--root',required=True,type=Path)
+    p.add_argument('--phase',required=True,choices=['build','run','tail','lifecycle','compiler','diagnostic','followup-screen','perf-preflight','archive']);p.add_argument('--root',required=True,type=Path)
     p.add_argument('--source',required=True,type=Path);p.add_argument('--tools',required=True,type=Path)
     p.add_argument('--baseline',default=BASELINE);p.add_argument('--candidate',required=True)
     p.add_argument('--prepatch',default=FOLLOWUP_PREPATCH)
@@ -1915,7 +2007,8 @@ def main(argv=None):
     a=p.parse_args(argv)
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
-    if a.normal_self_probe and a.phase not in ('build','diagnostic','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/archive')
+    if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/preflight/archive')
+    if a.phase=='perf-preflight' and not a.normal_self_probe:p.error('perf-preflight requires explicit normal-self mode')
     if a.pg_queue_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-queue-screen only supports fresh build/diagnostic/archive')
     try:validate_screen_selection(a,a.build_set)
     except ValueError as error:p.error(str(error))
@@ -1931,7 +2024,15 @@ def main(argv=None):
     if a.phase=='followup-screen' and a.build_set!='followup-screen':p.error('screen phase requires --build-set followup-screen')
     if a.build_set=='followup-screen' and a.candidate==a.prepatch:p.error('screen candidate must differ from frozen prepatch')
     if a.phase in ('run','tail','lifecycle','compiler') and a.build_set!='full':p.error('formal phases require full build-set')
-    a.root.mkdir(parents=True,exist_ok=True);identity=hosted_identity(a,a.build_set)
+    a.root.mkdir(parents=True,exist_ok=True)
+    if a.phase=='perf-preflight':
+        def preflight_stop(*unused):raise KeyboardInterrupt('perf preflight wall bound')
+        signal.signal(signal.SIGALRM,preflight_stop)
+        signal.alarm(19)
+        try:result=normal_perf_preflight(a)
+        finally:signal.alarm(0)
+        print(json.dumps(result));return 0 if result.get('complete') is True else 2
+    identity=hosted_identity(a,a.build_set)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
     if a.phase=='archive':result=archive(a,state)

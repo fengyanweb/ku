@@ -604,6 +604,17 @@ jobs:
           test "$(stat -c %g "$KU_PERFORMANCE_V2_ROOT")" = "$(id -g)"
           go version
 
+      - name: Verify acknowledged perf control before any normal SELF build
+        id: normal_perf_preflight
+        if: inputs.normal_self_probe
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase perf-preflight --build-set diagnostic \
+            --normal-self-probe --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+            --tools "$KU_PERFORMANCE_V2_ROOT/tools" --candidate "$GITHUB_SHA"
+
       - name: Download the exact optional prior build archive
         if: inputs.reuse_build_run != ''
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -781,8 +792,17 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Retain the small redacted normal SELF observation
+      - name: Retain the isolated perf control preflight
         if: always() && inputs.normal_self_probe
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-normal-perf-preflight
+          path: ${{ runner.temp }}/ku-performance-v2/normal-perf-preflight
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain the small redacted normal SELF observation
+        if: always() && inputs.normal_self_probe && steps.normal_perf_preflight.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ku-normal-self-observation

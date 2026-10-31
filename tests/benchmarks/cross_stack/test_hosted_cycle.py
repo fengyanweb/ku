@@ -121,39 +121,141 @@ class HostedCycleTests(unittest.TestCase):
                 '--root','/unused','--source','/unused','--tools','/unused'])
         self.assertEqual(invalid.exception.code,2)
 
-    def test_normal_self_sampler_wraps_original_client_and_owns_only_minimal_perf(self):
-        for sample,exit_code,timed_out in ((False,0,False),(True,0,False),(True,130,False),(True,-2,False),(True,0,True)):
-            with self.subTest(sample=sample,exit_code=exit_code,timed_out=timed_out),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+    def test_controlled_perf_requires_enable_ack_stop_ack_and_exit_zero(self):
+        for issue in ('success','fragmented','exit-minus2','exit130','missing-ack','bad-ack','junk','oversize','eof','padding-eof','stop-ack','exit-timeout'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                output=Path(temp);record={};invoked=[];commands=[]
+                class Process:
+                    pid=99999999;returncode=None
+                    def poll(self):return self.returncode
+                    def wait(self,timeout):
+                        if issue=='exit-timeout' and timeout==5:raise h.subprocess.TimeoutExpired('perf',timeout)
+                        self.returncode=-2 if issue=='exit-minus2' else 130 if issue=='exit130' else 0
+                        return self.returncode
+                def launch(argv,**kwargs):
+                    commands.append((argv,kwargs));Path(argv[argv.index('-o')+1]).write_bytes(b'perf data');return Process()
+                patches.enter_context(patch.object(h.subprocess,'Popen',side_effect=launch))
+                reads=[0]
+                def ready(r,w,e,timeout):
+                    reads[0]+=1;self.assertGreater(timeout,0);self.assertLessEqual(timeout,8)
+                    return ([],[],[]) if issue=='missing-ack' or issue=='stop-ack' and reads[0]==2 else (r,[],[])
+                patches.enter_context(patch.object(h.select,'select',side_effect=ready))
+                chunks=([b'a',b'ck\n',b'\0',b'ac',b'k\n\0'] if issue=='fragmented' else
+                    [b'bad\n\0'] if issue=='bad-ack' else [b'ack\n\0junk'] if issue=='junk' else
+                    [b'a'*65] if issue=='oversize' else [b''] if issue=='eof' else [b'ack\n',b''] if issue=='padding-eof'
+                    else [b'ack\n\0',b'ack\n\0'])
+                ack_reads=patches.enter_context(patch.object(h.os,'read',side_effect=chunks))
+                writes=patches.enter_context(patch.object(h.os,'write',side_effect=lambda fd,data:len(data)))
+                kill=patches.enter_context(patch.object(h.os,'killpg'))
+                def client():
+                    self.assertEqual([x['command'] for x in record['control']],['enable']);invoked.append(True);return {'original':True}
+                bad_ready=issue in ('missing-ack','bad-ack','junk','oversize','eof','padding-eof')
+                if bad_ready or issue in ('stop-ack','exit-timeout'):
+                    with self.assertRaises((TimeoutError,RuntimeError,h.subprocess.TimeoutExpired)):
+                        h.controlled_perf(client,123,output,'/perf',record)
+                else:self.assertEqual(h.controlled_perf(client,123,output,'/perf',record),{'original':True})
+                self.assertEqual(record['record_complete'],issue in ('success','fragmented'))
+                self.assertEqual(bool(invoked),not bad_ready)
+                argv,options=commands[0];self.assertIn('--delay=-1',argv);self.assertNotIn('--',argv)
+                self.assertIn('--control=fd:'+','.join(map(str,options['pass_fds'])),argv)
+                self.assertEqual(argv[argv.index('-p')+1],'123');self.assertEqual(len(options['pass_fds']),2)
+                for call in kill.call_args_list:self.assertEqual(call.args,(99999999,h.signal.SIGKILL))
+                for fd in options['pass_fds']:
+                    with self.assertRaises(OSError):h.os.fstat(fd)
+                if issue in ('success','fragmented'):
+                    self.assertEqual([x['command'] for x in record['control']],['enable','stop'])
+                    self.assertTrue(all(x['ack_wire_bytes']==5 for x in record['control']))
+                    self.assertEqual(len(set(x.args[0] for x in ack_reads.call_args_list)),1)
+                self.assertEqual([x.args[1] for x in writes.call_args_list],
+                    [b'enable\n'] if bad_ready else [b'enable\n',b'stop\n'])
+
+    def test_normal_self_sampler_preserves_client_and_snapshot_scope(self):
+        for sample in (False,True):
+            with self.subTest(sample=sample),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
                     domain=types.SimpleNamespace(snapshot=lambda:{'memory_stat':{'anon':42}}))
                 patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
                 memory=patches.enter_context(patch.object(h,'diagnostic_memory',return_value={'categories':{}}))
                 symbols=patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'files':[]}))
-                class Process:
-                    pid=99999999;returncode=None if timed_out else exit_code
-                    def poll(self):return self.returncode
-                    def wait(self,timeout):
-                        if timeout==8 and timed_out:raise h.subprocess.TimeoutExpired('perf',timeout)
-                        self.returncode=exit_code;return self.returncode
-                calls=[]
-                def popen(argv,**kwargs):
-                    calls.append(argv);Path(argv[argv.index('-o')+1]).write_bytes(b'perf data');return Process()
-                launch=patches.enter_context(patch.object(h.subprocess,'Popen',side_effect=popen))
-                kill=patches.enter_context(patch.object(h.os,'killpg'))
-                invoked=[]
-                result=h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample)
-                self.assertEqual(result,{'original':True});self.assertEqual(invoked,[True])
-                record=h.load(output/'normal-self-observations.json');self.assertEqual(record['record_complete'],not sample or exit_code==0 and not timed_out)
-                self.assertLessEqual(record['client_started_monotonic_ns'],record['client_finished_monotonic_ns'])
-                if timed_out:kill.assert_called_once_with(99999999,h.signal.SIGINT)
-                else:kill.assert_not_called()
-                self.assertIn('not a simultaneous',record['before']['scope'])
+                def controlled(client,pid,out,perf,record):
+                    self.assertEqual((pid,out,perf),(99999999,output,'/perf'))
+                    record.update(client_started_monotonic_ns=1,client_finished_monotonic_ns=2,record_complete=True)
+                    return client()
+                measured=patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled));invoked=[]
+                self.assertEqual(h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample),{'original':True})
+                self.assertEqual(invoked,[True]);record=h.load(output/'normal-self-observations.json')
+                self.assertTrue(record['record_complete']);self.assertIn('not a simultaneous',record['before']['scope'])
                 self.assertIn('unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
                 self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
-                self.assertEqual(launch.call_count,1 if sample else 0)
-                if sample:
-                    self.assertEqual(calls[0],['/perf','record','--clockid','mono','-e','cpu-clock','-F','499',
-                        '-p','99999999','-o',str(output/'perf.data'),'--','sleep','21'])
+                self.assertEqual(measured.call_count,1 if sample else 0)
+
+    def test_perf_preflight_needs_controlled_samples_header_and_exports_then_reaps_child(self):
+        for issue in ('success','fragment-child','control','header','empty-samples','export'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate='b'*40)
+                stream=types.SimpleNamespace(fileno=lambda:1234,close=lambda:None)
+                class Child:
+                    pid=77777777;returncode=None;stdin=stream;stdout=stream
+                    def poll(self):return self.returncode
+                    def wait(self,timeout):self.returncode=0;return 0
+                child=Child();patches.enter_context(patch.object(h.subprocess,'Popen',return_value=child))
+                patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64))
+                write=patches.enter_context(patch.object(h.os,'write',side_effect=lambda fd,data:len(data)))
+                patches.enter_context(patch.object(h.select,'select',side_effect=lambda r,w,e,t:(r,[],[])))
+                patches.enter_context(patch.object(h.os,'read',side_effect=[b'd',b'one\n'] if issue=='fragment-child' else [b'done\n']))
+                kill=patches.enter_context(patch.object(h.os,'killpg'))
+                def controlled(client,pid,output,perf,record,**kwargs):
+                    self.assertEqual(pid,child.pid);self.assertEqual(kwargs['limit'],1<<20)
+                    if issue=='control':raise TimeoutError('no enable ACK')
+                    client();record.update(record_complete=True,client_started_monotonic_ns=10_000_000_001,
+                        client_finished_monotonic_ns=11_000_000_002,controlled_stop_exit=True,perf_exit_code=0)
+                    raw=bytearray(64);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQ',raw,40,65 if issue=='header' else 56,8)
+                    (output/'perf.data').write_bytes(raw)
+                patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
+                def command(argv,output,**kwargs):
+                    text='perf version6.8\n' if argv[1]=='version' else '' if issue=='empty-samples' else '777 777 10.500000000: cpu-clock: abc\n'
+                    Path(output).write_text(text);return {'complete':issue!='export'}
+                calls=patches.enter_context(patch.object(h,'diagnostic_command',side_effect=command))
+                result=h.normal_perf_preflight(a)
+                self.assertEqual(result['complete'],issue in ('success','fragment-child'));self.assertEqual(child.returncode,0)
+                self.assertFalse((root/'hosted-state.json').exists());self.assertLessEqual(result['seconds'],25)
+                if issue=='control':kill.assert_called_once_with(child.pid,h.signal.SIGKILL)
+                else:
+                    kill.assert_not_called();self.assertEqual(write.call_count,2)
+                    self.assertTrue(result['child_reaped']);self.assertIn('version6.8',result['perf_version_text'])
+                    for call in calls.call_args_list:
+                        if call.args[0][1]!='version':self.assertEqual(call.args[0][call.args[0].index('--time')+1],'10.000000001,11.000000002')
+
+    def test_normal_preflight_gate_prevents_build_or_service_and_validates_identity(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);a=types.SimpleNamespace(root=root,candidate='b'*40,prepatch=h.BASELINE,build_set='diagnostic',normal_self_probe=True)
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));builder=patches.enter_context(patch.object(h.bl,'Builder'))
+            with self.assertRaisesRegex(ValueError,'preflight required'):h.build(a,{})
+            builder.assert_not_called();patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+            db=patches.enter_context(patch.object(h.db,'Database'))
+            with self.assertRaisesRegex(ValueError,'preflight required'):h.normal_self_probe(a,{})
+            db.assert_not_called();patches.enter_context(patch.object(h,'sha',return_value='f'*64))
+            receipt=root/'normal-perf-preflight/preflight.json'
+            record=dict(complete=True,candidate='b'*40,entry_sha256='f'*64,boot_sha256='f'*64,perf_path='/perf',perf_sha256='f'*64)
+            h.save(receipt,record);h.require_normal_perf_preflight(a)
+            for key in ('complete','candidate','entry_sha256','boot_sha256','perf_sha256'):
+                h.save(receipt,dict(record,**{key:False}))
+                with self.subTest(key=key),self.assertRaises(ValueError):h.require_normal_perf_preflight(a)
+
+    def test_preflight_phase_is_isolated_and_has_a_total_wall_alarm(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);source=root/'source';tools=root/'tools';source.mkdir();tools.mkdir()
+            patches.enter_context(patch.object(h.platform,'system',return_value='Linux'));patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+            alarm=patches.enter_context(patch.object(h.signal,'alarm'));patches.enter_context(patch.object(h.signal,'signal'))
+            patches.enter_context(patch.object(h,'normal_perf_preflight',return_value={'complete':False}))
+            build=patches.enter_context(patch.object(h,'build'));observe=patches.enter_context(patch.object(h,'diagnostic'))
+            with redirect_stdout(io.StringIO()):code=h.main(['--phase','perf-preflight','--build-set','diagnostic','--normal-self-probe',
+                '--root',str(root/'out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40])
+            self.assertEqual(code,2);self.assertEqual([x.args[0] for x in alarm.call_args_list],[19,0])
+            self.assertFalse((root/'out/hosted-state.json').exists());build.assert_not_called();observe.assert_not_called()
 
     def test_normal_self_six_windows_stop_on_failure_or_control_drift(self):
         for issue in ('none','unknown-environment','functional','accounting','cleanup','observer','quality','driver','drift','database'):
@@ -168,6 +270,7 @@ class HostedCycleTests(unittest.TestCase):
                 mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
                     pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack=p['versions'][n]['stack'],build_mode=mode)))
                 patches.enter_context(patch.object(h,'sha',return_value='f'*64));patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
                 commands=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
@@ -251,6 +354,7 @@ class HostedCycleTests(unittest.TestCase):
                     'client_started_monotonic_ns':10_000_000_001,'client_finished_monotonic_ns':25_000_000_002});return result
             patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
             patches.enter_context(patch.object(fc,'Harness',Harness));patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:bindings[n]))
+            patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
             patches.enter_context(patch.object(fc,'quiet_metrics',return_value=True));patches.enter_context(patch.object(fc,'service_termination_succeeded',return_value=True))
             patches.enter_context(patch.object(fc,'window_lifecycle_cost',return_value={'cpu_seconds_per_correct':.00001}))
             patches.enter_context(patch.object(fc,'qualification',side_effect=lambda report,w:dict(qualified=False,reasons=['environment_quality:'+report['assessment']['environment_quality']])) )

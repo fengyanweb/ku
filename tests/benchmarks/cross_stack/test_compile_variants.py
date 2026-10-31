@@ -221,7 +221,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),4)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),5)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
@@ -266,6 +266,16 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('name: ku-normal-self-observation',small)
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/normal-self-observation',small)
         self.assertNotIn('*.csv',small);self.assertNotIn('bin/',small)
+
+    def test_normal_perf_preflight_blocks_build_before_any_six_window_capture(self):
+        _,job=self.workflow()
+        preflight=job.split('- name: Verify acknowledged perf control before any normal SELF build',1)[1].split('\n      - name:',1)[0]
+        self.assertIn('if: inputs.normal_self_probe',preflight);self.assertIn('timeout-minutes: 1',preflight)
+        self.assertIn('--phase perf-preflight --build-set diagnostic',preflight);self.assertIn('--normal-self-probe',preflight)
+        self.assertLess(job.index('Verify acknowledged perf control'),job.index('Build frozen sources and plans'))
+        self.assertNotIn('continue-on-error',preflight)
+        artifact=job.split('- name: Retain the isolated perf control preflight',1)[1].split('\n      - name:',1)[0]
+        self.assertIn('if: always() && inputs.normal_self_probe',artifact);self.assertIn('name: ku-normal-perf-preflight',artifact)
 
     def test_pg_queue_screen_is_explicit_frozen_and_never_a_formal_matrix(self):
         text,job=self.workflow()
