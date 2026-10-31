@@ -13,6 +13,138 @@ import focus_cycle as fc
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_http_wake_plan_is_three_original_controls_and_only_twenty_business_windows(self):
+        plan=h.http_wake_plan({'A':{},'B':{}})
+        controls,business=plan['windows'][:3],plan['windows'][3:]
+        self.assertEqual(len(plan['windows']),23);self.assertEqual(plan['maximum_windows'],23)
+        self.assertEqual(plan['prepatch'],h.HTTP_WAKE_PREPATCH);self.assertEqual(plan['maximum_replacements'],0)
+        self.assertTrue(all((x['name'],x['phase'],x['workload'],x['rate'],x['warmup_seconds'],x['score_seconds'])==
+            ('A','environment-control','json_object',500,5,10) for x in controls))
+        for workload,rate,contract in [('json_object',500,'dom'),('ok',2000,'text'),('db',200,'pg-strict')]:
+            rows=[x for x in business if x['workload']==workload]
+            self.assertEqual([(x['group'],x['name']) for x in rows],[(1,'A'),(1,'B'),(2,'B'),(2,'A'),(3,'A'),(3,'B')])
+            self.assertTrue(all((x['rate'],x['contract'],x['warmup_seconds'],x['score_seconds'])==(rate,contract,3,15) for x in rows))
+        cpu=[x for x in business if x['workload']=='cpu'];self.assertEqual([(x['name'],x['rate']) for x in cpu],[('A',100),('B',100)])
+        self.assertEqual(plan['resources'],h.RESOURCES);self.assertFalse(plan['formal_qualified'])
+        self.assertEqual(plan['adoption_thresholds']['json_geometric_ratio_maximum'],.98)
+        self.assertEqual(plan['adoption_thresholds']['json_upper95_strictly_below'],1)
+        self.assertEqual(plan['adoption_thresholds']['compute_ratio_maximum'],1.03)
+
+    def test_http_wake_compute_uses_real_assessment_and_preserves_low_sample_rejection(self):
+        from linux_harness import result_assessment
+        for count in (300,1500):
+            with self.subTest(count=count),tempfile.TemporaryDirectory() as temp:
+                # Actual V5 histogram.value emits p999=null below1000 samples.
+                # The real assessor and window gates run here without mocks.
+                report=dict(valid_driver=True,ledger=dict(planned=count,attempted=count,planned_reconciled=True,
+                    results={'correct':count},scheduled_to_attempt=dict(count=count,p99_ms=1,
+                        p999_ms=None if count<1000 else 1,max_ms=1)),service_cost=dict(
+                    before={'memory_events':{}},after={'memory_events':{}},
+                    driver_headroom={'fraction_of_quota':.3,'saturated':False}))
+                assessed=result_assessment(report,h.POLICY,{'quality':'pass','evidence':'original-controls.json'})
+                self.assertTrue(assessed['functional_valid']);self.assertTrue(assessed['accounting_valid'])
+                self.assertEqual(assessed['arrival_schedule_quality'],'unknown' if count==300 else 'pass')
+                self.assertEqual('arrival_histogram_incomplete' in assessed['reasons'],count==300)
+                path=Path(temp)/'client.json';h.save(path,report)
+                row=dict(assessed,all_correct=True,natural_reclamation=True,score_report=str(path))
+                valid,_=h.normal_diagnostic_quality(row)
+                self.assertEqual(valid,count==1500)
+                self.assertFalse(assessed['candidate_accepted'])
+
+    def test_http_wake_selection_freezes_prepatch_is_exclusive_and_is_not_default(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_WAKE_PREPATCH,screen_variants=[])
+        self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('http_wake_screen',False))
+        identity=h.hosted_identity(types.SimpleNamespace(**base,http_wake_screen=True),'diagnostic')
+        self.assertEqual(identity['prepatch'],h.HTTP_WAKE_PREPATCH);self.assertTrue(identity['http_wake_screen'])
+        for flag in ('normal_self_probe','pg_failure_probe','task_json_screen','common_http_screen','final_task_json','pg_queue_screen','pg_driver_screen'):
+            with self.subTest(flag=flag),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**base,http_wake_screen=True,**{flag:True}),'diagnostic')
+        for change in ({'prepatch':h.BASELINE},{'candidate':h.HTTP_WAKE_PREPATCH}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change),http_wake_screen=True),'diagnostic')
+        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(http_wake_screen=True),'full')
+
+    def test_http_wake_build_only_fresh_normal_A_B_and_same_driver(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);calls=[]
+            class Builder:
+                def __init__(self,directory,source,**kwargs):self.name=directory.name
+                def ku(self):calls.append((self.name,'ku'))
+                def go_build(self,client=False):calls.append((self.name,'driver',client))
+                def rust(self):raise AssertionError('no reference build belongs in this screen')
+                def ku_native(self,*args):raise AssertionError('both products must use their own identified CLI')
+                def finish(self,**kwargs):return {}
+            patches.enter_context(patch.object(h.bl,'Builder',Builder))
+            patches.enter_context(patch.object(h,'snapshot',side_effect=lambda s,c,d:d.mkdir(parents=True)))
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=1));patches.enter_context(patch.object(h.os,'getegid',return_value=1))
+            patches.enter_context(patch.object(h,'complete_build',return_value={'ready':True}))
+            a=types.SimpleNamespace(root=root,source=root/'source',tools=root/'tools',baseline=h.BASELINE,candidate='b'*40,
+                prepatch=h.HTTP_WAKE_PREPATCH,screen_variants=[],build_set='diagnostic',http_wake_screen=True)
+            self.assertEqual(h.build(a,{'steps':{}}),{'ready':True})
+            self.assertEqual(calls,[('A','ku'),('B','ku'),('Driver','driver',True)])
+
+    def test_http_wake_comparison_never_adopts_and_blocks_invalid_environment_and_guards(self):
+        plan=h.http_wake_plan({'A':{},'B':{}})
+        for issue in ('none','environment-unknown','business-environment-unknown','incomplete','json-small','pg-regression','compute-regression'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in plan['windows']:
+                    row=dict(config);ratio={'json_object':.97,'ok':.99,'db':.99,'cpu':1.02}[row['workload']]
+                    if issue=='json-small' and row['workload']=='json_object':ratio=.99
+                    if issue=='pg-regression' and row['workload']=='db':ratio=1.01
+                    if issue=='compute-regression' and row['workload']=='cpu':ratio=1.04
+                    row['full_cpu_us']=100*(ratio if row['name']=='B' else 1)
+                    row['environment_quality']='unknown' if issue=='business-environment-unknown' else 'pass';rows.append(row)
+                result=h.http_wake_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='environment-unknown' else 'pass'})
+                self.assertEqual(result['eligible_for_root_review'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                if issue=='environment-unknown':self.assertIn('environment qualification unresolved or failed',result['reasons'])
+                if issue!='incomplete':
+                    self.assertEqual(result['compute_guard']['pairs'],1);self.assertIsNone(result['compute_guard']['confidence_interval'])
+
+    def test_http_wake_runner_stops_failed_controls_or_invalid_business_without_replacement(self):
+        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.http_wake_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+                h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
+                fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
+                    stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
+                mode=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',pg_execution_mode='async',
+                    pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+                if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
+                    source_commit=h.HTTP_WAKE_PREPATCH if n=='A' else 'b'*40,
+                    files={'expanded source':{'sha256':'a'*64 if issue=='business' and n=='A' else 'b'*64}})))
+                patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64));measured=[]
+                env=patches.enter_context(patch.object(h,'environment_record',return_value={'evidence':str(root/'qualification.json'),'quality':
+                    'unknown' if issue=='environment-unknown' else 'fail' if issue=='environment-fail' else 'pass'}))
+                def window(p,name,workload,rate,warmup,duration,output,**kwargs):
+                    control='environment-controls' in Path(output).parts;measured.append((name,workload,control))
+                    row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
+                        all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
+                        environment_quality='unknown' if control else 'pass',measurement_invalid=False,
+                        full_cpu_us=97 if name=='B' else 100,cleanup=[{'natural':True}])
+                    self.assertEqual(kwargs['job']['contract'],'dom' if control else next(c['contract'] for c in plan['windows'] if c['workload']==workload))
+                    for part in ('warmup','score'):
+                        report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
+                            driver_headroom={'fraction_of_quota':.3,'saturated':False})))
+                        h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
+                    row['score_report']=str(Path(output)/'score/client.json');return row
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_wake_screen=True)
+                if issue in ('flags','business'):
+                    with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
+                    self.assertEqual(measured,[]);database.assert_not_called();continue
+                result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
+                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 23)
+                self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
+                if issue=='none':
+                    self.assertEqual([x[2] for x in measured[:3]],[True]*3)
+                    self.assertEqual(result['environment_qualification']['quality'],'pass')
+                else:self.assertFalse(result['comparison']['eligible_for_root_review'])
+
     def test_pg_driver_plan_is_two_conditions_with_original_deadlines_and_recovery(self):
         plan=h.pg_driver_plan({'B':{}})
         self.assertEqual([x['concurrency'] for x in plan['windows']],[256,1024])
@@ -1224,7 +1356,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_wake_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 
