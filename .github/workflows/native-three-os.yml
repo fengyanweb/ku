@@ -23,6 +23,11 @@ on:
         type: boolean
         default: false
 
+      common_http_screen:
+        description: 'Explicit 55-window shared HTTP screen; requires followup-screen and task_json_screen, keeps separate B/BT admission'
+        type: boolean
+        default: false
+
       reuse_build_run:
         description: 'Optional prior followup build run; reuses verified binaries only, never measurements'
         type: string
@@ -443,7 +448,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -459,6 +464,7 @@ jobs:
       KU_PERFORMANCE_V2_PREPATCH: ${{ inputs.prepatch || '956727188a058119fdb3790959063f1496ccb4cc' }}
       KU_PERFORMANCE_V2_VARIANTS: ${{ inputs.screen_variants }}
       KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN: ${{ inputs.common_http_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
       KU_PERFORMANCE_V2_REUSE_SHA256: ${{ inputs.reuse_build_sha256 }}
       KU_PERFORMANCE_V2_CANDIDATE: ${{ inputs.reuse_product_commit || github.sha }}
@@ -478,6 +484,10 @@ jobs:
         run: |
           if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+          fi
+          if [ "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = followup-screen
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
           fi
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_compile_variants.py
           python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_hosted_cycle.py
@@ -551,6 +561,11 @@ jobs:
             test "$performance_build_set" = followup-screen
             performance_task_json_args+=(--task-json-screen)
           fi
+          if [ "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
+            performance_task_json_args+=(--common-http-screen)
+          fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
             test "$performance_build_set" = followup-screen
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
@@ -600,6 +615,11 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then
             test "$performance_build_set" = followup-screen
             performance_task_json_args+=(--task-json-screen)
+          fi
+          if [ "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = true ]; then
+            test "$performance_build_set" = followup-screen
+            test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true
+            performance_task_json_args+=(--common-http-screen)
           fi
           for performance_phase in "${performance_phases[@]}"; do
             sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase "$performance_phase" --build-set "$performance_build_set" \

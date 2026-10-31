@@ -153,6 +153,72 @@ class HostedCycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'identified BT build'):
             h.followup_plan({n:v for n,v in versions.items() if n!='BT'},'f'*40,task_json_screen=True)
 
+    def test_common_http_screen_is_55_related_windows_without_new_worker_or_HC_passes(self):
+        versions={n:{'root':'/unused/'+n,'source_commit':'b'*40} for n in ['A','B','BT','BF','R','RS','D','HC','C1']}
+        plan=h.followup_plan(versions,'f'*40,task_json_screen=True,common_http_screen=True)
+        self.assertTrue(plan['common_http_screen']);self.assertEqual(plan['maximum_windows'],55)
+        self.assertEqual(plan['candidate_versions'],['B','BT'])
+        self.assertEqual([(c['workload'],c['rate'],c['reference']) for c in plan['cases']],
+            [('ok',2000,'R'),('json_object',500,'R'),('json_escape',500,'R'),('db',200,'RS'),('cpu',80,'R')])
+        self.assertEqual(next(c for c in plan['cases'] if c['workload']=='db')['contract'],'pg-strict')
+        turns={c['workload']:h.diagnostic_turns(plan,c,True) for c in plan['cases']}
+        self.assertEqual([len(v) for v in turns.values()],[9,13,12,9,9])
+        self.assertEqual(sum(name=='D' for ts in turns.values() for _,name in ts),1)
+        for case in plan['cases']:
+            names={n for _,n in turns[case['workload']]}
+            if case['workload'] in ('json_object','json_escape'):self.assertIn('BT',names)
+            else:self.assertEqual(names,{'A','B',case['reference']})
+        self.assertNotIn('worker_growth',plan);self.assertNotIn('transport_control',plan)
+        self.assertNotIn('targets',plan);self.assertEqual(plan['quality_policy'],h.POLICY)
+        self.assertEqual(plan['admission'],h.ADMISSION)
+        self.assertEqual(plan['task_json_admission'],dict(h.ADMISSION,name='BT'))
+        good=dict(functional_valid=True,accounting_valid=True,all_correct=True,natural_reclamation=True,
+            arrival_schedule_quality='pass',environment_quality='pass',observed_environment_faults=[])
+        plan['json_layer_diagnosis']={'execution_complete':True}
+        gate={'passed':True,'execution_complete':True}
+        axes=h.diagnostic_axes(plan,[good],1,[],None,[],True,gate)
+        self.assertTrue(axes['execution_complete']);self.assertIsNone(axes['transport_control_complete'])
+        self.assertIsNone(axes['worker_growth_complete']);self.assertIn('not run',axes['unchanged_control_scope'])
+        self.assertFalse(h.diagnostic_axes(plan,[good],1,[],None,[],True)['execution_complete'])
+        self.assertEqual(h.followup_plan(versions,'f'*40,task_json_screen=True)['maximum_windows'],50)
+        ordinary={n:v for n,v in versions.items() if n!='C1'}
+        self.assertEqual(h.followup_plan(ordinary,'f'*40)['maximum_windows'],76)
+
+    def test_common_http_selection_is_bound_and_invalid_combinations_stop_before_build(self):
+        import io
+        from contextlib import redirect_stderr,redirect_stdout
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch='f'*40,screen_variants=[])
+        absent=types.SimpleNamespace(**base,task_json_screen=True)
+        explicit=types.SimpleNamespace(**base,task_json_screen=True,common_http_screen=True)
+        self.assertIs(h.hosted_identity(absent,'followup-screen')['common_http_screen'],False)
+        self.assertIs(h.hosted_identity(explicit,'followup-screen')['common_http_screen'],True)
+        self.assertNotEqual(h.hosted_identity(absent,'followup-screen'),h.hosted_identity(explicit,'followup-screen'))
+        with self.assertRaisesRegex(ValueError,'requires --task-json-screen'):
+            h.followup_plan({},common_http_screen=True)
+        for build_set,task in [('followup-screen',False),('full',True),('diagnostic',False)]:
+            a=types.SimpleNamespace(**base,build_set=build_set,task_json_screen=task,common_http_screen=True)
+            with self.subTest(build_set=build_set,task=task),patch.object(h.os,'geteuid',return_value=1):
+                with self.assertRaises(ValueError):h.build(a,{'steps':{}})
+                with self.assertRaises(ValueError):h.complete_build(a,{'steps':{}},build_set,a.prepatch,[])
+                with self.assertRaises(ValueError):h.hosted_identity(a,build_set)
+        with tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+            root=Path(directory);source=root/'source';source.mkdir();tools=root/'tools';tools.mkdir()
+            output=root/'output';error=io.StringIO()
+            patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+            patches.enter_context(patch.object(h.signal,'signal'));patches.enter_context(patch.object(h.signal,'alarm'))
+            build=patches.enter_context(patch.object(h,'build',return_value={'execution_complete':True}))
+            argv=['--phase','build','--root',str(output),'--source',str(source),'--tools',str(tools),
+                '--candidate','b'*40,'--prepatch','f'*40,'--build-set','followup-screen']
+            with redirect_stderr(error),self.assertRaises(SystemExit) as invalid:
+                h.main([*argv,'--common-http-screen'])
+            self.assertEqual(invalid.exception.code,2);build.assert_not_called()
+            with redirect_stdout(io.StringIO()):self.assertEqual(h.main([*argv,'--task-json-screen']),0)
+            with redirect_stderr(error),self.assertRaises(SystemExit) as changed:
+                h.main([*argv,'--task-json-screen','--common-http-screen'])
+            self.assertEqual(changed.exception.code,2);self.assertIn('identity changed',error.getvalue())
+            build.assert_called_once()
+
     def test_task_json_screen_uses_current_worker_denominator_and_all_quality_checks(self):
         rows=[]
         for group in range(1,4):
@@ -266,6 +332,9 @@ class HostedCycleTests(unittest.TestCase):
         self.assertIn('type: boolean',entry);self.assertIn('default: false',entry)
         job=workflow.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
         self.assertIn("KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}",job)
+        self.assertIn("KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN: ${{ inputs.common_http_screen && 'true' || 'false' }}",job)
+        common=workflow.split('\n      common_http_screen:\n',1)[1].split('\n      reuse_build_run:',1)[0]
+        self.assertIn('type: boolean',common);self.assertIn('default: false',common)
         build=job.split('- name: Build frozen',1)[1].split('- name: Run the one',1)[0]
         run=job.split('- name: Run the one',1)[1].split('- name: Always archive',1)[0]
         for phase,count in ((build,2),(run,1)):
@@ -273,6 +342,9 @@ class HostedCycleTests(unittest.TestCase):
             self.assertIn('if [ "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true ]; then',phase)
             self.assertIn('test "$performance_build_set" = followup-screen',phase)
             self.assertIn('performance_task_json_args+=(--task-json-screen)',phase)
+            self.assertIn('if [ "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = true ]; then',phase)
+            self.assertIn('test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = true',phase)
+            self.assertIn('performance_task_json_args+=(--common-http-screen)',phase)
             self.assertEqual(phase.count('"${performance_task_json_args[@]}"'),count)
 
     def test_screen_uses_selected_candidate_normalized_cpu_and_its_own_tails(self):
@@ -436,12 +508,14 @@ class HostedCycleTests(unittest.TestCase):
 
     def test_diagnostic_and_screen_admission_are_required_but_not_timed_windows(self):
         from unittest.mock import Mock
-        for followup,gate_passed,task in ((False,True,False),(False,False,False),(True,True,False),(True,False,False),(True,True,True),(True,False,True)):
-            with self.subTest(followup=followup,gate_passed=gate_passed,task=task),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
+        for followup,gate_passed,task,common in ((False,True,False,False),(False,False,False,False),
+                (True,True,False,False),(True,False,False,False),(True,True,True,False),(True,False,True,False),
+                (True,True,True,True),(True,False,True,True)):
+            with self.subTest(followup=followup,gate_passed=gate_passed,task=task,common=common),tempfile.TemporaryDirectory() as directory,ExitStack() as patches:
                 root=Path(directory)
                 versions={name:{'root':str(root/name),'source_commit':'a'*40}
                     for name in ['A','B','R','RS','D','HC',*(['BT'] if task else [])]}
-                plan=h.followup_plan(versions,task_json_screen=task) if followup else h.diagnostic_plan(versions)
+                plan=h.followup_plan(versions,task_json_screen=task,common_http_screen=common) if followup else h.diagnostic_plan(versions)
                 plan['json_layer_diagnosis']={'execution_complete':True}
                 h.save(root/'frozen-plan.json',plan)
                 manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'

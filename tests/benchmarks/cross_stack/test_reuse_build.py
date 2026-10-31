@@ -32,13 +32,14 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
     def test_reuse_selection_and_state_identity_match_the_explicit_hosted_flag(self):
-        for selected in (None,False,True):
-            with self.subTest(selected=selected),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+        for selected,common in ((None,None),(False,False),(True,False),(True,True)):
+            with self.subTest(selected=selected,common=common),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
                 root=Path(d);fresh=root/'fresh';tools=root/'tools';tools.mkdir()
                 args=types.SimpleNamespace(root=fresh,source=root/'source',tools=tools,archive=root/'inert.tgz',
                     archive_sha256='1'*64,source_run='123',baseline=r.h.BASELINE,
                     candidate='b'*40,prepatch='f'*40,screen_variants=[])
                 if selected is not None:args.task_json_screen=selected
+                if common is not None:args.common_http_screen=common
                 def extract(archive,root,digest,expected):
                     for name in expected:(root/name).mkdir(parents=True)
                     # Even capable normal cached builds must not implicitly
@@ -62,6 +63,13 @@ class ReuseBuildTests(unittest.TestCase):
                 state=r.h.load(fresh/'hosted-state.json')
                 self.assertEqual(state['identity'],r.h.hosted_identity(args,'followup-screen'))
                 self.assertIs(state['identity']['task_json_screen'],selected is True)
+                self.assertIs(state['identity']['common_http_screen'],common is True)
+
+    def test_reuse_rejects_common_http_without_explicit_task_before_reading_archive(self):
+        args=types.SimpleNamespace(common_http_screen=True,task_json_screen=False)
+        with patch.object(r,'extract_builds') as extract:
+            with self.assertRaisesRegex(ValueError,'--task-json-screen'):r.prepare(args)
+            extract.assert_not_called()
 
     def test_reformatted_source_json_is_recovered_from_exact_commit_without_redefining_corpus(self):
         with tempfile.TemporaryDirectory() as d:
