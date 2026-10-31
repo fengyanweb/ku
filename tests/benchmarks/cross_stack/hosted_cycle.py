@@ -246,17 +246,17 @@ def pg_failure_plan(versions):
 
 def normal_self_plan(versions):
     """Normal Release SELF, bounded by two unsampled controls per stack."""
-    return dict(schema='ku-hosted-normal-self-probe-v1',versions=versions,
+    return dict(schema='ku-hosted-normal-kernel-chains-v1',versions=versions,
         resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),
         workload='json_object',contract='dom',rate=4000,warmup_seconds=10,score_seconds=15,
         order=[[name,turn] for name in ('B','R') for turn in ('before','sample','after')],
-        event='cpu-clock',perf_frequency=499,perf_flags=[],maximum_windows=6,maximum_replacements=0,
+        event='cpu-clock',perf_frequency=499,perf_flags=['--call-graph','fp','--kernel-callchains'],maximum_windows=6,maximum_replacements=0,
         maximum_control_cpu_ratio=1.10,observation_alarm_seconds=330,workflow_limit_seconds=420,
         diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
-        purpose='Identify current normal B/R synchronous JSON SELF; only normal Release binaries, '
+        purpose='Identify kernel-only callchains in fixed reused normal B/R synchronous JSON; only original Release binaries, '
                 'same fixed corpus and driver, before/sample/after per stack. No D ledger, retries, '
-                'callchain probe, capacity, product change or performance acceptance. '
-                'SELF shares are not exclusive whole-request CPU attribution; inclusive chains are unavailable.')
+                'capacity, product change or performance acceptance. Kernel unwinding depends on the active kernel; '
+                'no user callchain completeness, blocked-time or additive inclusive-CPU claim.')
 
 
 def http_short_plan(versions,goal='cpu'):
@@ -550,8 +550,7 @@ def build_json_layers(a):
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
-    if getattr(a,'memory_owner_probe',False):raise ValueError('owner probe requires verified fixed archive reuse, not a fresh build')
-    if getattr(a,'normal_self_probe',False):require_normal_perf_preflight(a)
+    if getattr(a,'memory_owner_probe',False) or getattr(a,'normal_self_probe',False):raise ValueError('explicit observation requires verified fixed archive reuse, not a fresh build')
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
     class Builder(bl.Builder):
         def command(self,label,command,**kwargs):
@@ -604,6 +603,7 @@ def complete_build(a,state,build_set,prepatch,variants):
         +['B',*(['BF'] if fixed_control else []),'R','RS'] if diagnostic else ['A0','B','R','BJ','BP','BD','RS','RJ','RP','RPS'])
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):names=['A','B']
     if getattr(a,'pg_driver_screen',False):names=['B']
+    if getattr(a,'normal_self_probe',False):names=['B','R']
     if task_json_screen or final_task_json:
         require_task_json_support(a.root)
         if not (a.root/'BT/manifest.json').is_file():raise ValueError('explicit Task JSON mode requires the completed BT build')
@@ -1185,6 +1185,80 @@ def pg_failure_probe(a,state):
     return result
 
 
+
+def kernel_chain_raw(path,start=None,end=None):
+    """Validate the requested CPU-clock ABI, not text indentation or symbols."""
+    path=Path(path)
+    if not 0<path.stat().st_size<=16<<20:raise ValueError('bounded perf raw required')
+    raw=path.read_bytes()
+    if len(raw)<104 or raw[:8]!=b'PERFILE2':raise ValueError('PERFILE2 header required')
+    attr_size,attrs,attrs_bytes,data,size=struct.unpack_from('<QQQQQ',raw,16)
+    if not (attrs_bytes==attr_size and attr_size>=48 and attrs+attr_size<=len(raw) and 0<data<=len(raw) and size<=len(raw)-data):raise ValueError('single bounded perf attr/data required')
+    sample_type=struct.unpack_from('<Q',raw,attrs+24)[0]
+    # UAPI order: IDENTIFIER,IP,TID,TIME,ADDR,ID,STREAM_ID,CPU,PERIOD,READ,CALLCHAIN.
+    fields=(65536,1,2,4,8,64,512,128,256);supported=32|sum(fields)
+    if sample_type&295!=295 or sample_type&~supported:raise ValueError('requested bounded CALLCHAIN sample layout required')
+    counts=dict(sample_type=sample_type,all_raw_samples=0,window_samples=0,kernel_multiframe_samples=0,raw_sha256=sha(path));offset=data
+    while offset<data+size:
+        if offset+8>data+size:raise ValueError('truncated perf record header')
+        kind,misc,n=struct.unpack_from('<IHH',raw,offset)
+        if n<8 or offset+n>data+size:raise ValueError('bad perf record bounds')
+        if kind in (2,5,6,13):raise ValueError('lost or throttled perf records')
+        if kind==9:
+            cursor=offset+8;ip=stamp=0
+            for bit in fields:
+                if sample_type&bit:
+                    if cursor+8>offset+n:raise ValueError('truncated fixed sample fields')
+                    value=struct.unpack_from('<Q',raw,cursor)[0];cursor+=8
+                    if bit==1:ip=value
+                    if bit==4:stamp=value
+            if cursor+8>offset+n:raise ValueError('missing callchain count')
+            nr=struct.unpack_from('<Q',raw,cursor)[0];cursor+=8
+            if nr>512 or cursor+nr*8!=offset+n:raise ValueError('bad callchain bounds')
+            kernel=misc&7==1;frames=[]
+            for addr in struct.unpack_from('<'+'Q'*nr,raw,cursor):
+                if addr>=(1<<64)-4095:kernel=addr==(1<<64)-128
+                elif kernel and addr:frames.append(addr)
+            counts['all_raw_samples']+=1;inside=start is None or start<=stamp<=end
+            if inside:counts['window_samples']+=1
+            if misc&7==1 and ip and len(set(frames))>=2 and inside:
+                counts['kernel_multiframe_samples']+=1
+                if 'example' not in counts:counts['example']=[hex(x) for x in frames[:128]]
+        offset+=n
+    return counts
+
+
+def kernel_context():
+    result=dict(kernel=platform.release(),clock_ticks_per_second=os.sysconf('SC_CLK_TCK'),build_ids=[],
+        symbols='perf names require exact current build-id review; unknown IPs remain unknown; no old ASLR base reuse')
+    try:
+        with Path('/sys/kernel/notes').open('rb') as stream:raw=stream.read(65537)
+        if len(raw)>65536:raise ValueError('kernel notes bound')
+        result['notes_sha256']=hashlib.sha256(raw).hexdigest();cursor=0
+        while cursor+12<=len(raw):
+            names,descs,kind=struct.unpack_from('<III',raw,cursor);cursor+=12
+            name=raw[cursor:cursor+names];cursor+=(names+3)&~3;desc=raw[cursor:cursor+descs];cursor+=(descs+3)&~3
+            if cursor>len(raw):raise ValueError('kernel note bounds')
+            if name.rstrip(b'\0')==b'GNU' and kind==3:result['build_ids'].append(desc.hex())
+    except (OSError,ValueError) as error:result['unavailable']=repr(error)
+    return result
+
+
+def kernel_raw_export(a,directory,bindings):
+    output=a.root/'normal-kernel-raw';output.mkdir();rows=[]
+    for name in ('B','R'):
+        source=directory/name/'sample/score/perf.data'
+        if not source.is_file():continue
+        if source.is_symlink() or not 0<source.stat().st_size<=16<<20:raise ValueError('raw artifact size/type bound')
+        target=output/(name+'.perf.data');shutil.copyfile(source,target);target.chmod(0o644)
+        if sha(target)!=sha(source):raise ValueError('raw copy identity changed')
+        rows.append(dict(path=target.name,bytes=target.stat().st_size,sha256=sha(target),binding=bindings[name]))
+    record=dict(files=rows,total_limit_bytes=32<<20,per_file_limit_bytes=16<<20,
+        original_bytes_no_redaction=True,complete=len(rows)==2,kernel_context=load(directory/'kernel-context.json') if (directory/'kernel-context.json').is_file() else {},
+        scope='Two fixed allowlisted raw files only; exact B/R ELFs from reused verified archive; no measurement imports or rebuilt binary')
+    save(output/'index.json',record);return record
+
+
 def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20):
     """Readiness is an acknowledged enable, completion an acknowledged stop+exit0."""
     output=Path(output);raw=output/'perf.data';fds=[];process=watch=None;stop=threading.Event()
@@ -1195,7 +1269,7 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20):
     try:
         read_ctl,write_ctl=os.pipe();fds.extend((read_ctl,write_ctl));read_ack,write_ack=os.pipe();fds.extend((read_ack,write_ack))
         os.set_blocking(write_ctl,False);os.set_blocking(read_ack,False)
-        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','--delay=-1',
+        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','--call-graph','fp','--kernel-callchains','--delay=-1',
             f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
         record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
             control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
@@ -1254,11 +1328,12 @@ def normal_perf_preflight(a):
     output=a.root/'normal-perf-preflight';output.mkdir();deadline=time.monotonic()+18;child=None
     perf=shutil.which('perf',path=str(a.tools/'bin')+os.pathsep+os.environ.get('PATH',''))
     record=dict(complete=False,maximum_wall_seconds=25,coordinator_alarm_seconds=19,entry_sha256=sha(__file__),candidate=a.candidate,
-        boot_sha256=sha('/proc/sys/kernel/random/boot_id'),perf_path=perf,child_reaped=False)
+        boot_sha256=sha('/proc/sys/kernel/random/boot_id'),perf_path=perf,child_reaped=False,
+        perf_flags=normal_self_plan({})['perf_flags'])
     try:
         if not perf:raise ValueError('perf unavailable; preflight blocks build and six windows')
         record.update(perf_sha256=sha(perf),perf_real_path=str(Path(perf).resolve()))
-        code='import sys,time\nsys.stdin.buffer.read(1)\nend=time.monotonic()+1\nwhile time.monotonic()<end: pass\nprint("done",flush=True)\nsys.stdin.buffer.read(1)\n'
+        code='import sys,time,socket\na,b=socket.socketpair();a.settimeout(.1);b.settimeout(.1)\nsys.stdin.buffer.read(1)\nend=time.monotonic()+1\nwhile time.monotonic()<end: a.sendall(b"x");b.recv(1)\na.close();b.close()\nprint("done",flush=True)\nsys.stdin.buffer.read(1)\n'
         child=subprocess.Popen([sys.executable,'-c',code],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,start_new_session=True)
         def busy():
@@ -1287,8 +1362,9 @@ def normal_perf_preflight(a):
         record['perf_version_valid']=len(versions)==1 and bool(version) and version.isprintable() and len(version.encode('utf-8'))<=128
         if not record['perf_version_valid']:record['version_identity_error']='expected exactly one nonempty printable record-header version, at most128 UTF-8 bytes'
         text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
+        record['kernel_chains']=kernel_chain_raw(output/'perf.data',start,end)
         record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
-            and record['sample_count']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
+            and record['sample_count']>0 and record['kernel_chains']['kernel_multiframe_samples']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
     except BaseException as error:
         record['error']=repr(error)
         if not isinstance(error,Exception):raise
@@ -1309,7 +1385,8 @@ def normal_perf_preflight(a):
 
 def require_normal_perf_preflight(a):
     path=a.root/'normal-perf-preflight/preflight.json';record=load(path) if path.is_file() else {}
-    if not (record.get('complete') is True and record.get('candidate')==a.candidate and record.get('entry_sha256')==sha(__file__)
+    if not (record.get('complete') is True and record.get('kernel_chains',{}).get('kernel_multiframe_samples',0)>0
+            and record.get('perf_flags')==normal_self_plan({})['perf_flags'] and record.get('candidate')==a.candidate and record.get('entry_sha256')==sha(__file__)
             and record.get('boot_sha256')==sha('/proc/sys/kernel/random/boot_id') and record.get('perf_path')
             and record.get('perf_sha256')==sha(record['perf_path'])):
         raise ValueError('matching successful controlled-perf preflight required before build/normal six-window capture')
@@ -1318,7 +1395,7 @@ def require_normal_perf_preflight(a):
 def normal_self_client(client,service,output,duration,perf,*,sample):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
-    record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
+    record=dict(sampled=sample,callchains='kernel-only; active kernel unwinder; no complete user-chain claim',clock_ticks_per_second=os.sysconf('SC_CLK_TCK'),
         cpu_distribution='unknown: no CPU field; instantaneous last-CPU is not a residency distribution',
         sample_scope='Controlled perf enable is acknowledged before client launch; stop follows client return. Filter mono-clock raw events by client_started/finished_monotonic_ns; '
             'that interval includes client startup/drain, not only planned arrivals. Full lifecycle CPU includes post-client perf finalization; '
@@ -1741,6 +1818,7 @@ def normal_self_probe(a,state):
         save(directory/'identity.json',dict(bindings=bindings,resources=plan['resources'],quality_policy=plan['quality_policy'],
             database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id'),
             kernel=platform.release(),machine=platform.machine(),perf=perf,purpose=plan['purpose']))
+        save(directory/'kernel-context.json',kernel_context())
         diagnostic_command(['ps','-eo','pid,ppid,nlwp,rss,stat,comm'],directory/'processes-before.log')
         for name,turn in plan['order']:
             active['sample']=turn=='sample';output=directory/name/turn
@@ -1766,11 +1844,14 @@ def normal_self_probe(a,state):
                 row['perf_export_time_range']=dict(clock='mono',start_ns=start,end_ns=end,argument=sample_time,
                     scope='Full raw retained; SELF and PC exports limited to scored-client launch/return, excluding post-client perf stop/finalization')
                 exports.append(diagnostic_command([perf,'report','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--stdio','--no-children',
-                    '--show-nr-samples','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=20,limit=4<<20))
+                    '--show-nr-samples','--call-graph','none','--sort','symbol,dso,comm','--percent-limit','0'],output/'score/perf-self.log',timeout=20,limit=4<<20))
                 exports.append(diagnostic_command([perf,'script','-i',str(raw),'--symfs',str(symfs),'--time',sample_time,'--ns',
                     '--show-lost-events','--show-task-events','-F','+pid,+tid,+time,+ip,+sym,+dso,+symoff,+srcline,+misc'],
                     output/'score/perf-pcs.log',timeout=20,limit=8<<20))
-                row['exports_complete']=all(x['complete'] for x in exports)
+                exports.append(diagnostic_command([perf,'report','-i',str(raw),'--header-only','--stdio'],output/'score/perf-header.log',timeout=2,limit=1<<20))
+                exports.append(diagnostic_command([perf,'buildid-list','-i',str(raw)],output/'score/perf-buildids.log',timeout=2,limit=1<<20))
+                row['kernel_chains']=kernel_chain_raw(raw,start,end)
+                row['exports_complete']=all(x['complete'] for x in exports) and row['kernel_chains']['kernel_multiframe_samples']>0
             quality,signature=normal_diagnostic_quality(row)
             valid=(quality and row['observation_complete']
                 and (not active['sample'] or row.get('exports_complete') is True))
@@ -1817,7 +1898,13 @@ def normal_self_probe(a,state):
             'window.json','full-lifecycle.json','score/client.json','score/driver-cleanup.json',
             'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
             'score/symbol-identities.json','score/maps.log','score/perf-record.log'))
-        result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
+        priority=[directory/name for name in ('summary.json','identity.json','results.json','kernel-context.json')]
+        priority.extend(directory/name/turn/rel for name,turn in plan['order']
+            for rel in ('window.json','full-lifecycle.json','score/client.json','score/normal-self-observations.json'))
+        priority.extend(directory/name/'sample/score'/rel for name in ('B','R')
+            for rel in ('perf-header.log','perf-buildids.log','perf-record.log','perf-self.log','perf-pcs.log','symbol-identities.json'))
+        result['raw_artifact']=kernel_raw_export(a,directory,bindings)
+        result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=list(dict.fromkeys(priority+selected)))
         save(a.root/'hosted-state.json',state)
     return result
 
@@ -2371,7 +2458,7 @@ def main(argv=None):
     p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
-    p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
+    p.add_argument('--normal-self-probe',action='store_true',help='Fixed archived normal B/R kernel chains; diagnostic only, no fresh builds or acceptance')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
@@ -2382,7 +2469,7 @@ def main(argv=None):
     if a.memory_owner_probe and a.phase not in ('diagnostic','archive'):p.error('--memory-owner-probe requires fixed archive reuse before diagnostic')
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
-    if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fresh build/diagnostic/preflight/archive')
+    if a.normal_self_probe and a.phase not in ('build','diagnostic','perf-preflight','archive'):p.error('--normal-self-probe only supports fixed build-registration/diagnostic/preflight/archive')
     if a.phase=='perf-preflight' and not a.normal_self_probe:p.error('perf-preflight requires explicit normal-self mode')
     if a.http_short_screen and a.phase not in ('build','diagnostic','archive'):p.error('--http-short-screen only supports fresh build/diagnostic/archive')
     if a.pg_driver_screen and a.phase not in ('build','diagnostic','archive'):p.error('--pg-driver-screen only supports fresh build/diagnostic/archive')

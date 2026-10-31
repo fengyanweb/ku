@@ -38,6 +38,29 @@ class ReuseBuildTests(unittest.TestCase):
             r.prepare(args)
         extract.assert_not_called()
 
+    def test_normal_kernel_reuse_preflight_before_extract_and_no_builder(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            a=types.SimpleNamespace(root=Path(temp),source=Path(temp),archive=Path(temp)/'archive',
+                normal_self_probe=True,source_run=r.OWNER_RUN,archive_sha256=r.OWNER_ARCHIVE_SHA,
+                candidate=r.OWNER_PRODUCT,baseline=r.h.BASELINE,prepatch=r.h.BASELINE,screen_variants=[])
+            patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+            patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+            extract=patches.enter_context(patch.object(r,'extract_builds',return_value={}))
+            gate=patches.enter_context(patch.object(r.h,'require_normal_perf_preflight',side_effect=ValueError('missing preflight')))
+            with self.assertRaisesRegex(ValueError,'missing preflight'):r.prepare(a)
+            extract.assert_not_called();gate.side_effect=None
+            for function in ('restore_json_inputs','validate_protocol_inputs','verify_manifest'):patches.enter_context(patch.object(r,function))
+            patches.enter_context(patch.object(r.subprocess,'check_output',return_value='new-tools-head\n'))
+            complete=patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
+            builder=patches.enter_context(patch.object(r.h.bl,'Builder'));driver=patches.enter_context(patch.object(r,'new_driver'))
+            self.assertTrue(r.prepare(a)['execution_complete']);builder.assert_not_called();driver.assert_not_called()
+            self.assertEqual(extract.call_args.kwargs,dict(owner_observation=True,normal_preflight=True))
+            self.assertEqual(complete.call_args.args[2:],('diagnostic',a.prepatch,[]))
+            receipt=r.h.load(a.root/'reuse-build.json');self.assertEqual(receipt['measurement_tool_commit'],'new-tools-head')
+            self.assertEqual(receipt['normal_versions'],{'B':r.OWNER_PRODUCT,'R':r.OWNER_PRODUCT})
+            self.assertEqual(receipt['imported_measurement_windows'],0)
+
     def test_measured_owner_archive_exception_never_imports_observations(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);path=root/'owner.tgz'
@@ -57,6 +80,13 @@ class ReuseBuildTests(unittest.TestCase):
             self.assertFalse((root/'good/normal-self-probe').exists())
             self.assertNotIn('diagnostic',r.h.load(root/'good/reuse-original-state.json')['steps'])
             self.assertEqual((root/'good/B/build/bin/ku-server').read_bytes(),b'B')
+            pre=root/'preflight';(pre/'normal-perf-preflight').mkdir(parents=True)
+            with patch.object(r,'OWNER_ARCHIVE_SHA',digest):
+                r.extract_builds(path,pre,digest,{'B','R'},owner_observation=True,normal_preflight=True)
+            self.assertFalse((pre/'normal-self-probe').exists());self.assertTrue((pre/'normal-perf-preflight').is_dir())
+            wrong=root/'wrong-preflight';(wrong/'normal-perf-preflight').mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError,'fresh output'):
+                r.extract_builds(path,wrong,digest,{'B','R'},owner_observation=True)
 
     def test_reuse_selection_and_state_identity_match_the_explicit_hosted_flag(self):
         for selected,common in ((None,None),(False,False),(True,False),(True,True)):

@@ -223,7 +223,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertEqual(job.count('performance_task_json_args+=(--memory-owner-probe)'),2)
         for value in ('41182804290','5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6','4e5f5d94da277654862d8679f7ae4a7fda3f05ff'):
             self.assertIn(value,job)
-        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
         self.assertIn('name: ku-memory-owner-observation',job)
         self.assertIn('inputs.memory_owner_probe && 3',job)
 
@@ -232,7 +232,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),8)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),9)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
@@ -258,7 +258,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-failure-observation',small)
         self.assertNotIn('*.csv',small);self.assertNotIn('bin/',small)
 
-    def test_normal_self_probe_is_explicit_exclusive_fresh_and_bounded(self):
+    def test_normal_self_probe_is_explicit_exclusive_fixed_reuse_and_bounded(self):
         text,job=self.workflow()
         self.assertIn('normal_self_probe:\n',text)
         self.assertIn("KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}",job)
@@ -270,6 +270,9 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false',
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
+        self.assertIn('test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41182804290',verify)
+        self.assertIn('test "$KU_PERFORMANCE_V2_CANDIDATE" = 4e5f5d94da277654862d8679f7ae4a7fda3f05ff',verify)
+        self.assertIn('name: ku-normal-kernel-raw',job)
         self.assertEqual(job.count('performance_task_json_args+=(--normal-self-probe)'),2)
         self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted normal SELF observation',1)[1]
@@ -282,6 +285,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         _,job=self.workflow()
         preflight=job.split('- name: Verify acknowledged perf control before any normal SELF build',1)[1].split('\n      - name:',1)[0]
         self.assertIn('if: inputs.normal_self_probe',preflight);self.assertIn('timeout-minutes: 1',preflight)
+        self.assertIn('--candidate "$KU_PERFORMANCE_V2_CANDIDATE"',preflight)
         self.assertIn('--phase perf-preflight --build-set diagnostic',preflight);self.assertIn('--normal-self-probe',preflight)
         self.assertLess(job.index('Verify acknowledged perf control'),job.index('Build frozen sources and plans'))
         self.assertNotIn('continue-on-error',preflight)

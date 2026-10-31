@@ -13,6 +13,16 @@ import focus_cycle as fc
 import http_cost_diagnostic as hcd
 
 
+def kernel_raw(path, *, chain=None, misc=1, sample_type=295, stamp=10_500_000_000):
+    chain=[(1<<64)-128,0xffff800000001000,0xffff800000002000] if chain is None else chain
+    values={65536:99,1:0xffff800000001000,2:(777<<32)|777,4:stamp,8:8,64:64,512:512,128:3,256:1}
+    payload=b''.join(h.struct.pack('<Q',values[b]) for b in values if sample_type&b)
+    payload+=h.struct.pack('<Q',len(chain))+b''.join(h.struct.pack('<Q',v) for v in chain)
+    record=h.struct.pack('<IHH',9,misc,8+len(payload))+payload
+    raw=bytearray(168);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQQQQ',raw,16,64,104,64,168,len(record))
+    h.struct.pack_into('<Q',raw,128,sample_type);Path(path).write_bytes(raw+record)
+
+
 class HostedCycleTests(unittest.TestCase):
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
@@ -466,11 +476,44 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertTrue(all(row['environment_quality']=='unknown' for row in result['rows']))
                 self.assertEqual(result['goal_status'],'unknown' if issue=='none' else 'blocked')
 
+    def test_kernel_raw_requires_real_kernel_multiframe_and_true_field_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'perf.data'
+            for bits in (295,295|65536|8|64|512|128):
+                kernel_raw(path,sample_type=bits);row=h.kernel_chain_raw(path,10_000_000_000,11_000_000_000)
+                self.assertEqual((row['all_raw_samples'],row['window_samples'],row['kernel_multiframe_samples']),(1,1,1))
+                self.assertEqual(row['sample_type'],bits)
+            for chain,misc in [([],1),([0,0],1),([(1<<64)-128,(1<<64)-512],1),([123,123],1),([123,456],2),([(1<<64)-512,123,456],1)]:
+                kernel_raw(path,chain=chain,misc=misc);self.assertEqual(h.kernel_chain_raw(path)['kernel_multiframe_samples'],0)
+            kernel_raw(path);self.assertEqual(h.kernel_chain_raw(path,1,2)['window_samples'],0)
+            original=path.read_bytes()
+            for kind in (2,5,6,13):
+                raw=bytearray(original);h.struct.pack_into('<I',raw,168,kind);path.write_bytes(raw)
+                with self.assertRaises(ValueError):h.kernel_chain_raw(path)
+            for broken in (original[:-1],original[:128],b'not perf'):
+                path.write_bytes(broken)
+                with self.assertRaises(ValueError):h.kernel_chain_raw(path)
+            kernel_raw(path,sample_type=295|16)
+            with self.assertRaises(ValueError):h.kernel_chain_raw(path)
+
+    def test_kernel_small_raw_has_only_two_identical_bound_samples(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);directory=root/'normal-self-probe';bindings={n:{'binary_sha256':n*64} for n in ('B','R')}
+            for name in bindings:
+                raw=directory/name/'sample/score/perf.data';raw.parent.mkdir(parents=True);kernel_raw(raw)
+                (raw.parent/'unrelated.data').write_bytes(b'never exported')
+            result=h.kernel_raw_export(types.SimpleNamespace(root=root),directory,bindings)
+            self.assertTrue(result['complete']);self.assertTrue(result['original_bytes_no_redaction'])
+            self.assertEqual(set(p.name for p in (root/'normal-kernel-raw').iterdir()),{'index.json','B.perf.data','R.perf.data'})
+            for row in result['files']:
+                self.assertEqual(row['sha256'],h.sha(root/'normal-kernel-raw'/row['path']))
+                self.assertEqual(row['binding'],bindings[row['path'][0]])
+
     def test_normal_self_plan_is_six_normal_windows_without_ledger_or_acceptance(self):
         plan=h.normal_self_plan({'B':{},'R':{}})
         self.assertEqual(plan['order'],[[name,turn] for name in ('B','R') for turn in ('before','sample','after')])
         self.assertEqual((plan['workload'],plan['rate'],plan['warmup_seconds'],plan['score_seconds']),('json_object',4000,10,15))
-        self.assertEqual((plan['event'],plan['perf_frequency'],plan['perf_flags']),('cpu-clock',499,[]))
+        self.assertEqual((plan['event'],plan['perf_frequency'],plan['perf_flags']),('cpu-clock',499,['--call-graph','fp','--kernel-callchains']))
         self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(6,0))
         self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
         self.assertEqual(plan['resources'],h.RESOURCES);self.assertEqual(plan['quality_policy'],h.POLICY)
@@ -527,6 +570,7 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(record['record_complete'],issue in ('success','fragmented'))
                 self.assertEqual(bool(invoked),not bad_ready)
                 argv,options=commands[0];self.assertIn('--delay=-1',argv);self.assertNotIn('--',argv)
+                self.assertEqual(argv[argv.index('--call-graph'):argv.index('--delay=-1')],['--call-graph','fp','--kernel-callchains'])
                 self.assertIn('--control=fd:'+','.join(map(str,options['pass_fds'])),argv)
                 self.assertEqual(argv[argv.index('-p')+1],'123');self.assertEqual(len(options['pass_fds']),2)
                 for call in kill.call_args_list:self.assertEqual(call.args,(99999999,h.signal.SIGKILL))
@@ -555,13 +599,13 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(h.normal_self_client(lambda:invoked.append(True) or {'original':True},service,output,15,'/perf',sample=sample),{'original':True})
                 self.assertEqual(invoked,[True]);record=h.load(output/'normal-self-observations.json')
                 self.assertTrue(record['record_complete']);self.assertIn('not a simultaneous',record['before']['scope'])
-                self.assertIn('unavailable',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
+                self.assertIn('kernel-only',record['callchains']);self.assertIn('unknown',record['cpu_distribution'])
                 self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
     def test_perf_preflight_needs_controlled_samples_header_and_exports_then_reaps_child(self):
         for issue in ('success','fragment-child','control','header','empty-samples','export',
-                'version-missing','version-empty','version-multiple','version-identical-multiple','version-oversize'):
+                'version-missing','version-empty','version-multiple','version-identical-multiple','version-oversize','missing-chain'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 root=Path(temp);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate='b'*40)
                 stream=types.SimpleNamespace(fileno=lambda:1234,close=lambda:None)
@@ -581,8 +625,9 @@ class HostedCycleTests(unittest.TestCase):
                     if issue=='control':raise TimeoutError('no enable ACK')
                     client();record.update(record_complete=True,client_started_monotonic_ns=10_000_000_001,
                         client_finished_monotonic_ns=11_000_000_002,controlled_stop_exit=True,perf_exit_code=0)
-                    raw=bytearray(64);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQ',raw,40,65 if issue=='header' else 56,8)
-                    (output/'perf.data').write_bytes(raw)
+                    kernel_raw(output/'perf.data',chain=[] if issue=='missing-chain' else None)
+                    if issue=='header':
+                        raw=bytearray((output/'perf.data').read_bytes());h.struct.pack_into('<Q',raw,40,len(raw)+1);(output/'perf.data').write_bytes(raw)
                 patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
                 def command(argv,output,**kwargs):
                     self.assertIn(argv[1],('report','script'))
@@ -615,16 +660,17 @@ class HostedCycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
             root=Path(temp);a=types.SimpleNamespace(root=root,candidate='b'*40,prepatch=h.BASELINE,build_set='diagnostic',normal_self_probe=True)
             patches.enter_context(patch.object(h.os,'geteuid',return_value=1));builder=patches.enter_context(patch.object(h.bl,'Builder'))
-            with self.assertRaisesRegex(ValueError,'preflight required'):h.build(a,{})
+            with self.assertRaisesRegex(ValueError,'fixed archive reuse'):h.build(a,{})
             builder.assert_not_called();patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
             db=patches.enter_context(patch.object(h.db,'Database'))
             with self.assertRaisesRegex(ValueError,'preflight required'):h.normal_self_probe(a,{})
             db.assert_not_called();patches.enter_context(patch.object(h,'sha',return_value='f'*64))
             receipt=root/'normal-perf-preflight/preflight.json'
-            record=dict(complete=True,candidate='b'*40,entry_sha256='f'*64,boot_sha256='f'*64,perf_path='/perf',perf_sha256='f'*64)
+            record=dict(complete=True,candidate='b'*40,entry_sha256='f'*64,boot_sha256='f'*64,perf_path='/perf',perf_sha256='f'*64,
+                perf_flags=h.normal_self_plan({})['perf_flags'],kernel_chains={'kernel_multiframe_samples':1})
             h.save(receipt,record);h.require_normal_perf_preflight(a)
-            for key in ('complete','candidate','entry_sha256','boot_sha256','perf_sha256'):
-                h.save(receipt,dict(record,**{key:False}))
+            for key in ('complete','candidate','entry_sha256','boot_sha256','perf_sha256','perf_flags','kernel_chains'):
+                h.save(receipt,dict(record,**{key:{} if key=='kernel_chains' else False}))
                 with self.subTest(key=key),self.assertRaises(ValueError):h.require_normal_perf_preflight(a)
 
     def test_preflight_phase_is_isolated_and_has_a_total_wall_alarm(self):
@@ -655,6 +701,7 @@ class HostedCycleTests(unittest.TestCase):
                     pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
                 patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
+                patches.enter_context(patch.object(h,'kernel_chain_raw',return_value={'kernel_multiframe_samples':1}))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack=p['versions'][n]['stack'],build_mode=mode)))
                 patches.enter_context(patch.object(h,'sha',return_value='f'*64));patches.enter_context(patch.object(h.shutil,'which',return_value='/perf'))
                 commands=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
@@ -691,9 +738,9 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertEqual(result['controls']['B']['sampled_full_cpu_over_control_geomean'],10)
                 self.assertEqual(result['perf_attempts'],2 if expected==6 else 1)
                 self.assertEqual(result['goal_status'],'unknown' if complete else 'blocked')
-                self.assertTrue(all('--call-graph' not in call.args[0] for call in commands.call_args_list))
+                self.assertFalse(any('--call-graph' in c.args[0] and c.args[0][c.args[0].index('--call-graph')+1]!='none' for c in commands.call_args_list))
                 for call in commands.call_args_list:
-                    if call.args[0][1] in ('report','script'):
+                    if call.args[0][1] in ('report','script') and '--time' in call.args[0]:
                         args=call.args[0];self.assertEqual(args[args.index('--time')+1],'10.000000001,25.000000002')
 
     def test_normal_self_raw_perf_and_mapped_elf_are_in_full_archive_allowlist(self):
@@ -739,6 +786,7 @@ class HostedCycleTests(unittest.TestCase):
             patches.enter_context(patch.object(h.os,'geteuid',return_value=0));patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
             patches.enter_context(patch.object(fc,'Harness',Harness));patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:bindings[n]))
             patches.enter_context(patch.object(h,'require_normal_perf_preflight'))
+            patches.enter_context(patch.object(h,'kernel_chain_raw',return_value={'kernel_multiframe_samples':1}))
             patches.enter_context(patch.object(fc,'quiet_metrics',return_value=True));patches.enter_context(patch.object(fc,'service_termination_succeeded',return_value=True))
             patches.enter_context(patch.object(fc,'window_lifecycle_cost',return_value={'cpu_seconds_per_correct':.00001}))
             patches.enter_context(patch.object(fc,'qualification',side_effect=lambda report,w:dict(qualified=False,reasons=['environment_quality:'+report['assessment']['environment_quality']])) )

@@ -25,11 +25,15 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, normal_preflight=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
-    if root.exists() and (root.is_symlink() or any(p.name!='tools' for p in root.iterdir())):
+    allowed={'tools'}
+    if normal_preflight:
+        if not(owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA):raise ValueError('fixed normal preflight reuse required')
+        allowed.add('normal-perf-preflight')
+    if root.exists() and (root.is_symlink() or any(p.name not in allowed for p in root.iterdir())):
         raise ValueError('reuse requires a fresh output (only prepared tools may exist)')
     with tarfile.open(archive,'r:gz') as tar:
         members=tar.getmembers()
@@ -252,8 +256,9 @@ def prepare_owner(a):
         raise ValueError('owner probe requires the fixed verified normal source/run/archive')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on Linux ARM64 required')
+    if getattr(a,'normal_self_probe',False):h.require_normal_perf_preflight(a)
     expected={'B':a.candidate,'R':a.candidate}
-    mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected,owner_observation=True)
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected,owner_observation=True,normal_preflight=getattr(a,'normal_self_probe',False))
     restore_json_inputs(a.source,a.root,expected,mapping)
     for name,commit in expected.items():
         validate_protocol_inputs(a.root,name,mapping);verify_manifest(a.root,name,commit,mapping)
@@ -262,13 +267,14 @@ def prepare_owner(a):
         reused_build=dict(archive_sha256=a.archive_sha256,source_run=a.source_run,product_commit=a.candidate,
             normal_versions=expected,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False))
     h.save(a.root/'hosted-state.json',state)
-    result=h.step(state,a.root,'build',lambda:h.prepare_memory_owner(a,state))
+    if getattr(a,'normal_self_probe',False):state['reused_build']['measurement_tool_commit']=subprocess.check_output(['git','-C',str(a.source),'rev-parse','HEAD'],text=True,timeout=10).strip()
+    result=h.step(state,a.root,'build',lambda:h.complete_build(a,state,'diagnostic',a.prepatch,a.screen_variants) if getattr(a,'normal_self_probe',False) else h.prepare_memory_owner(a,state))
     h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=result['execution_complete']))
     return result
 
 
 def prepare(a):
-    if getattr(a,'memory_owner_probe',False):return prepare_owner(a)
+    if getattr(a,'memory_owner_probe',False) or getattr(a,'normal_self_probe',False):return prepare_owner(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
@@ -301,12 +307,13 @@ def main(argv=None):
     parser.add_argument('--archive-sha256',required=True);parser.add_argument('--source-run',required=True)
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
+    parser.add_argument('--normal-self-probe',action='store_true',help='Fixed B/R archive kernel-chain observation; no rebuild')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
     a=parser.parse_args(argv)
-    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe else 'followup-screen')
+    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe or a.normal_self_probe else 'followup-screen')
     except ValueError as error:parser.error(str(error))
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []
