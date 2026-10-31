@@ -370,6 +370,14 @@ jobs:
           cargo test --release --locked --test native_http_test native_http_async_ \
             -- --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test \
+            native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs \
+            -- --exact --list > "$RUNNER_TEMP/ku-http-publication-tests.list"
+          grep -Fx 'native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs: test' "$RUNNER_TEMP/ku-http-publication-tests.list"
+          test "$(grep -c ': test$' "$RUNNER_TEMP/ku-http-publication-tests.list")" -eq 1
+          cargo test --release --locked --test native_http_test \
+            native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs \
+            -- --exact --nocapture --test-threads=1
+          cargo test --release --locked --test native_http_test \
             native_http_task_self_wake_keeps_late_work_and_cross_thread_retirement \
             -- --exact --nocapture --test-threads=1
           cargo test --release --locked --test native_http_test \
