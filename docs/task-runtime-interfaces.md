@@ -28,6 +28,8 @@ fn main(): null! {
 
 原 native Task 的整数、布尔、空值、字符串、flat array、局部 bytes、函数身份、Task 调用/await、结构化 finally、time 和已支持文件操作仍沿用现有受限代码生成。这里没有把所有 Ku 对象类型、任意闭包捕获或所有标准库扩成新的异步后端；不支持的 native async 表达式应明确编译报错。
 
+JSON 局部值可跨等待保存，支持解码、字符串键索引、子树移交和编码；所有权、预付预算及具体类型范围见 [Task JSON](native-task-json.md)（[English](native-task-json.en.md)）。Task 参数、捕获和公开返回值未因此扩为任意 JSON。
+
 ## 等待与固定归属
 
 - HTTP 连接、parser、响应写出和该请求的 Task 固定归属一个事件线程。子 Task 继承归属，不偷取活动 Task。
