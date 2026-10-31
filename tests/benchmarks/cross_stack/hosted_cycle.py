@@ -1151,8 +1151,6 @@ def normal_perf_preflight(a):
     try:
         if not perf:raise ValueError('perf unavailable; preflight blocks build and six windows')
         record.update(perf_sha256=sha(perf),perf_real_path=str(Path(perf).resolve()))
-        record['version']=diagnostic_command([perf,'version'],output/'perf-version.log',timeout=2,limit=65536)
-        record['perf_version_text']=(output/'perf-version.log').read_text()[:4096]
         code='import sys,time\nsys.stdin.buffer.read(1)\nend=time.monotonic()+1\nwhile time.monotonic()<end: pass\nprint("done",flush=True)\nsys.stdin.buffer.read(1)\n'
         child=subprocess.Popen([sys.executable,'-c',code],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,start_new_session=True)
@@ -1174,10 +1172,16 @@ def normal_perf_preflight(a):
         selected=f'{start//10**9}.{start%10**9:09d},{end//10**9}.{end%10**9:09d}'
         record['exports']=[diagnostic_command([perf,kind,'-i',str(output/'perf.data'),'--time',selected,*flags],
             output/('perf-'+kind+'.log'),timeout=max(.01,min(2,deadline-time.monotonic())),limit=1<<20)
-            for kind,flags in [('report',['--stdio','--no-children','--show-nr-samples']),('script',['--ns','-F','pid,tid,time,event,ip'])]]
+            for kind,flags in [('report',['--header','--stdio','--no-children','--show-nr-samples']),('script',['--ns','-F','pid,tid,time,event,ip'])]]
+        versions=re.findall(r'^#[ \t]*perf version[ \t]*:([^\r\n]*)\r?$',(output/'perf-report.log').read_text(),re.M)
+        version=versions[0].strip() if len(versions)==1 else ''
+        record.update(perf_version_text=version,perf_version_header_fields=len(versions),
+            perf_version_source='record header VERSION feature from the required perf report --header')
+        record['perf_version_valid']=len(versions)==1 and bool(version) and version.isprintable() and len(version.encode('utf-8'))<=128
+        if not record['perf_version_valid']:record['version_identity_error']='expected exactly one nonempty printable record-header version, at most128 UTF-8 bytes'
         text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
         record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
-            and record['sample_count']>0 and record['version']['complete'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
+            and record['sample_count']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
     except BaseException as error:
         record['error']=repr(error)
         if not isinstance(error,Exception):raise

@@ -190,7 +190,8 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
     def test_perf_preflight_needs_controlled_samples_header_and_exports_then_reaps_child(self):
-        for issue in ('success','fragment-child','control','header','empty-samples','export'):
+        for issue in ('success','fragment-child','control','header','empty-samples','export',
+                'version-missing','version-empty','version-multiple','version-identical-multiple','version-oversize'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
                 root=Path(temp);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate='b'*40)
                 stream=types.SimpleNamespace(fileno=lambda:1234,close=lambda:None)
@@ -214,7 +215,16 @@ class HostedCycleTests(unittest.TestCase):
                     (output/'perf.data').write_bytes(raw)
                 patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
                 def command(argv,output,**kwargs):
-                    text='perf version6.8\n' if argv[1]=='version' else '' if issue=='empty-samples' else '777 777 10.500000000: cpu-clock: abc\n'
+                    self.assertIn(argv[1],('report','script'))
+                    self.assertGreater(kwargs['timeout'],0);self.assertLessEqual(kwargs['timeout'],2)
+                    if argv[1]=='report':
+                        self.assertIn('--header',argv)
+                        text=('# perf version : 7.0.14\n' if issue!='version-missing' else '# other header : present\n')
+                        if issue=='version-empty':text='# perf version : \t\n'
+                        elif issue=='version-multiple':text+='# perf version : 6.8.0\n'
+                        elif issue=='version-identical-multiple':text+='# perf version : 7.0.14\n'
+                        elif issue=='version-oversize':text='# perf version : '+'x'*129+'\n'
+                    else:text='' if issue=='empty-samples' else '777 777 10.500000000: cpu-clock: abc\n'
                     Path(output).write_text(text);return {'complete':issue!='export'}
                 calls=patches.enter_context(patch.object(h,'diagnostic_command',side_effect=command))
                 result=h.normal_perf_preflight(a)
@@ -223,9 +233,13 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='control':kill.assert_called_once_with(child.pid,h.signal.SIGKILL)
                 else:
                     kill.assert_not_called();self.assertEqual(write.call_count,2)
-                    self.assertTrue(result['child_reaped']);self.assertIn('version6.8',result['perf_version_text'])
+                    self.assertTrue(result['child_reaped']);self.assertNotIn('version',result)
+                    self.assertEqual(calls.call_count,2)
+                    self.assertEqual(result['perf_version_valid'],not issue.startswith('version-'))
+                    if not issue.startswith('version-'):self.assertEqual(result['perf_version_text'],'7.0.14')
+                    if issue in ('version-multiple','version-identical-multiple'):self.assertEqual(result['perf_version_header_fields'],2)
                     for call in calls.call_args_list:
-                        if call.args[0][1]!='version':self.assertEqual(call.args[0][call.args[0].index('--time')+1],'10.000000001,11.000000002')
+                        self.assertEqual(call.args[0][call.args[0].index('--time')+1],'10.000000001,11.000000002')
 
     def test_normal_preflight_gate_prevents_build_or_service_and_validates_identity(self):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
