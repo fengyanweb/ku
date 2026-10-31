@@ -1187,25 +1187,49 @@ def pg_failure_probe(a,state):
 
 
 def kernel_chain_raw(path,start=None,end=None):
-    """Validate the requested CPU-clock ABI, not text indentation or symbols."""
+    """Parse bounded CPU-clock + optional perf dummy attributes by actual event IDs."""
     path=Path(path)
     if not 0<path.stat().st_size<=16<<20:raise ValueError('bounded perf raw required')
     raw=path.read_bytes()
     if len(raw)<104 or raw[:8]!=b'PERFILE2':raise ValueError('PERFILE2 header required')
     attr_size,attrs,attrs_bytes,data,size=struct.unpack_from('<QQQQQ',raw,16)
-    if not (attrs_bytes==attr_size and attr_size>=48 and attrs+attr_size<=len(raw) and 0<data<=len(raw) and size<=len(raw)-data):raise ValueError('single bounded perf attr/data required')
-    sample_type=struct.unpack_from('<Q',raw,attrs+24)[0]
-    # UAPI order: IDENTIFIER,IP,TID,TIME,ADDR,ID,STREAM_ID,CPU,PERIOD,READ,CALLCHAIN.
-    fields=(65536,1,2,4,8,64,512,128,256);supported=32|sum(fields)
-    if sample_type&295!=295 or sample_type&~supported:raise ValueError('requested bounded CALLCHAIN sample layout required')
-    counts=dict(sample_type=sample_type,all_raw_samples=0,window_samples=0,kernel_multiframe_samples=0,raw_sha256=sha(path));offset=data
+    if not (attr_size>=64 and attrs_bytes%attr_size==0 and 1<=attrs_bytes//attr_size<=2
+            and attrs+attrs_bytes<=len(raw) and 0<data<=len(raw) and size<=len(raw)-data):raise ValueError('bounded perf attr/data required')
+    # UAPI order: IDENTIFIER,IP,TID,TIME,ADDR,ID,STREAM_ID,CPU,PERIOD,READ,CALLCHAIN,...,REGS_USER.
+    fields=(65536,1,2,4,8,64,512,128,256);supported=32|4096|sum(fields);events=[];ids={}
+    for offset in range(attrs,attrs+attrs_bytes,attr_size):
+        kind,declared=struct.unpack_from('<II',raw,offset);config=struct.unpack_from('<Q',raw,offset+8)[0]
+        sample_type=struct.unpack_from('<Q',raw,offset+24)[0]
+        if not (48<=declared<=attr_size-16 and kind==1 and config in (0,9)):raise ValueError('known CPU-clock or non-sampling dummy attr required')
+        if sample_type&~supported or sample_type&263!=263:raise ValueError('unsupported sample layout')
+        if config==0 and sample_type&32==0:raise ValueError('CPU-clock CALLCHAIN required')
+        if config==9 and sample_type!=65799:raise ValueError('known identifier-only dummy layout required')
+        if sample_type&4096 and declared<88:raise ValueError('REGS_USER mask unavailable')
+        mask=struct.unpack_from('<Q',raw,offset+80)[0] if declared>=88 else 0
+        event=dict(config=config,sample_type=sample_type,regs_user_mask=mask,ids=[]);events.append(event)
+        position,length=struct.unpack_from('<QQ',raw,offset+attr_size-16)
+        if length%8 or length>4096 or position>len(raw) or length>len(raw)-position:raise ValueError('bounded event IDs required')
+        for identifier in struct.unpack_from('<'+'Q'*(length//8),raw,position):
+            if identifier in ids:raise ValueError('duplicate event ID')
+            ids[identifier]=event;event['ids'].append(identifier)
+    primary=[event for event in events if event['config']==0]
+    if len(primary)!=1 or len({event['config'] for event in events})!=len(events):raise ValueError('one CPU-clock and at most one dummy required')
+    if len(events)>1 and any(not(event['sample_type']&65536) or not event['ids'] for event in events):raise ValueError('multi-attr samples require identifier mapping')
+    counts=dict(sample_type=primary[0]['sample_type'],attributes=events,all_raw_samples=0,all_raw_kernel_samples=0,all_raw_user_samples=0,
+        window_samples=0,window_kernel_samples=0,window_user_samples=0,window_nonzero_ip_samples=0,kernel_multiframe_samples=0,raw_sha256=sha(path));offset=data
     while offset<data+size:
         if offset+8>data+size:raise ValueError('truncated perf record header')
         kind,misc,n=struct.unpack_from('<IHH',raw,offset)
         if n<8 or offset+n>data+size:raise ValueError('bad perf record bounds')
         if kind in (2,5,6,13):raise ValueError('lost or throttled perf records')
         if kind==9:
-            cursor=offset+8;ip=stamp=0
+            cursor=offset+8;ip=stamp=0;event=events[0]
+            if len(events)>1 or event['sample_type']&65536:
+                if cursor+8>offset+n:raise ValueError('missing sample identifier')
+                event=ids.get(struct.unpack_from('<Q',raw,cursor)[0])
+                if event is None:raise ValueError('unknown sample identifier')
+            if event['config']!=0:raise ValueError('dummy event must not emit SAMPLE')
+            sample_type=event['sample_type']
             for bit in fields:
                 if sample_type&bit:
                     if cursor+8>offset+n:raise ValueError('truncated fixed sample fields')
@@ -1214,13 +1238,25 @@ def kernel_chain_raw(path,start=None,end=None):
                     if bit==4:stamp=value
             if cursor+8>offset+n:raise ValueError('missing callchain count')
             nr=struct.unpack_from('<Q',raw,cursor)[0];cursor+=8
-            if nr>512 or cursor+nr*8!=offset+n:raise ValueError('bad callchain bounds')
+            if nr>512 or cursor+nr*8>offset+n:raise ValueError('bad callchain bounds')
             kernel=misc&7==1;frames=[]
             for addr in struct.unpack_from('<'+'Q'*nr,raw,cursor):
                 if addr>=(1<<64)-4095:kernel=addr==(1<<64)-128
                 elif kernel and addr:frames.append(addr)
+            cursor+=nr*8
+            if sample_type&4096:
+                if cursor+8>offset+n:raise ValueError('missing REGS_USER ABI')
+                abi=struct.unpack_from('<Q',raw,cursor)[0];cursor+=8
+                if abi not in (0,1,2):raise ValueError('unknown REGS_USER ABI')
+                cursor+=(event['regs_user_mask'].bit_count() if abi else 0)*8
+            if cursor!=offset+n:raise ValueError('sample tail/REGS_USER bounds differ')
             counts['all_raw_samples']+=1;inside=start is None or start<=stamp<=end
-            if inside:counts['window_samples']+=1
+            mode='kernel' if misc&7==1 else 'user' if misc&7==2 else None
+            if mode:counts['all_raw_'+mode+'_samples']+=1
+            if inside:
+                counts['window_samples']+=1
+                if ip:counts['window_nonzero_ip_samples']+=1
+                if mode:counts['window_'+mode+'_samples']+=1
             if misc&7==1 and ip and len(set(frames))>=2 and inside:
                 counts['kernel_multiframe_samples']+=1
                 if 'example' not in counts:counts['example']=[hex(x) for x in frames[:128]]
@@ -1361,8 +1397,9 @@ def normal_perf_preflight(a):
             perf_version_source='record header VERSION feature from the required perf report --header')
         record['perf_version_valid']=len(versions)==1 and bool(version) and version.isprintable() and len(version.encode('utf-8'))<=128
         if not record['perf_version_valid']:record['version_identity_error']='expected exactly one nonempty printable record-header version, at most128 UTF-8 bytes'
-        text=(output/'perf-script.log').read_text();record['sample_count']=sum(int(m[1],16)!=0 for m in re.finditer(r'cpu-clock:\s+(?:0x)?([0-9a-fA-F]+)\b',text))
         record['kernel_chains']=kernel_chain_raw(output/'perf.data',start,end)
+        record['sample_count']=record['kernel_chains']['window_nonzero_ip_samples']
+        record['sample_count_source']='raw identifier-mapped SAMPLE IP inside client monotonic range; text is export only'
         record['complete']=(record.get('record_complete') is True and record['child_reaped'] and record['header_bounds_valid']
             and record['sample_count']>0 and record['kernel_chains']['kernel_multiframe_samples']>0 and record['perf_version_valid'] and all(x['complete'] for x in record['exports']) and time.monotonic()<=deadline)
     except BaseException as error:

@@ -13,14 +13,32 @@ import focus_cycle as fc
 import http_cost_diagnostic as hcd
 
 
-def kernel_raw(path, *, chain=None, misc=1, sample_type=295, stamp=10_500_000_000):
+def kernel_raw(path, *, chain=None, misc=1, sample_type=295, stamp=10_500_000_000, ip=0xffff800000001000):
     chain=[(1<<64)-128,0xffff800000001000,0xffff800000002000] if chain is None else chain
-    values={65536:99,1:0xffff800000001000,2:(777<<32)|777,4:stamp,8:8,64:64,512:512,128:3,256:1}
+    values={65536:99,1:ip,2:(777<<32)|777,4:stamp,8:8,64:64,512:512,128:3,256:1}
     payload=b''.join(h.struct.pack('<Q',values[b]) for b in values if sample_type&b)
     payload+=h.struct.pack('<Q',len(chain))+b''.join(h.struct.pack('<Q',v) for v in chain)
     record=h.struct.pack('<IHH',9,misc,8+len(payload))+payload
     raw=bytearray(168);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQQQQ',raw,16,64,104,64,168,len(record))
-    h.struct.pack_into('<Q',raw,128,sample_type);Path(path).write_bytes(raw+record)
+    h.struct.pack_into('<II',raw,104,1,48);h.struct.pack_into('<Q',raw,128,sample_type)
+    ids=b''
+    if sample_type&65536:
+        h.struct.pack_into('<QQ',raw,152,168+len(record),8);ids=h.struct.pack('<Q',99)
+    Path(path).write_bytes(raw+record+ids)
+
+
+def kernel_raw_two_attrs(path):
+    # Exact observed perf shape: software CPU-clock + non-sampling dummy, IDs and REGS_USER ABI64.
+    raw=bytearray(488);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQQ',raw,16,160,168,320)
+    for at,config,bits,mask,ids_at,ids in [(168,0,69927,1<<30,104,(11,12,13,14)),(328,9,65799,0,136,(15,16,17,18))]:
+        h.struct.pack_into('<IIQQQ',raw,at,1,144,config,499,bits)
+        h.struct.pack_into('<Q',raw,at+80,mask);h.struct.pack_into('<QQ',raw,at+144,ids_at,32)
+        h.struct.pack_into('<QQQQ',raw,ids_at,*ids)
+    chain=[(1<<64)-128,0xffff800000001000,0xffff800000002000]
+    payload=h.struct.pack('<QQQQQQ',14,chain[1],777,10_500_000_000,1,len(chain))
+    payload+=b''.join(h.struct.pack('<Q',x) for x in chain)+h.struct.pack('<QQ',2,12345)
+    record=h.struct.pack('<IHH',9,1,len(payload)+8)+payload
+    h.struct.pack_into('<QQ',raw,40,488,len(record));Path(path).write_bytes(raw+record)
 
 
 class HostedCycleTests(unittest.TestCase):
@@ -496,6 +514,27 @@ class HostedCycleTests(unittest.TestCase):
             kernel_raw(path,sample_type=295|16)
             with self.assertRaises(ValueError):h.kernel_chain_raw(path)
 
+    def test_kernel_raw_event_ids_dummy_and_register_tail_are_strict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'perf.data';kernel_raw_two_attrs(path);original=path.read_bytes()
+            row=h.kernel_chain_raw(path);self.assertEqual(row['sample_type'],69927)
+            self.assertEqual((row['window_samples'],row['window_nonzero_ip_samples'],row['kernel_multiframe_samples']),(1,1,1))
+            self.assertEqual(row['attributes'][0]['regs_user_mask'],1<<30)
+            # Unknown ID, dummy sample, duplicate ID, unknown event, absent identifier, missing reg, bad ABI/mask/tail.
+            for label,offset,fmt,value in [('unknown-id',496,'Q',999),('dummy-sample',496,'Q',15),
+                    ('duplicate-id',136,'Q',14),('unknown-event',336,'Q',8),('no-identifier',192,'Q',4391),
+                    ('bad-abi',len(original)-16,'Q',3),('two-regs',248,'Q',(1<<30)|1),
+                    ('missing-regs-mask',172,'I',80),('bad-id-bounds',312,'Q',len(original)+1)]:
+                with self.subTest(label=label):
+                    raw=bytearray(original);h.struct.pack_into('<'+fmt,raw,offset,value);path.write_bytes(raw)
+                    with self.assertRaises(ValueError):h.kernel_chain_raw(path)
+            raw=bytearray(original[:-8]);h.struct.pack_into('<Q',raw,48,len(raw)-488)
+            h.struct.pack_into('<H',raw,494,len(raw)-488);path.write_bytes(raw)
+            with self.assertRaisesRegex(ValueError,'REGS_USER bounds'):h.kernel_chain_raw(path)
+            # ABI_NONE carries no registers even with a configured mask.
+            h.struct.pack_into('<Q',raw,len(raw)-8,0);path.write_bytes(raw)
+            self.assertEqual(h.kernel_chain_raw(path)['kernel_multiframe_samples'],1)
+
     def test_kernel_small_raw_has_only_two_identical_bound_samples(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);directory=root/'normal-self-probe';bindings={n:{'binary_sha256':n*64} for n in ('B','R')}
@@ -625,7 +664,7 @@ class HostedCycleTests(unittest.TestCase):
                     if issue=='control':raise TimeoutError('no enable ACK')
                     client();record.update(record_complete=True,client_started_monotonic_ns=10_000_000_001,
                         client_finished_monotonic_ns=11_000_000_002,controlled_stop_exit=True,perf_exit_code=0)
-                    kernel_raw(output/'perf.data',chain=[] if issue=='missing-chain' else None)
+                    kernel_raw(output/'perf.data',chain=[] if issue=='missing-chain' else None,ip=0 if issue=='empty-samples' else 0xffff800000001000)
                     if issue=='header':
                         raw=bytearray((output/'perf.data').read_bytes());h.struct.pack_into('<Q',raw,40,len(raw)+1);(output/'perf.data').write_bytes(raw)
                 patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
@@ -639,7 +678,7 @@ class HostedCycleTests(unittest.TestCase):
                         elif issue=='version-multiple':text+='# perf version : 6.8.0\n'
                         elif issue=='version-identical-multiple':text+='# perf version : 7.0.14\n'
                         elif issue=='version-oversize':text='# perf version : '+'x'*129+'\n'
-                    else:text='' if issue=='empty-samples' else '777 777 10.500000000: cpu-clock: abc\n'
+                    else:text='' if issue=='success' else '777 777 10.500000000: cpu-clock:\n\n2840 2840 unrelated header\n'
                     Path(output).write_text(text);return {'complete':issue!='export'}
                 calls=patches.enter_context(patch.object(h,'diagnostic_command',side_effect=command))
                 result=h.normal_perf_preflight(a)
@@ -649,6 +688,7 @@ class HostedCycleTests(unittest.TestCase):
                 else:
                     kill.assert_not_called();self.assertEqual(write.call_count,2)
                     self.assertTrue(result['child_reaped']);self.assertNotIn('version',result)
+                    if issue!='header':self.assertEqual(result['sample_count'],0 if issue=='empty-samples' else 1)
                     self.assertEqual(calls.call_count,2)
                     self.assertEqual(result['perf_version_valid'],not issue.startswith('version-'))
                     if not issue.startswith('version-'):self.assertEqual(result['perf_version_text'],'7.0.14')
