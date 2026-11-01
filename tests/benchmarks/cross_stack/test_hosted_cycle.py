@@ -14,6 +14,53 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_v4_stages_are_fixed_independent_and_preserve_historical_thresholds(self):
+        screen=h.http_short_plan({},'v4-memory-screen');confirm=h.http_short_plan({},'v4-memory-confirm')
+        self.assertEqual((screen['maximum_windows'],confirm['maximum_windows']),(23,77))
+        self.assertEqual((screen['paired_windows_per_business'],confirm['paired_windows_per_business']),(3,12))
+        self.assertEqual(confirm['maximum_replacements'],0)
+        for workload in ('json_object','ok','db'):
+            rows=[r for r in confirm['windows'] if r['phase']=='normal' and r['workload']==workload]
+            self.assertEqual(len(rows),24)
+            self.assertEqual(sum(rows[i]['name']=='A' for i in range(0,24,2)),6)
+        self.assertEqual(confirm['adoption_thresholds']['confirmation_cpu_upper95_maximum'],1.03)
+        self.assertEqual(h.http_short_plan({},'pg-memory')['adoption_thresholds']['pg_memory_geometric_ratio_maximum'],.95)
+        self.assertNotEqual(h.PG_MEMORY_C['B'],h.V4_MEMORY_C['B'])
+        h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.V4_MEMORY_C.items()},'v4-memory-screen')
+        with self.assertRaises(ValueError):
+            h.verify_pg_memory_builds({n:{'files':{'generated C':{'sha256':v}}} for n,v in h.PG_MEMORY_C.items()},'v4-memory-screen')
+
+    def test_v4_confirmation_requires_real_memory_and_unchanged_public_CPU_guard(self):
+        for issue in ('none','cpu-old-ambiguous','memory-missing','memory-no-gain','other-memory','unknown','incomplete','compute'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({},'v4-memory-confirm')['windows']:
+                    r=dict(config,environment_quality='unknown' if issue=='unknown' else 'pass',full_cpu_us=100,
+                        memory={'steady_median_bytes':1_000_000})
+                    if r['name']=='B':
+                        r['full_cpu_us']*=.99
+                        r['memory']['steady_median_bytes']*=.94 if r['workload']=='db' else 1
+                        if issue=='cpu-old-ambiguous' and r['workload']=='db':r['full_cpu_us']=103.23294247991877
+                        if issue=='memory-no-gain' and r['workload']=='db':r['memory']['steady_median_bytes']=990000
+                        if issue=='other-memory' and r['workload']=='json_object':r['memory']['steady_median_bytes']=1040000
+                        if issue=='compute' and r['workload']=='cpu':r['full_cpu_us']=104
+                    if issue=='memory-missing' and r['workload']=='db':r['memory']={'virtual_bytes':1}
+                    rows.append(r)
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},'v4-memory-confirm')
+                self.assertEqual(result['eligible_for_root_review'],issue=='none')
+                self.assertFalse(result['candidate_accepted']);self.assertFalse(result['eligible_for_confirmation'])
+                self.assertFalse(result['pooling_previous_windows'])
+
+    def test_v4_screen_only_enables_confirmation_not_adoption(self):
+        rows=[]
+        for config in h.http_short_plan({},'v4-memory-screen')['windows']:
+            r=dict(config,environment_quality='pass',full_cpu_us=100,memory={'steady_median_bytes':1_000_000})
+            if r['name']=='B' and r['workload']=='db':r['memory']['steady_median_bytes']=940000
+            rows.append(r)
+        result=h.http_short_comparison(rows,True,{'quality':'pass'},'v4-memory-screen')
+        self.assertTrue(result['eligible_for_confirmation']);self.assertFalse(result['eligible_for_root_review'])
+        self.assertFalse(result['candidate_accepted']);self.assertEqual(result['compute_guard']['pairs'],1)
+
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
         controls,business=plan['windows'][:3],plan['windows'][3:]
@@ -1542,7 +1589,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn("timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_goal == 'v4-memory-confirm' && 36 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}",workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

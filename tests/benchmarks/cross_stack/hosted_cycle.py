@@ -21,6 +21,8 @@ PG_MEMORY_C = {
     'A':'830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77',
     'B':'e2f32de65729b0c2f8241fec2238cc3c59cd955ccb3857e0d8be191dc0c1d5a2',
 }
+V4_GOALS=('v4-memory-screen','v4-memory-confirm')
+V4_MEMORY_C=dict(PG_MEMORY_C,B='19f5406c142cb93807d25dd114d1aee858c5498ffdfd228503f8879ca8146765')
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -41,12 +43,12 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def http_short_prepatch(goal):
-    if goal not in ('cpu','memory','pg-memory'):raise ValueError('HTTP short goal must be cpu or memory or pg-memory')
-    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' else HTTP_SHORT_PREPATCH
+    if goal not in ('cpu','memory','pg-memory',*V4_GOALS):raise ValueError('unregistered HTTP short goal')
+    return HTTP_SHORT_PG_PREPATCH if goal=='pg-memory' or goal in V4_GOALS else HTTP_SHORT_PREPATCH
 
 
-def verify_pg_memory_builds(identities):
-    for name,expected in PG_MEMORY_C.items():
+def verify_pg_memory_builds(identities,goal='pg-memory'):
+    for name,expected in (V4_MEMORY_C if goal in V4_GOALS else PG_MEMORY_C).items():
         if identities.get(name,{}).get('files',{}).get('generated C',{}).get('sha256')!=expected:
             raise ValueError('PG memory screen requires the exact preregistered complete C: '+name)
 
@@ -284,6 +286,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal in V4_GOALS:return v4_short_plan(versions,goal)
     prepatch=http_short_prepatch(goal)
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
         rate=500,warmup_seconds=5,score_seconds=10) for g in (1,2,3)]
@@ -319,6 +322,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal in V4_GOALS:return v4_short_comparison(rows,complete,environment,goal)
     http_short_prepatch(goal)
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
         formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment,http_short_goal=goal)
@@ -369,6 +373,73 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
     if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
     result['eligible_for_root_review']=not result['reasons']
     result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
+    return result
+
+
+def v4_short_plan(versions,goal):
+    if goal not in V4_GOALS:raise ValueError('v4 stage must be preregistered')
+    confirm=goal==V4_GOALS[1];pairs=12 if confirm else 3
+    plan=http_short_plan(versions,'pg-memory')
+    controls=plan['windows'][:3]
+    windows=[dict(name=name,phase='normal',workload=w,contract=c,group=g,rate=rate,warmup_seconds=3,score_seconds=15)
+        for w,rate,c in (('json_object',500,'dom'),('ok',2000,'text'),('db',200,'pg-strict'))
+        for g in range(1,pairs+1) for name in (('A','B') if g%2 else ('B','A'))]
+    windows+=plan['windows'][-2:]
+    plan.update(http_short_goal=goal,windows=controls+windows,maximum_windows=len(controls+windows),
+        observation_alarm_seconds=2130 if confirm else 690,workflow_limit_seconds=2160 if confirm else 720,
+        paired_windows_per_business=pairs,stage='independent-confirmation' if confirm else 'screen',
+        purpose='V4 single SoA/full-token + same-result PG shape + query-capacity candidate; ordinary A/B helpers O2, unchanged business/SQL/deadlines/capacity. '
+            'Screen3pairs and one separate fixed12pair confirmation, each with3controls and one coarse compute pair. No optional stopping, replacements, pooled stages, Rust ranking, capacity or30min acceptance.',
+        adoption_thresholds=dict(pg_memory_geometric_ratio_maximum=.97,
+            rationale='New10/12B aligned full-key layout has smaller requested saving than rejected4B variant;3% minimum is frozen before this new candidate, not a changed historical5% gate or original16target.',
+            screen_memory_upper95_maximum=1.03,screen_cpu_point_maximum=1.03,screen_cpu_lower95_maximum=1.03,
+            confirmation_memory_upper95_strictly_below=1,confirmation_cpu_lower95_maximum=1,
+            confirmation_cpu_upper95_maximum=1.03,confirmation_other_memory_lower95_maximum=1,
+            confirmation_other_memory_upper95_maximum=1.03,compute_ratio_maximum=1.03,
+            memory_metric='memory.steady_median_bytes',CPU_metric='full_cpu_us: before score driver launch after warmup through recorded termination; no cold-start/warmup CPU',
+            final_decision='Screen can only enable the one fixed confirmation. Confirmation never automatically adopts or passes original16goals.'),
+        evidence_basis=dict(old_candidate_run=41312215552,old_not_adopted=True,
+            old_complete_C=PG_MEMORY_C['B'],new_complete_C=V4_MEMORY_C['B'],
+            mechanism='Aligned full64token plane plus16/32bit slot plane; no registration-dependent key probe or deletion home lookup. Same allocation count, capacity, namespace and conservative16B budget.',
+            CPU_cause_of_old_point_estimate='unknown; added indirect loads are source facts, not established CPU cause',
+            generic_Value_AST_changed=False))
+    return plan
+
+
+def v4_short_comparison(rows,complete,environment,goal):
+    plan=v4_short_plan({},goal);confirm=goal==V4_GOALS[1];groups=range(1,plan['paired_windows_per_business']+1)
+    result=dict(complete=complete,http_short_goal=goal,eligible_for_confirmation=False,eligible_for_root_review=False,
+        candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,reasons=[],comparisons={},other_memory_guards={},
+        independent_stage=True,pooling_previous_windows=False,thresholds=plan['adoption_thresholds'])
+    if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification failed or unknown')
+    if not complete:
+        result['reasons'].append('incomplete observations or cleanup; no metric scoring');return result
+    business=[r for r in rows if r['phase']=='normal']
+    if len(business)!=6*len(groups) or any(r.get('environment_quality')!='pass' for r in business):
+        result['reasons'].append('business row count or environment differs');return result
+    for workload in ('json_object','ok','db'):
+        selected=[r for r in business if r['workload']==workload]
+        pairs=[{r['name']:r for r in selected if r['group']==g} for g in groups]
+        if any(set(p)!=set(('A','B')) for p in pairs):raise ValueError('v4 incomplete pair identity')
+        cpu=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
+        memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+            [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+        result['comparisons'][workload]=cpu
+        if cpu.get('status')!='estimated' or (cpu['lower95']>1 or cpu['upper95']>1.03 if confirm else cpu['estimate']>1.03 or cpu['lower95']>1.03):
+            result['reasons'].append(workload+' CPU '+('confirmation guard unresolved/failed' if confirm else 'screen failed'))
+        if workload=='db':
+            result['pg_memory']=memory
+            if memory.get('status')!='estimated' or memory['estimate']>.97 or (memory['upper95']>=1 if confirm else memory['upper95']>1.03):
+                result['reasons'].append('PG memory '+('confirmation criterion unresolved/failed' if confirm else 'screen failed'))
+        else:
+            result['other_memory_guards'][workload]=memory
+            if memory.get('status')!='estimated' or (memory['lower95']>1 or memory['upper95']>1.03 if confirm else memory['lower95']>1.03):
+                result['reasons'].append(workload+' memory guard unresolved/failed')
+    cpu={r['name']:r for r in rows if r['phase']=='compute-guard'}
+    ratio=cpu['B']['full_cpu_us']/cpu['A']['full_cpu_us']
+    result['compute_guard']=dict(B_over_A=ratio,pairs=1,confidence_interval=None,scope='coarse guard only')
+    if ratio>1.03:result['reasons'].append('coarse compute guard failed')
+    result['eligible_for_root_review' if confirm else 'eligible_for_confirmation']=not result['reasons']
     return result
 
 
@@ -690,8 +761,8 @@ def complete_build(a,state,build_set,prepatch,variants):
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
-    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu')=='pg-memory':
-        verify_pg_memory_builds(identities)
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu') in ('pg-memory',*V4_GOALS):
+        verify_pg_memory_builds(identities,getattr(a,'http_short_goal','cpu'))
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     if build_set=='followup-screen':
@@ -2454,7 +2525,7 @@ def main(argv=None):
     p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-memory',*V4_GOALS],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
@@ -2499,7 +2570,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else http_short_plan({},a.http_short_goal)['observation_alarm_seconds'] if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
