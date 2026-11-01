@@ -610,7 +610,8 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             case "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" in
-              pg-zero-cpu) test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507 ;;
+              pg-zero-cpu) test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507
+                test "$KU_PERFORMANCE_V2_CANDIDATE" = 5b6b41138cce4086c19cc7daa24e820c9b6513d8 ;;
               cpu|memory) test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69 ;;
               *) exit 2 ;;
             esac
@@ -852,6 +853,10 @@ jobs:
             if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
               test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true
               test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            elif [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ] && [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-zero-cpu ]; then
+              test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+              test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = 5b6b41138cce4086c19cc7daa24e820c9b6513d8
             else
               test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
             fi

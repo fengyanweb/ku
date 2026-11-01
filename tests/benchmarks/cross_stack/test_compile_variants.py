@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import types
 from unittest.mock import patch
@@ -173,6 +175,85 @@ class HostedWorkflowContracts(unittest.TestCase):
     def workflow(self):
         text=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
         return text,text.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
+
+    def test_actual_bash_build_gate_binds_zero_pair_and_preserves_legacy_and_normal_PG(self):
+        bash=shutil.which('bash')
+        if bash is None:self.skipTest('Actual hosted workflow shell requires Bash')
+        _,job=self.workflow()
+        def script(step):
+            block=job.split('- name: '+step,1)[1].split('\n      - name:',1)[0]
+            return textwrap.dedent(block.split('run: |\n',1)[1])
+        verify=script('Verify runner entry contracts without starting workloads')
+        build=script('Build frozen sources and plans as the benchmark user')
+        A='ca6cdeec4a3c315afc965c941680f2111ae3e507'
+        B='5b6b41138cce4086c19cc7daa24e820c9b6513d8'
+        old='b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
+        pg='f43e74fdfe384c385a6703f3ee3eab933880b9e2'
+        head='c'*40
+        base=dict(KU_PERFORMANCE_V2_SCOPE='performance-followup-diagnostic',
+            KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN='true',KU_PERFORMANCE_V2_HTTP_SHORT_GOAL='pg-zero-cpu',
+            KU_PERFORMANCE_V2_PREPATCH=A,KU_PERFORMANCE_V2_CANDIDATE=B,
+            KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD='json_object',KU_PERFORMANCE_V2_VARIANTS='',
+            KU_PERFORMANCE_V2_REUSE_RUN='',KU_PERFORMANCE_V2_REUSE_SHA256='',
+            KU_PERFORMANCE_V2_BASELINE='956727188a058119fdb3790959063f1496ccb4cc',GITHUB_SHA=head)
+        for key in ('PG_DRIVER_SCREEN','PG_QUEUE_SCREEN','PG_FAILURE_PROBE','NORMAL_SELF_PROBE',
+                'TASK_JSON_SCREEN','COMMON_HTTP_SCREEN','FINAL_TASK_JSON','MEMORY_OWNER_PROBE'):
+            base['KU_PERFORMANCE_V2_'+key]='false'
+        cases=[('zero-correct',{},True),
+            ('zero-wrong-A',{'KU_PERFORMANCE_V2_PREPATCH':old},False),
+            ('zero-wrong-B',{'KU_PERFORMANCE_V2_CANDIDATE':'0'*40},False),
+            ('zero-wrong-B-current-tools',{'KU_PERFORMANCE_V2_CANDIDATE':head},False),
+            ('zero-wrong-scope',{'KU_PERFORMANCE_V2_SCOPE':'followup-screen'},False),
+            ('zero-not-selected',{'KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN':'false'},False),
+            ('zero-conflicting-mode',{'KU_PERFORMANCE_V2_NORMAL_SELF_PROBE':'true'},False),
+            ('zero-no-reuse',{'KU_PERFORMANCE_V2_REUSE_RUN':'123'},False)]
+        for goal in ('cpu','memory'):
+            legacy=dict(KU_PERFORMANCE_V2_HTTP_SHORT_GOAL=goal,KU_PERFORMANCE_V2_PREPATCH=old,
+                KU_PERFORMANCE_V2_CANDIDATE=head)
+            cases += [(goal+'-current-head',legacy,True),
+                (goal+'-foreign-product',dict(legacy,KU_PERFORMANCE_V2_CANDIDATE=B),False),
+                (goal+'-wrong-A',dict(legacy,KU_PERFORMANCE_V2_PREPATCH=A),False)]
+        for workload in ('db','db-gpr'):
+            normal=dict(KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN='false',KU_PERFORMANCE_V2_HTTP_SHORT_GOAL='cpu',
+                KU_PERFORMANCE_V2_NORMAL_SELF_PROBE='true',KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD=workload,
+                KU_PERFORMANCE_V2_CANDIDATE=pg)
+            cases += [(workload+'-frozen-F',normal,True),
+                (workload+'-foreign-product',dict(normal,KU_PERFORMANCE_V2_CANDIDATE=B),False),
+                (workload+'-missing-probe',dict(normal,KU_PERFORMANCE_V2_NORMAL_SELF_PROBE='false'),False)]
+        for name,changes,success in cases:
+            with self.subTest(name=name),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);bin_dir=root/'bin';bin_dir.mkdir();receipt=root/'stub.jsonl'
+                # Every Python entry (pure checks and build) only records argv.
+                # The workflow Bash itself executes unchanged; no compiler,
+                # dependency install, database, service or driver is invoked.
+                stub=bin_dir/'python3';stub.write_text('#!'+sys.executable+'\n'
+                    'import json,os,sys\n'
+                    'with open(os.environ["STUB_RECEIPT"],"a") as s:s.write(json.dumps(sys.argv[1:])+"\\n")\n')
+                stub.chmod(0o755)
+                env={**os.environ,**base,**changes}
+                env.update(PATH=str(bin_dir)+os.pathsep+os.defpath,
+                    STUB_RECEIPT=str(receipt),RUNNER_TEMP=str(root),GITHUB_WORKSPACE=str(root),
+                    KU_PERFORMANCE_V2_ROOT=str(root/'evidence'))
+                for variable in ('BASH_ENV','ENV','PYTHONHOME','PYTHONPATH','PYTHONINSPECT'):
+                    env.pop(variable,None)
+                entry=subprocess.run([bash,'--noprofile','--norc','-e','-o','pipefail','-c',verify],
+                    env=env,cwd=root,capture_output=True,text=True,timeout=10)
+                built=(subprocess.run([bash,'--noprofile','--norc','-e','-o','pipefail','-c',build],
+                    env=env,cwd=root,capture_output=True,text=True,timeout=10) if entry.returncode==0 else None)
+                self.assertEqual(entry.returncode==0 and built is not None and built.returncode==0,success,
+                    (entry.stdout,entry.stderr,None if built is None else built.stderr))
+                calls=[json.loads(line) for line in receipt.read_text().splitlines()] if receipt.exists() else []
+                build_calls=[args for args in calls if 'tests/benchmarks/cross_stack/hosted_cycle.py' in args]
+                self.assertEqual(len(build_calls),1 if success else 0)
+                self.assertTrue(all('-m' in args or args in build_calls for args in calls))
+                if success:
+                    args=build_calls[0]
+                    for flag,expected in [('--phase','build'),('--build-set','diagnostic'),
+                            ('--candidate',env['KU_PERFORMANCE_V2_CANDIDATE']),('--prepatch',env['KU_PERFORMANCE_V2_PREPATCH'])]:
+                        self.assertEqual(args[args.index(flag)+1],expected)
+                    if env['KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN']=='true':
+                        self.assertIn('--http-short-screen',args)
+                        self.assertEqual(args[args.index('--http-short-goal')+1],env['KU_PERFORMANCE_V2_HTTP_SHORT_GOAL'])
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
