@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import statistics
 import tarfile
 import tempfile
 import urllib.request
@@ -213,7 +214,7 @@ def slice_archive(archive, receipt_path, metadata_path, output, include_self=Fal
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('metadata', 'slice'))
+    parser.add_argument('mode', choices=('metadata', 'slice', 'recompute'))
     parser.add_argument('--source-run')
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--receipt', type=Path)
@@ -223,9 +224,86 @@ def main():
     args = parser.parse_args()
     if args.mode == 'metadata':
         fetch_metadata(args.source_run or '', args.output)
+    elif args.mode == 'recompute':
+        print(json.dumps(recompute_slice(args.archive, args.output), sort_keys=True))
     else:
         print(json.dumps(slice_archive(args.archive, args.receipt, args.metadata, args.output,
                                        args.include_normal_self_probe), sort_keys=True))
+
+
+def recompute_slice(archive, output):
+    """Replay original samples. No executable, service or workload is run."""
+    if archive.is_symlink() or not archive.is_file() or not 0 < archive.stat().st_size <= MAX_ARCHIVE:
+        raise ValueError('requires a bounded regular slice')
+    if output.exists() or output.is_symlink():
+        raise ValueError('recompute output already exists')
+    inputs = {}
+    with tarfile.open(archive, 'r:gz') as source:
+        members = source.getmembers()
+        if len(members) > MAX_FILES or sum(m.size for m in members) > MAX_EXPANDED:
+            raise ValueError('slice exceeds bound')
+        for member in members:
+            safe_path(member.name)
+            if not member.isfile() or member.size > MAX_FILE or member.name in inputs:
+                raise ValueError('unsupported slice member')
+            if member.name == 'slice-manifest.json' or (member.name.startswith('http-short-screen/')
+                    and member.name.endswith(('/score/resources.json', '/score/client.json', '/full-lifecycle.json', '/window.json'))):
+                raw = source.extractfile(member).read()
+                if len(raw) != member.size:
+                    raise ValueError('truncated slice input')
+                inputs[member.name] = (json.loads(raw), digest(raw), len(raw))
+    manifest = inputs['slice-manifest.json'][0]
+    expected = {f['path']: f for f in manifest['files']}
+    for name, (_, checksum, size) in inputs.items():
+        if name != 'slice-manifest.json' and (expected[name]['exported_sha256'] != checksum or expected[name]['bytes'] != size):
+            raise ValueError('recompute input identity differs: ' + name)
+    rows = []
+    for name in sorted(inputs):
+        if not name.endswith('/score/resources.json'):
+            continue
+        prefix = name.removesuffix('/score/resources.json')
+        needed = [name, prefix+'/score/client.json', prefix+'/full-lifecycle.json', prefix+'/window.json']
+        samples, client, full, window = [inputs[k][0] for k in needed]
+        cost, correct = client['service_cost'], client['ledger']['correct_total']
+        clock = cost['cross_process_clock']
+        if not clock['available'] or samples['error'] or samples['overflow'] or correct <= 0:
+            raise ValueError('unavailable original metric inputs: ' + prefix)
+        start = clock['origin_ns']
+        stop = start + int(client['configuration']['duration_seconds']*1e9)
+        selected = [d for sample in samples['samples'] for d in sample['domains']
+                    if d['label'] == cost['before']['label'] and start <= d['monotonic_ns'] <= stop]
+        if len(selected) < 5 or any(a['monotonic_ns'] > b['monotonic_ns'] for a, b in zip(selected, selected[1:])):
+            raise ValueError('insufficient or unordered original memory samples')
+        lo, hi = len(selected)//5, len(selected)*4//5
+        middle = selected[lo:hi]
+        memory = statistics.median(d['memory_current'] for d in middle)
+        begin, end = cost['before'], full['accounting_end']
+        cpu_delta = end['cpu_stat']['usage_usec'] - begin['cpu_stat']['usage_usec']
+        cpu = cpu_delta/correct
+        if (cpu_delta < 0 or end['monotonic_ns'] < begin['monotonic_ns'] or correct != window['correct']
+                or abs(cpu-window['full_cpu_us']) > 1e-9
+                or abs(cpu-full['cpu_seconds_per_correct']*1e6) > 1e-9
+                or memory != window['memory']['steady_median_bytes']
+                or memory != cost['arrival_window_memory']['steady_median_bytes']):
+            raise ValueError('original metric replay differs: ' + prefix)
+        rows.append(dict(window=prefix, correct=correct, full_cpu_us=cpu,
+            cpu_begin_monotonic_ns=begin['monotonic_ns'], cpu_end_monotonic_ns=end['monotonic_ns'],
+            cpu_begin_usage_usec=begin['cpu_stat']['usage_usec'], cpu_end_usage_usec=end['cpu_stat']['usage_usec'],
+            arrival_start_ns=start, arrival_end_ns=stop, memory_sample_count=len(selected),
+            middle_indices=[lo, hi], middle_memory_values=[d['memory_current'] for d in middle],
+            middle_monotonic_ns=[d['monotonic_ns'] for d in middle], steady_median_bytes=memory,
+            inputs={k: dict(sha256=inputs[k][1], bytes=inputs[k][2]) for k in needed}))
+    if not rows:
+        raise ValueError('no original short-screen resource windows')
+    report = dict(schema='ku-existing-short-metric-replay-v1', source_run=manifest['source_run'],
+        source_head=manifest['source_head'], source_archive_sha256=manifest['source_archive_sha256'],
+        code_sha256=digest(Path(__file__).read_bytes()), source_slice_sha256=digest(archive.read_bytes()),
+        no_new_measurement=True, window_count=len(rows), correct=sum(r['correct'] for r in rows),
+        CPU_scope='Original service-domain snapshot before score-driver launch (after startup/warmup) through recorded accounting_end after drain/termination. Does not include cold startup or warmup.',
+        memory_scope='Original1Hz service-cgroup memory.current within arrival interval, chronological sample slice[n//5:n*4//5], then median. No RSS or endpoint substitution.', rows=rows)
+    with output.open('x') as stream:
+        stream.write(encoded(report).decode())
+    return {k: v for k, v in report.items() if k != 'rows'}
 
 
 if __name__ == '__main__':

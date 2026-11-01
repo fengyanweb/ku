@@ -1977,11 +1977,22 @@ jobs:
             --output "$RUNNER_TEMP/evidence-slice-output/ku-evidence-slice.tar.gz" "${options[@]}" \
             2>&1 | tee "$RUNNER_TEMP/evidence-slice-logs/slice.log"
 
+      - name: Recompute existing short-window CPU and memory from original samples
+        if: inputs.include_normal_self_probe != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/evidence_slice.py recompute \
+            --archive "$RUNNER_TEMP/evidence-slice-output/ku-evidence-slice.tar.gz" \
+            --output "$RUNNER_TEMP/evidence-slice-output/recomputed-short-metrics.json"
+
       - name: Retain verified compact slice (existing evidence, no performance progress)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ku-evidence-slice
-          path: ${{ runner.temp }}/evidence-slice-output/ku-evidence-slice.tar.gz
+          path: |
+            ${{ runner.temp }}/evidence-slice-output/ku-evidence-slice.tar.gz
+            ${{ runner.temp }}/evidence-slice-output/recomputed-short-metrics.json
           retention-days: 1
           if-no-files-found: error
 
