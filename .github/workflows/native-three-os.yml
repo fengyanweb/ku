@@ -602,7 +602,7 @@ jobs:
         run: |
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
+            test "$KU_PERFORMANCE_V2_PREPATCH" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
             test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false
