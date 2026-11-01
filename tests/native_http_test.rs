@@ -3807,10 +3807,16 @@ fn native_http_validates_unmaterialized_headers_and_owns_route_snapshot() {
     let mut generated = native_c_harness::emit_c(
         directory.path(),
         r#"
-import "std.http"
+import { http, json } from "std"
 fn ProofText(): HttpResponse { return http.text("owner".clone()) }
 fn ProofNumber(): HttpResponse { return http.text(str(40 + 2)) }
 fn ProofError(): HttpResponse! { return err("controlled") }
+fn ProofMath(): HttpResponse { zero=0 return http.text(str(1 / zero)) }
+fn ProofUnused(_req: HttpRequest): HttpResponse { return http.text("owner".clone()) }
+fn ProofUnusedNumber(_req: HttpRequest): HttpResponse { return http.text(str(40 + 2)) }
+fn ProofUnusedError(_req: HttpRequest): HttpResponse! { return err("controlled") }
+fn ProofUnusedMath(_req: HttpRequest): HttpResponse { zero=0 return http.text(str(1 / zero)) }
+fn ProofUnusedJson(_req: HttpRequest): HttpResponse! { return ok(http.text(json.encode({a: 1})?)) }
 fn ProofLong(): HttpResponse { i=0 while (i<1000) { i=i+1 } return http.text(str(i)) }
 fn ProofBodyQuery(req: HttpRequest): HttpResponse { return http.text(req.body + req.query.q) }
 fn ProofComplete(req: HttpRequest): HttpResponse { return http.text(req.headers.host + req.params.id + req.method + req.path + req.body + req.query.q) }
@@ -3825,6 +3831,12 @@ fn main(): null! {
     app.get("/proof-number",ProofNumber)
     app.get("/proof-error",ProofError)
     app.get("/proof-long",ProofLong)
+    app.post("/unused/{id}",ProofUnused)
+    app.get("/unused-number",ProofUnusedNumber)
+    app.get("/unused-error",ProofUnusedError)
+    app.get("/unused-math",ProofUnusedMath)
+    app.get("/unused-json",ProofUnusedJson)
+    app.get("/proof-math",ProofMath)
     app.post("/body/{id}",ProofBodyQuery)
     app.post("/whole/{id}",ProofWhole)
     app.post("/async-query/{id}",ProofAsyncQuery)
@@ -4098,17 +4110,33 @@ int main(void) {
   CHECK(ku_http_handler_is_short((void*)ProofNumber__thunk));
   CHECK(ku_http_handler_is_short((void*)ProofError__thunk));
   CHECK(!ku_http_handler_is_short((void*)ProofLong__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofMath__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofUnused__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofUnusedNumber__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofUnusedError__thunk));
+  CHECK(ku_http_handler_is_short((void*)ProofUnusedMath__thunk));
+  CHECK(!ku_http_handler_is_short((void*)ProofUnusedJson__thunk));
+  CHECK(ku_http_handler_request_fields((void*)ProofUnused__thunk)==0u);
+  ku_http_server_add_route(server,STR("POST"),STR("/unused/{id}"),(void*)ProofUnused__thunk,NULL,1,0);
   /* Exercise real generated bodies and cleanup with a deliberately populated
      outer TLS frame; every field must survive success, Result error and expiry. */
   KuHttpWake local_wake={0};CHECK(ku_http_wake_init(&local_wake));
   KuHttpQueue local_queue={0};CHECK(ku_http_queue_init(&local_queue,4,&local_wake));
-  void* invokes[]={(void*)ProofText__thunk,(void*)ProofNumber__thunk,(void*)ProofError__thunk};
-  for(int mode=0;mode<4;mode++) {
+  void* invokes[]={(void*)ProofText__thunk,(void*)ProofNumber__thunk,(void*)ProofError__thunk,(void*)ProofMath__thunk,
+      (void*)ProofUnused__thunk,(void*)ProofUnusedNumber__thunk,(void*)ProofUnusedError__thunk,(void*)ProofUnusedMath__thunk};
+  for(int mode=0;mode<11;mode++) {
     KuHttpInput local_input={0};local_input.budget=&budget;budget.limit=1048576;
-    CHECK(ku_http_parse_complete_header(server,plain,strlen(plain),&local_input)==0);
-    local_input.route->invoke=invokes[mode%3];local_input.route->returns_result=mode%3==2;
+    const char* request="POST /unused/a?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n";
+    CHECK(ku_http_parse_complete_header(server,request,strlen(request),&local_input)==0);
+    CHECK(local_input.route->fields_mask==0u && !local_input.headers);
+    memcpy(local_input.body,"hey",3u);
+    int choice=mode<8?mode:4;
+    local_input.route->invoke=invokes[choice];local_input.route->returns_result=choice%4==2;
+    local_input.route->arity=choice>=4;
     KuHttpJob* job=ku_http_job_new(&local_queue,&local_input);CHECK(job);
-    job->request_deadline=mode==3?1:ku_http_deadline_ms(3000u);
+    job->request_deadline=mode==8?1:ku_http_deadline_ms(3000u);
+    if(mode==9)ku_http_queue_cancel_job(job);
+    if(mode==10)budget.limit=budget.current+sizeof(KuStruct___ku_http_request)-1u;
     __ku_call_depth=7;__ku_handler_deadline=11;__ku_handler_cleanup_deadline=13;
     __ku_handler_timed_out=1;__ku_handler_unwind_depth=3;
     KuSyncExitSignal previous={0};previous.kind=KU_SYNC_EXIT_ARITHMETIC_FATAL;
@@ -4118,11 +4146,40 @@ int main(void) {
     CHECK(__ku_handler_timed_out==1 && __ku_handler_unwind_depth==3);
     CHECK(__ku_sync_return_signal.kind==previous.kind && __ku_sync_return_signal.arithmetic_status==2);
     CHECK(job->completed && ku_http_job_only_owner(job));
-    if(mode==0)CHECK(job->response.status==200 && job->response.body.len==5 && !memcmp(job->response.body.ptr,"owner",5));
-    if(mode==1)CHECK(job->response.status==200 && job->response.body.len==2 && !memcmp(job->response.body.ptr,"42",2));
-    if(mode==2)CHECK(job->response.status==500);
-    if(mode==3)CHECK(job->cancelled && !job->started && !job->response.body.ptr);
+    CHECK(!job->projection_charge && !job->input.body && !job->input.route);
+    if(mode<8) {
+      CHECK(job->started && !job->cancelled && job->handler_deadline<=job->request_deadline);
+      if(choice%4==0)CHECK(job->response.status==200 && job->response.body.len==5 && !memcmp(job->response.body.ptr,"owner",5));
+      if(choice%4==1)CHECK(job->response.status==200 && job->response.body.len==2 && !memcmp(job->response.body.ptr,"42",2));
+      if(choice%4>=2)CHECK(job->response.status==500);
+      if(choice%4==3)CHECK(job->failure.reason==KU_HTTP_ERROR_HANDLER_EXIT);
+    } else if(mode==10)CHECK(!job->cancelled && !job->started && job->response.status==503);
+    else CHECK(job->cancelled && !job->started && !job->response.body.ptr);
     ku_http_job_release(job);CHECK(!budget.current);
+  }
+  /* The ordinary one-argument route must actually take the bounded owner
+     admission path, without a physical handler worker or queued reference. */
+  {
+    KuHttpLoopGroup inline_group={0};CHECK(ku_http_mutex_init(&inline_group.lock));inline_group.server=server;
+    KuHttpLoopOwner inline_owner={0};inline_owner.group=&inline_group;inline_owner.wake=&local_wake;
+    KuHttpConnection connection={0};connection.socket_value=KU_HTTP_INVALID_SOCKET;
+    connection.budget=&budget;connection.input.budget=&budget;budget.limit=1048576;
+    connection.request_deadline=ku_http_deadline_ms(3000u);
+    const char* request="POST /unused/a?q=z HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\n";
+    CHECK(!ku_http_parse_complete_header(server,request,strlen(request),&connection.input));
+    memcpy(connection.input.body,"hey",3u);local_queue.owner_inline_remaining=1;
+    ku_http_current_loop=&inline_owner;
+    ku_http_connection_submit(&connection,server,&local_queue,0);
+    CHECK(!local_queue.owner_inline_remaining && !local_queue.count && local_queue.resident==1u);
+    CHECK(connection.phase==KU_HTTP_IO_JOB && connection.job && connection.job->completed);
+    CHECK(ku_http_job_only_owner(connection.job) && !connection.job->input.body && !connection.job->input.route);
+    ku_http_connection_observe_job(&connection,server);
+    CHECK(connection.phase==KU_HTTP_IO_WRITE && connection.output.response.status==200);
+    CHECK(connection.output.response.body.len==5u && !memcmp(connection.output.response.body.ptr,"owner",5u));
+    CHECK(inline_owner.requests==1u && inline_owner.admitted==1u && inline_owner.success==1u);
+    ku_http_connection_close(&connection);ku_http_current_loop=NULL;
+    CHECK(!connection.job && !local_queue.resident && !budget.current);
+    ku_http_mutex_destroy(&inline_group.lock);
   }
   /* A direct-field sync thunk omits unobserved maps/strings; whole-request
      transfer conservatively keeps all fields. Framing validation remains before
