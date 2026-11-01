@@ -33,6 +33,11 @@ on:
         type: boolean
         default: false
 
+      fixed_goals_only:
+        description: 'Original80 windows/16 goals only; performance-v2, fresh full build, no capacity/stability or complete-acceptance claim'
+        type: boolean
+        default: false
+
       pg_failure_probe:
         description: 'One PG12800 failure observation; performance-followup-diagnostic only, fresh normal build, no matrix or perf'
         type: boolean
@@ -597,6 +602,7 @@ jobs:
       KU_PERFORMANCE_V2_TASK_JSON_SCREEN: ${{ inputs.task_json_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN: ${{ inputs.common_http_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_FINAL_TASK_JSON: ${{ inputs.final_task_json && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_FIXED_GOALS_ONLY: ${{ inputs.fixed_goals_only && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}
@@ -621,6 +627,16 @@ jobs:
 
       - name: Verify runner entry contracts without starting workloads
         run: |
+          if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            for mode in HTTP_SHORT_SCREEN MEMORY_OWNER_PROBE PG_DRIVER_SCREEN PG_QUEUE_SCREEN PG_FAILURE_PROBE NORMAL_SELF_PROBE TASK_JSON_SCREEN COMMON_HTTP_SCREEN FINAL_TASK_JSON; do
+              mode="KU_PERFORMANCE_V2_$mode"; test "${!mode}" = false
+            done
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
+            test -z "$KU_PERFORMANCE_V2_VARIANTS"
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+          fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
@@ -779,6 +795,12 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            test "$performance_build_set" = full
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            performance_task_json_args+=(--fixed-goals-only)
+          fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
@@ -876,6 +898,12 @@ jobs:
             performance_build_set=followup-screen
           fi
           performance_task_json_args=()
+          if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
+            test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
+            test "$performance_build_set" = full
+            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            performance_task_json_args+=(--fixed-goals-only)
+          fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
@@ -943,6 +971,9 @@ jobs:
         run: |
           set -euo pipefail
           performance_archive_args=()
+          if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
+            performance_archive_args+=(--fixed-goals-only)
+          fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             performance_archive_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH")
           fi

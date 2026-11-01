@@ -1592,6 +1592,48 @@ class HostedCycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'--fixed-goals-only'):
                 h.run(types.SimpleNamespace(fixed_goals_only=True),{},**kwargs)
 
+    def test_fixed_goals_workflow_executes_frozen_flag_and_rejects_mixed_modes_before_build(self):
+        import subprocess
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        job=workflow.split('\n  performance-v2:\n',1)[1].split('\n  full-tests:\n',1)[0]
+        def chunk(name):
+            step=job.split('      - name: '+name+'\n',1)[1].split('\n      - name:',1)[0]
+            script=step.split('        run: |\n',1)[1]
+            return '\n'.join(line[10:] if line.startswith('          ') else line for line in script.splitlines())
+        modes=('HTTP_SHORT_SCREEN','MEMORY_OWNER_PROBE','PG_DRIVER_SCREEN','PG_QUEUE_SCREEN',
+               'PG_FAILURE_PROBE','NORMAL_SELF_PROBE','TASK_JSON_SCREEN','COMMON_HTTP_SCREEN','FINAL_TASK_JSON')
+        env=dict(os.environ,**{'KU_PERFORMANCE_V2_'+key:'false' for key in modes})
+        env.update(KU_PERFORMANCE_V2_FIXED_GOALS_ONLY='true',KU_PERFORMANCE_V2_SCOPE='performance-v2',
+            KU_PERFORMANCE_V2_REUSE_RUN='',KU_PERFORMANCE_V2_REUSE_SHA256='',KU_PERFORMANCE_V2_VARIANTS='',
+            KU_PERFORMANCE_V2_CANDIDATE='b'*40,GITHUB_SHA='b'*40,KU_PERFORMANCE_V2_ROOT='/not-run',
+            GITHUB_WORKSPACE='/not-run',RUNNER_TEMP='/not-run',KU_PERFORMANCE_V2_BASELINE=h.BASELINE,
+            KU_PERFORMANCE_V2_PREPATCH=h.BASELINE,KU_PERFORMANCE_V2_HTTP_SHORT_GOAL='cpu')
+        preflight=chunk('Verify runner entry contracts without starting workloads')
+        # Read-only contract checks are the real shell entry, without a service or compiler.
+        with tempfile.TemporaryDirectory() as directory:
+            record=Path(directory)/'argv'
+            prefix='python3() { printf "%s\\0" "$@" >> "$ARGV_RECORD"; }; sudo() { shift; "$@"; }; chown() { :; };\n'
+            env['ARGV_RECORD']=str(record)
+            # The preflight also runs tool unit tests; intercept their Python invocations.
+            valid=subprocess.run(['bash','-ec',prefix+preflight],env=env,capture_output=True)
+            self.assertEqual(valid.returncode,0,valid.stderr.decode())
+            for key,value in [('KU_PERFORMANCE_V2_SCOPE','followup-screen'),
+                    ('KU_PERFORMANCE_V2_REUSE_RUN','123'),('KU_PERFORMANCE_V2_REUSE_SHA256','a'*64),
+                    ('KU_PERFORMANCE_V2_VARIANTS','a'*40),('KU_PERFORMANCE_V2_CANDIDATE','c'*40),
+                    *[('KU_PERFORMANCE_V2_'+key,'true') for key in modes]]:
+                with self.subTest(key=key):
+                    invalid=subprocess.run(['bash','-ec',prefix+preflight],env=dict(env,**{key:value}),capture_output=True)
+                    self.assertNotEqual(invalid.returncode,0)
+            for name,phase in [('Build frozen sources and plans as the benchmark user','build'),
+                    ('Run the one serial cgroup cycle and preserve each goal status','run'),
+                    ('Always archive the allowlisted evidence and goal_status','archive')]:
+                record.write_bytes(b'')
+                result=subprocess.run(['bash','-ec',prefix+chunk(name)],env=env,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr.decode())
+                args=record.read_bytes().split(b'\0')[:-1]
+                self.assertEqual(args.count(b'--fixed-goals-only'),1)
+                self.assertEqual(args[args.index(b'--phase')+1],phase.encode())
+
     def test_fixed_goals_only_stops_after_80_windows_without_full_acceptance_and_always_cleans_db(self):
         issues=(None,'core-not-met','goal-not-met','missing-window','missing-goal','cleanup',
                 'environment','admission','exception','interrupt','mode-mismatch')
