@@ -8490,7 +8490,34 @@ static int fixture_closed_event_source(void) {
   reactor.descriptor=-1;CHECK(!close(pair[1]));ku_http_reactor_destroy(&reactor);
   puts("http-persistent-closed-event-source-fault-ok");return 0;
 }
+static int fixture_no_poll_projection(void) {
+  KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor reactor;
+  CHECK(sizeof(KuHttpRegistration)==48u); /* ready_events consumes prior padding. */
+  CHECK(ku_http_reactor_init_pending(&reactor,&active,1u,1u));
+  int pair[2];char byte;CHECK(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));
+  ku_http_reactor_interest(&reactor,4u,pair[0],KU_HTTP_POLL_READ,51u,32767);
+  CHECK(!reactor.fault && write(pair[1],"a",1)==1);
+  CHECK(ku_http_reactor_wait(&reactor,NULL,1000)>0);
+  CHECK(ku_http_reactor_ready_events(&reactor,4u)&KU_HTTP_POLL_READ);
+  CHECK(!ku_http_reactor_ready_events(&reactor,5u));
+  KuHttpReadyEvent old=reactor.ready[0];CHECK(ku_http_reactor_event_valid(&reactor,&old));
+  CHECK(read(pair[0],&byte,1)==1 && byte=='a');
+  CHECK(ku_http_reactor_wait(&reactor,NULL,0)==0);
+  CHECK(!ku_http_reactor_ready_events(&reactor,4u));
+  ku_http_reactor_delete(&reactor,4u);
+  ku_http_reactor_interest(&reactor,5u,pair[0],KU_HTTP_POLL_READ,52u,0);
+  CHECK(!reactor.fault && !ku_http_reactor_event_valid(&reactor,&old));
+  CHECK(write(pair[1],"b",1)==1 && ku_http_reactor_wait(&reactor,NULL,1000)>0);
+  CHECK(!ku_http_reactor_ready_events(&reactor,4u));
+  CHECK(ku_http_reactor_ready_events(&reactor,5u)&KU_HTTP_POLL_READ);
+  CHECK(read(pair[0],&byte,1)==1 && byte=='b');
+  CHECK(ku_http_reactor_wait(&reactor,NULL,0)==0 && !ku_http_reactor_ready_events(&reactor,5u));
+  ku_http_reactor_delete(&reactor,5u);CHECK(!close(pair[0]) && !close(pair[1]));
+  ku_http_reactor_destroy(&reactor);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  puts("http-persistent-no-poll-projection-ok");return 0;
+}
 int main(int argc,char** argv) {
+  if(argc>1 && !strcmp(argv[1],"no-poll-projection"))return fixture_no_poll_projection();
   if(argc>1 && !strcmp(argv[1],"fd-index-clusters"))return fixture_fd_index_clusters();
   if(argc>1 && !strcmp(argv[1],"fd-index-init-failures"))return fixture_fd_index_init_failures();
   if(argc>1 && !strcmp(argv[1],"failed-new-alias"))return fixture_failed_new_preserves_alias();
@@ -8616,6 +8643,7 @@ int main(int argc,char** argv) {
     // registration. Root serializes execution; product code is unchanged.
     let mut failures = Vec::new();
     for scenario in [
+        "no-poll-projection",
         "fd-index-clusters",
         "fd-index-init-failures",
         "failed-new-alias",
