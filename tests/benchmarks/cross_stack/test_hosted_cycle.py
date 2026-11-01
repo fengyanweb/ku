@@ -14,6 +14,80 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_pg_zero_emission_guard_rejects_other_code_or_wrong_helper_before_workload(self):
+        runtime=(Path(__file__).resolve().parents[3]/'src/backend/c_task.rs').read_text()
+        start=runtime.index('static int ku_task_frame_zero_bytes(')
+        old=runtime[start:runtime.index('\n}',start)+2]
+        chunk='''  /* memcpy permits unaligned storage and preserves the byte-wise aliasing
+   * contract. Check complete words only; the tail never reads past bytes. */
+  while (bytes >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, data, sizeof(word));
+    if (word) return 0;
+    data += sizeof(word);
+    bytes -= sizeof(word);
+  }
+'''
+        new=old.replace('  for (size_t index',chunk+'  for (size_t index',1)
+        for issue in ('none','other-code','tail','no-change','duplicate'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);A=root/'A.c';B=root/'B.c';A.write_text('int prefix;\n'+old+'\nint suffix;\n')
+                program='int prefix;\n'+new+'\nint suffix;\n'
+                if issue=='other-code':program+='int another;\n'
+                elif issue=='tail':program=program.replace('bytes >= sizeof(uint64_t)','bytes > 0')
+                elif issue=='no-change':program=A.read_text()
+                elif issue=='duplicate':program+='\n'+new
+                B.write_text(program);bindings={n:{'files':{'generated C':{'path':str(p)}}} for n,p in [('A',A),('B',B)]}
+                if issue=='none':
+                    receipt=h.frame_zero_generated_contract(bindings)
+                    self.assertTrue(receipt['complete']);self.assertTrue(receipt['only_zero_helper_changed'])
+                    self.assertEqual(receipt['generated_C']['A']['sha256'],h.sha(A))
+                else:
+                    with self.assertRaises(ValueError):h.frame_zero_generated_contract(bindings)
+
+    def test_pg_zero_goal_only_has_frozen_ca6_controls_three_pairs_and_coarse_compute(self):
+        plan=h.http_short_plan({'A':{},'B':{}},'pg-zero-cpu')
+        self.assertEqual(plan['prepatch'],h.FRAME_ZERO_PREPATCH)
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(11,0))
+        self.assertEqual(plan['windows'][:3],h.http_short_plan({})['windows'][:3])
+        pg=plan['windows'][3:9]
+        self.assertEqual([(x['group'],x['name']) for x in pg],[(1,'A'),(1,'B'),(2,'B'),(2,'A'),(3,'A'),(3,'B')])
+        self.assertTrue(all((x['workload'],x['rate'],x['warmup_seconds'],x['score_seconds'],x['contract'])==
+            ('db',200,10,15,'pg-default') for x in pg))
+        self.assertEqual([(x['workload'],x['name'],x['rate']) for x in plan['windows'][9:]],
+            [('cpu','A',100),('cpu','B',100)])
+        self.assertEqual((plan['resources'],plan['quality_policy']),(h.RESOURCES,h.POLICY))
+        self.assertIsNone(plan['adoption_thresholds']['minimum_service_gain'])
+        self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
+
+    def test_pg_zero_goal_binds_prepatch_and_never_changes_nonselected_default(self):
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.FRAME_ZERO_PREPATCH,screen_variants=[])
+        selected=types.SimpleNamespace(**base,http_short_screen=True,http_short_goal='pg-zero-cpu')
+        identity=h.hosted_identity(selected,'diagnostic')
+        self.assertEqual((identity['prepatch'],identity['http_short_goal']),(h.FRAME_ZERO_PREPATCH,'pg-zero-cpu'))
+        plain=h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')
+        self.assertEqual(plain,h.hosted_identity(types.SimpleNamespace(**base,http_short_goal='pg-zero-cpu'),'diagnostic'))
+        for change in ({'prepatch':h.HTTP_SHORT_PREPATCH},{'candidate':h.FRAME_ZERO_PREPATCH}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change),
+                    http_short_screen=True,http_short_goal='pg-zero-cpu'),'diagnostic')
+
+    def test_pg_zero_comparison_keeps_inconclusive_crossing_one_without_gain_threshold(self):
+        for issue in ('small-gain','crossing','regression','compute','unknown','incomplete'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({'A':{},'B':{}},'pg-zero-cpu')['windows']:
+                    r=dict(config,environment_quality='pass',full_cpu_us=100)
+                    if r['name']=='B':
+                        r['full_cpu_us']*=([.98,1,1.01][r['group']-1] if issue=='crossing' else
+                            1.001 if issue=='regression' else 1.04 if issue=='compute' and r['workload']=='cpu' else .995)
+                    rows.append(r)
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='unknown' else 'pass'},'pg-zero-cpu')
+                self.assertFalse(result['candidate_accepted']);self.assertFalse(result['formal_qualified'])
+                self.assertEqual(result['eligible_for_root_review'],issue in ('small-gain','crossing'))
+                if issue=='small-gain':self.assertTrue(result['service_speedup_demonstrated'])
+                if issue=='crossing':self.assertFalse(result['service_speedup_demonstrated'])
+
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
         controls,business=plan['windows'][:3],plan['windows'][3:]

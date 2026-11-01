@@ -58,7 +58,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory]
+        options: [cpu, memory, pg-zero-cpu]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -609,7 +609,11 @@ jobs:
         run: |
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69
+            case "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" in
+              pg-zero-cpu) test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507 ;;
+              cpu|memory) test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69 ;;
+              *) exit 2 ;;
+            esac
             test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false
