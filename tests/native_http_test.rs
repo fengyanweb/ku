@@ -9676,10 +9676,17 @@ fn native_http_bounded_json_works_between_real_task_owner_polls() {
     let source = r#"
 import {http,json} from "std"
 fn Echo(req:HttpRequest):HttpResponse! { x=json.decode(req.body)? return ok(http.text(json.encode(x)?)) }
+fn Transform(req:HttpRequest):HttpResponse! {
+ decoded=json.decode(req.body)?
+ counter=decoded["counter"]?.as_int()?
+ data=decoded.take("data")?
+ body=json.encode({id:req.query.rid,counter:counter+1,data:data})?
+ return ok(http.text(body))
+}
 async fn Marker():HttpResponse! { return ok(http.text("task")) }
 fn main():null! {
  app=http.server({max_connections:16,max_active_requests:8,max_pending_requests:8})
- app.post("/json",Echo) app.get("/task",Marker) app.listen("__ADDRESS__")?
+ app.post("/json",Echo) app.post("/transform",Transform) app.get("/task",Marker) app.listen("__ADDRESS__")?
  return ok(null)
 }
 "#;
@@ -9700,6 +9707,21 @@ fn main():null! {
         return;
     };
     let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    let corpus = include_str!("benchmarks/cross_stack/corpora/object.json");
+    let scores = (0..32)
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let description = "业务数据中文🙂".repeat(36);
+    let data = [
+        r#"{"absent":null,"enabled":true,"nested":{"description":""#,
+        &description,
+        r#"","scores":["#,
+        &scores,
+        r#"]},"number":42,"tags":["http","json","postgres"],"title":"Ku 中文🙂 business"}"#,
+    ]
+    .concat();
+    let expected = format!(r#"{{"counter":8,"data":{data},"id":"ordinary"}}"#);
     for _ in 0..3 {
         let task = http_response(
             &address,
@@ -9710,6 +9732,16 @@ fn main():null! {
         let json=http_response(&address,"POST /json HTTP/1.1\r\nHost: local\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"x\":1}",Duration::from_secs(3));
         assert_status(&json, "HTTP/1.1 200 OK");
         assert!(json.ends_with("{\"x\":1}"));
+        let transform = http_response(
+            &address,
+            &format!(
+                "POST /transform?rid=ordinary HTTP/1.1\r\nHost: local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corpus}",
+                corpus.len()
+            ),
+            Duration::from_secs(3),
+        );
+        assert_status(&transform, "HTTP/1.1 200 OK");
+        assert!(transform.ends_with(&expected), "{transform}");
     }
     let metrics=http_response(&management,"GET /__ku/metrics HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: json-owner-guard\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
     let loops = metrics
