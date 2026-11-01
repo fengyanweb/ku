@@ -232,7 +232,9 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),8)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),9)
+        self.assertIn("if: always() && inputs.http_short_screen && inputs.http_short_goal == 'typed-json'",job)
+        self.assertIn('name: ku-typed-json-source-observation',job)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
@@ -294,7 +296,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('http_short_screen:\n',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN: ${{ inputs.http_short_screen && 'true' || 'false' }}",job)
         verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
-        mode=verify.split('if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then',1)[1].split('fi',1)[0]
+        mode=verify.split('if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then',1)[1].split('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE"',1)[0]
         for check in ('test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic',
                 'test "$KU_PERFORMANCE_V2_PREPATCH" = '+hosted_cycle.HTTP_SHORT_PREPATCH,
                 'test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false','test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false',
@@ -310,7 +312,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('http_wake_screen:',text)
         self.assertNotIn('--http-wake-screen',text)
         self.assertIn('http_short_goal:\n',text)
-        self.assertIn('default: cpu\n        options: [cpu, memory, memory-probe]',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory, memory-probe, typed-json]',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)

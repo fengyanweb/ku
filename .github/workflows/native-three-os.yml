@@ -52,7 +52,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory, memory-probe]
+        options: [cpu, memory, memory-probe, typed-json]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -602,7 +602,12 @@ jobs:
         run: |
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
-            test "$KU_PERFORMANCE_V2_PREPATCH" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = typed-json ]; then
+              test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = e3187f0ebd81b6e85a0b33fcbf6c8f572299521d
+            else
+              test "$KU_PERFORMANCE_V2_PREPATCH" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            fi
             test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false
             test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false
@@ -976,6 +981,15 @@ jobs:
         with:
           name: ku-http-short-observation
           path: ${{ runner.temp }}/ku-performance-v2/http-short-observation
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain the byte-exact typed and default source guards
+        if: always() && inputs.http_short_screen && inputs.http_short_goal == 'typed-json'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-typed-json-source-observation
+          path: ${{ runner.temp }}/ku-performance-v2/typed-json-source-observation
           retention-days: 1
           if-no-files-found: error
 

@@ -16,6 +16,8 @@ BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'f43e74fdfe384c385a6703f3ee3eab933880b9e2'
+TYPED_JSON_PREPATCH = 'ca6cdeec4a3c315afc965c941680f2111ae3e507'
+TYPED_JSON_CANDIDATE = 'e3187f0ebd81b6e85a0b33fcbf6c8f572299521d'
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
              'driver_cores': 1, 'driver_cpuset': '2', 'driver_memory_bytes': GIB}
@@ -37,13 +39,16 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 def validate_screen_selection(a,build_set):
     if getattr(a,'http_short_screen',False):
-        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','memory-probe'):
-            raise ValueError('--http-short-goal must be cpu, memory or memory-probe')
+        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','memory-probe','typed-json'):
+            raise ValueError('--http-short-goal must be cpu, memory, memory-probe or typed-json')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
             raise ValueError('--http-short-screen requires diagnostic build-set and no other opt-in screen')
-        if getattr(a,'prepatch',None)!=HTTP_SHORT_PREPATCH or a.candidate==HTTP_SHORT_PREPATCH:
-            raise ValueError('--http-short-screen requires frozen current f43e74f prepatch and a distinct candidate')
+        expected=TYPED_JSON_PREPATCH if getattr(a,'http_short_goal','cpu')=='typed-json' else HTTP_SHORT_PREPATCH
+        if getattr(a,'prepatch',None)!=expected or a.candidate==expected:
+            raise ValueError('--http-short-screen requires its goal-specific frozen prepatch and a distinct candidate')
+        if getattr(a,'http_short_goal','cpu')=='typed-json' and a.candidate!=TYPED_JSON_CANDIDATE:
+            raise ValueError('typed JSON screen requires its one frozen e3187f0 candidate')
     if getattr(a,'memory_owner_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
             ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen'))):
         raise ValueError('--memory-owner-probe requires diagnostic build-set and no other opt-in mode')
@@ -260,6 +265,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal=='typed-json':return typed_json_plan(versions)
     if goal=='memory-probe':return http_memory_probe_plan(versions)
     if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
@@ -287,6 +293,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal=='typed-json':return typed_json_comparison(rows,complete,environment)
     if goal=='memory-probe':return http_memory_probe_comparison(rows,complete,environment)
     if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
@@ -328,6 +335,125 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
     result['eligible_for_root_review']=not result['reasons']
     result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
     return result
+
+
+
+def typed_json_plan(versions):
+    # A separate typed contract; the existing DOM/CPU/memory plans are untouched.
+    plan=http_short_plan(versions,'cpu')
+    rows=[dict(row,contract='typed' if row['workload']=='json_object' else row['contract'])
+          for row in plan['windows'] if row['workload'] in ('json_object','cpu')]
+    plan.update(http_short_goal='typed-json',prepatch=TYPED_JSON_PREPATCH,candidate=TYPED_JSON_CANDIDATE,
+        windows=rows,maximum_windows=11,observation_alarm_seconds=330,
+        expected_score_correct=63000,automatic_expansion=False,
+        public_path_guard='Build must prove typed full C differs only in the owner certificate, and ordinary helpers/text full C is byte-identical; no public-path timing invented.',
+        memory_scope='Whole service cgroup memory.current, middle60% score median; reported separately, not a CPU win or a Rust comparison.',
+        purpose='Three original A typed JSON500/s environment controls, three typed JSON A/B pairs in AB/BA/AB order, one coarse compute100/s pair;11 serial windows. '
+            'Same helpers/typed/worker input, ordinary O2 and contracts. No DOM score substitution, extra PG/ok windows, retry, capacity, long run, automatic expansion or formal acceptance.')
+    plan['adoption_thresholds'].pop('other_business_regression')
+    return plan
+
+
+def typed_json_comparison(rows,complete,environment=None):
+    result=dict(complete=complete,http_short_goal='typed-json',eligible_for_root_review=False,
+        candidate_accepted=False,formal_qualified=False,normal_score_eligible=False,automatic_expansion=False,
+        comparisons={},reasons=[],environment_qualification=environment,
+        memory_scope='Whole service cgroup memory.current sampled during score; middle60% median; not RSS, endpoints, virtual or requested bytes')
+    if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification unresolved or failed')
+    if not complete:
+        result['reasons'].append('incomplete or invalid observation/cleanup; no scoring or retry');return result
+    if any(r.get('environment_quality')!='pass' for r in rows):result['reasons'].append('one or more windows have unresolved environment qualification')
+    selected=[r for r in rows if r['phase']=='normal' and r['workload']=='json_object']
+    if len(selected)!=6 or any(r.get('contract')!='typed' for r in selected):
+        result['reasons'].append('six typed JSON windows required; DOM cannot substitute');return result
+    pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
+    if any(set(pair)!=set(('A','B')) for pair in pairs):
+        result['reasons'].append('three complete typed A/B pairs required');return result
+    cpu=fc.paired_interval([p['B']['full_cpu_us'] for p in pairs],[p['A']['full_cpu_us'] for p in pairs],minimum=3)
+    memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+        [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+    result['comparisons']['json_object']=cpu;result['json_memory']=memory
+    if cpu.get('status')!='estimated' or cpu['estimate']>.98 or cpu['upper95']>=1:
+        result['reasons'].append('typed JSON CPU criterion not demonstrated: geometric B/A<=.98 and upper95<1 required')
+    coarse={r['name']:r for r in rows if r['phase']=='compute-guard' and r['workload']=='cpu'}
+    if set(coarse)!=set(('A','B')):
+        result['reasons'].append('one coarse compute pair required');return result
+    result['compute_guard']=dict(B_over_A=coarse['B']['full_cpu_us']/coarse['A']['full_cpu_us'],pairs=1,
+        confidence_interval=None,scope='Correctness/coarse guard only; a single pair is not a precise interval')
+    if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
+    result['eligible_for_root_review']=not result['reasons']
+    result['note']='Typed-only CPU screen, no DOM/Rust ranking. Memory interval is independent and may remain unknown. Root reviews raw evidence; no automatic adoption or repeats.'
+    return result
+
+
+def typed_json_c_guard(before,after):
+    pattern=r'(static const KuHttpJsonWork\* ku_http_handler_json_work\(void\* invoke\) \{\n)(.*?)(\n\}\n)'
+    matches=[list(re.finditer(pattern,text,re.S)) for text in (before,after)]
+    if any(len(found)!=1 for found in matches):raise ValueError('one exact JSON certificate function required')
+    old,new=(found[0] for found in matches)
+    if old.group(2).strip()!='return NULL;' or new.group(2).count('bounded JSON owner handler')!=1:
+        raise ValueError('expected absent old and one new typed JSON certificate')
+    normalized=[text[:found[0].start(2)]+'/* certificate omitted */'+text[found[0].end(2):]
+                for text,found in zip((before,after),matches)]
+    if normalized[0]!=normalized[1]:raise ValueError('typed generated C differs outside the owner certificate')
+    if 'ku_json_stringify_typed_struct_Envelope(envelope)' not in before:
+        raise ValueError('frozen typed Envelope handler missing')
+    return dict(equal_outside_certificate=True,outside_certificate_sha256=hashlib.sha256(normalized[0].encode()).hexdigest(),
+        before_certificate_sha256=hashlib.sha256(old.group(2).encode()).hexdigest(),
+        after_certificate_sha256=hashlib.sha256(new.group(2).encode()).hexdigest(),
+        scope='Entire typed generated C identical except the single static certificate; includes the actual typed writer and handler bodies.')
+
+
+def build_typed_json_source_guard(a,state):
+    roots={name:a.root/name for name in ('A','B')}
+    typed={name:load(root/'manifest.json')['stacks']['ku']['build'] for name,root in roots.items()}
+    paths={name:Path(build['native']['server']['generated_c']) for name,build in typed.items()}
+    check=typed_json_c_guard(paths['A'].read_text(),paths['B'].read_text())
+    # Keep ROOT/name/src layout so the existing archive excludes unrelated
+    # product sources from these temporary default-build snapshots as well.
+    directory=a.root;defaults={};files=list(paths.values())
+    for name,commit in (('A',TYPED_JSON_PREPATCH),('B',TYPED_JSON_CANDIDATE)):
+        root=directory/('typed-default-'+name);snapshot(a.source,commit,root/'src');(root/'tools').symlink_to(a.tools,target_is_directory=True)
+        builder=bl.Builder(root,root/'src',uid=state['uid'],gid=state['gid'],candidate=commit)
+        try:builder.ku_native(Path(typed[name]['cli']));builder.finish()
+        except BaseException as error:builder.finish(failed=repr(error));raise
+        # This is a real default native build with the already-built CLI; no
+        # Rust build, database or service is started by the source guard.
+        build=load(root/'manifest.json')['stacks']['ku']['build'];path=Path(build['native']['server']['generated_c'])
+        if build['formatting_mode']!='helpers' or build['json_response_mode']!='text' or build['json_execution_mode']!='worker':
+            raise ValueError('ordinary default guard mode changed')
+        defaults[name]=dict(path=str(path),sha256=sha(path),cli_sha256=sha(typed[name]['cli']),manifest=str(root/'manifest.json'))
+        files.extend([path,root/'manifest.json'])
+    if Path(defaults['A']['path']).read_bytes()!=Path(defaults['B']['path']).read_bytes():
+        raise ValueError('ordinary helpers/text complete generated C changed')
+    record=dict(check,source_commits={'A':TYPED_JSON_PREPATCH,'B':TYPED_JSON_CANDIDATE},
+        typed_paths={name:str(path) for name,path in paths.items()},default=defaults,
+        default_full_C_byte_identical=True,ordinary_default_guard_sha256=defaults['A']['sha256'],
+        retained_files=[dict(path=str(path),sha256=sha(path)) for path in files])
+    save(a.root/'typed-json-source-guard.json',record)
+    # Small byte-exact C evidence avoids another transfer of the whole archive.
+    export=a.root/'typed-json-source-observation';export.mkdir(exist_ok=False);exported=[]
+    for group,inputs in (('typed',paths),('default',{name:Path(row['path']) for name,row in defaults.items()})):
+        for name,path in inputs.items():
+            destination=export/(group+'-'+name+'.c');shutil.copy2(path,destination);destination.chmod(0o644)
+            exported.append(dict(path=destination.name,bytes=destination.stat().st_size,sha256=sha(destination)))
+    save(export/'export.json',dict(schema='ku-typed-json-source-evidence-v1',source_commits=record['source_commits'],
+        files=exported,source_guard=record,byte_exact=True,no_private_fixture_config=True))
+    return record
+
+
+def verify_typed_json_source_guard(root):
+    root=Path(root);record=load(root/'typed-json-source-guard.json')
+    if record.get('source_commits')!={'A':TYPED_JSON_PREPATCH,'B':TYPED_JSON_CANDIDATE} or record.get('default_full_C_byte_identical') is not True:
+        raise ValueError('matching typed/default source guard missing')
+    for row in record['retained_files']:
+        path=Path(row['path'])
+        if not path.resolve().is_relative_to(root.resolve()) or not path.is_file() or path.is_symlink() or sha(path)!=row['sha256']:
+            raise ValueError('typed/default source guard file changed')
+    typed_json_c_guard(*(Path(record['typed_paths'][name]).read_text() for name in ('A','B')))
+    if Path(record['default']['A']['path']).read_bytes()!=Path(record['default']['B']['path']).read_bytes():
+        raise ValueError('ordinary full C guard changed before workload')
+    return record
 
 
 def http_memory_probe_plan(versions):
@@ -628,7 +754,9 @@ def build(a,state):
     builds=([('A',prepatch,None),*[(f'C{i+1}',commit,None) for i,commit in enumerate(variants)]] if build_set=='followup-screen' else [])+[
         ('B',a.candidate,None),('R',a.candidate,None)] if diagnostic else [('A0',a.baseline,None),('B',a.candidate,None),('R',a.candidate,None),
         ('BJ',a.candidate,{'ku_json':'typed'}),('BP',a.candidate,{'ku_pg_read':'typed'}),('BD',a.candidate,{'ku_format':'direct'})]
-    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):builds=[('A',prepatch,None),('B',a.candidate,None),('Driver',a.candidate,None)]
+    if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):
+        mode={'ku_json':'typed'} if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu')=='typed-json' else None
+        builds=[('A',prepatch,mode),('B',a.candidate,mode),('Driver',a.candidate,None)]
     if getattr(a,'pg_driver_screen',False):builds=[('B',a.candidate,None),('Driver',a.candidate,None)]
     for name,commit,mode in builds:
         step(state,a.root,'build-'+name,lambda n=name,c=commit,m=mode:one(n,c,m))
@@ -698,6 +826,8 @@ def complete_build(a,state,build_set,prepatch,variants):
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
     if (getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False)) and identities['A']['files']['expanded source']['sha256']!=identities['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal','cpu')=='typed-json':
+        step(state,a.root,'typed-json-source-guard',lambda:build_typed_json_source_guard(a,state))
     if build_set=='followup-screen':
         for name in plan['candidate_versions']:
             if name=='BT':continue
@@ -1537,13 +1667,18 @@ def normal_diagnostic_quality(row):
 def pg_queue_screen(a,state):
     if os.geteuid()!=0:raise ValueError('PG queue screen requires root cgroup control')
     short=getattr(a,'http_short_screen',False);plan=load(a.root/'frozen-plan.json')
-    prepatch=HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
+    typed=short and getattr(a,'http_short_goal','cpu')=='typed-json'
+    prepatch=TYPED_JSON_PREPATCH if typed else HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
     expected_plan=http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
+    if typed:expected['json_response_mode']='typed'
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
+    if typed:
+        if bindings['B']['source_commit']!=TYPED_JSON_CANDIDATE:raise ValueError('typed JSON candidate differs from frozen e3187f0')
+        verify_typed_json_source_guard(a.root)
     if bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
     if short and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
@@ -2422,7 +2557,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','memory-probe'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','memory-probe','typed-json'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit control+normal A/B single HTTP candidate diagnostic (23 windows or9 for memory-probe); frozen current f43e74f prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
@@ -2467,7 +2602,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 330 if a.http_short_screen and a.http_short_goal=='memory-probe' else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 330 if a.http_short_screen and a.http_short_goal in ('memory-probe','typed-json') else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

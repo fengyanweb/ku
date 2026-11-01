@@ -14,6 +14,80 @@ import http_cost_diagnostic as hcd
 
 
 class HostedCycleTests(unittest.TestCase):
+    def test_typed_json_plan_has_only_frozen_typed_pairs_controls_and_compute(self):
+        original=h.http_short_plan({})
+        plan=h.http_short_plan({},'typed-json')
+        self.assertEqual(plan['maximum_windows'],11);self.assertEqual(len(plan['windows']),11)
+        self.assertEqual(plan['prepatch'],h.TYPED_JSON_PREPATCH);self.assertEqual(plan['candidate'],h.TYPED_JSON_CANDIDATE)
+        self.assertEqual(plan['maximum_replacements'],0);self.assertFalse(plan['automatic_expansion'])
+        self.assertEqual(plan['resources'],original['resources']);self.assertEqual(plan['quality_policy'],original['quality_policy'])
+        controls=plan['windows'][:3]
+        self.assertTrue(all((r['name'],r['phase'],r['contract'],r['rate'],r['warmup_seconds'],r['score_seconds'])==
+            ('A','environment-control','typed',500,5,10) for r in controls))
+        pairs=plan['windows'][3:9]
+        self.assertEqual([(r['group'],r['name']) for r in pairs],[(1,'A'),(1,'B'),(2,'B'),(2,'A'),(3,'A'),(3,'B')])
+        self.assertTrue(all((r['workload'],r['contract'],r['rate'],r['warmup_seconds'],r['score_seconds'])==
+            ('json_object','typed',500,3,15) for r in pairs))
+        self.assertEqual([r['name'] for r in plan['windows'][9:]],['A','B'])
+        self.assertEqual(sum(r['score_seconds']*r['rate'] for r in plan['windows']),63000)
+        self.assertEqual(original,h.http_short_plan({}),'typed plan must not mutate the existing DOM plan')
+
+    def test_typed_json_selection_requires_one_pair_and_exclusive_explicit_mode(self):
+        base=dict(baseline=h.BASELINE,candidate=h.TYPED_JSON_CANDIDATE,prepatch=h.TYPED_JSON_PREPATCH,
+            screen_variants=[],http_short_screen=True,http_short_goal='typed-json')
+        self.assertEqual(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')['http_short_goal'],'typed-json')
+        for change in ({'prepatch':h.HTTP_SHORT_PREPATCH},{'candidate':'b'*40},{'normal_self_probe':True},{'memory_owner_probe':True}):
+            with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
+        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**base),'full')
+
+    def test_typed_json_comparison_keeps_memory_separate_and_rejects_dom(self):
+        for failure in (None,'dom','environment','cpu','compute'):
+            rows=[]
+            for config in h.http_short_plan({},'typed-json')['windows']:
+                row=dict(config,environment_quality='pass',full_cpu_us=100)
+                if row['name']=='B':
+                    row['full_cpu_us']*=1.04 if row['workload']=='cpu' and failure=='compute' else 1.01 if failure=='cpu' else .8 if row['workload']=='json_object' else 1
+                row['memory']={'steady_median_bytes':2_000_000 if row['name']=='B' else 1_000_000}
+                row['endpoint_memory_current']=1;row['virtual_bytes']=1
+                if failure=='dom':row['contract']='dom'
+                if failure=='environment':row['environment_quality']='unknown'
+                rows.append(row)
+            result=h.http_short_comparison(rows,True,{'quality':'pass'},'typed-json')
+            self.assertEqual(result['eligible_for_root_review'],failure is None);self.assertFalse(result['candidate_accepted'])
+            if failure is None:
+                self.assertEqual(result['json_memory']['estimate'],2)
+                self.assertAlmostEqual(result['comparisons']['json_object']['estimate'],.8)
+            self.assertFalse(h.http_short_comparison(rows,False,{'quality':'pass'},'typed-json')['eligible_for_root_review'])
+
+    @staticmethod
+    def typed_c_pair():
+        first='static const KuHttpJsonWork* ku_http_handler_json_work(void* invoke) {\n  return NULL;\n}\n'
+        tail='static int encode(void) { return ku_json_stringify_typed_struct_Envelope(envelope); }\n'
+        second='static const KuHttpJsonWork* ku_http_handler_json_work(void* invoke) {\n  if(invoke==(void*)encode__thunk) { return &work; } /* bounded JSON owner handler 1 */\n}\n'
+        return first+tail,second+tail
+
+    def test_typed_json_source_guard_rejects_any_noncertificate_change(self):
+        before,after=self.typed_c_pair()
+        self.assertTrue(h.typed_json_c_guard(before,after)['equal_outside_certificate'])
+        for old,new in ((before,after.replace('return ku_json','return changed_json')),(after,after),(before,after+after),
+                (before.replace('typed_struct_Envelope','generic'),after.replace('typed_struct_Envelope','generic'))):
+            with self.assertRaises(ValueError):h.typed_json_c_guard(old,new)
+
+    def test_typed_json_source_guard_is_rechecked_before_any_load(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);before,after=self.typed_c_pair();files=[];typed={};default={}
+            for name,text in [('A',before),('B',after)]:
+                path=root/('typed-'+name+'.c');path.write_text(text);typed[name]=str(path);files.append(path)
+                path=root/('default-'+name+'.c');path.write_text('same ordinary default full C');default[name]={'path':str(path)};files.append(path)
+            record=dict(source_commits={'A':h.TYPED_JSON_PREPATCH,'B':h.TYPED_JSON_CANDIDATE},default_full_C_byte_identical=True,
+                retained_files=[{'path':str(path),'sha256':h.sha(path)} for path in files],typed_paths=typed,default=default)
+            h.save(root/'typed-json-source-guard.json',record)
+            self.assertTrue(h.verify_typed_json_source_guard(root)['default_full_C_byte_identical'])
+            Path(default['B']['path']).write_text('unrelated runtime change')
+            with self.assertRaises(ValueError):h.verify_typed_json_source_guard(root)
+            self.assertFalse(h.evidence_file(root/'typed-default-A/src/src/lib.rs',root))
+            self.assertTrue(h.evidence_file(root/'typed-default-A/build/ku-native/server.c',root))
+
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
         controls,business=plan['windows'][:3],plan['windows'][3:]
