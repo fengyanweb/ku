@@ -265,7 +265,7 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo test --release --locked --lib http_short::tests -- --list > "$RUNNER_TEMP/http-proof.list"
-          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 6
+          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 7
           cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
           names=(
             native_http_bounded_json_owner_preserves_input_edges_and_legacy_results
@@ -277,9 +277,23 @@ jobs:
             native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout
             native_http_sync_body_transfer_preserves_owner_and_budget_handoff
             native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs
+            native_http_task_runtime_blocking_init_timeout_preserves_cleanup_owner
+            native_http_async_tcp_waits_share_owner_loops_without_occupying_blocking_worker
           )
           for name in "${names[@]}"; do
             cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
+          done
+          cases=(
+            native_task_adapter_test:native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline
+            native_pg_query_poll_test:native_pg_elastic_worker_start_failure_keeps_other_waits_and_returns_connect_lease
+            native_task_frame_c_test:native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread
+            native_task_frame_c_test:native_task_frame_pending_resume_cancel_and_payload_drop_execute_in_c
+          )
+          for entry in "${cases[@]}"; do
+            target=${entry%%:*}; name=${entry#*:}
+            cargo test --release --locked --test "$target" "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
           done
@@ -294,6 +308,12 @@ jobs:
           set -euo pipefail
           for name in native_http_bounded_json_owner_preserves_input_edges_and_legacy_results native_http_bounded_json_works_between_real_task_owner_polls native_http_validates_unmaterialized_headers_and_owns_route_snapshot; do
             cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
+          done
+          for entry in native_task_adapter_test:native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline native_pg_query_poll_test:native_pg_elastic_worker_start_failure_keeps_other_waits_and_returns_connect_lease native_task_frame_c_test:native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread; do
+            target=${entry%%:*}; name=${entry#*:}
+            cargo test --release --locked --test "$target" "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
           done
