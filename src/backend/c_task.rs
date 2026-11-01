@@ -4395,6 +4395,15 @@ static int ku_task_frame_ranges_overlap(const void* a, size_t a_size,
 }
 static int ku_task_frame_zero_bytes(const void* storage, size_t bytes) {
   const uint8_t* data = (const uint8_t*)storage;
+  /* memcpy permits unaligned storage and preserves the byte-wise aliasing
+   * contract. Check complete words only; the tail never reads past bytes. */
+  while (bytes >= sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, data, sizeof(word));
+    if (word) return 0;
+    data += sizeof(word);
+    bytes -= sizeof(word);
+  }
   for (size_t index = 0; index < bytes; index++) if (data[index]) return 0;
   return 1;
 }

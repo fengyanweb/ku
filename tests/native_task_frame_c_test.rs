@@ -598,6 +598,80 @@ int main(void) {
 }
 
 #[test]
+fn native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread() {
+    let generated =
+        c::generate_task_frame_c_source(&sync_program("fn main() {}"), &frames()).unwrap();
+    let mut source = generated.replacen(
+        "int main(void) {",
+        "static int ku_generated_main(void) {",
+        1,
+    );
+    source.push_str(ZERO_STORAGE_MAIN);
+    let directory = TempDir::new("task-zero-storage");
+    let c_file = directory.path().join("zero-storage.c");
+    fs::write(&c_file, source).expect("write generated zero-storage fixture");
+    let Some(executable) = compile_harness(directory.path(), &c_file, "zero-storage") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute zero-storage C fixture"
+        );
+        return;
+    };
+    fs::remove_file(&c_file).expect("remove source before native execution");
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "zero-storage execution failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-zero-storage\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+const ZERO_STORAGE_MAIN: &str = r#"
+#define ZERO_CHECK(c) do { if (!(c)) { fprintf(stderr, "zero storage line %d: %s\n", __LINE__, #c); return 1; } } while (0)
+int main(void) {
+  static const size_t large[] = {81,127,128,129,255,256,257,2976,4095,4096,16384};
+  ZERO_CHECK(ku_task_frame_zero_bytes(NULL, 0));
+  for (size_t round = 0; round < 81u + sizeof(large)/sizeof(large[0]); round++) {
+    size_t bytes = round < 81u ? round : large[round-81u];
+    for (size_t offset = 0; offset < 8u; offset++) {
+      /* The allocation ends exactly at the checked span. ASan catches a
+       * partial-word overread; every offset exercises unaligned memcpy. */
+      uint8_t* allocation = (uint8_t*)malloc(offset + bytes + (bytes == 0));
+      ZERO_CHECK(allocation);
+      memset(allocation, 0xa5, offset);
+      uint8_t* data = allocation + offset;
+      memset(data, 0, bytes);
+      ZERO_CHECK(ku_task_frame_zero_bytes(data, bytes));
+      for (size_t index = 0; index < bytes; index++) {
+        for (unsigned bit = 0; bit < (bytes <= 81u ? 8u : 2u); bit++) {
+          data[index] = (uint8_t)(1u << (bytes <= 81u ? bit : bit*7u));
+          ZERO_CHECK(!ku_task_frame_zero_bytes(data, bytes));
+          ZERO_CHECK(data[index] == (uint8_t)(1u << (bytes <= 81u ? bit : bit*7u)));
+          data[index] = 0;
+        }
+      }
+      ZERO_CHECK(ku_task_frame_zero_bytes(data, bytes));
+      for (size_t index = 0; index < offset; index++) ZERO_CHECK(allocation[index] == 0xa5);
+      free(allocation);
+    }
+  }
+  puts("task-zero-storage");
+  return 0;
+}
+"#;
+
+#[test]
 fn native_task_driver_thread_creation_failure_cleans_platform_initialization() {
     let generated =
         c::generate_task_frame_c_source(&sync_program("fn main() {}"), &frames()).unwrap();
