@@ -59,7 +59,7 @@ def elf_loads(path):
     return kind, segments
 
 
-def global_symbol(elf):
+def global_symbol(elf, destination=None):
     raw = subprocess.check_output(['nm', '-S', '--defined-only', str(elf)], text=True, timeout=2)
     rows = [line.split() for line in raw.splitlines() if line.split()[-1:] == ['ku_http_live_group']]
     if len(rows) != 1 or len(rows[0]) != 4 or rows[0][2] not in ('b', 'B', 'd', 'D'):
@@ -67,6 +67,8 @@ def global_symbol(elf):
     address, size = int(rows[0][0], 16), int(rows[0][1], 16)
     if size != 8:
         raise ValueError('ku_http_live_group must be exactly one 8-byte pointer')
+    if destination is not None:
+        Path(destination).write_text(next(line for line in raw.splitlines() if line.split()[-1:] == ['ku_http_live_group']) + '\n')
     return address
 
 
@@ -100,9 +102,9 @@ def prepare(elf, source, manifest, compiler_receipt, compiler, libpq, source_com
     if len(source_commit) != 40 or any(c not in '0123456789abcdef' for c in source_commit):
         raise ValueError('original product SHA required, not current equivalent relabel')
     elf_loads(elf)
-    symbol = global_symbol(elf)
     output = Path(output).resolve()
     output.mkdir(exist_ok=False)
+    symbol = global_symbol(elf, output / 'normal-global-symbol.readback')
     wrapper, helper = output / 'layout-only.c', output / 'layout-only'
     wrapper.write_text(layout_wrapper(source))
     argv = [str(compiler), str(wrapper), '-std=c11', '-O2', '-pthread', str(libpq), '-o', str(helper)]
@@ -283,7 +285,7 @@ class OwnerReader:
         owner_size = self.layout['types']['KuHttpLoopOwner']['size']
         for index in range(loops):
             owner = group + offset + index * owner_size
-            values = self.fields(owner, 'KuHttpLoopOwner', 'index', 'slots', 'ready', 'exited', 'connection_base', 'handler_queue')
+            values = self.fields(owner, 'KuHttpLoopOwner', 'index', 'slots', 'ready', 'exited', 'connection_base', 'handler_queue', 'connections', 'pending_count')
             if values['index'] != index or values['ready'] != 1 or values['exited']:
                 raise ValueError('loop owner identity/readiness mismatch')
             self.quiet(owner, 'KuHttpLoopOwner', 'queued', 'running', 'resident', 'active_requests')
@@ -299,6 +301,17 @@ class OwnerReader:
                 self.missing.append('owner%d queue pointer unavailable' % index)
             # Read only two known pointer fields of connection0, never request
             # IDs, payloads, SQL, connection strings or arbitrary heap bytes.
+            self.quiet(connections, 'KuHttpConnection', 'request_lease', 'request_queued', 'buffered', 'carry_length', 'job', 'async_task')
+            phase = self.field(connections, 'KuHttpConnection', 'phase')
+            if phase not in (0, 1):
+                raise ValueError('connection0 is neither FREE nor idle HEADER')
+            header_capacity = self.field(connections, 'KuHttpConnection', 'capacity')
+            header_pointer = self.field(connections, 'KuHttpConnection', 'header')
+            if header_capacity:
+                self.backing('idle-header-capacity', header_pointer, header_capacity, 1, owner)
+            self.metadata.append(dict(kind='idle connection0 metadata only; no payload read', owner=index,
+                phase=phase, connections=values['connections'], cached_pending=values['pending_count'],
+                retained_header_capacity=header_capacity, retained_header_pointer=hex(header_pointer)))
             active = self.field(connections, 'KuHttpConnection', 'active_set')
             reactor = self.field(connections, 'KuHttpConnection', 'reactor')
             if not active or not reactor:
@@ -308,6 +321,12 @@ class OwnerReader:
             acap = self.field(active, 'KuHttpActiveSet', 'capacity')
             if acap != slots or self.field(active, 'KuHttpActiveSet', 'connections') != connections:
                 raise ValueError('active set does not match its connection allocation')
+            pending = self.field(active, 'KuHttpActiveSet', 'pending')
+            if not pending:
+                raise ValueError('live pending pointer unavailable; quiet cannot be established')
+            self.quiet(pending, 'KuHttpPending', 'count', 'raw_count')
+            pcap = self.cap(self.field(pending, 'KuHttpPending', 'cap'), 16384, 'HTTP pending capacity', allow_zero=True)
+            self.backing('http-pending-items', self.field(pending, 'KuHttpPending', 'items'), pcap, elements['pending_item'], owner)
             self.backing('http-active-indices', self.field(active, 'KuHttpActiveSet', 'indices'), slots, elements['int'], owner)
             if self.field(reactor, 'KuHttpReactor', 'active') != active or self.field(reactor, 'KuHttpReactor', 'slots') != slots:
                 raise ValueError('reactor owner/slots mismatch')
@@ -321,7 +340,7 @@ class OwnerReader:
             self.metadata.append(dict(kind='stack queue/active/reactor headers, not heap allocations',
                                       owner=index, queue=hex(queue), active=hex(active), reactor=hex(reactor)))
         return dict(complete=True, records=self.records, metadata=self.metadata, missing=self.missing,
-                    coverage_complete=False, scope='Fixed reachable backing only; loop-local net/poll/pending arrays and third-party heap remain unknown.')
+                    coverage_complete=False, scope='Fixed reachable backing plus explicitly labelled idle header capacity only; loop-local net/poll arrays and third-party heap remain unknown.')
 
 
 def page_ranges(owners, page):

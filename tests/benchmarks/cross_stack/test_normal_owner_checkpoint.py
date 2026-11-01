@@ -13,7 +13,7 @@ import normal_owner_checkpoint as n
 
 class ScalarFixture:
     def __init__(self):
-        self.layout={'pointer_bytes':8,'types':{},'element_bytes':dict(driver_slot=128,task_handle=128,ring=8,free_handle=4,binding_key=8,connection=512,registration=64,token_bucket=24,fd_bucket=4,int=4,pointer=8,blocking_job=64,blocking_input=32)}
+        self.layout={'pointer_bytes':8,'types':{},'element_bytes':dict(driver_slot=128,task_handle=128,ring=8,free_handle=4,binding_key=8,connection=512,registration=64,token_bucket=24,fd_bucket=4,int=4,pointer=8,blocking_job=64,blocking_input=32,pending_item=64)}
         for line in n.TEMPLATE.read_text().splitlines():
             begin=re.search(r'^  BEGIN\((\w+)\);',line)
             if begin:
@@ -31,10 +31,11 @@ class ScalarFixture:
         self.set(0x4000,'KuTaskDriverV1',capacity=16,resident=0,queued=0,running=0,building=0,closing=0,binding_cells=128,binding_keys=0x18000)
         self.set(0x6000,'KuTaskBlockingPoolV1',capacity=16,resident=0,queued=0,running=0,net_wait_count=0,net_step_count=0,storage=0x100000,storage_bytes=8192,jobs=0x100000,inputs=0x100400,ring=0x100600,free_indices=0x100680)
         owner=0x2000+self.layout['types']['KuHttpLoopGroup']['fields']['loops']['offset']
-        self.set(owner,'KuHttpLoopOwner',index=0,slots=2,ready=1,exited=0,connection_base=0x20000,handler_queue=0x8000,queued=0,running=0,resident=0,active_requests=0)
+        self.set(owner,'KuHttpLoopOwner',index=0,slots=2,ready=1,exited=0,connection_base=0x20000,handler_queue=0x8000,queued=0,running=0,resident=0,active_requests=0,connections=1,pending_count=0)
         self.set(0x8000,'KuHttpQueue',count=0,resident=0,running=0,cap=2,items=0x22000)
-        self.set(0x20000,'KuHttpConnection',active_set=0xa000,reactor=0xc000)
-        self.set(0xa000,'KuHttpActiveSet',request_active=0,capacity=2,connections=0x20000,indices=0x24000)
+        self.set(0x20000,'KuHttpConnection',active_set=0xa000,reactor=0xc000,phase=1,request_lease=0,request_queued=0,buffered=0,carry_length=0,job=0,async_task=0,header=0,capacity=0)
+        self.set(0xa000,'KuHttpActiveSet',request_active=0,capacity=2,connections=0x20000,indices=0x24000,pending=0xe000)
+        self.set(0xe000,'KuHttpPending',count=0,raw_count=0,cap=2,items=0x30000)
         self.set(0xc000,'KuHttpReactor',active=0xa000,slots=2,capacity=4,hash_capacity=16,fd_capacity=16,registrations=0x26000,hash=0x28000,fd_entries=0x2a000,work=0x2c000,idle_heap=0x2e000)
         self.maps=[dict(start=0x1000,end=0x200000,perms='rw-p')]
     def set(self,pointer,typename,**values):
@@ -48,15 +49,20 @@ class ScalarFixture:
 class FixedOwnerTests(unittest.TestCase):
     def test_valid_scalar_traversal_and_embedded_storage_not_double_counted(self):
         f=ScalarFixture(); result=f.capture(); labels={r['label'] for r in result['records']}
-        self.assertEqual(len(result['records']),16)
+        self.assertEqual(len(result['records']),17)
         self.assertTrue({'task-slots','blocking-storage','reactor-fd_entries'}<=labels)
         self.assertFalse({'embedded-driver','blocking-jobs'}&labels)
         self.assertFalse(result['coverage_complete']);self.assertEqual(result['missing'],[])
     def test_quiet_uses_live_queue_driver_and_pool_not_cached_owner(self):
-        for pointer,typename,name in [(0x4000,'KuTaskDriverV1','building'),(0x8000,'KuHttpQueue','count'),(0x6000,'KuTaskBlockingPoolV1','net_wait_count')]:
+        for pointer,typename,name in [(0x4000,'KuTaskDriverV1','building'),(0x8000,'KuHttpQueue','count'),(0x6000,'KuTaskBlockingPoolV1','net_wait_count'),(0xe000,'KuHttpPending','count')]:
             with self.subTest(name=name):
                 f=ScalarFixture();f.set(pointer,typename,**{name:1})
                 with self.assertRaisesRegex(ValueError,'not quiet'):f.capture()
+    def test_idle_connection_and_retained_header_capacity_are_allowed_without_payload_reads(self):
+        f=ScalarFixture();f.set(0x20000,'KuHttpConnection',header=0x32000,capacity=4096)
+        result=f.capture();row=next(x for x in result['records'] if x['label']=='idle-header-capacity')
+        self.assertEqual(row['requested_bytes'],4096)
+        self.assertEqual(next(x for x in result['metadata'] if x['kind'].startswith('idle connection'))['connections'],1)
     def test_null_active_marks_unknown_without_guessing(self):
         f=ScalarFixture();f.set(0x20000,'KuHttpConnection',active_set=0);r=f.capture()
         self.assertEqual(len(r['missing']),1)
@@ -84,6 +90,13 @@ class FixedOwnerTests(unittest.TestCase):
         with patch.object(n,'elf_loads',return_value=(3,seg)):
             self.assertEqual(n.load_bias(maps,'/not-read',17,'00:01',0x3000,4096),0x10000)
             with self.assertRaises(ValueError):n.load_bias(maps,'/not-read',18,'00:01',0x3000,4096)
+    def test_reused_page_reader_accepts_subset_and_keeps_unknown_permissions(self):
+        owners=dict(complete=True,records=[dict(pid=123,label='one',context='fixed',pointer='0x2000',requested_bytes=4096)])
+        with patch.object(n.hcd,'read_text',return_value='(fixture) '+' '.join(['x']*19+['77'])),patch.object(n.hcd.Path,'open',side_effect=PermissionError('metadata fixture unavailable')):
+            result=n.hcd.allocation_owner_pages(123,owners,'77',maximum_records=16384)
+        self.assertFalse(result['available']);self.assertIn('metadata fixture unavailable',result['unavailable_reason'])
+        default=n.hcd.allocation_owner_pages(123,owners,'77')
+        self.assertFalse(default['available']);self.assertIn('validated bounded',default['unavailable_reason'])
     def test_UTF8_header_name_is_literal_and_ambiguous_paths_are_rejected(self):
         wrapper=n.layout_wrapper(Path('/tmp/中文目录/server.c'))
         self.assertIn('#include "/tmp/中文目录/server.c"',wrapper)
@@ -98,6 +111,11 @@ class FixedOwnerTests(unittest.TestCase):
         with patch.object(n.rs,'read_exact') as read:
             with self.assertRaises(TimeoutError):r.word(0x1800,4)
             read.assert_not_called()
+    def test_exact_global_symbol_readback_is_retained(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(n.subprocess,'check_output',return_value='00000010 00000008 b ku_http_live_group\n'):
+            p=Path(temp)/'symbol.readback'
+            self.assertEqual(n.global_symbol('/not-read',p),16)
+            self.assertEqual(p.read_text(),'00000010 00000008 b ku_http_live_group\n')
     def test_global_is_one_exact8_byte_data_symbol(self):
         for raw in ['0000 0008 b ku_http_live_group\n0008 0008 b ku_http_live_group\n','0000 0010 b ku_http_live_group\n','0000 0008 t ku_http_live_group\n']:
             with patch.object(n.subprocess,'check_output',return_value=raw):

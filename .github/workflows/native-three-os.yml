@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, libpq-loader-memory]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, libpq-loader-memory, normal-owner-checkpoint]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -86,12 +86,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'libpq-loader-memory') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'libpq-loader-memory' || inputs.scope == 'normal-owner-checkpoint') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
   quality:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full'))
     name: Rust format, check and clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -144,7 +144,7 @@ jobs:
           python3 -B .github/scripts/test-prepare-release.py
 
   borrow-sanitizers:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full'))
     name: Native borrow and Task ASan, UBSan and leak checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -196,7 +196,7 @@ jobs:
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 
   task-tsan:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full'))
     name: Linux native Task selected-path ThreadSanitizer gate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -233,7 +233,7 @@ jobs:
           if-no-files-found: error
 
   http-short-proof:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && inputs.scope == 'http-short-proof')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && inputs.scope == 'http-short-proof'))
     name: ${{ matrix.os }} bounded HTTP request regressions
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -287,7 +287,7 @@ jobs:
           if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/http-request-detectors.log"; then exit 1; fi
 
   task-main-path:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')))
     name: ${{ matrix.os }} Task main-path regressions
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -489,7 +489,7 @@ jobs:
           )
 
   task-main-path-linux-arm64:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && inputs.scope == 'task-main-path'))
     name: Linux ARM64 normal CLI and matching native link
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -558,7 +558,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe))
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)))
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -1007,7 +1007,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')))
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1460,7 +1460,7 @@ jobs:
           if-no-files-found: error
 
   release-contract:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full'))
     name: ${{ matrix.os }} release scripts and clean CheckOnly
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -1540,7 +1540,7 @@ jobs:
           fi
 
   native:
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full'))
     name: ${{ matrix.target }} native build and run
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1611,7 +1611,7 @@ jobs:
 
   release-bundle:
     name: ${{ matrix.target }} release download bundle
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -1708,7 +1708,7 @@ jobs:
 
   installed-pg:
     name: ${{ matrix.target }} actual installed CLI PostgreSQL lifecycle
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push'))
     needs: [release-bundle]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
@@ -1838,7 +1838,7 @@ jobs:
 
   verify-release:
     name: Verify the complete release asset set
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push')
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push'))
     needs: [release-bundle]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1867,7 +1867,7 @@ jobs:
 
   publish-release:
     name: Publish all verified release bundles together
-    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && ((github.event_name != 'workflow_dispatch' || inputs.scope != 'libpq-loader-memory') && (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release, installed-pg]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1910,7 +1910,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --draft=false
 
   libpq-loader-memory:
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'libpq-loader-memory'
+    if: (github.event_name != 'workflow_dispatch' || inputs.scope != 'normal-owner-checkpoint') && (github.event_name == 'workflow_dispatch' && inputs.scope == 'libpq-loader-memory')
     name: Linux ARM64 libpq loader preliminary memory9
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
@@ -2043,5 +2043,107 @@ jobs:
             ${{ runner.temp }}/libpq-loader-memory/memory9/archive.json
             ${{ runner.temp }}/libpq-loader-memory/restoration.json
             ${{ runner.temp }}/libpq-loader-memory/system-modules-preparation.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  normal-owner-checkpoint:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'normal-owner-checkpoint'
+    name: Linux ARM64 ordinary owner idle checkpoint
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out only the frozen private tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Refuse concurrent measurement or owner jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          OWN_RUN: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B - <<'PYGUARD'
+          import json, os, subprocess
+          blocked=[]
+          for state in ('in_progress','queued','waiting','pending','requested'):
+              page=json.loads(subprocess.check_output(['gh','api',f"repos/{os.environ['REPOSITORY']}/actions/runs?status={state}&per_page=100"],timeout=15))
+              if page['total_count']>100:raise SystemExit('Active run inventory exceeds bound')
+              for run in page['workflow_runs']:
+                  if run['id']==int(os.environ['OWN_RUN']):continue
+                  jobs=json.loads(subprocess.check_output(['gh','api',f"repos/{os.environ['REPOSITORY']}/actions/runs/{run['id']}/jobs?per_page=100"],timeout=15))
+                  if jobs['total_count']>100:raise SystemExit('Active job inventory exceeds bound')
+                  for job in jobs['jobs']:
+                      if job['status']!='completed' and any(x in job['name'].lower() for x in ('serial performance evidence','libpq loader preliminary memory9','libpq loader build','ordinary owner idle checkpoint')):
+                          blocked.append({'run':run['id'],'job':job['name']})
+          print(json.dumps({'blocked':blocked}))
+          if blocked:raise SystemExit('Concurrent owned measurement scope; nothing started')
+          PYGUARD
+      - name: Prepare existing Linux fixture tools without starting system services
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(nproc)" -ge 4
+          test -f /sys/fs/cgroup/cgroup.controllers
+          policy_backup="$RUNNER_TEMP/normal-owner-policy-rc.d"
+          if sudo -n test -e /usr/sbin/policy-rc.d; then
+            sudo -n cp -p /usr/sbin/policy-rc.d "$policy_backup"
+          fi
+          restore_policy() {
+            if test -e "$policy_backup"; then
+              sudo -n mv "$policy_backup" /usr/sbin/policy-rc.d
+            else
+              sudo -n rm -f /usr/sbin/policy-rc.d
+            fi
+          }
+          trap restore_policy EXIT
+          printf '#!/bin/sh\nexit 101\n' | sudo -n tee /usr/sbin/policy-rc.d >/dev/null
+          sudo -n chmod 755 /usr/sbin/policy-rc.d
+          sudo -n apt-get update
+          sudo -n apt-get install -y --no-install-recommends \
+            clang-18 binutils postgresql-16 libpq5 libldap2 libsasl2-modules-db \
+            libssl3t64 libgssapi-krb5-2
+          if pgrep -x postgres >/dev/null; then
+            echo 'Existing PostgreSQL process; no process stopped, no checkpoint started.' >&2
+            exit 1
+          fi
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_normal_owner_checkpoint.py
+          python3 -B .github/scripts/test-prepare-libpq-loader-memory.py
+          python3 -B .github/scripts/test-run-normal-owner-checkpoint.py
+      - name: Download only the exact original normal build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api repos/fengyanweb/ku/actions/artifacts/13073466540/zip > "$RUNNER_TEMP/normal-owner-old.zip"
+          printf '%s  %s\n' ee3328487aca8bdb5c6bf855a5a8dbe3da47a101c3f13abf29ee1e3fd313e234 "$RUNNER_TEMP/normal-owner-old.zip" | sha256sum --check --strict
+      - name: One ordinary JSON response then one independent idle checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=5s 115s sudo -n -E python3 -B \
+            .github/scripts/run-normal-owner-checkpoint.py \
+            --old-zip "$RUNNER_TEMP/normal-owner-old.zip" \
+            --root "$RUNNER_TEMP/normal-owner-checkpoint"
+      - name: Remove temporary restored tools without touching retained evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/normal-owner-old.zip"
+          sudo -n rm -f "$RUNNER_TEMP/normal-owner-checkpoint/original-evidence.tar.gz"
+          sudo -n rm -rf "$RUNNER_TEMP/normal-owner-checkpoint/original"
+      - name: Retain bounded checkpoint evidence without publication
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a9 # v7.0.1
+        with:
+          name: normal-owner-idle-checkpoint
+          path: ${{ runner.temp }}/normal-owner-checkpoint/evidence
           if-no-files-found: warn
           retention-days: 14

@@ -36,6 +36,8 @@ int main(void) {
   FIELD(KuHttpLoopOwner,running);
   FIELD(KuHttpLoopOwner,resident);
   FIELD(KuHttpLoopOwner,active_requests);
+  FIELD(KuHttpLoopOwner,connections);
+  FIELD(KuHttpLoopOwner,pending_count);
   END();
   fputs(",",stdout);
   BEGIN(KuHttpTaskRuntime);
@@ -94,6 +96,15 @@ int main(void) {
   FIELD(KuHttpConnection,active_set);
   FIELD(KuHttpConnection,reactor);
   FIELD(KuHttpConnection,connection_generation);
+  FIELD(KuHttpConnection,phase);
+  FIELD(KuHttpConnection,request_lease);
+  FIELD(KuHttpConnection,request_queued);
+  FIELD(KuHttpConnection,buffered);
+  FIELD(KuHttpConnection,carry_length);
+  FIELD(KuHttpConnection,job);
+  FIELD(KuHttpConnection,async_task);
+  FIELD(KuHttpConnection,header);
+  FIELD(KuHttpConnection,capacity);
   END();
   fputs(",",stdout);
   BEGIN(KuHttpActiveSet);
@@ -103,6 +114,14 @@ int main(void) {
   FIELD(KuHttpActiveSet,high_water);
   FIELD(KuHttpActiveSet,count);
   FIELD(KuHttpActiveSet,request_active);
+  FIELD(KuHttpActiveSet,pending);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpPending);
+  FIELD(KuHttpPending,items);
+  FIELD(KuHttpPending,cap);
+  FIELD(KuHttpPending,count);
+  FIELD(KuHttpPending,raw_count);
   END();
   fputs(",",stdout);
   BEGIN(KuHttpReactor);
@@ -117,7 +136,7 @@ int main(void) {
   FIELD(KuHttpReactor,work);
   FIELD(KuHttpReactor,idle_heap);
   END();
-  printf("},\"element_bytes\":{\"driver_slot\":%zu,\"task_handle\":%zu,\"ring\":%zu,\"free_handle\":%zu,\"binding_key\":%zu,\"connection\":%zu,\"registration\":%zu,\"token_bucket\":%zu,\"fd_bucket\":%zu,\"int\":%zu,\"pointer\":%zu,\"blocking_job\":%zu,\"blocking_input\":%zu}}\n",
-      sizeof(KuTaskDriverSlotV1),sizeof(KuHttpTaskHandle),sizeof(size_t),sizeof(uint32_t),sizeof(KuTaskControlV1*),sizeof(KuHttpConnection),sizeof(KuHttpRegistration),sizeof(((KuHttpReactor*)0)->hash[0]),sizeof(uint32_t),sizeof(int),sizeof(void*),sizeof(KuTaskBlockingJobV1),sizeof(KuTaskBlockingInputsV1));
+  printf("},\"element_bytes\":{\"driver_slot\":%zu,\"task_handle\":%zu,\"ring\":%zu,\"free_handle\":%zu,\"binding_key\":%zu,\"connection\":%zu,\"registration\":%zu,\"token_bucket\":%zu,\"fd_bucket\":%zu,\"int\":%zu,\"pointer\":%zu,\"blocking_job\":%zu,\"blocking_input\":%zu,\"pending_item\":%zu}}\n",
+      sizeof(KuTaskDriverSlotV1),sizeof(KuHttpTaskHandle),sizeof(size_t),sizeof(uint32_t),sizeof(KuTaskControlV1*),sizeof(KuHttpConnection),sizeof(KuHttpRegistration),sizeof(((KuHttpReactor*)0)->hash[0]),sizeof(uint32_t),sizeof(int),sizeof(void*),sizeof(KuTaskBlockingJobV1),sizeof(KuTaskBlockingInputsV1),sizeof(KuHttpPendingItem));
   return ferror(stdout)?1:0;
 }

@@ -77,6 +77,13 @@
       "mode": 420,
       "original_sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
       "path": "Driver/src/tests/benchmarks/cross_stack/corpora/object.json"
+    },
+    {
+      "archived_sha256": "df58ba75288a0a2c1041fdb3a4022e11c10bc91725600abf7c9e16e9bd6e4001",
+      "bytes": 1687,
+      "mode": 420,
+      "original_sha256": "895c467009dffa10503c0683ef0adff32ec82a0700728f0793cd456064da6e11",
+      "path": "B/build/logs/1793514266618607938/native-compiler-server/compiler.json"
     }
   ],
   "servers_started": 0,
@@ -84,5 +91,5 @@
   "source_archive_sha256": "33526a0f802767104d869b8874b7b004fdf69d8567a62a8111d13cef529ea4e8",
   "source_run": 41280471018,
   "source_tools_commit": "d553a2a5aa77152d693d88586f3d01fed1ca776c",
-  "total_required_bytes": 24029587
+  "total_required_bytes": 24031274
 }
