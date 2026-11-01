@@ -525,11 +525,13 @@ class HostedCycleTests(unittest.TestCase):
                     h.save(path,dict(record,perf_flags=flags));h.require_normal_perf_preflight(a)
 
     def test_normal_pg_gpr_plan_keeps_frozen_work_and_excludes_extended_registers(self):
-        flags=['--call-graph','dwarf,4096',
+        flags=['--call-graph','dwarf,16384',
             '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
         self.assertEqual(h.NORMAL_PG_GPR_FLAGS,flags)
         plain=h.normal_self_plan({'B':{}},'db');gpr=h.normal_self_plan({'B':{}},'db-gpr')
         self.assertEqual(gpr['perf_flags'],flags)
+        self.assertEqual((gpr['perf_frequency'],gpr['raw_limit_bytes'],gpr['log_limit_bytes']),(999,96<<20,1<<20))
+        self.assertEqual(plain['perf_frequency'],499)
         for key in ('product_commit','workload','contract','rate','warmup_seconds','score_seconds',
                 'control_score_seconds','order','resources','quality_policy','maximum_windows','maximum_replacements'):
             self.assertEqual(gpr[key],plain[key],key)
@@ -543,7 +545,7 @@ class HostedCycleTests(unittest.TestCase):
                 h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
 
     @staticmethod
-    def normal_perf_attr_fixture(*,mask=0x1ffffffff,stack=4096,frequency=499,flags=1<<10):
+    def normal_perf_attr_fixture(*,mask=0x1ffffffff,stack=16384,frequency=999,flags=1<<10):
         header=bytearray(104);header[:8]=b'PERFILE2'
         h.struct.pack_into('<QQQQQQ',header,8,104,144,104,144,248,8)
         attr=bytearray(144)
@@ -558,10 +560,12 @@ class HostedCycleTests(unittest.TestCase):
             attrs=h.normal_perf_event_attributes(path)
             self.assertEqual(len(attrs),1)
             self.assertEqual({key:attrs[0][key] for key in ('type','config','frequency','user_regs_mask','stack_user')},
-                dict(type=1,config=0,frequency=499,user_regs_mask='0x1ffffffff',stack_user=4096))
+                dict(type=1,config=0,frequency=999,user_regs_mask='0x1ffffffff',stack_user=16384))
             self.assertFalse(attrs[0]['exclude_host']);self.assertFalse(attrs[0]['exclude_guest'])
             self.assertTrue(attrs[0]['frequency_mode']);self.assertTrue(h.normal_perf_gpr_attributes_valid(attrs))
             self.assertTrue(attrs[0]['sample_type'] & 4096);self.assertTrue(attrs[0]['sample_type'] & 8192)
+            with path.open('ab') as stream:stream.truncate(96<<20)
+            self.assertEqual(h.normal_perf_event_attributes(path),attrs)
             for mask in (0,0x40000000,0x1ffffffff|(1<<46)):
                 path.write_bytes(self.normal_perf_attr_fixture(mask=mask))
                 rows=h.normal_perf_event_attributes(path)
@@ -783,6 +787,71 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(memory.call_count,2 if sample else 0);self.assertEqual(symbols.call_count,1 if sample else 0)
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
+    def test_gpr16_sampler_binds_frequency_raw_bound_actual_attrs_and_actual_ELF(self):
+        for valid in (True,False):
+            with self.subTest(valid=valid),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                output=Path(temp);service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999),
+                    domain=types.SimpleNamespace(path='/service-only',snapshot=lambda:{}))
+                patches.enter_context(patch.object(h,'diagnostic_context',return_value={'task_count':3}))
+                patches.enter_context(patch.object(h,'diagnostic_memory',return_value={}))
+                patches.enter_context(patch.object(h,'diagnostic_symbols',return_value={'complete':True,'files':[{'sha256':h.NORMAL_PG_ELF_SHA}]}))
+                assembly=patches.enter_context(patch.object(h,'diagnostic_command',return_value={'complete':True}))
+                def controlled(client,pid,out,perf,record,**kwargs):
+                    self.assertEqual(kwargs,dict(perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,limit=96<<20))
+                    record.update(record_complete=True);return client()
+                patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
+                attrs=h.normal_perf_event_attributes
+                raw=output/'perf.data';raw.write_bytes(self.normal_perf_attr_fixture(stack=16384 if valid else 4096))
+                result=h.normal_self_client(lambda:{'same':'requests'},service,output,60,'/perf',sample=True,
+                    perf_flags=h.NORMAL_PG_GPR_FLAGS,perf_frequency=999,raw_limit=96<<20)
+                self.assertEqual(result,{'same':'requests'})
+                record=h.load(output/'normal-self-observations.json')
+                self.assertEqual(record['record_complete'],valid)
+                self.assertEqual(record['actual_mask_frequency_stack_valid'],valid)
+                self.assertEqual(record['event_attributes'],attrs(raw))
+                self.assertEqual(assembly.call_args.args[0],['objdump','-d','-l','/proc/99999999/exe'])
+
+    def test_actual_normal_pg_workflow_entry_accepts_only_the_new_fixed_triple(self):
+        import os,subprocess,textwrap
+        import reuse_build
+        workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
+        body=workflow.split('      - name: Verify runner entry contracts without starting workloads',1)[1]
+        body=body.split('        run: |\n',1)[1].split('          python3 -B -m unittest',1)[0]
+        body=textwrap.dedent(body)
+        base={**os.environ,**{'KU_PERFORMANCE_V2_'+key:'false' for key in ('HTTP_SHORT_SCREEN','MEMORY_OWNER_PROBE',
+            'PG_DRIVER_SCREEN','PG_FAILURE_PROBE','PG_QUEUE_SCREEN','TASK_JSON_SCREEN','COMMON_HTTP_SCREEN','FINAL_TASK_JSON')}}
+        base.update(KU_PERFORMANCE_V2_NORMAL_SELF_PROBE='true',KU_PERFORMANCE_V2_SCOPE='performance-followup-diagnostic',
+            KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD='db-gpr',KU_PERFORMANCE_V2_REUSE_RUN=reuse_build.PG_SELF_RUN,
+            KU_PERFORMANCE_V2_REUSE_SHA256=reuse_build.PG_SELF_ARCHIVE_SHA,KU_PERFORMANCE_V2_CANDIDATE=h.NORMAL_PG_PRODUCT,
+            KU_PERFORMANCE_V2_VARIANTS='')
+        for change in ({},{'KU_PERFORMANCE_V2_REUSE_RUN':'41271758889'},
+                {'KU_PERFORMANCE_V2_REUSE_SHA256':'0'*64},{'KU_PERFORMANCE_V2_CANDIDATE':'b'*40}):
+            with self.subTest(change=change):
+                result=subprocess.run(['bash','-euo','pipefail','-c',body],env=dict(base,**change),
+                    stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=2)
+                self.assertEqual(result.returncode==0,not change,result.stderr.decode())
+
+    def test_pg_runtime_rejects_overrides_wrong_library_and_truncated_maps(self):
+        import io
+        service=types.SimpleNamespace(process=types.SimpleNamespace(pid=99999999))
+        for issue in ('normal','override','GNUTLS_SKIP_GLOBAL_INIT','duplicate','wrong','oversize'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                raw=b'1000-2000 r--p 00000000 01:01 9 /usr/lib/libpq.so.5.18\n'
+                if issue=='duplicate':raw+=b'3000-4000 r--p 00000000 01:01 10 /other/libpq.so.5.18\n'
+                if issue=='oversize':raw=b'x'*((1<<20)+1)
+                patches.enter_context(patch.dict(h.os.environ,{'LD_PRELOAD':'owned-shim'} if issue=='override' else
+                    {'GNUTLS_SKIP_GLOBAL_INIT':'1'} if issue=='GNUTLS_SKIP_GLOBAL_INIT' else {},clear=True))
+                patches.enter_context(patch.object(h.Path,'open',return_value=io.BytesIO(raw)))
+                patches.enter_context(patch.object(h,'sha',return_value='f'*64 if issue=='wrong' else h.NORMAL_PG_D_SHA))
+                save=patches.enter_context(patch.object(h,'save'))
+                write=patches.enter_context(patch.object(h.Path,'write_bytes'))
+                if issue=='normal':
+                    h.normal_pg_runtime(service,temp);self.assertEqual(save.call_args.args[1]['sha256'],h.NORMAL_PG_D_SHA)
+                    write.assert_called_once_with(raw)
+                else:
+                    with self.assertRaises(ValueError):h.normal_pg_runtime(service,temp)
+                    save.assert_not_called();write.assert_not_called()
+
     def test_perf_preflight_needs_controlled_samples_header_and_exports_then_reaps_child(self):
         for issue in ('success','pg','gpr','gpr-mask','gpr-stack','gpr-period','gpr-frequency','gpr-sample-type','gpr-corrupt',
                 'fragment-child','control','header','empty-samples','export',
@@ -804,7 +873,9 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h.os,'read',side_effect=[b'd',b'one\n'] if issue=='fragment-child' else [b'done\n']))
                 kill=patches.enter_context(patch.object(h.os,'killpg'))
                 def controlled(client,pid,output,perf,record,**kwargs):
-                    self.assertEqual(pid,child.pid);self.assertEqual(kwargs['limit'],(4 if issue=='pg' or gpr else 1)<<20)
+                    self.assertEqual(pid,child.pid);self.assertEqual(kwargs['limit'],(96 if gpr else 4 if issue=='pg' else 1)<<20)
+                    if gpr:self.assertEqual(kwargs['perf_frequency'],999)
+                    else:self.assertNotIn('perf_frequency',kwargs)
                     if issue=='pg':self.assertEqual(kwargs['perf_flags'],h.NORMAL_PG_PERF_FLAGS)
                     elif gpr:self.assertEqual(kwargs['perf_flags'],h.NORMAL_PG_GPR_FLAGS)
                     else:self.assertNotIn('perf_flags',kwargs)
@@ -814,8 +885,8 @@ class HostedCycleTests(unittest.TestCase):
                     raw=bytearray(64);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQ',raw,40,65 if issue=='header' else 56,8)
                     if gpr:
                         raw=self.normal_perf_attr_fixture(mask=0x40000000 if issue=='gpr-mask' else 0x1ffffffff,
-                            stack=8192 if issue=='gpr-stack' else 4096,flags=0 if issue=='gpr-period' else 1<<10,
-                            frequency=500 if issue=='gpr-frequency' else 499)
+                            stack=8192 if issue=='gpr-stack' else 16384,flags=0 if issue=='gpr-period' else 1<<10,
+                            frequency=500 if issue=='gpr-frequency' else 999)
                         if issue=='gpr-sample-type':h.struct.pack_into('<Q',raw,104+24,327)
                         if issue=='gpr-corrupt':h.struct.pack_into('<Q',raw,16,0)
                     (output/'perf.data').write_bytes(raw)

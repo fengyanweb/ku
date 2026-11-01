@@ -661,9 +661,9 @@ jobs:
             test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false
             if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
               test "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr
-              test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41271758889
-              test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 4d9229ae3229c923dcf592e2376e5c567a5aa6da019bda6d5a900a0695c3dcf2
-              test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+              test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41280471018
+              test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 33526a0f802767104d869b8874b7b004fdf69d8567a62a8111d13cef529ea4e8
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = 5b6b41138cce4086c19cc7daa24e820c9b6513d8
             fi
             test -z "$KU_PERFORMANCE_V2_VARIANTS"
           fi
@@ -747,7 +747,7 @@ jobs:
           set -euo pipefail
           performance_self_args=(--normal-self-probe)
           if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
-            test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = 5b6b41138cce4086c19cc7daa24e820c9b6513d8
             performance_self_args+=(--normal-self-workload "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD")
           fi
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase perf-preflight --build-set diagnostic \
@@ -847,7 +847,7 @@ jobs:
           else
             if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
               test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true
-              test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = 5b6b41138cce4086c19cc7daa24e820c9b6513d8
             else
               test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
             fi

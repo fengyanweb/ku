@@ -48,8 +48,8 @@ class ReuseBuildTests(unittest.TestCase):
                 'normal-self-probe/results.json':b'old measured windows',
                 'normal-perf-preflight/preflight.json':b'old boot preflight',
                 'hosted-state.json':json.dumps(dict(identity=dict(candidate=r.h.NORMAL_PG_PRODUCT,
-                    normal_self_probe=True,normal_self_workload='db-gpr'),
-                    steps={k:{'state':'completed'} for k in ('build','build-B','build-Driver','diagnostic')},
+                    http_short_screen=True,http_short_goal='pg-zero-cpu'),
+                    steps={k:{'state':'completed'} for k in ('build','build-A','build-B','build-Driver','diagnostic')},
                     boot_sha256='old boot',database_cleanup={'old':'runtime'})).encode()}
             index={'path_root':r.TOKEN,'raw_and_redacted_hashes_distinct':True,'files':[
                 {'path':k,'bytes':len(v),'archived_sha256':hashlib.sha256(v).hexdigest()} for k,v in files.items()]}
@@ -127,6 +127,7 @@ class ReuseBuildTests(unittest.TestCase):
                     if issue=='driver-source':common['source_sha256']='0'*64
                     return {'client':common}
                 patches.enter_context(patch.object(r,'verify_manifest',side_effect=verify))
+                patches.enter_context(patch.object(r,'check_pg_self_default'))
                 fresh_driver=patches.enter_context(patch.object(r,'new_driver'))
                 complete=patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
                 if issue!='none':
@@ -139,6 +140,29 @@ class ReuseBuildTests(unittest.TestCase):
                     self.assertEqual(state['reused_build']['imported_measurement_windows'],0)
                     self.assertFalse(state['reused_build']['old_boot_or_runtime_state_imported'])
                 fresh_driver.assert_not_called();self.assertEqual(current.read_text(),'new boot')
+
+    def test_pg_default_proof_rejects_wrong_current_C_source_and_runtime_override(self):
+        for issue in ('normal','current-C','original-C','source','override','ELF','library'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);proof=root/'proof.json'
+                receipt=dict(byte_equal=True,current={'sha256':r.h.NORMAL_PG_C_SHA},
+                    original={'sha256':r.h.NORMAL_PG_C_SHA},old_source_commit=r.h.NORMAL_PG_PRODUCT)
+                if issue=='current-C':receipt['current']['sha256']='0'*64
+                if issue=='original-C':receipt['original']['sha256']='0'*64
+                if issue=='source':receipt['old_source_commit']='b'*40
+                r.h.save(proof,receipt)
+                normal={'stacks':{'ku':{'env':{'LD_LIBRARY_PATH':'rejected-candidate'} if issue=='override' else {},
+                    'build':dict(libpq_source='normal-libpq',native={'server':{'binary':'normal-ELF','generated_c':'normal-C'}})}}}
+                def checked(path,wanted):
+                    if (issue=='ELF' and path=='normal-ELF') or (issue=='library' and path=='normal-libpq'):
+                        raise ValueError('input identity differs')
+                patches.enter_context(patch.object(r,'checked',side_effect=checked))
+                if issue=='normal':
+                    r.check_pg_self_default(root,normal,proof)
+                    self.assertEqual(r.h.load(root/'current-default-C-proof.json'),receipt)
+                else:
+                    with self.assertRaises(ValueError):r.check_pg_self_default(root,normal,proof)
+                    self.assertFalse((root/'current-default-C-proof.json').exists())
 
     def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
         args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)

@@ -16,9 +16,12 @@ BASELINE = '956727188a058119fdb3790959063f1496ccb4cc'
 FOLLOWUP_PREPATCH = BASELINE
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
-NORMAL_PG_PRODUCT = 'f43e74fdfe384c385a6703f3ee3eab933880b9e2'
+NORMAL_PG_PRODUCT = '5b6b41138cce4086c19cc7daa24e820c9b6513d8'
+NORMAL_PG_ELF_SHA = '234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b'
+NORMAL_PG_C_SHA = '830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77'
+NORMAL_PG_D_SHA = 'b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df'
 NORMAL_PG_PERF_FLAGS = ['--call-graph','dwarf,4096']
-NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,4096',
+NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,16384',
     '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
@@ -268,8 +271,13 @@ def normal_self_plan(versions,workload='json_object'):
                 'SELF samples describe on-CPU work; caller PCs may distinguish query/reset only when resolved. '
                 'Unresolved/inline callers and sparse/lost samples stay unknown. CPU sampling does not measure blocked wait duration. '
                 'No Rust, capacity, acceptance, replacement or later sample extension.')
-        if workload=='db-gpr':plan.update(perf_flags=list(NORMAL_PG_GPR_FLAGS),user_regs_mask='0x1ffffffff',
-            register_scope='All33 ARM64 GPRs; VG excluded. SVE-dependent/unresolved DWARF frames remain unknown.')
+        if workload=='db-gpr':plan.update(perf_flags=list(NORMAL_PG_GPR_FLAGS),perf_frequency=999,
+            raw_limit_bytes=96<<20,log_limit_bytes=1<<20,expected_cpu_samples=1079,
+            sample_estimate_basis='200 requests/s *60s *90us service CPU/request *999Hz; estimate only, no minimum or extension',
+            user_regs_mask='0x1ffffffff',
+            register_scope='All33 ARM64 GPRs; VG excluded. SVE-dependent/unresolved DWARF frames remain unknown.',
+            caller_PC_contract='Raw SELF PC is the sampled instruction. perf-unwound ARM64 ancestors may use LR-1 markers; preserve raw values, recover aligned return PC/BL site from actual ELF instructions before query/reset attribution. Inclusive chains overlap and cannot be summed.',
+            previous_invalid_control_sequences=1,stop_after_repeated_control_failure=True)
         return plan
     if workload!='json_object':raise ValueError('unknown normal SELF workload')
     return dict(schema='ku-hosted-normal-self-probe-v1',versions=versions,
@@ -1213,7 +1221,7 @@ def pg_failure_probe(a,state):
     return result
 
 
-def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,perf_flags=()):
+def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,perf_flags=(),perf_frequency=499):
     """Readiness is an acknowledged enable, completion an acknowledged stop+exit0."""
     output=Path(output);raw=output/'perf.data';fds=[];process=watch=None;stop=threading.Event()
     def remaining(seconds):
@@ -1223,7 +1231,7 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,p
     try:
         read_ctl,write_ctl=os.pipe();fds.extend((read_ctl,write_ctl));read_ack,write_ack=os.pipe();fds.extend((read_ack,write_ack))
         os.set_blocking(write_ctl,False);os.set_blocking(read_ack,False)
-        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F','499','--delay=-1',*perf_flags,
+        command=[perf,'record','--clockid','mono','-e','cpu-clock','-F',str(perf_frequency),'--delay=-1',*perf_flags,
             f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
         record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
             control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
@@ -1280,14 +1288,18 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,p
 
 def normal_perf_event_attributes(path):
     """Read actual perf attrs; no sample attribution or inferred register mask."""
-    with Path(path).open('rb') as stream:data=stream.read((4<<20)+1)
-    if len(data)<56 or len(data)>4<<20 or data[:8]!=b'PERFILE2':raise ValueError('bounded perf header required')
-    header_size=struct.unpack_from('<Q',data,8)[0]
-    stride,offset,size=struct.unpack_from('<QQQ',data,16)
-    if not 56<=header_size<=offset<=len(data) or not 112<=stride<=4096 or not size or size%stride or size//stride>8 or size>len(data)-offset:
-        raise ValueError('perf attr section bounds differ')
+    with Path(path).open('rb') as stream:
+        header=stream.read(56);length=os.fstat(stream.fileno()).st_size
+        if len(header)!=56 or header[:8]!=b'PERFILE2':raise ValueError('bounded perf header required')
+        header_size=struct.unpack_from('<Q',header,8)[0]
+        stride,offset,size=struct.unpack_from('<QQQ',header,16)
+        if (not 56<=header_size<=offset<=length or not 112<=stride<=4096 or not size
+                or size%stride or size//stride>8 or size>length-offset or size>4<<20):
+            raise ValueError('perf attr section bounds differ')
+        stream.seek(offset);data=stream.read(size)
+        if len(data)!=size:raise ValueError('perf attr section truncated')
     rows=[]
-    for at in range(offset,offset+size,stride):
+    for at in range(0,size,stride):
         kind,attr_size=struct.unpack_from('<II',data,at)
         if not 96<=attr_size<=stride-16:raise ValueError('perf attr size differs')
         config,frequency,sample_type=struct.unpack_from('<QQQ',data,at+8)
@@ -1301,8 +1313,8 @@ def normal_perf_event_attributes(path):
 
 def normal_perf_gpr_attributes_valid(rows):
     events=[x for x in rows if x['type']==1 and x['config']==0]
-    return (len(events)==1 and events[0]['frequency_mode'] and events[0]['frequency']==499
-        and events[0]['user_regs_mask']=='0x1ffffffff' and events[0]['stack_user']==4096
+    return (len(events)==1 and events[0]['frequency_mode'] and events[0]['frequency']==999
+        and events[0]['user_regs_mask']=='0x1ffffffff' and events[0]['stack_user']==16384
         and events[0]['sample_type']&((1<<12)|(1<<13))==((1<<12)|(1<<13)))
 
 
@@ -1329,11 +1341,11 @@ def normal_perf_preflight(a,*,output=None,perf_flags=None):
         workload=getattr(a,'normal_self_workload','json_object')
         flags=(NORMAL_PG_GPR_FLAGS if workload=='db-gpr' else NORMAL_PG_PERF_FLAGS if workload=='db' else []) if perf_flags is None else perf_flags
         if flags:record['perf_flags']=list(flags)
-        raw_limit=4<<20 if '--call-graph' in flags else 1<<20
+        raw_limit=96<<20 if workload=='db-gpr' else 4<<20 if '--call-graph' in flags else 1<<20
         if workload=='db-gpr' or perf_flags is not None:
             record.update(kernel=platform.release(),machine=platform.machine(),target_pid=child.pid,
                 target_scope='Only this owned busy child via -p; no product, database, driver or system-wide collection')
-        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_flags':flags} if flags else {}))
+        controlled_perf(busy,child.pid,output,perf,record,deadline=deadline,limit=raw_limit,**({'perf_flags':flags,**({'perf_frequency':999} if workload=='db-gpr' else {})} if flags else {}))
         os.write(child.stdin.fileno(),b'x');child.stdin.close();child.wait(timeout=1);record['child_reaped']=child.returncode==0
         size_on_disk=(output/'perf.data').stat().st_size
         with (output/'perf.data').open('rb') as stream:header=stream.read(56)
@@ -1424,7 +1436,23 @@ def require_normal_perf_preflight(a):
         raise ValueError('matching successful controlled-perf preflight required before build/normal six-window capture')
 
 
-def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=()):
+def normal_pg_runtime(service,output):
+    """Only the normal system D library; never infer selection from link flags."""
+    if any(os.environ.get(key) for key in ('LD_PRELOAD','LD_AUDIT','LD_LIBRARY_PATH','GNUTLS_SKIP_GLOBAL_INIT')):
+        raise ValueError('PG SELF cannot inherit a runtime library override')
+    output=Path(output);output.mkdir(parents=True,exist_ok=True)
+    with (Path('/proc')/str(service.process.pid)/'maps').open('rb') as stream:raw=stream.read((1<<20)+1)
+    if len(raw)>1<<20:raise ValueError('PG maps exceeded1MiB bound')
+    paths=sorted({line.split(maxsplit=5)[5] for line in raw.decode().splitlines()
+        if len(line.split(maxsplit=5))==6 and Path(line.split(maxsplit=5)[5]).name.startswith('libpq.so')})
+    if len(paths)!=1 or sha(paths[0])!=NORMAL_PG_D_SHA:
+        raise ValueError('PG SELF did not map the unchanged distro D library')
+    save(output/'runtime-default-libpq.json',dict(path=paths[0],sha256=NORMAL_PG_D_SHA,pid=service.process.pid,
+        scope='Before this client launch; actual mapped D library, no rejected eager/lazy candidate'))
+    (output/'runtime-default-libpq.maps').write_bytes(raw)
+
+
+def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(),perf_frequency=499,raw_limit=16<<20):
     """Observe the existing scored client; never change its requests or deadlines."""
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     record=dict(sampled=sample,callchains='unavailable: minimal SELF has no CALLCHAIN field',
@@ -1433,7 +1461,7 @@ def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(
             'that interval includes client startup/drain, not only planned arrivals. Full lifecycle CPU includes post-client perf finalization; '
             'scored-client cpu_us retains the existing h.client accounting interval.')
     if perf_flags:
-        record.update(perf_flags=list(perf_flags),callchains='DWARF user stack request bounded to4096 bytes; completeness/unresolved callers require raw review',
+        record.update(perf_flags=list(perf_flags),callchains='DWARF user stack request '+str(perf_flags[1])+'; completeness/unresolved callers require raw review',
             cpu_target=dict(service_pid=service.process.pid,service_cgroup=str(service.domain.path),
                 scope='perf -p attaches service threads; independent driver/DB processes are outside this target. No system-wide or other-domain sampling.'),
             attribution='SELF denominator counts each sampled PC once. Inclusive caller chains overlap; never sum query/reset/kernel inclusive frames as exclusive CPU. Off-CPU wait duration is unavailable.')
@@ -1460,11 +1488,26 @@ def normal_self_client(client,service,output,duration,perf,*,sample,perf_flags=(
         if sample:
             if not perf:raise ValueError('perf unavailable; preflight required')
             record['symbols']=diagnostic_symbols(service,output)
-            return controlled_perf(client,service.process.pid,output,perf,record,**({'perf_flags':perf_flags} if perf_flags else {}))
+            if perf_frequency==999:
+                if (record['symbols'].get('complete') is not True
+                        or not any(row.get('sha256')==NORMAL_PG_ELF_SHA for row in record['symbols'].get('files',[]))):
+                    raise ValueError('complete mapped-symbol snapshot of actual normal PG ELF required')
+                executable=str(Path('/proc')/str(service.process.pid)/'exe')
+                record['actual_ELF_disassembly']=diagnostic_command(['objdump','-d','-l',executable],
+                    output/'normal-ELF-disassembly.log',timeout=20,limit=16<<20)
+                if not record['actual_ELF_disassembly']['complete']:raise ValueError('actual PG ELF disassembly incomplete')
+            return controlled_perf(client,service.process.pid,output,perf,record,**({'perf_flags':perf_flags,**({'perf_frequency':perf_frequency,'limit':raw_limit} if perf_frequency!=499 else {})} if perf_flags else {}))
         record['client_started_monotonic_ns']=time.monotonic_ns()
         try:return client()
         finally:record['client_finished_monotonic_ns']=time.monotonic_ns()
     finally:
+        if sample and perf_frequency==999 and record.get('record_complete') is True:
+            try:
+                record['event_attributes']=normal_perf_event_attributes(output/'perf.data')
+                record['actual_mask_frequency_stack_valid']=normal_perf_gpr_attributes_valid(record['event_attributes'])
+                record['record_complete']=record['actual_mask_frequency_stack_valid']
+            except (OSError,ValueError) as error:
+                record.update(record_complete=False,event_attributes_error=repr(error))
         record['after']=endpoint('after');record.setdefault('record_complete',not sample)
         save(output/'normal-self-observations.json',record)
 
@@ -1848,9 +1891,10 @@ def normal_self_probe(a,state):
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
         def client(self,service,workload,rate,duration,output,**kwargs):
             parent=super().client
+            if pg:normal_pg_runtime(service,output)
             if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
             return normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
-                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags']} if pg else {}))
+                service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload=='db-gpr' else {})} if pg else {}))
     began=time.monotonic()
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=SelfHarness
@@ -1938,9 +1982,10 @@ def normal_self_probe(a,state):
         selected.extend(directory/name/turn/relative for name,turn in plan['order'] for relative in (
             'window.json','full-lifecycle.json','score/client.json','score/driver-cleanup.json',
             'score/normal-self-observations.json','score/perf-self.log','score/perf-pcs.log',
-            'score/symbol-identities.json','score/maps.log','score/perf-record.log'))
+            'score/symbol-identities.json','score/maps.log','score/perf-record.log','score/normal-ELF-disassembly.log',
+            'score/runtime-default-libpq.json','score/runtime-default-libpq.maps'))
         if pg:selected.extend(directory/name/turn/'warmup'/relative for name,turn in plan['order']
-            for relative in ('client.json','driver-cleanup.json'))
+            for relative in ('client.json','driver-cleanup.json','runtime-default-libpq.json','runtime-default-libpq.maps'))
         result['small_artifact']=pg_failure_export(a,directory,output_name='normal-self-observation',schema='ku-normal-self-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
     return result

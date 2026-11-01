@@ -67,10 +67,10 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
                     and all(v.get('state')=='completed' for v in old['steps'].values()))
             pg=(pg_self_observation and set(names)=={'B','Driver'} and expected_sha256==PG_SELF_ARCHIVE_SHA
-                and set(old.get('steps',{}))=={'build','build-B','build-Driver','diagnostic'}
+                and set(old.get('steps',{}))=={'build','build-A','build-B','build-Driver','diagnostic'}
                 and all(v.get('state')=='completed' for v in old['steps'].values())
                 and old.get('identity',{}).get('candidate')==h.NORMAL_PG_PRODUCT
-                and old['identity'].get('normal_self_probe') is True and old['identity'].get('normal_self_workload')=='db-gpr')
+                and old['identity'].get('http_short_screen') is True and old['identity'].get('http_short_goal')=='pg-zero-cpu')
             if not (owner or pg):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
         if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
@@ -263,8 +263,21 @@ func TestReusedProtocolInputBytes(t *testing.T) {
 OWNER_RUN='41182804290'
 OWNER_ARCHIVE_SHA='5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6'
 OWNER_PRODUCT='4e5f5d94da277654862d8679f7ae4a7fda3f05ff'
-PG_SELF_RUN='41271758889'
-PG_SELF_ARCHIVE_SHA='4d9229ae3229c923dcf592e2376e5c567a5aa6da019bda6d5a900a0695c3dcf2'
+PG_SELF_RUN='41280471018'
+PG_SELF_ARCHIVE_SHA='33526a0f802767104d869b8874b7b004fdf69d8567a62a8111d13cef529ea4e8'
+
+
+def check_pg_self_default(root,normal,proof):
+    build=normal['stacks']['ku']['build'];native=build['native']['server']
+    checked(native['binary'],h.NORMAL_PG_ELF_SHA);checked(native['generated_c'],h.NORMAL_PG_C_SHA)
+    checked(build['libpq_source'],h.NORMAL_PG_D_SHA)
+    if normal['stacks']['ku'].get('env'):
+        raise ValueError('normal PG service cannot have a runtime library override')
+    receipt=h.load(proof)
+    if (receipt.get('byte_equal') is not True or receipt['current']['sha256']!=h.NORMAL_PG_C_SHA
+            or receipt['original']['sha256']!=h.NORMAL_PG_C_SHA or receipt['old_source_commit']!=h.NORMAL_PG_PRODUCT):
+        raise ValueError('current-default complete C equivalence proof absent')
+    h.save(root/'current-default-C-proof.json',receipt)
 
 
 def prepare_pg_self(a):
@@ -283,6 +296,7 @@ def prepare_pg_self(a):
     if len({v['protocol_sha256'] for v in inputs.values()})!=1:raise ValueError('PG SELF protocol inputs differ')
     source=a.root/'Driver/src/tests/benchmarks/cross_stack/client/main.go'
     normal=verify_manifest(a.root,'B',a.candidate,mapping,client_source=source)
+    check_pg_self_default(a.root,normal,a.source/'.github/fixtures/pg-self-stack16/current-default-C-proof.json')
     original_driver=h.load(a.root/'Driver/manifest.json');driver=translated(original_driver,a.root);receipt=h.load(driver['build_receipt'])
     if (driver.get('candidate_base')!=a.candidate or receipt.get('candidate_base')!=a.candidate
             or receipt.get('failure') is not None or not receipt.get('commands')
