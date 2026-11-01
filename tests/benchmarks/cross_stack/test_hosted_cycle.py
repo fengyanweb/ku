@@ -85,8 +85,7 @@ class HostedCycleTests(unittest.TestCase):
                 result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'unknown' if issue=='unknown' else 'pass'},'pg-zero-cpu')
                 self.assertFalse(result['candidate_accepted']);self.assertFalse(result['formal_qualified'])
                 self.assertEqual(result['eligible_for_root_review'],issue in ('small-gain','crossing'))
-                if issue=='small-gain':self.assertTrue(result['service_speedup_demonstrated'])
-                if issue=='crossing':self.assertFalse(result['service_speedup_demonstrated'])
+                if issue!='incomplete':self.assertEqual(result['service_speedup_demonstrated'],issue=='small-gain')
 
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})

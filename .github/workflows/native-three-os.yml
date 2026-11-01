@@ -50,7 +50,7 @@ on:
         options: [json_object, db, db-gpr]
 
       http_short_screen:
-        description: 'Three A environment controls then20 normal single-candidate HTTP A/B windows; diagnostic only'
+        description: 'Frozen normal A/B HTTP screen; cpu/memory23 or pg-zero-cpu11 windows, diagnostic only'
         type: boolean
         default: false
 

@@ -388,7 +388,6 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
         pg=result['comparisons']['db']
         if pg.get('status')!='estimated' or pg['lower95']>1:
             result['reasons'].append('PG CPU regression or unavailable interval')
-        result['service_speedup_demonstrated']=pg.get('status')=='estimated' and pg['upper95']<1
     elif goal=='cpu':
         j=result['comparisons']['json_object']
         if j.get('status')!='estimated' or j['estimate']>.98 or j['upper95']>=1:
@@ -410,6 +409,9 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
                 result['reasons'].append(workload+' CPU guard requires lower95<=1 and upper95<=1.03')
     if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
     result['eligible_for_root_review']=not result['reasons']
+    if goal=='pg-zero-cpu':
+        pg=result['comparisons']['db']
+        result['service_speedup_demonstrated']=(not result['reasons'] and pg.get('status')=='estimated' and pg['upper95']<1)
     result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
     return result
 
