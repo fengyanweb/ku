@@ -31,6 +31,54 @@ def archive(path, changes=None, old_run=False):
 
 
 class ReuseBuildTests(unittest.TestCase):
+    def test_ok_guard_requires_fixed_archive_before_extract_and_never_builds(self):
+        args=types.SimpleNamespace(http_short_screen=True,http_short_goal='pg-ok-guard',prepatch=r.h.HTTP_SHORT_PREPATCH,
+            candidate=r.OK_GUARD_PRODUCT,source_run='wrong',archive_sha256=r.OK_GUARD_ARCHIVE_SHA)
+        with patch.object(r,'extract_builds') as extract,self.assertRaisesRegex(ValueError,'fixed prior'):
+            r.prepare(args)
+        extract.assert_not_called()
+
+    def test_ok_guard_reuse_prepares_only_old_pair_and_fresh_observation_state(self):
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp)/'new';args=types.SimpleNamespace(root=root,source=Path(temp),tools=Path(temp),archive=Path(temp)/'fixed.tgz',
+                http_short_screen=True,http_short_goal='pg-ok-guard',prepatch=r.h.HTTP_SHORT_PREPATCH,candidate=r.OK_GUARD_PRODUCT,
+                source_run=r.OK_GUARD_RUN,archive_sha256=r.OK_GUARD_ARCHIVE_SHA,baseline=r.h.BASELINE,screen_variants=[])
+            patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+            patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+            extract=patches.enter_context(patch.object(r,'extract_builds',side_effect=lambda *a,**k:(root.mkdir(),{})[1]))
+            patches.enter_context(patch.object(r,'restore_json_inputs'))
+            patches.enter_context(patch.object(r,'validate_protocol_inputs',return_value={'protocol_sha256':'a'*64}))
+            patches.enter_context(patch.object(r,'verify_manifest',side_effect=lambda *a,**k:dict(protocol='/inert/protocol',client={'command':['old-driver']},
+                stacks={'ku':{'command':['old-server']}})))
+            patches.enter_context(patch.object(r,'checked'))
+            patches.enter_context(patch.object(r.h,'sha',return_value='a'*64))
+            patches.enter_context(patch.object(r.h.fc,'version_identity',return_value={}))
+            driver=patches.enter_context(patch.object(r,'new_driver'));build=patches.enter_context(patch.object(r.h,'build'))
+            self.assertTrue(r.prepare(args)['execution_complete']);driver.assert_not_called();build.assert_not_called()
+            self.assertEqual(extract.call_args.kwargs,{'ok_guard':True})
+            self.assertEqual(set(extract.call_args.args[3]),{'A','B','Driver'})
+            state=r.h.load(root/'hosted-state.json');self.assertEqual(state['identity']['candidate'],r.OK_GUARD_PRODUCT)
+            self.assertEqual(set(state['steps']),{'build'});self.assertEqual(state['reused_build']['imported_measurement_windows'],0)
+            self.assertEqual(r.h.load(root/'frozen-plan.json')['maximum_windows'],13)
+
+    def test_measured_ok_archive_extracts_only_build_inputs_and_drops_old_observations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'guard.tgz'
+            files={**{n+'/input':b'ELF or source' for n in ('A','B','Driver')},'http-short-screen/summary.json':b'old measurement',
+                'hosted-state.json':json.dumps({'steps':{n:{'state':'completed'} for n in ('build','build-A','build-B','build-Driver','diagnostic')}}).encode()}
+            index={'path_root':r.TOKEN,'raw_and_redacted_hashes_distinct':True,'files':[
+                {'path':n,'bytes':len(v),'archived_sha256':hashlib.sha256(v).hexdigest()} for n,v in files.items()]}
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,data in files.items():
+                    member=tarfile.TarInfo(name);member.size=len(data);tar.addfile(member,io.BytesIO(data))
+            digest=r.h.sha(path)
+            with self.assertRaises(ValueError):r.extract_builds(path,root/'reject',digest,{'A','B','Driver'},ok_guard=True)
+            with patch.object(r,'OK_GUARD_ARCHIVE_SHA',digest):r.extract_builds(path,root/'new',digest,{'A','B','Driver'},ok_guard=True)
+            self.assertFalse((root/'new/http-short-screen').exists())
+            provenance=r.h.load(root/'new/reuse-original-state.json')
+            self.assertNotIn('diagnostic',provenance['steps']);self.assertFalse(provenance['measurement_results_imported'])
 
     def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
         args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)

@@ -114,6 +114,22 @@ class HostedCycleTests(unittest.TestCase):
                     http_short_goal='cpu' if issue=='goal' else 'memory'),{'uid':1,'gid':1,'steps':{}})
                 binding.assert_not_called();database.assert_not_called()
 
+    def test_pg_ok_guard_is_one_independent_fixed_five_pair_supplement(self):
+        plan=h.http_short_plan({'A':{},'B':{}},'pg-ok-guard')
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements'],plan['observation_alarm_seconds'],plan['workflow_limit_seconds']),(13,0,900,960))
+        self.assertEqual(plan['windows'][:3],h.http_short_plan({},'pg-cpu')['windows'][:3])
+        self.assertEqual([x['name'] for x in plan['windows'][3:]],list('BAABB AABBA'.replace(' ','')))
+        self.assertTrue(all((x['workload'],x['rate'],x['warmup_seconds'],x['score_seconds'])==('ok',2000,10,60) for x in plan['windows'][3:]))
+        for issue in ('pass','lower','upper','missing','environment'):
+            rows=[dict(c,environment_quality='unknown' if issue=='environment' else 'pass',
+                full_cpu_us=100*(1.001 if issue=='lower' else [1,1,1,1,1.1][c['group']-1] if issue=='upper' else 1)
+                    if c['name']=='B' else 100) for c in plan['windows']]
+            if issue=='missing':rows.pop()
+            result=h.http_short_comparison(rows,True,{'quality':'pass'},'pg-ok-guard')
+            self.assertEqual(result['eligible_for_root_review'],issue=='pass')
+            self.assertEqual(set(result['comparisons']),{'ok'});self.assertNotIn('compute_guard',result);self.assertNotIn('json_memory',result)
+            self.assertFalse(result['candidate_accepted']);self.assertIn('failed',result['original_23_window_guard_status'])
+
     def test_pg_cpu_goal_reuses_original_windows_and_freezes_distinct_guards(self):
         cpu=h.http_short_plan({'A':{},'B':{}},'cpu')
         pg=h.http_short_plan({'A':{},'B':{}},'pg-cpu')
@@ -1553,7 +1569,7 @@ class HostedCycleTests(unittest.TestCase):
                 '--source','/unused','--tools','/unused','--root','/unused-output'])
         self.assertEqual(invalid.exception.code,2);self.assertIn('complete performance-v2',error.getvalue())
         workflow=(Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml').read_text()
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
+        self.assertIn('timeout-minutes: ${{ inputs.http_short_goal == \'pg-ok-guard\' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',workflow)
         self.assertIn('test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',workflow)
         self.assertEqual(workflow.count('performance_task_json_args+=(--final-task-json)'),2)
 

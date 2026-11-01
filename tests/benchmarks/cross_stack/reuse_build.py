@@ -25,7 +25,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, pg_cost_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, pg_cost_observation=False, ok_guard=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -51,10 +51,13 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         mapping={entry['path']:entry for entry in entries}
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
         old=json.load(tar.extractfile('hosted-state.json'))
+        guard_exception=(ok_guard and set(names)=={'A','B','Driver'} and expected_sha256==OK_GUARD_ARCHIVE_SHA
+            and set(old.get('steps',{}))=={'build','build-A','build-B','build-Driver','diagnostic'}
+            and all(v.get('state')=='completed' for v in old['steps'].values()))
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not ((owner_observation or pg_cost_observation) and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not (guard_exception or ((owner_observation or pg_cost_observation) and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
-                    and all(v.get('state')=='completed' for v in old['steps'].values())):
+                    and all(v.get('state')=='completed' for v in old['steps'].values()))):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
         if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
@@ -69,7 +72,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not (owner_observation or pg_cost_observation) else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or pg_cost_observation or ok_guard) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -125,7 +128,7 @@ def require_elf(path):
         raise ValueError('reused artifact is not ELF64 little-endian AArch64: '+str(path))
 
 
-def verify_manifest(root, name, commit, mapping, verify_system=True):
+def verify_manifest(root, name, commit, mapping, verify_system=True, client_source=None):
     path=root/name/'manifest.json';original=h.load(path);m=translated(original,root)
     receipt=h.load(m['build_receipt'])
     if (m.get('candidate_base')!=commit or receipt.get('candidate_base')!=commit
@@ -177,7 +180,7 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
             native['compiler_receipt_sha256']=entry['archived_sha256']
             native['compiler_receipt_scope']='archived redacted bytes; original declaration verified via portable file map'
     old_client=m['client'];checked(old_client['command'][0],old_client['sha256']);require_elf(old_client['command'][0])
-    checked(root/'R/src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
+    checked(client_source or root/'R/src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
     h.save(root/'reuse-provenance'/(name+'-manifest.json'),original)
     m['uid'],m['gid']=os.getuid(),os.getgid()
     m['source_inventory_scope']='original build inventory; portable tree is partial and documentation redactions are separately bound'
@@ -245,6 +248,36 @@ OWNER_RUN='41182804290'
 OWNER_ARCHIVE_SHA='5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6'
 OWNER_PRODUCT='4e5f5d94da277654862d8679f7ae4a7fda3f05ff'
 PG_COST_RUNTIME='f181894173c7bd722091f6525ac04466bdc1cded'
+OK_GUARD_RUN='41261653069'
+OK_GUARD_ARCHIVE_SHA='9b7506d8000399c4ba2418dfa301807fb3d679361a5b4f8a71619099b01958cc'
+OK_GUARD_PRODUCT='0e73c9c871ae1f833541f12c66f66879fcb004ac'
+
+
+def prepare_ok_guard(a):
+    h.validate_screen_selection(a,'diagnostic')
+    if (a.source_run,a.archive_sha256,a.prepatch,a.candidate)!=(OK_GUARD_RUN,OK_GUARD_ARCHIVE_SHA,h.HTTP_SHORT_PREPATCH,OK_GUARD_PRODUCT):
+        raise ValueError('OK guard requires the fixed prior A/B/Driver archive and original product identities')
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
+        raise ValueError('ordinary benchmark user on Linux ARM64 required')
+    commits={'A':a.prepatch,'B':a.candidate,'Driver':a.candidate}
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,commits,ok_guard=True)
+    restore_json_inputs(a.source,a.root,commits,mapping)
+    checks={n:validate_protocol_inputs(a.root,n,mapping) for n in commits}
+    if len({x['protocol_sha256'] for x in checks.values()})!=1:raise ValueError('OK guard protocol inputs differ')
+    versions={};clients=[]
+    for name in ('A','B'):
+        m=verify_manifest(a.root,name,commits[name],mapping,client_source=a.root/'Driver/src/tests/benchmarks/cross_stack/client/main.go')
+        checked(m['protocol'],checks[name]['protocol_sha256']);clients.append(m['client'])
+        versions[name]=dict(root=str(a.root/name),stack='ku',source_commit=commits[name],binary_sha256=h.sha(m['stacks']['ku']['command'][0]))
+    if clients[0]!=clients[1]:raise ValueError('OK guard driver configuration differs')
+    fixture=h.normalize_manifest(copy.deepcopy(m),Path(m['protocol']),m['client']);fixture['stacks']={}
+    h.save(a.root/'fixture/manifest.json',fixture);h.save(a.root/'frozen-plan.json',h.http_short_plan(versions,'pg-ok-guard'))
+    h.save(a.root/'build-identities.json',{n:h.fc.version_identity({'versions':versions},n) for n in versions})
+    state=dict(identity=h.hosted_identity(a,'diagnostic'),steps={},uid=os.getuid(),gid=os.getgid(),goal_status='unknown',
+        reused_build=dict(source_run=a.source_run,archive_sha256=a.archive_sha256,product_commit=a.candidate,
+            normal_versions=commits,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False))
+    result=h.step(state,a.root,'build',lambda:dict(execution_complete=True,goal_status='unknown'))
+    h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=True));return result
 
 
 def prepare_owner(a):
@@ -276,6 +309,7 @@ def prepare_owner(a):
 
 
 def prepare(a):
+    if getattr(a,'http_short_screen',False) and getattr(a,'http_short_goal',None)=='pg-ok-guard':return prepare_ok_guard(a)
     if getattr(a,'pg_cost_probe',False) or getattr(a,'memory_owner_probe',False):return prepare_owner(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
@@ -309,13 +343,14 @@ def main(argv=None):
     parser.add_argument('--archive-sha256',required=True);parser.add_argument('--source-run',required=True)
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
+    parser.add_argument('--http-short-screen',action='store_true');parser.add_argument('--http-short-goal',choices=['cpu','memory','pg-cpu','pg-ok-guard'],default='cpu')
     parser.add_argument('--pg-cost-probe',action='store_true',help='Reuse the same fixed verified normal B/R archive for PG normal/probe/normal cost diagnosis')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
     a=parser.parse_args(argv)
-    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe or a.pg_cost_probe else 'followup-screen')
+    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe or a.pg_cost_probe or a.http_short_screen else 'followup-screen')
     except ValueError as error:parser.error(str(error))
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []

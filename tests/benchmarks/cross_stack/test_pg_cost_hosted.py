@@ -150,7 +150,7 @@ class PgCostHostedTests(unittest.TestCase):
         self.assertIn('      pg_cost_probe:\n',text)
         self.assertEqual(text.count('performance_task_json_args+=(--pg-cost-probe)'),2)
         self.assertIn('name: ku-pg-cost-observation',text)
-        self.assertIn('PG_COST_PROBE" != true ]; then test "$performance_build_set" = followup-screen',text)
+        self.assertIn('PG_COST_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" != pg-ok-guard ]; then test "$performance_build_set" = followup-screen',text)
 
 
 if __name__=='__main__':unittest.main()

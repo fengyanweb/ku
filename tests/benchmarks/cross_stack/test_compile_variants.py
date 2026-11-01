@@ -212,7 +212,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertIn('set -euo pipefail',run)
         self.assertIn('KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}',run)
         self.assertIn('Dispatch these scopes serially',run)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',run)
+        self.assertIn('timeout-minutes: ${{ inputs.http_short_goal == \'pg-ok-guard\' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',run)
         for sdk in ('setup-node','setup-java','setup-dotnet','docker','gh release','git push'):
             self.assertNotIn(sdk,job)
 
@@ -223,7 +223,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertEqual(job.count('performance_task_json_args+=(--memory-owner-probe)'),2)
         for value in ('41182804290','5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6','4e5f5d94da277654862d8679f7ae4a7fda3f05ff'):
             self.assertIn(value,job)
-        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" != pg-ok-guard ]; then test "$performance_build_set" = followup-screen; fi',job)
         self.assertIn('name: ku-memory-owner-observation',job)
         self.assertIn('inputs.memory_owner_probe && 3',job)
 
@@ -251,7 +251,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-failure-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.http_short_goal == \'pg-ok-guard\' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted PG failure observation',1)[1]
         self.assertIn('if: always() && inputs.pg_failure_probe',small)
         self.assertIn('name: ku-pg-failure-observation',small)
@@ -271,7 +271,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test -z "$KU_PERFORMANCE_V2_REUSE_RUN"','test -z "$KU_PERFORMANCE_V2_VARIANTS"'):
             self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--normal-self-probe)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.http_short_goal == \'pg-ok-guard\' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         small=job.split('- name: Retain the small redacted normal SELF observation',1)[1]
         self.assertIn('if: always() && inputs.normal_self_probe',small)
         self.assertIn('name: ku-normal-self-observation',small)
@@ -309,7 +309,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('http_wake_screen:',text)
         self.assertNotIn('--http-wake-screen',text)
         self.assertIn('http_short_goal:\n',text)
-        self.assertIn('default: cpu\n        options: [cpu, memory, pg-cpu]',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory, pg-cpu, pg-ok-guard]',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)
@@ -343,7 +343,7 @@ class HostedWorkflowContracts(unittest.TestCase):
                 'test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false','test -z "$KU_PERFORMANCE_V2_REUSE_RUN"',
                 'test -z "$KU_PERFORMANCE_V2_VARIANTS"'):self.assertIn(check,verify)
         self.assertEqual(job.count('performance_task_json_args+=(--pg-queue-screen)'),2)
-        self.assertIn('timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
+        self.assertIn('timeout-minutes: ${{ inputs.http_short_goal == \'pg-ok-guard\' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}',job)
         self.assertIn('if: always() && inputs.pg_queue_screen',job)
         self.assertIn('name: ku-pg-queue-observation',job)
         self.assertIn('path: ${{ runner.temp }}/ku-performance-v2/pg-queue-observation',job)

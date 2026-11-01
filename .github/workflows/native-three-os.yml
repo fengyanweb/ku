@@ -52,7 +52,7 @@ on:
         description: 'Preregistered HTTP short-screen target; ignored when the screen is not selected'
         type: choice
         default: cpu
-        options: [cpu, memory, pg-cpu]
+        options: [cpu, memory, pg-cpu, pg-ok-guard]
 
       memory_owner_probe:
         description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
@@ -562,8 +562,12 @@ jobs:
             test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false
             test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false
             test "$KU_PERFORMANCE_V2_FINAL_TASK_JSON" = false
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             test -z "$KU_PERFORMANCE_V2_VARIANTS"
+            if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = pg-ok-guard ]; then
+              test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41261653069
+              test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 9b7506d8000399c4ba2418dfa301807fb3d679361a5b4f8a71619099b01958cc
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = 0e73c9c871ae1f833541f12c66f66879fcb004ac
+            else test -z "$KU_PERFORMANCE_V2_REUSE_RUN"; fi
           fi
           if [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -729,7 +733,7 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" != pg-ok-guard ]; then test -z "$KU_PERFORMANCE_V2_REUSE_RUN"; fi
             performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")
           fi
           if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then
@@ -778,7 +782,7 @@ jobs:
             performance_task_json_args+=(--final-task-json)
           fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
-            if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi
+            if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" != pg-ok-guard ]; then test "$performance_build_set" = followup-screen; fi
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
               --archive "$RUNNER_TEMP/ku-reused-build/ku-performance-v2-evidence.tar.gz" \
               --archive-sha256 "$KU_PERFORMANCE_V2_REUSE_SHA256" \
@@ -800,7 +804,7 @@ jobs:
           fi
 
       - name: Run the one serial cgroup cycle and preserve each goal status
-        timeout-minutes: ${{ inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
+        timeout-minutes: ${{ inputs.http_short_goal == 'pg-ok-guard' && 16 || inputs.memory_owner_probe && 3 || inputs.pg_failure_probe && 3 || inputs.normal_self_probe && 7 || inputs.pg_queue_screen && 8 || inputs.pg_driver_screen && 4 || inputs.http_short_screen && 12 || inputs.final_task_json && 150 || 130 }}
         env:
           KU_PERFORMANCE_V2_SCOPE: ${{ inputs.scope }}
         shell: bash
@@ -831,7 +835,7 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
+            if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" != pg-ok-guard ]; then test -z "$KU_PERFORMANCE_V2_REUSE_RUN"; fi
             performance_task_json_args+=(--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL")
           fi
           if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" = true ]; then

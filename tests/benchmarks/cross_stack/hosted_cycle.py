@@ -41,7 +41,7 @@ def validate_screen_selection(a,build_set):
              'pg_queue_screen','pg_driver_screen','http_short_screen','memory_owner_probe'))):
         raise ValueError('--pg-cost-probe requires diagnostic build-set and no other opt-in mode')
     if getattr(a,'http_short_screen',False):
-        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','pg-cpu'):
+        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','pg-cpu','pg-ok-guard'):
             raise ValueError('--http-short-goal must be cpu, memory or pg-cpu')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
@@ -265,7 +265,17 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
-    if goal not in ('cpu','memory','pg-cpu'):raise ValueError('HTTP short goal must be cpu, memory or pg-cpu')
+    if goal=='pg-ok-guard':
+        plan=http_short_plan(versions,'pg-cpu')
+        plan.update(http_short_goal=goal,maximum_windows=13,observation_alarm_seconds=900,workflow_limit_seconds=960,
+            windows=plan['windows'][:3]+[dict(name=n,phase='normal',workload='ok',contract='text',group=g,
+                rate=2000,warmup_seconds=10,score_seconds=60) for g,order in enumerate(
+                (('B','A'),('A','B'),('B','A'),('A','B'),('B','A')),1) for n in order],
+            adoption_thresholds=dict(ok_cpu_lower95_maximum=1,ok_cpu_upper95_maximum=1.03),
+            purpose='One fixed independent five-pair OK guard supplement using exact prior A/B/driver ELF. '
+                'Old three-pair/23-window guard failure remains unchanged and is not pooled or relabelled passed. No retry or extension.')
+        return plan
+    if goal not in ('cpu','memory','pg-cpu'):raise ValueError('HTTP short goal must be cpu, memory, pg-cpu or pg-ok-guard')
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
         rate=500,warmup_seconds=5,score_seconds=10) for g in (1,2,3)]
     windows=[dict(name=n,phase='normal',workload=w,contract=c,group=g,rate=r,warmup_seconds=3,score_seconds=15)
@@ -296,15 +306,27 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
-    if goal not in ('cpu','memory','pg-cpu'):raise ValueError('HTTP short goal must be cpu, memory or pg-cpu')
+    if goal not in ('cpu','memory','pg-cpu','pg-ok-guard'):raise ValueError('invalid HTTP short goal')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
         formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment,http_short_goal=goal)
+    if goal=='pg-ok-guard':result['original_23_window_guard_status']='failed; preserved separately'
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification unresolved or failed')
     if not complete:
         result['reasons'].append('incomplete or invalid observation/cleanup; no scoring or retry');return result
     rows=[r for r in rows if r['phase']!='environment-control']
     if any(r.get('environment_quality')!='pass' for r in rows):
         result['reasons'].append('one or more business windows have unresolved environment qualification')
+    if goal=='pg-ok-guard':
+        if len(rows)!=10 or any(r['workload']!='ok' for r in rows):result['reasons'].append('exactly ten OK business windows required')
+        pairs=[{r['name']:r for r in rows if r['workload']=='ok' and r['group']==g} for g in range(1,6)]
+        interval=fc.paired_interval([p.get('B',{}).get('full_cpu_us') for p in pairs],
+            [p.get('A',{}).get('full_cpu_us') for p in pairs],minimum=5)
+        result['comparisons']['ok']=interval
+        if interval.get('status')!='estimated' or interval['lower95']>1 or interval['upper95']>1.03:
+            result['reasons'].append('OK CPU guard requires five pairs, lower95<=1 and upper95<=1.03')
+        result.update(eligible_for_root_review=not result['reasons'],original_23_window_guard_status='failed; preserved separately',
+            note='Independent fixed five-pair supplement only; old three pairs are retained, not pooled or reclassified. No automatic adoption.')
+        return result
     for workload in ('json_object','ok','db'):
         selected=[r for r in rows if r['workload']==workload]
         pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
@@ -573,6 +595,7 @@ def build_json_layers(a):
 
 
 def build(a,state):
+    if getattr(a,'http_short_goal',None)=='pg-ok-guard' and getattr(a,'http_short_screen',False):raise ValueError('PG OK guard requires exact fixed archive reuse')
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
     if getattr(a,'pg_cost_probe',False):raise ValueError('PG cost probe requires verified fixed archive reuse, not a fresh build')
@@ -1719,6 +1742,10 @@ def pg_queue_screen(a,state):
         selected=[directory/name for name in ('summary.json','identity.json','results.json','environment-qualification.json')]
         selected.extend(directory/(('environment-controls' if c['phase']=='environment-control' else c['workload']) if short else c['phase'])/f"g{c['group']}-{c['name']}"/relative for c in plan['windows'] for relative in (
             'window.json','full-lifecycle.json','warmup/client.json','score/client.json','warmup/runtime-after-failure.json','service/service.log'))
+        if short and plan['http_short_goal']=='pg-ok-guard':
+            selected=selected[:4]+[directory/('environment-controls' if c['phase']=='environment-control' else 'ok')/f"g{c['group']}-{c['name']}"/relative
+                for c in plan['windows'] for relative in (('window.json','full-lifecycle.json','score/client.json') if c['phase']=='environment-control'
+                    else ('window.json','full-lifecycle.json','score/client.json','warmup/client.json','score/driver-cleanup.json'))]
         result['small_artifact']=pg_failure_export(a,directory,output_name='http-short-observation' if short else 'pg-queue-observation',
             schema='ku-http-short-small-artifact-v1' if short else 'ku-pg-queue-small-artifact-v1',selected=selected)
         save(a.root/'hosted-state.json',state)
@@ -2518,7 +2545,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-cpu'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-cpu','pg-ok-guard'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen 3e5f18e prepatch, no capacity or adoption claim')
     p.add_argument('--pg-cost-probe',action='store_true',help='Fixed archive normal/probe/normal PG200 diagnostic, no fresh cargo build or performance acceptance')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
@@ -2565,7 +2592,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(180 if a.pg_cost_probe else 120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(900 if a.http_short_screen and a.http_short_goal=='pg-ok-guard' else 180 if a.pg_cost_probe else 120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
