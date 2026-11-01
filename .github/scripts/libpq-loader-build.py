@@ -182,8 +182,25 @@ def main():
              str(fixture / "explicit-ffi-smoke.c"), str(shared), "-ldl", "-o", str(probe)], dest / "probe-build.log")
         static_probe = dest / "static-consumer-smoke"
         static_libs = [token for token in shlex.split(pc) if token != "-lpq"]
-        run(["clang", "-std=c11", "-O2", "-pthread", str(fixture / "explicit-ffi-smoke.c"),
-             str(static)] + static_libs + ["-ldl", "-o", str(static_probe)], dest / "static-consumer-build.log")
+        static_command = ["clang", "-std=c11", "-O2", "-pthread", str(fixture / "explicit-ffi-smoke.c"), str(static)]
+        try:
+            run(static_command + static_libs + ["-ldl", "-o", str(static_probe)], dest / "static-consumer-build.log")
+            record["original_pc_static_consumer"] = "PASS"
+        except RuntimeError:
+            failure = (dest / "static-consumer-build.log").read_text()
+            unresolved = set(re.findall(r"undefined reference to [`']([^`']+)[`']", failure))
+            if not unresolved or not unresolved.issubset({"pg_encoding_to_char", "pg_char_to_encoding"}):
+                raise
+            # The original Make pc chooses libpgcommon.a's private encodings,
+            # while libpq.a references public encoding names. Keep that failure
+            # visible and supplement only this consumer with upstream's existing
+            # public-encoding provider; change no library, pc flag or capability.
+            record["original_pc_static_consumer"] = "FAIL: original public/private encoding helper mismatch"
+            record["static_consumer_supplement"] = "same installed libpgcommon_shlib.a for A/B"
+            run(["nm", "--defined-only", str(prefix / "lib/libpgcommon.a")], dest / "pgcommon-symbols.log")
+            run(["nm", "--defined-only", str(prefix / "lib/libpgcommon_shlib.a")], dest / "pgcommon-shlib-symbols.log")
+            run(static_command + [str(prefix / "lib/libpgcommon_shlib.a")] + static_libs
+                + ["-ldl", "-o", str(static_probe)], dest / "static-consumer-supplemented-build.log")
         assert "libpq.so.5" not in needed(static_probe)
         static_text = run([str(static_probe), "plain"], dest / "static-consumer-plain.log", env=env, timeout=20)
         assert json.loads(next(line for line in static_text.splitlines() if line.startswith("{")))["ambient_ldap"]
@@ -220,6 +237,7 @@ def main():
         records[label] = record
     a, b = records["A"], records["B"]
     assert a["static_object_undefined"] == b["static_object_undefined"]
+    assert a["original_pc_static_consumer"] == b["original_pc_static_consumer"]
     assert a["pkg_config_static_tokens"] == b["pkg_config_static_tokens"]
     assert a["evaluated_Make_variables"]["pc"] == b["evaluated_Make_variables"]["pc"]
     assert a["configure_flags"] == b["configure_flags"]
@@ -227,7 +245,8 @@ def main():
     assert [x for x in a["DT_NEEDED"] if x != "libldap.so.2"] == b["DT_NEEDED"]
     write_json(output / "runtime-module-sha256.json",
                {label: record["runtime_module_sha256"] for label, record in records.items()})
-    write_json(output / "result.json", {"status": "PASS", "Make_shared_static": True,
+    write_json(output / "result.json", {"status": "PASS_SCOPED_SHARED_LOADER_GATE", "Make_shared_static": True,
+               "original_pc_static_consumer": {k: v["original_pc_static_consumer"] for k, v in records.items()},
                "static_flags_original_order": True, "real_FFI_both_orders": True,
                "parallel_first_and_partial_failure_recovery": True,
                "Meson_real_build": "NOT RUN", "LDAP_successful_search_and_TLS_handshake": "NOT RUN",

@@ -8,6 +8,7 @@
 - LDAP 用例只连接未提供服务的本机端口，不启动服务器，不发 SQL，不运行性能测试。
 - Meson 的编译依赖修订尚未实际构建；成功 LDAP 查询、TLS 握手与服务内存收益也不在本门禁的通过范围。
 - 首次 LDAP 使用前的隐式全局符号可见性以及缺库的失败时机会改变；显式装载原库保留完整初始化。
+- 官方 Make 的原始静态 pc 编码 helper 不匹配若出现，会保留失败；仅消费夹具为 A/B 同加原有 `libpgcommon_shlib.a`，不修饰成原 pc 已通过。
 
 # libpq LDAP loader candidate
 
@@ -19,3 +20,6 @@ initialization, static consumers and bounded loader failures; they start no serv
 issue no SQL and measure no performance. Meson builds, successful LDAP searches,
 TLS handshakes and whole-service memory savings remain unverified. Ambient symbol
 visibility before first use and missing-library failure timing are explicit changes.
+Any original Make static pc encoding-helper mismatch remains recorded as failure;
+the paired consumer may use the same existing public-encoding helper without
+changing the libraries or generated pc flags.
