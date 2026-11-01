@@ -1560,6 +1560,116 @@ class HostedCycleTests(unittest.TestCase):
         self.assertEqual(plan['capacity']['refinements'],2);self.assertEqual(plan['capacity']['recovery_maximum_seconds'],5)
         self.assertEqual(fc.stability_config(plan)['seconds'],1800);self.assertEqual(plan['resume']['maximum_replacements'],0)
 
+    def test_fixed_goals_only_preserves_original_design_and_has_an_exclusive_frozen_identity(self):
+        import io
+        from contextlib import redirect_stderr
+        plain=self.plan();fixed=h.frozen_plan(plain['versions'],fixed_goals_only=True)
+        self.assertTrue(fixed.pop('fixed_goals_only'));self.assertEqual(fixed,plain)
+        self.assertEqual(len(fc.jobs_for(fixed,'all')),80);self.assertEqual(len(fixed['targets']),16)
+        self.assertEqual(h.frozen_plan(plain['versions'],fixed_goals_only=False),plain)
+        with self.assertRaisesRegex(ValueError,'Task JSON supplement'):
+            h.frozen_plan(plain['versions'],final_task_json=True,fixed_goals_only=True)
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch='f'*40,screen_variants=[])
+        old=h.hosted_identity(types.SimpleNamespace(**base),'full')
+        self.assertNotIn('fixed_goals_only',old)
+        self.assertEqual(old,h.hosted_identity(types.SimpleNamespace(**base,fixed_goals_only=False),'full'))
+        for phase in ('build','run','archive'):
+            explicit=h.hosted_identity(types.SimpleNamespace(**base,phase=phase,fixed_goals_only=True),'full')
+            self.assertTrue(explicit.pop('fixed_goals_only'));self.assertEqual(explicit,old)
+        for flag in ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe',
+                     'pg_queue_screen','pg_driver_screen','memory_owner_probe','http_short_screen'):
+            with self.subTest(flag=flag),self.assertRaisesRegex(ValueError,'--fixed-goals-only'):
+                h.hosted_identity(types.SimpleNamespace(**base,fixed_goals_only=True,**{flag:True}),'full')
+        for build_set in ('diagnostic','followup-screen'):
+            with self.assertRaisesRegex(ValueError,'--fixed-goals-only'):
+                h.hosted_identity(types.SimpleNamespace(**base,fixed_goals_only=True),build_set)
+        for phase in ('tail','lifecycle','compiler','diagnostic','followup-screen','perf-preflight'):
+            with self.subTest(phase=phase),redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as invalid:
+                h.main(['--phase',phase,'--fixed-goals-only','--candidate','b'*40,
+                    '--source','/unused','--tools','/unused','--root','/unused-output'])
+            self.assertEqual(invalid.exception.code,2)
+        for kwargs in ({'tail_only':True},{'tail_only':True,'stability_only':True}):
+            with self.assertRaisesRegex(ValueError,'--fixed-goals-only'):
+                h.run(types.SimpleNamespace(fixed_goals_only=True),{},**kwargs)
+
+    def test_fixed_goals_only_stops_after_80_windows_without_full_acceptance_and_always_cleans_db(self):
+        issues=(None,'core-not-met','goal-not-met','missing-window','missing-goal','cleanup',
+                'environment','admission','exception','interrupt','mode-mismatch')
+        for issue in issues:
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);plan=h.frozen_plan(self.plan()['versions'],fixed_goals_only=True)
+                h.save(root/'frozen-plan.json',plan);before=h.sha(root/'frozen-plan.json')
+                manifest=root/'fixture/manifest.json';dbstate=root/'fixture/state.json'
+                h.save(manifest,{'db_url':'fixture','db_cgroup':'/unused','database':{}})
+                h.save(dbstate,{'limits':{'cpuset.cpus':'3'}})
+                cleanup=[];fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=dbstate,
+                    stop=lambda:cleanup.append('database') or {'stopped':True})
+                state={'uid':os.getuid(),'gid':os.getgid(),'steps':{}};calls=[];old_harness=fc.Harness
+                read_bytes,read_text=Path.read_bytes,Path.read_text;interval=fc.paired_interval
+                patches.enter_context(patch.object(Path,'read_bytes',lambda p:b'boot' if str(p)=='/proc/sys/kernel/random/boot_id' else read_bytes(p)))
+                patches.enter_context(patch.object(Path,'read_text',lambda p,*a,**k:'MemTotal: 16777216 kB' if str(p)=='/proc/meminfo' else read_text(p,*a,**k)))
+                patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+                patches.enter_context(patch.object(h.os,'sched_getaffinity',return_value={0,1,2,3},create=True))
+                database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
+                patches.enter_context(patch.object(h,'environment_record',return_value={'quality':'fail' if issue=='environment' else 'pass'}))
+                gate=patches.enter_context(patch.object(h,'admission_window',return_value=dict(
+                    passed=issue!='admission',execution_complete=True,binding={'source_commit':'a'*40})))
+                # Constant synthetic pair values preserve exact boundary outcomes;
+                # reduce only this pure test's resampling cost, never the plan.
+                patches.enter_context(patch.object(fc,'paired_interval',side_effect=lambda *a,**k:interval(*a,**dict(k,resamples=100))))
+                good=dict(status='observed',functional_valid=True,accounting_valid=True,arrival_schedule_quality='pass',
+                    environment_quality='pass',measurement_invalid=False,natural_reclamation=True,
+                    qualification={'qualified':True},formal_duration=True,comparison_contract='same')
+                def measured(path,output,phase,**unused):
+                    config=h.load(path);label=Path(output).name;calls.append(label)
+                    self.assertEqual(phase,'all');self.assertNotIn('capacity',config);self.assertNotIn('stability',config)
+                    jobs=fc.jobs_for(config,'all')
+                    if label=='control':
+                        self.assertEqual(len(jobs),3)
+                        self.assertEqual({(j['name'],j['warmup'],j['duration']) for j in jobs},{('A0',5,10)})
+                        return dict(execution_complete=True,rows=[dict(j,**good) for j in jobs])
+                    self.assertEqual(label,'final');self.assertEqual(len(jobs),80);self.assertEqual(len(config['targets']),16)
+                    self.assertEqual(config['bootstrap_resamples'],20000)
+                    if issue=='exception':raise ValueError('fixed failure')
+                    if issue=='interrupt':raise KeyboardInterrupt('fixed interruption')
+                    candidate=130 if issue=='goal-not-met' else 85 if issue=='core-not-met' else 75
+                    rows=[dict(j,**good,full_cpu_us=candidate if j['name'] in ('B','BJ','BP') else 100,
+                        memory={'steady_median_bytes':100}) for j in jobs]
+                    if issue=='missing-window':rows.pop()
+                    if issue=='cleanup':rows[0]['natural_reclamation']=False
+                    goals=fc.compare_goals(config,rows)
+                    if issue=='missing-goal':goals.pop()
+                    return dict(execution_complete=True,formal_design_complete=issue!='missing-window',formal_qualified=True,
+                        goal_status='not_met' if issue=='goal-not-met' else 'met',rows=rows,goals=goals)
+                patches.enter_context(patch.object(fc,'execute',side_effect=measured))
+                args=types.SimpleNamespace(root=root,fixed_goals_only=issue!='mode-mismatch')
+                if issue in ('exception','interrupt','mode-mismatch'):
+                    with self.assertRaises((KeyboardInterrupt if issue=='interrupt' else ValueError)):
+                        h.run(args,state)
+                else:
+                    result=h.run(args,state)
+                    self.assertFalse(result['whole_acceptance']);self.assertFalse(result['functional_acceptance'])
+                    self.assertFalse(result['candidate_accepted']);self.assertFalse(result['capacity_executed'])
+                    self.assertFalse(result['stability_executed']);self.assertEqual(result['stability_status'],'not_executed')
+                    if issue in ('environment','admission','missing-window','missing-goal','cleanup'):
+                        self.assertFalse(result['execution_complete']);self.assertEqual(result['goal_status'],'blocked')
+                    else:
+                        self.assertTrue(result['execution_complete']);self.assertTrue(result['fixed_matrix_executed'])
+                        self.assertEqual(result['goal_status'],'unknown' if issue is None else 'not_met')
+                        self.assertEqual(result['original_16_goal_status'],'not_met' if issue=='goal-not-met' else 'met')
+                        self.assertEqual(result['core_advantage_goal_status'],'met' if issue is None else 'not_met')
+                        self.assertEqual(len(result['axes']['final']['rows']),80)
+                        self.assertEqual(len(result['axes']['final']['goals']),16)
+                        self.assertEqual(set(state['deferred']),{'capacity','stability'})
+                        self.assertTrue((root/'results/core-advantage.json').is_file())
+                self.assertNotIn('capacity',state['steps']);self.assertNotIn('stability',state['steps'])
+                self.assertFalse((root/'results/stability').exists());self.assertFalse((root/'results/capacity').exists())
+                self.assertEqual(calls,[] if issue=='mode-mismatch' else ['control'] if issue in ('environment','admission') else ['control','final'])
+                self.assertEqual(gate.call_count,0 if issue in ('mode-mismatch','environment') else 1)
+                self.assertEqual(database.call_count,0 if issue=='mode-mismatch' else 1)
+                self.assertEqual(cleanup,[] if issue=='mode-mismatch' else ['database'])
+                self.assertIs(fc.Harness,old_harness);self.assertEqual(h.sha(root/'frozen-plan.json'),before)
+
     def controls(self,root,*,fault=None,missing=False,spread=False):
         rows=[]
         for i in range(3):
@@ -1782,6 +1892,31 @@ class HostedCycleTests(unittest.TestCase):
                              '--tools',str(tools),'--candidate','1'*40,*(['--final-task-json'] if final else [])])
                 self.assertEqual(code,0 if complete else 2)
                 alarm.assert_called_once_with((150 if final else 130)*60-30)
+
+    def test_fixed_goals_only_cli_freezes_stop_mode_and_cannot_resume_as_full_acceptance(self):
+        import io
+        from contextlib import redirect_stderr
+        for complete in (False,True):
+            with self.subTest(complete=complete),tempfile.TemporaryDirectory() as d,ExitStack() as patches:
+                root=Path(d);source=root/'source';tools=root/'tools';source.mkdir();tools.mkdir()
+                patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(h.signal,'signal'));alarm=patches.enter_context(patch.object(h.signal,'alarm'))
+                observed=patches.enter_context(patch.object(h,'run',return_value=dict(execution_complete=complete,
+                    goal_status='unknown',whole_acceptance=False,candidate_accepted=False)))
+                patches.enter_context(patch('builtins.print'))
+                argv=['--phase','run','--root',str(root/'output'),'--source',str(source),'--tools',str(tools),'--candidate','1'*40]
+                code=h.main([*argv,'--fixed-goals-only'])
+                self.assertEqual(code,0 if complete else 2)
+                self.assertTrue(observed.call_args.args[0].fixed_goals_only)
+                self.assertTrue(h.load(root/'output/hosted-state.json')['identity']['fixed_goals_only'])
+                alarm.assert_called_once_with(130*60-30)
+                with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as invalid:
+                    h.main(argv)
+                self.assertEqual(invalid.exception.code,2);self.assertEqual(observed.call_count,1)
+                with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit) as invalid:
+                    h.main([*argv,'--fixed-goals-only','--baseline','b'*40])
+                self.assertEqual(invalid.exception.code,2);self.assertEqual(observed.call_count,1)
 
 
     def test_compiler_phase_has_48_short_balanced_comparisons_no_formal_or_capacity(self):

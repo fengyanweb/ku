@@ -36,6 +36,11 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'fixed_goals_only',False):
+        if (build_set!='full' or getattr(a,'phase',None) not in (None,'build','run','archive')
+                or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen','final_task_json',
+                    'pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe','http_short_screen'))):
+            raise ValueError('--fixed-goals-only requires full build/run/archive without tail or opt-in screens')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -80,6 +85,7 @@ def hosted_identity(a,build_set):
     if getattr(a,'http_short_screen',False):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
+    if getattr(a,'fixed_goals_only',False):identity['fixed_goals_only']=True
     return identity
 
 
@@ -89,8 +95,10 @@ def require_task_json_support(root):
         raise ValueError('explicit Task JSON mode requires a frozen B product with native Task JSON support')
 
 
-def frozen_plan(versions,final_task_json=False):
+def frozen_plan(versions,final_task_json=False,fixed_goals_only=False):
     """Seven named rows, PG Ku shared only inside the same registered group."""
+    if fixed_goals_only and final_task_json:
+        raise ValueError('--fixed-goals-only cannot add the Task JSON supplement')
     triples = [['A0','B','R'], ['B','R','A0'], ['R','A0','B'], ['A0','R','B'], ['B','A0','R']]
     pairs = [['B','R'], ['R','B'], ['B','R'], ['R','B'], ['B','R']]
     schedule, targets = [], []
@@ -139,6 +147,7 @@ def frozen_plan(versions,final_task_json=False):
             scope='Separate15 normal O2/helpers/text Task JSON windows; original80 schedule and16 targets unchanged; BT/B is cost change only')
         plan['capacity'].update(maximum_points=12,maximum_coarse_points=10,
             maximum_rates={'json_object':64000,'db':64000})
+    if fixed_goals_only:plan['fixed_goals_only']=True
     return plan
 
 
@@ -642,7 +651,7 @@ def complete_build(a,state,build_set,prepatch,variants):
     elif getattr(a,'pg_failure_probe',False):plan=pg_failure_plan(versions)
     elif build_set=='followup-screen':plan=followup_plan(versions,prepatch,task_json_screen=task_json_screen,common_http_screen=getattr(a,'common_http_screen',False))
     elif diagnostic:plan=diagnostic_plan(versions)
-    else:plan=frozen_plan(versions,final_task_json=final_task_json)
+    else:plan=frozen_plan(versions,final_task_json=final_task_json,fixed_goals_only=getattr(a,'fixed_goals_only',False))
     if layers is not None:plan['json_layer_diagnosis']=layers
     save(a.root/'frozen-plan.json',plan)
     identities={n:fc.version_identity(plan,n) for n in versions};save(a.root/'build-identities.json',identities)
@@ -713,11 +722,18 @@ def environment_record(summary, destination):
 
 
 def run(a,state,tail_only=False,stability_only=False):
+    fixed_goals_only=getattr(a,'fixed_goals_only',False)
+    if fixed_goals_only and (tail_only or stability_only):
+        raise ValueError('--fixed-goals-only cannot run tail or stability-only phases')
     if stability_only and not tail_only:raise ValueError('stability-only requires tail scope')
     if os.geteuid()!=0:raise ValueError('run requires root cgroup control')
     boot=hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()
     if state.setdefault('run_boot_sha256',boot)!=boot:raise ValueError('resume across hosts/boots forbidden; new root required')
     plan=load(a.root/'frozen-plan.json')
+    if bool(plan.get('fixed_goals_only',False))!=fixed_goals_only:
+        raise ValueError('--fixed-goals-only differs from the frozen plan; new root required')
+    if fixed_goals_only and (plan.get('final_task_json') or plan.get('task_json_supplemental')):
+        raise ValueError('--fixed-goals-only cannot add the Task JSON supplement')
     if plan.get('final_task_json') and tail_only:raise ValueError('final Task JSON requires the complete performance-v2 run, not tail-only')
     fixture=db.Database(a.root/'fixture',state['uid'],state['gid'])
     original=fc.Harness;environment=None;private=None
@@ -741,9 +757,13 @@ def run(a,state,tail_only=False,stability_only=False):
         if 'admission' not in axes:pending.insert(0,'admission')
         if plan.get('final_task_json') and 'task_json_supplemental' not in axes:pending.append('task-json-supplemental')
         state['deferred']={label:reason for label in pending}
-        return dict(execution_complete=False,goal_status='blocked',candidate_accepted=False,
+        result=dict(execution_complete=False,goal_status='blocked',candidate_accepted=False,
             environment_quality=environment['quality'],fixed_matrix_executed='final' in axes,
             axes=axes,reason=reason,scope='Retained original windows; downstream measurements not started or retried.')
+        if fixed_goals_only:
+            result.update(fixed_goals_only=True,whole_acceptance=False,functional_acceptance=False,
+                capacity_executed=False,stability_executed=False,stability_status='not_executed')
+        return result
     try:
         fixture.start();private=load(a.root/'fixture/manifest.json')
         private['database']['cpu_set']=load(fixture.state_path)['limits']['cpuset.cpus'];save(fixture.manifest_path,private)
@@ -769,6 +789,24 @@ def run(a,state,tail_only=False,stability_only=False):
         if not function_ok:
             return blocked('fixed/control measurement incomplete, invalid or function/accounting/cleanup failed',
                 {'control':summary,'admission':admission,**({'final':final} if final is not None else {})})
+        if fixed_goals_only:
+            if (final.get('formal_design_complete') is not True or len(final.get('rows',[]))!=80
+                    or len(final.get('goals',[]))!=16):
+                return blocked('original80-window/16-goal design incomplete',
+                    {'control':summary,'admission':admission,'final':final})
+            core=core_advantage_result(plan,final.get('rows',[]))
+            save(a.root/'results/core-advantage.json',core)
+            reason='Explicit fixed-goals-only stop after original80 windows; capacity/stability not executed'
+            state['deferred']={label:reason for label in ('capacity','stability')}
+            return dict(execution_complete=True,fixed_goals_only=True,fixed_matrix_executed=True,
+                goal_status='not_met' if 'not_met' in (core['goal_status'],final.get('goal_status')) else 'unknown',
+                original_16_goal_status=final.get('goal_status','unknown'),core_advantage_goal_status=core['goal_status'],
+                formal_qualified=final.get('formal_qualified',False),environment_quality=environment['quality'],
+                capacity_executed=False,stability_executed=False,stability_status='not_executed',
+                functional_acceptance=False,whole_acceptance=False,candidate_accepted=False,cross_host_pooling=False,
+                axes={'control':summary,'admission':admission,'final':final},
+                scope='Original16 fixed goals only; completion/qualification are limited to that stage. '
+                    'Capacity and continuous acceptance remain incomplete; this is not full task acceptance.')
         supplemental=None
         if plan.get('final_task_json'):
             config=supplemental_task_json_plan(plan)
@@ -805,12 +843,8 @@ def run(a,state,tail_only=False,stability_only=False):
                 'capacity_executed':not stability_only,'axes':axes,
                 'environment_quality':environment['quality'],'candidate_accepted':False,
                 'scope':'tail on this instance only; no fixed-matrix rows imported, fabricated or pooled across hosts'}
-        core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='full_cpu_us' else 1) for t in plan['targets']
-            if t['numerator']=='B' and ((t['contract']=='dom' and t['denominator']=='R') or (t['contract']=='pg-shared' and t['denominator']=='RS'))]
-        core_plan=dict(plan,targets=core_targets);core=fc.compare_goals(core_plan,final.get('rows',[]))
-        scenes=[[g for g in core if g['target']['contract']==contract] for contract in ['dom','pg-shared']]
-        core_status='met' if any(len(g)==2 and all(x['goal_status']=='met' for x in g) for g in scenes) else 'not_met' if all(any(x['goal_status']=='not_met' for x in g) for g in scenes) else 'unknown'
-        save(a.root/'results/core-advantage.json',{'goals':core,'goal_status':core_status,'selection':'predeclared dom/strictPG only; no score postselection'})
+        core=core_advantage_result(plan,final.get('rows',[]));core_status=core['goal_status']
+        save(a.root/'results/core-advantage.json',core)
         goal='not_met' if 'not_met' in (core_status,final.get('goal_status')) else 'met' if core_status==final.get('goal_status')=='met' else 'unknown'
         acceptance=acceptance_result(final,state['steps'].get('capacity',{}).get('result',{}),
             state['steps'].get('stability',{}).get('result',{}),goal,admission)
@@ -2256,6 +2290,16 @@ def compiler(a,state):
         state['compiler_database_cleanup']=fixture.stop();save(a.root/'hosted-state.json',state)
 
 
+def core_advantage_result(plan,rows):
+    """The same predeclared advantage conditions for full and fixed-only runs."""
+    core_targets=[dict(t,maximum_ratio=.80 if t['metric']=='full_cpu_us' else 1) for t in plan['targets']
+        if t['numerator']=='B' and ((t['contract']=='dom' and t['denominator']=='R') or (t['contract']=='pg-shared' and t['denominator']=='RS'))]
+    core=fc.compare_goals(dict(plan,targets=core_targets),rows)
+    scenes=[[g for g in core if g['target']['contract']==contract] for contract in ['dom','pg-shared']]
+    status='met' if any(len(g)==2 and all(x['goal_status']=='met' for x in g) for g in scenes) else 'not_met' if all(any(x['goal_status']=='not_met' for x in g) for g in scenes) else 'unknown'
+    return {'goals':core,'goal_status':status,'selection':'predeclared dom/strictPG only; no score postselection'}
+
+
 def acceptance_result(final, capacity, stability, comparison_goal, admission=None):
     """Capacity/recovery and continuous evidence are independent required axes."""
     rows=capacity.get('capacity',[]);scenes=[]
@@ -2370,6 +2414,7 @@ def main(argv=None):
     p.add_argument('--task-json-screen',action='store_true',help='Explicit separate native Task JSON comparison; followup-screen only, never an implicit product-capability switch')
     p.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP candidate screen; requires followup-screen and --task-json-screen; omits unchanged worker/HC windows')
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
+    p.add_argument('--fixed-goals-only',action='store_true',help='Explicit full-build/run stop after controls, admission and original80 windows/16 goals; capacity/stability and whole acceptance remain incomplete')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
