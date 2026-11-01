@@ -25,6 +25,10 @@ const MAX_CALLS: usize = 8;
 // Byte work counts bounded scans/copies/comparisons. Visits count fixed-size
 // node/bucket operations (the runtime also checks the ABI element-size bound).
 // A JSON call requires all32 untouched credits and consumes that complete turn.
+// Bounds cover normal execution and returning errors. Existing fatal allocation
+// failure still reports to stderr and terminates the process, as on the worker
+// and on the original owner's string allocation paths; it is not a resumable
+// Result or a promise of continued scheduling after process termination begins.
 const JSON_INPUT_BYTES: usize = 2048;
 const JSON_MAX_BYTE_WORK: usize = 32 * 4096;
 const JSON_MAX_VISITS: usize = 32 * 192;
@@ -428,7 +432,10 @@ impl JsonProof {
                                     .map(|key| key.bytes.0[0] * 18)
                                     .sum(),
                             ),
-                            JsonCost::constant(values.len() * 32),
+                            // Even an empty object initializes its eight buckets.
+                            // The per-field allowance covers this for nonempty
+                            // objects, but must not erase the empty-table cost.
+                            JsonCost::constant((values.len() * 32).max(8)),
                         )?;
                         object
                     }
@@ -1378,6 +1385,49 @@ mod tests {
         assert!(!proven(&program, &program.functions[index]));
     }
 
+    #[test]
+    fn json_owner_empty_object_work_cannot_hide_below_the_turn_limit() {
+        let source = r#"import {http,json} from "std"
+            fn Reply(_req:HttpRequest):HttpResponse! {
+                return ok(http.text(json.encode(null)?))
+            } fn main() {}"#;
+        let ast = crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        let program = crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap());
+        let mut function = program
+            .functions
+            .iter()
+            .find(|function| function.name == "Reply")
+            .unwrap()
+            .clone();
+        // Typed IR counterexample: 400 zero-field object temporaries already
+        // require 6,400 bucket initializations/retirement visits. The original
+        // certificate forgot initialization and incorrectly fitted this turn.
+        // Build IR after optimization so unrelated DCE cannot erase the witness.
+        let objects = (0..400).map(|index| IrInst::Temp {
+            id: TempId(100_000 + index),
+            ty: IrType::Named("__ku_object".into()),
+            value: IrExpr {
+                ty: IrType::Named("__ku_object".into()),
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        ty: IrType::Function,
+                        kind: IrExprKind::Local("__ku_object".into()),
+                    }),
+                    args: vec![],
+                    kind: IrCallKind::Intrinsic("__ku_object".into()),
+                },
+            },
+        });
+        function.blocks[0].instructions.splice(0..0, objects);
+        let proof = bounded_json(&function).expect("finite typed JSON IR");
+        assert!(proof.instructions <= 512);
+        assert!(
+            proof.visits.0[0] > JSON_MAX_VISITS,
+            "the runtime must keep this over-budget handler on its worker"
+        );
+    }
     #[test]
     fn json_owner_certificate_keeps_pure_value_flow_and_rejects_escape() {
         fn plan(body: &str) -> Option<JsonProof> {
