@@ -830,8 +830,8 @@ static size_t ku_http_query_fields(const char* target,size_t path_len) {
   }
   return fields;
 }
-static KuObject* ku_http_parse_query(const char* target, size_t path_len) {
-  KuObject* q = ku_object_new(ku_http_map_capacity(ku_http_query_fields(target,path_len)));
+static KuObject* ku_http_parse_query_capacity(const char* target,size_t path_len,size_t capacity) {
+  KuObject* q = ku_object_new(capacity);
   const char* p = target + path_len;
   if (*p != '?') return q;
   p++;
@@ -850,6 +850,9 @@ static KuObject* ku_http_parse_query(const char* target, size_t path_len) {
     if (*amp == '&') p = amp + 1; else break;
   }
   return q;
+}
+static KuObject* ku_http_parse_query(const char* target,size_t path_len) {
+  return ku_http_parse_query_capacity(target,path_len,ku_http_map_capacity(ku_http_query_fields(target,path_len)));
 }
 /* Request header lines -> KuObject{lowercased-name -> trimmed-value}, matching the
    interpreter (header names lowercased, names and values trimmed). */
@@ -1325,19 +1328,26 @@ static int ku_http_json_input_bounded(const KuHttpInput* input,const KuHttpJsonW
       && ku_http_json_work_fits(work->output,values,16384u)
       && ku_http_json_work_fits(work->nodes,values,256u);
 }
-static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
+static size_t ku_http_projection_bytes_with_query_capacity(KuHttpInput* input,size_t parameters,size_t parameter_names,size_t* query_capacity) {
   unsigned int fields=ku_http_input_fields(input);
   size_t target=strlen(input->target),bytes=sizeof(KuStruct___ku_http_request);
+  if(query_capacity)*query_capacity=0;
   /* Bound every allocated map/string independently. Input/header metadata is
      already charged; body transfer retains this reservation across input drop. */
   if(fields&2u)bytes+=sizeof(KuObject)+ku_http_map_capacity(parameters)*sizeof(KuEntry)
       +parameter_names+input->path_len;
-  if(fields&4u)bytes+=sizeof(KuObject)
-      +ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len))*sizeof(KuEntry)+target*2u;
+  if(fields&4u) {
+    size_t capacity=ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len));
+    if(query_capacity)*query_capacity=capacity;
+    bytes+=sizeof(KuObject)+capacity*sizeof(KuEntry)+target*2u;
+  }
   if(fields&8u)bytes+=strlen(input->method);
   if(fields&16u)bytes+=input->path_len;
   if(fields&32u)bytes+=input->body_len;
   return bytes;
+}
+static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
+  return ku_http_projection_bytes_with_query_capacity(input,parameters,parameter_names,NULL);
 }
 static int ku_http_job_projection(KuHttpJob*,size_t);
 static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms);
@@ -1362,9 +1372,9 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
     KuSyncExitSignal handler_signal = {0};
     __ku_sync_reset();
     if (route->arity == 1) {
-      size_t parameter_names=0;
+      size_t parameter_names=0,query_capacity=0;
       for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
-      if (!ku_http_job_projection(job,ku_http_projection_bytes(input,route->nparams,parameter_names)))
+      if (!ku_http_job_projection(job,ku_http_projection_bytes_with_query_capacity(input,route->nparams,parameter_names,&query_capacity)))
         return ku_http_status_response(503,"Service Unavailable");
       unsigned int fields=ku_http_input_fields(input);
       KuStruct___ku_http_request req = {0};
@@ -1379,7 +1389,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if(fields&8u)req.method = ku_http_string_copy(method, strlen(method));
       if(fields&16u)req.path = ku_http_string_copy(target, path_len);
       if(fields&32u) { req.body = ku_http_input_take_body(input); }
-      if(fields&4u)req.query = ku_http_parse_query(target, path_len);
+      if(fields&4u)req.query = ku_http_parse_query_capacity(target,path_len,query_capacity);
       if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
       if (route->returns_result) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
@@ -3197,9 +3207,9 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   KuStruct___ku_http_request req = {0};
   size_t projection_charge=0;
   if (route->arity == 1) {
-    size_t parameter_names=0;
+    size_t parameter_names=0,query_capacity=0;
     for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
-    projection_charge=ku_http_projection_bytes(input,route->nparams,parameter_names);
+    projection_charge=ku_http_projection_bytes_with_query_capacity(input,route->nparams,parameter_names,&query_capacity);
     if (!ku_http_buffer_reserve(connection->budget,projection_charge)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection,server,503); return 1; }
     unsigned int fields=ku_http_input_fields(input);
     if(fields&2u) {
@@ -3211,7 +3221,7 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
     if(fields&8u)req.method = ku_http_string_copy(method,strlen(method));
     if(fields&16u)req.path = ku_http_string_copy(target,path_len);
     if(fields&32u)req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
-    if(fields&4u)req.query = ku_http_parse_query(target,path_len);
+    if(fields&4u)req.query = ku_http_parse_query_capacity(target,path_len,query_capacity);
     if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
   }
   KuHttpLoopOwner* owner = ku_http_current_loop;
@@ -3633,8 +3643,8 @@ typedef struct {
   int registered,poll_index;
   size_t resource_slot;
 } KuHttpRegistration;
-/* Preserve the original conservative fixed-budget receipt. Live hash buckets
- * below hold only slot+1; their full-width keys already live in registrations. */
+/* Keep the original conservative reservation. Physical hash storage has one
+ * aligned full-key plane followed by narrow slot+1 values, not pointers. */
 typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHashBudget;
 typedef struct {
   size_t entry;
@@ -3648,7 +3658,7 @@ typedef struct KuHttpReactor {
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
-  uint32_t* hash;
+  uint64_t* hash;
   /* Slot+1, not a truncated fd/token. Zero is empty; keys live in registrations. */
   uint32_t* fd_entries;
   int* work;
@@ -3680,6 +3690,19 @@ static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size
       +pending*sizeof(KuHttpRegistration)
       +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*(sizeof(KuHttpRegistrationHashBudget)+sizeof(uint32_t));
 }
+static size_t ku_http_reactor_hash_slot_bytes(const KuHttpReactor* r) {
+  return r->capacity<=UINT16_MAX?sizeof(uint16_t):sizeof(uint32_t);
+}
+static uint32_t ku_http_reactor_hash_slot(const KuHttpReactor* r,size_t at) {
+  const uint8_t* slots=(const uint8_t*)(r->hash+r->hash_capacity);
+  if(r->capacity<=UINT16_MAX) {uint16_t value;memcpy(&value,slots+at*sizeof(value),sizeof(value));return value;}
+  uint32_t value;memcpy(&value,slots+at*sizeof(value),sizeof(value));return value;
+}
+static void ku_http_reactor_hash_set_slot(KuHttpReactor* r,size_t at,uint32_t value) {
+  uint8_t* slots=(uint8_t*)(r->hash+r->hash_capacity);
+  if(r->capacity<=UINT16_MAX) {uint16_t narrow=(uint16_t)value;memcpy(slots+at*sizeof(narrow),&narrow,sizeof(narrow));}
+  else memcpy(slots+at*sizeof(value),&value,sizeof(value));
+}
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
   token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
   token^=token>>27; token*=UINT64_C(0x94d049bb133111eb); token^=token>>31;
@@ -3689,46 +3712,44 @@ static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
-    uint32_t stored=r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!stored) break;
-    size_t entry=(size_t)stored-1u;
-    if(entry>=r->capacity) return SIZE_MAX;
-    if(r->registrations[entry].token==token) return entry;
+    size_t at=(start+i)&(r->hash_capacity-1u);uint64_t key=r->hash[at];
+    if(!key) break;
+    if(key==token) {
+      uint32_t slot=ku_http_reactor_hash_slot(r,at);
+      return slot && (size_t)slot<=r->capacity?(size_t)slot-1u:SIZE_MAX;
+    }
   }
   return SIZE_MAX;
 }
-static uint32_t ku_http_reactor_slot_plus_one(size_t entry) {
-  return entry<UINT32_MAX?(uint32_t)(entry+1u):0u;
-}
 static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
-  uint32_t stored=ku_http_reactor_slot_plus_one(entry);
-  if(!stored || entry>=r->capacity || !token || token==UINT64_MAX
-      || r->registrations[entry].token!=token) return 0;
+  if(entry>=r->capacity || entry>=UINT32_MAX || !token || token==UINT64_MAX)return 0;
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
     size_t at=(start+i)&(r->hash_capacity-1u);
-    if(!r->hash[at]) {r->hash[at]=stored;return 1;}
+    if(!r->hash[at]) {
+      ku_http_reactor_hash_set_slot(r,at,(uint32_t)(entry+1u));r->hash[at]=token;return 1;
+    }
   }
   return 0;
 }
 static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
-    uint32_t stored=r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!stored) return;
-    size_t entry=(size_t)stored-1u;
-    if(entry>=r->capacity) {r->fault=1;return;}
-    if(r->registrations[entry].token==token) {
+    size_t bucket=(start+i)&(r->hash_capacity-1u);uint64_t key=r->hash[bucket];
+    if(!key) return;
+    if(key==token) {
+      uint32_t slot=ku_http_reactor_hash_slot(r,bucket);
+      if(!slot || (size_t)slot>r->capacity) {r->fault=1;return;}
       /* Back-shift the finite probe cluster. Repeated request turnover must
        * not fill the table with tombstones and turn stale lookup into O(cap). */
       size_t mask=r->hash_capacity-1u,hole=(start+i)&mask,at=(hole+1u)&mask;
       for(size_t moved=0;moved<r->hash_capacity && r->hash[at];moved++,at=(at+1u)&mask) {
-        size_t next=(size_t)r->hash[at]-1u;
-        if(next>=r->capacity) {r->fault=1;return;}
-        size_t home=ku_http_reactor_hash_start(r,r->registrations[next].token);
-        if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
+        size_t home=ku_http_reactor_hash_start(r,r->hash[at]);
+        if(((at-home)&mask)>=((hole-home)&mask)) {
+          r->hash[hole]=r->hash[at];ku_http_reactor_hash_set_slot(r,hole,ku_http_reactor_hash_slot(r,at));hole=at;
+        }
       }
-      r->hash[hole]=0;return;
+      r->hash[hole]=0;ku_http_reactor_hash_set_slot(r,hole,0);return;
     }
   }
   r->fault=1;
@@ -3886,22 +3907,18 @@ static void ku_http_reactor_interest(KuHttpReactor* r,size_t index,
   ku_http_reactor_delete(r,index);
   if(r->next_token>=UINT64_MAX-1u) {r->fault=1;return;}
   uint64_t token=++r->next_token;
-  /* Publish the key before its integer bucket, while this owner is the only
-   * table mutator. No event wait or slot reuse can interleave this preflight.
-   * Removal/failed-NEW rollback always precedes overwriting or clearing it. */
-  entry->token=token;
-  if(!ku_http_reactor_hash_add(r,token,index)) {entry->token=0;r->fault=1;return;}
+  if(!ku_http_reactor_hash_add(r,token,index)) {r->fault=1;return;}
   /* Preflight before changing the kernel. This owner cannot concurrently
    * mutate the index, so a successful NEW can publish without a fallible insert. */
-  if(!ku_http_reactor_fd_prepare(r)) {ku_http_reactor_hash_remove(r,token);entry->token=0;return;}
+  if(!ku_http_reactor_fd_prepare(r)) {ku_http_reactor_hash_remove(r,token);return;}
   size_t bucket=ku_http_reactor_fd_bucket(r,fd);
-  if(bucket==SIZE_MAX) {ku_http_reactor_hash_remove(r,token);entry->token=0;r->fault=1;return;}
+  if(bucket==SIZE_MAX) {ku_http_reactor_hash_remove(r,token);r->fault=1;return;}
 #if defined(KU_HTTP_REACTOR_FD_ORACLE)
   size_t expected=r->fd_entries[bucket]?(size_t)r->fd_entries[bucket]-1u:SIZE_MAX;
-  if(!ku_http_reactor_fd_oracle(r,fd,expected)) {ku_http_reactor_hash_remove(r,token);entry->token=0;r->fault=1;return;}
+  if(!ku_http_reactor_fd_oracle(r,fd,expected)) {ku_http_reactor_hash_remove(r,token);r->fault=1;return;}
 #endif
   if(!ku_http_reactor_kernel(r,entry,fd,events,token,0)) {
-    ku_http_reactor_hash_remove(r,token);entry->token=0;r->fault=1;return;
+    ku_http_reactor_hash_remove(r,token);r->fault=1;return;
   }
   int new_fd=!r->fd_entries[bucket];
   ku_http_reactor_retire_fd_aliases(r,index,fd,bucket);
@@ -4067,7 +4084,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
   r->fd_capacity=r->hash_capacity<32u?r->hash_capacity:32u;
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
-  r->hash=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->hash));
+  r->hash=(uint64_t*)calloc(r->hash_capacity,sizeof(*r->hash)+ku_http_reactor_hash_slot_bytes(r));
   r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
 #if defined(__linux__)

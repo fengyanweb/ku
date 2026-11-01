@@ -8417,10 +8417,12 @@ static int fixture_fd_index_init_failures(void) {
   KuHttpConnection connections[1]={{0}};KuHttpActiveSet active={connections,1,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init_pending(&r,&active,1u,2u));
   CHECK(fixture_alloc_calls==5u);
-  /* Conservative Task reservation/refund is unchanged; only the physical
-   * token buckets stop duplicating the full keys in registration storage. */
-  CHECK(sizeof(*r.hash)==4u && sizeof(KuHttpRegistrationHashBudget)==16u);
-  CHECK(fixture_live_bytes+r.hash_capacity*(sizeof(KuHttpRegistrationHashBudget)-sizeof(*r.hash))
+  /* Conservative reservation/refund is unchanged. The two aligned planes
+   * retain full keys while narrowing only each slot index. */
+  CHECK(sizeof(*r.hash)==8u && ku_http_reactor_hash_slot_bytes(&r)==2u
+      && sizeof(KuHttpRegistrationHashBudget)==16u);
+  CHECK(fixture_live_bytes+r.hash_capacity*(sizeof(KuHttpRegistrationHashBudget)
+      -sizeof(*r.hash)-ku_http_reactor_hash_slot_bytes(&r))
       ==ku_http_reactor_pending_storage_bytes(1u,1u,2u)-sizeof(r));
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
   CHECK(!ku_http_reactor_init(&r,&active,(size_t)UINT32_MAX));
@@ -8428,10 +8430,6 @@ static int fixture_fd_index_init_failures(void) {
   puts("http-persistent-fd-index-init-budget-cleanup-ok");return 0;
 }
 static int fixture_token_index_identities(void) {
-  CHECK(ku_http_reactor_slot_plus_one(0u)==1u);
-  CHECK(ku_http_reactor_slot_plus_one((size_t)UINT32_MAX-1u)==UINT32_MAX);
-  CHECK(!ku_http_reactor_slot_plus_one((size_t)UINT32_MAX));
-  CHECK(!ku_http_reactor_slot_plus_one(SIZE_MAX));
   KuHttpConnection connections[8]={{0}};KuHttpActiveSet active={connections,8,NULL};KuHttpReactor r;
   CHECK(ku_http_reactor_init(&r,&active,0u));
   CHECK(r.hash_capacity==ku_http_reactor_hash_capacity(r.capacity));
@@ -8455,7 +8453,7 @@ static int fixture_token_index_identities(void) {
     for(size_t step=0;step<4u;step++) {
       size_t slot=deletion[step];ku_http_reactor_hash_remove(&r,keys[slot]);
       CHECK(ku_http_reactor_lookup(&r,keys[slot])==SIZE_MAX);
-      r.registrations[slot].token=0; /* Only after back-shift read the full key. */
+      r.registrations[slot].token=0;
       for(size_t i=0;i<4u;i++)if(r.registrations[i].token)
         CHECK(ku_http_reactor_lookup(&r,keys[i])==i);
     }
@@ -8466,10 +8464,44 @@ static int fixture_token_index_identities(void) {
   CHECK(ku_http_reactor_lookup(&r,keys[0])==r.capacity-1u);
   ku_http_reactor_hash_remove(&r,keys[0]);r.registrations[r.capacity-1u].token=0;
   CHECK(ku_http_reactor_lookup(&r,0u)==SIZE_MAX && ku_http_reactor_lookup(&r,UINT64_MAX)==SIZE_MAX);
-  size_t bucket=ku_http_reactor_hash_start(&r,keys[0]);r.hash[bucket]=UINT32_MAX;
-  CHECK(ku_http_reactor_lookup(&r,keys[0])==SIZE_MAX);
-  ku_http_reactor_hash_remove(&r,keys[0]);CHECK(r.fault);r.hash[bucket]=0;
+  size_t bucket=ku_http_reactor_hash_start(&r,keys[0]);r.hash[bucket]=keys[0];
+  for(uint32_t invalid=0;invalid<=r.capacity+1u;invalid+=(uint32_t)r.capacity+1u) {
+    ku_http_reactor_hash_set_slot(&r,bucket,invalid);
+    CHECK(ku_http_reactor_lookup(&r,keys[0])==SIZE_MAX);
+    ku_http_reactor_hash_remove(&r,keys[0]);CHECK(r.fault);r.fault=0;
+  }
+  r.hash[bucket]=0;ku_http_reactor_hash_set_slot(&r,bucket,0);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+
+  /* Codec extreme without allocating a maximum-size reactor. This verifies
+   * uint32 slot+1 representation, not full-capacity execution. */
+  KuHttpReactor codec={0};codec.capacity=UINT32_MAX;codec.hash_capacity=8u;
+  codec.hash=calloc(codec.hash_capacity,sizeof(*codec.hash)+ku_http_reactor_hash_slot_bytes(&codec));
+  CHECK(codec.hash && ku_http_reactor_hash_slot_bytes(&codec)==4u);
+  CHECK(ku_http_reactor_hash_add(&codec,UINT64_MAX-1u,(size_t)UINT32_MAX-1u));
+  CHECK(ku_http_reactor_lookup(&codec,UINT64_MAX-1u)==(size_t)UINT32_MAX-1u);
+  CHECK(!ku_http_reactor_hash_add(&codec,1u,(size_t)UINT32_MAX));
+  ku_http_reactor_hash_remove(&codec,UINT64_MAX-1u);CHECK(!codec.fault);
+  for(size_t i=0;i<codec.hash_capacity;i++)CHECK(!codec.hash[i] && !ku_http_reactor_hash_slot(&codec,i));
+  free(codec.hash);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+
+  /* Width switches only at the real capacity boundary, not live count. The
+   * last physical slot must remain representable and keep all token bits. */
+  for(size_t cap=UINT16_MAX;cap<=(size_t)UINT16_MAX+1u;cap++) {
+    KuHttpActiveSet empty={NULL,0,NULL};
+    CHECK(ku_http_reactor_init_pending(&r,&empty,0u,cap-3u));
+    CHECK(r.capacity==cap && ku_http_reactor_hash_slot_bytes(&r)==(cap==UINT16_MAX?2u:4u));
+    uint64_t key=UINT64_MAX-1u;
+    CHECK(ku_http_reactor_hash_add(&r,key,cap-1u));
+    CHECK(ku_http_reactor_lookup(&r,key)==cap-1u);
+    CHECK(!ku_http_reactor_hash_add(&r,key-1u,cap));
+    CHECK(!ku_http_reactor_hash_add(&r,key-1u,SIZE_MAX));
+    CHECK(!ku_http_reactor_hash_add(&r,0u,0u) && !ku_http_reactor_hash_add(&r,UINT64_MAX,0u));
+    ku_http_reactor_hash_remove(&r,key);
+    CHECK(ku_http_reactor_lookup(&r,key)==SIZE_MAX && !r.fault);
+    for(size_t i=0;i<r.hash_capacity;i++)CHECK(!r.hash[i] && !ku_http_reactor_hash_slot(&r,i));
+    ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+  }
 
   KuHttpConnection growing[32]={{0}};KuHttpActiveSet growth={growing,32,NULL};
   CHECK(ku_http_reactor_init(&r,&growth,0u));
