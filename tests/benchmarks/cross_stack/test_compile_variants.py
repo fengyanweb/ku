@@ -295,7 +295,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         verify=job.split('- name: Verify runner entry',1)[1].split('- name: Install only',1)[0]
         mode=verify.split('if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then',1)[1].split('fi',1)[0]
         for check in ('test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic',
-                'test "$KU_PERFORMANCE_V2_PREPATCH" = b765f9bc5d3a6e71353a562e27cef7b4cbb35f69',
+                'test "$KU_PERFORMANCE_V2_PREPATCH" = 3e5f18e9c7a45dbc775088c43a0278c19cf1ea84',
                 'test "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = false','test "$KU_PERFORMANCE_V2_PG_QUEUE_SCREEN" = false',
                 'test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = false','test "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = false',
                 'test "$KU_PERFORMANCE_V2_TASK_JSON_SCREEN" = false','test "$KU_PERFORMANCE_V2_COMMON_HTTP_SCREEN" = false',
