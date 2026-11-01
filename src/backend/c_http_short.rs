@@ -95,6 +95,9 @@ struct JsonBound {
     fields: JsonCost,
     depth: usize,
     body_text: bool,
+    // Only set by a complete, type-checked literal of a known user layout.
+    // A Named type alone must never qualify resources or arbitrary structs.
+    pure_struct: Option<String>,
 }
 impl JsonBound {
     fn scalar(ty: &IrType, bytes: usize) -> Self {
@@ -108,6 +111,7 @@ impl JsonBound {
             fields: JsonCost::default(),
             depth: 0,
             body_text: false,
+            pure_struct: None,
         }
     }
     fn string(ty: &IrType, bytes: JsonCost) -> Option<Self> {
@@ -135,10 +139,12 @@ impl JsonBound {
     fn checked(self) -> Option<Self> {
         let supported = match &self.ty {
             IrType::Int | IrType::Bool | IrType::Null | IrType::Str | IrType::Void => true,
-            IrType::Named(name) => matches!(
-                name.as_str(),
-                "__ku_value" | "__ku_object" | "__ku_error_type" | "__ku_http_response"
-            ),
+            IrType::Named(name) => {
+                matches!(
+                    name.as_str(),
+                    "__ku_value" | "__ku_object" | "__ku_error_type" | "__ku_http_response"
+                ) || self.pure_struct.as_ref() == Some(name)
+            }
             IrType::Result(inner) => {
                 matches!(
                     inner.as_ref(),
@@ -182,6 +188,7 @@ struct JsonProof {
     max_bytes: JsonCost,
     max_nodes: JsonCost,
     json: bool,
+    struct_fields: HashMap<String, Vec<(String, IrType)>>,
 }
 fn json_forward_cfg(function: &IrFunction) -> bool {
     function.blocks.iter().enumerate().all(|(position, block)| {
@@ -291,6 +298,61 @@ impl JsonProof {
             IrExprKind::Local(name) | IrExprKind::BorrowedParam(name) => locals.get(name)?.clone(),
             IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => temps.get(id)?.clone(),
             IrExprKind::Borrow(value) => self.expression(value, parameter, locals, temps)?,
+            IrExprKind::StructLiteral { name, fields } => {
+                // Typed JSON writers have no user callbacks: they write these
+                // exact fields in static key order and borrow their values.
+                // Require every layout field exactly once; unknown/defaulted
+                // fields, resources and unbounded element types stay workers.
+                let layout = self.struct_fields.get(name)?.clone();
+                if name.starts_with("__ku_")
+                    || expr.ty != IrType::Named(name.clone())
+                    || layout.len() != fields.len()
+                    || fields.len() > 8
+                {
+                    return None;
+                }
+                let mut seen = HashSet::new();
+                let mut object = JsonBound::scalar(&expr.ty, 0);
+                object.pure_struct = Some(name.clone());
+                object.encoded = JsonCost::constant(2);
+                object.depth = 1;
+                for (key, field) in fields {
+                    let declared = layout.iter().find(|(name, _)| name == key)?;
+                    if key.len() > 64 || !seen.insert(key) || field.ty != declared.1 {
+                        return None;
+                    }
+                    let value = self.expression(field, parameter, locals, temps)?;
+                    if !matches!(
+                        &value.ty,
+                        IrType::Int | IrType::Bool | IrType::Null | IrType::Str
+                    ) && !matches!(&value.ty,IrType::Named(name) if name=="__ku_object"||name=="__ku_value"||value.pure_struct.as_ref()==Some(name))
+                    {
+                        return None;
+                    }
+                    // Six per key byte is conservative for the static writer's
+                    // escaping; +4 covers quotes, colon and comma. Values use
+                    // the same bounded legacy JSON writer as dynamic objects.
+                    object.encoded =
+                        object
+                            .encoded
+                            .add(&value.encoded)?
+                            .add(&JsonCost::constant(
+                                key.len().checked_mul(6)?.checked_add(4)?,
+                            ))?;
+                    object.keys = object.keys.add(&JsonCost::constant(key.len()))?;
+                    object = object.combine(&value)?;
+                }
+                object.depth = object.depth.checked_add(1)?;
+                object.fields = object.fields.add(&JsonCost::constant(fields.len()))?;
+                // Struct construction moves each field, without heap keys,
+                // table insertion or an output DOM. Deep cleanup/clone work is
+                // charged by retire/clone_tree, including embedded KuValues.
+                self.work(
+                    JsonCost::default(),
+                    JsonCost::constant(1 + fields.len() * 4),
+                )?;
+                object
+            }
             IrExprKind::Field { target, name } if matches!(&target.kind,IrExprKind::Local(local)|IrExprKind::BorrowedParam(local) if local==parameter) => {
                 match name.as_str() {
                     "body" => {
@@ -643,13 +705,30 @@ impl JsonProof {
         self.json.then_some(())
     }
 }
-fn bounded_json(function: &IrFunction) -> Option<JsonProof> {
+fn bounded_json(program: &IrProgram, function: &IrFunction) -> Option<JsonProof> {
     let response = matches!(&function.return_type,IrType::Named(name) if name=="__ku_http_response")
         || matches!(&function.return_type,IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_http_response"));
     if !response {
         return None;
     }
-    let mut proof = JsonProof::default();
+    let mut proof = JsonProof {
+        struct_fields: program
+            .layouts
+            .structs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.name.clone(),
+                    layout
+                        .fields
+                        .iter()
+                        .map(|field| (field.name.clone(), field.ty.clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+        ..JsonProof::default()
+    };
     proof.function(function)?;
     Some(proof)
 }
@@ -1231,7 +1310,7 @@ pub(super) fn emit(
         .iter()
         .filter(|function| {
             (function.is_closure_body || targets.iter().any(|target| target.id == function.id))
-                && bounded_json(function).is_some()
+                && bounded_json(program, function).is_some()
         })
         .count();
     out.push_str(&format!("/* JSON certificate caps: input {JSON_INPUT_BYTES}, bytes {JSON_MAX_BYTE_WORK}, visits {JSON_MAX_VISITS}, output {JSON_MAX_VALUE_BYTES}, nodes {JSON_MAX_VALUE_NODES}. */\n"));
@@ -1246,9 +1325,10 @@ pub(super) fn emit(
         if json_candidates > 64 {
             continue;
         }
-        if let (Some(proof), Some(symbol)) =
-            (bounded_json(function), closure_invoke_symbol(function.id))
-        {
+        if let (Some(proof), Some(symbol)) = (
+            bounded_json(program, function),
+            closure_invoke_symbol(function.id),
+        ) {
             out.push_str(&format!("  if(invoke==(void*){symbol}) {{ static const KuHttpJsonWork work={{{{{}}},{{{}}},{{{}}},{{{}}}}}; return &work; }} /* bounded JSON owner handler {} */\n",proof.byte_work.c(),proof.visits.c(),proof.max_bytes.c(),proof.max_nodes.c(),function.id.0));
         }
     }
@@ -1430,13 +1510,89 @@ mod tests {
             },
         });
         function.blocks[0].instructions.splice(0..0, objects);
-        let proof = bounded_json(&function).expect("finite typed JSON IR");
+        let proof = bounded_json(&program, &function).expect("finite typed JSON IR");
         assert!(proof.instructions <= 512);
         assert!(
             proof.visits.0[0] > JSON_MAX_VISITS,
             "the runtime must keep this over-budget handler on its worker"
         );
     }
+    #[test]
+    fn json_owner_typed_structs_keep_layout_and_work_bounds() {
+        fn program(declarations: &str, body: &str) -> IrProgram {
+            let source = format!(
+                r#"import {{http,json}} from "std" {declarations}
+                fn Reply(req:HttpRequest):HttpResponse! {{ {body} }} fn main() {{}}"#
+            );
+            let ast =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap())
+        }
+        fn proof(program: &IrProgram) -> Option<JsonProof> {
+            bounded_json(
+                program,
+                program
+                    .functions
+                    .iter()
+                    .find(|function| function.name == "Reply")
+                    .unwrap(),
+            )
+        }
+        let body = r#"decoded=json.decode(req.body)?
+            counter=decoded["counter"]?.as_int()?
+            data=decoded.take("data")?
+            envelope=Packet {id:req.query.rid,counter:counter+1,data:data}
+            return ok(http.text(json.encode(envelope)?))"#;
+        let mut typed = program("struct Packet {id:str counter:int data:KuValue}", body);
+        let certificate = proof(&typed).expect("known pure struct has a certificate");
+        let metrics = [1, 1048, 80, 64, 72, 56, 10, 5, 8, 1, 0];
+        let evaluate = |cost: &JsonCost| {
+            cost.0
+                .iter()
+                .zip(metrics)
+                .map(|(a, b)| a * b)
+                .sum::<usize>()
+        };
+        assert!(evaluate(&certificate.byte_work) <= JSON_MAX_BYTE_WORK);
+        assert!(evaluate(&certificate.visits) <= JSON_MAX_VISITS);
+        assert!(evaluate(&certificate.max_bytes) <= JSON_MAX_VALUE_BYTES);
+        assert!(evaluate(&certificate.max_nodes) <= JSON_MAX_VALUE_NODES);
+        // A Named type without its matching declaration is insufficient proof.
+        typed
+            .layouts
+            .structs
+            .retain(|layout| layout.name != "Packet");
+        assert!(proof(&typed).is_none());
+        for (declarations, expression) in [
+            (
+                "struct Wide {a:int b:int c:int d:int e:int f:int g:int h:int i:int}",
+                "Wide {a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8,i:9}",
+            ),
+            ("struct Decimal {value:float}", "Decimal {value:1.5}"),
+            ("struct Items {values:[int]}", "Items {values:[1,2]}"),
+        ] {
+            assert!(proof(&program(
+                declarations,
+                &format!("value={expression} return ok(http.text(json.encode(value)?))")
+            ))
+            .is_none());
+        }
+        let nested = program(
+            "struct Inner {value:KuValue} struct Outer {id:str content:Inner}",
+            r#"decoded=json.decode(req.body)?
+            inner=Inner {value:decoded}
+            outer=Outer {id:req.query.rid,content:inner}
+            copy=outer.clone()
+            return ok(http.text(json.encode(copy)?))"#,
+        );
+        assert!(
+            proof(&nested).is_some(),
+            "nested finite layouts retain clone/drop bounds"
+        );
+    }
+
     #[test]
     fn json_owner_certificate_keeps_pure_value_flow_and_rejects_escape() {
         fn plan(body: &str) -> Option<JsonProof> {
@@ -1450,6 +1606,7 @@ mod tests {
                     .unwrap();
             let program = crate::ir::optimize_program(&crate::ir::lower_program(&ast).unwrap());
             bounded_json(
+                &program,
                 program
                     .functions
                     .iter()
