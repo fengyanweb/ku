@@ -25,7 +25,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False, pg_cost_observation=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -52,7 +52,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
         old=json.load(tar.extractfile('hosted-state.json'))
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not ((owner_observation or pg_cost_observation) and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
                     and all(v.get('state')=='completed' for v in old['steps'].values())):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
@@ -69,7 +69,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not owner_observation else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or pg_cost_observation) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -244,6 +244,7 @@ func TestReusedProtocolInputBytes(t *testing.T) {
 OWNER_RUN='41182804290'
 OWNER_ARCHIVE_SHA='5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6'
 OWNER_PRODUCT='4e5f5d94da277654862d8679f7ae4a7fda3f05ff'
+PG_COST_RUNTIME='f181894173c7bd722091f6525ac04466bdc1cded'
 
 
 def prepare_owner(a):
@@ -253,7 +254,13 @@ def prepare_owner(a):
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on Linux ARM64 required')
     expected={'B':a.candidate,'R':a.candidate}
-    mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected,owner_observation=True)
+    pg_cost=getattr(a,'pg_cost_probe',False)
+    if pg_cost:
+        changed=subprocess.check_output(['git','-C',str(a.source),'diff','--name-only',PG_COST_RUNTIME,
+            a.candidate,'--','src','Cargo.toml','Cargo.lock'],text=True,timeout=10)
+        if changed.strip():raise ValueError('fixed archive product is not runtime-equivalent to f181894')
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected,
+        **({'pg_cost_observation':True} if pg_cost else {'owner_observation':True}))
     restore_json_inputs(a.source,a.root,expected,mapping)
     for name,commit in expected.items():
         validate_protocol_inputs(a.root,name,mapping);verify_manifest(a.root,name,commit,mapping)
@@ -261,14 +268,15 @@ def prepare_owner(a):
     state=dict(identity=identity,steps={},goal_status='unknown',uid=os.getuid(),gid=os.getgid(),
         reused_build=dict(archive_sha256=a.archive_sha256,source_run=a.source_run,product_commit=a.candidate,
             normal_versions=expected,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False))
+    if pg_cost:state['reused_build']['runtime_equivalent']=PG_COST_RUNTIME
     h.save(a.root/'hosted-state.json',state)
-    result=h.step(state,a.root,'build',lambda:h.prepare_memory_owner(a,state))
+    result=h.step(state,a.root,'build',lambda:h.prepare_pg_cost(a,state) if pg_cost else h.prepare_memory_owner(a,state))
     h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=result['execution_complete']))
     return result
 
 
 def prepare(a):
-    if getattr(a,'memory_owner_probe',False):return prepare_owner(a)
+    if getattr(a,'pg_cost_probe',False) or getattr(a,'memory_owner_probe',False):return prepare_owner(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
@@ -301,12 +309,13 @@ def main(argv=None):
     parser.add_argument('--archive-sha256',required=True);parser.add_argument('--source-run',required=True)
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
+    parser.add_argument('--pg-cost-probe',action='store_true',help='Reuse the same fixed verified normal B/R archive for PG normal/probe/normal cost diagnosis')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
     a=parser.parse_args(argv)
-    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe else 'followup-screen')
+    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe or a.pg_cost_probe else 'followup-screen')
     except ValueError as error:parser.error(str(error))
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []

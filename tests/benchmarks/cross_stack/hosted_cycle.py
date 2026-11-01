@@ -36,6 +36,10 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    if getattr(a,'pg_cost_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
+            ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe',
+             'pg_queue_screen','pg_driver_screen','http_short_screen','memory_owner_probe'))):
+        raise ValueError('--pg-cost-probe requires diagnostic build-set and no other opt-in mode')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
             raise ValueError('--http-short-goal must be cpu or memory')
@@ -80,6 +84,7 @@ def hosted_identity(a,build_set):
     if getattr(a,'http_short_screen',False):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
+    if getattr(a,'pg_cost_probe',False):identity['pg_cost_probe']=True
     return identity
 
 
@@ -550,6 +555,7 @@ def build_json_layers(a):
 def build(a,state):
     if os.geteuid()==0: raise ValueError('build must run as the ordinary checkout user')
     validate_screen_selection(a,getattr(a,'build_set','full'))
+    if getattr(a,'pg_cost_probe',False):raise ValueError('PG cost probe requires verified fixed archive reuse, not a fresh build')
     if getattr(a,'memory_owner_probe',False):raise ValueError('owner probe requires verified fixed archive reuse, not a fresh build')
     if getattr(a,'normal_self_probe',False):require_normal_perf_preflight(a)
     uid,gid=os.getuid(),os.getgid();state.update(uid=uid,gid=gid)
@@ -1357,6 +1363,125 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
 
 
 
+def pg_cost_plan(versions):
+    return dict(schema='ku-pg-cost-plan-v1',versions=versions,resources=copy.deepcopy(RESOURCES),
+        quality_policy=copy.deepcopy(POLICY),diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,workload='db',rate=200,warmup_seconds=3,score_seconds=15,
+        order=[['B','before'],['PC','probe'],['B','after']],maximum_windows=3,maximum_replacements=0,
+        maximum_control_cpu_ratio=1.10,sampling_stride=64,
+        runtime_equivalent='f181894173c7bd722091f6525ac04466bdc1cded',
+        scope='Ku mandatory reset unchanged. Default/strict Rust comparisons remain separate historical contracts; no Rust cost/ranking is inferred by these Ku-only windows.')
+
+
+def prepare_pg_cost(a,state):
+    import pg_cost_diagnostic as pgc
+    from compile_variants import Commands, clean_environment
+    directory=a.root/'PC';directory.mkdir();m=copy.deepcopy(load(a.root/'B/manifest.json'))
+    stack=m['stacks']['ku'];build=stack['build'];native=build['native']['server'];original=copy.deepcopy(native)
+    emission=pgc.prepare(Path(native['generated_c']),directory/'pg-cost.c',a.candidate)
+    invocation=native['compiler_invocation'];libs=invocation['library_inputs']
+    if len(libs)!=1 or libs[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
+        raise ValueError('PG cost probe requires original normal C11O2 and single libpq input')
+    binary=directory/'bin/ku-pg-cost';binary.parent.mkdir()
+    command=[invocation['compiler']['path'],str(directory/'pg-cost.c'),*invocation['flags'],
+        libs[0]['selected_input']['real_path'],'-Wl,--wrap=pthread_create','-o',str(binary)]
+    log=Commands(directory/'logs',clean_environment(a.tools));log.run('pg-cost-link',command,directory,timeout=120)
+    with binary.open('rb') as stream:header=stream.read(20)
+    if len(header)!=20 or header[:6]!=b'\x7fELF\x02\x01' or int.from_bytes(header[18:20],'little')!=183:
+        raise ValueError('PG cost link is not ELF64 little-endian AArch64')
+    save(directory/'compile.json',dict(command=command,commands=log.rows,diagnostic_only=True,normal_score_eligible=False))
+    native.update(binary=str(binary),binary_sha256=sha(binary),generated_c=str(directory/'pg-cost.c'),
+        generated_c_sha256=emission['diagnostic_c_sha256'],compiler_receipt=str(directory/'compile.json'),
+        compiler_receipt_sha256=sha(directory/'compile.json'),
+        compiler_invocation=dict(invocation,argv=command,output=str(binary),source=dict(path=str(directory/'pg-cost.c'),
+            sha256=emission['diagnostic_c_sha256']),cwd=str(directory)))
+    stack['command']=[str(binary)];build.update(instrumented='pg-phase-cost-v1',normal_score_eligible=False)
+    m.update(diagnostic_only=True,normal_score_eligible=False,build_receipt=str(directory/'compile.json'))
+    m=normalize_manifest(m,Path(m['protocol']),m['client']);save(directory/'manifest.json',m)
+    fixture=copy.deepcopy(m);fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
+    versions={name:dict(root=str(a.root/name),stack='ku',source_commit=a.candidate,
+        binary_sha256=load(a.root/name/'manifest.json')['stacks']['ku']['build']['native']['server']['binary_sha256'],
+        diagnostic_only=name=='PC',normal_score_eligible=False) for name in ('B','PC')}
+    plan=pg_cost_plan(versions);save(a.root/'frozen-plan.json',plan)
+    save(a.root/'build-identities.json',{name:fc.version_identity(plan,name) for name in versions})
+    if sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']:
+        raise ValueError('normal B artifact changed while preparing PG cost probe')
+    return dict(execution_complete=True,goal_status='unknown',diagnostic_only=True,normal_score_eligible=False)
+
+
+def pg_cost_controls(rows,maximum=1.10):
+    controls=[row for row in rows if row.get('turn') in ('before','after')]
+    probes=[row for row in rows if row.get('turn')=='probe']
+    result=dict(controls_complete=len(controls)==2 and len(probes)==1,drift_valid=False,
+        interpretation='Single sequence, gross probe CPU includes observer work; no CI, subtraction of per-clock overhead or adoption claim.')
+    for metric in ('cpu_us','full_cpu_us'):
+        values=[row.get(metric) for row in controls];probe=probes[0].get(metric) if len(probes)==1 else None
+        valid=len(values)==2 and all(type(x) in (int,float) and x>0 for x in [*values,probe])
+        result[metric]=dict(unsampled_max_min=max(values)/min(values) if valid else None,
+            probe_over_unsampled_geomean=probe/(values[0]*values[1])**.5 if valid else None)
+    ratio=result['cpu_us']['unsampled_max_min']
+    result['drift_valid']=result['controls_complete'] and ratio is not None and ratio<=maximum
+    return result
+
+
+def pg_cost_probe(a,state):
+    import pg_cost_diagnostic as pgc
+    if os.geteuid()!=0:raise ValueError('PG cost probe requires root cgroup control')
+    plan=load(a.root/'frozen-plan.json')
+    if plan!=pg_cost_plan(plan.get('versions',{})):raise ValueError('matching frozen PG cost plan required')
+    bindings={name:fc.version_identity(plan,name) for name in ('B','PC')}
+    directory=a.root/'pg-cost-probe';directory.mkdir()
+    fixture=db.Database(a.root/'fixture',state['uid'],state['gid']);original=fc.Harness;private=None
+    result=dict(schema='ku-pg-cost-observation-v1',diagnostic_only=True,normal_score_eligible=False,
+        formal_qualified=False,candidate_accepted=False,attribution_eligible=False,
+        attribution_review='Pending sampled phase denominator, call-count and ordinary/probe/ordinary perturbation review; gross clocks are not original CPU cost.',
+        execution_complete=False,goal_status='unknown',rows=[],stopped=[])
+    class CostHarness(original):
+        def __init__(self,*args,**kwargs):
+            super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
+            self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+    try:
+        fixture.start();private=load(fixture.manifest_path);fc.Harness=CostHarness
+        save(directory/'identity.json',dict(bindings=bindings,plan=plan,reused_build=state.get('reused_build'),
+            database_limits=load(fixture.state_path)['limits'],boot_sha256=sha('/proc/sys/kernel/random/boot_id')))
+        for name,turn in plan['order']:
+            output=directory/turn
+            row=fc.window(plan,name,'db',200,3,15,output,binding=bindings[name],job={'phase':'diagnostic','contract':'pg-shared'})
+            row.update(turn=turn,diagnostic_only=True,normal_score_eligible=False,formal_qualified=False)
+            result['rows'].append(row)
+            valid,signature=normal_diagnostic_quality(row)
+            valid=valid and row.get('correct')==3000 and row.get('all_correct') is True
+            if turn=='probe':
+                log=output/'service/service.log'
+                with log.open('rb') as stream:raw=stream.read((8<<20)+1)
+                if len(raw)>8<<20:raise ValueError('PG cost service log exceeds8MiB bound')
+                records=[json.loads(line[len('KU_FLOW_DIAG '):]) for line in raw.decode().splitlines() if line.startswith('KU_FLOW_DIAG ')]
+                save(output/'flow-ledger.json',dict(records=records,record_count=len(records)))
+                if len(records)!=1:raise ValueError('exactly one joined PG cost ledger required')
+                result['phase_costs']=pgc.summarize(records[0]);save(output/'phase-costs.json',result['phase_costs'])
+                valid=valid and result['phase_costs']['valid']
+            if fc.version_identity(plan,name)!=bindings[name]:raise ValueError('PG cost artifact changed between windows')
+            if not valid:
+                result['stopped'].append(dict(turn=turn,quality_signature=signature,reason='quality/ledger/cleanup failure; no replacement'));break
+        result['controls']=pg_cost_controls(result['rows'],plan['maximum_control_cpu_ratio'])
+    except BaseException as error:
+        result['observer_error']=repr(error)
+        if not isinstance(error,Exception):raise
+    finally:
+        fc.Harness=original
+        try:result['database_cleanup']=fixture.stop()
+        except Exception as error:result['database_cleanup']={'error':repr(error)}
+        cleanup=result['database_cleanup'];dbok=(cleanup.get('forced') is False and cleanup.get('cgroup_removed') is True and cleanup.get('after',{}).get('process_count')==0)
+        result['execution_complete']=(len(result['rows'])==3 and not result['stopped'] and dbok and 'observer_error' not in result
+            and result.get('controls',{}).get('drift_valid') is True and result.get('phase_costs',{}).get('valid') is True)
+        result['goal_status']='unknown' if result['execution_complete'] else 'blocked'
+        state['database_cleanup']=cleanup;save(directory/'summary.json',result);save(a.root/'hosted-state.json',state)
+        selected=[p for p in directory.rglob('*') if p.is_file() and p.name in ('summary.json','identity.json','window.json',
+            'full-lifecycle.json','termination.json','client.json','driver-cleanup.json','phase-costs.json','flow-ledger.json')]
+        result['small_artifact']=pg_failure_export(a,directory,output_name='pg-cost-observation',schema='ku-pg-cost-small-v1',selected=selected)
+    return result
+
+
 def memory_owner_plan(versions):
     return dict(schema='ku-memory-owner-plan-v1',versions=versions,resources=copy.deepcopy(RESOURCES),
         quality_policy=copy.deepcopy(POLICY),diagnostic_only=True,normal_score_eligible=False,
@@ -1823,6 +1948,7 @@ def normal_self_probe(a,state):
 
 
 def diagnostic(a,state,followup=False):
+    if getattr(a,'pg_cost_probe',False):return pg_cost_probe(a,state)
     if getattr(a,'memory_owner_probe',False):return memory_owner_probe(a,state)
     if getattr(a,'pg_driver_screen',False):return pg_driver_screen(a,state)
     if getattr(a,'pg_queue_screen',False) or getattr(a,'http_short_screen',False):return pg_queue_screen(a,state)
@@ -2374,11 +2500,13 @@ def main(argv=None):
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen b765f9b prepatch, no capacity or adoption claim')
+    p.add_argument('--pg-cost-probe',action='store_true',help='Fixed archive normal/probe/normal PG200 diagnostic, no fresh cargo build or performance acceptance')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
+    if a.pg_cost_probe and a.phase not in ('diagnostic','archive'):p.error('--pg-cost-probe requires fixed archive reuse before diagnostic')
     if a.memory_owner_probe and a.phase not in ('diagnostic','archive'):p.error('--memory-owner-probe requires fixed archive reuse before diagnostic')
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
@@ -2417,7 +2545,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(180 if a.pg_cost_probe else 120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,

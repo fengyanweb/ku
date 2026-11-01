@@ -223,7 +223,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertEqual(job.count('performance_task_json_args+=(--memory-owner-probe)'),2)
         for value in ('41182804290','5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6','4e5f5d94da277654862d8679f7ae4a7fda3f05ff'):
             self.assertIn(value,job)
-        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ] && [ "$KU_PERFORMANCE_V2_PG_COST_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
         self.assertIn('name: ku-memory-owner-observation',job)
         self.assertIn('inputs.memory_owner_probe && 3',job)
 
@@ -232,7 +232,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('if: always()',archive)
         self.assertIn('sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase archive',archive)
-        self.assertEqual(job.count('uses: actions/upload-artifact@'),8)
+        self.assertEqual(job.count('uses: actions/upload-artifact@'),9)
         self.assertIn('retention-days: 1',job)
         self.assertIn('/ku-performance-v2/ku-performance-v2-evidence.tar.gz',job)
         self.assertIn('/ku-performance-v2/archive.json',job)
