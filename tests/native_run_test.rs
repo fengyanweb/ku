@@ -1076,7 +1076,9 @@ static int ku_http_fixture_read_case(KuHttpWake* wake, KuHttpBufferBudget* budge
     passed = connection.phase == original_phase && connection.deadline == 100
       && ku_http_fixture_recv_calls == 1
       && (kind == 0
-          ? connection.header != NULL && connection.capacity == 1024 && budget->current == 1024
+          /* A would-block read owns no bytes. The header buffer is reserved
+             only after positive input, without changing the original D. */
+          ? connection.header == NULL && connection.capacity == 0 && budget->current == 0
           : connection.header == original_header && connection.capacity == original_capacity)
       && connection.buffered == original_buffered
       && connection.input.body == original_body
