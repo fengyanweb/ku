@@ -265,7 +265,7 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo test --release --locked --lib http_short::tests -- --list > "$RUNNER_TEMP/http-proof.list"
-          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 6
+          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 7
           cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
           names=(
             native_http_bounded_json_owner_preserves_input_edges_and_legacy_results
@@ -283,6 +283,11 @@ jobs:
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
           done
+          for name in native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread native_task_frame_pending_resume_cancel_and_payload_drop_execute_in_c; do
+            cargo test --release --locked --test native_task_frame_c_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
+          done
       - name: Check the request owner path with Linux detectors
         if: runner.os == 'Linux'
         shell: bash
@@ -297,6 +302,10 @@ jobs:
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
           done
+          name=native_task_zero_storage_checks_every_byte_without_alignment_or_tail_overread
+          cargo test --release --locked --test native_task_frame_c_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
+          if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
