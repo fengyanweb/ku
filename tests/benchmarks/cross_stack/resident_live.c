@@ -24,6 +24,7 @@ uint64_t ku_resident_records[CAPACITY][5];
 static _Thread_local unsigned entered __attribute__((tls_model("initial-exec")));
 #if defined(KU_RESIDENT_ASN1)
 #include <dlfcn.h>
+#include <stdlib.h>
 /* Optional bounded provenance, never enabled in the original owner mode.
  * kind's low byte remains its allocator kind; upper bits name this call.
  * No ASN.1 node contents, keys or certificate payloads are read/exported. */
