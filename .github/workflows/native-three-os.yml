@@ -256,6 +256,7 @@ jobs:
           rustup set profile minimal
           rustup toolchain install 1.89.0 --no-self-update
           rustup default 1.89.0
+          rustup component add rustfmt --toolchain 1.89.0
           command -v clang
           clang --version
       - name: Run bounded proof and affected HTTP contracts
