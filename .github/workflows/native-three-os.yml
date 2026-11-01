@@ -9,7 +9,7 @@ on:
         description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -231,6 +231,59 @@ jobs:
           name: native-task-tsan-evidence
           path: ${{ runner.temp }}/ku-task-tsan
           if-no-files-found: error
+
+  http-short-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'http-short-proof'
+    name: ${{ matrix.os }} bounded HTTP request regressions
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_CC: "clang"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install the pinned compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          command -v clang
+          clang --version
+      - name: Run bounded proof and affected HTTP contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --release --locked --lib http_short::tests -- --list > "$RUNNER_TEMP/http-proof.list"
+          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 4
+          cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
+          for name in native_http_validates_unmaterialized_headers_and_owns_route_snapshot native_http_handler_deadline_is_capped_by_absolute_request_deadline native_http_backpressure_matches_interpreter; do
+            cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
+          done
+      - name: Check the request owner path with Linux detectors
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          KU_CC: "clang -fsanitize=address,undefined -fno-omit-frame-pointer -g -DKU_BORROW_REQUIRE_ASAN"
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: |
+          set -euo pipefail
+          name=native_http_validates_unmaterialized_headers_and_owns_route_snapshot
+          cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/http-request-detectors.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/http-request-detectors.log"
+          if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/http-request-detectors.log"; then exit 1; fi
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
@@ -953,7 +1006,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
