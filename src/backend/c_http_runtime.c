@@ -3633,7 +3633,9 @@ typedef struct {
   int registered,poll_index;
   size_t resource_slot;
 } KuHttpRegistration;
-typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHash;
+/* Keep the original conservative reservation. Physical hash storage has one
+ * aligned full-key plane followed by narrow slot+1 values, not pointers. */
+typedef struct { uint64_t token; size_t entry; } KuHttpRegistrationHashBudget;
 typedef struct {
   size_t entry;
   uint64_t token,generation;
@@ -3646,7 +3648,7 @@ typedef struct KuHttpReactor {
   uint64_t next_token;
   KuHttpActiveSet* active;
   KuHttpRegistration* registrations;
-  KuHttpRegistrationHash* hash;
+  uint64_t* hash;
   /* Slot+1, not a truncated fd/token. Zero is empty; keys live in registrations. */
   uint32_t* fd_entries;
   int* work;
@@ -3669,14 +3671,27 @@ static size_t ku_http_reactor_hash_capacity(size_t capacity) {
 static size_t ku_http_reactor_storage_bytes(size_t slots,size_t net) {
   size_t capacity=slots+3u+net;
   return sizeof(KuHttpReactor)+capacity*sizeof(KuHttpRegistration)
-      +ku_http_reactor_hash_capacity(capacity)*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t))
+      +ku_http_reactor_hash_capacity(capacity)*(sizeof(KuHttpRegistrationHashBudget)+sizeof(uint32_t))
       +slots*2u*sizeof(int);
 }
 static size_t ku_http_reactor_pending_storage_bytes(size_t slots,size_t net,size_t pending) {
   size_t before=slots+3u+net,after=before+pending;
   return ku_http_reactor_storage_bytes(slots,net)
       +pending*sizeof(KuHttpRegistration)
-      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*(sizeof(KuHttpRegistrationHash)+sizeof(uint32_t));
+      +(ku_http_reactor_hash_capacity(after)-ku_http_reactor_hash_capacity(before))*(sizeof(KuHttpRegistrationHashBudget)+sizeof(uint32_t));
+}
+static size_t ku_http_reactor_hash_slot_bytes(const KuHttpReactor* r) {
+  return r->capacity<=UINT16_MAX?sizeof(uint16_t):sizeof(uint32_t);
+}
+static uint32_t ku_http_reactor_hash_slot(const KuHttpReactor* r,size_t at) {
+  const uint8_t* slots=(const uint8_t*)(r->hash+r->hash_capacity);
+  if(r->capacity<=UINT16_MAX) {uint16_t value;memcpy(&value,slots+at*sizeof(value),sizeof(value));return value;}
+  uint32_t value;memcpy(&value,slots+at*sizeof(value),sizeof(value));return value;
+}
+static void ku_http_reactor_hash_set_slot(KuHttpReactor* r,size_t at,uint32_t value) {
+  uint8_t* slots=(uint8_t*)(r->hash+r->hash_capacity);
+  if(r->capacity<=UINT16_MAX) {uint16_t narrow=(uint16_t)value;memcpy(slots+at*sizeof(narrow),&narrow,sizeof(narrow));}
+  else memcpy(slots+at*sizeof(value),&value,sizeof(value));
 }
 static size_t ku_http_reactor_hash_start(const KuHttpReactor* r,uint64_t token) {
   token^=token>>30; token*=UINT64_C(0xbf58476d1ce4e5b9);
@@ -3687,34 +3702,44 @@ static size_t ku_http_reactor_lookup(const KuHttpReactor* r,uint64_t token) {
   if(!token || token==UINT64_MAX) return SIZE_MAX;
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
-    const KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!item->token) break;
-    if(item->token==token) return item->entry;
+    size_t at=(start+i)&(r->hash_capacity-1u);uint64_t key=r->hash[at];
+    if(!key) break;
+    if(key==token) {
+      uint32_t slot=ku_http_reactor_hash_slot(r,at);
+      return slot && (size_t)slot<=r->capacity?(size_t)slot-1u:SIZE_MAX;
+    }
   }
   return SIZE_MAX;
 }
 static int ku_http_reactor_hash_add(KuHttpReactor* r,uint64_t token,size_t entry) {
+  if(entry>=r->capacity || entry>=UINT32_MAX || !token || token==UINT64_MAX)return 0;
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
     size_t at=(start+i)&(r->hash_capacity-1u);
-    if(!r->hash[at].token) {r->hash[at]=(KuHttpRegistrationHash){token,entry};return 1;}
+    if(!r->hash[at]) {
+      ku_http_reactor_hash_set_slot(r,at,(uint32_t)(entry+1u));r->hash[at]=token;return 1;
+    }
   }
   return 0;
 }
 static void ku_http_reactor_hash_remove(KuHttpReactor* r,uint64_t token) {
   size_t start=ku_http_reactor_hash_start(r,token);
   for(size_t i=0;i<r->hash_capacity;i++) {
-    KuHttpRegistrationHash* item=&r->hash[(start+i)&(r->hash_capacity-1u)];
-    if(!item->token) return;
-    if(item->token==token) {
+    size_t bucket=(start+i)&(r->hash_capacity-1u);uint64_t key=r->hash[bucket];
+    if(!key) return;
+    if(key==token) {
+      uint32_t slot=ku_http_reactor_hash_slot(r,bucket);
+      if(!slot || (size_t)slot>r->capacity) {r->fault=1;return;}
       /* Back-shift the finite probe cluster. Repeated request turnover must
        * not fill the table with tombstones and turn stale lookup into O(cap). */
       size_t mask=r->hash_capacity-1u,hole=(start+i)&mask,at=(hole+1u)&mask;
-      for(size_t moved=0;moved<r->hash_capacity && r->hash[at].token;moved++,at=(at+1u)&mask) {
-        size_t home=ku_http_reactor_hash_start(r,r->hash[at].token);
-        if(((at-home)&mask)>=((hole-home)&mask)) {r->hash[hole]=r->hash[at];hole=at;}
+      for(size_t moved=0;moved<r->hash_capacity && r->hash[at];moved++,at=(at+1u)&mask) {
+        size_t home=ku_http_reactor_hash_start(r,r->hash[at]);
+        if(((at-home)&mask)>=((hole-home)&mask)) {
+          r->hash[hole]=r->hash[at];ku_http_reactor_hash_set_slot(r,hole,ku_http_reactor_hash_slot(r,at));hole=at;
+        }
       }
-      r->hash[hole]=(KuHttpRegistrationHash){0,0};return;
+      r->hash[hole]=0;ku_http_reactor_hash_set_slot(r,hole,0);return;
     }
   }
   r->fault=1;
@@ -4049,7 +4074,7 @@ static int ku_http_reactor_init_pending(KuHttpReactor* r,KuHttpActiveSet* active
   r->capacity=r->pending_base+pending;r->hash_capacity=ku_http_reactor_hash_capacity(r->capacity);
   r->fd_capacity=r->hash_capacity<32u?r->hash_capacity:32u;
   r->registrations=(KuHttpRegistration*)calloc(r->capacity,sizeof(*r->registrations));
-  r->hash=(KuHttpRegistrationHash*)calloc(r->hash_capacity,sizeof(*r->hash));
+  r->hash=(uint64_t*)calloc(r->hash_capacity,sizeof(*r->hash)+ku_http_reactor_hash_slot_bytes(r));
   r->fd_entries=(uint32_t*)calloc(r->hash_capacity,sizeof(*r->fd_entries));
   r->work=(int*)calloc((size_t)r->slots,sizeof(int));r->idle_heap=(int*)calloc((size_t)r->slots,sizeof(int));
 #if defined(__linux__)
