@@ -228,7 +228,7 @@ def run_restored(root):
         save(evidence / 'summary.json', hosted.redact(result, root))
         # Keep identities/layout/raw checkpoint, not temporary executables,
         # restored CLI/driver or the disposable PostgreSQL data directory.
-        for filename in ('prepared.json', 'layout.json', 'layout-build.stdout', 'layout-build.stderr', 'layout.stdout', 'layout.stderr', 'normal-global-symbol.readback'):
+        for filename in ('prepared.json', 'layout.json', 'known-static-symbols.json', 'layout-build.stdout', 'layout-build.stderr', 'layout.stdout', 'layout.stderr', 'normal-global-symbol.readback'):
             path = root / 'layout' / filename
             if path.exists(): shutil.copy2(path, evidence / filename)
         for path in (root / 'layout/layout-only', root / 'layout/layout-only.c',
@@ -283,7 +283,7 @@ def main(argv=None):
         return 1
     finally:
         signal.alarm(0); signal.signal(signal.SIGALRM, old_alarm); signal.signal(signal.SIGTERM, old_term)
-        for name in ('layout-build.stdout', 'layout-build.stderr', 'layout.stdout', 'layout.stderr', 'normal-global-symbol.readback'):
+        for name in ('layout-build.stdout', 'layout-build.stderr', 'layout.stdout', 'layout.stderr', 'normal-global-symbol.readback', 'known-static-symbols.json'):
             path=root/'layout'/name
             if path.exists(): shutil.copy2(path, root/'evidence'/name)
         for name in ('layout-only', 'layout-only.c'):

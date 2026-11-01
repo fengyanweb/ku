@@ -23,6 +23,7 @@ import resident_snapshot as rs
 MAX_FILE = 32 << 20
 MAX_RANGES = 512
 MAX_PAGES = 8192
+KNOWN_STATICS = ('ku_fs_base_path', 'ku_pg_diagnostics', 'ku_service_output')
 TEMPLATE = Path(__file__).with_name('normal_owner_layout.c.in')
 REQUIRED_BOUNDARY = ('clients_complete', 'request_producers_stopped',
                      'management_polling_stopped', 'isolated_owned_service',
@@ -59,7 +60,7 @@ def elf_loads(path):
     return kind, segments
 
 
-def global_symbol(elf, destination=None):
+def global_symbol(elf, destination=None, static_destination=None):
     raw = subprocess.check_output(['nm', '-S', '--defined-only', str(elf)], text=True, timeout=2)
     rows = [line.split() for line in raw.splitlines() if line.split()[-1:] == ['ku_http_live_group']]
     if len(rows) != 1 or len(rows[0]) != 4 or rows[0][2] not in ('b', 'B', 'd', 'D'):
@@ -67,8 +68,21 @@ def global_symbol(elf, destination=None):
     address, size = int(rows[0][0], 16), int(rows[0][1], 16)
     if size != 8:
         raise ValueError('ku_http_live_group must be exactly one 8-byte pointer')
+    selected = [next(line for line in raw.splitlines() if line.split()[-1:] == ['ku_http_live_group'])]
+    if static_destination is not None:
+        statics=[]
+        for name in KNOWN_STATICS:
+            rows=[line.split() for line in raw.splitlines() if line.split()[-1:] == [name]]
+            if len(rows)!=1 or len(rows[0])!=4 or rows[0][2] not in ('b','B','d','D'):
+                raise ValueError('one exact known static symbol required: '+name)
+            pointer,size=int(rows[0][0],16),int(rows[0][1],16)
+            if not 0<pointer<pointer+size<=1<<64 or not 0<size<=2<<20:
+                raise ValueError('known static symbol range exceeds bound')
+            statics.append(dict(name=name,vaddr=pointer,symbol_bytes=size))
+            selected.append(next(line for line in raw.splitlines() if line.split()[-1:] == [name]))
+        Path(static_destination).write_text(json.dumps(statics,indent=2)+'\n')
     if destination is not None:
-        Path(destination).write_text(next(line for line in raw.splitlines() if line.split()[-1:] == ['ku_http_live_group']) + '\n')
+        Path(destination).write_text('\n'.join(selected)+'\n')
     return address
 
 
@@ -104,7 +118,7 @@ def prepare(elf, source, manifest, compiler_receipt, compiler, libpq, source_com
     elf_loads(elf)
     output = Path(output).resolve()
     output.mkdir(exist_ok=False)
-    symbol = global_symbol(elf, output / 'normal-global-symbol.readback')
+    symbol = global_symbol(elf, output / 'normal-global-symbol.readback', output / 'known-static-symbols.json')
     wrapper, helper = output / 'layout-only.c', output / 'layout-only'
     wrapper.write_text(layout_wrapper(source))
     argv = [str(compiler), str(wrapper), '-std=c11', '-O2', '-pthread', str(libpq), '-o', str(helper)]
@@ -132,7 +146,7 @@ def prepare(elf, source, manifest, compiler_receipt, compiler, libpq, source_com
                  layout=str(layout_file), layout_SHA256=digest(layout_file),
                  template_SHA256=digest(TEMPLATE), wrapper_SHA256=digest(wrapper),
                  layout_helper_SHA256=digest(helper), layout_build_argv=argv,
-                 global_symbol_vaddr=symbol, normal_ELF_unmodified=True, Ku_main_invoked=False,
+                 global_symbol_vaddr=symbol, static_symbols=bounded_json(output / 'known-static-symbols.json'), normal_ELF_unmodified=True, Ku_main_invoked=False,
                  score_eligible=False, original_compiler_receipt=receipt)
     (output / 'prepared.json').write_text(json.dumps(value, indent=2) + '\n')
     return value
@@ -154,24 +168,62 @@ def check_identity(proc, prepared, start, executable):
     return status
 
 
-def load_bias(mappings, elf, inode, device, symbol, page):
+def load_bias(mappings, elf, inode, device, symbol, page, *, symbol_bytes=8):
     kind, segments = elf_loads(elf)
-    # Anchor the ELF-header PT_LOAD at file offset0; duplicate RELRO mappings
-    # of later pages are deliberately not candidates for this calculation.
-    anchors = [s for s in segments if s[2] == 0 and s[5] >= 64]
+    if page <= 0 or page & (page - 1) or not 0 <= symbol < symbol + symbol_bytes <= 1 << 64:
+        raise ValueError('invalid bounded symbol/page interval')
+    down = lambda value: value // page * page
+    up = lambda value: (value + page - 1) // page * page
+    # Only the exact executable's offset0/header PT_LOAD derives ASLR bias.
+    # Later RELRO aliases are never alternative anchors.
+    anchors = [segment for segment in segments if segment[2] == 0 and segment[5] >= 64]
     mapped = [m for m in mappings if m['inode'] == inode and m['device'] == device and m['offset'] == 0]
-    values = {m['start'] - (s[3] // page * page) for s in anchors for m in mapped}
+    values = {m['start'] - down(segment[3]) for segment in anchors for m in mapped}
     if len(values) != 1:
         raise ValueError('unique same-inode ELF-header load bias unavailable')
     bias = values.pop()
-    if kind == 2 and bias != 0:
-        raise ValueError('ET_EXEC must have zero load bias')
-    if not any(s[3] <= symbol and symbol + 8 <= s[3] + s[6] for s in segments):
-        raise ValueError('global symbol outside PT_LOAD memory')
-    address = bias + symbol
-    if not any(m['inode'] == inode and m['device'] == device and 'r' in m['perms']
-               and m['start'] <= address and address + 8 <= m['end'] for m in mappings):
-        raise ValueError('global address outside exact readable executable mapping')
+    if bias < 0 or (kind == 2 and bias != 0):
+        raise ValueError('invalid ELF load bias')
+    owners = [segment for segment in segments if segment[3] <= symbol
+              and symbol + symbol_bytes <= segment[3] + segment[6]]
+    if len(owners) != 1:
+        raise ValueError('symbol interval outside one exact PT_LOAD memory extent')
+    segment = owners[0]
+    _, flags, offset, virtual, _, filesz, memsz, _ = segment
+    if not 0 < filesz <= memsz or offset % page != virtual % page or not flags & 4:
+        raise ValueError('PT_LOAD needs a readable congruent nonempty file prefix')
+    file_lo, file_hi = bias + down(virtual), bias + up(virtual + filesz)
+    anon_lo, anon_hi = file_hi, bias + up(virtual + memsz)
+    file_offset = down(offset)
+
+    def covered(lo, hi, anonymous):
+        cursor = lo
+        for mapping in sorted(mappings, key=lambda m: m['start']):
+            left, right = max(lo, mapping['start']), min(hi, mapping['end'])
+            if left >= right:
+                continue
+            if left != cursor or 'r' not in mapping['perms'] or not mapping['perms'].endswith('p'):
+                raise ValueError('PT_LOAD mapping has a gap, overlap or unreadable/shared page')
+            if anonymous:
+                if (mapping['inode'] != 0 or mapping['device'] != '00:00' or mapping['offset'] != 0
+                        or mapping['path'] or 'x' in mapping['perms']):
+                    raise ValueError('expected only the exact anonymous PT_LOAD zero-fill tail')
+            elif (mapping['inode'] != inode or mapping['device'] != device
+                    or mapping['offset'] + left - mapping['start'] != file_offset + left - file_lo):
+                raise ValueError('PT_LOAD file prefix inode/device/offset mismatch')
+            cursor = right
+        if cursor != hi:
+            raise ValueError('PT_LOAD mapping extent is incomplete')
+
+    # Validate the complete file-backed prefix, including split RELRO pages.
+    # A symbol's later anonymous page is admitted only by this exact segment's
+    # filesz/memsz zero-fill geometry, never by an arbitrary readable VMA.
+    covered(file_lo, file_hi, False)
+    target_lo, target_hi = bias + symbol, bias + symbol + symbol_bytes
+    if target_hi > file_hi:
+        if memsz <= filesz or target_lo < bias + virtual or target_hi > bias + virtual + memsz:
+            raise ValueError('symbol not wholly in the proven PT_LOAD memory extent')
+        covered(anon_lo, anon_hi, True)
     return bias
 
 
@@ -390,14 +442,17 @@ def capture_owned(process, prepared_path, destination, boundary):
     destination = Path(destination)
     destination.mkdir(exist_ok=False)
     # Permission failures occur before STOP. No privilege or ptrace policy change.
-    mem = os.open(proc / 'mem', os.O_RDONLY)
-    began = time.monotonic_ns(); held = False; confirmed = None; resumed = None; pidfd = None
+    mem = None; pidfd = None; held = False; confirmed = None; resumed = None
+    stop_requested = None; resume_requested = None; failure = None; resume_failure = None; read_complete = False
+    began = time.monotonic_ns()
     try:
+        mem = os.open(proc / 'mem', os.O_RDONLY)
         if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
             raise ValueError('pidfd signalling unavailable; no target was stopped')
         pidfd = os.pidfd_open(process.pid)
         check_identity(proc, prepared, start, executable_key)
         held = True
+        stop_requested = time.monotonic_ns()
         signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
         deadline = time.monotonic() + 2
         while not (threads := rs.stopped_threads(proc)):
@@ -407,15 +462,30 @@ def capture_owned(process, prepared_path, destination, boundary):
         confirmed = time.monotonic_ns()
         check_identity(proc, prepared, start, executable_key)
         mappings_raw = rs.read_text(proc / 'maps', 1 << 20)
+        (destination / 'maps.log').write_text(mappings_raw)
         mappings = rs.maps_parse(mappings_raw)
         executable = (proc / 'exe').stat()
         device = '%02x:%02x' % (os.major(executable.st_dev), os.minor(executable.st_dev))
         bias = load_bias(mappings, prepared['ELF'], executable.st_ino, device,
                          prepared['global_symbol_vaddr'], os.sysconf('SC_PAGE_SIZE'))
-        reader = OwnerReader(mem, mappings, layout, process.pid, began / 1e9 + 8)
+        reader = OwnerReader(mem, mappings, layout, process.pid, stop_requested / 1e9 + 8)
         owners = reader.snapshot(bias + prepared['global_symbol_vaddr'])
+        statics=prepared.get('static_symbols',[])
+        if [item['name'] for item in statics]!=list(KNOWN_STATICS):
+            raise ValueError('only the three exact prepared static ELF ranges are allowed')
+        for item in statics:
+            if load_bias(mappings,prepared['ELF'],executable.st_ino,device,item['vaddr'],
+                         os.sysconf('SC_PAGE_SIZE'),symbol_bytes=item['symbol_bytes'])!=bias:
+                raise ValueError('static symbol load bias differs')
+            pointer=bias+item['vaddr']
+            reader.backing('ELF-static:'+item['name'],pointer,item['symbol_bytes'],1,bias)
+            row=next(record for record in reader.records if int(record['pointer'],16)==pointer)
+            row.update(storage_kind='known ELF static symbol',symbol_bytes=item['symbol_bytes'],
+                       byte_semantics='Virtual symbol span, not a heap allocation request or residency')
+        owners['scope'] += ' Three named static ELF ranges are separately labelled; no contents read.'
         address_pages = page_ranges(owners, os.sysconf('SC_PAGE_SIZE'))
         smaps_raw = rs.read_text(proc / 'smaps', 4 << 20)
+        (destination / 'smaps.log').write_text(smaps_raw)
         pages = hcd.allocation_owner_pages(process.pid, owners, start, maximum_records=16384)
         if pages.get('available'):
             pages['exclusive_ordinary_anon_full_interior_bytes_total'] = sum(
@@ -425,18 +495,39 @@ def capture_owned(process, prepared_path, destination, boundary):
         if rs.stopped_threads(proc) != threads:
             raise ValueError('thread set changed during checkpoint')
         check_identity(proc, prepared, start, executable_key)
+        read_complete = True
+    except BaseException as error:
+        failure = repr(error)[:1024]
+        raise
     finally:
         try:
             if held:
+                resume_requested = time.monotonic_ns()
                 try:
                     signal.pidfd_send_signal(pidfd, signal.SIGCONT)
                 except ProcessLookupError:
-                    pass
-                resumed = time.monotonic_ns()
+                    resume_failure = 'original target exited before CONT'
+                except BaseException as error:
+                    resume_failure = repr(error)[:1024]
+                    raise
+                finally:
+                    resumed = time.monotonic_ns()
         finally:
-            if pidfd is not None:
-                os.close(pidfd)
-            os.close(mem)
+            try:
+                if pidfd is not None:
+                    os.close(pidfd)
+            finally:
+                if mem is not None:
+                    os.close(mem)
+                attempt = dict(schema='ku-normal-owner-capture-attempt-v1', pid=process.pid,
+                    start_ticks=start, normal_ELF_SHA256=prepared['identities']['ELF'],
+                    normal_C_SHA256=prepared['identities']['source'], source_commit=prepared['product_source_commit'],
+                    capture_started_monotonic_ns=began, STOP_requested_monotonic_ns=stop_requested,
+                    all_threads_STOP_ack_monotonic_ns=confirmed, CONT_requested_monotonic_ns=resume_requested,
+                    CONT_returned_monotonic_ns=resumed, capture_finished_monotonic_ns=time.monotonic_ns(),
+                    memory_read_complete=read_complete, primary_error=failure, resume_error=resume_failure,
+                    scope='One attempt only. Null timestamps mean the stage was not reached; no fabricated owners/smaps. read_complete does not imply exported owner artifact or a performance result.')
+                (destination / 'attempt.json').write_text(json.dumps(attempt, indent=2) + '\n')
     value = dict(schema='ku-normal-fixed-owner-checkpoint-v1', pid=process.pid, start_ticks=start,
                  prepared_SHA256=digest(prepared_path), normal_ELF_SHA256=prepared['identities']['ELF'],
                  normal_C_SHA256=prepared['identities']['source'], source_commit=prepared['product_source_commit'],
@@ -444,11 +535,9 @@ def capture_owned(process, prepared_path, destination, boundary):
                  load_bias=hex(bias), global_pointer_address=hex(bias + prepared['global_symbol_vaddr']),
                  owners=owners, virtual_page_correspondence=address_pages, page_metadata=pages,
                  idle_only=True, score_eligible=False, coverage_complete=False,
-                 stop_requested_monotonic_ns=began, all_threads_stopped_monotonic_ns=confirmed,
-                 CONT_returned_monotonic_ns=resumed, total_STOP_span_ns=resumed - began,
+                 capture_started_monotonic_ns=began, stop_requested_monotonic_ns=stop_requested, all_threads_stopped_monotonic_ns=confirmed,
+                 CONT_returned_monotonic_ns=resumed, total_STOP_span_ns=resumed - stop_requested,
                  scope='One unchanged ordinary ELF. No allocation interposer. Requested ranges, VMA Anonymous/RSS/PSS and cgroup charge are distinct; no additive whole-memory claim.')
-    (destination / 'maps.log').write_text(mappings_raw)
-    (destination / 'smaps.log').write_text(smaps_raw)
     (destination / 'owners.json').write_text(json.dumps(value, indent=2) + '\n')
     return value
 

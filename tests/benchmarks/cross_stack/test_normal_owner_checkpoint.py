@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -131,17 +132,65 @@ class FixedOwnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'ELF/C'):n.prepare(p/'elf',p/'source',p/'manifest',p/'receipt',p/'compiler',p/'libpq','a'*40,p/'out')
                 run.assert_not_called();self.assertFalse((p/'out').exists())
 
+class BssMappingTests(unittest.TestCase):
+    BASE=0xab3fd4e10000
+    # Header-only unit fixture with the actual234300 PT_LOAD geometry, not
+    # executable code and never a substitute for the identified normal ELF.
+    SEGMENTS=[(1,5,0,0,0,0x95150,0x95150,0x10000),
+              (1,6,0x9fa80,0xafa80,0xafa80,0x928,0x10fe68,0x10000)]
+    def fixture(self,root):
+        path=root/'header-shape.elf';raw=bytearray(0xa03a8)
+        raw[:6]=b'\x7fELF\x02\x01';struct.pack_into('<HH',raw,16,3,183)
+        struct.pack_into('<Q',raw,32,64);struct.pack_into('<HH',raw,54,56,2)
+        for i,segment in enumerate(self.SEGMENTS):struct.pack_into('<IIQQQQQQ',raw,64+i*56,*segment)
+        path.write_bytes(raw)
+        rows=[(0,0x96000,'r-xp',0,17,'08:01','/normal/ku-server'),
+              (0xaf000,0xb0000,'r--p',0x9f000,17,'08:01','/normal/ku-server'),
+              (0xb0000,0xb1000,'rw-p',0xa0000,17,'08:01','/normal/ku-server'),
+              (0xb1000,0x1c0000,'rw-p',0,0,'00:00','')]
+        return path,[dict(start=self.BASE+a,end=self.BASE+b,perms=perms,offset=offset,inode=inode,device=device,path=name) for a,b,perms,offset,inode,device,name in rows]
+    def test_actual_shape_global_and_three_static_spans_use_one_proven_bias(self):
+        with tempfile.TemporaryDirectory() as temp:
+            elf,maps=self.fixture(Path(temp))
+            for symbol,size in [(0xb84a8,8),(0xb03c0,0x8001),(0xb84b0,0x62c0),(0xbe778,0x101168)]:
+                self.assertEqual(n.load_bias(maps,elf,17,'08:01',symbol,4096,symbol_bytes=size),self.BASE)
+    def test_bss_does_not_relax_bad_inode_offset_extent_or_anon_identity(self):
+        changes=[('anchor inode',lambda m:m[0].update(inode=18)),('data inode',lambda m:m[1].update(inode=18)),
+                 ('data offset',lambda m:m[2].update(offset=0xa1000)),('anon inode',lambda m:m[3].update(inode=19)),
+                 ('unrelated heap',lambda m:m[3].update(path='[heap]')),('truncated tail',lambda m:m[3].update(end=self.BASE+0x1bf000)),
+                 ('unreadable tail',lambda m:m[3].update(perms='---p'))]
+        with tempfile.TemporaryDirectory() as temp:
+            for name,mutate in changes:
+                with self.subTest(name=name):
+                    elf,maps=self.fixture(Path(temp));mutate(maps)
+                    with self.assertRaises(ValueError):n.load_bias(maps,elf,17,'08:01',0xb84a8,4096)
+            elf,maps=self.fixture(Path(temp))
+            for symbol,size in [(0x1bf8e8,8),(0xbe778,0x101171),(0x1c1000,8)]:
+                with self.assertRaises(ValueError):n.load_bias(maps,elf,17,'08:01',symbol,4096,symbol_bytes=size)
+    def test_known_static_nm_readback_exports_only_address_and_size(self):
+        raw='000b84a8 00000008 b ku_http_live_group\n000b03c0 00008001 b ku_fs_base_path\n000b84b0 000062c0 b ku_pg_diagnostics\n000be778 00101168 b ku_service_output\n'
+        with tempfile.TemporaryDirectory() as temp,patch.object(n.subprocess,'check_output',return_value=raw):
+            root=Path(temp);self.assertEqual(n.global_symbol('/not-read',root/'symbols',root/'statics'),0xb84a8)
+            values=json.loads((root/'statics').read_text());self.assertEqual([x['name'] for x in values],list(n.KNOWN_STATICS))
+            self.assertEqual(values[-1]['symbol_bytes'],0x101168)
+            self.assertTrue(all(set(x)=={'name','vaddr','symbol_bytes'} for x in values))
+
+
 class ResumeTests(unittest.TestCase):
     def call(self,mode):
         child=Mock(spec=subprocess.Popen);child.pid=3456;child.poll.return_value=None
-        p=dict(schema='ku-normal-fixed-owner-prepared-v1',ELF='/fake/elf',source='/fake/C',compiler='/fake/CC',libpq='/fake/pq',identities=dict(ELF='x',source='x',compiler='x',libpq='x'),layout='/fake/layout',layout_SHA256='x',template_SHA256='x',normal_manifest='/fake/manifest',normal_manifest_SHA256='x',global_symbol_vaddr=8)
+        p=dict(schema='ku-normal-fixed-owner-prepared-v1',ELF='/fake/elf',source='/fake/C',compiler='/fake/CC',libpq='/fake/pq',identities=dict(ELF='x',source='x',compiler='x',libpq='x'),layout='/fake/layout',layout_SHA256='x',template_SHA256='x',normal_manifest='/fake/manifest',normal_manifest_SHA256='x',global_symbol_vaddr=8,product_source_commit='a'*40)
         with tempfile.TemporaryDirectory() as temp,ExitStack() as stack:
             stack.enter_context(patch.object(n,'bounded_json',side_effect=[p,{}]));stack.enter_context(patch.object(n,'digest',return_value='x'))
             stack.enter_context(patch.object(n.Path,'stat',return_value=Mock(st_ino=123,st_dev=0)))
             stack.enter_context(patch.object(n,'read_start',return_value='77'));stack.enter_context(patch.object(n,'check_identity',return_value='State:\tT (stopped)\n' if mode=='stopped' else 'State:\tS (sleeping)\n'))
             stack.enter_context(patch.object(n.os,'open',return_value=90));stack.enter_context(patch.object(n.os,'pidfd_open',return_value=91,create=True))
             send=stack.enter_context(patch.object(n.signal,'pidfd_send_signal',create=True));close=stack.enter_context(patch.object(n.os,'close'))
-            stack.enter_context(patch.object(n.rs,'stopped_threads',side_effect=RuntimeError('injected failure')))
+            if mode=='bias-failed':
+                stack.enter_context(patch.object(n.rs,'stopped_threads',return_value=['3456']))
+                stack.enter_context(patch.object(n.rs,'read_text',return_value='1000-2000 r--p 00000000 00:00 123 /fake/elf\n'))
+                stack.enter_context(patch.object(n,'load_bias',side_effect=ValueError('injected BSS proof failure')))
+            else:stack.enter_context(patch.object(n.rs,'stopped_threads',side_effect=RuntimeError('injected failure')))
             if mode=='stopped':
                 with self.assertRaisesRegex(ValueError,'pre-stopped'):n.capture_owned(child,'/fake/prepared',Path(temp)/'out',dict.fromkeys(n.REQUIRED_BOUNDARY,True))
                 send.assert_not_called();close.assert_not_called()
@@ -149,10 +198,18 @@ class ResumeTests(unittest.TestCase):
                 with patch.object(n,'check_identity',side_effect=['State:\tS (sleeping)\n',ValueError('identity changed')]):
                     with self.assertRaisesRegex(ValueError,'identity changed'):n.capture_owned(child,'/fake/prepared',Path(temp)/'out',dict.fromkeys(n.REQUIRED_BOUNDARY,True))
                 send.assert_not_called();self.assertEqual([c.args[0] for c in close.call_args_list],[91,90])
+            elif mode=='bias-failed':
+                with self.assertRaisesRegex(ValueError,'injected BSS proof failure'):n.capture_owned(child,'/fake/prepared',Path(temp)/'out',dict.fromkeys(n.REQUIRED_BOUNDARY,True))
+                output=Path(temp)/'out';self.assertTrue((output/'maps.log').exists())
+                attempt=json.loads((output/'attempt.json').read_text());self.assertIn('injected BSS proof failure',attempt['primary_error']);self.assertFalse(attempt['memory_read_complete'])
+                for key in ('STOP_requested_monotonic_ns','all_threads_STOP_ack_monotonic_ns','CONT_requested_monotonic_ns','CONT_returned_monotonic_ns'):self.assertIsNotNone(attempt[key])
+                present={p.name for p in output.iterdir()};self.assertNotIn('owners.json',present);self.assertNotIn('smaps.log',present)
+                self.assertEqual([c.args[1] for c in send.call_args_list],[signal.SIGSTOP,signal.SIGCONT]);self.assertEqual([c.args[0] for c in close.call_args_list],[91,90])
             else:
                 with self.assertRaisesRegex(RuntimeError,'injected failure'):n.capture_owned(child,'/fake/prepared',Path(temp)/'out',dict.fromkeys(n.REQUIRED_BOUNDARY,True))
                 self.assertEqual([c.args[1] for c in send.call_args_list],[signal.SIGSTOP,signal.SIGCONT])
                 self.assertEqual([c.args[0] for c in close.call_args_list],[91,90])
+    def test_bias_failure_retains_maps_and_real_attempt_timing_without_fabricated_outputs(self):self.call('bias-failed')
     def test_exception_always_continues_exact_pidfd_and_closes(self):self.call('failure')
     def test_pre_stopped_child_is_not_signalled_or_resumed(self):self.call('stopped')
     def test_identity_changed_after_pidfd_open_is_not_stopped(self):self.call('identity-changed')
