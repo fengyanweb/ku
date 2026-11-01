@@ -34,7 +34,7 @@ on:
         default: false
 
       fixed_goals_only:
-        description: 'Original80 windows/16 goals only; performance-v2, fresh full build, no capacity/stability or complete-acceptance claim'
+        description: 'Original80 windows/16 goals; full normal build or exact frozen reuse, no capacity/stability or complete-acceptance claim'
         type: boolean
         default: false
 
@@ -632,10 +632,15 @@ jobs:
             for mode in HTTP_SHORT_SCREEN MEMORY_OWNER_PROBE PG_DRIVER_SCREEN PG_QUEUE_SCREEN PG_FAILURE_PROBE NORMAL_SELF_PROBE TASK_JSON_SCREEN COMMON_HTTP_SCREEN FINAL_TASK_JSON; do
               mode="KU_PERFORMANCE_V2_$mode"; test "${!mode}" = false
             done
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
-            test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
             test -z "$KU_PERFORMANCE_V2_VARIANTS"
-            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            if [ -z "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
+              test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            else
+              test "$KU_PERFORMANCE_V2_REUSE_RUN" = 41302648123
+              test "$KU_PERFORMANCE_V2_REUSE_SHA256" = 304d79c6fe23be9b167f5f5fc18d86e4e9834bf31f83505ab04bc3b61e50ac33
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = 80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd
+            fi
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -798,7 +803,6 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
             test "$performance_build_set" = full
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--fixed-goals-only)
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then
@@ -853,7 +857,7 @@ jobs:
             performance_task_json_args+=(--final-task-json)
           fi
           if [ -n "$KU_PERFORMANCE_V2_REUSE_RUN" ]; then
-            if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi
+            if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" != true ] && [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi
             python3 -B tests/benchmarks/cross_stack/reuse_build.py \
               --archive "$RUNNER_TEMP/ku-reused-build/ku-performance-v2-evidence.tar.gz" \
               --archive-sha256 "$KU_PERFORMANCE_V2_REUSE_SHA256" \
@@ -901,7 +905,6 @@ jobs:
           if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-v2
             test "$performance_build_set" = full
-            test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--fixed-goals-only)
           fi
           if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ]; then

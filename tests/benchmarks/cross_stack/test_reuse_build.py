@@ -32,6 +32,70 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_fixed_goals_reuse_is_one_exact_archive_and_never_imports_old_controls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'fixed.tgz'
+            old=dict(identity=dict(candidate=r.FIXED_GOALS_PRODUCT,baseline=r.h.BASELINE,build_set='full',fixed_goals_only=True),
+                steps={k:dict(state='completed') for k in ['build',*('build-'+n for n in r.FIXED_GOALS_NAMES),'control','run']})
+            old['steps']['run']['result']=dict(fixed_matrix_executed=False,reason='environment control quality is fail')
+            files={n+'/build/bin/normal':n.encode() for n in r.FIXED_GOALS_NAMES}
+            files.update({'hosted-state.json':json.dumps(old).encode(),'results/control/results.json':b'old CPU results'})
+            index=dict(path_root=r.TOKEN,raw_and_redacted_hashes_distinct=True,files=[dict(path=k,bytes=len(v),
+                archived_sha256=hashlib.sha256(v).hexdigest()) for k,v in files.items()])
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,raw in files.items():
+                    member=tarfile.TarInfo(name);member.size=len(raw);tar.addfile(member,io.BytesIO(raw))
+            digest=r.h.sha(path)
+            with self.assertRaisesRegex(ValueError,'build-only'):
+                r.extract_builds(path,root/'not-selected',digest,r.FIXED_GOALS_NAMES)
+            with patch.object(r,'FIXED_GOALS_ARCHIVE_SHA',digest):
+                self.assertTrue(r.fixed_goals_archive(old,r.FIXED_GOALS_NAMES,digest))
+                for key,value in [('candidate','b'*40),('baseline','f'*40),('fixed_goals_only',False)]:
+                    changed=json.loads(json.dumps(old));changed['identity'][key]=value
+                    self.assertFalse(r.fixed_goals_archive(changed,r.FIXED_GOALS_NAMES,digest))
+                self.assertFalse(r.fixed_goals_archive(old,{'B','R'},digest))
+                changed=json.loads(json.dumps(old));changed['steps']['run']['result']['fixed_matrix_executed']=True
+                self.assertFalse(r.fixed_goals_archive(changed,r.FIXED_GOALS_NAMES,digest))
+                r.extract_builds(path,root/'good',digest,r.FIXED_GOALS_NAMES,fixed_goals=True)
+            self.assertFalse((root/'good/results').exists())
+            provenance=r.h.load(root/'good/reuse-original-state.json')
+            self.assertFalse(provenance['measurement_results_imported'])
+            self.assertTrue(all(k.startswith('build') for k in provenance['steps']))
+            for name in r.FIXED_GOALS_NAMES:self.assertEqual((root/'good'/name/'build/bin/normal').read_bytes(),name.encode())
+
+    def test_fixed_goals_preparation_freezes_all_modes_without_rebuilding_driver_or_reusing_measurements(self):
+        for bad in (False,True):
+            with self.subTest(bad=bad),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);fresh=root/'fresh';tools=root/'tools';tools.mkdir()
+                args=types.SimpleNamespace(root=fresh,source=root/'source',tools=tools,archive=root/'inert.tgz',
+                    archive_sha256=r.FIXED_GOALS_ARCHIVE_SHA,source_run='bad' if bad else r.FIXED_GOALS_RUN,
+                    baseline=r.h.BASELINE,candidate=r.FIXED_GOALS_PRODUCT,prepatch=r.h.BASELINE,screen_variants=[],fixed_goals_only=True)
+                def extract(archive,root,digest,expected,**kwargs):
+                    self.assertEqual(kwargs,dict(fixed_goals=True))
+                    for name in expected:(root/name).mkdir(parents=True)
+                    return {}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+                patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+                selected=patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+                patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs',return_value={}))
+                verified=patches.enter_context(patch.object(r,'verify_manifest'))
+                driver=patches.enter_context(patch.object(r,'new_driver'))
+                finish=patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
+                if bad:
+                    with self.assertRaisesRegex(ValueError,'exact complete'):r.prepare(args)
+                    selected.assert_not_called();continue
+                self.assertTrue(r.prepare(args)['execution_complete']);driver.assert_not_called()
+                expected={n:r.h.BASELINE if n=='A0' else r.FIXED_GOALS_PRODUCT for n in r.FIXED_GOALS_NAMES}
+                self.assertEqual(selected.call_args.args[3],expected)
+                self.assertEqual({c.args[1] for c in verified.call_args_list},r.FIXED_GOALS_NAMES)
+                self.assertEqual(finish.call_args.args[2],'full')
+                state=r.h.load(fresh/'hosted-state.json')
+                self.assertTrue(state['identity']['fixed_goals_only']);self.assertEqual(set(state['steps']),{'build'})
+                self.assertEqual(state['reused_build']['imported_measurement_windows'],0)
+
     def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
         args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)
         with patch.object(r,'extract_builds') as extract,self.assertRaisesRegex(ValueError,'fixed verified'):

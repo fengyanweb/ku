@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reuse verified, unmeasured ARM64 builds; never import an old measurement."""
+"""Reuse verified ARM64 build bytes; never import an old measurement."""
 from __future__ import annotations
 import argparse, copy, hashlib, json, os
 from pathlib import Path, PurePosixPath
@@ -11,6 +11,21 @@ MAX_FILES=20000
 MAX_FILE=128<<20
 MAX_TOTAL=768<<20
 TOKEN='${EVIDENCE_ROOT}'
+FIXED_GOALS_RUN='41302648123'
+FIXED_GOALS_ARCHIVE_SHA='304d79c6fe23be9b167f5f5fc18d86e4e9834bf31f83505ab04bc3b61e50ac33'
+FIXED_GOALS_PRODUCT='80aaf7bccd4a436ebdf83e2283a83fcc6deec4fd'
+FIXED_GOALS_NAMES={'A0','B','R','BJ','BP','BD'}
+
+
+def fixed_goals_archive(old,names,digest):
+    identity=old.get('identity',{})
+    return (set(names)==FIXED_GOALS_NAMES and digest==FIXED_GOALS_ARCHIVE_SHA
+        and identity.get('candidate')==FIXED_GOALS_PRODUCT and identity.get('baseline')==h.BASELINE
+        and identity.get('build_set')=='full' and identity.get('fixed_goals_only') is True
+        and set(old.get('steps',{}))=={'build',*('build-'+n for n in FIXED_GOALS_NAMES),'control','run'}
+        and all(v.get('state')=='completed' for v in old['steps'].values())
+        and old['steps']['run'].get('result',{}).get('fixed_matrix_executed') is False
+        and old['steps']['run']['result'].get('reason')=='environment control quality is fail')
 
 
 def checked(path, expected):
@@ -25,7 +40,7 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,fixed_goals=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
@@ -52,9 +67,10 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
         old=json.load(tar.extractfile('hosted-state.json'))
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            if not ((owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
-                    and all(v.get('state')=='completed' for v in old['steps'].values())):
+                    and all(v.get('state')=='completed' for v in old['steps'].values()))
+                    or (fixed_goals and fixed_goals_archive(old,names,expected_sha256))):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
         if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
@@ -69,7 +85,7 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not owner_observation else dict(identity=old.get('identity'),
+        provenance=old if not (owner_observation or fixed_goals) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -149,7 +165,10 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
                 build['source_files_sha256'][relative]=entry['archived_sha256']
             else:checked(file,digest)
     else:
-        if any(build.get(k)!=v for k,v in [('formatting_mode','helpers'),('json_response_mode','text'),('pg_execution_mode','async'),('pg_read_mode','int')]):
+        modes=dict(formatting_mode='direct' if name=='BD' else 'helpers',
+            json_response_mode='typed' if name=='BJ' else 'text',pg_execution_mode='async',
+            pg_read_mode='typed' if name=='BP' else 'int')
+        if any(build.get(k)!=v for k,v in modes.items()):
             raise ValueError('reused build is not the normal helpers/text/async/int contract')
         if build.get('json_execution_mode','worker')!=('task' if name=='BT' else 'worker'):
             raise ValueError('reused JSON execution mode differs: '+name)
@@ -269,6 +288,7 @@ def prepare_owner(a):
 
 def prepare(a):
     if getattr(a,'memory_owner_probe',False):return prepare_owner(a)
+    if getattr(a,'fixed_goals_only',False):return prepare_fixed_goals(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
         raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
@@ -295,6 +315,29 @@ def prepare(a):
     return result
 
 
+def prepare_fixed_goals(a):
+    """One bounded second control attempt, with the same complete normal builds."""
+    h.validate_screen_selection(a,'full')
+    if (a.source_run,a.archive_sha256,a.candidate)!=(FIXED_GOALS_RUN,FIXED_GOALS_ARCHIVE_SHA,FIXED_GOALS_PRODUCT):
+        raise ValueError('fixed goals require the exact complete build/control-failure archive')
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
+        raise ValueError('ordinary benchmark user on a fresh Linux ARM64 host required')
+    expected={n:h.BASELINE if n=='A0' else a.candidate for n in sorted(FIXED_GOALS_NAMES)}
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,expected,fixed_goals=True)
+    restore_json_inputs(a.source,a.root,expected,mapping)
+    for name,commit in expected.items():
+        validate_protocol_inputs(a.root,name,mapping);verify_manifest(a.root,name,commit,mapping)
+        (a.root/name/'tools').symlink_to(a.tools,target_is_directory=True)
+    state=dict(identity=h.hosted_identity(a,'full'),steps={},goal_status='unknown',uid=os.getuid(),gid=os.getgid(),
+        reused_build=dict(source_run=a.source_run,archive_sha256=a.archive_sha256,product_commit=a.candidate,
+            normal_versions=expected,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False,
+            driver='original exact common R driver; no rebuild or measurements imported'))
+    h.save(a.root/'hosted-state.json',state)
+    result=h.step(state,a.root,'build',lambda:h.complete_build(a,state,'full',a.prepatch,[]))
+    h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=result['execution_complete']))
+    return result
+
+
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     for key in ['archive','root','source','tools']:parser.add_argument('--'+key,required=True,type=Path)
@@ -304,9 +347,10 @@ def main(argv=None):
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
+    parser.add_argument('--fixed-goals-only',action='store_true',help='Reuse only the exact first-control-failure complete normal builds; no old measurements')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
     a=parser.parse_args(argv)
-    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe else 'followup-screen')
+    try:h.validate_screen_selection(a,'full' if a.fixed_goals_only else 'diagnostic' if a.memory_owner_probe else 'followup-screen')
     except ValueError as error:parser.error(str(error))
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []

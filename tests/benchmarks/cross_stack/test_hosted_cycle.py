@@ -1633,6 +1633,24 @@ class HostedCycleTests(unittest.TestCase):
                 args=record.read_bytes().split(b'\0')[:-1]
                 self.assertEqual(args.count(b'--fixed-goals-only'),1)
                 self.assertEqual(args[args.index(b'--phase')+1],phase.encode())
+            import reuse_build
+            reused=dict(env,KU_PERFORMANCE_V2_REUSE_RUN=reuse_build.FIXED_GOALS_RUN,
+                KU_PERFORMANCE_V2_REUSE_SHA256=reuse_build.FIXED_GOALS_ARCHIVE_SHA,
+                KU_PERFORMANCE_V2_CANDIDATE=reuse_build.FIXED_GOALS_PRODUCT)
+            valid=subprocess.run(['bash','-ec',prefix+preflight],env=reused,capture_output=True)
+            self.assertEqual(valid.returncode,0,valid.stderr.decode())
+            for key,value in [('KU_PERFORMANCE_V2_REUSE_RUN','123'),
+                    ('KU_PERFORMANCE_V2_REUSE_SHA256','0'*64),('KU_PERFORMANCE_V2_CANDIDATE','b'*40)]:
+                invalid=subprocess.run(['bash','-ec',prefix+preflight],env=dict(reused,**{key:value}),capture_output=True)
+                self.assertNotEqual(invalid.returncode,0)
+            record.write_bytes(b'')
+            result=subprocess.run(['bash','-ec',prefix+chunk('Build frozen sources and plans as the benchmark user')],
+                env=reused,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr.decode())
+            args=record.read_bytes().split(b'\0')[:-1]
+            self.assertEqual(args[1],b'tests/benchmarks/cross_stack/reuse_build.py')
+            self.assertEqual(args.count(b'--fixed-goals-only'),1)
+            self.assertEqual(args[args.index(b'--source-run')+1],reuse_build.FIXED_GOALS_RUN.encode())
 
     def test_fixed_goals_only_stops_after_80_windows_without_full_acceptance_and_always_cleans_db(self):
         issues=(None,'core-not-met','goal-not-met','missing-window','missing-goal','cleanup',
