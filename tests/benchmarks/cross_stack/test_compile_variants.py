@@ -223,7 +223,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertEqual(job.count('performance_task_json_args+=(--memory-owner-probe)'),2)
         for value in ('41182804290','5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6','4e5f5d94da277654862d8679f7ae4a7fda3f05ff'):
             self.assertIn(value,job)
-        self.assertIn('if [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
+        self.assertIn('if [ "$KU_PERFORMANCE_V2_FIXED_GOALS_ONLY" != true ] && [ "$KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE" != true ]; then test "$performance_build_set" = followup-screen; fi',job)
         self.assertIn('name: ku-memory-owner-observation',job)
         self.assertIn('inputs.memory_owner_probe && 3',job)
 
