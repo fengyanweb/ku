@@ -32,6 +32,114 @@ def archive(path, changes=None, old_run=False):
 
 class ReuseBuildTests(unittest.TestCase):
 
+    def test_pg_self_reuse_requires_the_fixed_archive_and_explicit_profile_before_extraction(self):
+        base=dict(normal_self_probe=True,normal_self_workload='db-gpr',source_run=r.PG_SELF_RUN,
+            archive_sha256=r.PG_SELF_ARCHIVE_SHA,candidate=r.h.NORMAL_PG_PRODUCT,screen_variants=[])
+        for changes in ({'source_run':'123'},{'archive_sha256':'0'*64},{'candidate':'b'*40},
+                {'normal_self_probe':False},{'normal_self_workload':'db'},{'screen_variants':['b'*40]}):
+            with self.subTest(changes=changes),patch.object(r,'extract_builds') as extract:
+                with self.assertRaises(ValueError):r.prepare_pg_self(types.SimpleNamespace(**dict(base,**changes)))
+                extract.assert_not_called()
+
+    def test_pg_self_measured_archive_restores_only_builds_and_keeps_current_preflight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);path=root/'pg.tgz';fresh=root/'fresh'
+            files={'B/build/bin/ku-server':b'F server','Driver/build/bin/cross-stack-client':b'F driver',
+                'normal-self-probe/results.json':b'old measured windows',
+                'normal-perf-preflight/preflight.json':b'old boot preflight',
+                'hosted-state.json':json.dumps(dict(identity=dict(candidate=r.h.NORMAL_PG_PRODUCT,
+                    normal_self_probe=True,normal_self_workload='db-gpr'),
+                    steps={k:{'state':'completed'} for k in ('build','build-B','build-Driver','diagnostic')},
+                    boot_sha256='old boot',database_cleanup={'old':'runtime'})).encode()}
+            index={'path_root':r.TOKEN,'raw_and_redacted_hashes_distinct':True,'files':[
+                {'path':k,'bytes':len(v),'archived_sha256':hashlib.sha256(v).hexdigest()} for k,v in files.items()]}
+            files['portable-file-map.json']=json.dumps(index).encode()
+            with tarfile.open(path,'w:gz') as tar:
+                for name,raw in files.items():
+                    info=tarfile.TarInfo(name);info.size=len(raw);tar.addfile(info,io.BytesIO(raw))
+            digest=r.h.sha(path)
+            with self.assertRaises(ValueError):r.extract_builds(path,root/'ordinary',digest,{'B','Driver'})
+            with self.assertRaises(ValueError):r.extract_builds(path,root/'wrong-sha',digest,{'B','Driver'},pg_self_observation=True)
+            (fresh/'tools').mkdir(parents=True);current=fresh/'normal-perf-preflight/preflight.json'
+            current.parent.mkdir();current.write_text('this host verified preflight')
+            with patch.object(r,'PG_SELF_ARCHIVE_SHA',digest):
+                r.extract_builds(path,fresh,digest,{'B','Driver'},pg_self_observation=True)
+            self.assertEqual(current.read_text(),'this host verified preflight')
+            self.assertEqual((fresh/'B/build/bin/ku-server').read_bytes(),b'F server')
+            self.assertEqual((fresh/'Driver/build/bin/cross-stack-client').read_bytes(),b'F driver')
+            self.assertFalse((fresh/'normal-self-probe').exists());self.assertFalse((fresh/'hosted-state.json').exists())
+            provenance=r.h.load(fresh/'reuse-original-state.json')
+            self.assertNotIn('diagnostic',provenance['steps']);self.assertNotIn('database_cleanup',provenance)
+            self.assertNotIn('boot_sha256',provenance);self.assertFalse(provenance['measurement_results_imported'])
+            self.assertEqual(r.h.sha(path),digest)
+            self.assertEqual(r.h.load(fresh/'reuse-byte-verification.json')['all_map_files_verified'],len(index['files']))
+            # Unselected failed observations are verified too, then left out of
+            # the new tree. A valid tar hash cannot excuse an inconsistent map.
+            for issue in ('unselected-bytes','missing-map-entry'):
+                changed=dict(files)
+                if issue=='unselected-bytes':changed['normal-self-probe/results.json']=b'tampered retained observation'
+                else:changed['portable-file-map.json']=json.dumps(dict(index,files=index['files'][:-1])).encode()
+                bad=root/(issue+'.tgz');output=root/issue
+                with tarfile.open(bad,'w:gz') as tar:
+                    for name,raw in changed.items():
+                        info=tarfile.TarInfo(name);info.size=len(raw);tar.addfile(info,io.BytesIO(raw))
+                bad_digest=r.h.sha(bad)
+                with patch.object(r,'PG_SELF_ARCHIVE_SHA',bad_digest),self.assertRaises(ValueError):
+                    r.extract_builds(bad,output,bad_digest,{'B','Driver'},pg_self_observation=True)
+                self.assertFalse(output.exists())
+
+    def test_pg_self_preparation_reuses_identical_driver_and_creates_only_fresh_build_state(self):
+        for issue in ('none','driver-hash','driver-source','driver-commit','driver-command','protocol'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);fresh=root/'fresh';(fresh/'tools').mkdir(parents=True)
+                current=fresh/'normal-perf-preflight/preflight.json';current.parent.mkdir();current.write_text('new boot')
+                args=types.SimpleNamespace(root=fresh,source=root/'source',tools=fresh/'tools',archive=root/'source.tgz',
+                    source_run=r.PG_SELF_RUN,archive_sha256=r.PG_SELF_ARCHIVE_SHA,candidate=r.h.NORMAL_PG_PRODUCT,
+                    normal_self_probe=True,normal_self_workload='db-gpr',baseline=r.h.BASELINE,
+                    prepatch=r.h.BASELINE,screen_variants=[])
+                calls=[];client={};protocol_digest=[]
+                def extract(archive,output,digest,commits,**kwargs):
+                    calls.append('extract');self.assertEqual(calls,['preflight','extract'])
+                    self.assertEqual(commits,{'B':args.candidate,'Driver':args.candidate})
+                    self.assertEqual(kwargs,{'pg_self_observation':True})
+                    source=output/'Driver/src/tests/benchmarks/cross_stack/client/main.go';source.parent.mkdir(parents=True)
+                    source.write_text('package main\n');binary=output/'Driver/build/bin/cross-stack-client';binary.parent.mkdir(parents=True)
+                    header=bytearray(20);header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little');binary.write_bytes(header)
+                    protocol=source.parent.parent/'protocol.json';protocol.write_text('{"schema":1}\n');protocol_digest.append(r.h.sha(protocol))
+                    client.update(command=[str(binary)],sha256=r.h.sha(binary),source_sha256=r.h.sha(source),env={'GOMAXPROCS':'3'})
+                    receipt=output/'Driver/build/commands/build.json';r.h.save(receipt,dict(candidate_base=args.candidate,
+                        failure=None,commands=[{'exit_code':1 if issue=='driver-command' else 0}]))
+                    r.h.save(output/'Driver/manifest.json',dict(candidate_base='b'*40 if issue=='driver-commit' else args.candidate,
+                        protocol=str(protocol),client=client,build_receipt=str(receipt),build_complete=False,stacks={'control':{}}))
+                    return {}
+                patches.enter_context(patch.object(r.os,'geteuid',return_value=1))
+                patches.enter_context(patch.object(r.platform,'system',return_value='Linux'))
+                patches.enter_context(patch.object(r.platform,'machine',return_value='aarch64'))
+                patches.enter_context(patch.object(r.h,'require_normal_perf_preflight',side_effect=lambda a:calls.append('preflight')))
+                patches.enter_context(patch.object(r,'extract_builds',side_effect=extract))
+                patches.enter_context(patch.object(r,'restore_json_inputs'))
+                patches.enter_context(patch.object(r,'validate_protocol_inputs',side_effect=lambda p,n,m:
+                    {'protocol_sha256':'0'*64 if issue=='protocol' and n=='B' else protocol_digest[0]}))
+                def verify(*args,**kwargs):
+                    self.assertEqual(kwargs,{'client_source':fresh/'Driver/src/tests/benchmarks/cross_stack/client/main.go'})
+                    common=dict(client,env={'GOMAXPROCS':'1'})
+                    if issue=='driver-hash':common['sha256']='0'*64
+                    if issue=='driver-source':common['source_sha256']='0'*64
+                    return {'client':common}
+                patches.enter_context(patch.object(r,'verify_manifest',side_effect=verify))
+                fresh_driver=patches.enter_context(patch.object(r,'new_driver'))
+                complete=patches.enter_context(patch.object(r.h,'complete_build',return_value={'execution_complete':True}))
+                if issue!='none':
+                    with self.assertRaises(ValueError):r.prepare(args)
+                    complete.assert_not_called();self.assertFalse((fresh/'hosted-state.json').exists())
+                else:
+                    self.assertTrue(r.prepare(args)['execution_complete']);complete.assert_called_once()
+                    state=r.h.load(fresh/'hosted-state.json')
+                    self.assertEqual(set(state['steps']),{'build'});self.assertEqual(state['identity'],r.h.hosted_identity(args,'diagnostic'))
+                    self.assertEqual(state['reused_build']['imported_measurement_windows'],0)
+                    self.assertFalse(state['reused_build']['old_boot_or_runtime_state_imported'])
+                fresh_driver.assert_not_called();self.assertEqual(current.read_text(),'new boot')
+
     def test_owner_reuse_requires_the_fixed_triple_before_touching_archive(self):
         args=types.SimpleNamespace(memory_owner_probe=True,source_run='bad',archive_sha256=r.OWNER_ARCHIVE_SHA,candidate=r.OWNER_PRODUCT)
         with patch.object(r,'extract_builds') as extract,self.assertRaisesRegex(ValueError,'fixed verified'):

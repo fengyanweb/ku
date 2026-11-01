@@ -25,11 +25,12 @@ def translated(value, root):
     return value
 
 
-def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False):
+def extract_builds(archive, root, expected_sha256, names, *, owner_observation=False,pg_self_observation=False):
     """Check all paths/map entries first; write only into a fresh owned tree."""
     checked(archive,expected_sha256)
     root=Path(root)
-    if root.exists() and (root.is_symlink() or any(p.name!='tools' for p in root.iterdir())):
+    allowed={'tools','normal-perf-preflight'} if pg_self_observation else {'tools'}
+    if root.exists() and (root.is_symlink() or any(p.name not in allowed for p in root.iterdir())):
         raise ValueError('reuse requires a fresh output (only prepared tools may exist)')
     with tarfile.open(archive,'r:gz') as tar:
         members=tar.getmembers()
@@ -50,11 +51,27 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
         if len(entries)>MAX_FILES:raise ValueError('portable map entry limit')
         mapping={entry['path']:entry for entry in entries}
         if len(mapping)!=len(entries):raise ValueError('duplicate portable map entry')
+        if pg_self_observation:
+            if set(mapping)!={m.name for m in members if m.name!='portable-file-map.json'}:
+                raise ValueError('PG SELF archive/map closure differs')
+            # Check every original archived byte, including retained failed
+            # observations, while importing only the immutable build prefixes.
+            for member in members:
+                if member.name=='portable-file-map.json':continue
+                data=tar.extractfile(member).read();entry=mapping[member.name]
+                if entry.get('bytes')!=len(data) or hashlib.sha256(data).hexdigest()!=entry.get('archived_sha256'):
+                    raise ValueError('portable archived bytes differ: '+member.name)
         old=json.load(tar.extractfile('hosted-state.json'))
         if any(not name.startswith('build') for name in old.get('steps',{})):
-            if not (owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
+            owner=(owner_observation and set(names)=={'B','R'} and expected_sha256==OWNER_ARCHIVE_SHA
                     and set(old.get('steps',{}))=={'build','build-B','build-R','diagnostic'}
-                    and all(v.get('state')=='completed' for v in old['steps'].values())):
+                    and all(v.get('state')=='completed' for v in old['steps'].values()))
+            pg=(pg_self_observation and set(names)=={'B','Driver'} and expected_sha256==PG_SELF_ARCHIVE_SHA
+                and set(old.get('steps',{}))=={'build','build-B','build-Driver','diagnostic'}
+                and all(v.get('state')=='completed' for v in old['steps'].values())
+                and old.get('identity',{}).get('candidate')==h.NORMAL_PG_PRODUCT
+                and old['identity'].get('normal_self_probe') is True and old['identity'].get('normal_self_workload')=='db-gpr')
+            if not (owner or pg):
                 raise ValueError('this reuse path accepts build-only source runs except the fixed owner archive')
         if any(old.get('steps',{}).get('build-'+name,{}).get('state')!='completed' for name in names):
             raise ValueError('requested normal build was not completed')
@@ -69,7 +86,9 @@ def extract_builds(archive, root, expected_sha256, names, *, owner_observation=F
             with destination.open('xb') as stream:stream.write(data)
             destination.chmod(member.mode&0o777)
         h.save(root/'reuse-portable-file-map.json',index)
-        provenance=old if not owner_observation else dict(identity=old.get('identity'),
+        if pg_self_observation:h.save(root/'reuse-byte-verification.json',dict(archive_sha256=expected_sha256,
+            all_map_files_verified=len(mapping),imported_build_prefixes=sorted(names),imported_measurement_windows=0))
+        provenance=old if not (owner_observation or pg_self_observation) else dict(identity=old.get('identity'),
             steps={k:v for k,v in old.get('steps',{}).items() if k.startswith('build')},measurement_results_imported=False)
         h.save(root/'reuse-original-state.json',provenance)
         return mapping
@@ -125,7 +144,7 @@ def require_elf(path):
         raise ValueError('reused artifact is not ELF64 little-endian AArch64: '+str(path))
 
 
-def verify_manifest(root, name, commit, mapping, verify_system=True):
+def verify_manifest(root, name, commit, mapping, verify_system=True,client_source=None):
     path=root/name/'manifest.json';original=h.load(path);m=translated(original,root)
     receipt=h.load(m['build_receipt'])
     if (m.get('candidate_base')!=commit or receipt.get('candidate_base')!=commit
@@ -177,7 +196,7 @@ def verify_manifest(root, name, commit, mapping, verify_system=True):
             native['compiler_receipt_sha256']=entry['archived_sha256']
             native['compiler_receipt_scope']='archived redacted bytes; original declaration verified via portable file map'
     old_client=m['client'];checked(old_client['command'][0],old_client['sha256']);require_elf(old_client['command'][0])
-    checked(root/'R/src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
+    checked(client_source or root/'R/src/tests/benchmarks/cross_stack/client/main.go',old_client['source_sha256'])
     h.save(root/'reuse-provenance'/(name+'-manifest.json'),original)
     m['uid'],m['gid']=os.getuid(),os.getgid()
     m['source_inventory_scope']='original build inventory; portable tree is partial and documentation redactions are separately bound'
@@ -244,6 +263,44 @@ func TestReusedProtocolInputBytes(t *testing.T) {
 OWNER_RUN='41182804290'
 OWNER_ARCHIVE_SHA='5976cad0c051b684823214f898cf746e2c7d63cd54d3116b04b509eba4c9dac6'
 OWNER_PRODUCT='4e5f5d94da277654862d8679f7ae4a7fda3f05ff'
+PG_SELF_RUN='41271758889'
+PG_SELF_ARCHIVE_SHA='4d9229ae3229c923dcf592e2376e5c567a5aa6da019bda6d5a900a0695c3dcf2'
+
+
+def prepare_pg_self(a):
+    h.validate_screen_selection(a,'diagnostic')
+    if ((a.source_run,a.archive_sha256,a.candidate)!=(PG_SELF_RUN,PG_SELF_ARCHIVE_SHA,h.NORMAL_PG_PRODUCT)
+            or getattr(a,'normal_self_workload',None)!='db-gpr' or a.screen_variants):
+        raise ValueError('PG SELF reuse requires the fixed F B/Driver run/archive and explicit GPR profile')
+    if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
+        raise ValueError('ordinary benchmark user on Linux ARM64 required')
+    # This is the new host's bounded capability receipt, never an archived boot.
+    h.require_normal_perf_preflight(a)
+    commits={'B':a.candidate,'Driver':a.candidate}
+    mapping=extract_builds(a.archive,a.root,a.archive_sha256,commits,pg_self_observation=True)
+    restore_json_inputs(a.source,a.root,commits,mapping)
+    inputs={n:validate_protocol_inputs(a.root,n,mapping) for n in commits}
+    if len({v['protocol_sha256'] for v in inputs.values()})!=1:raise ValueError('PG SELF protocol inputs differ')
+    source=a.root/'Driver/src/tests/benchmarks/cross_stack/client/main.go'
+    normal=verify_manifest(a.root,'B',a.candidate,mapping,client_source=source)
+    original_driver=h.load(a.root/'Driver/manifest.json');driver=translated(original_driver,a.root);receipt=h.load(driver['build_receipt'])
+    if (driver.get('candidate_base')!=a.candidate or receipt.get('candidate_base')!=a.candidate
+            or receipt.get('failure') is not None or not receipt.get('commands')
+            or any(row.get('exit_code')!=0 for row in receipt['commands'])):
+        raise ValueError('PG SELF driver build identity/completion differs')
+    client=driver['client'];require_elf(client['command'][0]);checked(client['command'][0],client['sha256'])
+    checked(source,client['source_sha256']);checked(driver['protocol'],inputs['Driver']['protocol_sha256'])
+    if any(client[k]!=normal['client'][k] for k in ('sha256','source_sha256')):raise ValueError('PG SELF driver bytes differ')
+    h.save(a.root/'reuse-provenance/Driver-manifest.json',original_driver)
+    driver['uid'],driver['gid']=os.getuid(),os.getgid()
+    h.save(a.root/'Driver/manifest.json',driver)
+    state=dict(identity=h.hosted_identity(a,'diagnostic'),steps={},uid=os.getuid(),gid=os.getgid(),goal_status='unknown',
+        reused_build=dict(source_run=a.source_run,archive_sha256=a.archive_sha256,product_commit=a.candidate,
+            normal_versions=commits,imported_measurement_windows=0,old_boot_or_runtime_state_imported=False))
+    h.save(a.root/'hosted-state.json',state)
+    result=h.step(state,a.root,'build',lambda:h.complete_build(a,state,'diagnostic',a.prepatch,[]))
+    h.save(a.root/'reuse-build.json',dict(**state['reused_build'],complete=result['execution_complete']))
+    return result
 
 
 def prepare_owner(a):
@@ -268,6 +325,7 @@ def prepare_owner(a):
 
 
 def prepare(a):
+    if getattr(a,'normal_self_probe',False):return prepare_pg_self(a)
     if getattr(a,'memory_owner_probe',False):return prepare_owner(a)
     h.validate_screen_selection(a,'followup-screen')
     if os.geteuid()==0 or platform.system()!='Linux' or platform.machine() not in ('aarch64','arm64'):
@@ -302,11 +360,13 @@ def main(argv=None):
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one instrumented allocation-owner observation')
+    parser.add_argument('--normal-self-probe',action='store_true',help='Only the fixed F B/Driver archive; fresh GPR capability gate required')
+    parser.add_argument('--normal-self-workload',choices=['json_object','db','db-gpr'],default='json_object')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')
     parser.add_argument('--common-http-screen',action='store_true',help='Explicit shared HTTP screen; requires --task-json-screen and preserves its distinct cache identity')
     a=parser.parse_args(argv)
-    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe else 'followup-screen')
+    try:h.validate_screen_selection(a,'diagnostic' if a.memory_owner_probe or a.normal_self_probe else 'followup-screen')
     except ValueError as error:parser.error(str(error))
     for key in ['archive','source','tools']:setattr(a,key,getattr(a,key).resolve(strict=True))
     a.root=a.root.resolve();a.screen_variants=a.screen_variants.split(',') if a.screen_variants else []

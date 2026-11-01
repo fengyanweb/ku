@@ -18,7 +18,7 @@ PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
 NORMAL_PG_PRODUCT = 'f43e74fdfe384c385a6703f3ee3eab933880b9e2'
 NORMAL_PG_PERF_FLAGS = ['--call-graph','dwarf,4096']
-NORMAL_PG_GPR_FLAGS = ['-vv','--call-graph','dwarf,4096',
+NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,4096',
     '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
 POLICY = {'arrival_limits_ms': {'p99_ms': 2, 'p999_ms': 10, 'max_ms': 50}}
 RESOURCES = {'service_cores': 2, 'service_memory_bytes': GIB,
@@ -1227,7 +1227,7 @@ def controlled_perf(client,pid,output,perf,record,*,deadline=None,limit=16<<20,p
             f'--control=fd:{read_ctl},{write_ack}','-p',str(pid),'-o',str(raw)]
         record.update(command=command,raw_limit_bytes=limit,control=[],started_monotonic_ns=time.monotonic_ns(),
             control_ack_framing='Linux perf ACK_TAG sizeof includes trailing NUL: fixed5 bytes ack\\n\\0; consume full frame before next command')
-        if '-vv' in perf_flags:record['log_limit_bytes']=1<<20
+        if any(flag.startswith('--user-regs=') for flag in perf_flags):record['log_limit_bytes']=1<<20
         with (output/'perf-record.log').open('xb') as log:
             process=subprocess.Popen(command,stdout=log,stderr=log,stdin=subprocess.DEVNULL,
                 start_new_session=True,pass_fds=(read_ctl,write_ack))
@@ -1385,7 +1385,7 @@ def normal_perf_capability(a):
         purpose='Plain CPU SELF control and explicit33-GPR DWARF once each; old default-DWARF failure retained. '
             'Only a successful DWARF GPR arm may permit the frozen F three-window PG probe. No automatic retry.')
     try:
-        for name,workload,flags in [('plain','json_object',['-vv']),('dwarf-gpr','db-gpr',NORMAL_PG_GPR_FLAGS)]:
+        for name,workload,flags in [('plain','json_object',[]),('dwarf-gpr','db-gpr',NORMAL_PG_GPR_FLAGS)]:
             arm=copy.copy(a);arm.normal_self_workload=workload
             receipt=normal_perf_preflight(arm,output=directory/name,perf_flags=flags)
             result['arms'].append(dict(name=name,complete=receipt.get('complete') is True,

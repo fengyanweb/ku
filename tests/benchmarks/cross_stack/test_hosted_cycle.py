@@ -525,7 +525,7 @@ class HostedCycleTests(unittest.TestCase):
                     h.save(path,dict(record,perf_flags=flags));h.require_normal_perf_preflight(a)
 
     def test_normal_pg_gpr_plan_keeps_frozen_work_and_excludes_extended_registers(self):
-        flags=['-vv','--call-graph','dwarf,4096',
+        flags=['--call-graph','dwarf,4096',
             '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
         self.assertEqual(h.NORMAL_PG_GPR_FLAGS,flags)
         plain=h.normal_self_plan({'B':{}},'db');gpr=h.normal_self_plan({'B':{}},'db-gpr')
@@ -621,7 +621,7 @@ class HostedCycleTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError,'unavailable'):h.normal_perf_capability(a)
                     result=h.load(root/'normal-perf-preflight/capability.json')
                 else:result=h.normal_perf_capability(a)
-                expected=[('plain','json_object',['-vv'])]
+                expected=[('plain','json_object',[])]
                 if issue!='unreaped':expected.append(('dwarf-gpr','db-gpr',h.NORMAL_PG_GPR_FLAGS))
                 self.assertEqual(calls,expected);self.assertEqual(probe.call_count,len(expected))
                 self.assertEqual(previous.read_text(),'original failure retained\n')
