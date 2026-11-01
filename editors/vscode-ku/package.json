@@ -14,6 +14,11 @@
     "vscode": "^1.85.0"
   },
   "main": "./out/language.js",
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": { "supported": false, "description": "Ku checks and executable discovery run a locally installed CLI. Trust the workspace to enable these features." },
+    "virtualWorkspaces": false
+  },
   "activationEvents": [
     "onLanguage:ku",
     "onLanguage:ku-mod",
@@ -28,7 +33,11 @@
   ],
   "categories": ["Programming Languages"],
   "scripts": {
-    "compile": "tsc --target ES2020 --module commonjs --lib ES2020 --rootDir src --outDir out --strict --esModuleInterop --skipLibCheck src/language.ts src/imports.ts",
+    "compile": "tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "lint": "tsc -p . --noEmit --noUnusedLocals --noUnusedParameters",
+    "build": "npm run compile",
+    "package": "vsce package --no-dependencies --no-rewrite-relative-links",
     "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension json ok')\" && node test-completion-model.js && node test-formatter.js && node test-executable-model.js",
     "vscode:prepublish": "npm run compile"
   },
@@ -44,7 +53,7 @@
       { "command": "ku.checkCurrentFile", "title": "Ku: Check Current File", "icon": "$(check)" },
       { "command": "ku.showIr", "title": "Ku: Show IR", "icon": "$(symbol-misc)" },
       { "command": "ku.buildCurrentFile", "title": "Ku: Build Current File", "icon": "$(package)" },
-      { "command": "ku.buildNativeC", "title": "Ku: Build Native C", "icon": "$(gear)" },
+      { "command": "ku.buildNativeC", "title": "Ku: Emit Native C Source", "icon": "$(gear)" },
       { "command": "ku.packageGc", "title": "Ku: Package GC", "icon": "$(trash)" },
       { "command": "ku.showVersion", "title": "Ku: Show Version", "icon": "$(versions)" }
     ],
@@ -54,22 +63,26 @@
         "ku.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to ku executable. Empty means use PATH ku first, then workspace release/<rust-target>/ku[.exe]."
+          "scope": "resource",
+          "description": "Ku executable path, without shell quotes or arguments. Supports ${workspaceFolder}, ${userHome}, ~/ and workspace-relative paths. An invalid explicit path is reported without fallback. Empty uses PATH then workspace release/<rust-target>, target/release and target/debug."
         },
         "ku.checkOnSave": {
           "type": "boolean",
           "default": true,
+          "scope": "resource",
           "description": "Run ku check when a .ku file is saved."
         },
         "ku.checkOnOpen": {
           "type": "boolean",
           "default": true,
-          "description": "Run ku check when a .ku file is opened."
+          "scope": "resource",
+          "description": "Run ku check when a saved .ku file is opened."
         },
         "ku.checkOnChange": {
           "type": "boolean",
           "default": false,
-          "description": "Run ku check after edits. Disabled by default to avoid noisy diagnostics while typing."
+          "scope": "resource",
+          "description": "Debounce checks after document changes. The CLI reads files from disk, so dirty documents wait until saved; unsaved edits invalidate prior checks."
         }
       }
     },

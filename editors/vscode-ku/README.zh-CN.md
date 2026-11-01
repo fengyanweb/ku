@@ -1,92 +1,66 @@
-# Ku Language for VS Code
+# Ku VS Code 插件
 
-[简体中文](README.zh-CN.md) · [English](README.md#english)
+适配 Ku 0.0.19。提供 `.ku`、`ku.mod`、`ku.lock` 高亮、代码片段、内置补全和悬浮提示、本地/导入符号跳转、Outline、格式化，以及调用现有 Ku CLI 的命令。没有完整 LSP，不推断任意变量类型，不解析包缓存做依赖跳转。
 
-本插件为 `.ku` 文件提供语法高亮、代码片段、编译器诊断、运行命令和编辑辅助功能。插件版本为 **0.0.19**，需要另行安装匹配的 Ku CLI。
+## 安装与解释器
 
-## 功能
-
-- Ku 0.0.19 语法高亮：`async` / `await`、普通字符串、模板字符串、数字、内置类型和标准库调用；同时标记不受支持的 `let` / `mut` / `const`。
-- `ku.mod` 与 `ku.lock` 语法高亮，以及注释、括号、自动补全括号和包围选区的语言配置。
-- 代码片段：同步／异步 main 和函数、`await task?`、泛型函数、struct、enum、match、try/catch/finally、`std.fs`、`std.http`、`std.config`、`std.task`、有界 Task 压力示例、HTTP 响应、数组 map、字符串方法及 `array.try_get`。
-- 打开和保存文件时调用 `ku check`，在**问题**面板和编辑器红色波浪线中显示诊断。
-- 命令面板提供 Run、Check、Show IR、Build、Build Native C、Package GC 和 Show Version。
-- 编辑器和资源管理器的 `.ku` 文件右键菜单提供 **Ku Run**；没有 `fn main()` 时显示明确提示。编辑器标题栏也提供 Run、Check、IR 和 Build 按钮。
-- 状态栏从 `package.json` 读取插件版本，并与实际选中的 CLI 版本比较，提示解释器与插件版本不一致。
-- 悬浮说明覆盖 async/await、Error、Result、`std.fs`、`std.http`、`std.config`、`std.task`、match，以及字符串和数组辅助函数。
-- 补全覆盖关键字、基本类型、内置函数、标准库模块／函数、Error 和 HttpResponse 字段、字符串／数组方法、导入路径及包依赖前缀。
-- 成员补全按上下文处理：输入 `http.se` 可补全 `service` / `server`，构造器插入 `service()` / `server()`，不会生成旧的属性式 `http.service` / `http.server`。
-- 补全还覆盖 `std.bytes`、`std.net`、`std.lexer`、`std.parser`、目录操作，以及 `time.instant` / `time.elapsed` / `time.steady_millis`。`time.now()` 返回 Unix 毫秒，`time.instant()` 返回 Time 对象。
-- HTTP handler 补全识别 `req` / `app` / `router` 名称；`req.` 提供请求字段。普通路由模板在不读取请求时使用 `fn()`，需要请求时使用 `fn(req)`。
-- 普通 `async fn` 返回一次性 Task 句柄，插件不会为它建议生命周期句柄的 `status` / `cancel` / `await_timeout` 方法。
-- 类型化箭头函数是一等值。对象索引默认严格，显式可空查找使用 `object[key]?`；对象解构片段覆盖重命名、默认值和 rest。
-- JSON 格式的编译器诊断定位到实际出错的导入文件；过期检查结果不会覆盖更新后的保存或编辑结果。
-- 定义跳转覆盖本地函数／类型、导入文件及导入模块的导出符号；大纲覆盖模块、函数、struct、enum 和局部函数。
-- 快速修复覆盖缺失的 `std.http` / `std.fs` / `std.config` / `std.task` 导入，以及 `let` 和 `switch`。
-- 内置格式化使用四空格缩进、压缩多余空行、整理运算符／逗号间距，并合并 `} else` / `} catch` / `} finally`。
-
-## 从 VSIX 安装
-
-在 [v0.0.19 Release](https://github.com/fengyanweb/ku/releases/tag/v0.0.19) 实际发布后，从匹配平台的安装包中取得 `ku-language-0.0.19.vsix`。是否可下载以 Release 实际附件为准。CI 的 `native_ci-*` 是验证夹具，不是完整 CLI 安装包；部署范围以发布说明和具体业务验收为准。
-
-已有插件可重新从 VSIX 安装，或执行：
+在 VS Code 扩展面板选择 **… → 从 VSIX 安装**，选取本次交付的 `ku-language-0.0.19.vsix` 并重载窗口。同版本重装可执行：
 
 ```sh
-code --install-extension ./ku-language-0.0.19.vsix --force
+code --install-extension /绝对路径/ku-language-0.0.19.vsix --force
 ```
 
-需要自行构建时，从仓库根目录执行：
+插件与 CLI 分别安装，不包含数据库驱动或 native target pack。本次为本地交付，不代表市场或 GitHub Release 已公开发布。
 
-```powershell
-cd editors\vscode-ku
+`ku.executablePath` 支持文件夹级设置、多根工作区、中文和空格路径。填写可执行文件路径，不加 shell 引号或命令参数：
+
+```json
+{
+  "ku.executablePath": "${userHome}/tools/Ku SDK/ku"
+}
+```
+
+支持 `${workspaceFolder}`、`${userHome}`、`~/`、相对工作区路径；单独打开的文件以文件所在目录解析相对路径。显式路径错误会提示，避免悄悄换用其他 Ku；探测会同时检查退出码和 `ku <版本>` 输出。
+
+留空时依次查找 VS Code 扩展进程的 PATH、当前文件所属工作区 `release/<rust-target>/ku[.exe]`、`target/release`、`target/debug`。bundle 映射覆盖 Windows x64、Linux x64、macOS ARM64；其他架构请设置路径或使用 PATH。插件不修改 SDK、PATH。远程窗口使用远端扩展宿主的 CLI。受限模式和虚拟工作区不激活执行代码的扩展。
+
+## 命令的实际行为
+
+| 命令 | CLI | 结果 |
+| --- | --- | --- |
+| Ku Run | `ku run FILE` | 在进程任务终端运行，需要 main。 |
+| Check Current File | `ku check --json FILE` | 先保存，再在 Problems 和 Ku Output 显示诊断。 |
+| Show IR | `ku ir FILE` | 终端打印 IR。 |
+| Build Current File | `ku build FILE` | 使用 CLI 默认后端/profile，需要对应版本工具链。 |
+| Emit Native C Source | `ku build --native FILE` | 只生成 C 源码；现有 CLI 的这个兼容形式不链接可执行程序。 |
+| Package GC | `ku package gc FILE` | 按所属项目回收无用依赖缓存，会实际删除符合条件的缓存项。 |
+| Show Version | `ku version` | 显示实际 CLI 及插件版本。 |
+
+命令先保存脏文件，保存失败即停止。工作区进程任务直接传入可执行文件和参数，保留原生路径；可在 VS Code 任务界面停止。未打开文件夹时，直接把 CLI 作为终端可执行文件并传入同一参数数组，可关闭该终端停止。构建输出位置与工具链错误由 CLI 决定。
+
+默认打开/保存时检查。CLI 读取磁盘文件，未保存编辑会使相关旧诊断失效，不会把旧磁盘内容当作当前编辑结果。`ku.checkOnChange` 只对已保存文档防抖，不新增未保存缓冲区协议。检查最多同时运行两个作业，同根只保留最新待办，过期检查会取消，沿用 15 秒上限。只有明确不支持 `--json` 的旧 CLI 才回退文本检查；启动失败、超时会保留错误说明。
+
+诊断指向实际出错文件，包含导入文件，并把 Unicode 标量列映射为 VS Code UTF-16 位置。多个入口对同一导入文件的诊断按来源聚合，不互相清除。关闭入口、修改 Ku 配置、停用扩展时取消待办。读取诊断源码有文件数、大小和时间边界；无法映射列时会明确说明。
+
+## 补全和格式化边界
+
+补全依赖插件内置 API/名称模型，包括 async 一次性 Task、HTTP、JSON、bytes/net 和时间 API，不代表真实类型推导。本地 import 补全保留目录前缀，支持中文、空格及对应引号中的另一种引号；依赖前缀从 `ku.mod` 读取，不提供完整包缓存导航。
+
+格式化调整缩进、运算符/逗号空格、空行及相邻 else/catch/finally，遵循编辑器缩进设置和原换行符，保护字符串（含多行内容）及注释文字。未闭合字面量/注释保持原文。它不调用 CLI 格式化器。快速修复、Outline 和定义查找仍为启发式功能。
+
+## 本地构建
+
+需要 Node.js 20+ 和 npm，在本目录运行：
+
+```sh
 npm ci --ignore-scripts
+npm run lint
+npm run typecheck
 npm test
-npx --no-install vsce package --out ku-language-0.0.19.vsix
-code --install-extension .\ku-language-0.0.19.vsix
+npm run build
+npm run package -- --out /绝对输出目录/ku-language-0.0.19.vsix
 ```
 
-安装后，在命令面板执行 **Developer: Reload Window**，或重启 VS Code，再打开 `.ku` 文件。
+lint 使用 TypeScript 严格的未使用符号检查，无新增依赖；复用已有模型、格式化和诊断测试。VSIX 只含编译产物、语法、片段、文档和许可证，不包含开发依赖、源码或临时测试。开发宿主可在编译后使用 `code --extensionDevelopmentPath=/绝对路径/editors/vscode-ku` 启动。
 
-## 不使用命令行安装
-
-1. 打开 VS Code 的**扩展**面板。
-2. 点击 `...`，选择**从 VSIX 安装…**。
-3. 选择从匹配安装包解压或本地构建的 `ku-language-0.0.19.vsix`。
-4. 执行 **Developer: Reload Window**，或重启 VS Code。
-
-## 复制扩展目录安装
-
-先在 `editors/vscode-ku` 中执行 `npm ci --ignore-scripts` 和 `npm run compile`。不使用 `vsce` 时，也可把编译后的目录复制到 VS Code 扩展目录，必须包含 `out/`、`LICENSE.txt` 和 `NOTICE`。以下 Windows PowerShell 示例从**仓库根目录**执行：
-
-```powershell
-$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.19"
-New-Item -ItemType Directory -Force -Path $target | Out-Null
-Copy-Item -Path .\editors\vscode-ku\* -Destination $target -Recurse -Force
-```
-
-复制后重启 VS Code。
-
-## 开发模式
-
-用 VS Code 打开 `editors/vscode-ku`，按 `F5` 启动 Extension Development Host。
-
-## Ku 程序路径
-
-插件按以下顺序尝试可执行程序：
-
-1. 已配置的 `ku.executablePath`。
-2. PATH 中的 `ku`。
-3. 工作区 `release/<rust-target>/ku[.exe]` 中匹配宿主的包。
-4. 工作区的 `target/release/ku[.exe]` 和 `target/debug/ku[.exe]`。
-
-发布目标映射为 Windows x64 → `x86_64-pc-windows-msvc`，Linux x64 → `x86_64-unknown-linux-gnu`，Apple Silicon macOS → `aarch64-apple-darwin`。其他宿主架构需要使用 `ku.executablePath` 或 PATH 提供可用 CLI。
-
-## 能力边界
-
-补全和悬浮说明来自插件内置 API 模型，不是完整的编译器语言服务器，不能推断所有接收者类型和链式调用。编译器诊断由 `ku check` 提供，运行和构建命令仍需要已安装的 Ku 可执行程序。
-
-插件不会安装 CLI、数据库驱动或 native target pack。`std.bytes` / `std.net` 需要所选 Ku 包支持的 native C 执行路径。补全出现某个方法，不代表所有后端均支持它。
-
-## 许可证
-
-Apache-2.0。原始 `LICENSE.txt` 和 `NOTICE` 随插件分发；第三方组件保留各自的许可声明。
+本次记录见 [CHANGELOG.md](CHANGELOG.md)、[VERIFICATION.md](VERIFICATION.md)。Apache-2.0；分发包保留原始 `LICENSE.txt` 与 `NOTICE`。

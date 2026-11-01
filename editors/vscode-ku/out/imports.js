@@ -33,28 +33,70 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.importPathContext = importPathContext;
+exports.decodeImportPath = decodeImportPath;
 exports.parseImports = parseImports;
 exports.resolveImportUri = resolveImportUri;
 exports.isStdImport = isStdImport;
 exports.defaultModuleName = defaultModuleName;
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
-const IMPORT_LINE = /^\s*import\s+(?:(\{[^}]*\})\s+from\s+|([A-Za-z_][A-Za-z0-9_]*)\s+from\s+)?["']([^"']+)["']/;
+const IMPORT_PREFIX = /^\s*import\s+(?:(\{[^}]*\})\s+from\s+|([A-Za-z_][A-Za-z0-9_]*)\s+from\s+)?(["'])/;
+// Keep raw offsets for VS Code ranges, while resolving the same escape sequences
+// as Ku's quoted strings. An apostrophe inside a double-quoted path is ordinary text.
+function importPathContext(line) {
+    const match = IMPORT_PREFIX.exec(line);
+    if (!match)
+        return undefined;
+    const quote = match[3];
+    const start = match[0].length;
+    let end = start;
+    while (end < line.length && line[end] !== quote) {
+        if (line[end] === "\\")
+            end++;
+        end++;
+    }
+    const raw = line.slice(start, Math.min(end, line.length));
+    return { match, quote, start, end: Math.min(end, line.length), closed: end < line.length, raw };
+}
+function decodeImportPath(raw, quote) {
+    let value = "";
+    for (let i = 0; i < raw.length; i++) {
+        if (raw[i] !== "\\") {
+            value += raw[i];
+            continue;
+        }
+        const escaped = raw[++i];
+        if (escaped === "n")
+            value += "\n";
+        else if (escaped === "r")
+            value += "\r";
+        else if (escaped === "t")
+            value += "\t";
+        else if (escaped === "\\" || escaped === quote)
+            value += escaped;
+        else
+            return undefined;
+    }
+    return value;
+}
 function parseImports(document) {
     const imports = [];
     const maxLines = document.lineCount;
     for (let line = 0; line < maxLines; line++) {
         const text = document.lineAt(line).text;
-        const match = IMPORT_LINE.exec(text);
-        if (!match) {
+        const context = importPathContext(text);
+        if (!context?.closed) {
             continue;
         }
+        const { match } = context;
         const rawNamed = match[1];
         const namespace = match[2];
-        const importPath = match[3];
-        const pathStart = text.indexOf(importPath);
+        const importPath = decodeImportPath(context.raw, context.quote);
+        if (!importPath)
+            continue;
         const range = new vscode.Range(line, 0, line, text.length);
-        const pathRange = new vscode.Range(line, pathStart, line, pathStart + importPath.length);
+        const pathRange = new vscode.Range(line, context.start, line, context.end);
         if (rawNamed) {
             imports.push({
                 kind: "named",
@@ -88,7 +130,7 @@ function parseImports(document) {
     return imports;
 }
 function resolveImportUri(from, importPath) {
-    if (isStdImport(importPath)) {
+    if (isStdImport(importPath) || importPath.startsWith("@")) {
         return undefined;
     }
     const fromPath = "uri" in from ? from.uri.fsPath : from.fsPath;
