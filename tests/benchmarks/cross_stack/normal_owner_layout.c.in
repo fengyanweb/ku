@@ -1,0 +1,123 @@
+/* Preparation only. Compile on the actual target using the verified normal
+ * generated C and compiler. This emits type layout; it never invokes Ku main,
+ * starts HTTP, opens PG, or samples a service. The included normal C is not
+ * edited/recompiled as a candidate. Replace the one marker with a C string
+ * literal for the exact SHA-verified source. Keep UTF8 paths literal; reject
+ * quotes, backslashes and newlines instead of JSON ASCII escaping a header-name. */
+#define main ku_unused_original_main_for_layout
+#include @SOURCE_C_LITERAL@
+#undef main
+#include <stddef.h>
+static int first_layout_field;
+#define BEGIN(T) do {printf("\"" #T "\":{\"size\":%zu,\"fields\":{",sizeof(T));first_layout_field=1;}while(0)
+#define FIELD(T,M) do {printf("%s\"" #M "\":{\"offset\":%zu,\"bytes\":%zu}",first_layout_field?"":",",offsetof(T,M),sizeof(((T*)0)->M));first_layout_field=0;}while(0)
+#define END() fputs("}}",stdout)
+int main(void) {
+  printf("{\"schema\":\"ku-normal-owner-layout-v1\",\"pointer_bytes\":%zu,\"types\":{",sizeof(void*));
+  BEGIN(KuHttpLoopGroup);
+  FIELD(KuHttpLoopGroup,count);
+  FIELD(KuHttpLoopGroup,created);
+  FIELD(KuHttpLoopGroup,started);
+  FIELD(KuHttpLoopGroup,draining);
+  FIELD(KuHttpLoopGroup,tasks);
+  FIELD(KuHttpLoopGroup,loops);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpLoopOwner);
+  FIELD(KuHttpLoopOwner,index);
+  FIELD(KuHttpLoopOwner,slots);
+  FIELD(KuHttpLoopOwner,request_limit);
+  FIELD(KuHttpLoopOwner,pending);
+  FIELD(KuHttpLoopOwner,ready);
+  FIELD(KuHttpLoopOwner,exited);
+  FIELD(KuHttpLoopOwner,connection_base);
+  FIELD(KuHttpLoopOwner,handler_queue);
+  FIELD(KuHttpLoopOwner,queued);
+  FIELD(KuHttpLoopOwner,running);
+  FIELD(KuHttpLoopOwner,resident);
+  FIELD(KuHttpLoopOwner,active_requests);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpTaskRuntime);
+  FIELD(KuHttpTaskRuntime,driver);
+  FIELD(KuHttpTaskRuntime,slots);
+  FIELD(KuHttpTaskRuntime,ring);
+  FIELD(KuHttpTaskRuntime,handles);
+  FIELD(KuHttpTaskRuntime,free_handles);
+  FIELD(KuHttpTaskRuntime,capacity);
+  FIELD(KuHttpTaskRuntime,active_handles);
+  FIELD(KuHttpTaskRuntime,free_handle_count);
+  FIELD(KuHttpTaskRuntime,blocking);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuTaskDriverV1);
+  FIELD(KuTaskDriverV1,capacity);
+  FIELD(KuTaskDriverV1,binding_keys);
+  FIELD(KuTaskDriverV1,binding_cells);
+  FIELD(KuTaskDriverV1,resident);
+  FIELD(KuTaskDriverV1,running);
+  FIELD(KuTaskDriverV1,queued);
+  FIELD(KuTaskDriverV1,closing);
+  FIELD(KuTaskDriverV1,building);
+  FIELD(KuTaskDriverV1,workers_created);
+  FIELD(KuTaskDriverV1,workers_exited);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuTaskBlockingPoolV1);
+  FIELD(KuTaskBlockingPoolV1,storage);
+  FIELD(KuTaskBlockingPoolV1,storage_bytes);
+  FIELD(KuTaskBlockingPoolV1,capacity);
+  FIELD(KuTaskBlockingPoolV1,worker_target);
+  FIELD(KuTaskBlockingPoolV1,workers_created);
+  FIELD(KuTaskBlockingPoolV1,workers_exited);
+  FIELD(KuTaskBlockingPoolV1,resident);
+  FIELD(KuTaskBlockingPoolV1,queued);
+  FIELD(KuTaskBlockingPoolV1,running);
+  FIELD(KuTaskBlockingPoolV1,net_wait_count);
+  FIELD(KuTaskBlockingPoolV1,net_step_count);
+  FIELD(KuTaskBlockingPoolV1,jobs);
+  FIELD(KuTaskBlockingPoolV1,inputs);
+  FIELD(KuTaskBlockingPoolV1,ring);
+  FIELD(KuTaskBlockingPoolV1,free_indices);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpQueue);
+  FIELD(KuHttpQueue,items);
+  FIELD(KuHttpQueue,cap);
+  FIELD(KuHttpQueue,count);
+  FIELD(KuHttpQueue,resident);
+  FIELD(KuHttpQueue,running);
+  FIELD(KuHttpQueue,workers);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpConnection);
+  FIELD(KuHttpConnection,active_set);
+  FIELD(KuHttpConnection,reactor);
+  FIELD(KuHttpConnection,connection_generation);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpActiveSet);
+  FIELD(KuHttpActiveSet,connections);
+  FIELD(KuHttpActiveSet,indices);
+  FIELD(KuHttpActiveSet,capacity);
+  FIELD(KuHttpActiveSet,high_water);
+  FIELD(KuHttpActiveSet,count);
+  FIELD(KuHttpActiveSet,request_active);
+  END();
+  fputs(",",stdout);
+  BEGIN(KuHttpReactor);
+  FIELD(KuHttpReactor,active);
+  FIELD(KuHttpReactor,slots);
+  FIELD(KuHttpReactor,capacity);
+  FIELD(KuHttpReactor,hash_capacity);
+  FIELD(KuHttpReactor,fd_capacity);
+  FIELD(KuHttpReactor,registrations);
+  FIELD(KuHttpReactor,hash);
+  FIELD(KuHttpReactor,fd_entries);
+  FIELD(KuHttpReactor,work);
+  FIELD(KuHttpReactor,idle_heap);
+  END();
+  printf("},\"element_bytes\":{\"driver_slot\":%zu,\"task_handle\":%zu,\"ring\":%zu,\"free_handle\":%zu,\"binding_key\":%zu,\"connection\":%zu,\"registration\":%zu,\"token_bucket\":%zu,\"fd_bucket\":%zu,\"int\":%zu,\"pointer\":%zu,\"blocking_job\":%zu,\"blocking_input\":%zu}}\n",
+      sizeof(KuTaskDriverSlotV1),sizeof(KuHttpTaskHandle),sizeof(size_t),sizeof(uint32_t),sizeof(KuTaskControlV1*),sizeof(KuHttpConnection),sizeof(KuHttpRegistration),sizeof(((KuHttpReactor*)0)->hash[0]),sizeof(uint32_t),sizeof(int),sizeof(void*),sizeof(KuTaskBlockingJobV1),sizeof(KuTaskBlockingInputsV1));
+  return ferror(stdout)?1:0;
+}
