@@ -1613,17 +1613,35 @@ static void ku_http_queue_notify(KuHttpQueue* queue) {
 static int ku_http_queue_take_owner_work(KuHttpQueue* queue) {
   int pending=queue->owner_work_pending;queue->owner_work_pending=0;return pending;
 }
+/* State progresses only from zero to one. The worker publishes its immutable
+   deadline with started and its fully owned result with completed. The socket
+   owner alone consumes that result and initiates cancellation; queue ownership
+   and real job references still control admission and physical retirement. */
+#if defined(_WIN32)
+typedef volatile LONG KuHttpJobFlag;
+static void ku_http_job_flag_init(KuHttpJobFlag* flag) { *flag=0; }
+static int ku_http_job_flag_load(KuHttpJobFlag* flag) { return (int)InterlockedCompareExchange(flag,0,0); }
+static void ku_http_job_flag_publish(KuHttpJobFlag* flag) { (void)InterlockedExchange(flag,1); }
+#else
+typedef _Atomic int KuHttpJobFlag;
+static void ku_http_job_flag_init(KuHttpJobFlag* flag) { atomic_init(flag,0); }
+static int ku_http_job_flag_load(KuHttpJobFlag* flag) { return atomic_load_explicit(flag,memory_order_acquire); }
+static void ku_http_job_flag_publish(KuHttpJobFlag* flag) { atomic_store_explicit(flag,1,memory_order_release); }
+#endif
 struct KuHttpJob {
   KuAtomicRefcount owners;
-  KuHttpMutex lock;
   KuHttpQueue* queue;
   KuHttpBufferBudget* budget; size_t response_charge, projection_charge;
   KuHttpInput input;
   KuStruct___ku_http_response response;
   unsigned long long handler_deadline, request_deadline;
   KuHttpFailure failure;
-  int claimed; int started; int completed; int cancelled;
+  KuHttpJobFlag claimed, started, completed, cancelled;
 };
+static void ku_http_job_state_init(KuHttpJob* job) {
+  ku_http_job_flag_init(&job->claimed);ku_http_job_flag_init(&job->started);
+  ku_http_job_flag_init(&job->completed);ku_http_job_flag_init(&job->cancelled);
+}
 static int ku_http_job_projection(KuHttpJob* job,size_t bytes) {
   if (!ku_http_buffer_reserve(job->budget,bytes)) return 0;
   job->projection_charge=bytes; return 1;
@@ -1642,7 +1660,7 @@ static int ku_http_queue_init(KuHttpQueue* queue, int cap, KuHttpWake* wake) {
 static KuHttpJob* ku_http_job_new(KuHttpQueue* queue, KuHttpInput* input) {
   KuHttpJob* job = (KuHttpJob*)calloc(1, sizeof(KuHttpJob));
   if (!job) return NULL;
-  if (!ku_http_mutex_init(&job->lock)) { free(job); return NULL; }
+  ku_http_job_state_init(job);
   ku_atomic_refcount_init(&job->owners);
   job->queue = queue;
   job->budget = input->budget;
@@ -1659,7 +1677,6 @@ static void ku_http_job_release(KuHttpJob* job) {
     ku_http_input_drop(&job->input);
     ku_drop_struct___ku_http_response(&job->response);
     ku_http_buffer_refund(job->budget, job->response_charge);
-    ku_http_mutex_destroy(&job->lock);
     free(job);
     ku_http_mutex_lock(&queue->lock);
     if (!queue->resident) { fputs("http job retirement underflow\n", stderr); exit(1); }
@@ -1693,18 +1710,14 @@ static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms) {
      the original absolute request budget. Publish the same capped TLS value. */
   if (job->request_deadline && __ku_handler_deadline > job->request_deadline)
     __ku_handler_deadline = job->request_deadline;
-  ku_http_mutex_lock(&job->lock);
-  if (job->started) { fputs("http handler deadline restarted\n", stderr); exit(1); }
+  if (ku_http_job_flag_load(&job->started)) { fputs("http handler deadline restarted\n", stderr); exit(1); }
   job->handler_deadline = __ku_handler_deadline;
-  job->started = 1;
-  ku_http_mutex_unlock(&job->lock);
+  ku_http_job_flag_publish(&job->started);
   ku_http_queue_notify(job->queue);
 }
 static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
-  ku_http_mutex_lock(&job->lock);
-  int cancelled = job->cancelled || ku_http_now_ms() >= job->request_deadline;
-  if (cancelled) { job->cancelled = 1; job->completed = 1; }
-  ku_http_mutex_unlock(&job->lock);
+  int cancelled = ku_http_job_flag_load(&job->cancelled) || ku_http_now_ms() >= job->request_deadline;
+  if (cancelled) { ku_http_job_flag_publish(&job->cancelled); ku_http_job_flag_publish(&job->completed); }
   if (cancelled) { ku_http_input_drop(&job->input); ku_http_queue_notify(job->queue); return; }
   ku_http_failure_current=(KuHttpFailure){0};
   KuStruct___ku_http_response response = ku_http_execute_request(server, &job->input, job);
@@ -1714,12 +1727,10 @@ static void ku_http_job_run(KuHttpServer* server, KuHttpJob* job) {
   ku_http_input_drop(&job->input);
   size_t response_charge = ku_http_buffer_admit_response(job->budget, &response, &failure);
   ku_http_buffer_refund(job->budget,job->projection_charge); job->projection_charge=0;
-  ku_http_mutex_lock(&job->lock);
   job->response_charge = response_charge;
   job->failure = failure;
   job->response = response;
-  job->completed = 1;
-  ku_http_mutex_unlock(&job->lock);
+  ku_http_job_flag_publish(&job->completed);
   ku_http_queue_notify(job->queue);
 }
 /* Only compiler-proven bounded work enters here, once, before any worker
@@ -1769,9 +1780,7 @@ static KuHttpJob* ku_http_queue_pop(KuHttpQueue* queue) {
     queue->head = (queue->head + 1) % queue->cap;
     queue->count--;
     queue->queued_bytes-=job->input.body_charge+job->input.metadata_charge;
-    ku_http_mutex_lock(&job->lock);
-    job->claimed = 1; queue->running++;
-    ku_http_mutex_unlock(&job->lock);
+    ku_http_job_flag_publish(&job->claimed); queue->running++;
   }
   ku_http_mutex_unlock(&queue->lock);
   if (job) ku_http_queue_notify(queue);
@@ -1791,10 +1800,8 @@ static void ku_http_queue_cancel_job(KuHttpJob* job) {
     queue->items[queue->tail] = NULL; queue->count--;
     queue->queued_bytes-=job->input.body_charge+job->input.metadata_charge; removed = 1; break;
   }
-  ku_http_mutex_lock(&job->lock);
-  job->cancelled = 1;
-  if (removed) job->completed = 1;
-  ku_http_mutex_unlock(&job->lock);
+  ku_http_job_flag_publish(&job->cancelled);
+  if (removed) ku_http_job_flag_publish(&job->completed);
   ku_http_mutex_unlock(&queue->lock);
   if (removed) { ku_http_input_drop(&job->input); ku_http_job_release(job); }
 }
@@ -1817,9 +1824,7 @@ static void ku_http_queue_close(KuHttpQueue* queue, int drain) {
     ku_http_mutex_unlock(&queue->lock);
     if (!job) break;
     ku_http_input_drop(&job->input);
-    ku_http_mutex_lock(&job->lock);
-    job->cancelled = 1; job->completed = 1;
-    ku_http_mutex_unlock(&job->lock);
+    ku_http_job_flag_publish(&job->cancelled); ku_http_job_flag_publish(&job->completed);
     ku_http_job_release(job);
   }
 }
@@ -2504,15 +2509,13 @@ static void ku_http_connection_observe_job(KuHttpConnection* connection, KuHttpS
   KuHttpJob* job = connection->job;
   KuStruct___ku_http_response response = {0};
   size_t response_charge = 0;
-  ku_http_mutex_lock(&job->lock);
-  int completed = job->completed;
-  int cancelled = job->cancelled;
+  int completed = ku_http_job_flag_load(&job->completed);
+  int cancelled = ku_http_job_flag_load(&job->cancelled);
   if (completed && !cancelled) {
     response = job->response; response_charge = job->response_charge;
     connection->failure=job->failure;
     job->response = (KuStruct___ku_http_response){0}; job->response_charge = 0;
   }
-  ku_http_mutex_unlock(&job->lock);
   if (!completed && ku_http_now_ms() >= job->request_deadline) {
     ku_http_queue_cancel_job(job);
     ku_http_connection_status(connection,server,504);
@@ -4120,9 +4123,7 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
         int index=active.indices[position];
         KuHttpConnection* connection = &connections[index];
         if (connection->phase == KU_HTTP_IO_JOB) {
-          ku_http_mutex_lock(&connection->job->lock);
-          int claimed = connection->job->claimed;
-          ku_http_mutex_unlock(&connection->job->lock);
+          int claimed = ku_http_job_flag_load(&connection->job->claimed);
           if (claimed) continue; /* Already executing handlers finish normally. */
         } else if (connection->phase == KU_HTTP_IO_WRITE) continue;
         ku_http_connection_close(connection);
@@ -4188,10 +4189,8 @@ static const char* ku_http_loop_run(KuHttpLoopOwner* owner) {
       if (connection->async_task && connection->async_cancelled && now >= connection->async_cleanup_deadline)
         listen_failure = "asynchronous native work exceeded its cleanup deadline";
       if (connection->job) {
-        ku_http_mutex_lock(&connection->job->lock);
-        int stuck = connection->job->started && !connection->job->completed
+        int stuck = ku_http_job_flag_load(&connection->job->started) && !ku_http_job_flag_load(&connection->job->completed)
           && now > connection->job->handler_deadline && now-connection->job->handler_deadline >= KU_HANDLER_CLEANUP_GRACE_MS;
-        ku_http_mutex_unlock(&connection->job->lock);
         if (stuck) listen_failure = "native handler exceeded its cleanup deadline";
       }
       if (connection->phase == KU_HTTP_IO_HEADER && connection->carry_length)
