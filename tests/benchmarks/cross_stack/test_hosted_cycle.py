@@ -73,6 +73,44 @@ class HostedCycleTests(unittest.TestCase):
                 h.validate_screen_selection(types.SimpleNamespace(**base,http_short_screen=True,http_short_goal='memory',**{flag:True}),'diagnostic')
         with self.assertRaises(ValueError):h.http_short_plan({},'rss')
 
+    def test_pg_memory_screen_is_explicit_frozen_and_preserves_original23_and_thresholds(self):
+        old=h.http_short_plan({'A':{},'B':{}},'memory');pg=h.http_short_plan(old['versions'],'pg-memory')
+        self.assertEqual(pg['windows'],old['windows']);self.assertEqual(pg['resources'],old['resources'])
+        self.assertEqual(pg['maximum_windows'],23);self.assertEqual(pg['maximum_replacements'],0)
+        self.assertEqual(pg['prepatch'],h.HTTP_SHORT_PG_PREPATCH)
+        limits=pg['adoption_thresholds'];self.assertEqual(limits['pg_memory_geometric_ratio_maximum'],.95)
+        self.assertEqual(limits['pg_memory_upper95_strictly_below'],1)
+        self.assertEqual(limits['cpu_upper95_maximum'],1.03);self.assertNotIn('json_memory_geometric_ratio_maximum',limits)
+        args=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PG_PREPATCH,screen_variants=[],
+            http_short_screen=True,http_short_goal='pg-memory')
+        self.assertEqual(h.hosted_identity(types.SimpleNamespace(**args),'diagnostic')['http_short_goal'],'pg-memory')
+        with self.assertRaises(ValueError):h.hosted_identity(types.SimpleNamespace(**dict(args,prepatch=h.HTTP_SHORT_PREPATCH)),'diagnostic')
+        identities={n:{'files':{'generated C':{'sha256':digest}}} for n,digest in h.PG_MEMORY_C.items()}
+        h.verify_pg_memory_builds(identities)
+        for name in ('A','B'):
+            changed=json.loads(json.dumps(identities));changed[name]['files']['generated C']['sha256']='0'*64
+            with self.assertRaisesRegex(ValueError,'exact preregistered'):h.verify_pg_memory_builds(changed)
+
+    def test_pg_memory_goal_cannot_substitute_json_savings_or_skip_public_guards(self):
+        for issue in ('none','no-pg-saving','missing-pg','json-regression','ok-regression','cpu-regression','compute-regression'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({'A':{},'B':{}},'pg-memory')['windows']:
+                    row=dict(config,environment_quality='pass',full_cpu_us=100,memory={'steady_median_bytes':1_000_000})
+                    if row['name']=='B':
+                        ratio=.94 if row['workload']=='db' else 1
+                        if issue=='no-pg-saving':ratio=.8 if row['workload']=='json_object' else 1
+                        if issue==row['workload'].replace('json_object','json')+'-regression':ratio=1.05
+                        row['memory']['steady_median_bytes']*=ratio
+                        if issue=='cpu-regression' and row['workload']=='db':row['full_cpu_us']=104
+                        if issue=='compute-regression' and row['workload']=='cpu':row['full_cpu_us']=104
+                    if issue=='missing-pg' and row['workload']=='db':row['memory']={'virtual_bytes':1}
+                    rows.append(row)
+                result=h.http_short_comparison(rows,True,{'quality':'pass'},'pg-memory')
+                self.assertEqual(result['eligible_for_root_review'],issue=='none')
+                self.assertFalse(result['candidate_accepted']);self.assertNotIn('json_memory',result)
+                self.assertIn('pg_memory',result);self.assertEqual(set(result['other_memory_guards']),{'json_object','ok'})
+
     def test_http_short_memory_goal_reads_only_score_steady_cgroup_median_and_guards_cpu(self):
         cases=('none','memory-small','memory-upper','memory-missing','virtual-only','memory-nan','unknown',
             'json-cpu-lower','ok-cpu-lower','db-cpu-lower','cpu-upper','compute-regression')
@@ -1651,6 +1689,24 @@ class HostedCycleTests(unittest.TestCase):
             self.assertEqual(args[1],b'tests/benchmarks/cross_stack/reuse_build.py')
             self.assertEqual(args.count(b'--fixed-goals-only'),1)
             self.assertEqual(args[args.index(b'--source-run')+1],reuse_build.FIXED_GOALS_RUN.encode())
+            pg=dict(env,KU_PERFORMANCE_V2_FIXED_GOALS_ONLY='false',KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN='true',
+                KU_PERFORMANCE_V2_SCOPE='performance-followup-diagnostic',KU_PERFORMANCE_V2_HTTP_SHORT_GOAL='pg-memory',
+                KU_PERFORMANCE_V2_PREPATCH=h.HTTP_SHORT_PG_PREPATCH)
+            valid=subprocess.run(['bash','-ec',prefix+preflight],env=pg,capture_output=True)
+            self.assertEqual(valid.returncode,0,valid.stderr.decode())
+            invalid=subprocess.run(['bash','-ec',prefix+preflight],env=dict(pg,KU_PERFORMANCE_V2_PREPATCH=h.HTTP_SHORT_PREPATCH),capture_output=True)
+            self.assertNotEqual(invalid.returncode,0)
+            for name in ('Build frozen sources and plans as the benchmark user',
+                    'Run the one serial cgroup cycle and preserve each goal status',
+                    'Always archive the allowlisted evidence and goal_status'):
+                record.write_bytes(b'')
+                result=subprocess.run(['bash','-ec',prefix+chunk(name)],env=pg,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr.decode())
+                args=record.read_bytes().split(b'\0')[:-1]
+                self.assertEqual(args.count(b'--http-short-screen'),1)
+                self.assertEqual(args[args.index(b'--http-short-goal')+1],b'pg-memory')
+                self.assertEqual(args[args.index(b'--prepatch')+1],h.HTTP_SHORT_PG_PREPATCH.encode())
+                self.assertNotIn(b'--fixed-goals-only',args)
 
     def test_fixed_goals_only_stops_after_80_windows_without_full_acceptance_and_always_cleans_db(self):
         issues=(None,'core-not-met','goal-not-met','missing-window','missing-goal','cleanup',
