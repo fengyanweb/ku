@@ -16,7 +16,7 @@
     },
     "src/interfaces/libpq/fe-connect.c": {
       "before_sha256": "44a6e386cbfd67ebe768d6ef5493098119c2e6b4796239d53e5ed7b122b206a5",
-      "after_sha256": "86a0be3342b18171a3916624f64eb2f4d856d3c286e8b9ea4b00e85f92fae1f7"
+      "after_sha256": "85d03ad821589502d8030e988d16acf3d01deee1d1cae0c9de5c0c029d288050"
     },
     "src/interfaces/libpq/meson.build": {
       "before_sha256": "ae85c8b4e24a54e2d38052b11156aa7b32c95a2bbef3cfd9096f81c90abec864",

@@ -86,7 +86,7 @@
 +#endif
 +#include <dlfcn.h>
 +
-+/* Keep declarations and every matching release operation in one library. */
++/* Keep the original global lookup priority for the complete paired API. */
 +typedef struct
 +{
 +	LDAP *(*init) (const char *, int);
@@ -137,7 +137,7 @@
 +	}
 +#define LOAD_LDAP(member, symbol) \
 +	do { \
-+		if ((next.member = dlsym(module, symbol)) == NULL) \
++		if ((next.member = dlsym(RTLD_DEFAULT, symbol)) == NULL) \
 +		{ \
 +			libpq_append_error(errorMessage, "LDAP library lacks required symbol %s", symbol); \
 +			goto fail; \

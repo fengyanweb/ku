@@ -2046,10 +2046,26 @@ jobs:
             libssl-dev libkrb5-dev libcurl4-openssl-dev libicu-dev libreadline-dev zlib1g-dev \
             libnghttp2-dev libidn2-dev librtmp-dev libssh-dev libpsl-dev libbrotli-dev libzstd-dev
       - name: Build paired shared and static libraries and call original FFI APIs
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B .github/scripts/libpq-loader-build.py --output "$RUNNER_TEMP/libpq-loader-evidence"
+          gh api repos/fengyanweb/ku/actions/artifacts/13075318122/zip > "$RUNNER_TEMP/prior-libpq-gate.zip"
+          python3 -B - <<'PYPRIOR'
+          import hashlib, os, stat, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          archive = root / 'prior-libpq-gate.zip'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == '6c8e4ebee68e0480507af63ae1948cfb3dec958c517298b26b28bd6ff5dfadd7'
+          with zipfile.ZipFile(archive) as source:
+              for item in source.infolist():
+                  name = Path(item.filename)
+                  assert not name.is_absolute() and '..' not in name.parts and not stat.S_ISLNK(item.external_attr >> 16)
+              source.extractall(root / 'prior-libpq-gate')
+          PYPRIOR
+          python3 -B .github/scripts/libpq-loader-build.py --output "$RUNNER_TEMP/libpq-loader-evidence" \
+            --reuse-previous-gate "$RUNNER_TEMP/prior-libpq-gate"
       - name: Preserve build identities, libraries, object provenance and real FFI results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
