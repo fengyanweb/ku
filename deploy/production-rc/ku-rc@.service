@@ -1,0 +1,39 @@
+# Rendering source only. Do not install this file with unresolved rendering fields.
+# render-systemd.py emits one fully bound unit per configured slot.
+[Unit]
+Description=Ku RC supervised native application (@SLOT@)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@WORKING_DIRECTORY@
+ExecStart=@EXEC_START@
+# manage.py run execs Ku on POSIX. Only Ku supervises the native application.
+Restart=on-abnormal
+RestartSec=5s
+# TERM goes to the supervisor so it can drain. Final KILL covers the whole unit.
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStopSec=@TIMEOUT_STOP@s
+MemoryAccounting=yes
+MemoryMax=@MEMORY_MAX@
+CPUAccounting=yes
+CPUQuota=@CPU_QUOTA@%
+TasksAccounting=yes
+TasksMax=@TASKS_MAX@
+LimitNOFILE=@NOFILE@
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@IDENTIFIER@
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
