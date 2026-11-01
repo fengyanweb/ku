@@ -120,13 +120,15 @@ def check_maps(raw,arm,selected):
 
 def capture_maps(plan,manifest,service,output):
     arm=manifest.get('libpq_loader_arm');item=plan['libpq_loader'][arm]
+    actual=digest(item['path'])
+    if actual!=item['sha256']:raise ValueError('runtime libpq changed before warmup')
     with Path('/proc',str(service.process.pid),'maps').open('rb') as stream:raw=stream.read((1<<20)+1)
     receipt=check_maps(raw,arm,item['path'])
     if service.startup['environment'].get('LD_LIBRARY_PATH')!=str(Path(item['path']).resolve().parent):
         raise ValueError('actual service library environment differs')
     output=Path(output);rawpath=output.with_suffix('.maps');rawpath.write_bytes(raw)
     receipt.update(pid=service.process.pid,arm=arm,raw_path=str(rawpath),raw_sha256=digest(rawpath),
-        selected_libpq_sha256=digest(item['path']),timing='after startup, before warmup, before score CPU origin')
+        selected_libpq_sha256=actual,timing='after startup, before warmup, before score CPU origin')
     output.write_text(json.dumps(receipt,sort_keys=True,indent=2)+'\n')
 
 
