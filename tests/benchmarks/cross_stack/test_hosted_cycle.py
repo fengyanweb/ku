@@ -114,6 +114,55 @@ class HostedCycleTests(unittest.TestCase):
                     http_short_goal='cpu' if issue=='goal' else 'memory'),{'uid':1,'gid':1,'steps':{}})
                 binding.assert_not_called();database.assert_not_called()
 
+    def test_pg_cpu_goal_reuses_original_windows_and_freezes_distinct_guards(self):
+        cpu=h.http_short_plan({'A':{},'B':{}},'cpu')
+        pg=h.http_short_plan({'A':{},'B':{}},'pg-cpu')
+        self.assertEqual(cpu['windows'],pg['windows']);self.assertEqual(cpu['resources'],pg['resources'])
+        self.assertEqual(pg['maximum_windows'],23);self.assertEqual(pg['maximum_replacements'],0)
+        expected=dict(pg_cpu_geometric_ratio_maximum=.98,pg_cpu_upper95_strictly_below=1,
+            other_cpu_lower95_maximum=1,other_cpu_upper95_maximum=1.03,compute_ratio_maximum=1.03,
+            json_memory_geometric_ratio_maximum=1.03,json_memory_upper95_maximum=1.10)
+        for key,value in expected.items():self.assertEqual(pg['adoption_thresholds'][key],value)
+        base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
+        plain=h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')
+        self.assertEqual(plain,h.hosted_identity(types.SimpleNamespace(**base,http_short_goal='pg-cpu'),'diagnostic'))
+        selected=h.hosted_identity(types.SimpleNamespace(**base,http_short_screen=True,http_short_goal='pg-cpu'),'diagnostic')
+        self.assertEqual(selected['http_short_goal'],'pg-cpu')
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);pg['adoption_thresholds']['pg_cpu_geometric_ratio_maximum']=.99
+            h.save(root/'frozen-plan.json',pg)
+            patches.enter_context(patch.object(h.os,'geteuid',return_value=0))
+            binding=patches.enter_context(patch.object(fc,'version_identity'))
+            database=patches.enter_context(patch.object(h.db,'Database'))
+            with self.assertRaises(ValueError):h.diagnostic(types.SimpleNamespace(root=root,http_short_screen=True,
+                http_short_goal='pg-cpu'),{'uid':1,'gid':1,'steps':{}})
+            binding.assert_not_called();database.assert_not_called()
+
+    def test_pg_cpu_goal_requires_strict_pg_gain_and_preserves_json_ok_compute_memory_guards(self):
+        for issue in ('pass','pg-small','pg-upper','json-lower','ok-lower','json-upper','ok-upper',
+                      'compute','memory-point','memory-upper','memory-missing','memory-nan','unknown','incomplete'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({'A':{},'B':{}},'pg-cpu')['windows']:
+                    row=dict(config,environment_quality='unknown' if issue=='unknown' else 'pass')
+                    workload=row['workload'];group=row['group']-1
+                    ratio=.97 if workload=='db' else 1
+                    if issue=='pg-small' and workload=='db':ratio=.99
+                    if issue=='pg-upper' and workload=='db':ratio=[.94,.98,1.001][group]
+                    if issue=={'json_object':'json-lower','ok':'ok-lower'}.get(workload):ratio=1.001
+                    if issue=={'json_object':'json-upper','ok':'ok-upper'}.get(workload):ratio=[.98,1,1.04][group]
+                    if issue=='compute' and workload=='cpu':ratio=1.031
+                    row['full_cpu_us']=100*(ratio if row['name']=='B' else 1)
+                    memratio=1.031 if issue=='memory-point' else [.90,1.0,1.101][group] if issue=='memory-upper' else 1
+                    row['memory']={'steady_median_bytes':1_000_000*(memratio if row['name']=='B' else 1)}
+                    if issue=='memory-missing':row['memory']={'rss_bytes':1,'endpoint_memory_current':1}
+                    if issue=='memory-nan':row['memory']['steady_median_bytes']=float('nan')
+                    rows.append(row)
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},'pg-cpu')
+                self.assertEqual(result['eligible_for_root_review'],issue=='pass')
+                self.assertFalse(result['candidate_accepted']);self.assertFalse(result['formal_qualified'])
+                if issue=='pass':self.assertAlmostEqual(result['comparisons']['db']['estimate'],.97)
+
     def test_http_short_selection_freezes_prepatch_is_exclusive_and_is_not_default(self):
         base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
         self.assertFalse(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic').get('http_short_screen',False))

@@ -309,7 +309,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('http_wake_screen:',text)
         self.assertNotIn('--http-wake-screen',text)
         self.assertIn('http_short_goal:\n',text)
-        self.assertIn('default: cpu\n        options: [cpu, memory]',text)
+        self.assertIn('default: cpu\n        options: [cpu, memory, pg-cpu]',text)
         self.assertIn("KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}",job)
         archive=job.split('- name: Always archive',1)[1].split('- name: Retain one',1)[0]
         self.assertIn('--http-short-screen --http-short-goal "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" --build-set diagnostic --prepatch "$KU_PERFORMANCE_V2_PREPATCH"',archive)

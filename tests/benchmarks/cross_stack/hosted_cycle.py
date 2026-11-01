@@ -41,8 +41,8 @@ def validate_screen_selection(a,build_set):
              'pg_queue_screen','pg_driver_screen','http_short_screen','memory_owner_probe'))):
         raise ValueError('--pg-cost-probe requires diagnostic build-set and no other opt-in mode')
     if getattr(a,'http_short_screen',False):
-        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
-            raise ValueError('--http-short-goal must be cpu or memory')
+        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','pg-cpu'):
+            raise ValueError('--http-short-goal must be cpu, memory or pg-cpu')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
             raise ValueError('--http-short-screen requires diagnostic build-set and no other opt-in screen')
@@ -265,7 +265,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
-    if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
+    if goal not in ('cpu','memory','pg-cpu'):raise ValueError('HTTP short goal must be cpu, memory or pg-cpu')
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
         rate=500,warmup_seconds=5,score_seconds=10) for g in (1,2,3)]
     windows=[dict(name=n,phase='normal',workload=w,contract=c,group=g,rate=r,warmup_seconds=3,score_seconds=15)
@@ -278,6 +278,11 @@ def http_short_plan(versions,goal='cpu'):
         if goal=='cpu' else dict(json_memory_geometric_ratio_maximum=.95,json_memory_upper95_strictly_below=1,
             cpu_lower95_maximum=1,cpu_upper95_maximum=1.03,compute_ratio_maximum=1.03,
             memory_metric='memory.steady_median_bytes',memory_scope='Whole service cgroup memory.current; score middle60% median'))
+    if goal=='pg-cpu':
+        thresholds=dict(pg_cpu_geometric_ratio_maximum=.98,pg_cpu_upper95_strictly_below=1,
+            other_cpu_lower95_maximum=1,other_cpu_upper95_maximum=1.03,compute_ratio_maximum=1.03,
+            json_memory_geometric_ratio_maximum=1.03,json_memory_upper95_maximum=1.10,
+            memory_metric='memory.steady_median_bytes',memory_scope='Whole service cgroup memory.current; score middle60% median')
     thresholds['final_decision']='root reviews raw host/CPU/memory/correctness/arrival evidence; never automatic adoption'
     return dict(schema='ku-hosted-http-short-screen-v1',versions=versions,prepatch=HTTP_SHORT_PREPATCH,http_short_goal=goal,
         resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),windows=controls+windows,
@@ -291,7 +296,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
-    if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
+    if goal not in ('cpu','memory','pg-cpu'):raise ValueError('HTTP short goal must be cpu, memory or pg-cpu')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
         formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment,http_short_goal=goal)
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification unresolved or failed')
@@ -316,7 +321,7 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
             interval=result['comparisons'][workload]
             if interval.get('status')!='estimated' or interval['lower95']>1:
                 result['reasons'].append(workload+' CPU regression or unavailable interval')
-    else:
+    elif goal=='memory':
         selected=[r for r in rows if r['workload']=='json_object']
         pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
         result['json_memory']=j=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
@@ -327,6 +332,21 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
         for workload,interval in result['comparisons'].items():
             if interval.get('status')!='estimated' or interval['lower95']>1 or interval['upper95']>1.03:
                 result['reasons'].append(workload+' CPU guard requires lower95<=1 and upper95<=1.03')
+    else:
+        pg=result['comparisons']['db']
+        if pg.get('status')!='estimated' or pg['estimate']>.98 or pg['upper95']>=1:
+            result['reasons'].append('strict PG CPU criterion not demonstrated: geometric B/A<=.98 and upper95<1 required')
+        for workload in ('json_object','ok'):
+            interval=result['comparisons'][workload]
+            if interval.get('status')!='estimated' or interval['lower95']>1 or interval['upper95']>1.03:
+                result['reasons'].append(workload+' CPU guard requires lower95<=1 and upper95<=1.03')
+        selected=[r for r in rows if r['workload']=='json_object']
+        pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
+        result['json_memory']=memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+            [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+        result['memory_scope']='Whole service cgroup memory.current sampled during score; middle60% median; not endpoints, RSS, virtual or requested bytes'
+        if memory.get('status')!='estimated' or memory['estimate']>1.03 or memory['upper95']>1.10:
+            result['reasons'].append('JSON service memory guard requires geometric B/A<=1.03 and upper95<=1.10')
     if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
     result['eligible_for_root_review']=not result['reasons']
     result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
@@ -2498,7 +2518,7 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','pg-cpu'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen 3e5f18e prepatch, no capacity or adoption claim')
     p.add_argument('--pg-cost-probe',action='store_true',help='Fixed archive normal/probe/normal PG200 diagnostic, no fresh cargo build or performance acceptance')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
