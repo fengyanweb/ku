@@ -9460,6 +9460,8 @@ int main(int argc,char** argv) {
 #endif
   puts("http-utf8-differential-and-guard-page-ok");return 0;
 }
+
+
 "#,
     );
     let path = directory.path().join("unicode.c");
@@ -9484,6 +9486,255 @@ int main(int argc,char** argv) {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).replace('\r', ""),
         "http-utf8-differential-and-guard-page-ok\n"
+    );
+}
+
+#[test]
+fn native_http_bounded_json_owner_preserves_input_edges_and_legacy_results() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let directory = native_c_harness::TempDir::new("http-bounded-json-owner");
+    let mut generated = native_c_harness::emit_c(
+        directory.path(),
+        r#"
+import {http,json} from "std"
+fn Echo(req:HttpRequest):HttpResponse! {
+    decoded=json.decode(req.body)?
+    return ok(http.text(json.encode({payload:decoded,tag:req.query.tag})?))
+}
+fn Escaped(req:HttpRequest):HttpResponse! {
+ value=json.decode(req.body)? text=value.as_str()?
+ first=json.encode(text)? return ok(http.text(json.encode(first)?))
+}
+async fn TaskMarker():HttpResponse! { return ok(http.text("task")) }
+fn main():null! {
+    app=http.server()
+    app.post("/json",Echo)
+    app.get("/task",TaskMarker)
+    app.post("/escaped",Escaped)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#,
+    );
+    generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_original_main(void) {",
+        1,
+    );
+    generated.push_str(r#"
+#define CHECK(x) do { if(!(x)) {fprintf(stderr,"bounded JSON line %d: %s\n",__LINE__,#x);return 91;} } while(0)
+#define STR(x) ku_string_static((const uint8_t*)(x),strlen(x))
+static int fresh(KuHttpConnection* connection,KuHttpServer* server,KuHttpBufferBudget* budget,const char* body,const char* target) {
+  memset(connection,0,sizeof(*connection));connection->socket_value=KU_HTTP_INVALID_SOCKET;
+  connection->budget=budget;connection->input.budget=budget;
+  connection->request_deadline=ku_http_deadline_ms(3000u);
+  char header[4096];int length=snprintf(header,sizeof(header),"POST %s HTTP/1.1\r\nHost: local\r\nContent-Length: %zu\r\n\r\n",target,strlen(body));
+  CHECK(length>0 && (size_t)length<sizeof(header));
+  CHECK(!ku_http_parse_complete_header(server,header,(size_t)length,&connection->input));
+  if(*body)memcpy(connection->input.body,body,strlen(body));return 0;
+}
+int main(void) {
+  CHECK(!ku_http_net_init());KuHttpServer* server=ku_http_server_new();
+  ku_http_server_add_route(server,STR("POST"),STR("/json"),(void*)Echo__thunk,NULL,1,1);
+  ku_http_server_add_route(server,STR("POST"),STR("/escaped"),(void*)Escaped__thunk,NULL,1,1);
+  KuHttpBufferBudget budget={0};budget.limit=1048576u;CHECK(ku_http_mutex_init(&budget.lock));server->buffer_budget=&budget;
+  KuHttpWake wake={0};CHECK(ku_http_wake_init(&wake));KuHttpQueue queue={0};CHECK(ku_http_queue_init(&queue,8,&wake));
+  KuHttpLoopGroup group={0};group.server=server;CHECK(ku_http_mutex_init(&group.lock));
+  KuHttpLoopOwner owner={0};owner.group=&group;owner.wake=&wake;ku_http_current_loop=&owner;
+  KuHttpConnection connection={0};
+  CHECK(!fresh(&connection,server,&budget,"{\"x\":[1,true,null,\"中文🙂\"]}","/json?tag=z"));
+  queue.owner_inline_remaining=32u;
+  __ku_call_depth=7;__ku_handler_deadline=11;__ku_handler_cleanup_deadline=13;
+  __ku_handler_timed_out=1;__ku_handler_unwind_depth=3;
+  KuSyncExitSignal previous={0};previous.kind=KU_SYNC_EXIT_ARITHMETIC_FATAL;previous.arithmetic_status=2;__ku_sync_return_signal=previous;
+  ku_http_connection_submit(&connection,server,&queue,1);
+  /* This behavioral assertion is also compiled with the old public CLI for
+     RED: its ordinary sync JSON is queued rather than completed on the owner. */
+  CHECK(connection.job && connection.job->completed && !queue.count && !queue.owner_inline_remaining);
+  CHECK(ku_http_job_only_owner(connection.job) && !connection.job->input.body && !connection.job->projection_charge);
+  CHECK(__ku_call_depth==7 && __ku_handler_deadline==11 && __ku_handler_cleanup_deadline==13);
+  CHECK(__ku_handler_timed_out==1 && __ku_handler_unwind_depth==3 && __ku_sync_return_signal.kind==previous.kind);
+  ku_http_connection_observe_job(&connection,server);
+  const char* expected="{\"payload\":{\"x\":[1,true,null,\"中文🙂\"]},\"tag\":\"z\"}";
+  CHECK(connection.phase==KU_HTTP_IO_WRITE && connection.output.response.status==200);
+  CHECK(connection.output.response.body.len==strlen(expected) && !memcmp(connection.output.response.body.ptr,expected,strlen(expected)));
+  ku_http_connection_close(&connection);CHECK(!queue.resident && !budget.current);
+  __ku_call_depth=0;__ku_handler_deadline=0;__ku_handler_cleanup_deadline=0;__ku_handler_timed_out=0;__ku_handler_unwind_depth=0;__ku_sync_reset();
+#if defined(KU_HTTP_BOUNDED_JSON_OWNER)
+  KuHttpJsonWork zero={0};
+  CHECK(!fresh(&connection,server,&budget,"1.5","/json?tag=z"));
+  queue.owner_inline_remaining=32u;ku_http_connection_submit(&connection,server,&queue,1);
+  CHECK(queue.count==1 && queue.owner_inline_remaining==28u && !connection.job->completed);
+  KuHttpConnection second={0};CHECK(!fresh(&second,server,&budget,"1","/json?tag=z"));
+  ku_http_connection_submit(&second,server,&queue,1);CHECK(queue.count==2 && queue.owner_inline_remaining==28u && !second.job->completed);
+  ku_http_connection_close(&connection);ku_http_connection_close(&second);CHECK(!queue.resident && !budget.current);
+  const char* bodies[]={"1","-9223372036854775808","{\"a\":1,\"a\":2}","{\"broken\":}","{\"a\":1.5}","1e3"};
+  for(size_t i=0;i<sizeof(bodies)/sizeof(bodies[0]);i++) {
+    CHECK(!fresh(&connection,server,&budget,bodies[i],"/json?tag=z"));queue.owner_inline_remaining=32u;
+    ku_http_connection_submit(&connection,server,&queue,1);
+    if(queue.count) {
+      KuHttpJob* job=ku_http_queue_pop(&queue);CHECK(job==connection.job);
+      ku_http_current_loop=NULL;ku_http_job_run(server,job);ku_http_current_loop=&owner;
+      ku_http_mutex_lock(&queue.lock);queue.running--;ku_http_mutex_unlock(&queue.lock);ku_http_job_release(job);
+    }
+    ku_http_connection_observe_job(&connection,server);
+    CHECK(connection.output.response.status==(i==3?500:200));
+    ku_http_connection_close(&connection);CHECK(!queue.resident && !budget.current);
+  }
+  for(int expired=0;expired<2;expired++) {
+    CHECK(!fresh(&connection,server,&budget,"{}","/json?tag=z"));
+    if(expired)connection.request_deadline=1u;
+    else budget.limit=budget.current+sizeof(KuStruct___ku_http_request)-1u;
+    queue.owner_inline_remaining=32u;ku_http_connection_submit(&connection,server,&queue,1);
+    CHECK(connection.job && connection.job->completed && !connection.job->started);
+    if(expired)CHECK(connection.job->cancelled);else CHECK(connection.job->response.status==503);
+    ku_http_connection_close(&connection);CHECK(!queue.resident && !budget.current);budget.limit=1048576u;
+  }
+  for(int active=0;active<2;active++) {
+    CHECK(!fresh(&connection,server,&budget,"{}","/json?tag=z"));queue.owner_inline_remaining=32u;
+    if(active)ku_task_driver_entry_owner=1u;
+    else ku_task_driver_execution=(KuTaskDriverExecutionV1*)(uintptr_t)1;
+    ku_http_connection_submit(&connection,server,&queue,1);
+    ku_task_driver_entry_owner=0u;ku_task_driver_execution=NULL;
+    CHECK(queue.count==1 && queue.owner_inline_remaining==28u && !connection.job->completed);
+    ku_http_connection_close(&connection);CHECK(!queue.resident && !budget.current);
+  }
+  char text[4096];
+  for(size_t length=64;length<=65;length++) {
+    memset(text,'a',sizeof(text));text[0]='{';text[1]='"';text[length+2]='"';memcpy(text+length+3,":1}",4);
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(length==64));ku_http_connection_close(&connection);
+  }
+  for(size_t levels=16;levels<=17;levels++) {
+    memset(text,'[',levels);text[levels]='0';memset(text+levels+1,']',levels);text[levels*2+1]=0;
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(levels==16));ku_http_connection_close(&connection);
+  }
+  for(size_t count=8;count<=9;count++) {
+    size_t used=0;text[used++]='{';for(size_t i=0;i<count;i++)used+=(size_t)snprintf(text+used,sizeof(text)-used,"%s\"k%zu\":0",i?",":"",i);text[used++]='}';text[used]=0;
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(count==8));ku_http_connection_close(&connection);
+  }
+  for(size_t count=64;count<=65;count++) {
+    size_t used=0;text[used++]='[';for(size_t i=0;i<count;i++){if(i)text[used++]=',';text[used++]='0';}text[used++]=']';text[used]=0;
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(count==64));ku_http_connection_close(&connection);
+  }
+  for(size_t count=123;count<=124;count++) {
+    size_t used=0;text[used++]='[';for(size_t group=0;group<4;group++){if(group)text[used++]=',';text[used++]='[';size_t n=count/4+(group<count%4);for(size_t i=0;i<n;i++){if(i)text[used++]=',';text[used++]='0';}text[used++]=']';}text[used++]=']';text[used]=0;
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(count==123));ku_http_connection_close(&connection);
+  }
+  size_t limit=2048u-strlen("/json?tag=z");
+  for(size_t length=limit;length<=limit+1;length++) {
+    text[0]='"';memset(text+1,'a',length-2);text[length-1]='"';text[length]=0;
+    CHECK(!fresh(&connection,server,&budget,text,"/json?tag=z"));CHECK(ku_http_json_input_bounded(&connection.input,&zero)==(length==limit));ku_http_connection_close(&connection);
+  }
+  CHECK(!fresh(&connection,server,&budget,"\"\\b\\f\"","/escaped"));queue.owner_inline_remaining=32u;
+  ku_http_connection_submit(&connection,server,&queue,1);
+  CHECK(connection.job && connection.job->completed && !queue.count);
+  ku_http_connection_observe_job(&connection,server);
+  const char* escaped="\"\\\"\\\\u0008\\\\u000c\\\"\"";
+  CHECK(connection.output.response.status==200 && connection.output.response.body.len==strlen(escaped));
+  CHECK(!memcmp(connection.output.response.body.ptr,escaped,strlen(escaped)));
+  ku_http_connection_close(&connection);CHECK(!budget.current);
+  CHECK(!fresh(&connection,server,&budget,"{}","/json?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9"));
+  CHECK(!ku_http_json_input_bounded(&connection.input,&zero));ku_http_connection_close(&connection);CHECK(!budget.current);
+  KuHttpJsonWork overflow={0};overflow.bytes[0]=SIZE_MAX;
+  CHECK(!fresh(&connection,server,&budget,"{}","/json?tag=z"));CHECK(!ku_http_json_input_bounded(&connection.input,&overflow));ku_http_connection_close(&connection);
+#endif
+  CHECK(!queue.count && !queue.running && !queue.resident && !budget.current);
+  ku_http_current_loop=NULL;ku_http_queue_free(&queue);ku_http_wake_close(&wake);
+  ku_http_mutex_destroy(&group.lock);ku_http_mutex_destroy(&budget.lock);server->buffer_budget=NULL;ku_http_server_free(server);ku_http_net_cleanup();
+  puts("http-bounded-json-owner-input-result-budget-TLS-retirement-ok");return 0;
+}
+"#);
+    let path = directory.path().join("json-owner.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = native_c_harness::compile_harness(directory.path(), &path, "json-owner")
+    else {
+        return;
+    };
+    let output = run_bounded(
+        &mut Command::new(executable),
+        RUN_TIMEOUT,
+        RUN_OUTPUT_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn native_http_bounded_json_works_between_real_task_owner_polls() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let address = unused_local_address();
+    let management = unused_local_address();
+    let source = r#"
+import {http,json} from "std"
+fn Echo(req:HttpRequest):HttpResponse! { x=json.decode(req.body)? return ok(http.text(json.encode(x)?)) }
+async fn Marker():HttpResponse! { return ok(http.text("task")) }
+fn main():null! {
+ app=http.server({max_connections:16,max_active_requests:8,max_pending_requests:8})
+ app.post("/json",Echo) app.get("/task",Marker) app.listen("__ADDRESS__")?
+ return ok(null)
+}
+"#;
+    let Some(mut server) = spawn_native_server_settings(
+        "bounded-json-real-task",
+        source,
+        &address,
+        false,
+        None,
+        &[
+            ("KU_EVENT_LOOPS", "1"),
+            ("KU_BLOCKING_THREADS", "2"),
+            ("KU_THREAD_BUDGET", "16"),
+            ("KU_SERVICE_CONTROL_TOKEN", "json-owner-guard"),
+            ("KU_SERVICE_PROBE_ADDR", &management),
+        ],
+    ) else {
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    for _ in 0..3 {
+        let task = http_response(
+            &address,
+            "GET /task HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+            Duration::from_secs(3),
+        );
+        assert_status(&task, "HTTP/1.1 200 OK");
+        let json=http_response(&address,"POST /json HTTP/1.1\r\nHost: local\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"x\":1}",Duration::from_secs(3));
+        assert_status(&json, "HTTP/1.1 200 OK");
+        assert!(json.ends_with("{\"x\":1}"));
+    }
+    let metrics=http_response(&management,"GET /__ku/metrics HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: json-owner-guard\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    let loops = metrics
+        .split_once("\"loops\":[")
+        .unwrap()
+        .1
+        .split_once(']')
+        .unwrap()
+        .0;
+    let handler_workers = loops
+        .split_once("\"handler_workers\":")
+        .unwrap()
+        .1
+        .split_once(',')
+        .unwrap()
+        .0;
+    let drain=http_response(&management,"POST /__ku/drain HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: json-owner-guard\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
+    assert_status(&drain, "HTTP/1.1 200 OK");
+    assert!(watchdog
+        .wait_for_natural_exit(Duration::from_secs(5))
+        .success());
+    assert!(!watchdog.timed_out());
+    assert_eq!(
+        handler_workers, "0",
+        "ordinary HTTP owner must be outside its previous Task execution context: {loops}"
     );
 }
 
