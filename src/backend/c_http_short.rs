@@ -595,10 +595,19 @@ impl JsonProof {
                         locals.insert(name.clone(), value);
                     }
                     IrInst::BindOk { id, ty, result } => {
+                        // Result_take only transfers and clears an addressable
+                        // source. Its producer already paid for payload/error
+                        // retirement, including any later overwrite or unwind.
+                        // Keep the fixed take/zero/old-destination operations;
+                        // charging the whole tree again would count one owned
+                        // resource once per move rather than once per lifetime.
+                        if !matches!(result.kind, IrExprKind::Local(_) | IrExprKind::Temp(_)) {
+                            return None;
+                        }
                         let value = self
                             .expression(result, &parameter.name, &locals, &temps)?
                             .retag(ty)?;
-                        self.retire(&value)?;
+                        self.work(JsonCost::default(), JsonCost::constant(8))?;
                         let value = if let Some(old) = temps.get(id) {
                             value.merge(old)?
                         } else {
@@ -1458,18 +1467,22 @@ mod tests {
         .expect("bounded JSON value flow has an input certificate");
         // A concrete small tree fits; wider trees may conservatively retain
         // workers without changing any of their public JSON capabilities.
-        let metrics = [1, 120, 24, 24, 24, 16, 4, 5, 8, 1, 0];
-        let evaluate = |cost: &JsonCost| {
-            cost.0
-                .iter()
-                .zip(metrics)
-                .map(|(a, b)| a * b)
-                .sum::<usize>()
-        };
-        assert!(evaluate(&proof.byte_work) <= JSON_MAX_BYTE_WORK);
-        assert!(evaluate(&proof.visits) <= JSON_MAX_VISITS);
-        assert!(evaluate(&proof.max_bytes) <= JSON_MAX_VALUE_BYTES);
-        assert!(evaluate(&proof.max_nodes) <= JSON_MAX_VALUE_NODES);
+        for metrics in [
+            [1, 120, 24, 24, 24, 16, 4, 5, 8, 1, 0],
+            [1, 1048, 80, 64, 72, 56, 10, 5, 8, 1, 0],
+        ] {
+            let evaluate = |cost: &JsonCost| {
+                cost.0
+                    .iter()
+                    .zip(metrics)
+                    .map(|(a, b)| a * b)
+                    .sum::<usize>()
+            };
+            assert!(evaluate(&proof.byte_work) <= JSON_MAX_BYTE_WORK);
+            assert!(evaluate(&proof.visits) <= JSON_MAX_VISITS);
+            assert!(evaluate(&proof.max_bytes) <= JSON_MAX_VALUE_BYTES);
+            assert!(evaluate(&proof.max_nodes) <= JSON_MAX_VALUE_NODES);
+        }
         assert!(
             proof.max_bytes.0[10] > 0,
             "decoded escapes remain in the output certificate"
