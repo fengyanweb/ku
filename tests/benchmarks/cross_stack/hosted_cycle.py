@@ -3,7 +3,7 @@
 No product patch, remote dispatch, SDK matrix, installation or release operation.
 """
 from __future__ import annotations
-import argparse, copy, gzip, hashlib, io, json, os
+import argparse, copy, gzip, hashlib, io, json, math, os
 from pathlib import Path
 import platform, pwd, re, select, shutil, signal, struct, subprocess, sys, tarfile, threading, time
 import build_linux as bl
@@ -17,6 +17,7 @@ FOLLOWUP_PREPATCH = BASELINE
 PG_QUEUE_PREPATCH = 'f39c673df0cd08232f184141a7e2aedef4f585c9'
 HTTP_SHORT_PREPATCH = 'b765f9bc5d3a6e71353a562e27cef7b4cbb35f69'
 FRAME_ZERO_PREPATCH = 'ca6cdeec4a3c315afc965c941680f2111ae3e507'
+FRAME_ZERO_CONTROL_MAX_MIN = 1.10
 NORMAL_PG_PRODUCT = 'f43e74fdfe384c385a6703f3ee3eab933880b9e2'
 NORMAL_PG_PERF_FLAGS = ['--call-graph','dwarf,4096']
 NORMAL_PG_GPR_FLAGS = ['--call-graph','dwarf,4096',
@@ -291,6 +292,24 @@ def http_short_prepatch(goal):
     return FRAME_ZERO_PREPATCH if goal=='pg-zero-cpu' else HTTP_SHORT_PREPATCH
 
 
+def frame_zero_pg_A_controls(rows):
+    controls=[r for r in rows if r.get('phase')=='normal' and r.get('workload')=='db' and r.get('name')=='A']
+    groups=[r.get('group') for r in controls]
+    result=dict(groups=groups,maximum_max_min=FRAME_ZERO_CONTROL_MAX_MIN,metrics={},passed=False,
+        scope='Existing three PG A windows only, no additional load. Scored-client and full-lifecycle CPU/correct '
+            'must each have max/min<=1.10; initial JSON environment controls remain separate.')
+    for metric in ('cpu_us','full_cpu_us'):
+        values=[r.get(metric) for r in controls]
+        finite=[v if type(v) in (int,float) and math.isfinite(v) else None for v in values]
+        valid=groups==[1,2,3] and all(v is not None and v>0 for v in finite)
+        ratio=max(finite)/min(finite) if valid else None
+        if ratio is not None and not math.isfinite(ratio):ratio=None
+        result['metrics'][metric]=dict(values=finite,max_min=ratio,
+            passed=ratio is not None and ratio<=FRAME_ZERO_CONTROL_MAX_MIN)
+    result['passed']=all(r['passed'] for r in result['metrics'].values())
+    return result
+
+
 def frame_zero_generated_contract(bindings):
     """Observe the real complete generated programs, never rewrite either."""
     old='''static int ku_task_frame_zero_bytes(const void* storage, size_t bytes) {
@@ -337,11 +356,13 @@ def http_short_plan(versions,goal='cpu'):
             resources=copy.deepcopy(RESOURCES),quality_policy=copy.deepcopy(POLICY),windows=controls+windows,
             maximum_windows=11,maximum_replacements=0,observation_alarm_seconds=450,workflow_limit_seconds=480,
             adoption_thresholds=dict(pg_cpu_regression='lower95>1 blocks; crossing1 remains inconclusive',
+                pg_A_cpu_max_min=FRAME_ZERO_CONTROL_MAX_MIN,pg_A_cpu_metrics=['cpu_us','full_cpu_us'],
                 compute_ratio_maximum=1.03,minimum_service_gain=None,
                 final_decision='root reviews exact generated C diff, local helper evidence and raw service evidence; never automatic adoption'),
             diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,
             purpose='Three original A environment controls then six normal PG200 A/B windows (AB/BA/AB), '
                 'warm10s/score15s, and one coarse compute100 pair. Current ca6 A versus checked-zero helper only. '
+                'All three existing PG A CPU/correct values must have max/min<=1.10 in both client and full-lifecycle metrics; '
                 'All original SQL/reset/driver/limits/cleanup/deadlines remain; no perf, Rust, matrix, retries or formal target. '
                 'No minimum service gain is imposed or inferred from the helper; crossing1 is inconclusive and never triggers more windows.')
     windows=[dict(name=n,phase='normal',workload=w,contract=c,group=g,rate=r,warmup_seconds=3,score_seconds=15)
@@ -386,6 +407,9 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
         confidence_interval=None,scope='Correctness and coarse guard only; one pair cannot establish a precise confidence interval')
     if goal=='pg-zero-cpu':
         pg=result['comparisons']['db']
+        result['pg_A_controls']=frame_zero_pg_A_controls(rows)
+        if not result['pg_A_controls']['passed']:
+            result['reasons'].append('PG A CPU max/min>1.10 or missing; drift invalid, no retry')
         if pg.get('status')!='estimated' or pg['lower95']>1:
             result['reasons'].append('PG CPU regression or unavailable interval')
     elif goal=='cpu':
@@ -1729,6 +1753,11 @@ def pg_queue_screen(a,state):
             result['rows'].append(row);save(directory/'results.json',dict(rows=result['rows'],stopped=result['stopped']))
             if not observed:
                 result['stopped'].append(dict(name=name,phase=phase,group=config['group'],reason='normal quality or observation/physical cleanup failed; no retries'));break
+            if short and plan['http_short_goal']=='pg-zero-cpu' and phase=='normal' and name=='A' and config['group']==3:
+                result['pg_A_controls']=frame_zero_pg_A_controls(result['rows'])
+                if not result['pg_A_controls']['passed']:
+                    result['stopped'].append(dict(name=name,phase=phase,group=3,
+                        reason='PG A CPU max/min>1.10 or missing; drift invalid, no retries'));break
             if short and phase=='environment-control' and config['group']==3:
                 environment=environment_record(dict(rows=result['rows']),directory/'environment-qualification.json')
                 environment.update(control_version='A',scope='Three independent frozen prepatch A controls; original registered qualification checks.')

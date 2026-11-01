@@ -58,6 +58,8 @@ class HostedCycleTests(unittest.TestCase):
             [('cpu','A',100),('cpu','B',100)])
         self.assertEqual((plan['resources'],plan['quality_policy']),(h.RESOURCES,h.POLICY))
         self.assertIsNone(plan['adoption_thresholds']['minimum_service_gain'])
+        self.assertEqual(plan['adoption_thresholds']['pg_A_cpu_max_min'],1.10)
+        self.assertEqual(plan['adoption_thresholds']['pg_A_cpu_metrics'],['cpu_us','full_cpu_us'])
         self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
 
     def test_pg_zero_goal_binds_prepatch_and_never_changes_nonselected_default(self):
@@ -77,7 +79,7 @@ class HostedCycleTests(unittest.TestCase):
             with self.subTest(issue=issue):
                 rows=[]
                 for config in h.http_short_plan({'A':{},'B':{}},'pg-zero-cpu')['windows']:
-                    r=dict(config,environment_quality='pass',full_cpu_us=100)
+                    r=dict(config,environment_quality='pass',full_cpu_us=100,cpu_us=100)
                     if r['name']=='B':
                         r['full_cpu_us']*=([.98,1,1.01][r['group']-1] if issue=='crossing' else
                             1.001 if issue=='regression' else 1.04 if issue=='compute' and r['workload']=='cpu' else .995)
@@ -86,6 +88,46 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertFalse(result['candidate_accepted']);self.assertFalse(result['formal_qualified'])
                 self.assertEqual(result['eligible_for_root_review'],issue in ('small-gain','crossing'))
                 if issue!='incomplete':self.assertEqual(result['service_speedup_demonstrated'],issue=='small-gain')
+
+    def test_pg_zero_A_controls_require_all_three_finite_positive_metrics_without_more_load(self):
+        for issue in ('none','boundary','client-drift','full-drift','missing','zero','nan','infinite','bool','group','duplicate'):
+            with self.subTest(issue=issue):
+                rows=[dict(config,cpu_us=100,full_cpu_us=100)
+                    for config in h.http_short_plan({'A':{},'B':{}},'pg-zero-cpu')['windows']]
+                pg=[r for r in rows if r['workload']=='db' and r['name']=='A']
+                if issue=='boundary':pg[-1].update(cpu_us=110,full_cpu_us=110)
+                elif issue=='client-drift':pg[-1]['cpu_us']=110.001
+                elif issue=='full-drift':pg[-1]['full_cpu_us']=110.001
+                elif issue=='missing':pg[-1].pop('cpu_us')
+                elif issue=='zero':pg[-1]['cpu_us']=0
+                elif issue=='nan':pg[-1]['cpu_us']=float('nan')
+                elif issue=='infinite':pg[-1]['full_cpu_us']=float('inf')
+                elif issue=='bool':pg[-1]['full_cpu_us']=True
+                elif issue=='group':pg[-1]['group']=2
+                elif issue=='duplicate':rows.append(dict(pg[-1]))
+                result=h.frame_zero_pg_A_controls(rows)
+                self.assertEqual(result['passed'],issue in ('none','boundary'))
+                self.assertEqual(result['maximum_max_min'],1.10)
+                self.assertEqual(len(rows),12 if issue=='duplicate' else 11)
+                for metric in ('cpu_us','full_cpu_us'):
+                    self.assertTrue(all(v is None or (type(v)in(int,float) and h.math.isfinite(v))
+                        for v in result['metrics'][metric]['values']))
+
+    def test_pg_zero_A_drift_blocks_gain_claim_even_when_all_B_pairs_have_lower_CPU(self):
+        for metric in ('cpu_us','full_cpu_us'):
+            rows=[]
+            for config in h.http_short_plan({'A':{},'B':{}},'pg-zero-cpu')['windows']:
+                row=dict(config,cpu_us=100,full_cpu_us=100,environment_quality='pass')
+                if row['workload']=='db':
+                    scale=1 if row['group']==1 else 1.12
+                    row[metric]*=scale
+                    if row['name']=='B':row['full_cpu_us']*=.80
+                rows.append(row)
+            result=h.http_short_comparison(rows,True,{'quality':'pass'},'pg-zero-cpu')
+            self.assertFalse(result['pg_A_controls']['passed'])
+            self.assertFalse(result['eligible_for_root_review'])
+            self.assertFalse(result['service_speedup_demonstrated'])
+            self.assertTrue(any('PG A CPU max/min' in r for r in result['reasons']))
 
     def test_http_short_plan_is_three_original_controls_and_only_twenty_business_windows(self):
         plan=h.http_short_plan({'A':{},'B':{}})
@@ -238,10 +280,14 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertEqual(result['compute_guard']['pairs'],1);self.assertIsNone(result['compute_guard']['confidence_interval'])
 
     def test_http_short_runner_stops_failed_controls_or_invalid_business_without_replacement(self):
-        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
+        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business','pg-none','pg-drift'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+                goal='pg-zero-cpu' if issue.startswith('pg-') else 'cpu'
+                root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')},goal)
                 h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
+                if goal=='pg-zero-cpu':
+                    h.save(root/'frame-zero-generated-contract.json',{'complete':True})
+                    patches.enter_context(patch.object(h,'frame_zero_generated_contract',return_value={'complete':True}))
                 h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
                 fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
                     stop=lambda:dict(forced=issue=='database',cgroup_removed=True,after={'process_count':0}))
@@ -250,7 +296,7 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='flags':mode['native_flags']['server']=['-std=c11','-O3','-pthread']
                 patches.enter_context(patch.object(h.os,'geteuid',return_value=0));database=patches.enter_context(patch.object(h.db,'Database',return_value=fixture))
                 patches.enter_context(patch.object(fc,'version_identity',side_effect=lambda p,n:dict(stack='ku',build_mode=mode,
-                    source_commit=h.HTTP_SHORT_PREPATCH if n=='A' else 'b'*40,
+                    source_commit=plan['prepatch'] if n=='A' else 'b'*40,
                     files={'expanded source':{'sha256':'a'*64 if issue=='business' and n=='A' else 'b'*64}})))
                 patches.enter_context(patch.object(fc,'service_termination_succeeded',side_effect=lambda s,t:t.get('natural') is True))
                 patches.enter_context(patch.object(h,'sha',return_value='f'*64));measured=[]
@@ -261,25 +307,31 @@ class HostedCycleTests(unittest.TestCase):
                     row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
                         all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
                         environment_quality='unknown' if control else 'pass',measurement_invalid=False,
-                        full_cpu_us=97 if name=='B' else 100,cleanup=[{'natural':True}])
+                        full_cpu_us=97 if name=='B' else 100,cpu_us=97 if name=='B' else 100,cleanup=[{'natural':True}])
+                    if issue=='pg-drift' and workload=='db' and Path(output).name=='g3-A':
+                        row.update(cpu_us=112,full_cpu_us=112)
                     self.assertEqual(kwargs['job']['contract'],'dom' if control else next(c['contract'] for c in plan['windows'] if c['workload']==workload))
                     for part in ('warmup','score'):
                         report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
                         h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
                     row['score_report']=str(Path(output)/'score/client.json');return row
-                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_short_screen=True)
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_short_screen=True,http_short_goal=goal)
                 if issue in ('flags','business'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue
                 result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
-                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 23)
-                self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['candidate_accepted'])
+                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 11 if issue=='pg-none' else 8 if issue=='pg-drift' else 23)
+                self.assertEqual(result['execution_complete'],issue in ('none','pg-none'));self.assertFalse(result['candidate_accepted'])
                 self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
-                if issue=='none':
+                if issue in ('none','pg-none'):
                     self.assertEqual([x[2] for x in measured[:3]],[True]*3)
                     self.assertEqual(result['environment_qualification']['quality'],'pass')
                 else:self.assertFalse(result['comparison']['eligible_for_root_review'])
+                if issue=='pg-drift':
+                    self.assertFalse(result['pg_A_controls']['passed'])
+                    self.assertEqual(measured[-1][:2],('A','db'))
+                    self.assertTrue(any('PG A CPU max/min' in r['reason'] for r in result['stopped']))
 
     def test_owner_mode_is_single_unscored_reuse_only_window(self):
         for flag in ('pg_driver_screen','normal_self_probe','http_short_screen','task_json_screen','final_task_json'):
