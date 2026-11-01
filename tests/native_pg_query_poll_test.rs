@@ -1296,7 +1296,7 @@ int main(void) {
      * executable owner is forged or dispatched. Only the real PG state machine
      * and real pool publication/retirement helpers execute below. */
     ku_task_control_atomic_init(&controls[i].phase,KU_TASK_CONTROL_LIVE);
-    slots[i].state=KU_TASK_DRIVER_RUNNING;slots[i].generation=1u;slots[i].binding=&controls[i];
+    slots[i].state=KU_TASK_DRIVER_RUNNING;slots[i].generation=1u;slots[i].binding=&controls[i];slots[i].owner_worker=1u;
     slots[i].driver_lease.control=&controls[i];slots[i].blocking_pending=1u;slots[i].cancel_deadline=UINT64_MAX;
     size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK && index==i);
     KuTaskBlockingJobV1* job=&pool.jobs[i];job->kind=9u;job->pg_pool=&pool;job->net_owner=1u;
