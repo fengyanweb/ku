@@ -384,9 +384,17 @@ class OwnerReader:
                 raise ValueError('reactor owner/slots mismatch')
             for field, count_field, element in [('registrations', 'capacity', 'registration'),
                                                  ('hash', 'hash_capacity', 'token_bucket'),
-                                                 ('fd_entries', 'fd_capacity', 'fd_bucket')]:
+                                                 ('fd_entries', 'hash_capacity', 'fd_bucket')]:
                 count = self.cap(self.field(reactor, 'KuHttpReactor', count_field), 1 << 20, 'reactor ' + count_field)
                 self.backing('reactor-' + field, self.field(reactor, 'KuHttpReactor', field), count, elements[element], owner)
+            fd_logical = self.cap(self.field(reactor, 'KuHttpReactor', 'fd_capacity'), 1 << 20, 'reactor logical fd capacity')
+            fd_storage = self.field(reactor, 'KuHttpReactor', 'hash_capacity')
+            if fd_logical > fd_storage:
+                raise ValueError('logical fd capacity exceeds allocated hash backing')
+            self.metadata.append(dict(kind='reactor fd table backing versus logical lookup capacity', owner=index,
+                fd_logical_cells=fd_logical, fd_storage_cells=fd_storage,
+                backing_bytes=fd_storage*elements['fd_bucket'],
+                allocation_basis='normal generated C calloc(hash_capacity,sizeof(*fd_entries)); logical fd_capacity is not allocation size'))
             for field in ('work', 'idle_heap'):
                 self.backing('reactor-' + field, self.field(reactor, 'KuHttpReactor', field), slots, elements['int'], owner)
             self.metadata.append(dict(kind='stack queue/active/reactor headers, not heap allocations',

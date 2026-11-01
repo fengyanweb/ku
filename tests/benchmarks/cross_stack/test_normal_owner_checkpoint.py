@@ -59,6 +59,13 @@ class FixedOwnerTests(unittest.TestCase):
             with self.subTest(name=name):
                 f=ScalarFixture();f.set(pointer,typename,**{name:1})
                 with self.assertRaisesRegex(ValueError,'not quiet'):f.capture()
+    def test_fd_backing_uses_allocated_hash_capacity_not_logical_lookup_capacity(self):
+        f=ScalarFixture();f.set(0xc000,'KuHttpReactor',fd_capacity=4,hash_capacity=16)
+        result=f.capture();row=next(x for x in result['records'] if x['label']=='reactor-fd_entries')
+        self.assertEqual(row['requested_bytes'],16*4)
+        metadata=next(x for x in result['metadata'] if x['kind'].startswith('reactor fd table'))
+        self.assertEqual(metadata['fd_logical_cells'],4);self.assertEqual(metadata['fd_storage_cells'],16)
+        self.assertEqual(metadata['backing_bytes'],64)
     def test_idle_connection_and_retained_header_capacity_are_allowed_without_payload_reads(self):
         f=ScalarFixture();f.set(0x20000,'KuHttpConnection',header=0x32000,capacity=4096)
         result=f.capture();row=next(x for x in result['records'] if x['label']=='idle-header-capacity')
