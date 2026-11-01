@@ -9742,6 +9742,22 @@ fn main():null! {
         );
         assert_status(&transform, "HTTP/1.1 200 OK");
         assert!(transform.ends_with(&expected), "{transform}");
+        for invalid in [
+            r#"{"counter":9223372036854775807,"data":null}"#,
+            r#"{"counter":{},"data":null}"#,
+            r#"{"counter":7}"#,
+            r#"{"counter":}"#,
+        ] {
+            let error = http_response(
+                &address,
+                &format!(
+                    "POST /transform?rid=ordinary HTTP/1.1\r\nHost: local\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid}",
+                    invalid.len()
+                ),
+                Duration::from_secs(3),
+            );
+            assert_status(&error, "HTTP/1.1 500 Internal Server Error");
+        }
     }
     let metrics=http_response(&management,"GET /__ku/metrics HTTP/1.1\r\nHost: local\r\nX-Ku-Control-Token: json-owner-guard\r\nConnection: close\r\n\r\n",Duration::from_secs(3));
     let loops = metrics
