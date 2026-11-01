@@ -44,10 +44,10 @@ on:
         default: false
 
       normal_self_workload:
-        description: 'Explicit db: only3 ordinary F Ku PG200/s windows,15/60/15s, bounded DWARF CPU samples'
+        description: 'db-gpr: two owned-child capability arms then only3 F PG200/s windows if GPR succeeds; db retains original probe'
         type: choice
         default: json_object
-        options: [json_object, db]
+        options: [json_object, db, db-gpr]
 
       http_short_screen:
         description: 'Three A environment controls then20 normal single-candidate HTTP A/B windows; diagnostic only'
@@ -741,9 +741,9 @@ jobs:
         run: |
           set -euo pipefail
           performance_self_args=(--normal-self-probe)
-          if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+          if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
             test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
-            performance_self_args+=(--normal-self-workload db)
+            performance_self_args+=(--normal-self-workload "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD")
           fi
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase perf-preflight --build-set diagnostic \
             "${performance_self_args[@]}" --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
@@ -798,8 +798,8 @@ jobs:
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--normal-self-probe)
-            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
-              performance_task_json_args+=(--normal-self-workload db)
+            if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
+              performance_task_json_args+=(--normal-self-workload "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD")
             fi
           fi
           if [ "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = true ]; then
@@ -836,7 +836,7 @@ jobs:
               --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
               "${performance_task_json_args[@]}"
           else
-            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+            if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
               test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true
               test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
             else
@@ -903,8 +903,8 @@ jobs:
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--normal-self-probe)
-            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
-              performance_task_json_args+=(--normal-self-workload db)
+            if [[ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db || "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db-gpr ]]; then
+              performance_task_json_args+=(--normal-self-workload "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD")
             fi
           fi
           if [ "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = true ]; then

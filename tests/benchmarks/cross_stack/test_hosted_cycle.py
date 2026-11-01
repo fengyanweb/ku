@@ -524,6 +524,114 @@ class HostedCycleTests(unittest.TestCase):
                 with self.subTest(flags=flags),self.assertRaisesRegex(ValueError,'preflight required'):
                     h.save(path,dict(record,perf_flags=flags));h.require_normal_perf_preflight(a)
 
+    def test_normal_pg_gpr_plan_keeps_frozen_work_and_excludes_extended_registers(self):
+        flags=['-vv','--call-graph','dwarf,4096',
+            '--user-regs='+','.join([*('x%d'%n for n in range(30)),'lr','sp','pc'])]
+        self.assertEqual(h.NORMAL_PG_GPR_FLAGS,flags)
+        plain=h.normal_self_plan({'B':{}},'db');gpr=h.normal_self_plan({'B':{}},'db-gpr')
+        self.assertEqual(gpr['perf_flags'],flags)
+        for key in ('product_commit','workload','contract','rate','warmup_seconds','score_seconds',
+                'control_score_seconds','order','resources','quality_policy','maximum_windows','maximum_replacements'):
+            self.assertEqual(gpr[key],plain[key],key)
+        self.assertEqual(plain['perf_flags'],['--call-graph','dwarf,4096'])
+        self.assertEqual(h.normal_self_plan({'B':{},'R':{}})['perf_flags'],[])
+        base=dict(baseline=h.BASELINE,candidate=h.NORMAL_PG_PRODUCT,prepatch=h.BASELINE,screen_variants=[],
+            normal_self_probe=True,normal_self_workload='db-gpr')
+        self.assertEqual(h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')['normal_self_workload'],'db-gpr')
+        for change in ({'normal_self_probe':False},{'candidate':'b'*40}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(**dict(base,**change)),'diagnostic')
+
+    @staticmethod
+    def normal_perf_attr_fixture(*,mask=0x1ffffffff,stack=4096,frequency=499,flags=1<<10):
+        header=bytearray(104);header[:8]=b'PERFILE2'
+        h.struct.pack_into('<QQQQQQ',header,8,104,144,104,144,248,8)
+        attr=bytearray(144)
+        h.struct.pack_into('<IIQQQQ',attr,0,1,128,0,frequency,327|32|4096|8192,0)
+        h.struct.pack_into('<Q',attr,40,flags)
+        h.struct.pack_into('<QI',attr,80,mask,stack)
+        return header+attr+bytearray(8)
+
+    def test_normal_perf_event_attributes_parse_real_layout_and_reject_section_bounds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'perf.data';raw=self.normal_perf_attr_fixture();path.write_bytes(raw)
+            attrs=h.normal_perf_event_attributes(path)
+            self.assertEqual(len(attrs),1)
+            self.assertEqual({key:attrs[0][key] for key in ('type','config','frequency','user_regs_mask','stack_user')},
+                dict(type=1,config=0,frequency=499,user_regs_mask='0x1ffffffff',stack_user=4096))
+            self.assertFalse(attrs[0]['exclude_host']);self.assertFalse(attrs[0]['exclude_guest'])
+            self.assertTrue(attrs[0]['frequency_mode']);self.assertTrue(h.normal_perf_gpr_attributes_valid(attrs))
+            self.assertTrue(attrs[0]['sample_type'] & 4096);self.assertTrue(attrs[0]['sample_type'] & 8192)
+            for mask in (0,0x40000000,0x1ffffffff|(1<<46)):
+                path.write_bytes(self.normal_perf_attr_fixture(mask=mask))
+                rows=h.normal_perf_event_attributes(path)
+                self.assertEqual(rows[0]['user_regs_mask'],hex(mask));self.assertFalse(h.normal_perf_gpr_attributes_valid(rows))
+            path.write_bytes(self.normal_perf_attr_fixture(flags=0))
+            rows=h.normal_perf_event_attributes(path)
+            self.assertFalse(rows[0]['frequency_mode']);self.assertFalse(h.normal_perf_gpr_attributes_valid(rows))
+            malformed=[raw[:16],bytearray(raw)]
+            malformed[-1][:8]=b'BADFILE2'
+            for offset,value in ((16,0),(16,80),(24,len(raw)+1),(32,143),(32,len(raw))):
+                changed=bytearray(raw);h.struct.pack_into('<Q',changed,offset,value);malformed.append(changed)
+            for index,data in enumerate(malformed):
+                with self.subTest(malformed=index),self.assertRaises(ValueError):
+                    path.write_bytes(data);h.normal_perf_event_attributes(path)
+
+    def test_normal_perf_gpr_gate_binds_mask_raw_flags_and_owned_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);raw=root/'gpr.data';raw.write_bytes(self.normal_perf_attr_fixture())
+            a=types.SimpleNamespace(root=root,candidate=h.NORMAL_PG_PRODUCT,normal_self_workload='db-gpr')
+            path=root/'normal-perf-preflight/preflight.json'
+            digest=lambda p:h.hashlib.sha256(Path(p).read_bytes()).hexdigest() if str(p)==str(raw) else 'f'*64
+            with patch.object(h,'sha',side_effect=digest):
+                record=dict(complete=True,candidate=h.NORMAL_PG_PRODUCT,entry_sha256='f'*64,boot_sha256='f'*64,
+                    perf_path='/perf',perf_sha256='f'*64,perf_flags=list(h.NORMAL_PG_GPR_FLAGS),actual_mask_valid=True,
+                    raw_path=str(raw),raw_sha256=digest(raw),event_attributes=h.normal_perf_event_attributes(raw),
+                    target_pid=123,command=['/perf','record','-p','123','-o',str(raw)])
+                h.save(path,record);h.require_normal_perf_preflight(a)
+                for change in ({'perf_flags':h.NORMAL_PG_PERF_FLAGS},{'actual_mask_valid':False},
+                        {'target_pid':124},{'raw_sha256':'0'*64},{'event_attributes':[]}):
+                    with self.subTest(change=change),self.assertRaisesRegex(ValueError,'preflight required'):
+                        h.save(path,dict(record,**change));h.require_normal_perf_preflight(a)
+                for mask in (0,0x1ffffffff|(1<<46)):
+                    raw.write_bytes(self.normal_perf_attr_fixture(mask=mask))
+                    h.save(path,dict(record,raw_sha256=digest(raw),event_attributes=h.normal_perf_event_attributes(raw)))
+                    with self.subTest(mask=mask),self.assertRaisesRegex(ValueError,'preflight required'):
+                        h.require_normal_perf_preflight(a)
+
+    def test_normal_perf_capability_has_only_two_arms_and_never_publishes_plain_as_gpr(self):
+        for issue in ('none','gpr-failure','plain-failure','mask','boot','perf','unreaped','wall','exception'):
+            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate=h.NORMAL_PG_PRODUCT,
+                    normal_self_workload='db-gpr')
+                previous=root/'previous-default-dwarf-failure.json';previous.write_text('original failure retained\n')
+                calls=[]
+                def arm(selected,*,output,perf_flags):
+                    name=output.name;calls.append((name,selected.normal_self_workload,list(perf_flags)))
+                    output.mkdir()
+                    if issue=='exception' and name=='dwarf-gpr':raise RuntimeError('new capability arm unavailable')
+                    record=dict(complete=not(issue=='gpr-failure' and name=='dwarf-gpr') and not(issue=='plain-failure' and name=='plain'),
+                        actual_mask_valid=issue!='mask',perf_sha256='e'*64 if issue=='perf' and name=='dwarf-gpr' else 'f'*64,
+                        boot_sha256='e'*64 if issue=='boot' and name=='dwarf-gpr' else 'f'*64,
+                        raw_bytes=100,child_reaped=issue!='unreaped',error='retained failure' if 'failure' in issue else None)
+                    h.save(output/'preflight.json',record);return record
+                probe=patches.enter_context(patch.object(h,'normal_perf_preflight',side_effect=arm))
+                patches.enter_context(patch.object(h.time,'monotonic',side_effect=[0,51 if issue=='wall' else 2]))
+                if issue=='exception':
+                    with self.assertRaisesRegex(RuntimeError,'unavailable'):h.normal_perf_capability(a)
+                    result=h.load(root/'normal-perf-preflight/capability.json')
+                else:result=h.normal_perf_capability(a)
+                expected=[('plain','json_object',['-vv'])]
+                if issue!='unreaped':expected.append(('dwarf-gpr','db-gpr',h.NORMAL_PG_GPR_FLAGS))
+                self.assertEqual(calls,expected);self.assertEqual(probe.call_count,len(expected))
+                self.assertEqual(previous.read_text(),'original failure retained\n')
+                complete=issue in ('none','plain-failure')
+                self.assertEqual(result['complete'],complete);self.assertEqual(result['maximum_arms'],2)
+                gate=root/'normal-perf-preflight/preflight.json';self.assertEqual(gate.exists(),complete)
+                self.assertTrue((root/'normal-perf-preflight/plain/preflight.json').is_file())
+                if issue=='unreaped':self.assertFalse((root/'normal-perf-preflight/dwarf-gpr').exists())
+                if complete:self.assertEqual(h.load(gate),h.load(root/'normal-perf-preflight/dwarf-gpr/preflight.json'))
+
     def test_normal_pg_self_builds_only_ordinary_Ku_and_the_existing_driver(self):
         with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
             root=Path(temp);calls=[]
@@ -676,11 +784,13 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(measured.call_count,1 if sample else 0)
 
     def test_perf_preflight_needs_controlled_samples_header_and_exports_then_reaps_child(self):
-        for issue in ('success','pg','fragment-child','control','header','empty-samples','export',
+        for issue in ('success','pg','gpr','gpr-mask','gpr-stack','gpr-period','gpr-frequency','gpr-sample-type','gpr-corrupt',
+                'fragment-child','control','header','empty-samples','export',
                 'version-missing','version-empty','version-multiple','version-identical-multiple','version-oversize'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);a=types.SimpleNamespace(root=root,tools=root/'tools',candidate=h.NORMAL_PG_PRODUCT if issue=='pg' else 'b'*40,
-                    **({'normal_self_workload':'db'} if issue=='pg' else {}))
+                root=Path(temp);gpr=issue.startswith('gpr')
+                a=types.SimpleNamespace(root=root,tools=root/'tools',candidate=h.NORMAL_PG_PRODUCT if issue=='pg' or gpr else 'b'*40,
+                    **({'normal_self_workload':'db-gpr' if gpr else 'db'} if issue=='pg' or gpr else {}))
                 stream=types.SimpleNamespace(fileno=lambda:1234,close=lambda:None)
                 class Child:
                     pid=77777777;returncode=None;stdin=stream;stdout=stream
@@ -694,13 +804,20 @@ class HostedCycleTests(unittest.TestCase):
                 patches.enter_context(patch.object(h.os,'read',side_effect=[b'd',b'one\n'] if issue=='fragment-child' else [b'done\n']))
                 kill=patches.enter_context(patch.object(h.os,'killpg'))
                 def controlled(client,pid,output,perf,record,**kwargs):
-                    self.assertEqual(pid,child.pid);self.assertEqual(kwargs['limit'],(4 if issue=='pg' else 1)<<20)
+                    self.assertEqual(pid,child.pid);self.assertEqual(kwargs['limit'],(4 if issue=='pg' or gpr else 1)<<20)
                     if issue=='pg':self.assertEqual(kwargs['perf_flags'],h.NORMAL_PG_PERF_FLAGS)
+                    elif gpr:self.assertEqual(kwargs['perf_flags'],h.NORMAL_PG_GPR_FLAGS)
                     else:self.assertNotIn('perf_flags',kwargs)
                     if issue=='control':raise TimeoutError('no enable ACK')
                     client();record.update(record_complete=True,client_started_monotonic_ns=10_000_000_001,
                         client_finished_monotonic_ns=11_000_000_002,controlled_stop_exit=True,perf_exit_code=0)
                     raw=bytearray(64);raw[:8]=b'PERFILE2';h.struct.pack_into('<QQ',raw,40,65 if issue=='header' else 56,8)
+                    if gpr:
+                        raw=self.normal_perf_attr_fixture(mask=0x40000000 if issue=='gpr-mask' else 0x1ffffffff,
+                            stack=8192 if issue=='gpr-stack' else 4096,flags=0 if issue=='gpr-period' else 1<<10,
+                            frequency=500 if issue=='gpr-frequency' else 499)
+                        if issue=='gpr-sample-type':h.struct.pack_into('<Q',raw,104+24,327)
+                        if issue=='gpr-corrupt':h.struct.pack_into('<Q',raw,16,0)
                     (output/'perf.data').write_bytes(raw)
                 patches.enter_context(patch.object(h,'controlled_perf',side_effect=controlled))
                 def command(argv,output,**kwargs):
@@ -717,8 +834,12 @@ class HostedCycleTests(unittest.TestCase):
                     Path(output).write_text(text);return {'complete':issue!='export'}
                 calls=patches.enter_context(patch.object(h,'diagnostic_command',side_effect=command))
                 result=h.normal_perf_preflight(a)
-                self.assertEqual(result['complete'],issue in ('success','pg','fragment-child'));self.assertEqual(child.returncode,0)
+                self.assertEqual(result['complete'],issue in ('success','pg','gpr','fragment-child'));self.assertEqual(child.returncode,0)
                 if issue=='pg':self.assertEqual(result['perf_flags'],h.NORMAL_PG_PERF_FLAGS)
+                if gpr:
+                    self.assertEqual(result['target_pid'],child.pid)
+                    self.assertEqual(result['perf_flags'],h.NORMAL_PG_GPR_FLAGS)
+                    self.assertEqual(result.get('actual_mask_valid',False),issue=='gpr')
                 self.assertFalse((root/'hosted-state.json').exists());self.assertLessEqual(result['seconds'],25)
                 if issue=='control':kill.assert_called_once_with(child.pid,h.signal.SIGKILL)
                 else:
@@ -760,6 +881,24 @@ class HostedCycleTests(unittest.TestCase):
                 '--root',str(root/'out'),'--source',str(source),'--tools',str(tools),'--candidate','b'*40])
             self.assertEqual(code,2);self.assertEqual([x.args[0] for x in alarm.call_args_list],[19,0])
             self.assertFalse((root/'out/hosted-state.json').exists());build.assert_not_called();observe.assert_not_called()
+
+    def test_gpr_preflight_main_selects_only_capability_and_its_fixed_wall_alarm(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+            root=Path(temp);source=root/'source';tools=root/'tools';source.mkdir();tools.mkdir()
+            patches.enter_context(patch.object(h.platform,'system',return_value='Linux'))
+            patches.enter_context(patch.object(h.platform,'machine',return_value='aarch64'))
+            alarm=patches.enter_context(patch.object(h.signal,'alarm'));patches.enter_context(patch.object(h.signal,'signal'))
+            capability=patches.enter_context(patch.object(h,'normal_perf_capability',return_value={'complete':False}))
+            direct=patches.enter_context(patch.object(h,'normal_perf_preflight'))
+            build=patches.enter_context(patch.object(h,'build'));observe=patches.enter_context(patch.object(h,'diagnostic'))
+            with redirect_stdout(io.StringIO()):code=h.main(['--phase','perf-preflight','--build-set','diagnostic','--normal-self-probe',
+                '--normal-self-workload','db-gpr','--root',str(root/'out'),'--source',str(source),'--tools',str(tools),
+                '--candidate',h.NORMAL_PG_PRODUCT])
+            self.assertEqual(code,2);self.assertEqual([x.args[0] for x in alarm.call_args_list],[49,0])
+            capability.assert_called_once();direct.assert_not_called();build.assert_not_called();observe.assert_not_called()
+            self.assertFalse((root/'out/hosted-state.json').exists())
 
     def test_normal_self_six_windows_stop_on_failure_or_control_drift(self):
         for issue in ('none','unknown-environment','functional','accounting','cleanup','observer','quality','driver','drift','database'):
