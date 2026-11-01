@@ -43,6 +43,12 @@ on:
         type: boolean
         default: false
 
+      normal_self_workload:
+        description: 'Explicit db: only3 ordinary F Ku PG200/s windows,15/60/15s, bounded DWARF CPU samples'
+        type: choice
+        default: json_object
+        options: [json_object, db]
+
       http_short_screen:
         description: 'Three A environment controls then20 normal single-candidate HTTP A/B windows; diagnostic only'
         type: boolean
@@ -578,6 +584,7 @@ jobs:
       KU_PERFORMANCE_V2_FINAL_TASK_JSON: ${{ inputs.final_task_json && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_FAILURE_PROBE: ${{ inputs.pg_failure_probe && 'true' || 'false' }}
       KU_PERFORMANCE_V2_NORMAL_SELF_PROBE: ${{ inputs.normal_self_probe && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD: ${{ inputs.normal_self_workload || 'json_object' }}
       KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}
       KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN: ${{ inputs.http_short_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE: ${{ inputs.memory_owner_probe && 'true' || 'false' }}
@@ -733,9 +740,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          performance_self_args=(--normal-self-probe)
+          if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+            test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            performance_self_args+=(--normal-self-workload db)
+          fi
           sudo -n python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase perf-preflight --build-set diagnostic \
-            --normal-self-probe --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
-            --tools "$KU_PERFORMANCE_V2_ROOT/tools" --candidate "$GITHUB_SHA"
+            "${performance_self_args[@]}" --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
+            --tools "$KU_PERFORMANCE_V2_ROOT/tools" --candidate "$KU_PERFORMANCE_V2_CANDIDATE"
 
       - name: Download the exact optional prior build archive
         if: inputs.reuse_build_run != ''
@@ -786,6 +798,9 @@ jobs:
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--normal-self-probe)
+            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+              performance_task_json_args+=(--normal-self-workload db)
+            fi
           fi
           if [ "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -821,7 +836,12 @@ jobs:
               --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
               "${performance_task_json_args[@]}"
           else
-            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+              test "$KU_PERFORMANCE_V2_NORMAL_SELF_PROBE" = true
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = f43e74fdfe384c385a6703f3ee3eab933880b9e2
+            else
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            fi
             test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
             python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \
@@ -883,6 +903,9 @@ jobs:
             test "$performance_build_set" = diagnostic
             test -z "$KU_PERFORMANCE_V2_REUSE_RUN"
             performance_task_json_args+=(--normal-self-probe)
+            if [ "$KU_PERFORMANCE_V2_NORMAL_SELF_WORKLOAD" = db ]; then
+              performance_task_json_args+=(--normal-self-workload db)
+            fi
           fi
           if [ "$KU_PERFORMANCE_V2_PG_FAILURE_PROBE" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
