@@ -8453,7 +8453,7 @@ static int fixture_token_index_identities(void) {
     for(size_t step=0;step<4u;step++) {
       size_t slot=deletion[step];ku_http_reactor_hash_remove(&r,keys[slot]);
       CHECK(ku_http_reactor_lookup(&r,keys[slot])==SIZE_MAX);
-      r.registrations[slot].token=0; /* Only after back-shift read the full key. */
+      r.registrations[slot].token=0;
       for(size_t i=0;i<4u;i++)if(r.registrations[i].token)
         CHECK(ku_http_reactor_lookup(&r,keys[i])==i);
     }
@@ -8472,6 +8472,18 @@ static int fixture_token_index_identities(void) {
   }
   r.hash[bucket]=0;ku_http_reactor_hash_set_slot(&r,bucket,0);
   ku_http_reactor_destroy(&r);CHECK(!fixture_live_allocs && !fixture_live_bytes);
+
+  /* Codec extreme without allocating a maximum-size reactor. This verifies
+   * uint32 slot+1 representation, not full-capacity execution. */
+  KuHttpReactor codec={0};codec.capacity=UINT32_MAX;codec.hash_capacity=8u;
+  codec.hash=calloc(codec.hash_capacity,sizeof(*codec.hash)+ku_http_reactor_hash_slot_bytes(&codec));
+  CHECK(codec.hash && ku_http_reactor_hash_slot_bytes(&codec)==4u);
+  CHECK(ku_http_reactor_hash_add(&codec,UINT64_MAX-1u,(size_t)UINT32_MAX-1u));
+  CHECK(ku_http_reactor_lookup(&codec,UINT64_MAX-1u)==(size_t)UINT32_MAX-1u);
+  CHECK(!ku_http_reactor_hash_add(&codec,1u,(size_t)UINT32_MAX));
+  ku_http_reactor_hash_remove(&codec,UINT64_MAX-1u);CHECK(!codec.fault);
+  for(size_t i=0;i<codec.hash_capacity;i++)CHECK(!codec.hash[i] && !ku_http_reactor_hash_slot(&codec,i));
+  free(codec.hash);CHECK(!fixture_live_allocs && !fixture_live_bytes);
 
   /* Width switches only at the real capacity boundary, not live count. The
    * last physical slot must remain representable and keep all token bits. */
