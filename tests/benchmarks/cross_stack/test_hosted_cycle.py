@@ -219,6 +219,39 @@ class HostedCycleTests(unittest.TestCase):
         with patch.object(h.os,'geteuid',return_value=1),self.assertRaisesRegex(ValueError,'fixed archive reuse'):
             h.build(types.SimpleNamespace(memory_owner_probe=True,build_set='diagnostic'),{})
 
+    def test_live_owner_preparation_preserves_normal_ELF_C_and_native_receipts(self):
+        import copy
+        import compile_variants as cv
+        import resident_selftest
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);binary=root/'normal';binary.write_bytes(b'normal executable')
+            generated=root/'normal.c';generated.write_bytes(b'normal generated C')
+            native=dict(binary=str(binary),binary_sha256=h.sha(binary),generated_c=str(generated),
+                generated_c_sha256=h.sha(generated),compiler_receipt='original-receipt',
+                compiler_invocation={'compiler':{'path':'fixture-cc'},'flags':['-std=c11','-O2','-pthread'],
+                    'library_inputs':[{'role':'libpq'}]})
+            manifest=dict(stacks={'ku':dict(command=[str(binary)],env={'original':'kept'},build={'native':{'server':native}})},
+                protocol=str(root/'protocol.json'),client={})
+            h.save(root/'B/manifest.json',manifest);before=copy.deepcopy(native)
+            def compile(label,command,*args,**kwargs):
+                header=bytearray(20);header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little')
+                Path(command[-1]).write_bytes(header)
+            with patch.object(cv,'clean_environment',return_value={}),patch.object(cv,'Commands') as commands,\
+                    patch.object(resident_selftest,'run',return_value={'result':'pass'}) as selftest,\
+                    patch.object(h,'normalize_manifest',side_effect=lambda m,*args:m),\
+                    patch.object(fc,'version_identity',side_effect=lambda plan,name:{'name':name}),\
+                    patch.object(hcd,'prepare_allocation_owner_source') as rewrite:
+                commands.return_value.run.side_effect=compile;commands.return_value.rows=[]
+                result=h.prepare_memory_owner(types.SimpleNamespace(root=root,tools=root/'tools',candidate='a'*40),{})
+            self.assertTrue(result['execution_complete']);selftest.assert_called_once();rewrite.assert_not_called()
+            observed=h.load(root/'M/manifest.json');plan=h.load(root/'frozen-plan.json')
+            self.assertEqual(observed['stacks']['ku']['command'],[str(binary)])
+            self.assertEqual(observed['stacks']['ku']['build']['native']['server'],before)
+            self.assertEqual(h.load(root/'B/manifest.json'),manifest)
+            self.assertEqual(binary.read_bytes(),b'normal executable');self.assertEqual(generated.read_bytes(),b'normal generated C')
+            self.assertIn('LD_PRELOAD',observed['stacks']['ku']['env'])
+            self.assertEqual(plan['versions']['B']['binary_sha256'],plan['versions']['M']['binary_sha256'])
+
     def test_owner_source_preserves_normal_and_rejects_ambiguous_anchors(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);source=root/'normal.c';out=root/'owner.c'

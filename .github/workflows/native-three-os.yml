@@ -55,7 +55,7 @@ on:
         options: [cpu, memory]
 
       memory_owner_probe:
-        description: 'One diagnostic startup-owner map; requires fixed41182804290 normal build reuse, no score or matrix'
+        description: 'One idle-only live-allocation map with unchanged normal ELF; fixed41182804290 reuse, no score or matrix'
         type: boolean
         default: false
 

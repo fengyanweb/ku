@@ -1361,82 +1361,91 @@ def memory_owner_plan(versions):
     return dict(schema='ku-memory-owner-plan-v1',versions=versions,resources=copy.deepcopy(RESOURCES),
         quality_policy=copy.deepcopy(POLICY),diagnostic_only=True,normal_score_eligible=False,
         formal_qualified=False,workload='json_object',rate=500,warmup_seconds=3,score_seconds=5,
-        maximum_windows=1,maximum_replacements=0,timeout_seconds=3)
+        maximum_windows=1,maximum_replacements=0,timeout_seconds=3,
+        observer='normal-ELF-LD_PRELOAD-live-v1',idle_snapshot_endpoints=['startup','after'],
+        maximum_live_records=16384,maximum_snapshot_attempts=10)
 
 
 def prepare_memory_owner(a,state):
-    import http_cost_diagnostic as hcd
+    import resident_selftest
     from compile_variants import Commands, clean_environment
     directory=a.root/'M';directory.mkdir();m=copy.deepcopy(load(a.root/'B/manifest.json'))
     stack=m['stacks']['ku'];build=stack['build'];native=build['native']['server'];original=copy.deepcopy(native)
-    emission=hcd.prepare_allocation_owner_source(Path(native['generated_c']),directory/'owner.c',a.candidate)
     invocation=native['compiler_invocation'];libs=invocation['library_inputs']
     if len(libs)!=1 or libs[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
         raise ValueError('owner probe requires original normal C11O2 and single libpq input')
-    binary=directory/'bin/ku-owner';binary.parent.mkdir()
-    command=[invocation['compiler']['path'],str(directory/'owner.c'),*invocation['flags'],
-        libs[0]['selected_input']['real_path'],'-o',str(binary)]
-    log=Commands(directory/'logs',clean_environment(a.tools));log.run('owner-link',command,directory,timeout=120)
-    with binary.open('rb') as stream:header=stream.read(20)
+    source=Path(__file__).resolve().parent;library=directory/'resident-live.so'
+    command=[invocation['compiler']['path'],'-shared','-fPIC','-O2','-fno-builtin','-std=c11',
+        '-Wall','-Wextra','-Werror',str(source/'resident_live.c'),'-o',str(library)]
+    log=Commands(directory/'logs',clean_environment(a.tools));log.run('owner-interposer-link',command,directory,timeout=30)
+    with library.open('rb') as stream:header=stream.read(20)
     if len(header)!=20 or header[:6]!=b'\x7fELF\x02\x01' or int.from_bytes(header[18:20],'little')!=183:
-        raise ValueError('owner link is not ELF64 little-endian AArch64')
-    save(directory/'owner-compile.json',dict(command=command,commands=log.rows,diagnostic_only=True,normal_score_eligible=False))
-    native.update(binary=str(binary),binary_sha256=sha(binary),generated_c=str(directory/'owner.c'),
-        generated_c_sha256=emission['generated_c_sha256'],compiler_receipt=str(directory/'owner-compile.json'),
-        compiler_receipt_sha256=sha(directory/'owner-compile.json'),
-        compiler_invocation=dict(invocation,argv=command,output=str(binary),source=dict(path=str(directory/'owner.c'),
-            sha256=emission['generated_c_sha256']),cwd=str(directory)))
-    stack['command']=[str(binary)];build.update(instrumented='startup-allocation-owner-map-v1',normal_score_eligible=False)
+        raise ValueError('owner interposer is not ELF64 little-endian AArch64')
+    selftest=resident_selftest.run(invocation['compiler']['path'],library)
+    save(directory/'owner-selftest.json',selftest)
+    save(directory/'owner-compile.json',dict(command=command,commands=log.rows,diagnostic_only=True,
+        normal_score_eligible=False,normal_ELF_unchanged=True,source_sha256=sha(source/'resident_live.c'),
+        library=str(library),library_sha256=sha(library),selftest=selftest))
+    # Preserve every normal native/source/compiler receipt and actual ELF byte.
+    # Only this diagnostic manifest adds one preload dependency; no emitted-C
+    # rewrite can keep otherwise dead product allocations alive.
+    stack['env']=dict(stack.get('env',{}),LD_PRELOAD=str(library))
+    build.update(instrumented='normal-ELF-LD_PRELOAD-live-v1',normal_score_eligible=False)
     m.update(diagnostic_only=True,normal_score_eligible=False,build_receipt=str(directory/'owner-compile.json'))
     m=normalize_manifest(m,Path(m['protocol']),m['client']);save(directory/'manifest.json',m)
     fixture=copy.deepcopy(m);fixture['stacks']={};save(a.root/'fixture/manifest.json',fixture)
     versions={name:dict(root=str(a.root/name),stack='ku',source_commit=a.candidate,
         binary_sha256=load(a.root/name/'manifest.json')['stacks']['ku']['build']['native']['server']['binary_sha256'],
         diagnostic_only=name=='M',normal_score_eligible=False) for name in ('B','M')}
+    artifacts={'observer-library':dict(path=str(library),sha256=sha(library))}
+    for name in ('resident_live.c','resident_snapshot.py','resident_selftest.py','resident_live_fixture.c','http_cost_diagnostic.py'):
+        artifacts[name]=dict(path=str(source/name),sha256=sha(source/name))
+    versions['M']['artifacts']=artifacts
     plan=memory_owner_plan(versions);save(a.root/'frozen-plan.json',plan)
     save(a.root/'build-identities.json',{name:fc.version_identity(plan,name) for name in versions})
-    if sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']:
-        raise ValueError('normal B artifact changed while preparing owner probe')
+    if (sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']
+            or native!=original or versions['M']['binary_sha256']!=versions['B']['binary_sha256']):
+        raise ValueError('normal B artifact/receipt changed while preparing owner probe')
     return dict(execution_complete=True,goal_status='unknown',diagnostic_only=True,normal_score_eligible=False)
 
 
 def memory_owner_probe(a,state):
-    import http_cost_diagnostic as hcd
+    import resident_snapshot
     if os.geteuid()!=0:raise ValueError('owner probe requires root cgroup control')
     plan=load(a.root/'frozen-plan.json')
     if plan!=memory_owner_plan(plan.get('versions',{})):raise ValueError('matching single-window owner plan required')
     binding=fc.version_identity(plan,'M');normal=fc.version_identity(plan,'B')
+    if plan['versions']['M']['binary_sha256']!=plan['versions']['B']['binary_sha256']:
+        raise ValueError('live observer requires byte-identical normal B ELF')
+    library=Path(plan['versions']['M']['artifacts']['observer-library']['path'])
     directory=a.root/'memory-owner-probe';directory.mkdir();fixture=db.Database(a.root/'fixture',state['uid'],state['gid'])
+    shutil.copyfile(a.root/'M/owner-selftest.json',directory/'owner-selftest.json')
+    shutil.copyfile(a.root/'M/owner-compile.json',directory/'owner-compile.json')
     original=fc.Harness;private=None;captured={};result=dict(execution_complete=False,goal_status='blocked',
-        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,candidate_accepted=False)
+        diagnostic_only=True,normal_score_eligible=False,formal_qualified=False,candidate_accepted=False,
+        observer='normal-ELF-LD_PRELOAD-live-v1',normal_ELF_unchanged=True,
+        scope='Observer BSS, TLS, allocation placement, CPU and total memory are diagnostic only; requested bytes are not resident/retained bytes.')
     class OwnerHarness(original):
         def __init__(self,*args,**kwargs):
             super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
+        def endpoint(self,service,label):
+            resident_snapshot.capture(service.process.pid,library,directory/label)
+            value=load(directory/label/'live.json')
+            if not value['live_table_valid'] or value['executable']['sha256']!=plan['versions']['B']['binary_sha256']:
+                raise ValueError('invalid live table or changed normal service ELF')
+            if any('error' in module for module in value['modules'].values()):
+                raise ValueError('actual caller module identity unavailable')
+            captured[label]=dict(path=str(directory/label/'live.json'),status=value['status'],
+                executable=value['executable'],pages_available=value['pages']['available'])
+            save(directory/'live-owner-map.json',captured)
         def start(self,*args,**kwargs):
             service=super().start(*args,**kwargs)
-            try:
-                memory=diagnostic_memory(service,directory/'startup-smaps.log')
-                captured['startup']=dict(memory=memory,owners=hcd.allocation_owner_ranges(
-                    Path(service.cwd).parent/'service.log',service.process.pid,memory))
-                return service
-            except BaseException:
-                service.stop();raise
+            try:self.endpoint(service,'startup');return service
+            except BaseException:service.stop();raise
         def client(self,service,workload,rate,duration,output,**kwargs):
             report=super().client(service,workload,rate,duration,output,**kwargs)
-            if Path(output).name=='score':
-                memory=diagnostic_memory(service,directory/'after-smaps.log')
-                captured.update(memory=memory,context=diagnostic_context(service),
-                    owners=hcd.allocation_owner_ranges(Path(service.cwd).parent/'service.log',service.process.pid,memory))
-                with (Path('/proc')/str(service.process.pid)/'maps').open('rb') as stream:maps=stream.read((1<<20)+1)
-                if len(maps)>1<<20:raise ValueError('owner maps exceeds1MiB')
-                (directory/'after-maps.log').write_bytes(maps);save(directory/'live-owner-map.json',captured)
-                owner_input=directory/'owner-ranges.json';save(owner_input,captured['owners'])
-                ticks=(Path('/proc')/str(service.process.pid)/'stat').read_text().rsplit(')',1)[1].split()[19]
-                captured['optional_pages']=diagnostic_command([sys.executable,'-B',str(Path(hcd.__file__)),
-                    'owner-pages','--pid',str(service.process.pid),'--ranges',str(owner_input),'--start-ticks',ticks],
-                    directory/'owner-pages.json',timeout=2,limit=65536)
-                save(directory/'live-owner-map.json',captured)
+            if Path(output).name=='score':self.endpoint(service,'after')
             return report
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=OwnerHarness
@@ -1445,7 +1454,7 @@ def memory_owner_probe(a,state):
         row.update(diagnostic_only=True,normal_score_eligible=False,formal_qualified=False)
         valid=(row.get('correct')==2500 and row.get('all_correct') is True and row.get('functional_valid') is True
             and row.get('accounting_valid') is True and row.get('arrival_schedule_quality')=='pass'
-            and row.get('natural_reclamation') is True and captured.get('owners',{}).get('complete') is True)
+            and row.get('natural_reclamation') is True and set(captured)=={'startup','after'})
         if fc.version_identity(plan,'B')!=normal or fc.version_identity(plan,'M')!=binding:raise ValueError('owner artifact changed')
         result.update(row=row,execution_complete=valid,goal_status='unknown' if valid else 'blocked')
     except Exception as error:result['observer_error']=repr(error)
@@ -1458,9 +1467,9 @@ def memory_owner_probe(a,state):
             result.update(execution_complete=False,goal_status='blocked')
         save(directory/'summary.json',result);save(a.root/'hosted-state.json',state)
         selected=[p for p in directory.rglob('*') if p.is_file() and p.name in ('summary.json','live-owner-map.json',
-            'startup-smaps.log','after-smaps.log','after-maps.log','owner-pages.json','owner-pages.json.json','owner-pages.json.log','service.log','termination.json','window.json','client.json','driver-cleanup.json')]
+            'owner-selftest.json','owner-compile.json','smaps.log','maps.log','live.json','service.log','termination.json','window.json','client.json','driver-cleanup.json')]
         result['small_artifact']=pg_failure_export(a,directory,output_name='memory-owner-observation',
-            schema='ku-memory-owner-small-v1',selected=selected)
+            schema='ku-memory-owner-small-v2',selected=selected)
     return result
 
 

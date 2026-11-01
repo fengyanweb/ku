@@ -946,7 +946,7 @@ def allocation_owner_ranges(log, pid, memory):
         scope='Address intersections only. Requested/virtual bytes are not resident; shared VMA RSS/PSS/Anonymous are not assigned to each label.')
 
 
-def allocation_owner_pages(pid, owners, expected_start):
+def allocation_owner_pages(pid, owners, expected_start, *, maximum_records=30):
     """Own-process pages only; caller runs this optional observer with a2s bound.
 
     Kernel bit meanings: https://docs.kernel.org/admin-guide/mm/pagemap.html
@@ -956,7 +956,10 @@ def allocation_owner_pages(pid, owners, expected_start):
         scope='Sequential pagemap/kpageflags observation, not an atomic snapshot, PSS or cgroup charge. '
               'Only stable exclusively mapped ordinary ANON non-ZERO full interior pages are counted; boundaries/shared/compound pages are not assigned.')
     try:
-        if pid<=0 or not owners.get('complete') or len(owners.get('records',[]))!=30:raise ValueError('validated own30 allocations required')
+        count=len(owners.get('records',[]))
+        if (pid<=0 or not owners.get('complete') or maximum_records not in (30,16384)
+                or not (count==30 if maximum_records==30 else 0<count<=16384)):
+            raise ValueError('validated bounded own allocations required')
         def start():return read_text(Path('/proc')/str(pid)/'stat').rsplit(')',1)[1].split()[19]
         if start()!=str(expected_start):raise ValueError('own process start identity changed')
         size=os.sysconf('SC_PAGE_SIZE');pages=set();ranges=[];deadline=time.monotonic()+1.5
