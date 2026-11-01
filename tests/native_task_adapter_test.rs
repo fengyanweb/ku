@@ -1664,6 +1664,8 @@ async fn main(): null! { return ok(null) }
         .replacen("pool->storage=calloc(1,pool->storage_bytes);", "pool->storage=fixture_pool_calloc(1,pool->storage_bytes);", 1)
         .replacen("static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {",
             "static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {\n  if(fixture_fail_pool_spawn_in!=SIZE_MAX && --fixture_fail_pool_spawn_in==0u)return KU_TASK_BLOCKING_START_FAILED;\n  if(fixture_gate_pool_spawn){CHECK(ku_test_event_set(&fixture_spawn_entered));CHECK(ku_test_event_wait(&fixture_spawn_release,2000));}",1)
+        .replacen("  uint64_t now=ku_task_driver_now_ms();\n  return now==UINT64_MAX?KU_TASK_DRIVER_INTERNAL:\n      now>=deadline?KU_TASK_BLOCKING_START_EXPIRED:KU_TASK_DRIVER_OK;",
+            "  uint64_t now=fixture_start_clock_override?fixture_start_clock_override:ku_task_driver_now_ms();\n  return now==UINT64_MAX?KU_TASK_DRIVER_INTERNAL:\n      now>=deadline?KU_TASK_BLOCKING_START_EXPIRED:KU_TASK_DRIVER_OK;",1)
         .replacen(
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {",
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n  if (fixture_pool_signal_failure()) { pool->fault=KU_TASK_DRIVER_INTERNAL; return; }",
@@ -1723,6 +1725,7 @@ static int fixture_gate_io;
 static size_t fixture_io_calls,fixture_fail_blocking_in=SIZE_MAX;
 static int fixture_fail_pool_storage,fixture_elastic_pool,fixture_gate_pool_spawn;
 static size_t fixture_fail_pool_spawn_in=SIZE_MAX,fixture_pool_worker_target=1u;
+static uint64_t fixture_start_clock_override;
 static KuTestEvent fixture_spawn_entered,fixture_spawn_release;
 static void* fixture_pool_calloc(size_t count,size_t bytes) {
   if(fixture_fail_pool_storage) { fixture_fail_pool_storage=0; return NULL; }
@@ -2495,16 +2498,17 @@ static void blocking_elastic_start_close_and_deadline(void) {
   memset(&pool,0,sizeof(pool));
   CHECK(ku_task_blocking_init_policy(&pool,2u,2u,blocking_observation_deadline(),1)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_event_init(&fixture_spawn_entered) && ku_test_event_init(&fixture_spawn_release));
-  fixture_gate_pool_spawn=1;start=(FixtureElasticStart){&pool,ku_task_driver_now_ms()+20u,0};
+  fixture_start_clock_override=1000u;
+  fixture_gate_pool_spawn=1;start=(FixtureElasticStart){&pool,2000u,0};
   CHECK(ku_test_thread_start(&starter,blocking_elastic_thread,&start));
   CHECK(ku_test_event_wait(&fixture_spawn_entered,2000));
-  uint64_t observer=blocking_observation_deadline();
-  while(ku_task_driver_now_ms()<start.deadline) {
-    CHECK(ku_task_driver_now_ms()<observer);ku_test_thread_yield();
-  }
+  /* The event handoff orders this test-only clock update before the worker's
+   * post-create read. Original D stays2000; scheduler speed cannot skip the
+   * create barrier or manufacture a product failure. */
+  fixture_start_clock_override=2000u;
   CHECK(ku_test_event_set(&fixture_spawn_release));
   CHECK(ku_test_thread_join(&starter,2000) && starter.outcome==KU_TASK_BLOCKING_START_EXPIRED);
-  fixture_gate_pool_spawn=0;
+  fixture_gate_pool_spawn=0;fixture_start_clock_override=0u;
   CHECK(pool.workers_created==1u && !pool.queued && !pool.resident && !pool.closing && !pool.fault);
   CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
   CHECK(pool.workers_joined==1u && !pool.storage);

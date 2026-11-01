@@ -1308,8 +1308,12 @@ int main(void) {
   elastic_pg_fail_start=1;
   CHECK(ku_task_net_dispatch(&pool,0u,1u,pool.jobs[1].generation,0u)==KU_TASK_DRIVER_OK);
   CHECK(!pool.workers_created && !pool.fault && !pool.closing && !pool.queued && !pool.running);
+  /* Executor startup is a Task error, not a server/libpq error. The shared
+   * error_is helper deliberately requires the pg domain for wire failures. */
   CHECK(!pool.jobs[1].pg_operation && pool.jobs[1].state==KU_TASK_BLOCKING_DONE
-      && error_is(pool.jobs[1].pg_result,"worker_start_failed") && !budgets[1].bytes);
+      && !pool.jobs[1].pg_result.ok && !pool.jobs[1].pg_result.value
+      && equals(pool.jobs[1].pg_result.error.domain,"task")
+      && equals(pool.jobs[1].pg_result.error.code,"worker_start_failed") && !budgets[1].bytes);
   CHECK(pool.jobs[0].state==KU_TASK_BLOCKING_NET_WAIT && pool.jobs[0].pg_operation==held
       && client->active==1u && !client->connect_in_flight && !client->in_use[1]
       && starts==before_starts && user_sends==before_sends);
