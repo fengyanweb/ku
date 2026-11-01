@@ -1,0 +1,53 @@
+{
+  "upstream_tag": "REL_18_6",
+  "core_lines": 104,
+  "files": {
+    "meson.build": {
+      "before_sha256": "a48abdec9b47a5b9096ee258032f1564dfe0b30200de0e5fda9706412bbe2c35",
+      "after_sha256": "27306efdfe659633f805e832612dafc7ff729a0f86449d079ee48ab300e36e8b"
+    },
+    "meson_options.txt": {
+      "before_sha256": "91b9a0637848204672baad22ca9fdb67173a78e969b12d85677a1e93b8c776c2",
+      "after_sha256": "ef7e68c6470f711cc1c9ed9d3bda31e5e2a90a51356627ac548b792cb63f7875"
+    },
+    "src/interfaces/libpq/Makefile": {
+      "before_sha256": "4d3be30e88945e133b49c84d4c3fd8e38b0ee4ab9bc041d8709536f16a5313fb",
+      "after_sha256": "af351852b4c8213502ff9bd3451f4e69adb0396603029b44fe66b5820607b7ef"
+    },
+    "src/interfaces/libpq/fe-connect.c": {
+      "before_sha256": "44a6e386cbfd67ebe768d6ef5493098119c2e6b4796239d53e5ed7b122b206a5",
+      "after_sha256": "86a0be3342b18171a3916624f64eb2f4d856d3c286e8b9ea4b00e85f92fae1f7"
+    },
+    "src/interfaces/libpq/meson.build": {
+      "before_sha256": "ae85c8b4e24a54e2d38052b11156aa7b32c95a2bbef3cfd9096f81c90abec864",
+      "after_sha256": "106f8a5617802107fb4743b17cc510192903e7e91fb064a10f74f4aa4ea0f95c"
+    }
+  },
+  "diffstat": [
+    {
+      "file": "meson.build",
+      "added": 10,
+      "removed": 0
+    },
+    {
+      "file": "meson_options.txt",
+      "added": 3,
+      "removed": 0
+    },
+    {
+      "file": "src/interfaces/libpq/Makefile",
+      "added": 20,
+      "removed": 1
+    },
+    {
+      "file": "src/interfaces/libpq/fe-connect.c",
+      "added": 111,
+      "removed": 0
+    },
+    {
+      "file": "src/interfaces/libpq/meson.build",
+      "added": 4,
+      "removed": 1
+    }
+  ]
+}

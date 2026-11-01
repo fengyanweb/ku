@@ -1,0 +1,223 @@
+--- a/meson.build
++++ b/meson.build
+@@ -3322,6 +3322,7 @@
+ )
+ 
+ # Dependencies both for static and shared libpq
++libpq_deps_no_ldap = libpq_deps + [thread_dep, gssapi, libintl, ssl]
+ libpq_deps += [
+   thread_dep,
+ 
+@@ -3330,6 +3331,15 @@
+   libintl,
+   ssl,
+ ]
++
++libpq_shared_deps = libpq_deps
++if get_option('dynamic_ldap')
++  if host_system != 'linux' or not ldap_r.found()
++    error('dynamic_ldap requires Linux with LDAP support')
++  endif
++  ldap_compile_dep = ldap_r.partial_dependency(compile_args: true, includes: true)
++  libpq_shared_deps = libpq_deps_no_ldap + [ldap_compile_dep, dl_dep]
++endif
+ 
+ libpq_oauth_deps += [
+   thread_dep,
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -100,6 +100,9 @@
+ option('ldap', type: 'feature', value: 'auto',
+   description: 'LDAP support')
+ 
++option('dynamic_ldap', type: 'boolean', value: false,
++  description: 'Isolated Linux shared-libpq OpenLDAP SONAME-2 loader candidate')
++
+ option('libcurl', type : 'feature', value: 'auto',
+   description: 'libcurl support')
+ 
+--- a/src/interfaces/libpq/Makefile
++++ b/src/interfaces/libpq/Makefile
+@@ -69,6 +69,25 @@
+ fe-auth-oauth_shlib.o: override CPPFLAGS_SHLIB += -DUSE_DYNAMIC_OAUTH
+ OBJS_SHLIB = fe-auth-oauth_shlib.o
+ 
++# Isolated opt-in Linux/shared candidate; static LDAP linking stays unchanged.
++LDAP_SHLIB_LINK = $(LDAP_LIBS_FE)
++ifeq ($(DYNAMIC_LDAP),1)
++ifneq ($(PORTNAME),linux)
++$(error DYNAMIC_LDAP=1 is supported only on Linux)
++endif
++ifeq ($(strip $(LDAP_LIBS_FE)),)
++$(error DYNAMIC_LDAP=1 requires LDAP support)
++endif
++OBJS := $(filter-out fe-connect.o,$(OBJS))
++OBJS_STATIC += fe-connect.o
++fe-connect_shlib.o: override CPPFLAGS_SHLIB += -DUSE_DYNAMIC_LDAP
++OBJS_SHLIB += fe-connect_shlib.o
++LDAP_SHLIB_LINK =
++# Preserve LDAP transitive libraries for static consumers of pkg-config.
++%.pc: override LDAP_SHLIB_LINK = $(LDAP_LIBS_FE)
++endif
++
++
+ ifeq ($(PORTNAME), cygwin)
+ override shlib = cyg$(NAME)$(DLSUFFIX)
+ endif
+@@ -87,7 +106,7 @@
+ # that are built correctly for use in a shlib.
+ SHLIB_LINK_INTERNAL = -lpgcommon_shlib -lpgport_shlib
+ ifneq ($(PORTNAME), win32)
+-SHLIB_LINK += $(filter -lcrypt -ldes -lcom_err -lcrypto -lk5crypto -lkrb5 -lgssapi_krb5 -lgss -lgssapi -lssl -lsocket -lnsl -lresolv -lintl -ldl -lm, $(LIBS)) $(LDAP_LIBS_FE) $(PTHREAD_LIBS)
++SHLIB_LINK += $(filter -lcrypt -ldes -lcom_err -lcrypto -lk5crypto -lkrb5 -lgssapi_krb5 -lgss -lgssapi -lssl -lsocket -lnsl -lresolv -lintl -ldl -lm, $(LIBS)) $(LDAP_SHLIB_LINK) $(PTHREAD_LIBS)
+ else
+ SHLIB_LINK += $(filter -lcrypt -ldes -lcom_err -lcrypto -lk5crypto -lkrb5 -lgssapi32 -lssl -lsocket -lnsl -lresolv -lintl -lm $(PTHREAD_LIBS), $(LIBS)) $(LDAP_LIBS_FE)
+ endif
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -5430,6 +5430,110 @@
+ 
+ #ifdef USE_LDAP
+ 
++/* Isolated Linux/OpenLDAP SONAME-2 candidate; shared library only. */
++#ifdef USE_DYNAMIC_LDAP
++#if !defined(__linux__) || defined(WIN32)
++#error USE_DYNAMIC_LDAP is supported only by the isolated Linux candidate
++#endif
++#include <dlfcn.h>
++
++/* Keep declarations and every matching release operation in one library. */
++typedef struct
++{
++	LDAP *(*init) (const char *, int);
++	int (*set_option) (LDAP *, int, const void *);
++	int (*simple_bind) (LDAP *, const char *, const char *);
++	int (*result) (LDAP *, int, int, struct timeval *, LDAPMessage **);
++	int (*msgfree) (LDAPMessage *);
++	int (*search_st) (LDAP *, const char *, int, const char *, char **, int,
++					 struct timeval *, LDAPMessage **);
++	char *(*err2string) (int);
++	int (*unbind) (LDAP *);
++	int (*count_entries) (LDAP *, LDAPMessage *);
++	LDAPMessage *(*first_entry) (LDAP *, LDAPMessage *);
++	struct berval **(*get_values_len) (LDAP *, LDAPMessage *, const char *);
++	void (*value_free_len) (struct berval **);
++} LibpqLdapAPI;
++
++static LibpqLdapAPI libpq_ldap_api;
++static void *libpq_ldap_module;
++static pthread_mutex_t libpq_ldap_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static bool
++libpq_ldap_load(PQExpBuffer errorMessage)
++{
++	LibpqLdapAPI next = {0};
++	void *module;
++	int lockerr;
++
++	lockerr = pthread_mutex_lock(&libpq_ldap_mutex);
++	if (lockerr != 0)
++	{
++		libpq_append_error(errorMessage, "could not lock LDAP loader (%d)", lockerr);
++		return false;
++	}
++	if (libpq_ldap_module != NULL)
++	{
++		pthread_mutex_unlock(&libpq_ldap_mutex);
++		return true;
++	}
++
++	/* Preserve normal constructors and global symbol scope after first use. */
++	module = dlopen("libldap.so.2", RTLD_NOW | RTLD_GLOBAL);
++	if (module == NULL)
++	{
++		libpq_append_error(errorMessage, "could not load LDAP library libldap.so.2");
++		pthread_mutex_unlock(&libpq_ldap_mutex);
++		return false;
++	}
++#define LOAD_LDAP(member, symbol) \
++	do { \
++		if ((next.member = dlsym(module, symbol)) == NULL) \
++		{ \
++			libpq_append_error(errorMessage, "LDAP library lacks required symbol %s", symbol); \
++			goto fail; \
++		} \
++	} while (0)
++	LOAD_LDAP(init, "ldap_init");
++	LOAD_LDAP(set_option, "ldap_set_option");
++	LOAD_LDAP(simple_bind, "ldap_simple_bind");
++	LOAD_LDAP(result, "ldap_result");
++	LOAD_LDAP(msgfree, "ldap_msgfree");
++	LOAD_LDAP(search_st, "ldap_search_st");
++	LOAD_LDAP(err2string, "ldap_err2string");
++	LOAD_LDAP(unbind, "ldap_unbind");
++	LOAD_LDAP(count_entries, "ldap_count_entries");
++	LOAD_LDAP(first_entry, "ldap_first_entry");
++	LOAD_LDAP(get_values_len, "ldap_get_values_len");
++	LOAD_LDAP(value_free_len, "ldap_value_free_len");
++#undef LOAD_LDAP
++
++	/* Publish only a complete table, retaining its DSO for process lifetime. */
++	libpq_ldap_api = next;
++	libpq_ldap_module = module;
++	pthread_mutex_unlock(&libpq_ldap_mutex);
++	return true;
++
++fail:
++	dlclose(module);
++	pthread_mutex_unlock(&libpq_ldap_mutex);
++	return false;
++}
++
++#define ldap_init (*libpq_ldap_api.init)
++#define ldap_set_option (*libpq_ldap_api.set_option)
++#define ldap_simple_bind (*libpq_ldap_api.simple_bind)
++#define ldap_result (*libpq_ldap_api.result)
++#define ldap_msgfree (*libpq_ldap_api.msgfree)
++#define ldap_search_st (*libpq_ldap_api.search_st)
++#define ldap_err2string (*libpq_ldap_api.err2string)
++#define ldap_unbind (*libpq_ldap_api.unbind)
++#define ldap_count_entries (*libpq_ldap_api.count_entries)
++#define ldap_first_entry (*libpq_ldap_api.first_entry)
++#define ldap_get_values_len (*libpq_ldap_api.get_values_len)
++#define ldap_value_free_len (*libpq_ldap_api.value_free_len)
++#endif /* USE_DYNAMIC_LDAP */
++
+ #define LDAP_URL	"ldap://"
+ #define LDAP_DEF_PORT	389
+ #define PGLDAP_TIMEOUT 2
+@@ -5613,6 +5717,13 @@
+ 		return 3;
+ 	}
+ 
++#ifdef USE_DYNAMIC_LDAP
++	if (!libpq_ldap_load(errorMessage))
++	{
++		free(url);
++		return 3;
++	}
++#endif
+ 	/* initialize LDAP structure */
+ 	if ((ld = ldap_init(hostname, port)) == NULL)
+ 	{
+--- a/src/interfaces/libpq/meson.build
++++ b/src/interfaces/libpq/meson.build
+@@ -48,6 +48,9 @@
+ 
+ # The OAuth implementation differs depending on the type of library being built.
+ libpq_so_c_args = ['-DUSE_DYNAMIC_OAUTH']
++if get_option('dynamic_ldap')
++  libpq_so_c_args += ['-DUSE_DYNAMIC_LDAP']
++endif
+ 
+ # Not using both_libraries() here as
+ # 1) resource files should only be in the shared library
+@@ -74,7 +77,7 @@
+   version: '5.' + pg_version_major.to_string(),
+   soversion: host_system != 'windows' ? '5' : '',
+   darwin_versions: ['5', '5.' + pg_version_major.to_string()],
+-  dependencies: [frontend_shlib_code, libpq_deps],
++  dependencies: [frontend_shlib_code, libpq_shared_deps],
+   link_depends: export_file,
+   link_args: export_fmt.format(export_file.full_path()),
+   kwargs: default_lib_args,
