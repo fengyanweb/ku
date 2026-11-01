@@ -37,8 +37,8 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 def validate_screen_selection(a,build_set):
     if getattr(a,'http_short_screen',False):
-        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory'):
-            raise ValueError('--http-short-goal must be cpu or memory')
+        if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','memory-probe'):
+            raise ValueError('--http-short-goal must be cpu, memory or memory-probe')
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
             raise ValueError('--http-short-screen requires diagnostic build-set and no other opt-in screen')
@@ -260,6 +260,7 @@ def normal_self_plan(versions):
 
 
 def http_short_plan(versions,goal='cpu'):
+    if goal=='memory-probe':return http_memory_probe_plan(versions)
     if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     controls=[dict(name='A',phase='environment-control',workload='json_object',contract='dom',group=g,
         rate=500,warmup_seconds=5,score_seconds=10) for g in (1,2,3)]
@@ -286,6 +287,7 @@ def http_short_plan(versions,goal='cpu'):
 
 
 def http_short_comparison(rows,complete,environment=None,goal='cpu'):
+    if goal=='memory-probe':return http_memory_probe_comparison(rows,complete,environment)
     if goal not in ('cpu','memory'):raise ValueError('HTTP short goal must be cpu or memory')
     result=dict(complete=complete,eligible_for_root_review=False,candidate_accepted=False,comparisons={},
         formal_qualified=False,normal_score_eligible=False,reasons=[],environment_qualification=environment,http_short_goal=goal)
@@ -325,6 +327,54 @@ def http_short_comparison(rows,complete,environment=None,goal='cpu'):
     if result['compute_guard']['B_over_A']>1.03:result['reasons'].append('coarse compute ratio>1.03')
     result['eligible_for_root_review']=not result['reasons']
     result['note']='Screen evidence only; no significant CPU increase is not proof of strictly zero cost. CI crossing1 does not prove equivalence. Raw host/CPU/memory/arrival review and adoption remain with root.'
+    return result
+
+
+def http_memory_probe_plan(versions):
+    # Keep both existing23-window plans byte-for-byte unchanged. This opt-in
+    # preliminary gate reuses their original three A environment controls.
+    plan=http_short_plan(versions,'memory')
+    controls=plan['windows'][:3]
+    business=[dict(row,score_seconds=5) for row in plan['windows'][3:] if row['workload']=='json_object']
+    plan.update(http_short_goal='memory-probe',windows=controls+business,maximum_windows=9,
+        observation_alarm_seconds=330,preliminary_only=True,expected_business_correct=2500,
+        automatic_expansion=False,
+        purpose='Three original frozen-A environment controls followed by only three JSON500/s A/B pairs '
+                'in AB/BA/AB order, warmup3s/score5s. Whole-service memory preliminary stop-loss only; '
+                'no ok/PG/compute windows, retries, replacement, formal acceptance or automatic expansion. '
+                'Only a passing memory/JSON-CPU gate may be sent to root for later complete guards.')
+    plan['adoption_thresholds']['final_decision']='Preliminary gate only; root must run remaining guards before any adoption. Original5%/upper95 memory gate is unchanged.'
+    return plan
+
+
+def http_memory_probe_comparison(rows,complete,environment=None):
+    result=dict(complete=complete,preliminary_only=True,http_short_goal='memory-probe',
+        eligible_for_root_review=False,eligible_for_guard_followup=False,candidate_accepted=False,
+        formal_qualified=False,normal_score_eligible=False,automatic_expansion=False,
+        comparisons={},reasons=[],environment_qualification=environment,
+        memory_scope='Whole service cgroup memory.current sampled during score; middle60% median; not endpoints, RSS, virtual or requested bytes')
+    if not environment or environment.get('quality')!='pass':
+        result['reasons'].append('environment qualification unresolved or failed')
+    if not complete:
+        result['reasons'].append('incomplete or invalid observation/cleanup; no scoring or retry');return result
+    selected=[r for r in rows if r['phase']!='environment-control']
+    if len(selected)!=6 or {(r['group'],r['name']) for r in selected}!={(g,n) for g in (1,2,3) for n in ('A','B')}:
+        result['reasons'].append('three complete JSON A/B pairs required');return result
+    if any(r['workload']!='json_object' or r.get('correct')!=2500 or r.get('all_correct') is not True for r in selected):
+        result['reasons'].append('each business window requires exactly2500 correct JSON responses');return result
+    if any(r.get('environment_quality')!='pass' for r in selected):
+        result['reasons'].append('one or more business windows have unresolved environment qualification')
+    pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]
+    result['comparisons']['json_object']=cpu=fc.paired_interval([p['B'].get('full_cpu_us') for p in pairs],
+        [p['A'].get('full_cpu_us') for p in pairs],minimum=3)
+    result['json_memory']=memory=fc.paired_interval([fc.metric(p['B'],'memory.steady_median_bytes') for p in pairs],
+        [fc.metric(p['A'],'memory.steady_median_bytes') for p in pairs],minimum=3)
+    if memory.get('status')!='estimated' or memory['estimate']>.95 or memory['upper95']>=1:
+        result['reasons'].append('JSON service memory criterion not demonstrated: geometric B/A<=.95 and upper95<1 required')
+    if cpu.get('status')!='estimated' or cpu['lower95']>1 or cpu['upper95']>1.03:
+        result['reasons'].append('json_object CPU guard requires lower95<=1 and upper95<=1.03')
+    result['eligible_for_root_review']=result['eligible_for_guard_followup']=not result['reasons']
+    result['note']='Preliminary stop-loss evidence only. A failed gate rejects expansion; a passing gate still requires root to run the omitted guards. No automatic adoption or23-window expansion.'
     return result
 
 
@@ -2381,8 +2431,8 @@ def main(argv=None):
     p.add_argument('--final-task-json',action='store_true',help='Separate formal Task JSON15-window supplement; full/performance-v2 only, never replaces original80/16')
     p.add_argument('--pg-failure-probe',action='store_true',help='One normal B PG12800 failure observation; diagnostic build-set only, no retries or performance score')
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
-    p.add_argument('--http-short-goal',choices=['cpu','memory'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
-    p.add_argument('--http-short-screen',action='store_true',help='Explicit23-window control+normal A/B single HTTP candidate diagnostic; frozen 3e5f18e prepatch, no capacity or adoption claim')
+    p.add_argument('--http-short-goal',choices=['cpu','memory','memory-probe'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
+    p.add_argument('--http-short-screen',action='store_true',help='Explicit control+normal A/B single HTTP candidate diagnostic (23 windows or9 for memory-probe); frozen 3e5f18e prepatch, no capacity or adoption claim')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
@@ -2426,7 +2476,7 @@ def main(argv=None):
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')
         signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGALRM,stop)
         if a.phase in ('run','tail','lifecycle','compiler'):signal.alarm((150 if a.final_task_json else 130)*60-30)
-        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
+        if a.phase=='diagnostic':signal.alarm(120 if a.memory_owner_probe else 330 if a.http_short_screen and a.http_short_goal=='memory-probe' else 690 if a.http_short_screen else 180 if a.pg_driver_screen else 120 if a.pg_failure_probe else 330 if a.normal_self_probe else 420 if a.pg_queue_screen else 20*60-30)
         if a.phase=='followup-screen':signal.alarm((25+3*len(a.screen_variants))*60-30)
         operation={'build':build,'run':run,'tail':lambda a,s:run(a,s,tail_only=True),
             'lifecycle':lambda a,s:run(a,s,tail_only=True,stability_only=True),'compiler':compiler,'diagnostic':diagnostic,
