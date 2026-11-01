@@ -1,7 +1,10 @@
 """Pure loader-plan/mapping guards; never starts a service or compiler."""
 import copy
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
+import shlex
 import tempfile
 import types
 import unittest
@@ -11,6 +14,42 @@ import libpq_loader_screen as l
 
 
 class LoaderScreenTests(unittest.TestCase):
+    def test_actual_workflow_argv_pass_main_and_wrong_global_baseline_is_rejected(self):
+        workflow=Path(__file__).resolve().parents[3]/'.github/workflows/native-three-os.yml'
+        lines=workflow.read_text().split('\n  libpq-loader-memory:',1)[1].splitlines()
+        commands=[];script='tests/benchmarks/cross_stack/hosted_cycle.py'
+        for i,line in enumerate(lines):
+            if line.strip().startswith('sudo -n -E python3 -B '+script):
+                parts=[]
+                while True:
+                    part=lines[i].strip();parts.append(part.removesuffix('\\'))
+                    if not part.endswith('\\'):break
+                    i+=1
+                tokens=shlex.split(' '.join(parts));commands.append(tokens[tokens.index(script)+1:])
+        self.assertEqual(len(commands),2)
+        self.assertEqual([cmd[cmd.index('--phase')+1] for cmd in commands],['diagnostic','archive'])
+        with tempfile.TemporaryDirectory() as d:
+            temporary=Path(d);source=temporary/'checkout';source.mkdir()
+            root=temporary/'runtime/libpq-loader-memory/memory9'
+            for arm in ('A','B'):
+                (root/arm).mkdir(parents=True);(root/arm/'manifest.json').write_text(json.dumps(dict(uid=1001,gid=1001)))
+            for raw in commands:
+                argv=[arg.replace('$RUNNER_TEMP',str(temporary/'runtime')).replace('$GITHUB_WORKSPACE',str(source)) for arg in raw]
+                phase=argv[argv.index('--phase')+1]
+                self.assertEqual(argv[argv.index('--baseline')+1],h.BASELINE)
+                with self.subTest(phase=phase),patch.object(h.platform,'system',return_value='Linux'),\
+                        patch.object(h.platform,'machine',return_value='aarch64'),patch.object(h.signal,'signal'),\
+                        patch.object(h.signal,'alarm'),patch.object(h,phase,return_value=dict(execution_complete=True,goal_status='unknown')) as operation:
+                    with redirect_stdout(io.StringIO()):self.assertEqual(h.main(argv),0)
+                    operation.assert_called_once()
+                    actual=operation.call_args.args[0]
+                    self.assertEqual((actual.baseline,actual.candidate,actual.prepatch),(h.BASELINE,l.SOURCE,l.SOURCE))
+                    operation.reset_mock();bad=list(argv);bad[bad.index('--baseline')+1]=l.SOURCE
+                    errors=io.StringIO()
+                    with redirect_stderr(errors),self.assertRaises(SystemExit) as raised:h.main(bad)
+                    self.assertEqual(raised.exception.code,2);self.assertIn('frozen full commit identities required',errors.getvalue())
+                    operation.assert_not_called()
+
     def test_all_exact_system_dependencies_are_checked_and_mismatch_stops(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);plan={'libpq_loader':{}}

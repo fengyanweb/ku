@@ -2015,7 +2015,7 @@ jobs:
           sudo -n -E python3 -B tests/benchmarks/cross_stack/hosted_cycle.py \
             --phase diagnostic --root "$RUNNER_TEMP/libpq-loader-memory/memory9" \
             --source "$GITHUB_WORKSPACE" --tools "$GITHUB_WORKSPACE" \
-            --baseline 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
+            --baseline 956727188a058119fdb3790959063f1496ccb4cc \
             --candidate 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
             --prepatch 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
             --build-set diagnostic --http-short-screen --http-short-goal memory-probe --libpq-loader-screen
@@ -2028,7 +2028,7 @@ jobs:
             sudo -n -E python3 -B tests/benchmarks/cross_stack/hosted_cycle.py \
               --phase archive --root "$RUNNER_TEMP/libpq-loader-memory/memory9" \
               --source "$GITHUB_WORKSPACE" --tools "$GITHUB_WORKSPACE" \
-              --baseline 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
+              --baseline 956727188a058119fdb3790959063f1496ccb4cc \
               --candidate 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
               --prepatch 5b6b41138cce4086c19cc7daa24e820c9b6513d8 \
               --build-set diagnostic --http-short-screen --http-short-goal memory-probe --libpq-loader-screen
