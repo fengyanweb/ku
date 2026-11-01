@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +14,20 @@ r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
 
 
 class CheckpointRunnerTests(unittest.TestCase):
+    def test_all_action_refs_are40_hex_and_new_upload_matches_existing_pin(self):
+        text=(r.REPO/'.github/workflows/native-three-os.yml').read_text()
+        uses=re.findall(r'^\s*(?:-\s*)?uses:\s+(\S+)',text,re.M)
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action,r'^[^@]+@[0-9a-f]{40}$')
+        before,added=text.split('\n  normal-owner-checkpoint:',1)
+        existing=set(re.findall(r'uses:\s+(actions/upload-artifact@\S+)',before))
+        new=re.findall(r'uses:\s+(actions/upload-artifact@\S+)',added)
+        self.assertEqual(existing,{'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'})
+        self.assertEqual(new,list(existing))
+    def test_ECHILD_keeps_observation_unknown_and_never_hides_process_residue(self):
+        for mode in ('already-reaped','already-reaped-with-residue'):
+            with self.subTest(mode=mode):self.lifecycle(mode)
     def test_export_manifest_includes_maps_smaps_layout_and_exact_hashes(self):
         with tempfile.TemporaryDirectory() as temp:
             p=Path(temp);(p/'checkpoint').mkdir()
@@ -107,7 +122,9 @@ class CheckpointRunnerTests(unittest.TestCase):
             stack.enter_context(patch.object(r.time,'sleep'))
             stack.enter_context(patch.object(r.lh,'quiet_metrics',return_value=mode!='post-close-not-quiet'))
             stack.enter_context(patch.object(r.signal,'alarm'))
-            stack.enter_context(patch.object(r.os,'waitpid',return_value=(3210,0)))
+            wait=stack.enter_context(patch.object(r.os,'waitpid',return_value=(3210,0)))
+            if mode.startswith('already-reaped'):wait.side_effect=ChildProcessError()
+            if mode=='already-reaped-with-residue':fake_db.stop.return_value=dict(forced=True,cgroup_removed=False,after={'process_count':1})
             capture=stack.enter_context(patch.object(r.checkpoint,'capture_owned'))
             capture.return_value={'owners':{'records':[{}]},'page_metadata':{'available':False,'unavailable_reason':'PFNs unavailable'}}
             if mode=='capture-denied':capture.side_effect=PermissionError('owned proc mem denied')
@@ -124,8 +141,14 @@ class CheckpointRunnerTests(unittest.TestCase):
             self.assertEqual(connection.close.call_count,0 if mode=='JSON-failed' else 1)
             self.assertEqual(capture.call_count,0 if mode=='JSON-failed' else 1)
             self.assertEqual(service.metrics.call_count,1 if mode=='JSON-failed' else 2)
-            self.assertEqual(result['status'],'captured' if mode=='ok' else 'unknown')
-            self.assertTrue(result['natural_cleanup']);self.assertFalse(cgroup.exists())
+            self.assertEqual(result['status'],'captured' if mode in ('ok','already-reaped') else 'unknown')
+            self.assertEqual(result['natural_cleanup'],mode!='already-reaped-with-residue');self.assertFalse(cgroup.exists())
+            if mode.startswith('already-reaped'):
+                self.assertIsNone(result['owned_database_child_reaped'])
+                self.assertIsNone(result['database_wait_status'])
+                self.assertEqual(result['database_waitpid_state'],'already_reaped_or_not_child')
+                self.assertIn('ECHILD alone cannot distinguish',result['database_reap_observation_boundary'])
+                self.assertEqual(result['database_child_cleanup_verified'],mode!='already-reaped-with-residue')
             self.assertEqual(result['performance_windows'],0)
     def test_single_capture_and_all_failure_paths_cleanup_without_retry(self):
         for mode in ('ok','capture-denied','JSON-failed','post-close-not-quiet'):

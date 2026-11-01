@@ -134,6 +134,9 @@ def run_restored(root):
     try:
         fixture = database.Database(fixture_root, base['uid'], base['gid'])
         result['database_start'] = fixture.start()
+        result['database_child_provenance'] = dict(source='database.Database.start -> Harness.launch direct Popen',
+            pid=result['database_start'].get('pid'), cgroup=result['database_start'].get('cgroup'),
+            validation='Database.start validates the owned marker, executable, data directory and cgroup before returning; no waitpid observation is implied.')
         private = json.loads(fixture.manifest_path.read_text())
         base.update(db_url=private['db_url'], db_cgroup=private['db_cgroup'])
         save(service_root / 'manifest.json', base)
@@ -188,11 +191,17 @@ def run_restored(root):
                 try:
                     reaped,status=os.waitpid(db_pid,os.WNOHANG)
                     result['owned_database_child_reaped'] = reaped==db_pid
+                    result['database_waitpid_state'] = 'reaped_by_checkpoint' if reaped==db_pid else 'not_yet_reaped'
                     result['database_wait_status'] = status if reaped==db_pid else None
                 except ChildProcessError:
-                    result['owned_database_child_reaped'] = True
+                    result['owned_database_child_reaped'] = None
+                    result['database_waitpid_state'] = 'already_reaped_or_not_child'
+                    result['database_wait_status'] = None
+                    result['database_reap_observation_boundary'] = ('ECHILD alone cannot distinguish prior reaping from not-a-child. '
+                        'Only the recorded self-created fixture provenance plus zero processes and removed owned cgroup can establish no remaining fixture process; exact reap/exit status remains unknown.')
                 except OSError as error:
                     result['owned_database_child_reaped'] = False
+                    result['database_waitpid_state'] = 'waitpid_error'
                     result['database_reap_error'] = repr(error)[:256]
             owned_parent = Path(base['cgroup_root'])
             if owned_parent.exists():
@@ -203,9 +212,14 @@ def run_restored(root):
                     result['cgroup_parent_error'] = repr(error)[:256]
         finally:
             signal.alarm(0)
+        provenance=result.get('database_child_provenance',{})
+        result['database_child_cleanup_verified'] = (type(db_pid) is int and provenance.get('pid')==db_pid
+            and provenance.get('source')=='database.Database.start -> Harness.launch direct Popen'
+            and natural(result.get('database_cleanup',{}))
+            and result.get('database_waitpid_state') in ('reaped_by_checkpoint','already_reaped_or_not_child'))
         result['natural_cleanup'] = (natural(result.get('service_cleanup', {}), service=True)
             and natural(result.get('database_cleanup', {})) and result.get('empty_parent_cgroup_removed') is True
-            and result.get('owned_database_child_reaped') is True)
+            and result.get('database_child_cleanup_verified') is True)
         if result.get('post_close_quiet') is not True:
             result['status'] = 'unknown'
         if not result['natural_cleanup']:
