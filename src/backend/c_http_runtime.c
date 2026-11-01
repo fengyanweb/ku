@@ -830,8 +830,8 @@ static size_t ku_http_query_fields(const char* target,size_t path_len) {
   }
   return fields;
 }
-static KuObject* ku_http_parse_query(const char* target, size_t path_len) {
-  KuObject* q = ku_object_new(ku_http_map_capacity(ku_http_query_fields(target,path_len)));
+static KuObject* ku_http_parse_query_capacity(const char* target,size_t path_len,size_t capacity) {
+  KuObject* q = ku_object_new(capacity);
   const char* p = target + path_len;
   if (*p != '?') return q;
   p++;
@@ -850,6 +850,9 @@ static KuObject* ku_http_parse_query(const char* target, size_t path_len) {
     if (*amp == '&') p = amp + 1; else break;
   }
   return q;
+}
+static KuObject* ku_http_parse_query(const char* target,size_t path_len) {
+  return ku_http_parse_query_capacity(target,path_len,ku_http_map_capacity(ku_http_query_fields(target,path_len)));
 }
 /* Request header lines -> KuObject{lowercased-name -> trimmed-value}, matching the
    interpreter (header names lowercased, names and values trimmed). */
@@ -1325,19 +1328,26 @@ static int ku_http_json_input_bounded(const KuHttpInput* input,const KuHttpJsonW
       && ku_http_json_work_fits(work->output,values,16384u)
       && ku_http_json_work_fits(work->nodes,values,256u);
 }
-static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
+static size_t ku_http_projection_bytes_with_query_capacity(KuHttpInput* input,size_t parameters,size_t parameter_names,size_t* query_capacity) {
   unsigned int fields=ku_http_input_fields(input);
   size_t target=strlen(input->target),bytes=sizeof(KuStruct___ku_http_request);
+  if(query_capacity)*query_capacity=0;
   /* Bound every allocated map/string independently. Input/header metadata is
      already charged; body transfer retains this reservation across input drop. */
   if(fields&2u)bytes+=sizeof(KuObject)+ku_http_map_capacity(parameters)*sizeof(KuEntry)
       +parameter_names+input->path_len;
-  if(fields&4u)bytes+=sizeof(KuObject)
-      +ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len))*sizeof(KuEntry)+target*2u;
+  if(fields&4u) {
+    size_t capacity=ku_http_map_capacity(ku_http_query_fields(input->target,input->path_len));
+    if(query_capacity)*query_capacity=capacity;
+    bytes+=sizeof(KuObject)+capacity*sizeof(KuEntry)+target*2u;
+  }
   if(fields&8u)bytes+=strlen(input->method);
   if(fields&16u)bytes+=input->path_len;
   if(fields&32u)bytes+=input->body_len;
   return bytes;
+}
+static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
+  return ku_http_projection_bytes_with_query_capacity(input,parameters,parameter_names,NULL);
 }
 static int ku_http_job_projection(KuHttpJob*,size_t);
 static void ku_http_job_begin(KuHttpJob* job, unsigned long long timeout_ms);
@@ -1362,9 +1372,9 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
     KuSyncExitSignal handler_signal = {0};
     __ku_sync_reset();
     if (route->arity == 1) {
-      size_t parameter_names=0;
+      size_t parameter_names=0,query_capacity=0;
       for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
-      if (!ku_http_job_projection(job,ku_http_projection_bytes(input,route->nparams,parameter_names)))
+      if (!ku_http_job_projection(job,ku_http_projection_bytes_with_query_capacity(input,route->nparams,parameter_names,&query_capacity)))
         return ku_http_status_response(503,"Service Unavailable");
       unsigned int fields=ku_http_input_fields(input);
       KuStruct___ku_http_request req = {0};
@@ -1379,7 +1389,7 @@ static KuStruct___ku_http_response ku_http_execute_request(KuHttpServer* server,
       if(fields&8u)req.method = ku_http_string_copy(method, strlen(method));
       if(fields&16u)req.path = ku_http_string_copy(target, path_len);
       if(fields&32u) { req.body = ku_http_input_take_body(input); }
-      if(fields&4u)req.query = ku_http_parse_query(target, path_len);
+      if(fields&4u)req.query = ku_http_parse_query_capacity(target,path_len,query_capacity);
       if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
       if (route->returns_result) {
         ku_http_job_begin(job, (unsigned long long)server->handler_timeout_ms);
@@ -3197,9 +3207,9 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
   KuStruct___ku_http_request req = {0};
   size_t projection_charge=0;
   if (route->arity == 1) {
-    size_t parameter_names=0;
+    size_t parameter_names=0,query_capacity=0;
     for (size_t i=0;i<route->nparams;i++) parameter_names+=strlen(route->param_names[i]);
-    projection_charge=ku_http_projection_bytes(input,route->nparams,parameter_names);
+    projection_charge=ku_http_projection_bytes_with_query_capacity(input,route->nparams,parameter_names,&query_capacity);
     if (!ku_http_buffer_reserve(connection->budget,projection_charge)) { connection->failure.reason=KU_HTTP_ERROR_PROJECTION; ku_http_connection_status(connection,server,503); return 1; }
     unsigned int fields=ku_http_input_fields(input);
     if(fields&2u) {
@@ -3211,7 +3221,7 @@ static int ku_http_async_submit(KuHttpConnection* connection, KuHttpServer* serv
     if(fields&8u)req.method = ku_http_string_copy(method,strlen(method));
     if(fields&16u)req.path = ku_http_string_copy(target,path_len);
     if(fields&32u)req.body = ku_http_string_copy(body_buf ? body_buf : "",body_len);
-    if(fields&4u)req.query = ku_http_parse_query(target,path_len);
+    if(fields&4u)req.query = ku_http_parse_query_capacity(target,path_len,query_capacity);
     if(fields&1u) {req.headers = input->headers; input->headers = NULL;}
   }
   KuHttpLoopOwner* owner = ku_http_current_loop;
