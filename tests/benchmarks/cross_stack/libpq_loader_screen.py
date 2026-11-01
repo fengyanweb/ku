@@ -21,6 +21,13 @@ OPTIONAL=('libldap.so.2.0.200','liblber.so.2.0.200','libsasl2.so.2.0.25',
 def digest(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def reused_owner(root):
+    owners=[{key:json.loads((Path(root)/arm/'manifest.json').read_text())[key] for key in ('uid','gid')} for arm in ('A','B')]
+    if owners[0]!=owners[1] or any(type(value)is not int or value<=0 for value in owners[0].values()):
+        raise ValueError('same ordinary uid/gid required for reused inputs')
+    return owners[0]
+
+
 def validate_selection(a,build_set):
     if (not getattr(a,'http_short_screen',False) or build_set!='diagnostic'
             or getattr(a,'http_short_goal',None)!='memory-probe'
@@ -136,6 +143,7 @@ def prepare(original_root,output,libraries,current_c_proof,current_c):
     if digest(emitted)!=C_SHA:raise ValueError('current complete C changed')
     original_manifest=original_root/'B/manifest.json'
     base=json.loads(original_manifest.read_text().replace('${EVIDENCE_ROOT}',str(original_root)))
+    base['cgroup_root']='/sys/fs/cgroup/ku-loader-'+hashlib.sha256(str(output).encode()).hexdigest()[:12]
     # The compile-time libpq remains distro D; never rewrite its hash as A/B.
     build=base['stacks']['ku']['build']
     old_source=build['libpq_source']

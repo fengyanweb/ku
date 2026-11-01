@@ -2482,6 +2482,10 @@ def main(argv=None):
     identity=hosted_identity(a,a.build_set)
     state=load(a.root/'hosted-state.json') if (a.root/'hosted-state.json').exists() else {'identity':identity,'steps':{},'goal_status':'unknown'}
     if state['identity']!=identity and a.phase!='archive':p.error('identity changed; new root required')
+    if a.libpq_loader_screen and a.phase!='archive':
+        owners=lps.reused_owner(a.root)
+        if any(key in state and state[key]!=value for key,value in owners.items()):p.error('reused service owner identity changed')
+        state.update(owners)
     if a.phase=='archive':result=archive(a,state)
     else:
         def stop(*unused):raise KeyboardInterrupt('hosted coordinator interrupted')

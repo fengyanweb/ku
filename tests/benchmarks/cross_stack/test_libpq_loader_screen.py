@@ -10,6 +10,16 @@ import libpq_loader_screen as l
 
 
 class LoaderScreenTests(unittest.TestCase):
+    def test_reused_service_owner_cannot_be_root_or_differ_between_arms(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            for arm in ('A','B'):
+                (root/arm).mkdir();(root/arm/'manifest.json').write_text(json.dumps(dict(uid=1001,gid=1001)))
+            self.assertEqual(l.reused_owner(root),dict(uid=1001,gid=1001))
+            for uid in (0,True,1002):
+                (root/'B/manifest.json').write_text(json.dumps(dict(uid=uid,gid=1001)))
+                with self.subTest(uid=uid),self.assertRaises(ValueError):l.reused_owner(root)
+
     def test_explicit_same_source_only_and_existing_modes_remain_distinct(self):
         good=dict(http_short_screen=True,http_short_goal='memory-probe',prepatch=l.SOURCE,
             candidate=l.SOURCE,phase='diagnostic',libpq_loader_screen=True)
