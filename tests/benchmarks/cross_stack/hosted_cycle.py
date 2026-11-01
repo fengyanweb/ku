@@ -1553,7 +1553,9 @@ def pg_queue_screen(a,state):
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
-    if loader:lps.validate_bindings(plan,bindings)
+    if loader:
+        lps.validate_bindings(plan,bindings)
+        save(a.root/'system-module-preflight.json',lps.verify_system_modules(plan))
     elif bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
     if short and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')

@@ -1,0 +1,88 @@
+{
+  "claim": "Only original file hashes, not synthetic replacements; extract allowlist on disposable host then remove temporary full archive",
+  "files": [
+    {
+      "archived_sha256": "2ebd00c43806aeee3f20d807283e47038493577f74888ce3cf914babab75d9eb",
+      "bytes": 16226,
+      "mode": 420,
+      "original_sha256": "c12f5c7e9be7312460b025a37b3ecc79b7de8a3a46ed194ed7fa473be254cfb7",
+      "path": "B/manifest.json"
+    },
+    {
+      "archived_sha256": "234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b",
+      "bytes": 695600,
+      "mode": 493,
+      "original_sha256": "234300bba9b6fce603a178701ac289a82108398d5f35de3c0a7ad585f082367b",
+      "path": "B/build/bin/ku-server"
+    },
+    {
+      "archived_sha256": "758325f536f4e18a13fae70dd83c7920e0aa71a7241cee1eb975b6ae2c77d3d6",
+      "bytes": 13095808,
+      "mode": 493,
+      "original_sha256": "758325f536f4e18a13fae70dd83c7920e0aa71a7241cee1eb975b6ae2c77d3d6",
+      "path": "B/build/ku-cargo/release/ku"
+    },
+    {
+      "archived_sha256": "b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df",
+      "bytes": 395200,
+      "mode": 420,
+      "original_sha256": "b59de287c314a78cb70e7e0bb31fb2be34b961ccc90beff405d8c48412ace2df",
+      "path": "B/build/libpq/libpq.so"
+    },
+    {
+      "archived_sha256": "59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae",
+      "bytes": 5330,
+      "mode": 420,
+      "original_sha256": "59ede7cdba403d4d038c3720ab65f1cd940efd1038d07df782743a35eb9887ae",
+      "path": "B/build/ku-native/server.ku"
+    },
+    {
+      "archived_sha256": "830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77",
+      "bytes": 2474172,
+      "mode": 420,
+      "original_sha256": "830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77",
+      "path": "B/build/ku-native/.ku/build/release/c/CPkLjMo5cOr7gaP-eyr5YRGcrGvMEuNt83h2b7ezDEs/ku-server.c"
+    },
+    {
+      "archived_sha256": "08f1f4cf722c2c9939dd2b2df3c19951895cddac8dbabd395053a7af1534efbd",
+      "bytes": 7326598,
+      "mode": 493,
+      "original_sha256": "08f1f4cf722c2c9939dd2b2df3c19951895cddac8dbabd395053a7af1534efbd",
+      "path": "Driver/build/bin/cross-stack-client"
+    },
+    {
+      "archived_sha256": "ac9438bbda3ed4298980dcca6c5f4a26536fc871fd24d4ec843c62c17b8a6cf7",
+      "bytes": 14552,
+      "mode": 420,
+      "original_sha256": "ac9438bbda3ed4298980dcca6c5f4a26536fc871fd24d4ec843c62c17b8a6cf7",
+      "path": "Driver/src/tests/benchmarks/cross_stack/protocol.json"
+    },
+    {
+      "archived_sha256": "96e17f4ef99d04bede9f7208d0fa94f8b2f0dbeebc53c417e4b0624e7fda3ae1",
+      "bytes": 937,
+      "mode": 420,
+      "original_sha256": "96e17f4ef99d04bede9f7208d0fa94f8b2f0dbeebc53c417e4b0624e7fda3ae1",
+      "path": "Driver/src/tests/benchmarks/cross_stack/corpora/array.json"
+    },
+    {
+      "archived_sha256": "a5916fe82167409eb847eb0021da550a2c9bcaa224c80f1d62e91210dd72d8af",
+      "bytes": 4116,
+      "mode": 420,
+      "original_sha256": "a5916fe82167409eb847eb0021da550a2c9bcaa224c80f1d62e91210dd72d8af",
+      "path": "Driver/src/tests/benchmarks/cross_stack/corpora/escape.json"
+    },
+    {
+      "archived_sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "bytes": 1048,
+      "mode": 420,
+      "original_sha256": "548a8397f835c17ee8b524054e1da90d00d9293965986c5e48be5692663f5e3a",
+      "path": "Driver/src/tests/benchmarks/cross_stack/corpora/object.json"
+    }
+  ],
+  "servers_started": 0,
+  "source_archive_bytes": 30630168,
+  "source_archive_sha256": "33526a0f802767104d869b8874b7b004fdf69d8567a62a8111d13cef529ea4e8",
+  "source_run": 41280471018,
+  "source_tools_commit": "d553a2a5aa77152d693d88586f3d01fed1ca776c",
+  "total_required_bytes": 24029587
+}

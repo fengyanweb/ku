@@ -5,11 +5,28 @@ from pathlib import Path
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 import hosted_cycle as h
 import libpq_loader_screen as l
 
 
 class LoaderScreenTests(unittest.TestCase):
+    def test_all_exact_system_dependencies_are_checked_and_mismatch_stops(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);plan={'libpq_loader':{}}
+            modules={'/usr/lib/lib%d.so'%i:'a'*64 for i in range(20)}
+            modules['/home/runner/work/_temp/libpq-loader-private-build/common-install/lib/libpq.so.5.18']='b'*64
+            for arm in ('A','B'):
+                p=root/(arm+'.json');p.write_text(json.dumps(dict(runtime_module_sha256=modules)))
+                plan['libpq_loader'][arm]={'build_record':str(p)}
+            with patch.object(Path,'is_file',return_value=True),patch.object(l,'digest',return_value='a'*64) as digest:
+                self.assertEqual(len(l.verify_system_modules(plan)['files']),20);self.assertEqual(digest.call_count,20)
+            with patch.object(Path,'is_file',return_value=True),patch.object(l,'digest',return_value='0'*64),self.assertRaises(ValueError):
+                l.verify_system_modules(plan)
+            modules['/usr/lib/lib0.so']='0'*64
+            (root/'B.json').write_text(json.dumps(dict(runtime_module_sha256=modules)))
+            with self.assertRaises(ValueError):l.verify_system_modules(plan)
+
     def test_reused_service_owner_cannot_be_root_or_differ_between_arms(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d)

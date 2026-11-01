@@ -1,0 +1,21 @@
+{
+  "original": {
+    "path": "/Users/mac/Documents/Ku/\u5b9e\u65bd/HTTP_JSON_PG\u5dee\u8ddd\u95ed\u5408_v3_2026-10-30/pg-zero-d553/raw/B/build/ku-native/.ku/build/release/c/CPkLjMo5cOr7gaP-eyr5YRGcrGvMEuNt83h2b7ezDEs/ku-server.c",
+    "sha256": "830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77",
+    "bytes": 2474172
+  },
+  "current": {
+    "path": "/Users/mac/Documents/Ku/\u5b9e\u65bd/HTTP_JSON_PG\u5dee\u8ddd\u95ed\u5408_v3_2026-10-30/final-analysis/resident-loader-memory-screen-preparation/current-emission/build/ku-native/.ku/build/release/c/hollPRLrA_Zv0HdTmMXXNIWoXCcD9oQbBihxY48u0CQ/ku-server.c",
+    "sha256": "830536089f72ce56118e4e6a1556bbe007f816cc16a3c2f96c0dcff010d14e77",
+    "bytes": 2474172
+  },
+  "byte_equal": true,
+  "cli": "/Users/mac/.local/opt/ku/0.0.19/f85f0ad/aarch64-apple-darwin/ku",
+  "cli_sha256": "d68369e6b7430bbb586467fb92beb9d556f25aea948c5488ac3d10698822973e",
+  "generation_completed": true,
+  "normal_host_compile_completed": false,
+  "host_compile_failure": "KU_PG_LIB exact shared/import target path missing",
+  "old_source_commit": "5b6b41138cce4086c19cc7daa24e820c9b6513d8",
+  "current_F_commit": "3fe0cbf1a7fc92067672f9666571010dcac220c8",
+  "current_P_commit": "f85f0added0ff62953d961e47c65474b1a9871a8"
+}

@@ -103,6 +103,25 @@ def validate_bindings(plan,bindings):
         if manifests[0].get(key)!=manifests[1].get(key):raise ValueError('non-library harness contract differs: '+key)
 
 
+def verify_system_modules(plan):
+    """Recheck exact gate dependencies before any service, never adapt hashes."""
+    expected={}
+    for arm in ('A','B'):
+        record=json.loads(Path(plan['libpq_loader'][arm]['build_record']).read_text())
+        modules=record['runtime_module_sha256']
+        if len(modules)<20:raise ValueError('full gate dependency hashes required')
+        for name,wanted in modules.items():
+            if name=='/home/runner/work/_temp/libpq-loader-private-build/common-install/lib/libpq.so.5.18':continue
+            if not name.startswith('/usr/lib/'):raise ValueError('unexpected non-system gate module: '+name)
+            if name in expected and expected[name]!=wanted:raise ValueError('A/B system module receipts differ')
+            expected[name]=wanted
+    actual={}
+    for name,wanted in sorted(expected.items()):
+        if not Path(name).is_file() or digest(name)!=wanted:raise ValueError('system module changed since gate: '+name)
+        actual[name]=wanted
+    return dict(passed=True,files=actual,scope='All exact non-temp A/B gate dependency paths and SHA256; no fallback or reconfiguration')
+
+
 def check_maps(raw,arm,selected):
     if len(raw)>1<<20:raise ValueError('maps exceeds bounded 1MiB observation')
     paths={line.split(maxsplit=5)[-1] for line in raw.decode().splitlines() if len(line.split(maxsplit=5))==6}
@@ -159,7 +178,7 @@ def prepare(original_root,output,libraries,current_c_proof,current_c):
         (directory/'manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
         artifacts={'runtime libpq':{'path':item['path'],'sha256':item['sha256']},
             'current complete C proof':{'path':str(proof),'sha256':digest(proof)},
-            'current complete C':{'path':str(emitted),'sha256':C_SHA}}
+            'original source5b C with current byte-equality proof':{'path':str(emitted),'sha256':C_SHA}}
         for name,key in [('build record','build_record'),('functional gate','functional_gate'),('source/build identity','source_build_identity')]:
             artifacts[name]={'path':item[key],'sha256':item[key+'_sha256']}
         versions[arm]=dict(root=str(directory),stack='ku',source_commit=SOURCE,binary_sha256=ELF_SHA,artifacts=artifacts)
