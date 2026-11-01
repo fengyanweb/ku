@@ -362,8 +362,19 @@ def typed_json_comparison(rows,complete,environment=None):
     if not environment or environment.get('quality')!='pass':result['reasons'].append('environment qualification unresolved or failed')
     if not complete:
         result['reasons'].append('incomplete or invalid observation/cleanup; no scoring or retry');return result
-    if any(r.get('environment_quality')!='pass' for r in rows):result['reasons'].append('one or more windows have unresolved environment qualification')
-    selected=[r for r in rows if r['phase']=='normal' and r['workload']=='json_object']
+    controls=[r for r in rows if r['phase']=='environment-control']
+    business=[r for r in rows if r['phase']!='environment-control']
+    # Control rows precede the independent environment_record result, so their
+    # raw quality remains unknown. As in the original DOM screen, qualify the
+    # controls separately and require pass on every later business/guard row.
+    if len(rows)!=11 or {(r.get('name'),r.get('group')) for r in controls}!={('A',1),('A',2),('A',3)} or len(controls)!=3:
+        result['reasons'].append('all three controls and eight business/guard windows required');return result
+    if any(r.get('observation_complete') is not True or r.get('natural_reclamation') is not True
+            or {c.get('phase') for c in r.get('client_cleanup',[])}!={'warmup','score'}
+            or any(c.get('cleanup_ok') is not True or c.get('report_present') is not True for c in r.get('client_cleanup',[])) for r in rows):
+        result['reasons'].append('window observation or natural service/client cleanup missing or failed');return result
+    if any(r.get('environment_quality')!='pass' for r in business):result['reasons'].append('one or more business windows have unresolved environment qualification')
+    selected=[r for r in business if r['phase']=='normal' and r['workload']=='json_object']
     if len(selected)!=6 or any(r.get('contract')!='typed' for r in selected):
         result['reasons'].append('six typed JSON windows required; DOM cannot substitute');return result
     pairs=[{r['name']:r for r in selected if r['group']==g} for g in (1,2,3)]

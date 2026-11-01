@@ -44,7 +44,8 @@ class HostedCycleTests(unittest.TestCase):
         for failure in (None,'dom','environment','cpu','compute'):
             rows=[]
             for config in h.http_short_plan({},'typed-json')['windows']:
-                row=dict(config,environment_quality='pass',full_cpu_us=100)
+                row=dict(config,environment_quality='pass',full_cpu_us=100,observation_complete=True,natural_reclamation=True,
+                    client_cleanup=[dict(phase=phase,cleanup_ok=True,report_present=True) for phase in ('warmup','score')])
                 if row['name']=='B':
                     row['full_cpu_us']*=1.04 if row['workload']=='cpu' and failure=='compute' else 1.01 if failure=='cpu' else .8 if row['workload']=='json_object' else 1
                 row['memory']={'steady_median_bytes':2_000_000 if row['name']=='B' else 1_000_000}
@@ -58,6 +59,29 @@ class HostedCycleTests(unittest.TestCase):
                 self.assertEqual(result['json_memory']['estimate'],2)
                 self.assertAlmostEqual(result['comparisons']['json_object']['estimate'],.8)
             self.assertFalse(h.http_short_comparison(rows,False,{'quality':'pass'},'typed-json')['eligible_for_root_review'])
+
+    def test_typed_replay_qualifies_controls_separately_but_rejects_missing_evidence(self):
+        def rows():
+            return [dict(config,environment_quality='unknown' if config['phase']=='environment-control' else 'pass',
+                full_cpu_us=80 if config['name']=='B' and config['workload']=='json_object' else 100,
+                memory={'steady_median_bytes':1_000_000},observation_complete=True,natural_reclamation=True,
+                client_cleanup=[dict(phase=phase,cleanup_ok=True,report_present=True) for phase in ('warmup','score')])
+                for config in h.http_short_plan({},'typed-json')['windows']]
+        for issue in ('none','business-unknown','qualification-fail','qualification-unknown','drop-control','drop-business','drop-compute','missing-cleanup','failed-cleanup','unnatural-exit'):
+            with self.subTest(issue=issue):
+                selected=rows();qualification={'quality':'pass'}
+                if issue=='business-unknown':selected[4]['environment_quality']='unknown'
+                if issue.startswith('qualification-'):qualification['quality']=issue.split('-')[1]
+                if issue=='drop-control':selected.pop(0)
+                if issue=='drop-business':selected.pop(4)
+                if issue=='drop-compute':selected.pop()
+                if issue=='missing-cleanup':selected[4].pop('client_cleanup')
+                if issue=='failed-cleanup':selected[4]['client_cleanup'][1]['cleanup_ok']=False
+                if issue=='unnatural-exit':selected[4]['natural_reclamation']=False
+                result=h.http_short_comparison(selected,True,qualification,'typed-json')
+                self.assertEqual(result['eligible_for_root_review'],issue=='none')
+                self.assertFalse(result['candidate_accepted'])
+                if issue=='none':self.assertEqual(result['comparisons']['json_object']['estimate'],.8)
 
     @staticmethod
     def typed_c_pair():
