@@ -181,6 +181,32 @@ static uint32_t ku_task_net_dispatch(KuTaskBlockingPoolV1* pool,size_t owner,siz
     KuPgAsyncOp* operation=job->pg_operation;
     done=ku_pg_async_step(operation,events,ku_pg_now_ms(),cancelled);
     queue_connect=operation->phase==KU_PG_ASYNC_CONNECT && !operation->connect_ready;
+    if(queue_connect) {
+      if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
+      uint32_t startup=ku_task_blocking_workers_locked(pool,&job->ticket,operation->connect_deadline);
+      ku_task_blocking_unlock(pool);
+      if(startup!=KU_TASK_DRIVER_OK) {
+        /* No worker received this connect. NET_STEP still exclusively owns the
+         * operation; release its empty pool lease without DNS, SQL or retry.
+         * Pool/PG callbacks must run with neither Task-pool mutex held. */
+        ku_pg_mutex_lock(&operation->pool->lock);
+        operation->pool->connect_in_flight=0;operation->connecting=0;
+        uint64_t failed_at=ku_pg_now_ms();
+        if(startup==KU_TASK_BLOCKING_START_EXPIRED && failed_at>=operation->acquire_deadline)
+          ku_pg_async_capture_acquire_locked(operation,failed_at);
+        ku_pg_mutex_unlock(&operation->pool->lock);
+        KuError error=startup==KU_TASK_BLOCKING_START_EXPIRED
+            ? failed_at>=operation->acquire_deadline
+              ? ku_pg_client_acquire_timeout_error("acquire_timeout",sizeof("acquire_timeout")-1,
+                  "timed out acquiring a PostgreSQL client connection",sizeof("timed out acquiring a PostgreSQL client connection")-1)
+              : ku_pg_client_error("connect_timeout",sizeof("connect_timeout")-1,
+                  "timed out connecting a PostgreSQL client connection",sizeof("timed out connecting a PostgreSQL client connection")-1)
+            : ku_task_blocking_error(startup==KU_TASK_BLOCKING_START_FAILED?"worker_start_failed":"blocking_pool_stopped",
+                "blocking worker startup failed before PostgreSQL connect");
+        ku_pg_async_finish(operation,error,0);
+        queue_connect=0;done=1;
+      }
+    }
     if(done && ku_pg_async_can_dispose(operation)) {
       job->pg_result=ku_pg_async_take(operation);
       ku_pg_async_dispose(operation,1);job->pg_operation=NULL;

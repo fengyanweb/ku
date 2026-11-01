@@ -9147,11 +9147,10 @@ static int fixture_blocking_join(pthread_t thread,void** result) {
   int status=pthread_join(thread,result);if(!status)fixture_real_joins++;return status;
 }
 "#;
-    let init_edge =
-        "static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacity,";
+    let init_edge = "static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {";
     assert_eq!(generated.matches(init_edge).count(), 1);
     generated = generated.replacen(init_edge, &format!("{gates}\n{init_edge}"), 1);
-    let pool_init = "status=ku_task_blocking_init(runtime->blocking,runtime->driver.capacity,1u,startup_deadline);";
+    let pool_init = "status=ku_task_blocking_init_policy(runtime->blocking,runtime->driver.capacity,1u,startup_deadline,elastic_workers);";
     assert_eq!(generated.matches(pool_init).count(), 1);
     generated = generated.replacen(pool_init,&format!(r#"
   if(fixture_gate_enabled) {{
@@ -9271,7 +9270,7 @@ int main(void) {
         return;
     };
     let output = run_bounded(
-        &mut Command::new(executable),
+        &mut Command::new(executable).env("KU_HTTP_WORKER_POLICY", "fixed"),
         RUN_TIMEOUT,
         RUN_OUTPUT_LIMITS,
     )

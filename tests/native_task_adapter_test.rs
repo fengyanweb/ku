@@ -1662,6 +1662,8 @@ async fn main(): null! { return ok(null) }
         .replacen("void* pointer=malloc(bytes);", "void* pointer=fixture_output_malloc(bytes);", 1)
         .replacen("    pool->running--;", "    pool->running--; fixture_blocking_done(job->kind);", 1)
         .replacen("pool->storage=calloc(1,pool->storage_bytes);", "pool->storage=fixture_pool_calloc(1,pool->storage_bytes);", 1)
+        .replacen("static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {",
+            "static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {\n  if(fixture_fail_pool_spawn_in!=SIZE_MAX && --fixture_fail_pool_spawn_in==0u)return KU_TASK_BLOCKING_START_FAILED;\n  if(fixture_gate_pool_spawn){CHECK(ku_test_event_set(&fixture_spawn_entered));CHECK(ku_test_event_wait(&fixture_spawn_release,2000));}",1)
         .replacen(
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {",
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n  if (fixture_pool_signal_failure()) { pool->fault=KU_TASK_DRIVER_INTERNAL; return; }",
@@ -1719,7 +1721,9 @@ const BLOCKING_FIXTURE_HOOKS: &str = r#"
 static KuTestEvent fixture_io_entered,fixture_io_release;
 static int fixture_gate_io;
 static size_t fixture_io_calls,fixture_fail_blocking_in=SIZE_MAX;
-static int fixture_fail_pool_storage;
+static int fixture_fail_pool_storage,fixture_elastic_pool,fixture_gate_pool_spawn;
+static size_t fixture_fail_pool_spawn_in=SIZE_MAX,fixture_pool_worker_target=1u;
+static KuTestEvent fixture_spawn_entered,fixture_spawn_release;
 static void* fixture_pool_calloc(size_t count,size_t bytes) {
   if(fixture_fail_pool_storage) { fixture_fail_pool_storage=0; return NULL; }
   return fixture_calloc(count,bytes);
@@ -1831,7 +1835,8 @@ static void blocking_setup(size_t capacity,size_t dynamic_budget) {
   uint64_t deadline=blocking_observation_deadline();
   CHECK(ku_task_driver_init(&blocking_driver,sizeof(blocking_driver),KU_TASK_DRIVER_ABI_VERSION,
       blocking_slots,4,blocking_ring,4,fixed+dynamic_budget,1,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_blocking_init(&blocking_pool,capacity,1,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_init_policy(&blocking_pool,capacity,fixture_pool_worker_target,deadline,fixture_elastic_pool)==KU_TASK_DRIVER_OK);
+  if(fixture_elastic_pool)CHECK(!blocking_pool.workers_created && !blocking_pool.workers_exited);
   CHECK(ku_task_driver_attach_blocking(&blocking_driver,&blocking_pool,sizeof(blocking_pool),
       ku_task_blocking_close,ku_task_blocking_ready,blocking_pool.storage,blocking_pool.storage_bytes)==KU_TASK_DRIVER_OK);
   CHECK(blocking_driver_snapshot().fixed_bytes==fixed);
@@ -2426,6 +2431,103 @@ static void blocking_capacity_storage_is_bounded_and_freed(void) {
     CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   }
 }
+/* A real task submission exercises admission, copies, deferred startup failure,
+ * charge return and a later independent successful file operation. */
+static void blocking_elastic_first_use_and_partial_start(void) {
+  fixture_elastic_pool=1;fixture_pool_worker_target=2u;
+  blocking_setup(2u,8192u);
+  fixture_fail_pool_spawn_in=2u;
+  KuTaskValueV1 failed=blocking_start("elastic-not-written.txt");
+  blocking_take(&failed,"worker_start_failed");blocking_drop(&failed);blocking_idle();
+  CHECK(blocking_pool.workers_created==1u && !blocking_pool.closing && !blocking_pool.fault
+      && !blocking_pool.resident && !blocking_pool.queued && !blocking_pool.running);
+  CHECK(!blocking_work_ledger().bytes && !blocking_driver_snapshot().reserved_bytes);
+  blocking_no_file("elastic-not-written.txt");
+  fixture_fail_pool_spawn_in=SIZE_MAX;
+  KuTaskValueV1 next=blocking_start("elastic-written.txt");blocking_take(&next,NULL);
+  blocking_drop(&next);blocking_idle();
+  CHECK(blocking_pool.workers_created==2u && !blocking_pool.fault && !blocking_pool.resident);
+  CHECK(remove("elastic-written.txt")==0);
+  blocking_finish(blocking_observation_deadline());
+  fixture_pool_worker_target=1u;
+  /* No real blocking operation: close/destroy owns zero OS workers. */
+  blocking_setup(2u,8192u);blocking_finish(blocking_observation_deadline());
+  CHECK(!blocking_pool.workers_created && !blocking_pool.workers_joined);
+  fixture_elastic_pool=0;
+}
+typedef struct FixtureElasticStart {
+  KuTaskBlockingPoolV1* pool;uint64_t deadline;int close;
+} FixtureElasticStart;
+static int blocking_elastic_thread(void* raw) {
+  FixtureElasticStart* start=(FixtureElasticStart*)raw;
+  if(start->close)return (int)ku_task_blocking_close(start->pool);
+  CHECK(!ku_task_blocking_lock(start->pool));
+  uint32_t status=ku_task_blocking_workers_locked(start->pool,NULL,start->deadline);
+  ku_task_blocking_unlock(start->pool);return (int)status;
+}
+static void blocking_elastic_start_close_and_deadline(void) {
+  KuTaskBlockingPoolV1 pool={0};
+  CHECK(ku_task_blocking_init_policy(&pool,2u,2u,blocking_observation_deadline(),1)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_init(&fixture_spawn_entered) && ku_test_event_init(&fixture_spawn_release));
+  fixture_gate_pool_spawn=1;
+  FixtureElasticStart start={&pool,blocking_observation_deadline(),0},close={&pool,0,1};
+  KuTestThread starter={0},closer={0};
+  CHECK(ku_test_thread_start(&starter,blocking_elastic_thread,&start));
+  CHECK(ku_test_event_wait(&fixture_spawn_entered,2000));
+  CHECK(ku_test_thread_start(&closer,blocking_elastic_thread,&close));
+  CHECK(ku_test_event_set(&fixture_spawn_release));
+  CHECK(ku_test_thread_join(&starter,2000) && starter.outcome==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_thread_join(&closer,2000) && closer.outcome==KU_TASK_DRIVER_OK);
+  fixture_gate_pool_spawn=0;
+  CHECK(pool.workers_created==2u && pool.closing && !pool.queued && !pool.resident);
+  CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(pool.workers_joined==2u && !pool.storage);
+  CHECK(ku_test_event_destroy(&fixture_spawn_entered) && ku_test_event_destroy(&fixture_spawn_release));
+  memset(&pool,0,sizeof(pool));
+  CHECK(ku_task_blocking_init_policy(&pool,2u,2u,blocking_observation_deadline(),1)==KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_workers_locked(&pool,NULL,0u)==KU_TASK_BLOCKING_START_EXPIRED);
+  CHECK(!pool.workers_created && !pool.closing && !pool.fault);
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+  /* The first native create returns after the unchanged D. Its real handle
+   * stays owned, but no second thread or queued operation is published. */
+  memset(&pool,0,sizeof(pool));
+  CHECK(ku_task_blocking_init_policy(&pool,2u,2u,blocking_observation_deadline(),1)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_init(&fixture_spawn_entered) && ku_test_event_init(&fixture_spawn_release));
+  fixture_gate_pool_spawn=1;start=(FixtureElasticStart){&pool,ku_task_driver_now_ms()+20u,0};
+  CHECK(ku_test_thread_start(&starter,blocking_elastic_thread,&start));
+  CHECK(ku_test_event_wait(&fixture_spawn_entered,2000));
+  uint64_t observer=blocking_observation_deadline();
+  while(ku_task_driver_now_ms()<start.deadline) {
+    CHECK(ku_task_driver_now_ms()<observer);ku_test_thread_yield();
+  }
+  CHECK(ku_test_event_set(&fixture_spawn_release));
+  CHECK(ku_test_thread_join(&starter,2000) && starter.outcome==KU_TASK_BLOCKING_START_EXPIRED);
+  fixture_gate_pool_spawn=0;
+  CHECK(pool.workers_created==1u && !pool.queued && !pool.resident && !pool.closing && !pool.fault);
+  CHECK(ku_task_blocking_finish(&pool,blocking_observation_deadline())==KU_TASK_DRIVER_OK);
+  CHECK(pool.workers_joined==1u && !pool.storage);
+  CHECK(ku_test_event_destroy(&fixture_spawn_entered) && ku_test_event_destroy(&fixture_spawn_release));
+  fixture_elastic_pool=1;
+  blocking_setup(2u,8192u);
+  CHECK(ku_test_event_init(&fixture_spawn_entered) && ku_test_event_init(&fixture_spawn_release));
+  fixture_gate_pool_spawn=1;
+  KuTaskValueV1 cancelled=blocking_start("elastic-cancelled-before-queue.txt");
+  CHECK(ku_test_event_wait(&fixture_spawn_entered,2000));
+  CHECK(ku_task_control_request_cancel(&cancelled.owner.lease,KU_TASK_CONTROL_CANCELLED,
+      blocking_observation_deadline())==KU_TASK_CONTROL_OK);
+  CHECK(ku_test_event_set(&fixture_spawn_release));
+  CHECK(ku_task_driver_wait_result(&cancelled.ticket,&cancelled.owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  fixture_gate_pool_spawn=0;
+  CHECK(ku_task_control_status(&cancelled.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  blocking_drop(&cancelled);blocking_idle();
+  CHECK(!blocking_pool.queued && !blocking_pool.running && !blocking_pool.resident && !fixture_io_calls);
+  blocking_no_file("elastic-cancelled-before-queue.txt");
+  blocking_finish(blocking_observation_deadline());
+  CHECK(ku_test_event_destroy(&fixture_spawn_entered) && ku_test_event_destroy(&fixture_spawn_release));
+  fixture_elastic_pool=0;
+}
 static void blocking_notification_predicates(void) {
   KuTaskBlockingPoolV1 pool={0};
 #if defined(_WIN32)
@@ -2452,6 +2554,7 @@ static void blocking_notification_predicates(void) {
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==12u);
   blocking_notification_predicates();
+  blocking_elastic_first_use_and_partial_start();blocking_elastic_start_close_and_deadline();
   blocking_capacity_storage_is_bounded_and_freed();
   blocking_queue_and_generation(); blocking_queued_cancel_retires_before_occupied_worker_is_released();
   blocking_late_retirement_keeps_original_deadline();

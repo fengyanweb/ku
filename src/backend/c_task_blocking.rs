@@ -63,7 +63,7 @@ const RUNTIME: &str = r#"
  * malloc. The token conservatively retains the last actual input allocation
  * charge until DONE consumption, even after the worker has freed that input.
  * libc FILE buffers and OS thread stacks are outside this Task byte ledger. */
-enum { KU_TASK_BLOCKING_OUT_OF_MEMORY=48u };
+enum { KU_TASK_BLOCKING_OUT_OF_MEMORY=48u, KU_TASK_BLOCKING_START_FAILED=49u, KU_TASK_BLOCKING_START_EXPIRED=50u };
 enum { KU_TASK_BLOCKING_FREE=0u, KU_TASK_BLOCKING_BUILDING=1u,
        KU_TASK_BLOCKING_QUEUED=2u, KU_TASK_BLOCKING_RUNNING=3u,
        KU_TASK_BLOCKING_DONE=4u, KU_TASK_BLOCKING_NET_WAIT=5u,
@@ -177,6 +177,7 @@ typedef struct KuTaskBlockingSnapshotV1 {
 } KuTaskBlockingSnapshotV1;
 struct KuTaskBlockingPoolV1 {
   uint32_t initialized, resources, closing, fault;
+  uint32_t elastic_workers;
   size_t free_count,retired_slots;
   size_t output_charge_total,cancelled_running,net_wait_count,net_step_count;
 #if KU_TASK_BLOCKING_PG
@@ -737,6 +738,77 @@ static void* ku_task_blocking_thread(void* raw) {
   ku_task_blocking_worker((KuTaskBlockingWorkerV1*)raw); return NULL;
 }
 #endif
+/* Caller owns the pool mutex. Record every actual native thread before any
+ * fallible follow-up, so partial elastic startup has the same join owner as
+ * fixed startup. New workers cannot observe a half-published queue. */
+static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {
+  if(pool->workers_created>=pool->worker_target)return KU_TASK_DRIVER_INTERNAL;
+  KuTaskBlockingWorkerV1* worker=&pool->workers[pool->workers_created];worker->pool=pool;
+#if defined(_WIN32)
+  worker->thread=(HANDLE)_beginthreadex(NULL,
+#if defined(KU_RUNTIME_RESOURCE_CONFIG)
+      (unsigned)ku_runtime_thread_stack_bytes(),
+#else
+      0,
+#endif
+      ku_task_blocking_thread,worker,0,NULL);
+  if(!worker->thread)return KU_TASK_BLOCKING_START_FAILED;
+  pool->workers_created++;
+#else
+  pthread_attr_t attributes;
+  if(pthread_attr_init(&attributes))return KU_TASK_BLOCKING_START_FAILED;
+#if defined(KU_RUNTIME_RESOURCE_CONFIG)
+  if(pthread_attr_setstacksize(&attributes,ku_runtime_thread_stack_bytes())) {
+    return pthread_attr_destroy(&attributes)?KU_TASK_DRIVER_INTERNAL:KU_TASK_BLOCKING_START_FAILED;
+  }
+#endif
+  int creation=pthread_create(&worker->thread,&attributes,ku_task_blocking_thread,worker);
+  int destroyed=pthread_attr_destroy(&attributes);
+  if(creation)return destroyed?KU_TASK_DRIVER_INTERNAL:KU_TASK_BLOCKING_START_FAILED;
+  pool->workers_created++;
+  if(destroyed)return KU_TASK_DRIVER_INTERNAL;
+#endif
+  return KU_TASK_DRIVER_OK;
+}
+/* NET_WAIT/NET_STEP do not need a blocking executor. Only a real worker-queue
+ * publication starts this bounded, unchanged worker target in elastic mode.
+ * No idle retirement/recreation, capacity reduction or deadline reset. A failed
+ * thread creation rejects only this unqueued operation; any recorded partial
+ * workers stay owned and a later operation may request the missing capacity. */
+static uint32_t ku_task_blocking_start_check(const KuTaskDriverTicketV1* ticket,uint64_t deadline) {
+  if(ticket) {
+    uint32_t checked=ku_task_driver_blocking_can_start(ticket);
+    if(checked!=KU_TASK_DRIVER_OK)return checked;
+    if(ku_task_driver_lock(ticket->driver))return KU_TASK_DRIVER_INTERNAL;
+    KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+    if(slot)deadline=ku_task_driver_min(deadline,slot->cancel_deadline);
+    ku_task_driver_unlock(ticket->driver);
+    if(!slot)return KU_TASK_DRIVER_STALE;
+  }
+  uint64_t now=ku_task_driver_now_ms();
+  return now==UINT64_MAX?KU_TASK_DRIVER_INTERNAL:
+      now>=deadline?KU_TASK_BLOCKING_START_EXPIRED:KU_TASK_DRIVER_OK;
+}
+static uint32_t ku_task_blocking_workers_locked(KuTaskBlockingPoolV1* pool,
+    const KuTaskDriverTicketV1* ticket,uint64_t deadline) {
+  if(pool->closing || pool->fault)return KU_TASK_DRIVER_CLOSED;
+  if(pool->workers_created>pool->worker_target
+      || (!pool->elastic_workers && pool->workers_created!=pool->worker_target))
+    return KU_TASK_DRIVER_INTERNAL;
+  while(pool->workers_created<pool->worker_target) {
+    uint32_t status=ku_task_blocking_start_check(ticket,deadline);
+    if(status!=KU_TASK_DRIVER_OK)return status;
+    status=ku_task_blocking_spawn_locked(pool);
+    if(status==KU_TASK_BLOCKING_START_FAILED)return status;
+    if(status!=KU_TASK_DRIVER_OK) {
+      pool->fault=status;ku_task_blocking_set_closing_locked(pool,1u);
+      ku_task_blocking_signal(pool);return status;
+    }
+    status=ku_task_blocking_start_check(ticket,deadline);
+    if(status!=KU_TASK_DRIVER_OK)return status;
+  }
+  return KU_TASK_DRIVER_OK;
+}
 /* All pools in this generated file share the executable-relative base.
  * Concurrent setup refuses the in-progress setup rather than allowing workers
  * to race its old static initialization. State 2 also records a failed base
@@ -755,8 +827,8 @@ static uint32_t ku_task_blocking_prepare_base(void) {
   return KU_TASK_DRIVER_OK;
 #endif
 }
-static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacity,
-    size_t workers, uint64_t deadline) {
+static uint32_t ku_task_blocking_init_policy(KuTaskBlockingPoolV1* pool, size_t capacity,
+    size_t workers, uint64_t deadline, int elastic) {
   if (!pool || !capacity || capacity>KU_TASK_DRIVER_MAX_SLOTS || !workers
       || workers>64u || deadline==UINT64_MAX)
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
@@ -764,7 +836,7 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   uint32_t prepared=ku_task_blocking_prepare_base();
   if (prepared!=KU_TASK_DRIVER_OK) return prepared;
   pool->initialized=KU_TASK_DRIVER_STORAGE_REAPING;
-  pool->capacity=capacity; pool->worker_target=workers;
+  pool->capacity=capacity; pool->worker_target=workers;pool->elastic_workers=elastic!=0;
 #if KU_TASK_BLOCKING_PG
   ku_task_control_atomic_init(&pool->pg_closing_view,1u);
 #endif
@@ -801,37 +873,14 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
   pool->initialized=KU_TASK_DRIVER_STORAGE_LIVE; ku_task_blocking_set_closing_locked(pool,0u);
   uint32_t status=KU_TASK_DRIVER_OK;
-  for (size_t i=0;i<workers;i++) {
+  if(!pool->elastic_workers)for(size_t i=0;i<workers;i++) {
     uint64_t now=ku_task_driver_now_ms();
-    if (now==UINT64_MAX || now>=deadline) {
-      status=now==UINT64_MAX ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_SHUTDOWN_TIMEOUT; break;
+    if(now==UINT64_MAX || now>=deadline) {
+      status=now==UINT64_MAX?KU_TASK_DRIVER_INTERNAL:KU_TASK_DRIVER_SHUTDOWN_TIMEOUT;break;
     }
-    KuTaskBlockingWorkerV1* worker=&pool->workers[i]; worker->pool=pool;
-#if defined(_WIN32)
-    worker->thread=(HANDLE)_beginthreadex(NULL,
-#if defined(KU_RUNTIME_RESOURCE_CONFIG)
-        (unsigned)ku_runtime_thread_stack_bytes(),
-#else
-        0,
-#endif
-        ku_task_blocking_thread,worker,0,NULL);
-    if (!worker->thread) { status=KU_TASK_DRIVER_INTERNAL; break; }
-#else
-    pthread_attr_t attributes;
-    if (pthread_attr_init(&attributes)) { status=KU_TASK_DRIVER_INTERNAL; break; }
-#if defined(KU_RUNTIME_RESOURCE_CONFIG)
-    if (pthread_attr_setstacksize(&attributes,ku_runtime_thread_stack_bytes())) {
-      (void)pthread_attr_destroy(&attributes); status=KU_TASK_DRIVER_INTERNAL; break;
-    }
-#endif
-    int creation=pthread_create(&worker->thread,&attributes,ku_task_blocking_thread,worker);
-    int destroyed=pthread_attr_destroy(&attributes);
-    if (creation) {
-      status=KU_TASK_DRIVER_INTERNAL; break;
-    }
-    if (destroyed) { pool->workers_created++; status=KU_TASK_DRIVER_INTERNAL; break; }
-#endif
-    pool->workers_created++;
+    status=ku_task_blocking_spawn_locked(pool);
+    if(status==KU_TASK_BLOCKING_START_FAILED)status=KU_TASK_DRIVER_INTERNAL;
+    if(status!=KU_TASK_DRIVER_OK)break;
   }
   if (status==KU_TASK_DRIVER_OK) {
     uint64_t now=ku_task_driver_now_ms();
@@ -840,6 +889,11 @@ static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool, size_t capacit
   }
   if (status!=KU_TASK_DRIVER_OK) { ku_task_blocking_set_closing_locked(pool,1u); pool->fault=status; ku_task_blocking_signal(pool); }
   ku_task_blocking_unlock(pool); return status;
+}
+/* Public/internal fixed initializer keeps its established eager semantics. */
+static uint32_t ku_task_blocking_init(KuTaskBlockingPoolV1* pool,size_t capacity,
+    size_t workers,uint64_t deadline) {
+  return ku_task_blocking_init_policy(pool,capacity,workers,deadline,0);
 }
 static uint32_t ku_task_blocking_close(void* raw) {
   KuTaskBlockingPoolV1* pool=(KuTaskBlockingPoolV1*)raw;
@@ -1207,7 +1261,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     return KU_TASK_DRIVER_OK;
   }
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
-  uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
+  uint32_t status=pool->closing || pool->fault || (!pool->elastic_workers && pool->workers_created!=pool->worker_target)
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
   size_t index=0;
   if (status==KU_TASK_DRIVER_OK) status=ku_task_blocking_claim_locked(pool,&index);
@@ -1250,6 +1304,8 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
   }
   job=&pool->jobs[index];
   job->inputs->path=native; job->inputs->content=(KuString){copy,content.len,content.len,KU_STRING_OWNED};
+  status=ku_task_blocking_workers_locked(pool,ticket,UINT64_MAX);
+  if(status!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);goto ku_blocking_rejected;}
   if(ku_task_blocking_state_locked(pool,job,KU_TASK_BLOCKING_QUEUED)!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_INTERNAL;}
   pool->ring[(pool->head+pool->queued)%pool->capacity]=index; pool->queued++;
   if (pool->queued>pool->peak_queued) pool->peak_queued=pool->queued;
@@ -1272,8 +1328,8 @@ ku_blocking_rejected:
   uint32_t reconciled=reconcile(context);
   if (reconciled!=KU_TASK_DRIVER_OK) return reconciled;
   if (status!=KU_TASK_DRIVER_OK) error=ku_task_blocking_error(
-      status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "blocking_pool_stopped",
-      status==KU_TASK_DRIVER_LIMIT ? "blocking input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "blocking input allocation failed" : "blocking pool is closing");
+      status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : status==KU_TASK_BLOCKING_START_FAILED ? "worker_start_failed" : status==KU_TASK_BLOCKING_START_EXPIRED ? "cancelled" : "blocking_pool_stopped",
+      status==KU_TASK_DRIVER_LIMIT ? "blocking input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "blocking input allocation failed" : status==KU_TASK_BLOCKING_START_FAILED ? "blocking worker could not be started" : status==KU_TASK_BLOCKING_START_EXPIRED ? "task deadline passed during worker startup" : "blocking pool is closing");
   /* A valid exists call reports invalid native paths as false. Pool,
    * allocation and accounting failures retain their Task error payload. */
   if (kind==3u && status==KU_TASK_DRIVER_OK) {
@@ -1367,7 +1423,7 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
   else if (kind==7u && *client) timeout=(*client)->write_timeout_ms;
   uint64_t deadline=ku_net_deadline_after_ms(timeout);
   if (ku_task_blocking_lock(pool)) return KU_TASK_DRIVER_INTERNAL;
-  uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
+  uint32_t status=pool->closing || pool->fault || (!pool->elastic_workers && pool->workers_created!=pool->worker_target)
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT : KU_TASK_DRIVER_OK;
   size_t index=0;
   if (status==KU_TASK_DRIVER_OK) status=ku_task_blocking_claim_locked(pool,&index);
@@ -1426,6 +1482,10 @@ static uint32_t ku_task_blocking_submit_net(const KuTaskDriverTicketV1* ticket,
   int reactor_attached=job->net_owner && (ticket->driver->external_loops || ticket->driver->io_wait);
   ku_task_driver_unlock(ticket->driver);
   job->net_plain=reactor_attached && (kind==5u ? !(present & 64u) || !fields[6].as.b : !*client || !(*client)->tls_enabled);
+  if(!job->net_plain || kind==5u) {
+    status=ku_task_blocking_workers_locked(pool,ticket,deadline);
+    if(status!=KU_TASK_DRIVER_OK) {ku_task_blocking_unlock(pool);goto ku_net_blocking_rejected;}
+  }
   status=ku_task_blocking_net_state_locked(pool,job,job->net_plain && kind!=5u
       ? KU_TASK_BLOCKING_NET_WAIT : KU_TASK_BLOCKING_QUEUED);
   if(status!=KU_TASK_DRIVER_OK) {
@@ -1468,8 +1528,8 @@ ku_net_blocking_rejected:
   uint32_t reconciled=reconcile(context);
   if (reconciled!=KU_TASK_DRIVER_OK) return reconciled;
   ku_task_blocking_net_error_result(kind,output,ku_task_blocking_error(
-      status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "blocking_pool_stopped",
-      status==KU_TASK_DRIVER_LIMIT ? "network input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "network input allocation failed" : "blocking pool is closing"));
+      status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : status==KU_TASK_BLOCKING_START_FAILED ? "worker_start_failed" : status==KU_TASK_BLOCKING_START_EXPIRED ? (kind==5u?"connect_timeout":kind==6u?"read_timeout":"write_timeout") : "blocking_pool_stopped",
+      status==KU_TASK_DRIVER_LIMIT ? "network input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "network input allocation failed" : status==KU_TASK_BLOCKING_START_FAILED ? "blocking worker could not be started" : status==KU_TASK_BLOCKING_START_EXPIRED ? "network deadline passed during worker startup" : "blocking pool is closing"));
   return KU_TASK_DRIVER_OK;
 }
 "#;

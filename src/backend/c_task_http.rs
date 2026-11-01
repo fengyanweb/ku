@@ -511,7 +511,9 @@ static uint32_t ku_http_task_runtime_free(void* raw,uint64_t deadline) {
 const BLOCKING_INIT: &str = r#"
   runtime->blocking=(KuTaskBlockingPoolV1*)calloc(1,sizeof(*runtime->blocking));
   if(!runtime->blocking) goto ku_http_task_init_failed;
-  status=ku_task_blocking_init(runtime->blocking,runtime->driver.capacity,1u,startup_deadline);
+  const char* worker_policy=getenv("KU_HTTP_WORKER_POLICY");
+  int elastic_workers=!worker_policy || !strcmp(worker_policy,"elastic");
+  status=ku_task_blocking_init_policy(runtime->blocking,runtime->driver.capacity,1u,startup_deadline,elastic_workers);
   if(status==KU_TASK_DRIVER_OK) {
     if(ku_task_blocking_lock(runtime->blocking))
       ku_http_task_init_cleanup_failed("blocking pool lock failed");

@@ -1230,6 +1230,116 @@ fn native_pg_async_large_utf8_row_yields_at_byte_quantum_and_detaches_storage() 
 }
 
 #[test]
+fn native_pg_elastic_worker_start_failure_keeps_other_waits_and_returns_connect_lease() {
+    let directory = TempDir::new("pg-elastic-start");
+    let sync_fixture = fixture().split_once("fn main(): null! {").unwrap().0;
+    let source = format!(
+        "import http from \"std.http\"\n{}\n{}",
+        sync_fixture,
+        r#"
+fn main(): null! {
+    client = pg.client({conninfo: "hostaddr=127.0.0.1", max_connections: 2})?
+    async fn read(): HttpResponse! {
+        result = client.query("SELECT 3", [])?
+        return ok(http.text(result.value(0, 0)?))
+    }
+    app=http.service()
+    app.get("/read",read)
+    app.listen("127.0.0.1:0")?
+    return ok(null)
+}
+"#
+    );
+    let harness = query_stub_harness_source(&directory, &source)
+        .replacen("int main(void) {", "static int ku_legacy_query_tests(void) {", 1)
+        .replacen("static uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {",
+            "static int elastic_pg_fail_start;\nstatic uint32_t ku_task_blocking_spawn_locked(KuTaskBlockingPoolV1* pool) {\n  if(elastic_pg_fail_start){elastic_pg_fail_start=0;return KU_TASK_BLOCKING_START_FAILED;}",1)
+        + &ASYNC_QUERY_SUITE.replace("int main(void) {", "static int ku_async_sequential_tests(void) {")
+        + PG_ELASTIC_START_SUITE;
+    let path = directory.path().join("pg-elastic-start.c");
+    fs::write(&path, harness).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "pg-elastic-start") else {
+        return;
+    };
+    let output = run_bounded(&mut Command::new(executable), RUN_TIMEOUT, RUN_LIMITS).unwrap();
+    assert!(
+        output.status.success(),
+        "elastic PG startup: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "pg elastic startup closed loop"
+    );
+}
+
+const PG_ELASTIC_START_SUITE: &str = r#"
+static void elastic_pg_event(void* raw,size_t owner){(void)raw;(void)owner;}
+int main(void) {
+  clock_ms=ku_task_driver_now_ms();clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),2,8,1000,1000,2000);CHECK(opened.ok);
+  KuPgClient* client=opened.value;
+  KuTaskDriverV1 driver={0};KuTaskDriverSlotV1 slots[2]={{0}};size_t ring[2]={0};
+  CHECK(ku_task_driver_init_external(&driver,sizeof(driver),KU_TASK_DRIVER_ABI_VERSION,slots,2,ring,2,
+      1048576u,1u,ku_task_driver_now_ms()+2000u,NULL,elastic_pg_event)==KU_TASK_DRIVER_OK);
+  KuTaskBlockingPoolV1 pool={0};
+  CHECK(ku_task_blocking_init_policy(&pool,2u,1u,ku_task_driver_now_ms()+2000u,1)==KU_TASK_DRIVER_OK);
+  CHECK(!pool.workers_created && !pool.fault);
+  AsyncBudget budgets[2]={{0}};KuTaskControlV1 controls[2]={{0}};
+  KuPgAsyncOp* held=async_create(client,&budgets[0]);mode_on_send=T_READ_TIMEOUT;
+  CHECK(!ku_pg_async_step(held,0,clock_ms,0) && held->slot>=0 && held->sent);
+  KuPgAsyncOp* connecting=async_create(client,&budgets[1]);
+  CHECK(!ku_task_blocking_lock(&pool));
+  for(size_t i=0;i<2u;i++) {
+    /* This fixture owns two synthetic RUNNING tickets; no generated frame or
+     * executable owner is forged or dispatched. Only the real PG state machine
+     * and real pool publication/retirement helpers execute below. */
+    ku_task_control_atomic_init(&controls[i].phase,KU_TASK_CONTROL_LIVE);
+    slots[i].state=KU_TASK_DRIVER_RUNNING;slots[i].generation=1u;slots[i].binding=&controls[i];
+    slots[i].driver_lease.control=&controls[i];slots[i].blocking_pending=1u;slots[i].cancel_deadline=UINT64_MAX;
+    size_t index=SIZE_MAX;CHECK(ku_task_blocking_claim_locked(&pool,&index)==KU_TASK_DRIVER_OK && index==i);
+    KuTaskBlockingJobV1* job=&pool.jobs[i];job->kind=9u;job->pg_pool=&pool;job->net_owner=1u;
+    job->ticket=(KuTaskDriverTicketV1){&driver,i,1u};job->pg_operation=i?connecting:held;job->pg_ready=1u;
+    CHECK(ku_task_blocking_net_state_locked(&pool,job,KU_TASK_BLOCKING_NET_WAIT)==KU_TASK_DRIVER_OK);
+  }
+  ku_task_blocking_unlock(&pool);
+  size_t before_starts=starts,before_sends=user_sends;
+  elastic_pg_fail_start=1;
+  CHECK(ku_task_net_dispatch(&pool,0u,1u,pool.jobs[1].generation,0u)==KU_TASK_DRIVER_OK);
+  CHECK(!pool.workers_created && !pool.fault && !pool.closing && !pool.queued && !pool.running);
+  CHECK(!pool.jobs[1].pg_operation && pool.jobs[1].state==KU_TASK_BLOCKING_DONE
+      && error_is(pool.jobs[1].pg_result,"worker_start_failed") && !budgets[1].bytes);
+  CHECK(pool.jobs[0].state==KU_TASK_BLOCKING_NET_WAIT && pool.jobs[0].pg_operation==held
+      && client->active==1u && !client->connect_in_flight && !client->in_use[1]
+      && starts==before_starts && user_sends==before_sends);
+  ku_error_drop(&pool.jobs[1].pg_result.error);
+  CHECK(!ku_task_blocking_lock(&pool));
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[1],1u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_blocking_workers_locked(&pool,NULL,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  CHECK(pool.workers_created==1u && pool.jobs[0].state==KU_TASK_BLOCKING_NET_WAIT && !pool.fault);
+  ku_task_blocking_unlock(&pool);
+  CHECK(async_finish(held,1));async_drop_output(held,&budgets[0],0);
+  CHECK(!client->active && !client->connect_in_flight && !client->async_operations);
+  CHECK(!ku_task_blocking_lock(&pool));pool.jobs[0].pg_operation=NULL;
+  CHECK(ku_task_blocking_return_locked(&pool,&pool.jobs[0],0u)==KU_TASK_DRIVER_OK);
+  ku_task_blocking_unlock(&pool);
+  CHECK(ku_task_blocking_finish(&pool,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  CHECK(pool.workers_joined==1u && !pool.storage && !pool.resident);
+  /* Remove only fixture-owned synthetic tickets before the real driver's
+     ordinary empty close/pump/join/destroy lifecycle. */
+  memset(slots,0,sizeof(slots));
+  CHECK(ku_task_driver_request_close(&driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  uint64_t next=UINT64_MAX;CHECK(ku_task_driver_pump(&driver,0u,1u,&next)<=KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_join(&driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(&driver)==KU_TASK_DRIVER_OK);
+  ku_pg_client_close_owned(client);
+  CHECK(!live_connections && !live_results && !bad_calls && !budgets[0].bytes && !budgets[1].bytes);
+  puts("pg elastic startup closed loop");return 0;
+}
+"#;
+
+#[test]
 fn native_pg_task_fresh_cancel_observer_checks_real_job_state_and_generation() {
     let directory = TempDir::new("pg-task-fresh-cancel");
     let sync_fixture = fixture()

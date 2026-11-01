@@ -79,7 +79,7 @@ static uint32_t ku_task_blocking_submit_pg_inputs(const KuTaskDriverTicketV1* ti
     *output=(KuResult_pg_result){false,NULL,ku_task_blocking_error("blocking_pool_stopped","blocking pool is not available")};return KU_TASK_DRIVER_OK;
   }
   if(ku_task_blocking_lock(pool))return KU_TASK_DRIVER_INTERNAL;
-  uint32_t status=pool->closing || pool->fault || pool->workers_created!=pool->worker_target
+  uint32_t status=pool->closing || pool->fault || (!pool->elastic_workers && pool->workers_created!=pool->worker_target)
       ? KU_TASK_DRIVER_CLOSED : pool->resident>=pool->capacity ? KU_TASK_DRIVER_LIMIT:KU_TASK_DRIVER_OK;
   size_t index=0;
   if(status==KU_TASK_DRIVER_OK)status=ku_task_blocking_claim_locked(pool,&index);
