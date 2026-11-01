@@ -6,7 +6,7 @@ from contextlib import ExitStack
 import tarfile
 import tempfile
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import unittest
 import hosted_cycle as h
 import focus_cycle as fc
@@ -260,6 +260,85 @@ class HostedCycleTests(unittest.TestCase):
         self.assertFalse(plan['normal_score_eligible']);self.assertFalse(plan['formal_qualified'])
         with patch.object(h.os,'geteuid',return_value=1),self.assertRaisesRegex(ValueError,'fixed archive reuse'):
             h.build(types.SimpleNamespace(memory_owner_probe=True,build_set='diagnostic'),{})
+
+    def test_dependency_init_owner_variant_is_explicit_bounded_and_keeps_original_default(self):
+        versions={'M':{},'E':{}}
+        self.assertEqual(h.encoded(h.memory_owner_plan(versions)),h.encoded(h.memory_owner_plan(versions,'normal')))
+        self.assertNotIn('memory_owner_variant',h.memory_owner_plan(versions))
+        plan=h.memory_owner_plan(versions,'gnutls-explicit-init')
+        self.assertEqual(plan['order'],['M','E']);self.assertEqual(plan['maximum_windows'],2)
+        self.assertEqual(plan['maximum_replacements'],0);self.assertFalse(plan['normal_score_eligible'])
+        self.assertEqual((plan['rate'],plan['warmup_seconds'],plan['score_seconds']),(500,3,5))
+        for variant,enabled in (('gnutls-explicit-init',False),('unknown',True)):
+            with self.subTest(variant=variant),self.assertRaises(ValueError):
+                h.validate_screen_selection(types.SimpleNamespace(memory_owner_variant=variant,memory_owner_probe=enabled),'diagnostic')
+        h.validate_screen_selection(types.SimpleNamespace(memory_owner_variant='gnutls-explicit-init',memory_owner_probe=True),'diagnostic')
+
+    def test_dependency_init_preparation_changes_only_diagnostic_env_and_observer(self):
+        import compile_variants as cv
+        import resident_selftest
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);binary=root/'normal';binary.write_bytes(b'normal executable')
+            generated=root/'normal.c';generated.write_bytes(b'normal generated C')
+            native=dict(binary=str(binary),binary_sha256=h.sha(binary),generated_c=str(generated),
+                generated_c_sha256=h.sha(generated),compiler_invocation={'compiler':{'path':'fixture-cc'},
+                    'flags':['-std=c11','-O2','-pthread'],'library_inputs':[{'role':'libpq','selected_input':{'real_path':'/actual/libpq.so'}}]})
+            manifest=dict(stacks={'ku':dict(command=[str(binary)],env={'original':'kept'},build={'native':{'server':native}})},
+                protocol=str(root/'protocol.json'),client={})
+            h.save(root/'B/manifest.json',manifest);calls=[]
+            def compile(label,command,*args,**kwargs):
+                calls.append((label,command));header=bytearray(20);header[:6]=b'\x7fELF\x02\x01';header[18:20]=(183).to_bytes(2,'little')
+                Path(command[-1]).write_bytes(header)
+            with patch.object(cv,'clean_environment',return_value={}),patch.object(cv,'Commands') as commands,\
+                    patch.object(resident_selftest,'run',return_value={'result':'pass'}),\
+                    patch.object(h,'normalize_manifest',side_effect=lambda m,*args:m),\
+                    patch.object(fc,'version_identity',side_effect=lambda plan,name:{'name':name}):
+                commands.return_value.run.side_effect=compile;commands.return_value.rows=[]
+                h.prepare_memory_owner(types.SimpleNamespace(root=root,tools=root/'tools',candidate='a'*40,memory_owner_variant='gnutls-explicit-init'),{})
+            observed=h.load(root/'M/manifest.json');experiment=h.load(root/'E/manifest.json');plan=h.load(root/'frozen-plan.json')
+            self.assertEqual(h.load(root/'B/manifest.json'),manifest)
+            self.assertNotIn('GNUTLS_NO_IMPLICIT_INIT',observed['stacks']['ku']['env'])
+            self.assertEqual(experiment['stacks']['ku']['env']['GNUTLS_NO_IMPLICIT_INIT'],'1')
+            del experiment['stacks']['ku']['env']['GNUTLS_NO_IMPLICIT_INIT']
+            self.assertEqual(experiment,observed)
+            self.assertEqual({plan['versions'][n]['binary_sha256'] for n in ('B','M','E')},{h.sha(binary)})
+            self.assertIn('-DKU_RESIDENT_ASN1=1',calls[0][1]);self.assertIn('/actual/libpq.so',calls[1][1])
+            self.assertEqual(h.load(root/'M/ldap-compile.json')['library_input']['selected_input']['real_path'],'/actual/libpq.so')
+            self.assertIn('resident_gnutls_probe.py',plan['versions']['M']['artifacts'])
+
+    def test_dependency_init_tiny_case_checks_actual_dependencies_and_reaps_on_failure(self):
+        import resident_gnutls_probe as probe
+        for mismatch in (False,True):
+            with self.subTest(mismatch=mismatch),tempfile.TemporaryDirectory() as temporary:
+                output=Path(temporary)/'tiny';child=MagicMock()
+                child.pid=123;child.wait.return_value=0;child.poll.return_value=None if mismatch else 0
+                def snapshot(pid,library,destination):
+                    destination.mkdir();h.save(destination/'live.json',dict(live_table_valid=True,
+                        asn1_provenance={'valid':True},status={},executable={},records=[],total_confirmed_stopped_ns=1,
+                        modules={'/actual/libgnutls.so.30':{'sha256':'changed' if mismatch else 'correct'}}))
+                with patch.dict(probe.os.environ,{'GNUTLS_NO_EXPLICIT_INIT':'1'}),\
+                        patch.object(probe.subprocess,'Popen',return_value=child) as launched,\
+                        patch.object(probe.select,'select',return_value=([child.stdout],[],[])),\
+                        patch.object(probe.os,'read',return_value=b'{"stage":"before"}\n{"stage":"after"}\n'),\
+                        patch.object(probe.resident_snapshot,'capture',side_effect=snapshot):
+                    args=(Path('/fixture/tiny'),Path('/fixture/observer.so'),output,True,True,1,1,
+                          {'/actual/libgnutls.so.30':'correct'})
+                    if mismatch:
+                        with self.assertRaisesRegex(RuntimeError,'differs'):probe.tiny_case(*args)
+                        child.kill.assert_called_once();child.wait.assert_called_once_with(timeout=3)
+                    else:
+                        result=probe.tiny_case(*args);self.assertTrue(result['natural_exit'])
+                        self.assertEqual(child.stdin.write.call_count,2);child.kill.assert_not_called()
+                    self.assertEqual(launched.call_args.kwargs['env']['GNUTLS_NO_IMPLICIT_INIT'],'1')
+                    self.assertNotIn('GNUTLS_NO_EXPLICIT_INIT',launched.call_args.kwargs['env'])
+                    self.assertEqual(launched.call_args.kwargs['env']['LD_PRELOAD'],'/fixture/observer.so')
+                    self.assertEqual(launched.call_args.args[0],['/fixture/tiny','ffi-without-explicit-init'])
+                    child.stdin.close.assert_called_once();child.stdout.close.assert_called_once()
+                    self.assertEqual(h.load(output/'tiny-summary.json')['complete'],not mismatch)
+        for key in ('GNUTLS_NO_IMPLICIT_INIT','GNUTLS_NO_EXPLICIT_INIT'):
+            with self.subTest(contamination=key),patch.dict(probe.os.environ,{key:'1'}),\
+                    patch.object(probe.os,'geteuid',return_value=0),self.assertRaisesRegex(ValueError,'uncontaminated'):
+                probe.run(types.SimpleNamespace(),{},h)
 
     def test_live_owner_preparation_preserves_normal_ELF_C_and_native_receipts(self):
         import copy

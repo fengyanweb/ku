@@ -59,6 +59,12 @@ on:
         type: boolean
         default: false
 
+      memory_owner_variant:
+        description: 'Optional dependency-init diagnostic; requires memory_owner_probe'
+        type: choice
+        default: normal
+        options: [normal, gnutls-explicit-init]
+
       pg_driver_screen:
         description: 'Two fresh normal B PG sender conditions256/1024; diagnostic arrival ledger, no capacity ranking'
         type: boolean
@@ -527,6 +533,7 @@ jobs:
       KU_PERFORMANCE_V2_HTTP_SHORT_GOAL: ${{ inputs.http_short_goal || 'cpu' }}
       KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN: ${{ inputs.http_short_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE: ${{ inputs.memory_owner_probe && 'true' || 'false' }}
+      KU_PERFORMANCE_V2_MEMORY_OWNER_VARIANT: ${{ inputs.memory_owner_variant || 'normal' }}
       KU_PERFORMANCE_V2_PG_DRIVER_SCREEN: ${{ inputs.pg_driver_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_PG_QUEUE_SCREEN: ${{ inputs.pg_queue_screen && 'true' || 'false' }}
       KU_PERFORMANCE_V2_REUSE_RUN: ${{ inputs.reuse_build_run }}
@@ -714,6 +721,7 @@ jobs:
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
             performance_task_json_args+=(--memory-owner-probe)
+            performance_task_json_args+=(--memory-owner-variant "$KU_PERFORMANCE_V2_MEMORY_OWNER_VARIANT")
           fi
           if [ "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
@@ -811,6 +819,7 @@ jobs:
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
             test "$performance_build_set" = diagnostic
             performance_task_json_args+=(--memory-owner-probe)
+            performance_task_json_args+=(--memory-owner-variant "$KU_PERFORMANCE_V2_MEMORY_OWNER_VARIANT")
           fi
           if [ "$KU_PERFORMANCE_V2_PG_DRIVER_SCREEN" = true ]; then
             test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic

@@ -36,6 +36,9 @@ def encoded(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n
 
 
 def validate_screen_selection(a,build_set):
+    variant=getattr(a,'memory_owner_variant','normal')
+    if variant not in ('normal','gnutls-explicit-init') or (variant!='normal' and not getattr(a,'memory_owner_probe',False)):
+        raise ValueError('--memory-owner-variant requires explicit memory owner mode')
     if getattr(a,'http_short_screen',False):
         if getattr(a,'http_short_goal','cpu') not in ('cpu','memory','memory-probe'):
             raise ValueError('--http-short-goal must be cpu, memory or memory-probe')
@@ -79,7 +82,9 @@ def hosted_identity(a,build_set):
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     if getattr(a,'http_short_screen',False):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
-    if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
+    if getattr(a,'memory_owner_probe',False):
+        identity['memory_owner_probe']=True
+        if getattr(a,'memory_owner_variant','normal')!='normal':identity['memory_owner_variant']=a.memory_owner_variant
     return identity
 
 
@@ -1407,7 +1412,14 @@ def normal_self_client(client,service,output,duration,perf,*,sample):
 
 
 
-def memory_owner_plan(versions):
+def memory_owner_plan(versions,variant='normal'):
+    if variant=='gnutls-explicit-init':
+        plan=memory_owner_plan(versions)
+        plan.update(memory_owner_variant=variant,maximum_windows=2,order=['M','E'],
+            observer='normal-ELF-LD_PRELOAD-ASN1-origin-v1',tiny_C_cases=['ldap','ffi-without-explicit-init'],
+            comparison='exec-before-load GNUTLS_NO_IMPLICIT_INIT unset versus1; diagnostic only, never a default/product setting')
+        return plan
+    if variant!='normal':raise ValueError('unknown owner variant')
     return dict(schema='ku-memory-owner-plan-v1',versions=versions,resources=copy.deepcopy(RESOURCES),
         quality_policy=copy.deepcopy(POLICY),diagnostic_only=True,normal_score_eligible=False,
         formal_qualified=False,workload='json_object',rate=500,warmup_seconds=3,score_seconds=5,
@@ -1425,8 +1437,13 @@ def prepare_memory_owner(a,state):
     if len(libs)!=1 or libs[0]['role']!='libpq' or invocation['flags']!=['-std=c11','-O2','-pthread']:
         raise ValueError('owner probe requires original normal C11O2 and single libpq input')
     source=Path(__file__).resolve().parent;library=directory/'resident-live.so'
+    variant=getattr(a,'memory_owner_variant','normal');asn1=variant=='gnutls-explicit-init'
+    if asn1 and any(key in env for env in (m.get('service_env',{}),stack.get('env',{}))
+                    for key in ('GNUTLS_NO_IMPLICIT_INIT','GNUTLS_NO_EXPLICIT_INIT')):
+        raise ValueError('dependency-init comparison requires normal unset manifest environment')
     command=[invocation['compiler']['path'],'-shared','-fPIC','-O2','-fno-builtin','-std=c11',
-        '-Wall','-Wextra','-Werror',str(source/'resident_live.c'),'-o',str(library)]
+        '-Wall','-Wextra','-Werror',*(['-DKU_RESIDENT_ASN1=1'] if asn1 else []),str(source/'resident_live.c'),
+        *(['-ldl'] if asn1 else []),'-o',str(library)]
     log=Commands(directory/'logs',clean_environment(a.tools));log.run('owner-interposer-link',command,directory,timeout=30)
     with library.open('rb') as stream:header=stream.read(20)
     if len(header)!=20 or header[:6]!=b'\x7fELF\x02\x01' or int.from_bytes(header[18:20],'little')!=183:
@@ -1451,7 +1468,20 @@ def prepare_memory_owner(a,state):
     for name in ('resident_live.c','resident_snapshot.py','resident_selftest.py','resident_live_fixture.c','http_cost_diagnostic.py'):
         artifacts[name]=dict(path=str(source/name),sha256=sha(source/name))
     versions['M']['artifacts']=artifacts
-    plan=memory_owner_plan(versions);save(a.root/'frozen-plan.json',plan)
+    if asn1:
+        experiment=a.root/'E';experiment.mkdir();env_manifest=copy.deepcopy(m)
+        env_manifest['stacks']['ku']['env']['GNUTLS_NO_IMPLICIT_INIT']='1'
+        save(experiment/'manifest.json',env_manifest)
+        versions['E']=dict(versions['M'],root=str(experiment))
+        tiny=directory/'ldap-init'
+        log.run('ldap-public-init',[invocation['compiler']['path'],'-std=c11','-O2','-Wall','-Wextra','-Werror',
+            str(source/'resident_ldap_init.c'),libs[0]['selected_input']['real_path'],'-ldl','-o',str(tiny)],directory,timeout=30)
+        save(directory/'ldap-compile.json',dict(commands=log.rows,diagnostic_only=True,normal_score_eligible=False,
+            source_sha256=sha(source/'resident_ldap_init.c'),library_input=libs[0],binary_sha256=sha(tiny)))
+        artifacts['ldap-public-init']=dict(path=str(tiny),sha256=sha(tiny))
+        artifacts['resident_ldap_init.c']=dict(path=str(source/'resident_ldap_init.c'),sha256=sha(source/'resident_ldap_init.c'))
+        artifacts['resident_gnutls_probe.py']=dict(path=str(source/'resident_gnutls_probe.py'),sha256=sha(source/'resident_gnutls_probe.py'))
+    plan=memory_owner_plan(versions,variant);save(a.root/'frozen-plan.json',plan)
     save(a.root/'build-identities.json',{name:fc.version_identity(plan,name) for name in versions})
     if (sha(original['binary'])!=original['binary_sha256'] or sha(original['generated_c'])!=original['generated_c_sha256']
             or native!=original or versions['M']['binary_sha256']!=versions['B']['binary_sha256']):
@@ -1460,6 +1490,9 @@ def prepare_memory_owner(a,state):
 
 
 def memory_owner_probe(a,state):
+    if getattr(a,'memory_owner_variant','normal')=='gnutls-explicit-init':
+        import resident_gnutls_probe
+        return resident_gnutls_probe.run(a,state,sys.modules[__name__])
     import resident_snapshot
     if os.geteuid()!=0:raise ValueError('owner probe requires root cgroup control')
     plan=load(a.root/'frozen-plan.json')
@@ -2433,6 +2466,7 @@ def main(argv=None):
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--http-short-goal',choices=['cpu','memory','memory-probe'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit control+normal A/B single HTTP candidate diagnostic (23 windows or9 for memory-probe); frozen 3e5f18e prepatch, no capacity or adoption claim')
+    p.add_argument('--memory-owner-variant',choices=['normal','gnutls-explicit-init'],default='normal',help='Optional isolated dependency-init diagnostic; requires --memory-owner-probe and keeps normal ELF')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')

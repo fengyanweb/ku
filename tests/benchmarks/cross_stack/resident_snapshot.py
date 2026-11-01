@@ -114,10 +114,14 @@ def capture(pid, library, destination):
     symbols = {}
     for line in subprocess.check_output(['nm', '-D', '--defined-only', str(library)], text=True, timeout=2).splitlines():
         cells = line.split()
-        if len(cells) == 3 and cells[2] in ('ku_resident_status', 'ku_resident_records'):
+        if len(cells) == 3 and cells[2] in ('ku_resident_status', 'ku_resident_records',
+                                           'ku_resident_asn1_status', 'ku_resident_asn1_calls'):
             symbols[cells[2]] = int(cells[0], 16)
-    if len(symbols) != 2:
+    if not {'ku_resident_status','ku_resident_records'}<=set(symbols):
         raise RuntimeError('missing exported diagnostic symbols')
+    asn1_enabled='ku_resident_asn1_status' in symbols
+    if asn1_enabled != ('ku_resident_asn1_calls' in symbols):
+        raise RuntimeError('incomplete ASN1 diagnostic symbols')
     destination.mkdir(parents=False, exist_ok=False)
     memfd = os.open(proc / 'mem', os.O_RDONLY)
     held = False
@@ -154,7 +158,8 @@ def capture(pid, library, destination):
             words = struct.unpack('<11Q', read_exact(memfd, base + symbols['ku_resident_status'], 88))
             if words[0] != 1 or words[1] != 16384:
                 raise RuntimeError('unsupported observer layout')
-            if not words[2] and not words[3] and stopped_threads(proc) == thread_ids:
+            asn1_status=struct.unpack('<3Q',read_exact(memfd,base+symbols['ku_resident_asn1_status'],24)) if asn1_enabled else (0,0,0)
+            if not words[2] and not words[3] and not asn1_status[1] and stopped_threads(proc) == thread_ids:
                 break
             resumed()
             time.sleep(.025)
@@ -169,7 +174,7 @@ def capture(pid, library, destination):
             owner = next((m for m in mappings if m['start'] <= pc-1 < m['end']), None)
             target = next((m for m in mappings if m['start'] <= pointer < m['end']), None)
             records.append(dict(pointer=hex(pointer), requested_bytes=size, return_pc=hex(pc), symbol_probe_pc=hex(pc-1), tid=tid,
-                                kind=kind, callsite_file=owner['path'] if owner else None,
+                                kind=kind&255, **({'asn1_call':kind>>8} if asn1_enabled else {}), callsite_file=owner['path'] if owner else None,
                                 return_file_offset=hex(pc-owner['start']+owner['offset']) if owner else None,
                                 symbol_probe_file_offset=hex(pc-1-owner['start']+owner['offset']) if owner else None,
                                 allocation_vma_start=hex(target['start']) if target else None))
@@ -179,6 +184,15 @@ def capture(pid, library, destination):
             raise RuntimeError('live-count mismatch')
         if sorted(task_status) != thread_ids or stopped_threads(proc) != thread_ids:
             raise RuntimeError('thread list changed during stopped snapshot')
+        asn1_calls=[]
+        if asn1_enabled:
+            raw=read_exact(memfd,base+symbols['ku_resident_asn1_calls'],16*40)
+            for i,(table,root,pc,tid,result) in enumerate(struct.iter_unpack('<5Q',raw)):
+                if i>=min(asn1_status[0],16):break
+                caller=next((m for m in mappings if m['start']<=pc-1<m['end']),None)
+                asn1_calls.append(dict(call=i+1,table=hex(table),root=hex(root),return_pc=hex(pc),tid=tid,result=result,
+                    caller_file=caller['path'] if caller else None,
+                    symbol_probe_file_offset=hex(pc-1-caller['start']+caller['offset']) if caller else None))
         modules = {}
         paths=set(r['callsite_file'] for r in records if r['callsite_file'])
         paths.update(m['path'] for m in mappings if m['path'].startswith('/') and '.so' in m['path'])
@@ -215,6 +229,15 @@ def capture(pid, library, destination):
                                   status_bytes=88, mapped_library=[m for m in mappings if m['path']==str(library)]),
             scope='Interposed allocation boundaries only. libc private allocations, TLS/TCB, loader storage and raw mmap may be unobserved. Requested bytes are not resident bytes. Observer mappings and CPU are excluded from product comparisons.',
             coverage_complete=False, idle_only=True, normal_score_eligible=False, threads=task_status, records=records)
+        if asn1_enabled:
+            value['observer_storage']['asn1_status_start']=hex(base+symbols['ku_resident_asn1_status'])
+            value['observer_storage']['asn1_status_bytes']=24
+            value['observer_storage']['asn1_calls_start']=hex(base+symbols['ku_resident_asn1_calls'])
+            value['observer_storage']['asn1_calls_bytes']=16*40
+            value['asn1_provenance']=dict(status=dict(zip(('calls','inflight','overflow'),asn1_status)),
+                valid=not asn1_status[1] and not asn1_status[2] and asn1_status[0]<=16
+                    and all(r['asn1_call']<=asn1_status[0] for r in records),calls=asn1_calls,
+                scope='Allocator records carry the active asn1_array2tree call index. Actual caller RA is independently mapped; no node/key/certificate contents are exported.')
     finally:
         if held:resumed()
         os.close(memfd)

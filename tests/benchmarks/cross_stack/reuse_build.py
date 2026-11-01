@@ -301,6 +301,7 @@ def main(argv=None):
     parser.add_argument('--archive-sha256',required=True);parser.add_argument('--source-run',required=True)
     parser.add_argument('--candidate',required=True);parser.add_argument('--prepatch',default=h.FOLLOWUP_PREPATCH)
     parser.add_argument('--baseline',default=h.BASELINE);parser.add_argument('--screen-variants',default='')
+    parser.add_argument('--memory-owner-variant',choices=['normal','gnutls-explicit-init'],default='normal')
     parser.add_argument('--memory-owner-probe',action='store_true',help='Reuse only the fixed verified normal B/R archive for one bounded LD_PRELOAD live-allocation observation with unchanged normal ELF')
     parser.add_argument('--task-json-screen',action='store_true',help='Require a completed, verified BT build in the source archive; never infer the screen from product capability')
     parser.add_argument('--final-task-json',action='store_true',help='Rejected: final/full requires a fresh full build, not followup archive reuse')

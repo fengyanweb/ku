@@ -7,7 +7,8 @@
 #include <unistd.h>
 
 /* Diagnostic glibc boundary only. Never linked into a shipped Ku binary.
- * No dlsym, logger, observer thread, signal handler or dynamic storage. */
+ * No logger, observer thread, signal handler or dynamic storage. The optional
+ * ASN1 provenance build resolves only its real ASN1 callee with dlsym. */
 extern void *__libc_malloc(size_t);
 extern void *__libc_calloc(size_t, size_t);
 extern void *__libc_realloc(void *, size_t);
@@ -21,6 +22,15 @@ extern void *__libc_memalign(size_t, size_t);
 uint64_t ku_resident_status[11] = {1, CAPACITY};
 uint64_t ku_resident_records[CAPACITY][5];
 static _Thread_local unsigned entered __attribute__((tls_model("initial-exec")));
+#if defined(KU_RESIDENT_ASN1)
+#include <dlfcn.h>
+/* Optional bounded provenance, never enabled in the original owner mode.
+ * kind's low byte remains its allocator kind; upper bits name this call.
+ * No ASN.1 node contents, keys or certificate payloads are read/exported. */
+uint64_t ku_resident_asn1_status[3]; /* calls, inflight, overflow/lookup failure */
+uint64_t ku_resident_asn1_calls[16][5]; /* table, root, actual caller RA, tid, result */
+static _Thread_local uint64_t asn1_call __attribute__((tls_model("initial-exec")));
+#endif
 
 static int lock_table(void) {
   for (size_t attempt = 0; attempt < 1000000u; attempt++)
@@ -54,6 +64,9 @@ static void insert(void *pointer, size_t bytes, uintptr_t pc, unsigned kind) {
   uint64_t *row = ku_resident_records[empty];
   row[0] = (uintptr_t)pointer; row[1] = bytes; row[2] = pc;
   row[3] = (uint64_t)syscall(SYS_gettid); row[4] = kind;
+#if defined(KU_RESIDENT_ASN1)
+  row[4] |= asn1_call << 8;
+#endif
   ku_resident_status[6]++;
   if (++ku_resident_status[9] > ku_resident_status[10])
     ku_resident_status[10] = ku_resident_status[9];
@@ -98,6 +111,39 @@ static void end(void) {
   entered--;
 }
 #define CALLER ((uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)))
+#if defined(KU_RESIDENT_ASN1)
+int asn1_array2tree(const void *table, void **root, char *error) {
+  typedef int (*ArrayToTree)(const void *, void **, char *);
+  static _Atomic(ArrayToTree) target;
+  int before = errno;
+  __atomic_fetch_add(&ku_resident_asn1_status[1], 1, __ATOMIC_ACQ_REL);
+  ArrayToTree real = atomic_load_explicit(&target, memory_order_acquire);
+  if (!real) {
+    real = (ArrayToTree)dlsym(RTLD_NEXT, "asn1_array2tree");
+    if (real) atomic_store_explicit(&target, real, memory_order_release);
+  }
+  uint64_t call = __atomic_fetch_add(&ku_resident_asn1_status[0], 1, __ATOMIC_RELAXED);
+  uint64_t previous = asn1_call;
+  if (call < 16) {
+    uint64_t *row = ku_resident_asn1_calls[call];
+    row[0] = (uintptr_t)table; row[2] = CALLER; row[3] = (uint64_t)syscall(SYS_gettid);
+    asn1_call = call + 1;
+  } else {
+    __atomic_fetch_add(&ku_resident_asn1_status[2], 1, __ATOMIC_RELAXED); asn1_call = 0;
+  }
+  errno = before;
+  if (!real) _Exit(92); /* Diagnostic lookup failed; never simulate library success/error. */
+  int result = real(table, root, error);
+  int saved = errno;
+  if (call < 16) {
+    ku_resident_asn1_calls[call][1] = result == 0 && root ? (uintptr_t)*root : 0;
+    ku_resident_asn1_calls[call][4] = (uint64_t)(int64_t)result;
+  }
+  asn1_call = previous;
+  __atomic_fetch_sub(&ku_resident_asn1_status[1], 1, __ATOMIC_RELEASE);
+  errno = saved; return result;
+}
+#endif
 void *malloc(size_t bytes) {
   if (!begin()) { void *p = __libc_malloc(bytes); entered--; return p; }
   void *p = __libc_malloc(bytes); int saved = errno;
