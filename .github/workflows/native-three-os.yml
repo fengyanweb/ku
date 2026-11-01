@@ -265,9 +265,20 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo test --release --locked --lib http_short::tests -- --list > "$RUNNER_TEMP/http-proof.list"
-          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 4
+          test "$(grep -c '^backend::c::http_short::tests::.*: test$' "$RUNNER_TEMP/http-proof.list")" -eq 6
           cargo test --release --locked --lib http_short::tests -- --nocapture --test-threads=1
-          for name in native_http_validates_unmaterialized_headers_and_owns_route_snapshot native_http_handler_deadline_is_capped_by_absolute_request_deadline native_http_backpressure_matches_interpreter; do
+          names=(
+            native_http_bounded_json_owner_preserves_input_edges_and_legacy_results
+            native_http_bounded_json_works_between_real_task_owner_polls
+            native_http_validates_unmaterialized_headers_and_owns_route_snapshot
+            native_http_handler_deadline_is_capped_by_absolute_request_deadline
+            native_http_backpressure_matches_interpreter
+            native_http_async_json_values_cross_timer_and_keep_request_projection_and_errors
+            native_http_async_handlers_use_owner_tasks_timers_and_retire_after_timeout
+            native_http_sync_body_transfer_preserves_owner_and_budget_handoff
+            native_http_elastic_workers_preserve_full_capacity_and_retire_real_jobs
+          )
+          for name in "${names[@]}"; do
             cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name.log"
             if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name.log"; then exit 1; fi
@@ -281,10 +292,11 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           set -euo pipefail
-          name=native_http_validates_unmaterialized_headers_and_owns_route_snapshot
-          cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/http-request-detectors.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/http-request-detectors.log"
-          if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/http-request-detectors.log"; then exit 1; fi
+          for name in native_http_bounded_json_owner_preserves_input_edges_and_legacy_results native_http_bounded_json_works_between_real_task_owner_polls native_http_validates_unmaterialized_headers_and_owns_route_snapshot; do
+            cargo test --release --locked --test native_http_test "$name" -- --exact --nocapture --test-threads=1 | tee "$RUNNER_TEMP/$name-detectors.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/$name-detectors.log"
+            if grep -Ei 'skip(ped)?:' "$RUNNER_TEMP/$name-detectors.log"; then exit 1; fi
+          done
 
   task-main-path:
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'task-main-path' || inputs.scope == 'windows-task-main-path')
