@@ -149,8 +149,8 @@ FLOW_COUNTERS = (
 FLOW_COUNTER_NAMES = FLOW_COUNTERS + tuple(f'{metric}_source_{source}'
     for source in FLOW_SOURCES for metric in FLOW_SOURCE_METRICS)
 
-def _flow_c_prefix() -> str:
-    constants = '\n'.join('  KUF_' + name.upper() + ',' for name in FLOW_COUNTERS)
+def _flow_c_prefix(counters=FLOW_COUNTERS) -> str:
+    constants = '\n'.join('  KUF_' + name.upper() + ',' for name in counters)
     sources = '\n'.join('  KUF_SRC_' + name.upper() + ',' for name in FLOW_SOURCES)
     metrics = '\n'.join('  KUF_SM_' + name.upper() + ',' for name in FLOW_SOURCE_METRICS)
     return ('/* DIAGNOSTIC ONLY: TLS flow counters; not a scoring artifact. */\n'
@@ -379,7 +379,14 @@ def ledger_role_footer(footer: bytes) -> bytes:
         footer = footer.replace(old, new, 1)
     return footer
 
-def prepare_ledger_source(source: Path, destination: Path, source_commit: str | None = None) -> dict:
+def prepare_ledger_source(source: Path, destination: Path, source_commit: str | None = None,
+                          *, extra_counters: tuple[str, ...] = ()) -> dict:
+    if any(not re.fullmatch(r'[a-z][a-z0-9_]*', name) for name in extra_counters):
+        raise ValueError('extra flow counters require lowercase C identifier names')
+    counters = FLOW_COUNTERS + tuple(extra_counters)
+    if len(set(counters)) != len(counters) or len(extra_counters) > 256:
+        raise ValueError('extra flow counters must be unique and bounded to 256')
+    counter_names = counters + FLOW_COUNTER_NAMES[len(FLOW_COUNTERS):]
     source, destination = Path(source), Path(destination)
     if source.resolve() == destination.resolve():
         raise ValueError('ledger must not overwrite the normal C emission')
@@ -610,15 +617,15 @@ def prepare_ledger_source(source: Path, destination: Path, source_commit: str | 
                 '    ku_task_blocking_signal(pool);\n  }\n  ku_task_blocking_unlock(pool);return KU_TASK_DRIVER_OK;')
     footer = FLOW_FOOTER.replace('  /* COUNTER_NAMES */',
         '\n'.join('  KU_FLOW_APPEND("' + (',' if i else '') + '\\\"' + name + '\\\"");'
-                  for i, name in enumerate(FLOW_COUNTER_NAMES)))
-    output = (_flow_c_prefix() + text + '\n/* BEGIN FLOW LEDGER FOOTER: NOT A SCORE */\n' + footer).encode()
+                  for i, name in enumerate(counter_names)))
+    output = (_flow_c_prefix(counters) + text + '\n/* BEGIN FLOW LEDGER FOOTER: NOT A SCORE */\n' + footer).encode()
     receipt = {'schema': 'ku-http-pg-flow-emission-v1', 'diagnostic_only': True,
         'source_commit': source_commit, 'normal_generated_c': str(source),
         'normal_generated_c_bytes': len(original), 'normal_generated_c_sha256': hashlib.sha256(original).hexdigest(),
         'ledger_c_sha256': hashlib.sha256(output).hexdigest(), 'pg_present': pg, 'blocking_present': blocking,
         'task_owner_notify_mode': task_owner_notify_mode,
-        'slot_capacity': 256, 'counter_count': len(FLOW_COUNTER_NAMES),
-        'counter_names': FLOW_COUNTER_NAMES, 'anchors': anchors,
+        'slot_capacity': 256, 'counter_count': len(counter_names),
+        'counter_names': counter_names, 'anchors': anchors,
         'required_next_step': 'existing prepare_source with marker-gated ledger_role_footer; then --wrap=pthread_create',
         'scope': 'whole service lifetime including startup/readiness/warmup/drain, not per-request timing or scoring',
         'limitations': ['Counters do not measure CPU time or causality; zero/many calls alone cannot establish a hotspot.',
