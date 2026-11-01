@@ -176,7 +176,7 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, windows-task-main-path, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
+        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
         self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
@@ -185,7 +185,7 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
+        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
