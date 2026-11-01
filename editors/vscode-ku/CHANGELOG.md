@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.19 — diagnostic queue follow-up (2026-11-01)
+
+- Preserve clean queued checks, their original waiters and manual reveal intent when another document changes or saves.
+- Requeue cancelled clean active checks after the old process exits, without reviving dirty, closed or superseded requests. Existing pending work keeps priority; the two-job limit remains unchanged.
+- Verify the A/B active + C manual pending + unrelated D edit sequence, repeated edits, clean saves with automatic checks off, close/dirty cancellation, configuration reset and latest-request replacement.
+
 ## 0.0.19 — local extension hardening (2026-11-01)
 
 - Run, IR, build and C-source emission use VS Code process tasks with intact paths and save-failure handling; loose files use a direct terminal executable.

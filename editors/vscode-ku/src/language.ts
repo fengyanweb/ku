@@ -25,7 +25,11 @@ interface CheckRequest {
   resolve: () => void;
 }
 const pendingChecks = new Map<string, CheckRequest>();
-const activeChecks = new Map<string, AbortController>();
+interface ActiveCheck {
+  controller: AbortController;
+  request: CheckRequest;
+}
+const activeChecks = new Map<string, ActiveCheck>();
 const MAX_ACTIVE_CHECKS = 2;
 let diagnosticSession = 0;
 let diagnosticsEnabled = false;
@@ -126,7 +130,7 @@ function resetChecks() {
   checkTimers.clear();
   for (const request of pendingChecks.values()) request.resolve();
   pendingChecks.clear();
-  for (const controller of activeChecks.values()) controller.abort();
+  for (const { controller } of activeChecks.values()) controller.abort();
   checkGenerations.clear();
   diagnosticsByRoot.clear();
   diagnosticCollection.clear();
@@ -138,22 +142,35 @@ function cancelRootCheck(key: string) {
   checkTimers.delete(key);
   pendingChecks.get(key)?.resolve();
   pendingChecks.delete(key);
-  activeChecks.get(key)?.abort();
+  activeChecks.get(key)?.controller.abort();
 }
 
 function invalidateDocumentDiagnostics(document: vscode.TextDocument) {
   // An in-flight check can import this document even before it reports a location.
   diagnosticSession++;
-  for (const request of pendingChecks.values()) request.resolve();
-  pendingChecks.clear();
-  for (const controller of activeChecks.values()) controller.abort();
+  for (const [root, request] of pendingChecks) {
+    if (request.document.isDirty || request.document.isClosed) {
+      pendingChecks.delete(root);
+      request.resolve();
+    }
+  }
+  for (const [root, { controller, request }] of activeChecks) {
+    // Retain the original waiter and reveal intent until a fresh check runs.
+    // Never revive a superseded/cancelled request on a later edit or save.
+    if (!controller.signal.aborted && !request.document.isDirty && !request.document.isClosed
+      && checkGenerations.get(root) === request.generation && !pendingChecks.has(root)) {
+      pendingChecks.set(root, request);
+    }
+    controller.abort();
+  }
   const key = document.uri.toString();
-  cancelRootCheck(key);
+  if (document.isDirty || document.isClosed) cancelRootCheck(key);
   for (const [root, entries] of [...diagnosticsByRoot]) {
     if (root === key || entries.some((entry) => entry.uri.toString() === key)) {
       replaceDiagnostics(root, []);
     }
   }
+  drainChecks();
 }
 
 function config(uri?: vscode.Uri) {
@@ -228,12 +245,13 @@ function drainChecks() {
     if (activeChecks.has(key)) continue;
     pendingChecks.delete(key);
     const controller = new AbortController();
-    activeChecks.set(key, controller);
+    const active = { controller, request };
+    activeChecks.set(key, active);
     void runCheckJob(request, controller.signal).catch((error) => {
       if (!controller.signal.aborted && diagnosticsEnabled) output.appendLine(`Ku check failed: ${String(error)}`);
     }).finally(() => {
-      activeChecks.delete(key);
-      request.resolve();
+      if (activeChecks.get(key) === active) activeChecks.delete(key);
+      if (pendingChecks.get(key) !== request) request.resolve();
       drainChecks();
     });
   }

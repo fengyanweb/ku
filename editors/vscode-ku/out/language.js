@@ -138,7 +138,7 @@ function resetChecks() {
     for (const request of pendingChecks.values())
         request.resolve();
     pendingChecks.clear();
-    for (const controller of activeChecks.values())
+    for (const { controller } of activeChecks.values())
         controller.abort();
     checkGenerations.clear();
     diagnosticsByRoot.clear();
@@ -151,23 +151,35 @@ function cancelRootCheck(key) {
     checkTimers.delete(key);
     pendingChecks.get(key)?.resolve();
     pendingChecks.delete(key);
-    activeChecks.get(key)?.abort();
+    activeChecks.get(key)?.controller.abort();
 }
 function invalidateDocumentDiagnostics(document) {
     // An in-flight check can import this document even before it reports a location.
     diagnosticSession++;
-    for (const request of pendingChecks.values())
-        request.resolve();
-    pendingChecks.clear();
-    for (const controller of activeChecks.values())
+    for (const [root, request] of pendingChecks) {
+        if (request.document.isDirty || request.document.isClosed) {
+            pendingChecks.delete(root);
+            request.resolve();
+        }
+    }
+    for (const [root, { controller, request }] of activeChecks) {
+        // Retain the original waiter and reveal intent until a fresh check runs.
+        // Never revive a superseded/cancelled request on a later edit or save.
+        if (!controller.signal.aborted && !request.document.isDirty && !request.document.isClosed
+            && checkGenerations.get(root) === request.generation && !pendingChecks.has(root)) {
+            pendingChecks.set(root, request);
+        }
         controller.abort();
+    }
     const key = document.uri.toString();
-    cancelRootCheck(key);
+    if (document.isDirty || document.isClosed)
+        cancelRootCheck(key);
     for (const [root, entries] of [...diagnosticsByRoot]) {
         if (root === key || entries.some((entry) => entry.uri.toString() === key)) {
             replaceDiagnostics(root, []);
         }
     }
+    drainChecks();
 }
 function config(uri) {
     return vscode.workspace.getConfiguration("ku", uri ?? vscode.workspace.workspaceFolders?.[0]?.uri ?? null);
@@ -237,13 +249,16 @@ function drainChecks() {
             continue;
         pendingChecks.delete(key);
         const controller = new AbortController();
-        activeChecks.set(key, controller);
+        const active = { controller, request };
+        activeChecks.set(key, active);
         void runCheckJob(request, controller.signal).catch((error) => {
             if (!controller.signal.aborted && diagnosticsEnabled)
                 output.appendLine(`Ku check failed: ${String(error)}`);
         }).finally(() => {
-            activeChecks.delete(key);
-            request.resolve();
+            if (activeChecks.get(key) === active)
+                activeChecks.delete(key);
+            if (pendingChecks.get(key) !== request)
+                request.resolve();
             drainChecks();
         });
     }
