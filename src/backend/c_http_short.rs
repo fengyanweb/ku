@@ -344,16 +344,25 @@ fn acyclic(function: &IrFunction) -> bool {
 }
 
 fn proven(program: &IrProgram, function: &IrFunction) -> bool {
-    // Request materialization remains on the worker path: without field-size
-    // proof even a loop-free handler can copy the full configured body.
-    function.params.is_empty()
-        && matches!(&function.return_type,
+    // An unused request projects no maps or strings. Its zero-valued aggregate
+    // adds only fixed construction/drop work to the existing owner path. Keep
+    // every observed or escaped request on workers until field sizes are proven.
+    let args = match function.params.as_slice() {
+        [] => Vec::new(),
+        [parameter] if request_fields(function) == Some(0) => vec![Bound {
+            ty: parameter.ty.clone(),
+            bytes: 0,
+        }],
+        _ => return false,
+    };
+    let response = matches!(&function.return_type,
         IrType::Named(name) if name=="__ku_http_response")
-        && Proof::default().function(program, function, &[]).is_some()
-        || function.params.is_empty()
-            && matches!(&function.return_type,
-            IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_http_response"))
-            && Proof::default().function(program, function, &[]).is_some()
+        || matches!(&function.return_type,
+            IrType::Result(inner) if matches!(inner.as_ref(),IrType::Named(name) if name=="__ku_http_response"));
+    response
+        && Proof::default()
+            .function(program, function, &args)
+            .is_some()
 }
 
 fn request_fields(function: &IrFunction) -> Option<u32> {
@@ -631,6 +640,22 @@ mod tests {
         assert!(!accepts("import \"std.http\" fn Loop(): int { while (true) {} return 1 } fn Ready(): HttpResponse { n=Loop() return http.empty(n) } fn main() {}","Ready"));
         assert!(!accepts("import \"std.http\" fn Rec(): int { return Rec() } fn Ready(): HttpResponse { return http.empty(Rec()) } fn main() {}","Ready"));
         assert!(!accepts("import \"std.http\" fn Ready(req: HttpRequest): HttpResponse { return http.text(req.body) } fn main() {}","Ready"));
+        for (returns, body) in [
+            ("HttpResponse", "return http.text(\"ok\")"),
+            ("HttpResponse", "return http.text(str(40 + 2))"),
+            ("HttpResponse!", "return err(\"no\")"),
+            ("HttpResponse!", "return ok(http.text(\"ok\"))"),
+        ] {
+            assert!(accepts(&format!("import \"std.http\" fn Ready(_req: HttpRequest): {returns} {{ {body} }} fn main() {{}}"),"Ready"));
+        }
+        for body in [
+            "copy=req return ok(http.text(\"ok\"))",
+            "return Read(req)",
+            "while (true) {} return ok(http.text(\"ok\"))",
+            "return ok(http.text(json.encode({a: 1})?))",
+        ] {
+            assert!(!accepts(&format!("import {{ http, json }} from \"std\" fn Read(req: HttpRequest): HttpResponse! {{ return ok(http.text(req.body)) }} fn Ready(req: HttpRequest): HttpResponse! {{ {body} }} fn main() {{}}"),"Ready"));
+        }
         let long = "a".repeat(MAX_STRING + 1);
         assert!(!accepts(&format!("import \"std.http\" fn Ready(): HttpResponse {{ return http.text(\"{long}\") }} fn main() {{}}"),"Ready"));
     }
