@@ -826,7 +826,18 @@ jobs:
               --prepatch "$KU_PERFORMANCE_V2_PREPATCH" --screen-variants "$KU_PERFORMANCE_V2_VARIANTS" \
               "${performance_task_json_args[@]}"
           else
-            test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            if [ "$KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN" = true ] && [ "$KU_PERFORMANCE_V2_HTTP_SHORT_GOAL" = typed-json ]; then
+              test "$KU_PERFORMANCE_V2_SCOPE" = performance-followup-diagnostic
+              test "$performance_build_set" = diagnostic
+              test "$KU_PERFORMANCE_V2_PREPATCH" = ca6cdeec4a3c315afc965c941680f2111ae3e507
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = e3187f0ebd81b6e85a0b33fcbf6c8f572299521d
+              test -z "$KU_PERFORMANCE_V2_VARIANTS"
+              for contract_flag in MEMORY_OWNER_PROBE PG_DRIVER_SCREEN PG_QUEUE_SCREEN NORMAL_SELF_PROBE PG_FAILURE_PROBE TASK_JSON_SCREEN COMMON_HTTP_SCREEN FINAL_TASK_JSON; do
+                contract_env="KU_PERFORMANCE_V2_$contract_flag"; test "${!contract_env}" = false
+              done
+            else
+              test "$KU_PERFORMANCE_V2_CANDIDATE" = "$GITHUB_SHA"
+            fi
             test -z "$KU_PERFORMANCE_V2_REUSE_SHA256"
             python3 -B tests/benchmarks/cross_stack/hosted_cycle.py --phase build --build-set "$performance_build_set" \
               --root "$KU_PERFORMANCE_V2_ROOT" --source "$GITHUB_WORKSPACE" \

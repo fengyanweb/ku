@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 import types
 from unittest.mock import patch
@@ -187,6 +188,52 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('strategy:',job)
         self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
+
+    def test_real_build_shell_typed_candidate_exception_does_not_relax_other_modes(self):
+        import hosted_cycle
+        _,job=self.workflow()
+        block=job.split('- name: Build frozen sources and plans as the benchmark user',1)[1].split('\n      - name:',1)[0]
+        script=textwrap.dedent(block.split('        run: |\n',1)[1])
+        # Execute the actual workflow Bash, with only its final Python build
+        # command replaced by a PATH stub. No compiler/service/database starts.
+        cases=[('typed-separated-SHA',{},True),
+            ('wrong-A',{'KU_PERFORMANCE_V2_PREPATCH':'b'*40},False),
+            ('wrong-B-even-if-GITHUB-SHA',{'KU_PERFORMANCE_V2_CANDIDATE':'a'*40},False),
+            ('wrong-scope',{'KU_PERFORMANCE_V2_SCOPE':'followup-screen'},False),
+            ('not-explicit',{'KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN':'false'},False),
+            ('mixed-self-probe',{'KU_PERFORMANCE_V2_NORMAL_SELF_PROBE':'true'},False),
+            ('mixed-memory-probe',{'KU_PERFORMANCE_V2_MEMORY_OWNER_PROBE':'true'},False),
+            ('extra-variants',{'KU_PERFORMANCE_V2_VARIANTS':'c'*40},False),
+            ('unused-reuse-SHA',{'KU_PERFORMANCE_V2_REUSE_SHA256':'c'*64},False),
+            ('legacy-self-same-SHA',{'KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN':'false','KU_PERFORMANCE_V2_NORMAL_SELF_PROBE':'true','KU_PERFORMANCE_V2_CANDIDATE':'a'*40},True),
+            ('legacy-self-cannot-use-typed-exception',{'KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN':'false','KU_PERFORMANCE_V2_NORMAL_SELF_PROBE':'true'},False)]
+        for goal in ('cpu','memory','memory-probe'):
+            cases.extend([(goal+'-same-SHA',{'KU_PERFORMANCE_V2_HTTP_SHORT_GOAL':goal,'KU_PERFORMANCE_V2_PREPATCH':hosted_cycle.HTTP_SHORT_PREPATCH,'KU_PERFORMANCE_V2_CANDIDATE':'a'*40},True),
+                (goal+'-different-SHA',{'KU_PERFORMANCE_V2_HTTP_SHORT_GOAL':goal,'KU_PERFORMANCE_V2_PREPATCH':hosted_cycle.HTTP_SHORT_PREPATCH},False)])
+        for label,changed,allowed in cases:
+            with self.subTest(label=label),tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary);stub=root/'python3';record=root/'python-argv'
+                stub.write_text('#!/bin/sh\nprintf \"%s\\n\" \"$@\" > \"$BUILD_STUB_RECORD\"\n');stub.chmod(0o755)
+                env=os.environ.copy();env.update(PATH=str(root)+os.pathsep+env.get('PATH',''),BUILD_STUB_RECORD=str(record),
+                    GITHUB_SHA='a'*40,GITHUB_WORKSPACE=str(root),RUNNER_TEMP=str(root),
+                    KU_PERFORMANCE_V2_SCOPE='performance-followup-diagnostic',KU_PERFORMANCE_V2_HTTP_SHORT_SCREEN='true',
+                    KU_PERFORMANCE_V2_HTTP_SHORT_GOAL='typed-json',KU_PERFORMANCE_V2_CANDIDATE=hosted_cycle.TYPED_JSON_CANDIDATE,
+                    KU_PERFORMANCE_V2_PREPATCH=hosted_cycle.TYPED_JSON_PREPATCH,KU_PERFORMANCE_V2_ROOT=str(root),
+                    KU_PERFORMANCE_V2_BASELINE=hosted_cycle.BASELINE,KU_PERFORMANCE_V2_VARIANTS='',
+                    KU_PERFORMANCE_V2_REUSE_RUN='',KU_PERFORMANCE_V2_REUSE_SHA256='')
+                env.update({"KU_PERFORMANCE_V2_"+name:'false' for name in ('MEMORY_OWNER_PROBE','PG_DRIVER_SCREEN','PG_QUEUE_SCREEN','NORMAL_SELF_PROBE','PG_FAILURE_PROBE','TASK_JSON_SCREEN','COMMON_HTTP_SCREEN','FINAL_TASK_JSON')})
+                env.update(changed)
+                result=subprocess.run(['bash'],input=script,text=True,env=env,cwd=root,capture_output=True,timeout=5)
+                self.assertEqual(result.returncode==0,allowed,(label,result.stdout,result.stderr))
+                self.assertEqual(record.exists(),allowed,'rejected identities must not reach even the build stub')
+                if allowed:
+                    arguments=record.read_text().splitlines()
+                    self.assertIn('tests/benchmarks/cross_stack/hosted_cycle.py',arguments)
+                    self.assertEqual(arguments[arguments.index('--candidate')+1],env['KU_PERFORMANCE_V2_CANDIDATE'])
+                    if label=='typed-separated-SHA':
+                        self.assertIn('--http-short-screen',arguments)
+                        self.assertEqual(arguments[arguments.index('--http-short-goal')+1],'typed-json')
+                        self.assertNotEqual(env['KU_PERFORMANCE_V2_CANDIDATE'],env['GITHUB_SHA'])
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
         _,job=self.workflow()
