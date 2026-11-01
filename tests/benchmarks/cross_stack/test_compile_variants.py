@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -176,8 +177,8 @@ class HostedWorkflowContracts(unittest.TestCase):
 
     def test_only_explicit_performance_dispatch_selects_one_arm_job(self):
         text,job=self.workflow()
-        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]",text)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
+        self.assertIn("task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, evidence-slice]",text)
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope != 'evidence-slice' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)",job)
         self.assertIn('runs-on: ubuntu-24.04-arm',job)
         self.assertIn('timeout-minutes: 180',job)
         self.assertIn('permissions:\n      contents: read',job)
@@ -185,8 +186,66 @@ class HostedWorkflowContracts(unittest.TestCase):
         self.assertNotIn('runner.',job_env, 'GitHub does not allow runner context in jobs.<job>.env')
         self.assertIn("printf 'KU_PERFORMANCE_V2_ROOT=%s\\n' \"$RUNNER_TEMP/ku-performance-v2\" >> \"$GITHUB_ENV\"",job)
         self.assertNotIn('strategy:',job)
-        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')",text)
+        self.assertIn("(inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'evidence-slice')",text)
         self.assertIn("&& format('-{0}', inputs.scope) || ''",text)
+
+    def test_evidence_slice_is_the_only_selected_job_even_with_measurement_flags(self):
+        text,_=self.workflow()
+        blocks=re.split(r'\n(?=  [a-z][a-z0-9-]*:\n)', '\n'+text.split('\njobs:\n',1)[1])
+        conditions={}
+        for block in blocks:
+            header=re.search(r'^  ([a-z][a-z0-9-]*):$',block,re.M)
+            if header:
+                condition=re.search(r'^    if: (.+)$',block,re.M)
+                self.assertIsNotNone(condition, header[1]+' requires an explicit job condition')
+                conditions[header[1]]=condition[1]
+        measurement_flags=('common_http_screen','final_task_json','pg_failure_probe','normal_self_probe',
+            'pg_queue_screen','pg_driver_screen','http_short_screen','memory_owner_probe')
+        def selected(event,scope,enabled=(),ref='refs/heads/private'):
+            inputs=types.SimpleNamespace(scope=scope,**{name:name in enabled for name in measurement_flags})
+            github=types.SimpleNamespace(event_name=event,ref=ref)
+            return {name for name,condition in conditions.items() if eval(
+                condition.replace('&&',' and ').replace('||',' or '),
+                {'__builtins__':{},'startsWith':str.startswith},dict(inputs=inputs,github=github))}
+        for enabled in [(),*[(flag,) for flag in measurement_flags],measurement_flags]:
+            with self.subTest(flags=enabled):
+                self.assertEqual(selected('workflow_dispatch','evidence-slice',enabled),{'evidence-slice'})
+        full={'quality','borrow-sanitizers','task-tsan','full-tests','release-contract','native'}
+        performance=('performance-v2','performance-v2-builds','performance-v2-finish',
+            'performance-v2-validation','performance-followup-diagnostic','followup-screen')
+        scopes=re.search(r'options: \[([^\]]+)\]',text)[1].split(', ')
+        for scope in scopes:
+            if scope=='evidence-slice':continue
+            expected=(full if scope=='full' else {'performance-v2'} if scope in performance else
+                {'http-short-proof'} if scope=='http-short-proof' else
+                {'task-main-path','task-main-path-linux-arm64'} if scope=='task-main-path' else
+                {'task-main-path'} if scope=='windows-task-main-path' else {'full-tests'})
+            with self.subTest(scope=scope):
+                self.assertEqual(selected('workflow_dispatch',scope),expected)
+                self.assertEqual(selected('workflow_dispatch',scope,measurement_flags),expected|{'performance-v2'})
+        self.assertEqual(selected('pull_request',''),full)
+        push=full|{'release-bundle','installed-pg','verify-release'}
+        self.assertEqual(selected('push',''),push)
+        self.assertEqual(selected('push','',ref='refs/tags/v0.0.19'),push|{'publish-release'})
+        group=re.search(r'^  group: (.+)$',text,re.M)[1]
+        self.assertIn("inputs.scope == 'evidence-slice') && format('-{0}', inputs.scope)",group)
+
+    def test_registered_evidence_slice_job_contains_only_readonly_export_steps(self):
+        text,_=self.workflow();job=text.split('\n  evidence-slice:\n',1)[1]
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && inputs.scope == 'evidence-slice'",job)
+        self.assertIn('permissions:\n      contents: read\n      actions: read',job)
+        self.assertIn('runs-on: ubuntu-24.04\n    timeout-minutes: 10',job)
+        self.assertIn('SOURCE_RUN: ${{ inputs.source_run }}',job)
+        self.assertIn('INCLUDE_NORMAL_SELF: ${{ inputs.include_normal_self_probe }}',job)
+        self.assertIn('--source-run "$SOURCE_RUN"',job)
+        self.assertIn('repository: fengyanweb/ku',job)
+        self.assertIn('artifact-ids: ${{ steps.source.outputs.artifact-id }}',job)
+        self.assertIn('run-id: ${{ steps.source.outputs.run-id }}',job)
+        self.assertIn('evidence_slice.py metadata',job);self.assertIn('evidence_slice.py slice',job)
+        self.assertIn('if: always()',job)
+        for forbidden in ('needs:','hosted_cycle.py','cargo ','go build','sudo','perf record','npm ','git push'):
+            self.assertNotIn(forbidden,job)
+        self.assertFalse((Path(__file__).resolve().parents[3]/'.github/workflows/evidence-slice.yml').exists())
 
     def test_fixed_toolchains_and_nonroot_build_precede_root_execution(self):
         _,job=self.workflow()

@@ -6,10 +6,18 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust'
+        description: 'full runs gates; performance-v2 runs core; builds runs compiler; finish runs tail+compiler; validation runs lifecycle+compiler; diagnostic runs short current+Rust attribution; followup-screen runs frozen prepatch/current/Rust; evidence-slice copies verified existing archive bytes only'
         type: choice
         default: full
-        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen]
+        options: [full, windows-service, windows-pg-host, macos-service, service-recovery, windows-roll, task-main-path, windows-task-main-path, http-short-proof, performance-v2, performance-v2-builds, performance-v2-finish, performance-v2-validation, performance-followup-diagnostic, followup-screen, evidence-slice]
+      source_run:
+        description: 'Completed fengyanweb/ku run containing ku-performance-v2-evidence; required only for evidence-slice'
+        type: string
+        default: ''
+      include_normal_self_probe:
+        description: 'evidence-slice only: retain existing SELF raw samples, maps and selected libpq/libc/loader/libm ELF snapshots'
+        type: boolean
+        default: false
       prepatch:
         description: 'Full prepatch commit for explicit paired screens; wake/PG probes require their frozen baseline'
         type: string
@@ -86,7 +94,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen') && format('-{0}', inputs.scope) || '' }}
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.scope == 'evidence-slice') && format('-{0}', inputs.scope) || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -558,7 +566,7 @@ jobs:
           printf '42\n' | diff -u - "$fixture/actual.txt"
 
   performance-v2:
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
+    if: github.event_name == 'workflow_dispatch' && inputs.scope != 'evidence-slice' && (inputs.scope == 'performance-v2' || inputs.scope == 'performance-v2-builds' || inputs.scope == 'performance-v2-finish' || inputs.scope == 'performance-v2-validation' || inputs.scope == 'performance-followup-diagnostic' || inputs.scope == 'followup-screen' || inputs.common_http_screen || inputs.final_task_json || inputs.pg_failure_probe || inputs.normal_self_probe || inputs.pg_queue_screen || inputs.pg_driver_screen || inputs.http_short_screen || inputs.memory_owner_probe)
     name: Linux ARM64 serial performance evidence (goal status is separate)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -1007,7 +1015,7 @@ jobs:
           if-no-files-found: error
 
   full-tests:
-    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen')
+    if: github.event_name != 'workflow_dispatch' || (inputs.scope != 'http-short-proof' && inputs.scope != 'task-main-path' && inputs.scope != 'windows-task-main-path' && inputs.scope != 'performance-v2' && inputs.scope != 'performance-v2-builds' && inputs.scope != 'performance-v2-finish' && inputs.scope != 'performance-v2-validation' && inputs.scope != 'performance-followup-diagnostic' && inputs.scope != 'followup-screen' && inputs.scope != 'evidence-slice')
     name: ${{ matrix.os }} ${{ github.event_name == 'workflow_dispatch' && inputs.scope != 'full' && 'resident service follow-up' || 'unfiltered workspace test suite' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -1908,3 +1916,80 @@ jobs:
             "$RUNNER_TEMP/ku-publish-assets/SHA256SUMS"
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" --draft=false
+
+  evidence-slice:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'evidence-slice'
+    name: Read-only existing archive evidence transfer
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check read-only archive parser contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence-slice-logs" "$RUNNER_TEMP/evidence-slice-output"
+          python3 -B -m unittest discover -s tests/benchmarks/cross_stack -p test_evidence_slice.py \
+            2>&1 | tee "$RUNNER_TEMP/evidence-slice-logs/contracts.log"
+
+      - name: Bind decimal source run and exact artifact to same-repository Actions metadata
+        id: source
+        env:
+          SOURCE_RUN: ${{ inputs.source_run }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tests/benchmarks/cross_stack/evidence_slice.py metadata \
+            --source-run "$SOURCE_RUN" --output "$RUNNER_TEMP/evidence-slice-logs/source-actions.json" \
+            2>&1 | tee "$RUNNER_TEMP/evidence-slice-logs/metadata.log"
+
+      - name: Download only the bound existing evidence artifact on this runner
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          repository: fengyanweb/ku
+          artifact-ids: ${{ steps.source.outputs.artifact-id }}
+          run-id: ${{ steps.source.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/evidence-slice-input
+          merge-multiple: true
+
+      - name: Verify complete archive map and export byte-exact selected evidence
+        env:
+          INCLUDE_NORMAL_SELF: ${{ inputs.include_normal_self_probe }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          options=()
+          if [ "$INCLUDE_NORMAL_SELF" = true ]; then
+            options+=(--include-normal-self-probe)
+          fi
+          python3 -B tests/benchmarks/cross_stack/evidence_slice.py slice \
+            --archive "$RUNNER_TEMP/evidence-slice-input/ku-performance-v2-evidence.tar.gz" \
+            --receipt "$RUNNER_TEMP/evidence-slice-input/archive.json" \
+            --metadata "$RUNNER_TEMP/evidence-slice-logs/source-actions.json" \
+            --output "$RUNNER_TEMP/evidence-slice-output/ku-evidence-slice.tar.gz" "${options[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/evidence-slice-logs/slice.log"
+
+      - name: Retain verified compact slice (existing evidence, no performance progress)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-evidence-slice
+          path: ${{ runner.temp }}/evidence-slice-output/ku-evidence-slice.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Retain read-only transfer logs even on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-evidence-slice-logs
+          path: ${{ runner.temp }}/evidence-slice-logs
+          retention-days: 1
+          if-no-files-found: error
