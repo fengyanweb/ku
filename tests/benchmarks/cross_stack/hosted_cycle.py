@@ -1889,11 +1889,11 @@ def normal_self_probe(a,state):
         def __init__(self,*args,**kwargs):
             super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
-        def client(self,service,workload,rate,duration,output,**kwargs):
+        def client(self,service,request_workload,rate,duration,output,**kwargs):
             parent=super().client
             if pg:normal_pg_runtime(service,output)
-            if Path(output).name!='score':return parent(service,workload,rate,duration,output,**kwargs)
-            return normal_self_client(lambda:parent(service,workload,rate,duration,output,**kwargs),
+            if Path(output).name!='score':return parent(service,request_workload,rate,duration,output,**kwargs)
+            return normal_self_client(lambda:parent(service,request_workload,rate,duration,output,**kwargs),
                 service,output,duration,perf,sample=active['sample'],**({'perf_flags':plan['perf_flags'],**({'perf_frequency':plan['perf_frequency'],'raw_limit':plan['raw_limit_bytes']} if workload=='db-gpr' else {})} if pg else {}))
     began=time.monotonic()
     try:

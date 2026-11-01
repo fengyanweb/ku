@@ -713,6 +713,35 @@ class HostedCycleTests(unittest.TestCase):
                     if call.args[0][1] in ('report','script'):
                         argv=call.args[0];self.assertEqual(argv[argv.index('--time')+1],'10.000000001,70.000000002')
 
+    def test_real_pg_harness_does_not_shadow_observer_mode_with_the_db_request_workload(self):
+        import ast
+        import inspect
+        # Execute the actual nested adapter, with inert parent/observer methods.
+        # This exercises the previously missed plan -> Harness.client boundary.
+        function=ast.parse(inspect.getsource(h.normal_self_probe)).body[0]
+        adapter=next(n for n in function.body if isinstance(n,ast.ClassDef) and n.name=='SelfHarness')
+        class Parent:
+            def __init__(self):self.manifest={}
+            def client(self,*args,**kwargs):return args
+        for mode in ('db','db-gpr'):
+            for sample in (False,True):
+                with self.subTest(mode=mode,sample=sample):
+                    plan=h.normal_self_plan({'B':{}},mode);calls=[]
+                    def observer(client,*args,**kwargs):
+                        calls.append(kwargs);return client()
+                    scope=dict(vars(h),original=Parent,private={'db_url':'inert','db_cgroup':'/inert'},
+                        ExternalDomain=lambda p:None,pg=True,workload=mode,plan=plan,perf='/inert',
+                        active={'sample':sample},normal_pg_runtime=lambda *args:None,normal_self_client=observer)
+                    exec(compile(ast.Module(body=[adapter],type_ignores=[]),'<actual normal SelfHarness>','exec'),scope)
+                    harness=scope['SelfHarness']();service=object()
+                    result=harness.client(service,'db',200,60,Path('/inert/score'))
+                    self.assertEqual(result,(service,'db',200,60,Path('/inert/score')))
+                    expected={'sample':sample,'perf_flags':plan['perf_flags']}
+                    if mode=='db-gpr':expected.update(perf_frequency=999,raw_limit=96<<20)
+                    self.assertEqual(calls,[expected])
+                    harness.client(service,'db',200,10,Path('/inert/warmup'))
+                    self.assertEqual(len(calls),1)
+
     def test_controlled_perf_requires_enable_ack_stop_ack_and_exit_zero(self):
         for issue in ('success','fragmented','exit-minus2','exit130','missing-ack','bad-ack','junk','oversize','eof','padding-eof','stop-ack','exit-timeout'):
             with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
