@@ -1,0 +1,77 @@
+"""Pure loader-plan/mapping guards; never starts a service or compiler."""
+import copy
+import json
+from pathlib import Path
+import tempfile
+import types
+import unittest
+import hosted_cycle as h
+import libpq_loader_screen as l
+
+
+class LoaderScreenTests(unittest.TestCase):
+    def test_explicit_same_source_only_and_existing_modes_remain_distinct(self):
+        good=dict(http_short_screen=True,http_short_goal='memory-probe',prepatch=l.SOURCE,
+            candidate=l.SOURCE,phase='diagnostic',libpq_loader_screen=True)
+        h.validate_screen_selection(types.SimpleNamespace(**good),'diagnostic')
+        for key,value in [('http_short_screen',False),('http_short_goal','cpu'),('candidate','a'*40),('phase','build')]:
+            bad=dict(good,**{key:value})
+            with self.subTest(key=key),self.assertRaises(ValueError):l.validate_selection(types.SimpleNamespace(**bad),'diagnostic')
+        with self.assertRaises(ValueError):h.validate_screen_selection(types.SimpleNamespace(**dict(good,libpq_loader_screen=False)),'diagnostic')
+
+    def test_only_plan_identity_changes_not_original_windows_or_gates(self):
+        libraries={arm:dict(path='/'+arm+'/libpq.so.5.18',sha256=arm.lower()*64,
+            build_record='/'+arm+'/record.json',build_record_sha256='1'*64,
+            functional_gate='/gate.json',functional_gate_sha256='2'*64,
+            source_build_identity='/identities.json',source_build_identity_sha256='3'*64) for arm in ('A','B')}
+        plan=l.frozen_plan({},libraries);original=h.http_short_plan({},'memory-probe')
+        for key in ('windows','adoption_thresholds','resources','quality_policy','maximum_windows','maximum_replacements'):
+            self.assertEqual(plan[key],original[key])
+        self.assertEqual(plan['prepatch'],l.SOURCE)
+        for mutation in ('missing','sha'):
+            bad=copy.deepcopy(libraries)
+            if mutation=='missing':del bad['B']
+            else:bad['B']['sha256']='pending'
+            with self.assertRaises(ValueError):l.frozen_plan({},bad)
+
+    def test_actual_maps_require_selected_library_retained_SSL_GSS_and_exact_optional_closure(self):
+        with tempfile.TemporaryDirectory() as d:
+            pq=Path(d).resolve()/'libpq.so.5.18';pq.write_bytes(b'lib')
+            def maps(arm):
+                paths=[str(pq),'/usr/lib/libssl.so.3','/usr/lib/libcrypto.so.3','/usr/lib/libgssapi_krb5.so.2.2']
+                if arm=='A':paths+=['/usr/lib/'+x for x in l.OPTIONAL]
+                return ''.join(f'1000-2000 r--p 00000000 08:01 1 {x}\n' for x in paths).encode()
+            for arm in ('A','B'):
+                self.assertEqual(l.check_maps(maps(arm),arm,pq)['optional_closure_count'],12 if arm=='A' else 0)
+            for raw,arm in [(maps('A'),'B'),(maps('B'),'A'),(maps('B').replace(b'libssl.so.3',b'wrong.so'),'B'),
+                    (maps('B').replace(str(pq).encode(),b'/wrong/libpq.so.5.18'),'B'),(b'x'*(1<<20|1),'B')]:
+                with self.subTest(arm=arm),self.assertRaises(ValueError):l.check_maps(raw,arm,pq)
+
+    def test_runtime_override_keeps_original_D_link_receipt_and_rejects_other_input_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d).resolve();gate=root/'gate.json';gate.write_text('{}')
+            common=root/'identities.json';common.write_text('{}');versions={};libraries={};bindings={}
+            for arm in ('A','B'):
+                directory=root/arm;directory.mkdir();pq=directory/'libpq.so.5.18';pq.write_text(arm)
+                (directory/'libpq.so.5').symlink_to(pq.name)
+                record=directory/'record.json';record.write_text(json.dumps(dict(shared_sha256=l.digest(pq),
+                    DT_NEEDED=['libssl.so.3','libcrypto.so.3','libgssapi_krb5.so.2']+(['libldap.so.2'] if arm=='A' else []),
+                    configure_flags='same',exports=['PQlibVersion'],pkg_config_static_tokens=['-lpq','-lldap'])))
+                libraries[arm]=dict(path=str(pq),sha256=l.digest(pq),build_record=str(record),build_record_sha256=l.digest(record),
+                    functional_gate=str(gate),functional_gate_sha256=l.digest(gate),source_build_identity=str(common),source_build_identity_sha256=l.digest(common))
+                manifest=dict(libpq_loader_arm=arm,stacks={'ku':{'env':{'LD_LIBRARY_PATH':str(directory)}}})
+                (directory/'manifest.json').write_text(json.dumps(manifest));versions[arm]={'root':str(directory)}
+                files={key:{'sha256':'d'*64} for key in ('expanded source','Ku CLI','driver ELF')}
+                files.update(ELF={'sha256':l.ELF_SHA},**{'generated C':{'sha256':l.C_SHA},
+                    'libpq':{'path':'/original/D/libpq.so','sha256':'d'*64},
+                    'declared:runtime libpq':{'path':str(pq),'sha256':l.digest(pq)}})
+                bindings[arm]=dict(source_commit=l.SOURCE,files=files,build_mode={})
+            plan=l.frozen_plan(versions,libraries);l.validate_bindings(plan,bindings)
+            for change in ('ELF','Ku CLI','runtime libpq'):
+                bad=copy.deepcopy(bindings)
+                key='declared:runtime libpq' if change=='runtime libpq' else change
+                bad['B']['files'][key]['sha256']='0'*64
+                with self.subTest(change=change),self.assertRaises(ValueError):l.validate_bindings(plan,bad)
+
+
+if __name__=='__main__':unittest.main()

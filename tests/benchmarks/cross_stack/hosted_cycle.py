@@ -42,7 +42,11 @@ def validate_screen_selection(a,build_set):
         if build_set!='diagnostic' or any(getattr(a,k,False) for k in ('task_json_screen','common_http_screen',
                 'final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','memory_owner_probe')):
             raise ValueError('--http-short-screen requires diagnostic build-set and no other opt-in screen')
-        if getattr(a,'prepatch',None)!=HTTP_SHORT_PREPATCH or a.candidate==HTTP_SHORT_PREPATCH:
+        loader=getattr(a,'libpq_loader_screen',False)
+        if loader:
+            import libpq_loader_screen as lps
+            lps.validate_selection(a,build_set)
+        elif getattr(a,'prepatch',None)!=HTTP_SHORT_PREPATCH or a.candidate==HTTP_SHORT_PREPATCH:
             raise ValueError('--http-short-screen requires frozen current f43e74f prepatch and a distinct candidate')
     if getattr(a,'memory_owner_probe',False) and (build_set!='diagnostic' or any(getattr(a,k,False) for k in
             ('task_json_screen','common_http_screen','final_task_json','pg_failure_probe','normal_self_probe','pg_queue_screen','pg_driver_screen','http_short_screen'))):
@@ -79,6 +83,7 @@ def hosted_identity(a,build_set):
     if getattr(a,'pg_driver_screen',False):identity['pg_driver_screen']=True
     if getattr(a,'http_short_screen',False):
         identity.update(http_short_screen=True,http_short_goal=getattr(a,'http_short_goal','cpu'))
+    if getattr(a,'libpq_loader_screen',False):identity['libpq_loader_screen']=True
     if getattr(a,'memory_owner_probe',False):identity['memory_owner_probe']=True
     return identity
 
@@ -1537,14 +1542,19 @@ def normal_diagnostic_quality(row):
 def pg_queue_screen(a,state):
     if os.geteuid()!=0:raise ValueError('PG queue screen requires root cgroup control')
     short=getattr(a,'http_short_screen',False);plan=load(a.root/'frozen-plan.json')
+    loader=getattr(a,'libpq_loader_screen',False)
     prepatch=HTTP_SHORT_PREPATCH if short else PG_QUEUE_PREPATCH
-    expected_plan=http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
+    if loader:
+        import libpq_loader_screen as lps
+        expected_plan=lps.frozen_plan(plan.get('versions',{}),plan.get('libpq_loader',{}))
+    else:expected_plan=http_short_plan(plan.get('versions',{}),getattr(a,'http_short_goal','cpu')) if short else pg_queue_plan(plan.get('versions',{}),prepatch)
     if plan!=expected_plan:raise ValueError('matching frozen A/B diagnostic plan required')
     bindings={name:fc.version_identity(plan,name) for name in ('A','B')}
     expected=dict(formatting_mode='helpers',json_response_mode='text',json_execution_mode='worker',
         pg_execution_mode='async',pg_read_mode='int',native_flags={'batch':['-std=c11','-O2'],'server':['-std=c11','-O2','-pthread']})
     if any(x['stack']!='ku' or x['build_mode']!=expected for x in bindings.values()):raise ValueError('normal A/B Release modes required')
-    if bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
+    if loader:lps.validate_bindings(plan,bindings)
+    elif bindings['A']['source_commit']!=prepatch or bindings['B']['source_commit']==prepatch:raise ValueError('A/B source identities differ from the frozen pair')
     if short and bindings['A']['files']['expanded source']['sha256']!=bindings['B']['files']['expanded source']['sha256']:
         raise ValueError('A/B expanded business inputs differ')
     directory=a.root/('http-short-screen' if short else 'pg-queue-screen');directory.mkdir(exist_ok=False)
@@ -1558,6 +1568,10 @@ def pg_queue_screen(a,state):
             super().__init__(*args,**kwargs);self.manifest=copy.deepcopy(self.manifest)
             self.manifest['db_url']=private['db_url'];self.db_domain=ExternalDomain(private['db_cgroup'])
             if environment:self.manifest['environment_qualification']=environment
+        def start(self,*args,**kwargs):
+            service=super().start(*args,**kwargs)
+            if loader:lps.capture_maps(plan,self.manifest,service,Path(kwargs['output'])/'loader-maps.json')
+            return service
     try:
         fixture.start();private=load(fixture.manifest_path);fc.Harness=QueueHarness
         save(directory/'identity.json',dict(bindings=bindings,resources=plan['resources'],quality_policy=plan['quality_policy'],
@@ -2424,11 +2438,17 @@ def main(argv=None):
     p.add_argument('--normal-self-probe',action='store_true',help='Six normal B/R JSON before/sample/after windows; diagnostic build-set only, SELF not performance acceptance')
     p.add_argument('--http-short-goal',choices=['cpu','memory','memory-probe'],default='cpu',help='Preregistered target for explicit HTTP short screen only; frozen into identity/plan')
     p.add_argument('--http-short-screen',action='store_true',help='Explicit control+normal A/B single HTTP candidate diagnostic (23 windows or9 for memory-probe); frozen current f43e74f prepatch, no capacity or adoption claim')
+    p.add_argument('--libpq-loader-screen',action='store_true',help='Explicit same-ELF libpq loading memory9 comparison; prepared manifests only, no build or implicit adoption')
     p.add_argument('--memory-owner-probe',action='store_true',help='Single diagnostic-only owner-map window; fixed archive reuse required, no scoring')
     p.add_argument('--pg-driver-screen',action='store_true',help='Two fresh normal B PG diagnostic arms,256/1024 sender concurrency; no capacity ranking')
     p.add_argument('--pg-queue-screen',action='store_true',help='Eight normal A/B PG fix diagnostic windows; frozen f39c673 prepatch required, no matrix or formal capacity claim')
     p.add_argument('--build-set',choices=['full','diagnostic','followup-screen'],default='full')
     a=p.parse_args(argv)
+    if a.libpq_loader_screen:
+        try:
+            import libpq_loader_screen as lps
+            lps.validate_selection(a,a.build_set)
+        except ValueError as error:p.error(str(error))
     if a.memory_owner_probe and a.phase not in ('diagnostic','archive'):p.error('--memory-owner-probe requires fixed archive reuse before diagnostic')
     if a.final_task_json and a.phase not in ('build','run','archive'):p.error('--final-task-json only supports build/run/archive in the complete performance-v2 flow')
     if a.pg_failure_probe and a.phase not in ('build','diagnostic','archive'):p.error('--pg-failure-probe only supports fresh build/diagnostic/archive')
