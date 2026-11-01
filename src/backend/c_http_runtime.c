@@ -1224,6 +1224,107 @@ typedef struct KuHttpJob KuHttpJob;
 static unsigned int ku_http_input_fields(const KuHttpInput* input) {
   return input->route?input->route->fields_mask:63u;
 }
+/* Eligibility only: no allocation, syntax result, mutation, or owner transfer.
+ * Rejected/unsupported input still reaches the unchanged worker/parser. The
+ * lexical counts overestimate every prefix the legacy parser could construct.
+ * Strings stay opaque, including escapes/UTF8; the original validators decide
+ * their meaning and exact error. Keep these gates aligned with JsonProof. */
+#define KU_HTTP_BOUNDED_JSON_OWNER 1
+static int ku_http_json_work_fits(const size_t coefficients[11],const size_t values[11],size_t limit) {
+  size_t total=0;
+  for(size_t i=0;i<11u;i++) {
+    size_t coefficient=coefficients[i];
+    if(coefficient && values[i]>(limit-total)/coefficient)return 0;
+    total+=coefficient*values[i];
+  }
+  return 1;
+}
+static int ku_http_json_input_bounded(const KuHttpInput* input,const KuHttpJsonWork* work) {
+  if(!input || !work || !input->target || (input->body_len && !input->body)
+      || input->body_len>2048u || (ku_http_input_fields(input)&~36u)
+      || sizeof(KuEntry)>128u || sizeof(KuValue)>64u)return 0;
+  size_t target=0;
+  while(target<=2048u-input->body_len && input->target[target])target++;
+  if(target>2048u-input->body_len || input->path_len>target)return 0;
+  size_t values[11]={1u,input->body_len,target,0,0,0,0,0,0,0,0};
+  size_t query_at=input->path_len;
+  if(query_at<target && input->target[query_at]=='?')query_at++;
+  for(size_t at=query_at;at<target;) {
+    size_t end=at;while(end<target && input->target[end]!='&')end++;
+    size_t key=at;while(key<end && input->target[key]!='=')key++;
+    if(end>at) {
+      if(++values[9]>8u || key-at>64u)return 0;
+      values[7]+=key-at;
+    }
+    at=end<target?end+1u:end;
+  }
+  values[8]=ku_http_map_capacity(values[9]);
+  struct {unsigned char kind;size_t fields,items;} stack[16];
+  size_t depth=0,at=0;
+  const unsigned char* bytes=(const unsigned char*)input->body;
+#define KU_HTTP_JSON_TOKEN() do { \
+  if(++values[5]>128u)return 0; \
+  if(depth && stack[depth-1u].kind=='[' && ++stack[depth-1u].items>64u)return 0; \
+} while(0)
+  while(at<input->body_len) {
+    unsigned char byte=bytes[at++];
+    if(byte==' ' || byte=='\t' || byte=='\r' || byte=='\n')continue;
+    if(byte=='{' || byte=='[') {
+      KU_HTTP_JSON_TOKEN();if(depth==16u)return 0;
+      stack[depth].kind=byte;stack[depth].fields=stack[depth].items=0;depth++;continue;
+    }
+    if(byte=='}' || byte==']') {
+      if(!depth || stack[depth-1u].kind!=(byte=='}'?'{':'['))return 0;
+      size_t capacity=8u;
+      if(byte=='}') {if(stack[depth-1u].fields>=6u)capacity=16u;values[6]+=stack[depth-1u].fields;}
+      else while(capacity<stack[depth-1u].items)capacity*=2u;
+      values[4]+=capacity;depth--;continue;
+    }
+    if(byte==':') {
+      if(!depth || stack[depth-1u].kind!='{' || ++stack[depth-1u].fields>8u)return 0;
+      continue;
+    }
+    if(byte==',') {if(!depth)return 0;continue;}
+    if(byte=='"') {
+      KU_HTTP_JSON_TOKEN();size_t begin=at;int closed=0;
+      while(at<input->body_len) {
+        unsigned char current=bytes[at++];
+        if(current=='"') {closed=1;break;}
+        if(current=='\\') {
+          if(at==input->body_len)return 0;
+          if(bytes[at]=='b' || bytes[at]=='f')values[10]+=4u;
+          at++;
+        }
+      }
+      if(!closed)return 0;
+      size_t next=at;
+      while(next<input->body_len && (bytes[next]==' ' || bytes[next]=='\t' || bytes[next]=='\r' || bytes[next]=='\n'))next++;
+      if(next<input->body_len && bytes[next]==':') {
+        size_t length=at-begin-1u;if(length>64u)return 0;values[3]+=length;
+      }
+      continue;
+    }
+    if(byte=='-' || (byte>='0' && byte<='9')) {
+      size_t begin=at-1u;
+      while(at<input->body_len && bytes[at]>='0' && bytes[at]<='9')at++;
+      if(at-begin>20u)return 0;KU_HTTP_JSON_TOKEN();
+      if(at<input->body_len && (bytes[at]=='.' || bytes[at]=='e' || bytes[at]=='E'))return 0;
+      continue;
+    }
+    const char* literal=NULL;size_t length=0;
+    if(byte=='t'){literal="true";length=4u;}
+    else if(byte=='f'){literal="false";length=5u;}
+    else if(byte=='n'){literal="null";length=4u;}
+    else return 0;
+    if(length>input->body_len-(at-1u) || memcmp(bytes+at-1u,literal,length))return 0;
+    KU_HTTP_JSON_TOKEN();at+=length-1u;
+  }
+#undef KU_HTTP_JSON_TOKEN
+  return !depth && ku_http_json_work_fits(work->bytes,values,131072u)
+      && ku_http_json_work_fits(work->visits,values,6144u)
+      && ku_http_json_work_fits(work->output,values,16384u)
+      && ku_http_json_work_fits(work->nodes,values,256u);
+}
 static size_t ku_http_projection_bytes(KuHttpInput* input,size_t parameters,size_t parameter_names) {
   unsigned int fields=ku_http_input_fields(input);
   size_t target=strlen(input->target),bytes=sizeof(KuStruct___ku_http_request);
@@ -2320,10 +2421,27 @@ static void ku_http_connection_submit(KuHttpConnection* connection, KuHttpServer
   connection->job = job;
   connection->phase = KU_HTTP_IO_JOB;
   connection->deadline = 0;
-  if(ku_http_queue_is_current_owner(queue) && queue->owner_inline_remaining
-      && job->input.route && job->input.route->status==200u
-      && ku_http_handler_is_short(job->input.route->invoke)) {
-    queue->owner_inline_remaining--;
+  int local=ku_http_queue_is_current_owner(queue) && queue->owner_inline_remaining
+      && job->input.route && job->input.route->status==200u;
+  int short_handler=local && ku_http_handler_is_short(job->input.route->invoke);
+  const KuHttpJsonWork* json_work=local && queue->owner_inline_remaining==32u && !short_handler
+      ? ku_http_handler_json_work(job->input.route->invoke):NULL;
+  int bounded_json=0;
+  if(json_work) {
+    /* Rejection scans <=2B+3T<=6144 bytes and <=4N+192 bounded
+     * structural visits. Four credits cover both; a fresh32 requirement
+     * prevents another JSON attempt in this same turn. */
+    queue->owner_inline_remaining=28u;
+    bounded_json=
+#if defined(KU_HTTP_HAS_TASK_RUNTIME)
+        ku_http_task_execution_inactive() &&
+#endif
+        ku_http_json_input_bounded(&job->input,json_work);
+  }
+  if(short_handler || bounded_json) {
+    /* A single bounded JSON call owes the reactor a complete I/O turn. Keep
+     * the literal proof's original32 credits and all existing checkpoints. */
+    queue->owner_inline_remaining=bounded_json?0u:queue->owner_inline_remaining-1u;
     ku_http_count_admitted();
     ku_http_job_run_owner(server,job);return;
   }

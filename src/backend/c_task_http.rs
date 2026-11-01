@@ -177,6 +177,11 @@ static uint32_t ku_http_task_start_{id}(void* raw,size_t owner,void* environment
 }
 
 const BRIDGE: &str = r#"
+/* Normal sync JSON must never inherit an active Task execution/allocation
+ * context. Public Task JSON continues to receive its explicit allocation host. */
+static int ku_http_task_execution_inactive(void) {
+  return ku_task_driver_execution==NULL && ku_task_driver_entry_owner==0u;
+}
 static uint32_t ku_http_task_start_failure_reason(uint32_t status) {
   return status==KU_TASK_DRIVER_LIMIT ? KU_HTTP_ERROR_TASK_LIMIT :
     status==KU_TASK_DRIVER_CLOSED ? KU_HTTP_ERROR_TASK_CLOSED : KU_HTTP_ERROR_DRIVER;
