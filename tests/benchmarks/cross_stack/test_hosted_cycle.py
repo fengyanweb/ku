@@ -56,11 +56,12 @@ class HostedCycleTests(unittest.TestCase):
         base=dict(baseline=h.BASELINE,candidate='b'*40,prepatch=h.HTTP_SHORT_PREPATCH,screen_variants=[])
         plain=h.hosted_identity(types.SimpleNamespace(**base),'diagnostic')
         self.assertEqual(plain,h.hosted_identity(types.SimpleNamespace(**base,http_short_goal='memory'),'diagnostic'))
+        self.assertEqual(plain,h.hosted_identity(types.SimpleNamespace(**base,http_short_goal='memory-probe'),'diagnostic'))
         identities=[]
-        for goal in ('cpu','memory'):
+        for goal in ('cpu','memory','memory-probe'):
             identity=h.hosted_identity(types.SimpleNamespace(**base,http_short_screen=True,http_short_goal=goal),'diagnostic')
             self.assertEqual(identity['http_short_goal'],goal);identities.append(identity)
-        self.assertNotEqual(identities[0],identities[1])
+        self.assertEqual(len({json.dumps(x,sort_keys=True) for x in identities}),3)
         cpu,memory=(h.http_short_plan({'A':{},'B':{}},goal) for goal in ('cpu','memory'))
         self.assertEqual(cpu['windows'],memory['windows']);self.assertEqual(cpu['resources'],memory['resources'])
         self.assertEqual(memory['adoption_thresholds']['json_memory_geometric_ratio_maximum'],.95)
@@ -100,6 +101,41 @@ class HostedCycleTests(unittest.TestCase):
                 if issue=='none':self.assertAlmostEqual(result['json_memory']['estimate'],.94)
                 if issue in ('memory-missing','virtual-only','memory-nan'):
                     self.assertEqual(result['json_memory']['status'],'unavailable_nonpositive_or_missing_window')
+
+    def test_memory_probe_is_only_original_controls_and_three_five_second_JSON_pairs(self):
+        cpu,memory=(h.http_short_plan({},goal) for goal in ('cpu','memory'))
+        before_cpu,before_memory=json.dumps(cpu,sort_keys=True),json.dumps(memory,sort_keys=True)
+        plan=h.http_short_plan({},'memory-probe')
+        self.assertEqual(plan['windows'][:3],memory['windows'][:3])
+        self.assertEqual((plan['maximum_windows'],plan['maximum_replacements']),(9,0))
+        self.assertEqual([(r['group'],r['name']) for r in plan['windows'][3:]],[(1,'A'),(1,'B'),(2,'B'),(2,'A'),(3,'A'),(3,'B')])
+        self.assertTrue(all((r['workload'],r['rate'],r['warmup_seconds'],r['score_seconds'])==('json_object',500,3,5) for r in plan['windows'][3:]))
+        self.assertFalse(plan['automatic_expansion']);self.assertTrue(plan['preliminary_only'])
+        self.assertEqual(plan['adoption_thresholds']['json_memory_geometric_ratio_maximum'],.95)
+        self.assertEqual(plan['adoption_thresholds']['json_memory_upper95_strictly_below'],1)
+        self.assertEqual(before_cpu,json.dumps(h.http_short_plan({},'cpu'),sort_keys=True))
+        self.assertEqual(before_memory,json.dumps(h.http_short_plan({},'memory'),sort_keys=True))
+
+    def test_memory_probe_rejects_insufficient_memory_and_JSON_CPU_without_absent_workloads(self):
+        for issue in ('none','memory-small','memory-upper','missing-memory','cpu-regression','cpu-upper','wrong-count','unknown','incomplete'):
+            with self.subTest(issue=issue):
+                rows=[]
+                for config in h.http_short_plan({},'memory-probe')['windows']:
+                    row=dict(config,correct=2500,all_correct=True,environment_quality='unknown' if issue=='unknown' else 'pass')
+                    memory=.96 if issue=='memory-small' else [.90,.92,1.01][row['group']-1] if issue=='memory-upper' else .94
+                    cpu=1.001 if issue=='cpu-regression' else [.99,1,1.04][row['group']-1] if issue=='cpu-upper' else 1
+                    row.update(full_cpu_us=100*(cpu if row['name']=='B' else 1),memory={'steady_median_bytes':1000000*(memory if row['name']=='B' else 1)})
+                    if issue=='missing-memory':row['memory']={'virtual_bytes':1,'endpoint_memory_current':1}
+                    if issue=='wrong-count' and row['name']=='B':row['correct']=7500
+                    rows.append(row)
+                result=h.http_short_comparison(rows,issue!='incomplete',{'quality':'pass'},'memory-probe')
+                self.assertEqual(result['eligible_for_guard_followup'],issue=='none')
+                self.assertFalse(result['candidate_accepted']);self.assertFalse(result['automatic_expansion'])
+                self.assertNotIn('compute_guard',result)
+                self.assertFalse({'ok','db','cpu'}&set(result['comparisons']))
+                if issue=='none':
+                    self.assertAlmostEqual(result['json_memory']['estimate'],.94)
+                    self.assertEqual(set(result['comparisons']),{'json_object'})
 
     def test_http_short_goal_or_threshold_change_rejected_before_product_or_database_access(self):
         for issue in ('goal','threshold'):
@@ -165,9 +201,10 @@ class HostedCycleTests(unittest.TestCase):
                     self.assertEqual(result['compute_guard']['pairs'],1);self.assertIsNone(result['compute_guard']['confidence_interval'])
 
     def test_http_short_runner_stops_failed_controls_or_invalid_business_without_replacement(self):
-        for issue in ('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business'):
-            with self.subTest(issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
-                root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')})
+        cases=('none','control-quality','environment-unknown','environment-fail','arrival','cleanup','database','flags','business')
+        for goal,issue in [(goal,issue) for goal in ('cpu','memory-probe') for issue in cases]:
+            with self.subTest(goal=goal,issue=issue),tempfile.TemporaryDirectory() as temp,ExitStack() as patches:
+                root=Path(temp);plan=h.http_short_plan({n:dict(root=str(root/n),stack='ku') for n in ('A','B')},goal)
                 h.save(root/'frozen-plan.json',plan);manifest=root/'fixture/manifest.json';state_path=root/'fixture/state.json'
                 h.save(manifest,{'db_url':'postgresql://private@localhost/test','db_cgroup':'/unused'});h.save(state_path,{'limits':{}})
                 fixture=types.SimpleNamespace(start=lambda:None,manifest_path=manifest,state_path=state_path,
@@ -188,23 +225,28 @@ class HostedCycleTests(unittest.TestCase):
                     row=dict(status='observed',score_started=True,functional_valid=not(issue=='control-quality' and control),accounting_valid=True,
                         all_correct=True,natural_reclamation=True,arrival_schedule_quality='fail' if issue=='arrival' and not control else 'pass',
                         environment_quality='unknown' if control else 'pass',measurement_invalid=False,
-                        full_cpu_us=97 if name=='B' else 100,cleanup=[{'natural':True}])
+                        full_cpu_us=97 if name=='B' else 100,correct=rate*duration,
+                        memory={'steady_median_bytes':940000 if name=='B' else 1000000},cleanup=[{'natural':True}])
                     self.assertEqual(kwargs['job']['contract'],'dom' if control else next(c['contract'] for c in plan['windows'] if c['workload']==workload))
                     for part in ('warmup','score'):
                         report=Path(output)/part/'client.json';h.save(report,dict(service_cost=dict(before={'observed':True},after={'observed':True},
                             driver_headroom={'fraction_of_quota':.3,'saturated':False})))
                         h.save(Path(output)/part/'driver-cleanup.json',dict(process_reaped=not(issue=='cleanup' and not control),cgroup_removed=True,after={'process_count':0}))
                     row['score_report']=str(Path(output)/'score/client.json');return row
-                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_short_screen=True)
+                patches.enter_context(patch.object(fc,'window',side_effect=window));a=types.SimpleNamespace(root=root,http_short_screen=True,http_short_goal=goal)
                 if issue in ('flags','business'):
                     with self.assertRaises(ValueError):h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
                     self.assertEqual(measured,[]);database.assert_not_called();continue
                 result=h.diagnostic(a,{'uid':1,'gid':1,'steps':{}})
-                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else 23)
+                self.assertEqual(len(measured),1 if issue=='control-quality' else 3 if issue.startswith('environment') else 4 if issue in ('arrival','cleanup') else plan['maximum_windows'])
                 self.assertEqual(result['execution_complete'],issue=='none');self.assertFalse(result['candidate_accepted'])
                 self.assertEqual(env.call_count,0 if issue=='control-quality' else 1)
                 if issue=='none':
                     self.assertEqual([x[2] for x in measured[:3]],[True]*3)
+                    if goal=='memory-probe':
+                        self.assertEqual(len(measured),9);self.assertTrue(all(x[1]=='json_object' for x in measured))
+                        self.assertTrue(result['comparison']['eligible_for_guard_followup'])
+                        self.assertNotIn('compute_guard',result['comparison'])
                     self.assertEqual(result['environment_qualification']['quality'],'pass')
                 else:self.assertFalse(result['comparison']['eligible_for_root_review'])
 
