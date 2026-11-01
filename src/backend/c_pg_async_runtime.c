@@ -627,6 +627,11 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
   }
   if(op->phase==KU_PG_ASYNC_ACQUIRE) {int acquired=ku_pg_async_acquire(op,now);if(acquired || op->phase==KU_PG_ASYNC_ACQUIRE)return op->phase==KU_PG_ASYNC_DONE;}
   KuPgAsyncTurn turn={0};
+  /* Task readiness uses read=1/write=2 plus error/hangup bits; the sync
+   * adapter supplies read=1 after its socket wait. Consume each input event
+   * at most once in this turn. A preceding query's read event cannot also
+   * authorize a speculative socket read after sending its mandatory reset. */
+  unsigned int input_ready=events&~2u;
   /* A maximum of 32 protocol results per turn. Byte/row hard limits and the
    * original absolute deadline also apply in the shared detach implementation. */
   for(size_t work=0;work<32u;work++) {
@@ -656,6 +661,7 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       int tx=PQtransactionStatus(op->conn);
       if(PQstatus(op->conn)!=KU_PG_CONNECTION_OK || tx!=KU_PQTRANS_IDLE || PQsetnonblocking(op->conn,1)!=0
           || !PQconsumeInput(op->conn) || !ku_pg_connection_is_utf8(op->conn)) {ku_pg_async_failure(op);return 1;}
+      input_ready=0;
       ku_pg_async_set_phase(op,KU_PG_ASYNC_SEND);
     }
     if(op->phase==KU_PG_ASYNC_SEND) {
@@ -679,12 +685,22 @@ static int ku_pg_async_step_inner(KuPgAsyncOp* op,unsigned int events,unsigned l
       int flushed=PQflush(op->conn);
       if(flushed<0) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
       if(flushed) {
-        if((events&1u) && !PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
+        if(input_ready) {
+          input_ready=0;
+          if(!PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
+        }
         op->interest=3u;return 0;
       }
       ku_pg_async_set_phase(op,reset ? KU_PG_ASYNC_RESET_READ:KU_PG_ASYNC_READ);
     }
     if(PQisBusy(op->conn)) {
+      /* PQisBusy first permits buffered results/terminal NULL to drain even
+       * after a byte/cell/result quantum yield without a new socket event.
+       * A busy connection needs fresh input readiness, not another empty
+       * read using the already consumed event. All owner reactors retain
+       * level readiness, so partial input is revisited on the original fd. */
+      if(!input_ready) {op->interest=1u;return 0;}
+      input_ready=0;
       if(!PQconsumeInput(op->conn)) {if(reset)goto reset_failed;ku_pg_async_failure(op);return 1;}
       if(PQisBusy(op->conn)) {op->interest=1u;return 0;}
     }

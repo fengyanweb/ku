@@ -1962,6 +1962,7 @@ static struct pg_cancel cancel_token;
 static size_t fail_malloc_size = 0;
 static int injected_allocation_failures = 0;
 static int fail_runtime_allocation_after = 0, single_row_calls = 0, read_ahead_calls = 0;
+static int async_require_input_event = 0, active_consume_calls = 0;
 static int track_runtime_allocations = 0, live_runtime_allocations = 0;
 static int expire_oom_after_shutdown = 0;
 #define KU_PG_TEST_ALLOCATION_RECORDS 16
@@ -2201,6 +2202,7 @@ int PQconsumeInput(PGconn* conn) {
   if (conn->shutdowns) { poisoned_consumes++; conn->status = KU_PG_CONNECTION_BAD; return 0; }
   if (conn->status != KU_PG_CONNECTION_OK) return 0;
   if (!conn->active) return 1;
+  if(async_require_input_event)active_consume_calls++;
   /* All normal response packets are already buffered after the first row.
      Reading again before asking isBusy would model libpq input accumulation. */
   if (conn->index > 0 && conn->index < conn->total && conn->mode != T_PARTIAL_TIMEOUT) read_ahead_calls++;
@@ -2212,6 +2214,7 @@ int PQisBusy(PGconn* conn) {
   conn->mode_window = 0;
   int busy = conn->active && (conn->mode == T_READ_TIMEOUT || conn->mode == T_POLL_ERROR || conn->mode == T_HUP
       || conn->mode == T_CONSUME_FAIL
+      || (async_require_input_event && !conn->received_reads)
       || (conn->mode == T_INTERRUPTED && conn->received_reads < 2)
       || (conn->mode == T_PARTIAL_TIMEOUT && conn->index > 0));
   get_gate = !busy; return busy;
@@ -3069,6 +3072,74 @@ static void async_drop_output(KuPgAsyncOp* op,AsyncBudget* b,int expected_ok) {
   size_t bytes=0;if(result.ok){if(!ku_pg_result_owned_bytes(result.value,&bytes))abort();ku_drop_pg_result(&result.value);}else ku_error_drop(&result.error);
   ku_pg_async_dispose(op,1);if(bytes)async_refund(b,bytes);if(b->bytes)abort();
 }
+static int async_readiness_drain_buffered(KuPgAsyncOp* op) {
+  for(size_t turn=0;turn<32u;turn++) {
+    if(op->phase==KU_PG_ASYNC_RESET_READ)return 1;
+    if(op->interest || ku_pg_async_step(op,0u,clock_ms,0))return 0;
+  }
+  return 0;
+}
+static int async_input_readiness_regression(void) {
+  mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;async_require_input_event=1;
+  KuResult_pg_client opened=ku_pg_client_open(text("hostaddr=127.0.0.1"),1,8,1000,1000,2000);
+  CHECK(opened.ok);KuPgClient* p=opened.value;AsyncBudget b={0};
+  KuPgAsyncOp* op=async_create(p,&b);
+  int reads=active_consume_calls,users=user_sends,resets=reset_sends;
+  CHECK(!ku_pg_async_step(op,0u,clock_ms,0) && op->phase==KU_PG_ASYNC_READ && op->interest==1u);
+  CHECK(active_consume_calls==reads && user_sends==users+1 && reset_sends==resets);
+  CHECK(!ku_pg_async_step(op,2u,clock_ms,0) && op->interest==1u && active_consume_calls==reads);
+  /* A spurious read is consumed once, then the same interest remains armed. */
+  CHECK(!ku_pg_async_step(op,1u,clock_ms,0) && op->interest==1u && active_consume_calls==reads+1);
+  op->conn->pending_read=1;
+  CHECK(!ku_pg_async_step(op,1u,clock_ms,0) && async_readiness_drain_buffered(op));
+  CHECK(op->output.ok && p->active==1 && op->interest==1u && active_consume_calls==reads+2
+      && user_sends==users+1 && reset_sends==resets+1);
+  /* The query event cannot read a newly sent reset. A new event completes its
+   * COMMAND_OK and NULL before the original lease is reusable. */
+  op->conn->pending_read=1;
+  CHECK(ku_pg_async_step(op,1u,clock_ms,0) && op->output.ok && active_consume_calls==reads+3);
+  CHECK(!p->active && !p->in_use[0] && p->conns[0] && !p->conns[0]->active);
+  async_drop_output(op,&b,1);
+
+  /* Write backpressure plus READ|WRITE may consume once while still flushing.
+   * A following WRITE-only turn drains buffered query data without another
+   * consume, then waits for a genuinely new reset read. */
+  mode_on_send=T_BACKPRESSURE;op=async_create(p,&b);reads=active_consume_calls;
+  CHECK(!ku_pg_async_step(op,0u,clock_ms,0) && op->phase==KU_PG_ASYNC_FLUSH && op->interest==3u);
+  op->conn->pending_read=1;
+  CHECK(!ku_pg_async_step(op,3u,clock_ms,0) && active_consume_calls==reads+1);
+  CHECK(!ku_pg_async_step(op,2u,clock_ms,0) && async_readiness_drain_buffered(op)
+      && op->output.ok && active_consume_calls==reads+1);
+  op->conn->pending_read=1;
+  CHECK(ku_pg_async_step(op,1u,clock_ms,0) && op->output.ok && active_consume_calls==reads+2);
+  async_drop_output(op,&b,1);mode_on_send=T_OK;
+
+  /* Error and HUP/EOF are input opportunities too, with no SQL replay. Query
+   * failures keep execution_unknown; reset failures keep the detached result
+   * and evict exactly as before. */
+  for(int kind=0;kind<3;kind++) {
+    mode_on_send=kind==0?T_CONSUME_FAIL:kind==1?T_HUP:T_OK;
+    reset_mode_on_send=kind==2?T_CONSUME_FAIL:T_RESTORE;
+    op=async_create(p,&b);users=user_sends;resets=reset_sends;
+    for(size_t turn=0;op->phase!=KU_PG_ASYNC_READ && turn<8u;turn++) {
+      CHECK(!ku_pg_async_step(op,0u,clock_ms,0));
+      if(op->phase==KU_PG_ASYNC_CONNECT && !op->connect_ready)ku_pg_async_connect_run(op,0);
+    }
+    CHECK(op->phase==KU_PG_ASYNC_READ && user_sends==users+1);
+    op->conn->pending_read=1;
+    if(kind==2) {
+      CHECK(!ku_pg_async_step(op,1u,clock_ms,0) && async_readiness_drain_buffered(op) && op->output.ok);
+      CHECK(ku_pg_async_step(op,4u,clock_ms,0) && op->output.ok && reset_sends==resets+1);
+    } else {
+      CHECK(ku_pg_async_step(op,kind==0?4u:8u,clock_ms,0) && error_is(op->output,"execution_unknown"));
+      CHECK(reset_sends==resets);
+    }
+    CHECK(user_sends==users+1 && !p->active && !p->conns[0]);
+    async_drop_output(op,&b,kind==2);
+  }
+  async_require_input_event=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
+  ku_pg_client_close_owned(p);CHECK(!b.bytes);return 0;
+}
 int main(void) {
   clock_ms=1000;clock_step=0;mode_on_send=T_OK;reset_mode_on_send=T_RESTORE;
   KuResult_pg_client captured=ku_pg_client_open(ku_string_static((const uint8_t*)"hostaddr=127.0.0.1",18),1,128,1000,1000,2000);
@@ -3107,6 +3178,7 @@ int main(void) {
   CHECK(p->waiters==128 && p->async_operations==129);ku_pg_client_close_owned(p);
   for(size_t i=0;i<128;i++){CHECK(budgets[i].wakes==1);CHECK(waiters[i]->waiter.in_flight==0);CHECK(async_finish(waiters[i],1));async_drop_output(waiters[i],&budgets[i],0);}
   CHECK(async_finish(held,1));async_drop_output(held,&b,0); /* Last op physically destroys closed p. */
+  CHECK(!async_input_readiness_regression());
   CHECK(live_results==0 && live_connections==0 && live_runtime_allocations==0);
   puts("pg async pump closed loop");return 0;
 }
