@@ -8360,9 +8360,36 @@ static int fixture_token_prefix(void) {
     CHECK(bytes==ku_http_reactor_pending_storage_bytes(cases[test][0],cases[test][1],cases[test][2])-sizeof(r));
     uint64_t* keys=(uint64_t*)calloc(r.capacity,sizeof(*keys));CHECK(keys);
     size_t calls=fixture_alloc_calls;uint64_t next=UINT64_C(0x1000000000000001);
+    for(uint64_t key=1u;key<=128u;key++) {
+      CHECK(ku_http_reactor_fd_start(&r,(KuHttpSocket)key)==
+          (ku_http_reactor_hash_start(&r,key)&(r.fd_capacity-1u)));
+      if(full<=64u)CHECK(ku_http_reactor_token_start(&r,key,full)==ku_http_reactor_hash_start(&r,key));
+    }
+    if(full>64u) {
+      /* Same low six bits, distinct upper 16 bits: compact collisions must
+       * compare full tokens and back-shift correctly across the 63->0 wrap. */
+      const size_t deletion[4]={1u,0u,3u,2u};
+      for(uint64_t round=0;round<64u;round++) {
+        for(size_t i=0;i<4u;i++) {
+          keys[i]=((UINT64_C(0x1000)+round*4u+i)<<48u)|63u;
+          CHECK(ku_http_reactor_token_start(&r,keys[i],64u)==63u);
+          CHECK(ku_http_reactor_hash_add(&r,keys[i],i));
+          r.registrations[i]=(KuHttpRegistration){(int)i,keys[i],1u,0,1,-1,0};r.fd_count++;
+        }
+        CHECK(ku_http_reactor_lookup(&r,keys[0]+(UINT64_C(1)<<40u))==SIZE_MAX);
+        for(size_t step=0;step<4u;step++) {
+          size_t i=deletion[step];ku_http_reactor_hash_remove(&r,keys[i]);
+          r.registrations[i]=(KuHttpRegistration){0};r.fd_count--;
+          CHECK(ku_http_reactor_lookup(&r,keys[i])==SIZE_MAX);
+          for(size_t other=0;other<4u;other++)if(r.registrations[other].registered)
+            CHECK(ku_http_reactor_lookup(&r,keys[other])==other);
+        }
+        CHECK(!r.fault && !r.fd_count && ku_http_reactor_token_capacity(&r)==64u);
+        for(size_t i=0;i<64u;i++)CHECK(!r.hash[i].token);
+      }
+    }
     for(size_t i=0;i<r.capacity;i++) {
-      if(i<32u && full>64u)while((ku_http_reactor_hash_start(&r,next)&63u)!=63u)next++;
-      keys[i]=next++;
+      keys[i]=i<32u && full>64u ? ((UINT64_C(0x2000)+i)<<48u)|63u:next++;
       if(i==32u && full>64u) {
         CHECK(ku_http_reactor_token_capacity(&r)==64u);
         for(size_t j=64u;j<full;j++)CHECK(!r.hash[j].token);
@@ -8375,6 +8402,8 @@ static int fixture_token_prefix(void) {
     }
     CHECK(!r.fault && fixture_alloc_calls==calls && r.hash_capacity==full);
     for(size_t i=0;i<r.capacity;i++)CHECK(ku_http_reactor_lookup(&r,keys[i])==i);
+    if(full>64u && r.capacity>32u)for(size_t i=0;i<32u;i++)
+      CHECK(ku_http_reactor_token_start(&r,keys[i],full)==ku_http_reactor_hash_start(&r,keys[i]));
     for(size_t i=1;i<r.capacity;i+=2u) {
       ku_http_reactor_hash_remove(&r,keys[i]);r.registrations[i]=(KuHttpRegistration){0};r.fd_count--;
     }
